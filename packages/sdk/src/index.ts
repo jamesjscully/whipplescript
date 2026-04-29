@@ -1,183 +1,467 @@
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { existsSync, readFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
+import { Writable } from "node:stream";
+import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-export type JsonValue =
-  | null
-  | boolean
-  | number
-  | string
-  | JsonValue[]
-  | { [key: string]: JsonValue };
+export type JsonPrimitive = null | boolean | number | string;
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
+export interface ArmatureEvent<TPayload extends JsonValue = JsonValue> {
+  id?: string;
+  event_type: string;
+  payload: TPayload;
+  routing?: string;
+  config_version?: string | null;
+  source?: string | null;
+}
 
 export interface RunContext {
+  kind?: string;
+  name?: string;
   runId?: string;
-  eventId?: string;
-  workspaceRoot?: string;
   runDirectory?: string;
   stdoutPath?: string;
   stderrPath?: string;
   configVersion?: string;
-  taskName?: string;
-  serviceName?: string;
+  eventId?: string;
+  eventType?: string;
+  eventJson?: string;
+  eventPath?: string;
+  workspace?: string;
 }
 
-export interface ArmatureEvent<TPayload extends JsonValue = JsonValue> {
-  id?: string;
-  type: string;
-  payload: TPayload;
-  source?: string;
-  configVersion?: string;
+export interface StatusSnapshot {
+  workspace_root: string;
+  config_path: string;
+  config_version: string;
+  socket_path: string;
+  pid_path: string;
+  services: number;
+  tasks: number;
+  active_runs: number;
 }
 
-export interface TaskDefinition {
+export interface TaskStatus {
   name: string;
   run: string;
+  schedule?: string;
+  watch: string[];
+  on?: string;
+  admission: string;
+  active_run_ids: string[];
+  queued_triggers: number;
+  schedule_active: boolean;
+  watch_active: boolean;
 }
 
-export interface ServiceDefinition {
+export interface ServiceStatus {
   name: string;
   run: string;
   enabled: boolean;
+  restart: string;
+  state?: string;
+  supervision_state?: string;
+  active_run_id?: string | null;
+  stop_override?: boolean;
+  last_error?: string | null;
 }
 
 export interface RunRecord {
   id: string;
   name: string;
+  origin: string;
   state: string;
+  config_version?: string | null;
+  event_id?: string | null;
+  run_directory?: string | null;
+  stdout_path?: string | null;
+  stderr_path?: string | null;
 }
 
-export interface LogRecord {
-  runId: string;
-  stdoutPath: string;
-  stderrPath: string;
+export interface RunStartResult {
+  run_id: string;
+  task: string;
 }
 
-export interface RuntimeSnapshot {
-  tasks: TaskDefinition[];
-  services: ServiceDefinition[];
-  activeRuns: RunRecord[];
+export interface EmitResult<TPayload extends JsonValue = JsonValue> {
+  emitted: true;
+  event_type: string;
+  payload: TPayload;
 }
 
-export interface LockResult {
-  ok: boolean;
+export interface ServiceCommandResult {
+  service: string;
+  action: "started" | "stopped" | "restarted";
+}
+
+export interface LogsResult {
+  run_id: string;
+  stdout_path: string;
+  stderr_path: string;
+  stdout: string;
+  stderr: string;
+}
+
+export interface CancelResult {
+  cancelled: true;
+  run_id: string;
+}
+
+export interface ConfigCheckResult {
+  ok: true;
+  workspace_root: string;
+  config_path: string;
+  config_version: string;
+}
+
+export interface DoctorResult {
+  workspace_root: string;
+  config_path: string;
+  config_version?: string | null;
+  config_error?: string | null;
+  state_root: string;
+  database_path: string;
+  socket_path: string;
+  pid_path: string;
+  workspace_lock_path: string;
+  daemon_running: boolean;
+  daemon_error?: string | null;
+  detached_stdout_path: string;
+  detached_stderr_path: string;
+}
+
+export interface UpResult {
+  started?: boolean;
+  reloaded?: boolean;
+  foreground?: boolean;
+  mode?: string;
+  workspace_root: string;
+  socket_path?: string;
+}
+
+export interface DownResult {
+  stopped: true;
+  workspace_root: string;
+}
+
+export interface ManualLockRecord {
   name: string;
+  owner_pid: number;
+  acquired_at_ms: number;
+  expires_at_ms?: number | null;
+  manual: boolean;
+}
+
+export interface LockReleaseResult {
+  released: true;
+  name: string;
+}
+
+export type StructuredLogEntry = Record<string, JsonValue>;
+
+export interface ArmatureClientOptions {
+  bin?: string;
+  workspace?: string;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  lockTtl?: string;
+}
+
+export interface WithLockOptions {
+  ttl?: string;
 }
 
 export class ArmatureSdkError extends Error {
   readonly kind: string;
+  readonly details?: Record<string, JsonValue>;
 
-  constructor(kind: string, message: string) {
+  constructor(kind: string, message: string, details?: Record<string, JsonValue>) {
     super(message);
     this.name = "ArmatureSdkError";
     this.kind = kind;
+    this.details = details;
   }
 }
 
-function getRequiredEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new ArmatureSdkError("missing_env", `missing required environment variable ${name}`);
-  }
-  return value;
-}
-
-async function runCli<T>(args: string[]): Promise<T> {
-  const command = process.env.ARMATURE_BIN ?? "armature";
+function parseJson<T>(raw: string, context: string): T {
   try {
-    const { stdout } = await execFileAsync(command, args, { encoding: "utf8" });
-    return stdout.length > 0 ? (JSON.parse(stdout) as T) : (undefined as T);
+    return JSON.parse(raw) as T;
   } catch (error) {
-    throw new ArmatureSdkError("transport", `armature CLI call failed for ${args.join(" ")}`);
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ArmatureSdkError("invalid_json", `failed to parse ${context}: ${message}`, {
+      context,
+      raw
+    });
   }
 }
 
-export function getRunContext(): RunContext {
+function resolveEventJson(env: NodeJS.ProcessEnv): string {
+  const inline = env.ARMATURE_EVENT_JSON ?? env.ARMATURE_EVENT;
+  if (inline) {
+    return inline;
+  }
+
+  const path = env.ARMATURE_EVENT_PATH;
+  if (path && existsSync(path)) {
+    return readFileSync(path, "utf8");
+  }
+
+  throw new ArmatureSdkError(
+    "missing_env",
+    "missing Armature event payload; expected ARMATURE_EVENT_JSON or ARMATURE_EVENT_PATH"
+  );
+}
+
+async function runCli<T>(args: string[], options: ArmatureClientOptions): Promise<T> {
+  const command = options.bin ?? process.env.ARMATURE_BIN ?? "armature";
+  const commandArgs = ["--format", "json"];
+
+  if (options.workspace) {
+    commandArgs.push("--workspace", options.workspace);
+  }
+
+  commandArgs.push(...args);
+
+  try {
+    const { stdout } = await execFileAsync(command, commandArgs, {
+      cwd: options.cwd,
+      env: options.env,
+      encoding: "utf8"
+    });
+    return parseJson<T>(stdout, `CLI response for ${args.join(" ")}`);
+  } catch (error) {
+    if (error && typeof error === "object" && "stdout" in error) {
+      const commandError = error as {
+        code?: number | string;
+        stdout?: string;
+        stderr?: string;
+        message?: string;
+      };
+      throw new ArmatureSdkError("cli_failed", commandError.message ?? "armature CLI call failed", {
+        command,
+        args: commandArgs,
+        code: commandError.code == null ? null : String(commandError.code),
+        stdout: commandError.stdout ?? "",
+        stderr: commandError.stderr ?? ""
+      });
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ArmatureSdkError("transport", `failed to execute ${command}: ${message}`, {
+      command,
+      args: commandArgs
+    });
+  }
+}
+
+export class ArmatureClient {
+  readonly options: ArmatureClientOptions;
+
+  constructor(options: ArmatureClientOptions = {}) {
+    this.options = { ...options };
+  }
+
+  up(): Promise<UpResult> {
+    return runCli<UpResult>(["up"], this.options);
+  }
+
+  down(): Promise<DownResult> {
+    return runCli<DownResult>(["down"], this.options);
+  }
+
+  restart(): Promise<UpResult> {
+    return runCli<UpResult>(["restart"], this.options);
+  }
+
+  run(taskName: string): Promise<RunStartResult> {
+    return runCli<RunStartResult>(["run", taskName], this.options);
+  }
+
+  emit<TPayload extends JsonValue = JsonValue>(
+    eventType: string,
+    payload: TPayload = {} as TPayload
+  ): Promise<EmitResult<TPayload>> {
+    return runCli<EmitResult<TPayload>>(
+      ["emit", eventType, "--json", JSON.stringify(payload)],
+      this.options
+    );
+  }
+
+  status(): Promise<StatusSnapshot> {
+    return runCli<StatusSnapshot>(["status"], this.options);
+  }
+
+  inspect(): Promise<StatusSnapshot> {
+    return this.status();
+  }
+
+  tasks(): Promise<TaskStatus[]> {
+    return runCli<TaskStatus[]>(["tasks"], this.options);
+  }
+
+  services(): Promise<ServiceStatus[]> {
+    return runCli<ServiceStatus[]>(["services"], this.options);
+  }
+
+  startService(name: string): Promise<ServiceCommandResult> {
+    return runCli<ServiceCommandResult>(["service", "start", name], this.options);
+  }
+
+  stopService(name: string): Promise<ServiceCommandResult> {
+    return runCli<ServiceCommandResult>(["service", "stop", name], this.options);
+  }
+
+  restartService(name: string): Promise<ServiceCommandResult> {
+    return runCli<ServiceCommandResult>(["service", "restart", name], this.options);
+  }
+
+  runs(): Promise<RunRecord[]> {
+    return runCli<RunRecord[]>(["runs"], this.options);
+  }
+
+  logs(runId: string): Promise<LogsResult> {
+    return runCli<LogsResult>(["logs", runId], this.options);
+  }
+
+  cancel(runId: string): Promise<CancelResult> {
+    return runCli<CancelResult>(["cancel", runId], this.options);
+  }
+
+  configCheck(): Promise<ConfigCheckResult> {
+    return runCli<ConfigCheckResult>(["config", "check"], this.options);
+  }
+
+  doctor(): Promise<DoctorResult> {
+    return runCli<DoctorResult>(["doctor"], this.options);
+  }
+
+  lock(name: string, ttl = this.options.lockTtl ?? "5m"): Promise<ManualLockRecord> {
+    return runCli<ManualLockRecord>(["lock", "acquire", name, "--ttl", ttl], this.options);
+  }
+
+  unlock(name: string): Promise<LockReleaseResult> {
+    return runCli<LockReleaseResult>(["lock", "release", name], this.options);
+  }
+
+  locks(): Promise<ManualLockRecord[]> {
+    return runCli<ManualLockRecord[]>(["lock", "status"], this.options);
+  }
+
+  async withLock<T>(
+    name: string,
+    fn: () => Promise<T> | T,
+    options: WithLockOptions = {}
+  ): Promise<T> {
+    await this.lock(name, options.ttl);
+    try {
+      return await fn();
+    } finally {
+      await this.unlock(name);
+    }
+  }
+}
+
+export function createArmature(options: ArmatureClientOptions = {}): ArmatureClient {
+  return new ArmatureClient(options);
+}
+
+export const armature = createArmature();
+
+export function getRunContext(env: NodeJS.ProcessEnv = process.env): RunContext {
   return {
-    runId: process.env.ARMATURE_RUN_ID,
-    eventId: process.env.ARMATURE_EVENT_ID,
-    workspaceRoot: process.env.ARMATURE_WORKSPACE_ROOT,
-    runDirectory: process.env.ARMATURE_RUN_DIR,
-    stdoutPath: process.env.ARMATURE_STDOUT_LOG,
-    stderrPath: process.env.ARMATURE_STDERR_LOG,
-    configVersion: process.env.ARMATURE_CONFIG_VERSION,
-    taskName: process.env.ARMATURE_TASK_NAME,
-    serviceName: process.env.ARMATURE_SERVICE_NAME
+    kind: env.ARMATURE_KIND,
+    name: env.ARMATURE_NAME,
+    runId: env.ARMATURE_RUN_ID,
+    runDirectory: env.ARMATURE_RUN_DIR,
+    stdoutPath: env.ARMATURE_STDOUT_LOG,
+    stderrPath: env.ARMATURE_STDERR_LOG,
+    configVersion: env.ARMATURE_CONFIG_VERSION,
+    eventId: env.ARMATURE_EVENT_ID,
+    eventType: env.ARMATURE_EVENT_TYPE,
+    eventJson: env.ARMATURE_EVENT_JSON ?? env.ARMATURE_EVENT,
+    eventPath: env.ARMATURE_EVENT_PATH,
+    workspace: env.ARMATURE_WORKSPACE ?? env.ARMATURE_WORKSPACE_ROOT
   };
 }
 
-export function getEvent<TPayload extends JsonValue = JsonValue>(): ArmatureEvent<TPayload> {
-  const raw = getRequiredEnv("ARMATURE_EVENT");
-  return JSON.parse(raw) as ArmatureEvent<TPayload>;
+export function getEvent<TPayload extends JsonValue = JsonValue>(
+  env: NodeJS.ProcessEnv = process.env
+): ArmatureEvent<TPayload> {
+  return parseJson<ArmatureEvent<TPayload>>(resolveEventJson(env), "Armature event");
 }
 
-export function getPayload<TPayload extends JsonValue = JsonValue>(): TPayload {
-  return getEvent<TPayload>().payload;
+export function getPayload<TPayload extends JsonValue = JsonValue>(
+  env: NodeJS.ProcessEnv = process.env
+): TPayload {
+  return getEvent<TPayload>(env).payload;
 }
 
-export async function emit<TPayload extends JsonValue = JsonValue>(
-  eventType: string,
-  payload: TPayload
-): Promise<void> {
-  await runCli<void>(["emit", eventType, "--json", JSON.stringify(payload)]);
-}
-
-export async function run(taskName: string): Promise<RunRecord> {
-  return runCli<RunRecord>(["run", taskName]);
-}
-
-export async function status(): Promise<RuntimeSnapshot> {
-  return runCli<RuntimeSnapshot>(["status"]);
-}
-
-export async function tasks(): Promise<TaskDefinition[]> {
-  return runCli<TaskDefinition[]>(["tasks"]);
-}
-
-export async function services(): Promise<ServiceDefinition[]> {
-  return runCli<ServiceDefinition[]>(["services"]);
-}
-
-export async function runs(): Promise<RunRecord[]> {
-  return runCli<RunRecord[]>(["runs"]);
-}
-
-export async function logs(runId: string): Promise<LogRecord> {
-  return runCli<LogRecord>(["logs", runId]);
-}
-
-export async function cancel(runId: string): Promise<void> {
-  await runCli<void>(["cancel", runId]);
-}
-
-export async function lock(name: string): Promise<LockResult> {
-  return runCli<LockResult>(["lock", "acquire", name]);
-}
-
-export async function unlock(name: string): Promise<LockResult> {
-  return runCli<LockResult>(["lock", "release", name]);
-}
-
-export async function withLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
-  await lock(name);
-  try {
-    return await fn();
-  } finally {
-    await unlock(name);
-  }
-}
-
-export function log(entry: Record<string, JsonValue>): void {
-  process.stdout.write(`${JSON.stringify(entry)}\n`);
+export function log(entry: StructuredLogEntry, stream: Writable = process.stdout): void {
+  stream.write(`${JSON.stringify(entry)}\n`);
 }
 
 export async function readJson<T>(path: string): Promise<T> {
-  return JSON.parse(await readFile(path, "utf8")) as T;
+  return parseJson<T>(await readFile(path, "utf8"), path);
 }
 
 export async function writeJson(path: string, value: JsonValue): Promise<void> {
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+export async function emit<TPayload extends JsonValue = JsonValue>(
+  eventType: string,
+  payload: TPayload = {} as TPayload
+): Promise<EmitResult<TPayload>> {
+  return armature.emit(eventType, payload);
+}
+
+export async function run(taskName: string): Promise<RunStartResult> {
+  return armature.run(taskName);
+}
+
+export async function status(): Promise<StatusSnapshot> {
+  return armature.status();
+}
+
+export async function tasks(): Promise<TaskStatus[]> {
+  return armature.tasks();
+}
+
+export async function services(): Promise<ServiceStatus[]> {
+  return armature.services();
+}
+
+export async function runs(): Promise<RunRecord[]> {
+  return armature.runs();
+}
+
+export async function logs(runId: string): Promise<LogsResult> {
+  return armature.logs(runId);
+}
+
+export async function cancel(runId: string): Promise<CancelResult> {
+  return armature.cancel(runId);
+}
+
+export async function lock(name: string, ttl?: string): Promise<ManualLockRecord> {
+  return armature.lock(name, ttl);
+}
+
+export async function unlock(name: string): Promise<LockReleaseResult> {
+  return armature.unlock(name);
+}
+
+export async function locks(): Promise<ManualLockRecord[]> {
+  return armature.locks();
+}
+
+export async function withLock<T>(
+  name: string,
+  fn: () => Promise<T> | T,
+  options: WithLockOptions = {}
+): Promise<T> {
+  return armature.withLock(name, fn, options);
+}

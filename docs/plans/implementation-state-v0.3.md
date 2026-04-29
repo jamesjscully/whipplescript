@@ -29,7 +29,7 @@ file for design expansion; the authoritative design remains in:
 | daemon | done | `armature-daemon` | Codex | merged `761a878` to `main`; checks: `cargo test` |
 | triggers | done | `armature-triggers` | Codex | merged `fae27a1` to `main`; checks: `cargo test` |
 | cli | done | `armature-cli` | Codex | merged `14c99d7` to `main` as `305e7de`; checks: `cargo test`, CLI smoke (`init`, `up`, `tasks`, `run`, `runs`, `logs`, `doctor`, `lock`, `down`) |
-| sdk | pending | `armature-sdk` |  |  |
+| sdk | in_progress | `armature-sdk` | Codex |  |
 | recipes | pending | `armature-recipes` |  |  |
 
 ## Integration Notes
@@ -66,7 +66,7 @@ Done. Added foreground/detached daemon lifecycle, runtime inspection/task/servic
 
 ### sdk
 
-Pending.
+In progress. Inspecting CLI/runtime surfaces and implementing a thin TypeScript wrapper over env vars, daemon/CLI calls, event parsing, JSON helpers, and lock helpers.
 
 ### recipes
 
