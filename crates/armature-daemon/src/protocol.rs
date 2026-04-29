@@ -1,16 +1,34 @@
-use armature_core::{ProcessState, RunId, RunRecord};
+use armature_core::{EventRecord, ProcessState, RunId, RunRecord, TriggerRecord};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
     Inspect,
+    Events,
+    Triggers,
     Runs,
-    StartTask { name: String },
-    CancelRun { run_id: String },
-    ServiceStart { name: String },
-    ServiceStop { name: String },
-    ServiceRestart { name: String },
+    StartTask {
+        name: String,
+    },
+    EmitEvent {
+        event_type: String,
+        payload: Value,
+        source: Option<String>,
+    },
+    CancelRun {
+        run_id: String,
+    },
+    ServiceStart {
+        name: String,
+    },
+    ServiceStop {
+        name: String,
+    },
+    ServiceRestart {
+        name: String,
+    },
     ReloadConfig,
     Shutdown,
 }
@@ -21,6 +39,7 @@ pub struct InspectResponse {
     pub socket_path: String,
     pub pid_path: String,
     pub services: Vec<RuntimeServiceStatus>,
+    pub tasks: Vec<RuntimeTaskStatus>,
     pub active_runs: Vec<RunRecord>,
 }
 
@@ -36,6 +55,17 @@ pub struct RuntimeServiceStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeTaskStatus {
+    pub name: String,
+    pub admission: String,
+    pub active_run_ids: Vec<RunId>,
+    pub queued_triggers: usize,
+    pub schedule_active: bool,
+    pub watch_active: bool,
+    pub event_trigger: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DaemonResponse {
     Ok { payload: ResponsePayload },
@@ -47,6 +77,8 @@ pub enum DaemonResponse {
 pub enum ResponsePayload {
     Empty,
     Inspect(InspectResponse),
+    Events { events: Vec<EventRecord> },
+    Triggers { triggers: Vec<TriggerRecord> },
     Runs { runs: Vec<RunRecord> },
     StartedRun { run_id: RunId },
 }

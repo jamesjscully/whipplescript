@@ -27,7 +27,7 @@ file for design expansion; the authoritative design remains in:
 | config | done | `armature-config` | Codex | merged `651cd02` to `main` as `05a3cee`; checks: `cargo test`, `cargo run -q -p armature-cli -- --workspace <tmp> config check` |
 | store | done | `armature-store` | Codex | merged `2e7dd5f` to `main` as `fe7a9a9`; checks: `cargo test` |
 | daemon | done | `armature-daemon` | Codex | merged `761a878` to `main`; checks: `cargo test` |
-| triggers | pending | `armature-triggers` |  |  |
+| triggers | in_progress | `armature-triggers` | Codex |  |
 | cli | pending | `armature-cli` |  |  |
 | sdk | pending | `armature-sdk` |  |  |
 | recipes | pending | `armature-recipes` |  |  |
@@ -58,7 +58,7 @@ Done. Added Unix-socket daemon runtime, service reconciliation/supervision, proc
 
 ### triggers
 
-Pending.
+In progress. Implementing manual/schedule/watch/event routing, task admission, and inspectable trigger outcomes.
 
 ### cli
 

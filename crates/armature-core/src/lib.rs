@@ -11,10 +11,11 @@ pub use config::{
     CONFIG_FILE_NAME,
 };
 pub use error::{ArmatureError, ArmatureResult, ErrorKind};
-pub use ids::{EventId, RunId, WorkspaceId};
+pub use ids::{EventId, RunId, TriggerId, WorkspaceId};
 pub use model::{
     AdmissionPolicy, EventRecord, EventRouting, LogRecord, ProcessState, RunOrigin, RunRecord,
     RuntimeSnapshot, ServiceDefinition, SupervisionPolicy, TaskDefinition, TriggerDefinition,
+    TriggerOutcome, TriggerRecord,
 };
 pub use state::{
     state_home_from_env, RunPaths, WorkspaceRuntimePaths, ARMATURE_STATE_DIR_NAME,

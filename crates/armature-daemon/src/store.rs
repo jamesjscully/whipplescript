@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use armature_core::{
     ArmatureError, ArmatureResult, EventId, EventRecord, LogRecord, ProcessState, RunId, RunOrigin,
-    RunPaths, RunRecord, Workspace, WorkspaceRuntimePaths,
+    RunPaths, RunRecord, TriggerId, TriggerRecord, Workspace, WorkspaceRuntimePaths,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -85,6 +85,35 @@ impl SqliteStore {
                 },
             )
             .optional()
+            .map_err(map_sqlite_error)
+    }
+
+    pub fn list_events(&self) -> ArmatureResult<Vec<EventRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, event_type, payload_json, routing, config_version, source
+                 FROM events
+                 ORDER BY created_at_ms DESC, id DESC",
+            )
+            .map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                let id = row.get::<_, String>(0)?;
+                let payload_json = row.get::<_, String>(2)?;
+                Ok(EventRecord {
+                    id: EventId::parse(id).map_err(to_sqlite_user_error)?,
+                    event_type: row.get(1)?,
+                    payload: serde_json::from_str(&payload_json).map_err(to_sqlite_data_error)?,
+                    routing: enum_from_sql(&row.get::<_, String>(3)?)
+                        .map_err(to_sqlite_user_error)?,
+                    config_version: row.get(4)?,
+                    source: row.get(5)?,
+                })
+            })
+            .map_err(map_sqlite_error)?;
+
+        rows.collect::<Result<Vec<_>, _>>()
             .map_err(map_sqlite_error)
     }
 
@@ -279,6 +308,72 @@ impl SqliteStore {
             .map_err(map_sqlite_error)
     }
 
+    pub fn record_trigger(&self, trigger: &TriggerRecord) -> ArmatureResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO triggers (
+                    id, task_name, event_id, event_type, routing, admission, outcome, run_id, detail,
+                    created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    trigger.id.as_str(),
+                    trigger.task_name,
+                    trigger.event_id.as_ref().map(EventId::as_str),
+                    trigger.event_type,
+                    enum_to_sql(&trigger.routing)?,
+                    enum_to_sql(&trigger.admission)?,
+                    enum_to_sql(&trigger.outcome)?,
+                    trigger.run_id.as_ref().map(RunId::as_str),
+                    trigger.detail,
+                    now_millis(),
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+
+        Ok(())
+    }
+
+    pub fn list_triggers(&self) -> ArmatureResult<Vec<TriggerRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, task_name, event_id, event_type, routing, admission, outcome, run_id, detail
+                 FROM triggers
+                 ORDER BY created_at_ms DESC, id DESC",
+            )
+            .map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                let id = row.get::<_, String>(0)?;
+                let event_id = row.get::<_, Option<String>>(2)?;
+                let run_id = row.get::<_, Option<String>>(7)?;
+                Ok(TriggerRecord {
+                    id: TriggerId::parse(id).map_err(to_sqlite_user_error)?,
+                    task_name: row.get(1)?,
+                    event_id: event_id
+                        .map(EventId::parse)
+                        .transpose()
+                        .map_err(to_sqlite_user_error)?,
+                    event_type: row.get(3)?,
+                    routing: enum_from_sql(&row.get::<_, String>(4)?)
+                        .map_err(to_sqlite_user_error)?,
+                    admission: enum_from_sql(&row.get::<_, String>(5)?)
+                        .map_err(to_sqlite_user_error)?,
+                    outcome: enum_from_sql(&row.get::<_, String>(6)?)
+                        .map_err(to_sqlite_user_error)?,
+                    run_id: run_id
+                        .map(RunId::parse)
+                        .transpose()
+                        .map_err(to_sqlite_user_error)?,
+                    detail: row.get(8)?,
+                })
+            })
+            .map_err(map_sqlite_error)?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)
+    }
+
     fn bootstrap(&self) -> ArmatureResult<()> {
         self.connection
             .execute_batch(
@@ -312,6 +407,20 @@ impl SqliteStore {
                     stderr_path TEXT NOT NULL,
                     updated_at_ms INTEGER NOT NULL,
                     FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
+                 );
+                 CREATE TABLE IF NOT EXISTS triggers (
+                    id TEXT PRIMARY KEY,
+                    task_name TEXT NOT NULL,
+                    event_id TEXT,
+                    event_type TEXT NOT NULL,
+                    routing TEXT NOT NULL,
+                    admission TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    run_id TEXT,
+                    detail TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    FOREIGN KEY(event_id) REFERENCES events(id),
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
                  );",
             )
             .map_err(map_sqlite_error)?;
@@ -378,12 +487,14 @@ fn to_sqlite_data_error(error: serde_json::Error) -> rusqlite::Error {
 mod tests {
     use std::fs;
 
-    use armature_core::{discover_workspace, EventRouting};
+    use armature_core::{discover_workspace, EventRouting, TriggerOutcome};
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::SqliteStore;
-    use armature_core::{EventRecord, ProcessState, RunOrigin, WorkspaceRuntimePaths};
+    use armature_core::{
+        EventRecord, ProcessState, RunOrigin, TriggerId, TriggerRecord, WorkspaceRuntimePaths,
+    };
 
     #[test]
     fn bootstraps_database_under_state_root() {
@@ -477,6 +588,43 @@ mod tests {
         assert_eq!(run.event_id, Some(event.id));
         assert_eq!(run.state, ProcessState::Running);
         assert_eq!(store.list_runs().unwrap(), vec![run]);
+    }
+
+    #[test]
+    fn records_trigger_outcomes_for_inspection() {
+        let fixture = WorkspaceFixture::new();
+        let workspace = discover_workspace(fixture.root()).unwrap();
+        let runtime_paths = WorkspaceRuntimePaths::for_workspace_with_state_home(
+            &workspace,
+            fixture.state_home.path(),
+        )
+        .unwrap();
+        let store = SqliteStore::open_with_paths(runtime_paths).unwrap();
+        let event = EventRecord {
+            id: armature_core::EventId::new(),
+            event_type: "file.changed".to_string(),
+            payload: json!({ "paths": ["src/lib.rs"] }),
+            routing: EventRouting::Watch,
+            config_version: Some("cfg_123".to_string()),
+            source: Some("watch:test".to_string()),
+        };
+        store.record_event(&event).unwrap();
+
+        let trigger = TriggerRecord {
+            id: TriggerId::new(),
+            task_name: "test".to_string(),
+            event_id: Some(event.id.clone()),
+            event_type: event.event_type.clone(),
+            routing: EventRouting::Watch,
+            admission: armature_core::AdmissionPolicy::QueueOne,
+            outcome: TriggerOutcome::Queued,
+            run_id: None,
+            detail: Some("waiting for active run".to_string()),
+        };
+        store.record_trigger(&trigger).unwrap();
+
+        assert_eq!(store.list_events().unwrap(), vec![event]);
+        assert_eq!(store.list_triggers().unwrap(), vec![trigger]);
     }
 
     struct WorkspaceFixture {

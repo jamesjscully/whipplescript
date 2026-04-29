@@ -4,25 +4,32 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
+use std::str::FromStr;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use armature_core::{
-    load_workspace_config, ArmatureConfig, ArmatureError, ArmatureResult, ProcessState,
-    RestartMode, RunId, RunOrigin, RunRecord, ServiceConfig, TaskConfig, Workspace,
+    load_workspace_config, AdmissionPolicy, ArmatureConfig, ArmatureError, ArmatureResult, EventId,
+    EventRecord, EventRouting, ProcessState, RestartMode, RunId, RunOrigin, RunRecord,
+    ServiceConfig, TaskConfig, TriggerId, TriggerOutcome, TriggerRecord, Workspace,
     WorkspaceRuntimePaths,
 };
+use chrono::{DateTime, Local, Utc};
+use cron::Schedule;
 use serde::de::DeserializeOwned;
+use serde_json::{json, Value};
 
 use crate::duration::parse_duration;
 use crate::process::{signal_process_group, spawn_shell_command};
 use crate::protocol::{
     DaemonRequest, DaemonResponse, InspectResponse, ResponsePayload, RuntimeServiceStatus,
+    RuntimeTaskStatus,
 };
 use crate::store::SqliteStore;
 
 const LOOP_SLEEP: Duration = Duration::from_millis(25);
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+const DEFAULT_WATCH_SETTLE: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
@@ -126,6 +133,20 @@ impl DaemonClient {
         }
     }
 
+    pub fn events(&self) -> ArmatureResult<Vec<EventRecord>> {
+        match self.send(DaemonRequest::Events)? {
+            ResponsePayload::Events { events } => Ok(events),
+            _ => Err(ArmatureError::internal("unexpected events response")),
+        }
+    }
+
+    pub fn triggers(&self) -> ArmatureResult<Vec<TriggerRecord>> {
+        match self.send(DaemonRequest::Triggers)? {
+            ResponsePayload::Triggers { triggers } => Ok(triggers),
+            _ => Err(ArmatureError::internal("unexpected triggers response")),
+        }
+    }
+
     pub fn runs(&self) -> ArmatureResult<Vec<RunRecord>> {
         match self.send(DaemonRequest::Runs)? {
             ResponsePayload::Runs { runs } => Ok(runs),
@@ -138,6 +159,19 @@ impl DaemonClient {
             ResponsePayload::StartedRun { run_id } => Ok(run_id),
             _ => Err(ArmatureError::internal("unexpected task start response")),
         }
+    }
+
+    pub fn emit_event(
+        &self,
+        event_type: impl Into<String>,
+        payload: Value,
+        source: Option<String>,
+    ) -> ArmatureResult<()> {
+        self.expect_empty(DaemonRequest::EmitEvent {
+            event_type: event_type.into(),
+            payload,
+            source,
+        })
     }
 
     pub fn cancel_run(&self, run_id: impl Into<String>) -> ArmatureResult<()> {
@@ -200,6 +234,9 @@ struct Runtime {
     store: SqliteStore,
     config: ArmatureConfig,
     services: HashMap<String, ManagedService>,
+    tasks: HashMap<String, ManagedTask>,
+    schedules: HashMap<String, ScheduleState>,
+    watches: HashMap<String, WatchState>,
     active_runs: HashMap<String, ManagedRun>,
     shutdown_requested: bool,
     options: DaemonOptions,
@@ -215,14 +252,44 @@ struct ManagedService {
     last_error: Option<String>,
 }
 
+struct ManagedTask {
+    config: TaskConfig,
+    active_run_ids: Vec<String>,
+    pending: VecDeque<PendingTrigger>,
+}
+
+#[derive(Clone)]
+struct PendingTrigger {
+    event: EventRecord,
+}
+
 struct ManagedRun {
     record: RunRecord,
     child: Child,
     kind: RunKind,
+    task_name: Option<String>,
     kill_after: Option<Duration>,
     started_at: Instant,
     stop_started_at: Option<Instant>,
     stop_reason: Option<StopReason>,
+}
+
+#[derive(Clone)]
+struct ScheduleState {
+    schedule: Schedule,
+    next_fire_at: Option<DateTime<Utc>>,
+}
+
+struct WatchState {
+    settle_for: Duration,
+    known_files: HashMap<PathBuf, FileFingerprint>,
+    pending_paths: HashMap<PathBuf, Instant>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileFingerprint {
+    modified_at: Option<SystemTime>,
+    len: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -237,6 +304,12 @@ enum StopReason {
     TimedOut,
     Shutdown,
     ServiceUpdate,
+    AdmissionRestart,
+}
+
+enum RouteTarget {
+    AllMatching,
+    Task(String),
 }
 
 impl Runtime {
@@ -258,11 +331,14 @@ impl Runtime {
             store,
             config,
             services: HashMap::new(),
+            tasks: HashMap::new(),
+            schedules: HashMap::new(),
+            watches: HashMap::new(),
             active_runs: HashMap::new(),
             shutdown_requested: false,
             options,
         };
-        runtime.rebuild_services();
+        runtime.rebuild_runtime_state()?;
         runtime.reconcile_services()?;
         Ok(runtime)
     }
@@ -270,6 +346,10 @@ impl Runtime {
     fn run(&mut self) -> ArmatureResult<()> {
         while !self.shutdown_requested || !self.active_runs.is_empty() {
             self.accept_requests()?;
+            if !self.shutdown_requested {
+                self.poll_schedules()?;
+                self.poll_watches()?;
+            }
             self.poll_runs()?;
             if !self.shutdown_requested {
                 self.reconcile_services()?;
@@ -313,12 +393,26 @@ impl Runtime {
     fn handle_request_inner(&mut self, request: DaemonRequest) -> ArmatureResult<ResponsePayload> {
         match request {
             DaemonRequest::Inspect => Ok(ResponsePayload::Inspect(self.inspect())),
+            DaemonRequest::Events => Ok(ResponsePayload::Events {
+                events: self.store.list_events()?,
+            }),
+            DaemonRequest::Triggers => Ok(ResponsePayload::Triggers {
+                triggers: self.store.list_triggers()?,
+            }),
             DaemonRequest::Runs => Ok(ResponsePayload::Runs {
                 runs: self.store.list_runs()?,
             }),
             DaemonRequest::StartTask { name } => {
                 let run_id = self.start_task(&name)?;
                 Ok(ResponsePayload::StartedRun { run_id })
+            }
+            DaemonRequest::EmitEvent {
+                event_type,
+                payload,
+                source,
+            } => {
+                self.emit_user_event(event_type, payload, source)?;
+                Ok(ResponsePayload::Empty)
             }
             DaemonRequest::CancelRun { run_id } => {
                 self.cancel_run(&run_id, StopReason::Cancelled)?;
@@ -382,6 +476,25 @@ impl Runtime {
             .collect::<Vec<_>>();
         services.sort_by(|left, right| left.name.cmp(&right.name));
 
+        let mut tasks = self
+            .tasks
+            .values()
+            .map(|task| RuntimeTaskStatus {
+                name: task.config.name.clone(),
+                admission: admission_label(task.config.admission.when_busy.clone()).to_string(),
+                active_run_ids: task
+                    .active_run_ids
+                    .iter()
+                    .filter_map(|run_id| RunId::parse(run_id).ok())
+                    .collect(),
+                queued_triggers: task.pending.len(),
+                schedule_active: task.config.trigger.schedule.is_some(),
+                watch_active: !task.config.trigger.watch.is_empty(),
+                event_trigger: task.config.trigger.on.clone(),
+            })
+            .collect::<Vec<_>>();
+        tasks.sort_by(|left, right| left.name.cmp(&right.name));
+
         let mut active_runs = self
             .active_runs
             .values()
@@ -394,55 +507,53 @@ impl Runtime {
             socket_path: self.runtime_paths.socket_path().display().to_string(),
             pid_path: self.runtime_paths.pid_path().display().to_string(),
             services,
+            tasks,
             active_runs,
         }
     }
 
     fn start_task(&mut self, name: &str) -> ArmatureResult<RunId> {
-        let task = self
-            .config
-            .tasks
-            .iter()
-            .find(|task| task.name == name)
-            .cloned()
-            .ok_or_else(|| ArmatureError::not_found(format!("task {name:?} was not found")))?;
-        self.spawn_task(task)
+        if !self.tasks.contains_key(name) {
+            return Err(ArmatureError::not_found(format!(
+                "task {name:?} was not found"
+            )));
+        }
+
+        let event = EventRecord {
+            id: EventId::new(),
+            event_type: "manual.run.requested".to_string(),
+            payload: json!({ "task": name }),
+            routing: EventRouting::Manual,
+            config_version: Some(self.config.version.clone()),
+            source: Some("manual".to_string()),
+        };
+        self.store.record_event(&event)?;
+
+        let route_result = self.route_event(event, RouteTarget::Task(name.to_string()))?;
+        route_result.started_run_id.ok_or_else(|| {
+            ArmatureError::conflict(format!(
+                "task {name:?} did not start immediately because admission policy queued or rejected it"
+            ))
+        })
     }
 
-    fn spawn_task(&mut self, task: TaskConfig) -> ArmatureResult<RunId> {
-        let kill_after = optional_duration(task.resources.kill_after.as_deref())?;
-        let prepared = self.store.create_run(
-            task.name.clone(),
-            RunOrigin::Task,
-            Some(self.config.version.clone()),
-            None,
-        )?;
-        write_run_meta(&prepared.paths.meta, &prepared.record, "task")?;
-        let child = spawn_shell_command(
-            &task.run,
-            self.workspace.root(),
-            &prepared.paths.stdout,
-            &prepared.paths.stderr,
-            &run_envs("task", &prepared.record, self.config.version.as_str()),
-        )?;
-        self.store
-            .update_run_state(&prepared.record.id, ProcessState::Running)?;
-        let mut record = prepared.record;
-        record.state = ProcessState::Running;
-        let run_id = record.id.clone();
-        self.active_runs.insert(
-            run_id.as_str().to_string(),
-            ManagedRun {
-                record,
-                child,
-                kind: RunKind::Task,
-                kill_after,
-                started_at: Instant::now(),
-                stop_started_at: None,
-                stop_reason: None,
-            },
-        );
-        Ok(run_id)
+    fn emit_user_event(
+        &mut self,
+        event_type: String,
+        payload: Value,
+        source: Option<String>,
+    ) -> ArmatureResult<()> {
+        let event = EventRecord {
+            id: EventId::new(),
+            event_type,
+            payload,
+            routing: EventRouting::Event,
+            config_version: Some(self.config.version.clone()),
+            source,
+        };
+        self.store.record_event(&event)?;
+        let _ = self.route_event(event, RouteTarget::AllMatching)?;
+        Ok(())
     }
 
     fn reload_config(&mut self) -> ArmatureResult<()> {
@@ -450,7 +561,7 @@ impl Runtime {
         let previous = self.config.clone();
         self.config = next;
         self.apply_service_config_changes(&previous)?;
-        self.rebuild_services();
+        self.rebuild_runtime_state()?;
         Ok(())
     }
 
@@ -492,6 +603,14 @@ impl Runtime {
         Ok(())
     }
 
+    fn rebuild_runtime_state(&mut self) -> ArmatureResult<()> {
+        self.rebuild_services();
+        self.rebuild_tasks();
+        self.rebuild_schedules()?;
+        self.rebuild_watches()?;
+        Ok(())
+    }
+
     fn rebuild_services(&mut self) {
         let mut next = HashMap::new();
         for config in &self.config.services {
@@ -517,6 +636,70 @@ impl Runtime {
         self.services = next;
     }
 
+    fn rebuild_tasks(&mut self) {
+        let mut next = HashMap::new();
+        for config in &self.config.tasks {
+            let existing = self.tasks.remove(&config.name);
+            next.insert(
+                config.name.clone(),
+                ManagedTask {
+                    config: config.clone(),
+                    active_run_ids: existing
+                        .as_ref()
+                        .map(|entry| entry.active_run_ids.clone())
+                        .unwrap_or_default(),
+                    pending: existing.map(|entry| entry.pending).unwrap_or_default(),
+                },
+            );
+        }
+        self.tasks = next;
+    }
+
+    fn rebuild_schedules(&mut self) -> ArmatureResult<()> {
+        let mut next = HashMap::new();
+        for task in self.tasks.values() {
+            if let Some(schedule) = &task.config.trigger.schedule {
+                let parsed = parse_schedule(schedule)?;
+                let next_fire_at = next_schedule_time(&parsed);
+                next.insert(
+                    task.config.name.clone(),
+                    ScheduleState {
+                        schedule: parsed,
+                        next_fire_at,
+                    },
+                );
+            }
+        }
+        self.schedules = next;
+        Ok(())
+    }
+
+    fn rebuild_watches(&mut self) -> ArmatureResult<()> {
+        let mut next = HashMap::new();
+        for task in self.tasks.values() {
+            if !task.config.trigger.watch.is_empty() {
+                let settle_for = task
+                    .config
+                    .trigger
+                    .settle
+                    .as_deref()
+                    .map(parse_duration)
+                    .transpose()?
+                    .unwrap_or(DEFAULT_WATCH_SETTLE);
+                next.insert(
+                    task.config.name.clone(),
+                    WatchState {
+                        settle_for,
+                        known_files: HashMap::new(),
+                        pending_paths: HashMap::new(),
+                    },
+                );
+            }
+        }
+        self.watches = next;
+        Ok(())
+    }
+
     fn reconcile_services(&mut self) -> ArmatureResult<()> {
         let now = Instant::now();
         let service_names = self.services.keys().cloned().collect::<Vec<_>>();
@@ -539,6 +722,335 @@ impl Runtime {
         Ok(())
     }
 
+    fn poll_schedules(&mut self) -> ArmatureResult<()> {
+        let now = Utc::now();
+        let task_names = self.schedules.keys().cloned().collect::<Vec<_>>();
+        for task_name in task_names {
+            let should_fire = self
+                .schedules
+                .get(&task_name)
+                .and_then(|state| state.next_fire_at)
+                .map(|deadline| deadline <= now)
+                .unwrap_or(false);
+            if !should_fire {
+                continue;
+            }
+
+            let schedule_literal = self
+                .tasks
+                .get(&task_name)
+                .and_then(|task| task.config.trigger.schedule.clone())
+                .unwrap_or_default();
+            let event = EventRecord {
+                id: EventId::new(),
+                event_type: "timer.fired".to_string(),
+                payload: json!({
+                    "task": task_name,
+                    "schedule": schedule_literal,
+                    "time": Local::now().to_rfc3339(),
+                }),
+                routing: EventRouting::Schedule,
+                config_version: Some(self.config.version.clone()),
+                source: Some(format!("schedule:{task_name}")),
+            };
+            self.store.record_event(&event)?;
+            let _ = self.route_event(event, RouteTarget::Task(task_name.clone()))?;
+            if let Some(state) = self.schedules.get_mut(&task_name) {
+                state.next_fire_at = next_schedule_time(&state.schedule);
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_watches(&mut self) -> ArmatureResult<()> {
+        let task_names = self.watches.keys().cloned().collect::<Vec<_>>();
+        for task_name in task_names {
+            let patterns = match self.tasks.get(&task_name) {
+                Some(task) => task.config.trigger.watch.clone(),
+                None => continue,
+            };
+            let watch = self
+                .watches
+                .get_mut(&task_name)
+                .ok_or_else(|| ArmatureError::internal("watch state disappeared"))?;
+            let changed = scan_watch_patterns(self.workspace.root(), &patterns, watch)?;
+            let now = Instant::now();
+            let ready = watch
+                .pending_paths
+                .iter()
+                .filter_map(|(path, seen_at)| {
+                    if now.duration_since(*seen_at) >= watch.settle_for {
+                        Some(path.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            if ready.is_empty() {
+                let _ = changed;
+                continue;
+            }
+            for path in &ready {
+                watch.pending_paths.remove(path);
+            }
+            let relative_paths = ready
+                .iter()
+                .map(|path| relative_display(self.workspace.root(), path))
+                .collect::<Vec<_>>();
+            let event = EventRecord {
+                id: EventId::new(),
+                event_type: "file.changed".to_string(),
+                payload: json!({
+                    "task": task_name,
+                    "paths": relative_paths,
+                }),
+                routing: EventRouting::Watch,
+                config_version: Some(self.config.version.clone()),
+                source: Some(format!("watch:{task_name}")),
+            };
+            self.store.record_event(&event)?;
+            let _ = self.route_event(event, RouteTarget::Task(task_name.clone()))?;
+        }
+        Ok(())
+    }
+
+    fn route_event(
+        &mut self,
+        event: EventRecord,
+        target: RouteTarget,
+    ) -> ArmatureResult<RouteResult> {
+        let task_names = match target {
+            RouteTarget::AllMatching => self
+                .tasks
+                .values()
+                .filter(|task| task.config.trigger.on.as_deref() == Some(event.event_type.as_str()))
+                .map(|task| task.config.name.clone())
+                .collect::<Vec<_>>(),
+            RouteTarget::Task(name) => vec![name],
+        };
+
+        let mut started_run_id = None;
+        for task_name in task_names {
+            if !self.tasks.contains_key(&task_name) {
+                continue;
+            }
+            let run_id = self.apply_admission(&task_name, event.clone())?;
+            if started_run_id.is_none() {
+                started_run_id = run_id;
+            }
+        }
+
+        Ok(RouteResult { started_run_id })
+    }
+
+    fn apply_admission(
+        &mut self,
+        task_name: &str,
+        event: EventRecord,
+    ) -> ArmatureResult<Option<RunId>> {
+        let policy = self
+            .tasks
+            .get(task_name)
+            .map(|task| task.config.admission.when_busy.clone())
+            .ok_or_else(|| ArmatureError::not_found(format!("task {task_name:?} was not found")))?;
+
+        let is_busy = self
+            .tasks
+            .get(task_name)
+            .map(|task| !task.active_run_ids.is_empty())
+            .unwrap_or(false);
+
+        if !is_busy {
+            return self.start_task_run(task_name, event);
+        }
+
+        match policy {
+            AdmissionPolicy::Allow => self.start_task_run(task_name, event),
+            AdmissionPolicy::Reject => {
+                self.record_trigger(
+                    task_name,
+                    &event,
+                    policy,
+                    TriggerOutcome::Rejected,
+                    None,
+                    Some("task already has an active run".to_string()),
+                )?;
+                Ok(None)
+            }
+            AdmissionPolicy::QueueAll => {
+                self.queue_pending(task_name, event.clone())?;
+                self.record_trigger(
+                    task_name,
+                    &event,
+                    policy,
+                    TriggerOutcome::Queued,
+                    None,
+                    Some("queued behind an active run".to_string()),
+                )?;
+                Ok(None)
+            }
+            AdmissionPolicy::QueueOne => {
+                let already_pending = self
+                    .tasks
+                    .get(task_name)
+                    .map(|task| !task.pending.is_empty())
+                    .unwrap_or(false);
+                if already_pending {
+                    self.record_trigger(
+                        task_name,
+                        &event,
+                        policy.clone(),
+                        TriggerOutcome::Coalesced,
+                        None,
+                        Some("coalesced into the existing queued trigger".to_string()),
+                    )?;
+                    Ok(None)
+                } else {
+                    self.queue_pending(task_name, event.clone())?;
+                    self.record_trigger(
+                        task_name,
+                        &event,
+                        policy.clone(),
+                        TriggerOutcome::Queued,
+                        None,
+                        Some("queued behind an active run".to_string()),
+                    )?;
+                    Ok(None)
+                }
+            }
+            AdmissionPolicy::Restart => {
+                let replaced = {
+                    let task = self.task_mut(task_name)?;
+                    task.pending.pop_back()
+                };
+                if let Some(previous) = replaced {
+                    self.record_trigger(
+                        task_name,
+                        &previous.event,
+                        policy.clone(),
+                        TriggerOutcome::Superseded,
+                        None,
+                        Some("superseded by a newer restart trigger".to_string()),
+                    )?;
+                }
+                self.queue_pending(task_name, event.clone())?;
+                self.record_trigger(
+                    task_name,
+                    &event,
+                    policy.clone(),
+                    TriggerOutcome::Queued,
+                    None,
+                    Some("queued while active runs stop for restart admission".to_string()),
+                )?;
+                let active_run_ids = self
+                    .tasks
+                    .get(task_name)
+                    .map(|task| task.active_run_ids.clone())
+                    .unwrap_or_default();
+                for run_id in active_run_ids {
+                    self.cancel_run(&run_id, StopReason::AdmissionRestart)?;
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn queue_pending(&mut self, task_name: &str, event: EventRecord) -> ArmatureResult<()> {
+        let task = self.task_mut(task_name)?;
+        task.pending.push_back(PendingTrigger { event });
+        Ok(())
+    }
+
+    fn maybe_start_next_pending(&mut self, task_name: &str) -> ArmatureResult<()> {
+        let event = {
+            let task = self.task_mut(task_name)?;
+            if !task.active_run_ids.is_empty() {
+                return Ok(());
+            }
+            task.pending.pop_front().map(|pending| pending.event)
+        };
+
+        if let Some(event) = event {
+            let _ = self.start_task_run(task_name, event)?;
+        }
+        Ok(())
+    }
+
+    fn start_task_run(
+        &mut self,
+        task_name: &str,
+        event: EventRecord,
+    ) -> ArmatureResult<Option<RunId>> {
+        let task = self
+            .tasks
+            .get(task_name)
+            .map(|entry| entry.config.clone())
+            .ok_or_else(|| ArmatureError::not_found(format!("task {task_name:?} was not found")))?;
+        let admission = task.admission.when_busy.clone();
+        let run_id = self.spawn_task(task, Some(event.clone()))?;
+        self.record_trigger(
+            task_name,
+            &event,
+            admission,
+            TriggerOutcome::Started,
+            Some(run_id.clone()),
+            None,
+        )?;
+        Ok(Some(run_id))
+    }
+
+    fn spawn_task(
+        &mut self,
+        task: TaskConfig,
+        event: Option<EventRecord>,
+    ) -> ArmatureResult<RunId> {
+        let kill_after = optional_duration(task.resources.kill_after.as_deref())?;
+        let prepared = self.store.create_run(
+            task.name.clone(),
+            RunOrigin::Task,
+            Some(self.config.version.clone()),
+            event.as_ref().map(|record| record.id.clone()),
+        )?;
+        if let Some(event) = &event {
+            write_event_artifact(&prepared.paths.event, event)?;
+        }
+        write_run_meta(&prepared.paths.meta, &prepared.record, "task")?;
+        let child = spawn_shell_command(
+            &task.run,
+            self.workspace.root(),
+            &prepared.paths.stdout,
+            &prepared.paths.stderr,
+            &run_envs(
+                "task",
+                &prepared.record,
+                self.config.version.as_str(),
+                event.as_ref(),
+                &prepared.paths.event,
+            ),
+        )?;
+        self.store
+            .update_run_state(&prepared.record.id, ProcessState::Running)?;
+        let mut record = prepared.record;
+        record.state = ProcessState::Running;
+        let run_id = record.id.clone();
+        self.active_runs.insert(
+            run_id.as_str().to_string(),
+            ManagedRun {
+                record,
+                child,
+                kind: RunKind::Task,
+                task_name: Some(task.name.clone()),
+                kill_after,
+                started_at: Instant::now(),
+                stop_started_at: None,
+                stop_reason: None,
+            },
+        );
+        let task_state = self.task_mut(&task.name)?;
+        task_state.active_run_ids.push(run_id.as_str().to_string());
+        Ok(run_id)
+    }
+
     fn spawn_service(&mut self, name: &str) -> ArmatureResult<()> {
         let config = self.service(name)?.config.clone();
         let kill_after = optional_duration(config.resources.kill_after.as_deref())?;
@@ -554,12 +1066,17 @@ impl Runtime {
             self.workspace.root(),
             &prepared.paths.stdout,
             &prepared.paths.stderr,
-            &run_envs("service", &prepared.record, self.config.version.as_str()),
+            &run_envs(
+                "service",
+                &prepared.record,
+                self.config.version.as_str(),
+                None,
+                &prepared.paths.event,
+            ),
         )?;
         self.store
             .update_run_state(&prepared.record.id, ProcessState::Running)?;
         let run_id = prepared.record.id.as_str().to_string();
-        let pid = child.id();
         let mut record = prepared.record;
         record.state = ProcessState::Running;
         self.active_runs.insert(
@@ -568,6 +1085,7 @@ impl Runtime {
                 record,
                 child,
                 kind: RunKind::Service,
+                task_name: None,
                 kill_after,
                 started_at: Instant::now(),
                 stop_started_at: None,
@@ -578,7 +1096,6 @@ impl Runtime {
         service.active_run_id = Some(run_id);
         service.last_error = None;
         service.next_start_at = None;
-        let _ = pid;
         Ok(())
     }
 
@@ -661,26 +1178,60 @@ impl Runtime {
         self.store
             .update_run_state(&managed.record.id, final_state)?;
 
-        if managed.kind == RunKind::Service {
-            let service = self.service_mut(&managed.record.name)?;
-            service.active_run_id = None;
-            if let Some(reason) = managed.stop_reason {
-                match reason {
-                    StopReason::ServiceUpdate | StopReason::Shutdown => {}
-                    StopReason::Cancelled => {
-                        service.last_error = Some("cancelled".to_string());
+        match managed.kind {
+            RunKind::Service => {
+                let service = self.service_mut(&managed.record.name)?;
+                service.active_run_id = None;
+                if let Some(reason) = managed.stop_reason {
+                    match reason {
+                        StopReason::ServiceUpdate | StopReason::Shutdown => {}
+                        StopReason::Cancelled => {
+                            service.last_error = Some("cancelled".to_string());
+                        }
+                        StopReason::TimedOut => {
+                            service.last_error = Some("timed out".to_string());
+                            schedule_restart(service, &status, Instant::now())?;
+                        }
+                        StopReason::AdmissionRestart => {}
                     }
-                    StopReason::TimedOut => {
-                        service.last_error = Some("timed out".to_string());
-                        schedule_restart(service, &status, Instant::now())?;
-                    }
+                } else {
+                    schedule_restart(service, &status, Instant::now())?;
                 }
-            } else {
-                schedule_restart(service, &status, Instant::now())?;
+            }
+            RunKind::Task => {
+                if let Some(task_name) = &managed.task_name {
+                    if let Some(task) = self.tasks.get_mut(task_name) {
+                        task.active_run_ids
+                            .retain(|active_id| active_id != managed.record.id.as_str());
+                    }
+                    self.maybe_start_next_pending(task_name)?;
+                }
             }
         }
 
         Ok(())
+    }
+
+    fn record_trigger(
+        &self,
+        task_name: &str,
+        event: &EventRecord,
+        admission: AdmissionPolicy,
+        outcome: TriggerOutcome,
+        run_id: Option<RunId>,
+        detail: Option<String>,
+    ) -> ArmatureResult<()> {
+        self.store.record_trigger(&TriggerRecord {
+            id: TriggerId::new(),
+            task_name: task_name.to_string(),
+            event_id: Some(event.id.clone()),
+            event_type: event.event_type.clone(),
+            routing: event.routing.clone(),
+            admission,
+            outcome,
+            run_id,
+            detail,
+        })
     }
 
     fn service(&self, name: &str) -> ArmatureResult<&ManagedService> {
@@ -694,6 +1245,16 @@ impl Runtime {
             .get_mut(name)
             .ok_or_else(|| ArmatureError::not_found(format!("service {name:?} was not found")))
     }
+
+    fn task_mut(&mut self, name: &str) -> ArmatureResult<&mut ManagedTask> {
+        self.tasks
+            .get_mut(name)
+            .ok_or_else(|| ArmatureError::not_found(format!("task {name:?} was not found")))
+    }
+}
+
+struct RouteResult {
+    started_run_id: Option<RunId>,
 }
 
 fn bind_listener(path: impl AsRef<Path>) -> ArmatureResult<UnixListener> {
@@ -754,7 +1315,13 @@ fn write_json_line<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> A
     Ok(())
 }
 
-fn run_envs(kind: &str, record: &RunRecord, config_version: &str) -> Vec<(String, String)> {
+fn run_envs(
+    kind: &str,
+    record: &RunRecord,
+    config_version: &str,
+    event: Option<&EventRecord>,
+    event_path: &Path,
+) -> Vec<(String, String)> {
     let mut envs = vec![
         ("ARMATURE_KIND".to_string(), kind.to_string()),
         ("ARMATURE_NAME".to_string(), record.name.clone()),
@@ -776,6 +1343,21 @@ fn run_envs(kind: &str, record: &RunRecord, config_version: &str) -> Vec<(String
     if let Some(stderr_path) = &record.stderr_path {
         envs.push(("ARMATURE_STDERR_LOG".to_string(), stderr_path.clone()));
     }
+    if let Some(event) = event {
+        envs.push((
+            "ARMATURE_EVENT_ID".to_string(),
+            event.id.as_str().to_string(),
+        ));
+        envs.push(("ARMATURE_EVENT_TYPE".to_string(), event.event_type.clone()));
+        envs.push((
+            "ARMATURE_EVENT_JSON".to_string(),
+            serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string()),
+        ));
+        envs.push((
+            "ARMATURE_EVENT_PATH".to_string(),
+            event_path.display().to_string(),
+        ));
+    }
     envs
 }
 
@@ -792,6 +1374,15 @@ fn write_run_meta(path: &Path, record: &RunRecord, kind: &str) -> ArmatureResult
     fs::write(
         path,
         serde_json::to_vec_pretty(&value)
+            .map_err(|error| ArmatureError::internal(error.to_string()))?,
+    )?;
+    Ok(())
+}
+
+fn write_event_artifact(path: &Path, event: &EventRecord) -> ArmatureResult<()> {
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(event)
             .map_err(|error| ArmatureError::internal(error.to_string()))?,
     )?;
     Ok(())
@@ -880,6 +1471,89 @@ fn service_state(service: &ManagedService) -> ProcessState {
     }
 }
 
+fn admission_label(policy: AdmissionPolicy) -> &'static str {
+    match policy {
+        AdmissionPolicy::Allow => "allow",
+        AdmissionPolicy::Reject => "reject",
+        AdmissionPolicy::Restart => "restart",
+        AdmissionPolicy::QueueOne => "queue_one",
+        AdmissionPolicy::QueueAll => "queue_all",
+    }
+}
+
+fn parse_schedule(expression: &str) -> ArmatureResult<Schedule> {
+    let normalized = if expression.split_whitespace().count() == 5 {
+        format!("0 {expression}")
+    } else {
+        expression.to_string()
+    };
+    Schedule::from_str(&normalized).map_err(|error| {
+        ArmatureError::invalid_input(format!("invalid schedule {expression:?}: {error}"))
+    })
+}
+
+fn next_schedule_time(schedule: &Schedule) -> Option<DateTime<Utc>> {
+    schedule.upcoming(Utc).next()
+}
+
+fn scan_watch_patterns(
+    workspace_root: &Path,
+    patterns: &[String],
+    watch: &mut WatchState,
+) -> ArmatureResult<Vec<PathBuf>> {
+    let mut current = HashMap::new();
+    for pattern in patterns {
+        let absolute_pattern = workspace_root.join(pattern);
+        let Some(pattern_str) = absolute_pattern.to_str() else {
+            return Err(ArmatureError::invalid_input(format!(
+                "watch pattern {pattern:?} must be valid UTF-8"
+            )));
+        };
+        let entries = glob::glob(pattern_str).map_err(|error| {
+            ArmatureError::invalid_input(format!("invalid watch pattern: {error}"))
+        })?;
+        for entry in entries {
+            let path = entry.map_err(|error| ArmatureError::internal(error.to_string()))?;
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(_) => continue,
+                Err(_) => continue,
+            };
+            current.insert(
+                path,
+                FileFingerprint {
+                    modified_at: metadata.modified().ok(),
+                    len: metadata.len(),
+                },
+            );
+        }
+    }
+
+    let mut changed = Vec::new();
+    let now = Instant::now();
+    for (path, fingerprint) in &current {
+        if watch.known_files.get(path) != Some(fingerprint) {
+            watch.pending_paths.insert(path.clone(), now);
+            changed.push(path.clone());
+        }
+    }
+    for path in watch.known_files.keys() {
+        if !current.contains_key(path) {
+            watch.pending_paths.insert(path.clone(), now);
+            changed.push(path.clone());
+        }
+    }
+    watch.known_files = current;
+    Ok(changed)
+}
+
+fn relative_display(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -888,7 +1562,8 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use armature_core::{discover_workspace, ProcessState};
+    use armature_core::{discover_workspace, AdmissionPolicy, ProcessState, TriggerOutcome};
+    use serde_json::json;
     use tempfile::TempDir;
 
     use super::{DaemonOptions, DaemonServer};
@@ -1028,6 +1703,236 @@ kill_after = "5s"
             },
             Duration::from_secs(3),
         );
+
+        client.shutdown().unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn emit_event_routes_tasks_and_writes_event_artifacts() {
+        let _guard = test_lock().lock().unwrap();
+        let fixture = Fixture::new(
+            r#"
+[[task]]
+name = "react"
+on = "tool.run.completed"
+run = "printf '%s' \"$ARMATURE_EVENT_TYPE\" > event-type.txt; printf '%s' \"$ARMATURE_EVENT_ID\" > event-id.txt; printf '%s' \"$ARMATURE_EVENT_PATH\" > event-path.txt; cp \"$ARMATURE_EVENT_PATH\" event-copy.json"
+"#,
+        );
+        let workspace = discover_workspace(fixture.root()).unwrap();
+        let handle = DaemonServer::start_with_options(
+            workspace,
+            DaemonOptions {
+                poll_interval: Duration::from_millis(20),
+                termination_grace: Duration::from_millis(100),
+            },
+        )
+        .unwrap();
+        let client = handle.client();
+
+        client
+            .emit_event(
+                "tool.run.completed",
+                json!({ "runId": "abc123" }),
+                Some("tests".to_string()),
+            )
+            .unwrap();
+
+        wait_for(
+            || fixture.root().join("event-type.txt").is_file(),
+            Duration::from_secs(2),
+        );
+
+        let events = client.events().unwrap();
+        let triggers = client.triggers().unwrap();
+        assert_eq!(events[0].event_type, "tool.run.completed");
+        assert_eq!(triggers[0].outcome, TriggerOutcome::Started);
+        assert_eq!(
+            read_file(fixture.root().join("event-type.txt")).trim(),
+            "tool.run.completed"
+        );
+
+        let event_path = read_file(fixture.root().join("event-path.txt"));
+        assert!(Path::new(event_path.trim()).is_file());
+
+        client.shutdown().unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn admission_outcomes_remain_inspectable() {
+        let _guard = test_lock().lock().unwrap();
+        let fixture = Fixture::new(
+            r#"
+[[task]]
+name = "rejector"
+on = "reject"
+run = "sleep 0.4"
+
+[task.admission]
+when_busy = "reject"
+
+[[task]]
+name = "queue-one"
+on = "queue"
+run = "printf 'q\\n' >> queue.log; sleep 0.2"
+
+[task.admission]
+when_busy = "queue_one"
+
+[[task]]
+name = "restarter"
+on = "restart"
+run = "printf 'r\\n' >> restart.log; sleep 0.4"
+
+[task.admission]
+when_busy = "restart"
+"#,
+        );
+        let workspace = discover_workspace(fixture.root()).unwrap();
+        let handle = DaemonServer::start_with_options(
+            workspace,
+            DaemonOptions {
+                poll_interval: Duration::from_millis(20),
+                termination_grace: Duration::from_millis(100),
+            },
+        )
+        .unwrap();
+        let client = handle.client();
+
+        client.emit_event("reject", json!({}), None).unwrap();
+        wait_for(
+            || {
+                client
+                    .inspect()
+                    .unwrap()
+                    .tasks
+                    .iter()
+                    .any(|task| task.name == "rejector" && !task.active_run_ids.is_empty())
+            },
+            Duration::from_secs(2),
+        );
+        client.emit_event("reject", json!({}), None).unwrap();
+
+        client.emit_event("queue", json!({ "n": 1 }), None).unwrap();
+        wait_for(
+            || {
+                client
+                    .inspect()
+                    .unwrap()
+                    .tasks
+                    .iter()
+                    .any(|task| task.name == "queue-one" && !task.active_run_ids.is_empty())
+            },
+            Duration::from_secs(2),
+        );
+        client.emit_event("queue", json!({ "n": 2 }), None).unwrap();
+        client.emit_event("queue", json!({ "n": 3 }), None).unwrap();
+
+        client
+            .emit_event("restart", json!({ "n": 1 }), None)
+            .unwrap();
+        wait_for(
+            || {
+                client
+                    .inspect()
+                    .unwrap()
+                    .tasks
+                    .iter()
+                    .any(|task| task.name == "restarter" && !task.active_run_ids.is_empty())
+            },
+            Duration::from_secs(2),
+        );
+        client
+            .emit_event("restart", json!({ "n": 2 }), None)
+            .unwrap();
+        client
+            .emit_event("restart", json!({ "n": 3 }), None)
+            .unwrap();
+
+        wait_for(
+            || read_file(fixture.root().join("queue.log")).lines().count() >= 2,
+            Duration::from_secs(3),
+        );
+        wait_for(
+            || {
+                read_file(fixture.root().join("restart.log"))
+                    .lines()
+                    .count()
+                    >= 2
+            },
+            Duration::from_secs(3),
+        );
+
+        let triggers = client.triggers().unwrap();
+        assert!(triggers.iter().any(|trigger| {
+            trigger.task_name == "rejector" && trigger.outcome == TriggerOutcome::Rejected
+        }));
+        assert!(triggers.iter().any(|trigger| {
+            trigger.task_name == "queue-one" && trigger.outcome == TriggerOutcome::Queued
+        }));
+        assert!(triggers.iter().any(|trigger| {
+            trigger.task_name == "queue-one" && trigger.outcome == TriggerOutcome::Coalesced
+        }));
+        assert!(triggers.iter().any(|trigger| {
+            trigger.task_name == "restarter" && trigger.outcome == TriggerOutcome::Superseded
+        }));
+        assert!(triggers.iter().any(|trigger| {
+            trigger.task_name == "restarter"
+                && trigger.admission == AdmissionPolicy::Restart
+                && trigger.outcome == TriggerOutcome::Started
+        }));
+
+        client.shutdown().unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn schedules_and_watches_emit_mechanical_events() {
+        let _guard = test_lock().lock().unwrap();
+        let fixture = Fixture::new(
+            r#"
+[[task]]
+name = "scheduled"
+schedule = "*/1 * * * * *"
+run = "printf s >> schedule.log"
+
+[[task]]
+name = "watcher"
+watch = ["watched.txt"]
+settle = "50ms"
+run = "printf w >> watch.log"
+"#,
+        );
+        let workspace = discover_workspace(fixture.root()).unwrap();
+        let handle = DaemonServer::start_with_options(
+            workspace,
+            DaemonOptions {
+                poll_interval: Duration::from_millis(20),
+                termination_grace: Duration::from_millis(100),
+            },
+        )
+        .unwrap();
+        let client = handle.client();
+
+        fs::write(fixture.root().join("watched.txt"), "hello").unwrap();
+
+        wait_for(
+            || !read_file(fixture.root().join("schedule.log")).is_empty(),
+            Duration::from_secs(3),
+        );
+        wait_for(
+            || !read_file(fixture.root().join("watch.log")).is_empty(),
+            Duration::from_secs(2),
+        );
+
+        let events = client.events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.routing == armature_core::EventRouting::Schedule));
+        assert!(events
+            .iter()
+            .any(|event| event.routing == armature_core::EventRouting::Watch));
 
         client.shutdown().unwrap();
         handle.join().unwrap();

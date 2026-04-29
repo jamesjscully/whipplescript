@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ids::{EventId, RunId};
+use crate::ids::{EventId, RunId, TriggerId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +40,16 @@ pub enum ProcessState {
     Stopping,
     Exited,
     Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerOutcome {
+    Started,
+    Rejected,
+    Queued,
+    Coalesced,
+    Superseded,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +113,19 @@ pub struct LogRecord {
     pub stderr_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerRecord {
+    pub id: TriggerId,
+    pub task_name: String,
+    pub event_id: Option<EventId>,
+    pub event_type: String,
+    pub routing: EventRouting,
+    pub admission: AdmissionPolicy,
+    pub outcome: TriggerOutcome,
+    pub run_id: Option<RunId>,
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSnapshot {
     pub tasks: Vec<TaskDefinition>,
@@ -114,7 +137,10 @@ pub struct RuntimeSnapshot {
 mod tests {
     use serde_json::json;
 
-    use super::{AdmissionPolicy, EventRecord, EventRouting, ProcessState, RunOrigin, RunRecord};
+    use super::{
+        AdmissionPolicy, EventRecord, EventRouting, ProcessState, RunOrigin, RunRecord,
+        TriggerOutcome,
+    };
     use crate::{EventId, RunId};
 
     #[test]
@@ -150,6 +176,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(AdmissionPolicy::QueueOne).unwrap(),
             "queue_one"
+        );
+        assert_eq!(
+            serde_json::to_value(TriggerOutcome::Superseded).unwrap(),
+            "superseded"
         );
     }
 }

@@ -54,6 +54,7 @@ macro_rules! prefixed_id {
 
 prefixed_id!(RunId, "run_");
 prefixed_id!(EventId, "evt_");
+prefixed_id!(TriggerId, "trg_");
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -83,12 +84,13 @@ impl fmt::Display for WorkspaceId {
 mod tests {
     use std::path::Path;
 
-    use super::{EventId, RunId, WorkspaceId};
+    use super::{EventId, RunId, TriggerId, WorkspaceId};
 
     #[test]
     fn generated_ids_use_expected_prefixes() {
         assert!(RunId::new().as_str().starts_with("run_"));
         assert!(EventId::new().as_str().starts_with("evt_"));
+        assert!(TriggerId::new().as_str().starts_with("trg_"));
     }
 
     #[test]
