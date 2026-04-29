@@ -28,7 +28,7 @@ file for design expansion; the authoritative design remains in:
 | store | done | `armature-store` | Codex | merged `2e7dd5f` to `main` as `fe7a9a9`; checks: `cargo test` |
 | daemon | done | `armature-daemon` | Codex | merged `761a878` to `main`; checks: `cargo test` |
 | triggers | done | `armature-triggers` | Codex | merged `fae27a1` to `main`; checks: `cargo test` |
-| cli | in_progress | `armature-cli` | Codex |  |
+| cli | done | `armature-cli` | Codex | merged `14c99d7` to `main` as `305e7de`; checks: `cargo test`, CLI smoke (`init`, `up`, `tasks`, `run`, `runs`, `logs`, `doctor`, `lock`, `down`) |
 | sdk | pending | `armature-sdk` |  |  |
 | recipes | pending | `armature-recipes` |  |  |
 
@@ -62,7 +62,7 @@ Done. Added manual/schedule/watch/event routing through one event path, per-task
 
 ### cli
 
-In progress. Reading v0.3 runtime/protocol surfaces and wiring the required command set plus terminal/JSON output.
+Done. Added foreground/detached daemon lifecycle, runtime inspection/task/service/run/log/cancel/config/doctor commands, JSON/text rendering, and manual TTL-backed locks. Merged `14c99d7` to `main` as `305e7de`; checks: `cargo test` plus temp-workspace CLI smoke.
 
 ### sdk
 
