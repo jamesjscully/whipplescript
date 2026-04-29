@@ -11,4 +11,13 @@ path = "src/main.rs"
 [dependencies]
 armature-core = { path = "../armature-core" }
 armature-daemon = { path = "../armature-daemon" }
+chrono.workspace = true
 clap.workspace = true
+ctrlc = "3.5.1"
+libc = "0.2.177"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

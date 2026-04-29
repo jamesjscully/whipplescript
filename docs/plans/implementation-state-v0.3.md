@@ -28,7 +28,7 @@ file for design expansion; the authoritative design remains in:
 | store | done | `armature-store` | Codex | merged `2e7dd5f` to `main` as `fe7a9a9`; checks: `cargo test` |
 | daemon | done | `armature-daemon` | Codex | merged `761a878` to `main`; checks: `cargo test` |
 | triggers | done | `armature-triggers` | Codex | merged `fae27a1` to `main`; checks: `cargo test` |
-| cli | pending | `armature-cli` |  |  |
+| cli | in_progress | `armature-cli` | Codex |  |
 | sdk | pending | `armature-sdk` |  |  |
 | recipes | pending | `armature-recipes` |  |  |
 
@@ -62,7 +62,7 @@ Done. Added manual/schedule/watch/event routing through one event path, per-task
 
 ### cli
 
-Pending.
+In progress. Reading v0.3 runtime/protocol surfaces and wiring the required command set plus terminal/JSON output.
 
 ### sdk
 
