@@ -30,7 +30,7 @@ file for design expansion; the authoritative design remains in:
 | triggers | done | `armature-triggers` | Codex | merged `fae27a1` to `main`; checks: `cargo test` |
 | cli | done | `armature-cli` | Codex | merged `14c99d7` to `main` as `305e7de`; checks: `cargo test`, CLI smoke (`init`, `up`, `tasks`, `run`, `runs`, `logs`, `doctor`, `lock`, `down`) |
 | sdk | done | `armature-sdk` | Codex | merged `c098d8a` to `main`; checks: `npm test --workspace @armature/sdk` |
-| recipes | in_progress | `armature-recipes` | Codex | scaffolding generator in progress |
+| recipes | done | `armature-recipes` | Codex | merged `8ce7a57` to `main`; checks: `cargo test`, recipe smoke (`init recipe` x5 + `config check`) |
 
 ## Integration Notes
 
@@ -70,4 +70,4 @@ Done. Added a thin TypeScript SDK over Armature CLI/env surfaces with typed clie
 
 ### recipes
 
-In progress. Implementing `armature init recipe <name>` scaffolding for editable starter files only.
+Done. Added `armature init recipe <name>` scaffolding for file-watch tests, scheduled status, event source service, event hook task, and explicit named lock starters. Merged `8ce7a57` to `main`; checks: `cargo test`, recipe smoke for all five starters plus `config check`.
