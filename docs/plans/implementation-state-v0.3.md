@@ -26,7 +26,7 @@ file for design expansion; the authoritative design remains in:
 | foundation | done | `armature-foundation` | Codex | merged `d944f1c` to `main` as `a3daf03`; checks: `cargo test`, `npm test` |
 | config | done | `armature-config` | Codex | merged `651cd02` to `main` as `05a3cee`; checks: `cargo test`, `cargo run -q -p armature-cli -- --workspace <tmp> config check` |
 | store | done | `armature-store` | Codex | merged `2e7dd5f` to `main` as `fe7a9a9`; checks: `cargo test` |
-| daemon | pending | `armature-daemon` |  |  |
+| daemon | in_progress | `armature-daemon` | Codex | implementing runtime/supervision |
 | triggers | pending | `armature-triggers` |  |  |
 | cli | pending | `armature-cli` |  |  |
 | sdk | pending | `armature-sdk` |  |  |
@@ -54,7 +54,7 @@ Done. Added XDG state-root resolution keyed by canonical workspace hash, SQLite 
 
 ### daemon
 
-Pending.
+In progress. Building daemon runtime, Unix socket control path, service reconciliation/supervision, cancellation/timeouts, and config reload safety.
 
 ### triggers
 

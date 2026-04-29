@@ -91,6 +91,7 @@ name = "armature-daemon"
 version = "0.1.0"
 dependencies = [
  "armature-core",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
