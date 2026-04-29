@@ -25,7 +25,7 @@ file for design expansion; the authoritative design remains in:
 | --- | --- | --- | --- | --- |
 | foundation | done | `armature-foundation` | Codex | merged `d944f1c` to `main` as `a3daf03`; checks: `cargo test`, `npm test` |
 | config | done | `armature-config` | Codex | merged `651cd02` to `main` as `05a3cee`; checks: `cargo test`, `cargo run -q -p armature-cli -- --workspace <tmp> config check` |
-| store | in_progress | `armature-store` | Codex | implementing workspace state root + SQLite store |
+| store | done | `armature-store` | Codex | merged `2e7dd5f` to `main` as `fe7a9a9`; checks: `cargo test` |
 | daemon | pending | `armature-daemon` |  |  |
 | triggers | pending | `armature-triggers` |  |  |
 | cli | pending | `armature-cli` |  |  |
@@ -50,7 +50,7 @@ Done. Added strict TOML parsing/validation, normalized config hashing, upward-on
 
 ### store
 
-In progress. Building XDG state-root resolution keyed by canonical workspace hash, SQLite bootstrap/persistence interfaces, and isolated run artifact layout.
+Done. Added XDG state-root resolution keyed by canonical workspace hash, SQLite schema/bootstrap and event/run/log persistence APIs, and isolated `.armature/runs/<run-id>` artifact layout. Merged `2e7dd5f` into `main` as `fe7a9a9`.
 
 ### daemon
 
