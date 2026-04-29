@@ -23,7 +23,7 @@ file for design expansion; the authoritative design remains in:
 
 | Slice | Status | Branch / Worktree | Owner | Result |
 | --- | --- | --- | --- | --- |
-| foundation | in_progress | `armature-foundation` | Codex | scaffolding workspace/package layout |
+| foundation | done | `armature-foundation` | Codex | merged `d944f1c` to `main` as `a3daf03`; checks: `cargo test`, `npm test` |
 | config | pending | `armature-config` |  |  |
 | store | pending | `armature-store` |  |  |
 | daemon | pending | `armature-daemon` |  |  |
@@ -42,7 +42,7 @@ file for design expansion; the authoritative design remains in:
 
 ### foundation
 
-In progress. Establishing Rust workspace, package layout, shared core types, and baseline tests.
+Done. Added Rust workspace + SDK skeleton, shared core types/IDs/errors, and baseline Rust/TS tests. Merged `d944f1c` into `main` as `a3daf03`.
 
 ### config
 
