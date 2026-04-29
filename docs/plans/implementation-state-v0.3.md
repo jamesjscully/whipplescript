@@ -23,7 +23,7 @@ file for design expansion; the authoritative design remains in:
 
 | Slice | Status | Branch / Worktree | Owner | Result |
 | --- | --- | --- | --- | --- |
-| foundation | pending | `armature-foundation` |  |  |
+| foundation | in_progress | `armature-foundation` | Codex | scaffolding workspace/package layout |
 | config | pending | `armature-config` |  |  |
 | store | pending | `armature-store` |  |  |
 | daemon | pending | `armature-daemon` |  |  |
@@ -42,7 +42,7 @@ file for design expansion; the authoritative design remains in:
 
 ### foundation
 
-Pending.
+In progress. Establishing Rust workspace, package layout, shared core types, and baseline tests.
 
 ### config
 
