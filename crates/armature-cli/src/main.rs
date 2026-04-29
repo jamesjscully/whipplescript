@@ -1,6 +1,8 @@
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand};
 
-use armature_core::{ArmatureError, ArmatureResult};
+use armature_core::{load_workspace_config, resolve_workspace, ArmatureError, ArmatureResult};
 
 fn main() {
     if let Err(error) = run() {
@@ -11,7 +13,7 @@ fn main() {
 
 fn run() -> ArmatureResult<()> {
     let cli = Cli::parse();
-    cli.command.execute()
+    cli.command.execute(cli.workspace)
 }
 
 #[derive(Debug, Parser)]
@@ -21,6 +23,9 @@ fn run() -> ArmatureResult<()> {
     about = "Local daemon for triggering and supervising ordinary programs"
 )]
 struct Cli {
+    #[arg(long, global = true)]
+    workspace: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -57,7 +62,7 @@ enum Command {
 }
 
 impl Command {
-    fn execute(self) -> ArmatureResult<()> {
+    fn execute(self, workspace: Option<PathBuf>) -> ArmatureResult<()> {
         match self {
             Self::Init(args) => {
                 let _ = args;
@@ -77,9 +82,27 @@ impl Command {
             Self::Runs => Err(ArmatureError::not_implemented("runs")),
             Self::Logs(_) => Err(ArmatureError::not_implemented("logs")),
             Self::Cancel(_) => Err(ArmatureError::not_implemented("cancel")),
-            Self::Config { .. } => Err(ArmatureError::not_implemented("config")),
+            Self::Config { command } => command.execute(workspace),
             Self::Doctor => Err(ArmatureError::not_implemented("doctor")),
             Self::Lock { .. } => Err(ArmatureError::not_implemented("lock")),
+        }
+    }
+}
+
+impl ConfigCommand {
+    fn execute(self, workspace: Option<PathBuf>) -> ArmatureResult<()> {
+        match self {
+            Self::Check => {
+                let cwd = std::env::current_dir()?;
+                let workspace = resolve_workspace(workspace.as_ref(), &cwd)?;
+                let config = load_workspace_config(&workspace)?;
+                println!(
+                    "ok {} {}",
+                    workspace.config_path().display(),
+                    config.version
+                );
+                Ok(())
+            }
         }
     }
 }
