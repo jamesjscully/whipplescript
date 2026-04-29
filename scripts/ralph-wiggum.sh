@@ -31,8 +31,29 @@ USAGE
 run=0
 from_slice=""
 only_slice=""
-paseo_bin="${PASEO_BIN:-paseo}"
 provider="${PASEO_PROVIDER:-codex/gpt-5.4}"
+
+default_paseo_bin() {
+  local candidate resolved bundle_cli
+  candidate="$(command -v paseo 2>/dev/null || true)"
+  if [[ -z "$candidate" ]]; then
+    echo "paseo"
+    return
+  fi
+
+  resolved="$(readlink -f "$candidate" 2>/dev/null || printf '%s' "$candidate")"
+  if [[ "$(basename -- "$resolved")" == "Paseo.bin" ]]; then
+    bundle_cli="$(dirname -- "$resolved")/resources/bin/paseo"
+    if [[ -x "$bundle_cli" ]]; then
+      echo "$bundle_cli"
+      return
+    fi
+  fi
+
+  echo "$candidate"
+}
+
+paseo_bin="${PASEO_BIN:-$(default_paseo_bin)}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
