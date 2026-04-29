@@ -1,3 +1,5 @@
+pub mod store;
+
 use armature_core::{ArmatureError, ArmatureResult, RuntimeSnapshot};
 
 #[derive(Debug, Default)]
