@@ -292,7 +292,7 @@ Config sugar remains user-facing:
 ```toml
 schedule = "0 9 * * *"
 watch = ["src/**/*.ts"]
-on = "paseo.run.completed"
+on = "tool.run.completed"
 ```
 
 The implementation may normalize these internally as events before admission policy is evaluated.
@@ -391,7 +391,7 @@ Example:
 
 ```toml
 [service.health]
-check = "tsx sources/paseo-health.ts"
+check = "tsx sources/tool-health.ts"
 every = "30s"
 timeout = "5s"
 ```

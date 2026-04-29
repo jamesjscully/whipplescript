@@ -186,8 +186,8 @@ Example:
 
 ```toml
 [[service]]
-name = "paseo-event-source"
-run = "tsx sources/paseo-events.ts"
+name = "tool-event-source"
+run = "tsx sources/tool-events.ts"
 
 [service.supervision]
 restart = "on_failure"
@@ -246,7 +246,7 @@ Config forms such as:
 ```toml
 schedule = "0 9 * * *"
 watch = ["src/**/*.ts"]
-on = "paseo.run.completed"
+on = "tool.run.completed"
 ```
 
 are declarative trigger shortcuts. The daemon may implement them through a common event-routing path.
@@ -257,7 +257,7 @@ are declarative trigger shortcuts. The daemon may implement them through a commo
 
 A **Source** is a process or built-in mechanism that emits Armature events.
 
-Sources may be built in, such as schedules and file watchers, or user-authored, such as a TypeScript script that watches Paseo, GitHub, Slack, or a local log.
+Sources may be built in, such as schedules and file watchers, or user-authored, such as a TypeScript script that watches an external CLI, a webhook stream, a chat system, or a local log.
 
 Sources **SHOULD** be shallow. They observe and emit events. They should not become hidden workflow engines.
 
@@ -265,8 +265,8 @@ Preferred source form:
 
 ```toml
 [[service]]
-name = "paseo-source"
-run = "tsx sources/paseo-source.ts"
+name = "tool-source"
+run = "tsx sources/tool-source.ts"
 
 [service.supervision]
 restart = "on_failure"
@@ -277,7 +277,7 @@ within = "1m"
 The service emits events using the CLI or SDK:
 
 ```bash
-armature emit paseo.run.completed --json '{"runId":"abc"}'
+armature emit tool.run.completed --json '{"runId":"abc"}'
 ```
 
 Built-in sources such as schedules and file watchers **SHOULD** emit mechanical Armature events into the same event log used by user-authored sources.
@@ -321,7 +321,7 @@ Armature **MUST NOT** assign domain semantics to event types.
 These are all ordinary events:
 
 ```text
-paseo.run.completed
+tool.run.completed
 git.branch.changed
 file.changed
 timer.fired
@@ -498,7 +498,7 @@ A typical process tree looks like:
 armatured
   |- tsx scripts/on-agent-complete.ts
   |- npm test
-  |- tsx sources/paseo-events.ts
+  |- tsx sources/tool-events.ts
   `- bash scripts/daily-status.sh
 ```
 
@@ -568,9 +568,9 @@ User scripts **MAY**:
 
 ```text
 spawn agents
-call paseo
-call codex
-call claude
+call external CLIs
+call coding-agent CLIs
+call LLM CLIs
 call git
 call gh
 call npm
@@ -599,12 +599,12 @@ import { $ } from "zx"
 const event = JSON.parse(process.env.ARMATURE_EVENT_JSON!)
 
 const [review, tests] = await Promise.all([
-  $`paseo run --provider claude "Review run ${event.payload.runId}"`,
+  $`agent-cli review --run ${event.payload.runId}`,
   $`npm test`,
 ])
 
 if (tests.exitCode !== 0) {
-  await $`paseo run --provider codex "Fix the failing tests"`
+  await $`agent-cli fix --reason "tests failed"`
 }
 ```
 
@@ -664,17 +664,17 @@ Event-triggered task:
 
 ```toml
 [[task]]
-name = "after-paseo-run"
-on = "paseo.run.completed"
-run = "tsx scripts/after-paseo-run.ts"
+name = "after-tool-run"
+on = "tool.run.completed"
+run = "tsx scripts/after-tool-run.ts"
 ```
 
 Long-running service:
 
 ```toml
 [[service]]
-name = "paseo-source"
-run = "tsx sources/paseo-source.ts"
+name = "tool-source"
+run = "tsx sources/tool-source.ts"
 
 [service.supervision]
 restart = "on_failure"
@@ -969,11 +969,11 @@ Example:
 
 ```toml
 [[service]]
-name = "paseo-source"
-run = "tsx sources/paseo-source.ts"
+name = "tool-source"
+run = "tsx sources/tool-source.ts"
 
 [service.health]
-check = "tsx sources/paseo-health.ts"
+check = "tsx sources/tool-health.ts"
 every = "30s"
 timeout = "5s"
 
@@ -1175,7 +1175,7 @@ Automatic reconciliation is mechanical. It is not workflow planning.
 Armature may know:
 
 ```text
-service paseo-source is declared enabled and not running; start it
+service tool-source is declared enabled and not running; start it
 ```
 
 Armature must not infer:
@@ -1391,7 +1391,7 @@ Acceptable `plan` output:
 
 ```text
 Would start:
-  paseo-source
+  tool-source
 
 Would stop:
   github-source, disabled in config
@@ -1497,17 +1497,17 @@ Preferred model:
 
 ```toml
 [[service]]
-name = "paseo-source"
-run = "tsx sources/paseo-source.ts"
+name = "tool-source"
+run = "tsx sources/tool-source.ts"
 
 [service.supervision]
 restart = "on_failure"
 ```
 
-The source script observes Paseo and emits events:
+The source script observes an external tool and emits events:
 
 ```bash
-armature emit paseo.run.completed --json '{"runId":"abc"}'
+armature emit tool.run.completed --json '{"runId":"abc"}'
 ```
 
 Armature **MAY** ship shallow built-in adapters, but built-in adapters **MUST** only observe, translate, and emit events.
@@ -1515,18 +1515,18 @@ Armature **MAY** ship shallow built-in adapters, but built-in adapters **MUST** 
 Acceptable:
 
 ```text
-paseo.run.started
-paseo.run.completed
-paseo.run.failed
+tool.run.started
+tool.run.completed
+tool.run.failed
 ```
 
 Not acceptable in daemon core:
 
 ```text
-paseo.agent.is_stuck
-paseo.review_needed
-paseo.should_retry
-paseo.output_is_bad
+tool.agent_is_stuck
+tool.review_needed
+tool.should_retry
+tool.output_is_bad
 ```
 
 Those are user-space interpretations.
@@ -1542,22 +1542,22 @@ A recipe **MUST** generate ordinary editable files.
 Example:
 
 ```bash
-armature new recipe paseo-review-loop
+armature new recipe external-review-loop
 ```
 
 May create:
 
 ```text
 .armature/armature.toml
-scripts/on-paseo-complete.ts
+scripts/on-tool-complete.ts
 scripts/review.ts
-sources/paseo-source.ts
+sources/tool-source.ts
 ```
 
 Bad recipe model:
 
 ```bash
-armature enable paseo-review-loop
+armature enable external-review-loop
 ```
 
 where behavior is hidden in the daemon.
@@ -1772,7 +1772,7 @@ name = "review"
 run = "tsx scripts/review.ts"
 
 [task.capabilities]
-allow_exec = ["paseo", "git"]
+allow_exec = ["agent-cli", "git"]
 network = "none"
 ```
 
@@ -1801,13 +1801,13 @@ This is a mechanical watcher. The daemon does not know what the tests mean.
 
 ---
 
-### 41.2 Paseo Completion Hook
+### 41.2 External Tool Completion Hook
 
 ```toml
 [[task]]
-name = "after-paseo-run"
-on = "paseo.run.completed"
-run = "tsx scripts/after-paseo-run.ts"
+name = "after-tool-run"
+on = "tool.run.completed"
+run = "tsx scripts/after-tool-run.ts"
 ```
 
 ```ts
@@ -1817,9 +1817,9 @@ const event = JSON.parse(process.env.ARMATURE_EVENT_JSON!)
 
 const runId = event.payload.runId
 
-await $`paseo logs ${runId} --tail 200 > ${process.env.ARMATURE_RUN_DIR}/paseo.log`
+await $`tool-cli logs ${runId} --tail 200 > ${process.env.ARMATURE_RUN_DIR}/tool.log`
 
-await $`paseo run --provider claude "Review the completed run ${runId}. Use the saved log as context."`
+await $`review-cli request --run ${runId} --log ${process.env.ARMATURE_RUN_DIR}/tool.log`
 
 await $`armature emit review.requested --json ${JSON.stringify({ runId })}`
 ```
@@ -1842,14 +1842,14 @@ import { $ } from "zx"
 const prompt = process.argv.slice(2).join(" ")
 
 const attempts = await Promise.all([
-  $`paseo run --provider codex ${prompt}`,
-  $`paseo run --provider claude ${prompt}`,
-  $`paseo run --provider codex "Try a different approach: ${prompt}"`,
+  $`agent-cli attempt --strategy baseline ${prompt}`,
+  $`agent-cli attempt --strategy review-first ${prompt}`,
+  $`agent-cli attempt --strategy alternate ${prompt}`,
 ])
 
 const ids = attempts.map(a => a.stdout.trim())
 
-await $`paseo run --provider claude "Compare these runs and choose the best: ${ids.join(", ")}"`
+await $`agent-cli compare --runs ${ids.join(",")}`
 ```
 
 The user owns the fanout and join. Armature only launched the script and recorded the run.
@@ -1860,8 +1860,8 @@ The user owns the fanout and join. Armature only launched the script and recorde
 
 ```toml
 [[service]]
-name = "paseo-source"
-run = "tsx sources/paseo-source.ts"
+name = "tool-source"
+run = "tsx sources/tool-source.ts"
 
 [service.supervision]
 restart = "on_failure"
@@ -1874,9 +1874,9 @@ backoff = "exponential"
 import { emit } from "@armature/sdk"
 
 while (true) {
-  const event = await waitForPaseoEvent()
+  const event = await waitForToolEvent()
 
-  await emit(`paseo.run.${event.status}`, {
+  await emit(`tool.run.${event.status}`, {
     runId: event.runId,
     status: event.status,
   })
@@ -1895,7 +1895,7 @@ import { $ } from "zx"
 
 await withLock("branch:main", async () => {
   await $`git checkout main`
-  await $`paseo run --provider codex "Apply the accepted fix to main"`
+  await $`agent-cli apply --target main --source accepted-fix`
 })
 ```
 
