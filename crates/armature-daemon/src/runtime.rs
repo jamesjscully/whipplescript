@@ -126,6 +126,10 @@ impl DaemonHandle {
 }
 
 impl DaemonClient {
+    pub fn from_socket_path(socket_path: PathBuf) -> Self {
+        Self { socket_path }
+    }
+
     pub fn inspect(&self) -> ArmatureResult<InspectResponse> {
         match self.send(DaemonRequest::Inspect)? {
             ResponsePayload::Inspect(response) => Ok(response),
