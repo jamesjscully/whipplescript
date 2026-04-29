@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::io::{self};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -24,6 +25,16 @@ const DETACHED_DAEMON_STDERR: &str = "daemon.stderr.log";
 const LOCKS_DIR_NAME: &str = "locks";
 const LOCK_FILE_SUFFIX: &str = ".json";
 const INIT_TEMPLATE: &str = "# Armature v0.3 config\n#\n# Add tasks and services here.\n#\n# [[task]]\n# name = \"example\"\n# run = \"echo hello from armature\"\n";
+const RECIPE_FILE_WATCH_TESTS_CONFIG: &str = "# Armature v0.3 recipe: file-watch tests\n# Edit paths and commands to match your project.\n\n[[task]]\nname = \"test-on-change\"\nwatch = [\"src/**/*\", \"tests/**/*\"]\nrun = \"./scripts/run-tests.sh\"\n";
+const RECIPE_FILE_WATCH_TESTS_SCRIPT: &str = "#!/usr/bin/env sh\nset -eu\n\necho \"running project tests\"\n# Replace this placeholder with your real test command.\n# Examples: cargo test, npm test, pytest\nprintf '%s\\n' \"TODO: run your test command here\"\n";
+const RECIPE_SCHEDULED_STATUS_CONFIG: &str = "# Armature v0.3 recipe: scheduled status script\n# Replace the schedule and script body with your own status check.\n\n[[task]]\nname = \"scheduled-status\"\nschedule = \"*/15 * * * *\"\nrun = \"./scripts/scheduled-status.sh\"\n";
+const RECIPE_SCHEDULED_STATUS_SCRIPT: &str = "#!/usr/bin/env sh\nset -eu\n\nnow=$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")\necho \"status check at $now\"\n# Add whatever local inspection or reporting you need here.\n";
+const RECIPE_EVENT_SOURCE_SERVICE_CONFIG: &str = "# Armature v0.3 recipe: generic event source service\n# This service emits a mechanical event on a fixed loop.\n\n[[service]]\nname = \"generic-event-source\"\nrun = \"./sources/generic-event-source.sh\"\n\n[service.supervision]\nrestart = \"on_failure\"\nmax_restarts = 5\nwithin = \"1m\"\nbackoff = \"exponential\"\n";
+const RECIPE_EVENT_SOURCE_SERVICE_SCRIPT: &str = "#!/usr/bin/env sh\nset -eu\n\ninterval_seconds=\"${ARMATURE_EVENT_SOURCE_INTERVAL_SECONDS:-30}\"\n\necho \"generic event source started; interval=${interval_seconds}s\"\nwhile true; do\n  armature emit generic.event.tick --json \"$(date -u +'{\\\"emitted_at\\\":\\\"%Y-%m-%dT%H:%M:%SZ\\\",\\\"source\\\":\\\"generic-event-source\\\"}')\"\n  sleep \"$interval_seconds\"\ndone\n";
+const RECIPE_EVENT_HOOK_TASK_CONFIG: &str = "# Armature v0.3 recipe: event hook task\n# Emit `hook.example` to trigger this task.\n\n[[task]]\nname = \"event-hook\"\non = \"hook.example\"\nrun = \"./scripts/on-hook-event.sh\"\n";
+const RECIPE_EVENT_HOOK_TASK_SCRIPT: &str = "#!/usr/bin/env sh\nset -eu\n\necho \"received event: ${ARMATURE_EVENT_TYPE:-unknown}\"\necho \"payload: ${ARMATURE_EVENT_PAYLOAD_JSON:-null}\"\n# Extend this script with the local side effect you want.\n";
+const RECIPE_NAMED_LOCK_CONFIG: &str = "# Armature v0.3 recipe: explicit named lock example\n# This task acquires and releases a named lock itself.\n\n[[task]]\nname = \"with-named-lock\"\nrun = \"./scripts/with-named-lock.sh\"\n";
+const RECIPE_NAMED_LOCK_SCRIPT: &str = "#!/usr/bin/env sh\nset -eu\n\nlock_name=\"shared-resource\"\nacquired=0\ncleanup() {\n  if [ \"$acquired\" -eq 1 ]; then\n    armature lock release \"$lock_name\" >/dev/null\n  fi\n}\ntrap cleanup EXIT INT TERM\n\narmature lock acquire \"$lock_name\" --ttl 10m >/dev/null\nacquired=1\necho \"acquired lock: $lock_name\"\n# Put your critical section here.\nsleep 1\n";
 
 fn main() {
     if let Err(error) = run() {
@@ -169,7 +180,86 @@ enum InitCommand {
 
 #[derive(Debug, Args)]
 struct RecipeArgs {
-    name: String,
+    name: RecipeName,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum RecipeName {
+    FileWatchTests,
+    ScheduledStatusScript,
+    EventSourceService,
+    EventHookTask,
+    NamedLock,
+}
+
+impl RecipeName {
+    fn scaffold(self) -> RecipeScaffold {
+        match self {
+            Self::FileWatchTests => RecipeScaffold {
+                config: RECIPE_FILE_WATCH_TESTS_CONFIG,
+                files: vec![RecipeFile {
+                    relative_path: PathBuf::from("scripts/run-tests.sh"),
+                    contents: RECIPE_FILE_WATCH_TESTS_SCRIPT,
+                    executable: true,
+                }],
+            },
+            Self::ScheduledStatusScript => RecipeScaffold {
+                config: RECIPE_SCHEDULED_STATUS_CONFIG,
+                files: vec![RecipeFile {
+                    relative_path: PathBuf::from("scripts/scheduled-status.sh"),
+                    contents: RECIPE_SCHEDULED_STATUS_SCRIPT,
+                    executable: true,
+                }],
+            },
+            Self::EventSourceService => RecipeScaffold {
+                config: RECIPE_EVENT_SOURCE_SERVICE_CONFIG,
+                files: vec![RecipeFile {
+                    relative_path: PathBuf::from("sources/generic-event-source.sh"),
+                    contents: RECIPE_EVENT_SOURCE_SERVICE_SCRIPT,
+                    executable: true,
+                }],
+            },
+            Self::EventHookTask => RecipeScaffold {
+                config: RECIPE_EVENT_HOOK_TASK_CONFIG,
+                files: vec![RecipeFile {
+                    relative_path: PathBuf::from("scripts/on-hook-event.sh"),
+                    contents: RECIPE_EVENT_HOOK_TASK_SCRIPT,
+                    executable: true,
+                }],
+            },
+            Self::NamedLock => RecipeScaffold {
+                config: RECIPE_NAMED_LOCK_CONFIG,
+                files: vec![RecipeFile {
+                    relative_path: PathBuf::from("scripts/with-named-lock.sh"),
+                    contents: RECIPE_NAMED_LOCK_SCRIPT,
+                    executable: true,
+                }],
+            },
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FileWatchTests => "file-watch-tests",
+            Self::ScheduledStatusScript => "scheduled-status-script",
+            Self::EventSourceService => "event-source-service",
+            Self::EventHookTask => "event-hook-task",
+            Self::NamedLock => "named-lock",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RecipeScaffold {
+    config: &'static str,
+    files: Vec<RecipeFile>,
+}
+
+#[derive(Debug, Clone)]
+struct RecipeFile {
+    relative_path: PathBuf,
+    contents: &'static str,
+    executable: bool,
 }
 
 #[derive(Debug, Args, Clone, Copy)]
@@ -332,10 +422,7 @@ fn init_workspace(
     format: OutputFormat,
 ) -> ArmatureResult<()> {
     if let Some(InitCommand::Recipe(recipe)) = args.command {
-        return Err(ArmatureError::not_implemented(format!(
-            "init recipe {}",
-            recipe.name
-        )));
+        return init_recipe_workspace(workspace_arg, recipe.name, format);
     }
 
     let root = workspace_arg.unwrap_or(std::env::current_dir()?);
@@ -366,6 +453,102 @@ fn init_workspace(
         }),
         &format!("initialized {}", config_path.display()),
     )
+}
+
+fn init_recipe_workspace(
+    workspace_arg: Option<PathBuf>,
+    recipe_name: RecipeName,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let root = resolve_init_root(workspace_arg)?;
+    let config_dir = root.join(CONFIG_DIR_NAME);
+    let config_path = config_dir.join(CONFIG_FILE_NAME);
+    let scaffold = recipe_name.scaffold();
+
+    ensure_recipe_targets_available(&config_path, &root, &scaffold)?;
+
+    fs::create_dir_all(&config_dir)?;
+    fs::write(&config_path, scaffold.config)?;
+
+    let mut created_paths = vec![config_path.clone()];
+    for file in scaffold.files {
+        let path = root.join(&file.relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, file.contents)?;
+        if file.executable {
+            make_executable(&path)?;
+        }
+        created_paths.push(path);
+    }
+
+    let created = created_paths
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&root)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+
+    let text = format!(
+        "initialized recipe {} in {}\n{}",
+        recipe_name.as_str(),
+        root.display(),
+        created.join("\n")
+    );
+
+    print_data(
+        format,
+        &json!({
+            "workspace_root": root,
+            "recipe": recipe_name.as_str(),
+            "config_path": config_path,
+            "created": created_paths,
+        }),
+        &text,
+    )
+}
+
+fn resolve_init_root(workspace_arg: Option<PathBuf>) -> ArmatureResult<PathBuf> {
+    let root = workspace_arg.unwrap_or(std::env::current_dir()?);
+    if root.exists() {
+        Ok(root.canonicalize()?)
+    } else {
+        Ok(root)
+    }
+}
+
+fn ensure_recipe_targets_available(
+    config_path: &Path,
+    root: &Path,
+    scaffold: &RecipeScaffold,
+) -> ArmatureResult<()> {
+    if config_path.exists() {
+        return Err(ArmatureError::conflict(format!(
+            "workspace already initialized at {}",
+            config_path.display()
+        )));
+    }
+    for file in &scaffold.files {
+        let path = root.join(&file.relative_path);
+        if path.exists() {
+            return Err(ArmatureError::conflict(format!(
+                "recipe target already exists at {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn make_executable(path: &Path) -> ArmatureResult<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
 }
 
 fn dev_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> ArmatureResult<()> {
@@ -1135,11 +1318,15 @@ where
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     use clap::CommandFactory;
     use tempfile::TempDir;
 
-    use super::{list_manual_locks, lock_file_path, parse_duration, Cli, ManualLockRecord};
+    use super::{
+        init_recipe_workspace, list_manual_locks, lock_file_path, parse_duration, Cli,
+        ManualLockRecord, OutputFormat, RecipeName, CONFIG_DIR_NAME, CONFIG_FILE_NAME,
+    };
 
     #[test]
     fn cli_command_tree_builds() {
@@ -1171,5 +1358,87 @@ mod tests {
         let locks = list_manual_locks(dir.path()).unwrap();
         assert_eq!(locks.len(), 1);
         assert_eq!(locks[0].name, "branch:main");
+    }
+
+    #[test]
+    fn init_recipe_creates_expected_scaffolding() {
+        let cases = [
+            (
+                RecipeName::FileWatchTests,
+                "scripts/run-tests.sh",
+                "watch = [\"src/**/*\", \"tests/**/*\"]",
+                "TODO: run your test command here",
+            ),
+            (
+                RecipeName::ScheduledStatusScript,
+                "scripts/scheduled-status.sh",
+                "schedule = \"*/15 * * * *\"",
+                "status check at",
+            ),
+            (
+                RecipeName::EventSourceService,
+                "sources/generic-event-source.sh",
+                "name = \"generic-event-source\"",
+                "armature emit generic.event.tick",
+            ),
+            (
+                RecipeName::EventHookTask,
+                "scripts/on-hook-event.sh",
+                "on = \"hook.example\"",
+                "ARMATURE_EVENT_PAYLOAD_JSON",
+            ),
+            (
+                RecipeName::NamedLock,
+                "scripts/with-named-lock.sh",
+                "name = \"with-named-lock\"",
+                "armature lock acquire",
+            ),
+        ];
+
+        for (recipe, script_path, config_fragment, script_fragment) in cases {
+            let dir = TempDir::new().unwrap();
+            init_recipe_workspace(Some(dir.path().to_path_buf()), recipe, OutputFormat::Json)
+                .unwrap();
+
+            let config_path = dir.path().join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME);
+            let config = fs::read_to_string(&config_path).unwrap();
+            assert!(
+                config.contains(config_fragment),
+                "{recipe:?} config mismatch"
+            );
+
+            let script_path = dir.path().join(script_path);
+            let script = fs::read_to_string(&script_path).unwrap();
+            assert!(
+                script.contains(script_fragment),
+                "{recipe:?} script mismatch"
+            );
+            assert_ne!(
+                fs::metadata(script_path).unwrap().permissions().mode() & 0o111,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn init_recipe_rejects_existing_target_files() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("scripts/with-named-lock.sh");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "existing").unwrap();
+
+        let error = init_recipe_workspace(
+            Some(dir.path().to_path_buf()),
+            RecipeName::NamedLock,
+            OutputFormat::Json,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("recipe target already exists"));
+        assert!(!dir
+            .path()
+            .join(CONFIG_DIR_NAME)
+            .join(CONFIG_FILE_NAME)
+            .exists());
     }
 }
