@@ -24,7 +24,7 @@ file for design expansion; the authoritative design remains in:
 | Slice | Status | Branch / Worktree | Owner | Result |
 | --- | --- | --- | --- | --- |
 | foundation | done | `armature-foundation` | Codex | merged `d944f1c` to `main` as `a3daf03`; checks: `cargo test`, `npm test` |
-| config | in_progress | `armature-config` | Codex | implementing TOML config model, validation, hashing, workspace discovery, and `config check` |
+| config | done | `armature-config` | Codex | merged `651cd02` to `main` as `05a3cee`; checks: `cargo test`, `cargo run -q -p armature-cli -- --workspace <tmp> config check` |
 | store | pending | `armature-store` |  |  |
 | daemon | pending | `armature-daemon` |  |  |
 | triggers | pending | `armature-triggers` |  |  |
@@ -46,7 +46,7 @@ Done. Added Rust workspace + SDK skeleton, shared core types/IDs/errors, and bas
 
 ### config
 
-In progress. Adding strict TOML parsing/validation, normalized config hashing, upward-only workspace discovery, and `armature config check`.
+Done. Added strict TOML parsing/validation, normalized config hashing, upward-only workspace discovery, and `armature config check`. Merged `651cd02` into `main` as `05a3cee`.
 
 ### store
 
