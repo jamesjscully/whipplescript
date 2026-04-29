@@ -24,7 +24,7 @@ file for design expansion; the authoritative design remains in:
 | Slice | Status | Branch / Worktree | Owner | Result |
 | --- | --- | --- | --- | --- |
 | foundation | done | `armature-foundation` | Codex | merged `d944f1c` to `main` as `a3daf03`; checks: `cargo test`, `npm test` |
-| config | pending | `armature-config` |  |  |
+| config | in_progress | `armature-config` | Codex | implementing TOML config model, validation, hashing, workspace discovery, and `config check` |
 | store | pending | `armature-store` |  |  |
 | daemon | pending | `armature-daemon` |  |  |
 | triggers | pending | `armature-triggers` |  |  |
@@ -46,7 +46,7 @@ Done. Added Rust workspace + SDK skeleton, shared core types/IDs/errors, and bas
 
 ### config
 
-Pending.
+In progress. Adding strict TOML parsing/validation, normalized config hashing, upward-only workspace discovery, and `armature config check`.
 
 ### store
 
