@@ -6,7 +6,7 @@ It is subordinate to `spec/armature-v0.3.md`. If this file appears to introduce 
 
 ## 1. Implementation Goal
 
-Armature v0.3 should produce a complete local foreground runtime:
+Armature v0.3 should produce a complete local daemon runtime:
 
 ```text
 armature init
@@ -45,7 +45,7 @@ run history
 separate stdout/stderr logs
 per-run directories
 hot config reload
-foreground runtime inspection
+runtime inspection
 complete TypeScript SDK for core functionality
 recipes as editable scaffolding
 ```
@@ -53,7 +53,6 @@ recipes as editable scaffolding
 It should not include:
 
 ```text
-background daemon mode
 Windows support
 config migrations
 built-in external adapters
@@ -70,13 +69,17 @@ daemon-owned traces
 
 ## 2. Runtime Shape
 
-v0.3 is explicitly foreground-only.
+v0.3 supports a normal local daemon lifecycle and an explicit foreground mode.
 
 `armature dev` starts the daemon in the foreground and owns the workspace until it exits.
 
-The CLI may invoke foreground runtime commands against the active daemon, but Armature v0.3 should not install, daemonize, launchd-register, systemd-register, or background itself.
+`armature up` starts or reconciles the daemon runtime for the workspace without attaching it to the current terminal.
 
-If no foreground daemon owns the workspace, commands that require a running daemon should fail clearly.
+Foreground operation must be explicit through `armature dev` or an explicit foreground option. `armature up` without such an option should not run in the foreground.
+
+The CLI may invoke runtime commands against the active daemon.
+
+If no daemon owns the workspace, commands that require a running daemon should fail clearly.
 
 Commands that do not require a running daemon may operate directly on the workspace:
 
@@ -86,7 +89,11 @@ armature config check
 armature doctor
 ```
 
-`armature up`, `armature down`, and `armature restart` may be reserved or implemented as foreground-runtime commands only if their behavior is explicit. They must not imply hidden background daemon management in v0.3.
+`armature down` stops the daemon runtime for the workspace.
+
+`armature restart` performs `down` then `up`.
+
+The daemon should remain local to the machine and workspace. v0.3 should not install launchd or systemd services unless the user explicitly asks for that in a future version.
 
 ## 3. Language and Packages
 
@@ -161,7 +168,7 @@ The database is an internal daemon store. Users and agents may inspect exported 
 
 ## 6. Local Transport
 
-The CLI talks to the foreground daemon over a Unix domain socket.
+The CLI talks to the daemon over a Unix domain socket.
 
 The socket lives in the workspace state root, not in the repository checkout.
 
@@ -270,7 +277,7 @@ do not buffer while daemon is down
 do not promise exactly-once delivery
 ```
 
-If `armature emit` cannot reach the foreground daemon, it fails clearly.
+If `armature emit` cannot reach the daemon, it fails clearly.
 
 Built-in schedules and file watchers emit mechanical events into the same event log as user-authored sources.
 
@@ -581,6 +588,9 @@ Required v0.3 commands:
 armature init
 armature init recipe <name>
 armature dev
+armature up
+armature down
+armature restart
 armature run <task-name>
 armature emit <event-type> --json <payload>
 armature status
@@ -603,13 +613,10 @@ armature lock status
 Reserved or deferred:
 
 ```bash
-armature up
-armature down
-armature restart
 armature plan
 ```
 
-If `up`, `down`, or `restart` exist in v0.3, they must be explicit foreground-runtime controls and must not imply hidden background daemon management.
+Foreground operation must remain explicit through `armature dev` or a foreground option.
 
 ## 24. Validation Boundary
 
@@ -652,7 +659,7 @@ Build the first implementation in this order:
 1. Rust workspace and CLI skeleton.
 2. Workspace discovery and `armature init`.
 3. TOML config parse and `armature config check`.
-4. Foreground `armature dev` with workspace lock and Unix socket.
+4. Daemon lifecycle with workspace lock and Unix socket.
 5. SQLite store outside the workspace.
 6. Manual task execution with per-run directory and logs.
 7. `runs`, `logs`, `status`, and `ps`.

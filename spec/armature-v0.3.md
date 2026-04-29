@@ -487,10 +487,13 @@ A typical Armature project contains:
   armature.toml
   runs/
   events/
-  state/
 scripts/
 sources/
 ```
+
+The `.armature/` directory contains user-inspectable project config and artifacts.
+
+Internal daemon stores, sockets, lock files, and indexes **MAY** live outside the repository checkout. If an implementation stores internal state outside `.armature/`, it **SHOULD** expose the state location through `armature doctor` or JSON status.
 
 A typical process tree looks like:
 
@@ -1282,17 +1285,34 @@ The daemon exposes facts. The script interprets them.
 
 ## 29. Runtime Lifecycle
 
-Armature **SHOULD** support project lifecycle commands.
+Armature **SHOULD** support explicit project runtime lifecycle commands.
+
+Foreground operation **MUST** be explicit. A user who wants the runtime attached to the current terminal should request `armature dev` or an explicit foreground option.
+
+Non-foreground lifecycle commands such as `armature up` may start or contact a daemon without attaching it to the current terminal, but that behavior **MUST** be documented and inspectable.
 
 Recommended commands:
 
 ```bash
+armature dev
 armature up
 armature down
 armature restart
 ```
 
-### 29.1 `armature up`
+### 29.1 `armature dev`
+
+`armature dev` **SHOULD** run the daemon in the foreground for the current workspace.
+
+Foreground dev mode **SHOULD** use the same config validation, event log, run records, and process supervision semantics as the normal daemon runtime.
+
+Only one daemon instance **SHOULD** manage a workspace at a time. If another daemon already owns the workspace lock, `armature dev` **SHOULD** fail clearly or offer an explicit takeover option.
+
+On Ctrl-C or normal terminal termination, `armature dev` **SHOULD** perform graceful foreground shutdown.
+
+If graceful shutdown times out, the implementation **MAY** terminate remaining child process groups mechanically.
+
+### 29.2 `armature up`
 
 `armature up` **SHOULD**:
 
@@ -1307,7 +1327,9 @@ begin accepting events
 
 `armature up` is a project lifecycle command. It **SHOULD** reconcile the project toward the active config, including clearing per-service stop overrides unless an implementation documents a stricter option.
 
-### 29.2 `armature down`
+`armature up` **SHOULD NOT** run in the foreground unless the user explicitly requests foreground behavior.
+
+### 29.3 `armature down`
 
 `armature down` **SHOULD**:
 
@@ -1330,18 +1352,6 @@ armature down --leave-runs
 
 Lifecycle commands are runtime control-plane actions. They are not workflow transitions.
 
-### 29.3 `armature dev`
-
-`armature dev` **SHOULD** run the daemon in the foreground for the current workspace.
-
-Foreground dev mode **SHOULD** use the same config validation, event log, run records, and process supervision semantics as the background daemon.
-
-Only one daemon instance **SHOULD** manage a workspace at a time. If another daemon already owns the workspace lock, `armature dev` **SHOULD** fail clearly or offer an explicit takeover option.
-
-On Ctrl-C or normal terminal termination, `armature dev` **SHOULD** perform graceful shutdown equivalent to `armature down --graceful`.
-
-If graceful shutdown times out, the implementation **MAY** terminate remaining child process groups mechanically.
-
 ### 29.4 Command Names
 
 Armature command names **SHOULD** keep project lifecycle separate from service lifecycle.
@@ -1349,6 +1359,7 @@ Armature command names **SHOULD** keep project lifecycle separate from service l
 Recommended meanings:
 
 ```text
+armature dev                run the project runtime in the foreground
 armature up                 start/reconcile the project runtime
 armature down               stop the project runtime
 armature restart            down then up
@@ -1542,7 +1553,7 @@ A recipe **MUST** generate ordinary editable files.
 Example:
 
 ```bash
-armature new recipe external-review-loop
+armature init recipe external-review-loop
 ```
 
 May create:
