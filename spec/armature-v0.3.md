@@ -228,6 +228,29 @@ A trigger only decides **when to invoke a command**.
 
 A trigger does not decide what the command means.
 
+For implementation consistency, primitive triggers **SHOULD** be normalized internally as Armature events before task admission is evaluated.
+
+Examples:
+
+```text
+manual trigger       -> manual.run.requested
+schedule trigger     -> timer.fired
+file-watch trigger   -> file.changed
+event trigger        -> the emitted event itself
+```
+
+This normalization is mechanical. It does not require users to subscribe to built-in event names when using config sugar such as `schedule`, `watch`, or manual `armature run`.
+
+Config forms such as:
+
+```toml
+schedule = "0 9 * * *"
+watch = ["src/**/*.ts"]
+on = "paseo.run.completed"
+```
+
+are declarative trigger shortcuts. The daemon may implement them through a common event-routing path.
+
 ---
 
 ## 9. Source
@@ -256,6 +279,10 @@ The service emits events using the CLI or SDK:
 ```bash
 armature emit paseo.run.completed --json '{"runId":"abc"}'
 ```
+
+Built-in sources such as schedules and file watchers **SHOULD** emit mechanical Armature events into the same event log used by user-authored sources.
+
+Armature **MUST NOT** emit both a hidden direct trigger and a separate routable event for the same occurrence in a way that starts the same task twice.
 
 ---
 
@@ -305,6 +332,24 @@ trace.span.closed
 
 The daemon records and routes them. User code interprets them.
 
+### 10.1 Event Delivery
+
+Armature v0.3 uses narrow local event delivery semantics.
+
+When the daemon accepts an event, it **MUST** append the event atomically to the local event log before routing it to tasks.
+
+Accepted events **SHOULD** be routed once against the active valid config version.
+
+Armature v0.3 **MUST NOT** automatically replay historical events to newly added or changed tasks.
+
+Armature v0.3 **MUST NOT** provide durable promise, subscription cursor, distributed queue, or exactly-once delivery semantics.
+
+If the daemon is not running, `armature emit` **SHOULD** fail clearly rather than silently buffering events for later routing.
+
+If future versions add offline event insertion, replay, or subscriptions, those behaviors **MUST** be explicit and inspectable.
+
+Event-triggered tasks therefore have local, daemon-mediated, at-most-once routing for each accepted event and active config version. User code owns semantic deduplication and recovery.
+
 ---
 
 ## 11. Run
@@ -343,6 +388,17 @@ timed_out
 ```
 
 A run is a mechanical execution record. It is not a semantic workflow node.
+
+For v0.3, each OS process spawn **SHOULD** create one run record.
+
+Mechanical restarts **SHOULD** create new run records linked to the original run through explicit lineage metadata such as:
+
+```text
+restartOf
+attempt
+```
+
+Logs remain per run. Armature **SHOULD NOT** merge logs from multiple restart attempts into one inseparable log stream.
 
 ---
 
@@ -408,6 +464,17 @@ armature ps --json
 ```
 
 Runtime state is daemon-owned. Workflow meta-state is user-owned.
+
+For services, runtime status **SHOULD** distinguish at least:
+
+```text
+configured state
+user override state
+observed process state
+supervision state
+```
+
+These are mechanical desired-state facts. They do not describe domain progress.
 
 ---
 
@@ -992,6 +1059,28 @@ Armature does not know what `branch:main` means. It only provides atomic exclusi
 
 Armature **MUST NOT** implicitly lock based on task names, event types, files, branches, agents, or payload fields.
 
+### 24.1 Lock Ownership
+
+Named locks **SHOULD** have explicit mechanical ownership.
+
+Recommended owner fields:
+
+```text
+lock name
+owner run id, if acquired by a run
+owner process id, if known
+acquired time
+optional lease expiration
+```
+
+If a lock is acquired by a run and that run exits, Armature **SHOULD** release the lock automatically.
+
+If a lock is acquired outside a run, Armature **SHOULD** either require an explicit lease duration or mark the lock as manually owned and inspectable.
+
+Armature **SHOULD** expose held locks through a CLI or status interface.
+
+Armature **MUST NOT** infer stale locks from domain concepts. Staleness, if implemented, is based only on mechanical facts such as owner process death or lease expiration.
+
 ---
 
 ## 25. Event Emission
@@ -1095,6 +1184,38 @@ Armature must not infer:
 review workflow is incomplete; launch fixer
 ```
 
+### 27.1 Service Desired State
+
+Armature v0.3 **SHOULD** model service reconciliation with a small desired-state contract.
+
+At minimum, a service has:
+
+```text
+configured enabled state
+user override state
+observed process state
+```
+
+Recommended user override states:
+
+```text
+none
+stopped
+starting
+```
+
+A service declared enabled in config with no user override should converge toward running.
+
+`armature service stop <name>` **SHOULD** set a user override that prevents automatic restart until the user clears it with `armature service start <name>`, `armature service restart <name>`, or an explicit project lifecycle command that documents override clearing.
+
+`armature up` **SHOULD** clear service stop overrides by default and reconcile enabled services.
+
+`armature down` **SHOULD** stop services as part of project shutdown without treating those stops as per-service user overrides.
+
+Config reload **SHOULD NOT** clear a user stop override by default.
+
+This prevents accidental restart loops while keeping the normal project lifecycle simple.
+
 ---
 
 ## 28. Runtime Status
@@ -1184,6 +1305,8 @@ activate schedules
 begin accepting events
 ```
 
+`armature up` is a project lifecycle command. It **SHOULD** reconcile the project toward the active config, including clearing per-service stop overrides unless an implementation documents a stricter option.
+
 ### 29.2 `armature down`
 
 `armature down` **SHOULD**:
@@ -1206,6 +1329,35 @@ armature down --leave-runs
 ```
 
 Lifecycle commands are runtime control-plane actions. They are not workflow transitions.
+
+### 29.3 `armature dev`
+
+`armature dev` **SHOULD** run the daemon in the foreground for the current workspace.
+
+Foreground dev mode **SHOULD** use the same config validation, event log, run records, and process supervision semantics as the background daemon.
+
+Only one daemon instance **SHOULD** manage a workspace at a time. If another daemon already owns the workspace lock, `armature dev` **SHOULD** fail clearly or offer an explicit takeover option.
+
+On Ctrl-C or normal terminal termination, `armature dev` **SHOULD** perform graceful shutdown equivalent to `armature down --graceful`.
+
+If graceful shutdown times out, the implementation **MAY** terminate remaining child process groups mechanically.
+
+### 29.4 Command Names
+
+Armature command names **SHOULD** keep project lifecycle separate from service lifecycle.
+
+Recommended meanings:
+
+```text
+armature up                 start/reconcile the project runtime
+armature down               stop the project runtime
+armature restart            down then up
+armature service start      clear stop override and start one service
+armature service stop       stop one service and set stop override
+armature service restart    restart one service and clear stop override
+```
+
+Bare `armature start` and `armature stop` **SHOULD** either be omitted or documented aliases for `armature up` and `armature down`.
 
 ---
 
@@ -1482,8 +1634,6 @@ armature init
 armature dev
 armature up
 armature down
-armature start
-armature stop
 armature restart
 armature status
 armature ps
@@ -1504,6 +1654,8 @@ Optional but recommended:
 armature events
 armature sources
 armature plan
+armature start
+armature stop
 armature lock acquire <name>
 armature lock release <name>
 armature service restart <name>
@@ -1530,6 +1682,10 @@ new task runs use the new config
 service reconciliation occurs after valid reload
 each run records the config version it started under
 ```
+
+A config version **SHOULD** be a stable content-derived identifier or monotonically increasing daemon-local revision recorded in run and event metadata.
+
+Config versioning is for mechanical inspection and reconciliation only. It does not imply semantic workflow versioning.
 
 A bad config **MUST NOT** crash the daemon.
 
@@ -1967,4 +2123,3 @@ orchestrate
 One sentence:
 
 **Armature is a small local daemon for reliably invoking, supervising, reconciling, and inspecting ordinary user programs in response to events, while leaving all orchestration semantics in normal user code.**
-
