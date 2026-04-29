@@ -1,8 +1,5 @@
-.DS_Store
-node_modules/
-dist/
-build/
 target/
-.env
-.env.*
+dist/
+node_modules/
+.DS_Store
 

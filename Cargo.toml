@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/armature-cli",
+    "crates/armature-core",
+    "crates/armature-daemon",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+clap = { version = "4.5.39", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+thiserror = "2.0.17"
+ulid = "1.2.1"
+
