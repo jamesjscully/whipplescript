@@ -588,6 +588,146 @@ fn lock_fencing_tokens_are_enforced_from_the_cli() {
 }
 
 #[test]
+fn lock_recovery_and_with_lock() {
+    let sandbox = Sandbox::new(
+        r#"
+        [[task]]
+        name = "noop"
+        run = "true"
+        "#,
+    );
+
+    sandbox.ok(["up"]);
+
+    let expired = sandbox.json([
+        "--format",
+        "json",
+        "lock",
+        "acquire",
+        "recoverable",
+        "--ttl",
+        "100ms",
+        "--reason",
+        "stale holder",
+    ]);
+    let expired_token = expired["token"]
+        .as_str()
+        .expect("expired token")
+        .to_string();
+    thread::sleep(Duration::from_millis(150));
+
+    let expired_locks = sandbox.json(["--format", "json", "lock", "list", "--expired"]);
+    assert!(expired_locks.as_array().unwrap().iter().any(|lock| {
+        lock["name"] == "recoverable" && lock["token"].as_str() == Some(expired_token.as_str())
+    }));
+
+    let current = sandbox.json([
+        "--format",
+        "json",
+        "lock",
+        "acquire",
+        "recoverable",
+        "--ttl",
+        "5s",
+        "--reason",
+        "new holder",
+    ]);
+    let current_token = current["token"]
+        .as_str()
+        .expect("current token")
+        .to_string();
+    assert_ne!(expired_token, current_token);
+    assert_contains_stderr(
+        sandbox.err([
+            "lock",
+            "release",
+            "recoverable",
+            "--token",
+            expired_token.as_str(),
+        ]),
+        "different token",
+    );
+
+    let shown = sandbox.json(["--format", "json", "lock", "show", "recoverable"]);
+    assert_eq!(shown["token"], current_token);
+    assert_eq!(shown["reason"], "new holder");
+
+    let forced = sandbox.json([
+        "--format",
+        "json",
+        "lock",
+        "force-release",
+        "recoverable",
+        "--reason",
+        "operator recovery",
+    ]);
+    assert_eq!(forced["forced"], true);
+    assert_eq!(forced["released"]["token"], current_token);
+    assert!(sandbox
+        .json(["--format", "json", "lock", "status"])
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let audit_events = sandbox.json([
+        "events",
+        "--json",
+        "--type",
+        "lock.force_released",
+        "--correlation",
+        "recoverable",
+    ]);
+    assert!(audit_events.as_array().unwrap().iter().any(|event| {
+        event["source"] == "lock"
+            && event["payload"]["reason"] == "operator recovery"
+            && event["payload"]["token"] == current_token
+    }));
+
+    sandbox.ok([
+        "lock",
+        "with",
+        "wrapped",
+        "--ttl",
+        "5s",
+        "--reason",
+        "critical section",
+        "--",
+        "sh",
+        "-c",
+        "printf '%s:%s' \"$ARMATURE_LOCK_NAME\" \"$ARMATURE_LOCK_TOKEN\" > with-lock.txt",
+    ]);
+    let wrapped = sandbox.read("with-lock.txt");
+    assert!(wrapped.starts_with("wrapped:lock_"));
+    assert!(sandbox
+        .json(["--format", "json", "lock", "status"])
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let failed = sandbox.err([
+        "lock",
+        "with",
+        "wrapped",
+        "--ttl",
+        "5s",
+        "--reason",
+        "failing section",
+        "--",
+        "sh",
+        "-c",
+        "exit 7",
+    ]);
+    assert_eq!(failed.status.code(), Some(7));
+    assert!(sandbox
+        .json(["--format", "json", "lock", "status"])
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    sandbox.ok(["down"]);
+}
+
+#[test]
 fn object_cli_aliases() {
     let sandbox = Sandbox::new(
         r#"

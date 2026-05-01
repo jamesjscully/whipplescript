@@ -54,6 +54,11 @@ pub enum DaemonRequest {
         name: String,
         token: String,
     },
+    LockForceRelease {
+        name: String,
+        reason: String,
+        requested_by_pid: u32,
+    },
     LockStatus,
     ServiceStart {
         name: String,
@@ -148,5 +153,6 @@ pub enum ResponsePayload {
     StartedRun { run_id: RunId },
     LockAcquired { lock: ManualLockRecord },
     LockRenewed { lock: ManualLockRecord },
+    LockForceReleased { lock: ManualLockRecord },
     Locks { locks: Vec<ManualLockRecord> },
 }

@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc;
@@ -602,7 +602,10 @@ enum LockCommand {
     Acquire(LockAcquireArgs),
     Renew(LockRenewArgs),
     Release(LockNameArgs),
+    ForceRelease(LockForceReleaseArgs),
+    Show(LockShowArgs),
     List(LockListArgs),
+    With(LockWithArgs),
     Status,
 }
 
@@ -610,6 +613,11 @@ enum LockCommand {
 struct LockListArgs {
     #[arg(long, default_value_t = false)]
     expired: bool,
+}
+
+#[derive(Debug, Args)]
+struct LockShowArgs {
+    name: String,
 }
 
 #[derive(Debug, Args)]
@@ -635,6 +643,24 @@ struct LockNameArgs {
     name: String,
     #[arg(long)]
     token: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct LockForceReleaseArgs {
+    name: String,
+    #[arg(long)]
+    reason: String,
+}
+
+#[derive(Debug, Args)]
+struct LockWithArgs {
+    name: String,
+    #[arg(long)]
+    ttl: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(required = true, num_args = 1.., allow_hyphen_values = true, trailing_var_arg = true)]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2012,6 +2038,34 @@ fn lock_command(
                 "lock released",
             )
         }
+        LockCommand::ForceRelease(args) => {
+            if args.reason.trim().is_empty() {
+                return Err(ArmatureError::invalid_input(
+                    "lock force-release requires a non-empty --reason",
+                ));
+            }
+            let lock = client.force_release_lock(args.name.clone(), args.reason.clone())?;
+            print_data(
+                format,
+                &json!({
+                    "forced": true,
+                    "name": args.name,
+                    "reason": args.reason,
+                    "released": lock,
+                }),
+                "lock force-released",
+            )
+        }
+        LockCommand::Show(args) => {
+            let lock = client
+                .locks()?
+                .into_iter()
+                .find(|lock| lock.name == args.name)
+                .ok_or_else(|| {
+                    ArmatureError::not_found(format!("lock {:?} is not held", args.name))
+                })?;
+            print_lock_show(format, &lock)
+        }
         LockCommand::List(args) => {
             let locks = if args.expired {
                 list_expired_locks(&workspace)?
@@ -2020,11 +2074,26 @@ fn lock_command(
             };
             print_lock_list(format, &locks)
         }
+        LockCommand::With(args) => lock_with(&client, args, format),
         LockCommand::Status => {
             let locks = client.locks()?;
             print_lock_list(format, &locks)
         }
     }
+}
+
+fn print_lock_show(format: OutputFormat, lock: &ManualLockRecord) -> ArmatureResult<()> {
+    let text = format!(
+        "{}\nowner {}\npid {}\nexpires_at {}\nreason {}",
+        lock.name,
+        lock.owner_id,
+        lock.owner_pid,
+        lock.expires_at_ms
+            .map(timestamp_text)
+            .unwrap_or_else(|| "none".to_string()),
+        lock.reason.as_deref().unwrap_or("")
+    );
+    print_data(format, lock, &text)
 }
 
 fn print_lock_list(format: OutputFormat, locks: &[ManualLockRecord]) -> ArmatureResult<()> {
@@ -2049,6 +2118,70 @@ fn print_lock_list(format: OutputFormat, locks: &[ManualLockRecord]) -> Armature
             .join("\n")
     };
     print_data(format, &locks, &text)
+}
+
+fn lock_with(
+    client: &DaemonClient,
+    args: LockWithArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let ttl = parse_duration(&args.ttl)?;
+    if args.reason.trim().is_empty() {
+        return Err(ArmatureError::invalid_input(
+            "lock with requires a non-empty --reason",
+        ));
+    }
+    let lock = client.acquire_lock(args.name.clone(), ttl, Some(args.reason.clone()))?;
+    let status = run_locked_command(&args.command, &lock);
+    let release_result = client.release_lock(&args.name, lock.token.clone());
+    match (status, release_result) {
+        (Ok(status), Ok(())) if status.success() => print_data(
+            format,
+            &json!({
+                "name": args.name,
+                "released": true,
+                "exit_code": status.code(),
+                "signal": status.signal(),
+            }),
+            "lock released",
+        ),
+        (Ok(status), Ok(())) => {
+            if let Some(code) = status.code() {
+                std::process::exit(code);
+            }
+            std::process::exit(128 + status.signal().unwrap_or(1));
+        }
+        (Ok(status), Err(error)) if status.success() => Err(error),
+        (Ok(status), Err(error)) => {
+            eprintln!("{error}");
+            if let Some(code) = status.code() {
+                std::process::exit(code);
+            }
+            std::process::exit(128 + status.signal().unwrap_or(1));
+        }
+        (Err(error), release_result) => {
+            if let Err(release_error) = release_result {
+                eprintln!("{release_error}");
+            }
+            Err(error)
+        }
+    }
+}
+
+fn run_locked_command(
+    command: &[String],
+    lock: &ManualLockRecord,
+) -> ArmatureResult<std::process::ExitStatus> {
+    let Some((program, args)) = command.split_first() else {
+        return Err(ArmatureError::invalid_input("lock with requires a command"));
+    };
+    ProcessCommand::new(program)
+        .args(args)
+        .env("ARMATURE_LOCK_NAME", &lock.name)
+        .env("ARMATURE_LOCK_TOKEN", &lock.token)
+        .env("ARMATURE_LOCK_OWNER_ID", &lock.owner_id)
+        .status()
+        .map_err(|error| ArmatureError::internal(format!("failed to run locked command: {error}")))
 }
 
 fn list_expired_locks(workspace: &Workspace) -> ArmatureResult<Vec<ManualLockRecord>> {

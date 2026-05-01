@@ -306,6 +306,23 @@ impl DaemonClient {
         })
     }
 
+    pub fn force_release_lock(
+        &self,
+        name: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> ArmatureResult<ManualLockRecord> {
+        match self.send(DaemonRequest::LockForceRelease {
+            name: name.into(),
+            reason: reason.into(),
+            requested_by_pid: std::process::id(),
+        })? {
+            ResponsePayload::LockForceReleased { lock } => Ok(lock),
+            _ => Err(ArmatureError::internal(
+                "unexpected lock force-release response",
+            )),
+        }
+    }
+
     pub fn locks(&self) -> ArmatureResult<Vec<ManualLockRecord>> {
         match self.send(DaemonRequest::LockStatus)? {
             ResponsePayload::Locks { locks } => Ok(locks),
@@ -671,6 +688,28 @@ impl Runtime {
                     .release(&name, &token)?;
                 Ok(ResponsePayload::Empty)
             }
+            DaemonRequest::LockForceRelease {
+                name,
+                reason,
+                requested_by_pid,
+            } => {
+                let lock =
+                    ManualLockStore::new(self.runtime_paths.state_root().join(LOCKS_DIR_NAME))
+                        .force_release(&name)?;
+                self.record_lock_audit_event(
+                    "lock.force_released",
+                    &lock,
+                    json!({
+                        "name": lock.name,
+                        "token": lock.token,
+                        "owner_id": lock.owner_id,
+                        "owner_pid": lock.owner_pid,
+                        "reason": reason,
+                        "requested_by_pid": requested_by_pid,
+                    }),
+                )?;
+                Ok(ResponsePayload::LockForceReleased { lock })
+            }
             DaemonRequest::LockStatus => {
                 let locks =
                     ManualLockStore::new(self.runtime_paths.state_root().join(LOCKS_DIR_NAME))
@@ -887,6 +926,27 @@ impl Runtime {
         self.store.record_event(&event)?;
         let _ = self.route_event(event, RouteTarget::AllMatching)?;
         Ok(())
+    }
+
+    fn record_lock_audit_event(
+        &self,
+        event_type: &str,
+        lock: &ManualLockRecord,
+        payload: Value,
+    ) -> ArmatureResult<()> {
+        let event = EventRecord {
+            id: EventId::new(),
+            event_type: event_type.to_string(),
+            time: Utc::now().to_rfc3339(),
+            payload,
+            routing: EventRouting::Manual,
+            config_version: Some(self.config.version.clone()),
+            source: Some("lock".to_string()),
+            source_run_id: None,
+            parent_event_id: None,
+            correlation_id: Some(lock.name.clone()),
+        };
+        self.store.record_event(&event)
     }
 
     fn reload_config(&mut self) -> ArmatureResult<()> {
@@ -1877,6 +1937,7 @@ fn request_allowed_during_shutdown(request: &DaemonRequest) -> bool {
             | DaemonRequest::Runs
             | DaemonRequest::LockRenew { .. }
             | DaemonRequest::LockRelease { .. }
+            | DaemonRequest::LockForceRelease { .. }
             | DaemonRequest::LockStatus
             | DaemonRequest::Shutdown
     )

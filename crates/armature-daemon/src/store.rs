@@ -141,6 +141,13 @@ impl ManualLockStore {
         Ok(())
     }
 
+    pub fn force_release(&self, name: &str) -> ArmatureResult<ManualLockRecord> {
+        let path = self.lock_file_path(name);
+        let record = self.read_lock_record(&path, name)?;
+        fs::remove_file(path)?;
+        Ok(record)
+    }
+
     pub fn list(&self) -> ArmatureResult<Vec<ManualLockRecord>> {
         let mut locks = Vec::new();
         if !self.lock_dir.exists() {
@@ -181,6 +188,22 @@ impl ManualLockStore {
         Ok(record)
     }
 
+    fn read_lock_record(&self, path: &Path, name: &str) -> ArmatureResult<ManualLockRecord> {
+        if !path.exists() {
+            return Err(ArmatureError::not_found(format!(
+                "lock {:?} is not held",
+                name
+            )));
+        }
+        let raw = fs::read(path)?;
+        let mut record: ManualLockRecord = serde_json::from_slice(&raw)
+            .map_err(|error| ArmatureError::internal(format!("invalid lock record: {error}")))?;
+        if record.owner_id.is_empty() {
+            record.owner_id = format!("pid:{}", record.owner_pid);
+        }
+        Ok(record)
+    }
+
     fn write_new_lock(&self, path: &Path, record: &ManualLockRecord) -> ArmatureResult<()> {
         let contents = serde_json::to_vec_pretty(record)
             .map_err(|error| ArmatureError::internal(error.to_string()))?;
@@ -211,12 +234,7 @@ impl ManualLockStore {
         if !path.exists() {
             return Ok(None);
         }
-        let raw = fs::read(path)?;
-        let mut record: ManualLockRecord = serde_json::from_slice(&raw)
-            .map_err(|error| ArmatureError::internal(format!("invalid lock record: {error}")))?;
-        if record.owner_id.is_empty() {
-            record.owner_id = format!("pid:{}", record.owner_pid);
-        }
+        let record = self.read_lock_record(path, "")?;
         if lock_is_stale(&record) {
             let _ = fs::remove_file(path);
             return Ok(None);

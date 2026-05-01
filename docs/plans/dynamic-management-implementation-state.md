@@ -29,7 +29,7 @@ this file for design expansion; the authoritative design remains in:
 | object-cli | done | `armature-dynamic-object-cli` | Codex | Pushed `d47985d`; integrated into primary checkout; checks: `cargo test -p armature-cli --bin armature`, `cargo test -p armature-cli --test e2e`. |
 | query-wait | done | `armature-dynamic-query-wait` | Codex | Added filters, wait commands, subscribe streams, and e2e observation coverage. |
 | adhoc-run | done | `armature-dynamic-adhoc-run` | Codex | Added tracked ad hoc `run start` / `exec`; checks: `cargo test -p armature-cli --test e2e adhoc_run_is_tracked_and_cancelable`; `cargo test`. |
-| locks | pending | `armature-dynamic-locks` | - | Add force-release, show/list filters, `lock with`, and recovery audit. |
+| locks | in_progress | `armature-dynamic-locks` | Codex | Add force-release, show/list filters, `lock with`, and recovery audit. |
 | dynamic-services | pending | `armature-dynamic-services` | - | Add ephemeral dynamic service definitions. |
 | dynamic-tasks | pending | `armature-dynamic-tasks` | - | Add ephemeral dynamic task definitions. |
 | sdk-docs | pending | `armature-dynamic-sdk-docs` | - | Align SDK and docs after CLI/runtime behavior stabilizes. |
@@ -67,7 +67,8 @@ adhoc_run_is_tracked_and_cancelable`; `cargo test`.
 
 ### locks
 
-Pending.
+In progress. Slice is based on `origin/armature-dynamic-adhoc-run` so prior
+dynamic CLI/query/run prerequisites are present.
 
 ### dynamic-services
 
