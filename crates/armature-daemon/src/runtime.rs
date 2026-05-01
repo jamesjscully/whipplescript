@@ -99,7 +99,7 @@ impl DaemonServer {
             result
         });
 
-        wait_for_socket(&handle_socket_path, Duration::from_secs(1))?;
+        wait_for_socket(&handle_socket_path, Duration::from_secs(3))?;
 
         Ok(DaemonHandle {
             socket_path: handle_socket_path,

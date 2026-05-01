@@ -1,5 +1,6 @@
+use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self};
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -8,8 +9,8 @@ use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use armature_core::{
-    load_workspace_config, resolve_workspace, ArmatureConfig, ArmatureError, ArmatureResult, RunId,
-    Workspace, WorkspaceRuntimePaths, CONFIG_DIR_NAME, CONFIG_FILE_NAME,
+    load_workspace_config, resolve_workspace, ArmatureConfig, ArmatureError, ArmatureResult,
+    ProcessState, RunId, Workspace, WorkspaceRuntimePaths, CONFIG_DIR_NAME, CONFIG_FILE_NAME,
 };
 use armature_daemon::{
     store::SqliteStore, DaemonClient, DaemonServer, InspectResponse, RuntimeServiceStatus,
@@ -78,8 +79,25 @@ enum Command {
     Up(UpArgs),
     Down,
     Restart(UpArgs),
-    Run(RunArgs),
+    Run {
+        #[command(subcommand)]
+        command: RunCommand,
+    },
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
     Emit(EmitArgs),
+    Event {
+        #[command(subcommand)]
+        command: EventCommand,
+    },
+    Events,
+    Trigger {
+        #[command(subcommand)]
+        command: TriggerCommand,
+    },
+    Triggers,
     Status,
     Ps,
     Tasks,
@@ -90,6 +108,10 @@ enum Command {
     },
     Runs,
     Logs(LogsArgs),
+    Log {
+        #[command(subcommand)]
+        command: LogCommand,
+    },
     Cancel(CancelArgs),
     Config {
         #[command(subcommand)]
@@ -115,8 +137,13 @@ impl Command {
             Self::Up(args) => up_workspace(workspace, args, format),
             Self::Down => down_workspace(workspace, format),
             Self::Restart(args) => restart_workspace(workspace, args, format),
-            Self::Run(args) => run_task(workspace, args, format),
+            Self::Run { command } => run_command(workspace, command, format),
+            Self::Task { command } => task_command(workspace, command, format),
             Self::Emit(args) => emit_event(workspace, args, format),
+            Self::Event { command } => event_command(workspace, command, format),
+            Self::Events => events_workspace(workspace, format),
+            Self::Trigger { command } => trigger_command(workspace, command, format),
+            Self::Triggers => triggers_workspace(workspace, format),
             Self::Status => status_workspace(workspace, format),
             Self::Ps => ps_workspace(workspace, format),
             Self::Tasks => tasks_workspace(workspace, format),
@@ -124,6 +151,7 @@ impl Command {
             Self::Service { command } => service_command(workspace, command, format),
             Self::Runs => runs_workspace(workspace, format),
             Self::Logs(args) => logs_workspace(workspace, args, format),
+            Self::Log { command } => log_command(workspace, command, format),
             Self::Cancel(args) => cancel_run(workspace, args, format),
             Self::Config { command } => command.execute(workspace, format),
             Self::Doctor => doctor_workspace(workspace, format),
@@ -271,6 +299,35 @@ struct UpArgs {
 #[derive(Debug, Args)]
 struct RunArgs {
     task_name: String,
+    #[arg(long)]
+    correlation: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskCommand {
+    List,
+    Show(TaskNameArgs),
+    Run(RunArgs),
+}
+
+#[derive(Debug, Args)]
+struct TaskNameArgs {
+    name: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum RunCommand {
+    List,
+    Show(RunShowArgs),
+    Logs(LogsArgs),
+    Cancel(CancelArgs),
+    #[command(external_subcommand)]
+    TaskAlias(Vec<OsString>),
+}
+
+#[derive(Debug, Args)]
+struct RunShowArgs {
+    run_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -280,8 +337,35 @@ struct EmitArgs {
     json: Option<String>,
 }
 
+#[derive(Debug, Subcommand)]
+enum EventCommand {
+    List,
+    Show(EventShowArgs),
+    Emit(EmitArgs),
+}
+
+#[derive(Debug, Args)]
+struct EventShowArgs {
+    event_id: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum TriggerCommand {
+    List,
+    Show(TriggerShowArgs),
+}
+
+#[derive(Debug, Args)]
+struct TriggerShowArgs {
+    trigger_id: String,
+}
+
 #[derive(Debug, Args)]
 struct LogsArgs {
+    #[arg(long, value_name = "LINES")]
+    tail: Option<usize>,
+    #[arg(long, default_value_t = false)]
+    follow: bool,
     run_id: String,
 }
 
@@ -297,6 +381,8 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
+    List,
+    Show(ServiceNameArgs),
     Start(ServiceNameArgs),
     Stop(ServiceNameArgs),
     Restart(ServiceNameArgs),
@@ -324,6 +410,25 @@ struct LockAcquireArgs {
 #[derive(Debug, Args)]
 struct LockNameArgs {
     name: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum LogCommand {
+    Show(LogsArgs),
+    Tail(LogTailArgs),
+    Follow(LogFollowArgs),
+}
+
+#[derive(Debug, Args)]
+struct LogTailArgs {
+    run_id: String,
+    #[arg(long, value_name = "LINES", default_value_t = 100)]
+    lines: usize,
+}
+
+#[derive(Debug, Args)]
+struct LogFollowArgs {
+    run_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -649,6 +754,61 @@ fn restart_workspace(
     up_workspace(Some(workspace.root().to_path_buf()), args, format)
 }
 
+fn task_command(
+    workspace_arg: Option<PathBuf>,
+    command: TaskCommand,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    match command {
+        TaskCommand::List => tasks_workspace(workspace_arg, format),
+        TaskCommand::Show(args) => task_show(workspace_arg, args, format),
+        TaskCommand::Run(args) => run_task(workspace_arg, args, format),
+    }
+}
+
+fn run_command(
+    workspace_arg: Option<PathBuf>,
+    command: RunCommand,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    match command {
+        RunCommand::List => runs_workspace(workspace_arg, format),
+        RunCommand::Show(args) => run_show(workspace_arg, args, format),
+        RunCommand::Logs(args) => logs_workspace(workspace_arg, args, format),
+        RunCommand::Cancel(args) => cancel_run(workspace_arg, args, format),
+        RunCommand::TaskAlias(raw) => run_task(workspace_arg, parse_run_alias(raw)?, format),
+    }
+}
+
+fn parse_run_alias(raw: Vec<OsString>) -> ArmatureResult<RunArgs> {
+    let mut values = raw.into_iter();
+    let task_name = values
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(|| ArmatureError::invalid_input("expected task name"))?;
+    let mut correlation = None;
+    while let Some(value) = values.next() {
+        let value = value
+            .into_string()
+            .map_err(|_| ArmatureError::invalid_input("invalid run argument"))?;
+        if value == "--correlation" {
+            let next = values
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| ArmatureError::invalid_input("--correlation requires a value"))?;
+            correlation = Some(next);
+        } else {
+            return Err(ArmatureError::invalid_input(format!(
+                "unknown run alias argument {value:?}"
+            )));
+        }
+    }
+    Ok(RunArgs {
+        task_name,
+        correlation,
+    })
+}
+
 fn run_task(
     workspace_arg: Option<PathBuf>,
     args: RunArgs,
@@ -688,6 +848,29 @@ fn emit_event(
         }),
         "event emitted",
     )
+}
+
+fn event_command(
+    workspace_arg: Option<PathBuf>,
+    command: EventCommand,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    match command {
+        EventCommand::List => events_workspace(workspace_arg, format),
+        EventCommand::Show(args) => event_show(workspace_arg, args, format),
+        EventCommand::Emit(args) => emit_event(workspace_arg, args, format),
+    }
+}
+
+fn trigger_command(
+    workspace_arg: Option<PathBuf>,
+    command: TriggerCommand,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    match command {
+        TriggerCommand::List => triggers_workspace(workspace_arg, format),
+        TriggerCommand::Show(args) => trigger_show(workspace_arg, args, format),
+    }
 }
 
 fn status_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> ArmatureResult<()> {
@@ -760,6 +943,28 @@ fn tasks_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> Arma
     print_data(format, &tasks, &text)
 }
 
+fn task_show(
+    workspace_arg: Option<PathBuf>,
+    args: TaskNameArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let config = load_workspace_config(&workspace)?;
+    let inspect = daemon_client(&workspace).inspect().ok();
+    let task = build_task_views(&config, inspect.as_ref())
+        .into_iter()
+        .find(|task| task.name == args.name)
+        .ok_or_else(|| ArmatureError::not_found(format!("task {:?} was not found", args.name)))?;
+    let text = format!(
+        "{}\nrun {}\nadmission {}\nactive_runs {}",
+        task.name,
+        task.run,
+        task.admission,
+        task.active_run_ids.len()
+    );
+    print_data(format, &task, &text)
+}
+
 fn services_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> ArmatureResult<()> {
     let workspace = resolve_workspace_arg(workspace_arg)?;
     let config = load_workspace_config(&workspace)?;
@@ -785,14 +990,44 @@ fn services_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> A
     print_data(format, &services, &text)
 }
 
+fn service_show(
+    workspace_arg: Option<PathBuf>,
+    args: ServiceNameArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let config = load_workspace_config(&workspace)?;
+    let inspect = daemon_client(&workspace).inspect().ok();
+    let service = build_service_views(&config, inspect.as_ref())
+        .into_iter()
+        .find(|service| service.name == args.name)
+        .ok_or_else(|| {
+            ArmatureError::not_found(format!("service {:?} was not found", args.name))
+        })?;
+    let text = format!(
+        "{}\nrun {}\nenabled {}\nstate {}",
+        service.name,
+        service.run,
+        service.enabled,
+        service.state.as_deref().unwrap_or("not_running")
+    );
+    print_data(format, &service, &text)
+}
+
 fn service_command(
     workspace_arg: Option<PathBuf>,
     command: ServiceCommand,
     format: OutputFormat,
 ) -> ArmatureResult<()> {
+    match command {
+        ServiceCommand::List => return services_workspace(workspace_arg, format),
+        ServiceCommand::Show(args) => return service_show(workspace_arg, args, format),
+        _ => {}
+    }
     let workspace = resolve_workspace_arg(workspace_arg)?;
     let client = daemon_client(&workspace);
     let (name, action) = match command {
+        ServiceCommand::List | ServiceCommand::Show(_) => unreachable!(),
         ServiceCommand::Start(args) => {
             client.service_start(args.name.clone())?;
             (args.name, "started")
@@ -814,6 +1049,97 @@ fn service_command(
         }),
         &format!("service {} {}", name, action),
     )
+}
+
+fn events_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let store = SqliteStore::open(&workspace)?;
+    let events = store.list_events()?;
+    let text = if events.is_empty() {
+        "no events recorded".to_string()
+    } else {
+        events
+            .iter()
+            .map(|event| {
+                format!(
+                    "{}\t{}\t{}",
+                    event.id.as_str(),
+                    event.event_type,
+                    event.source.as_deref().unwrap_or("unknown")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    print_data(format, &events, &text)
+}
+
+fn event_show(
+    workspace_arg: Option<PathBuf>,
+    args: EventShowArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let event_id = armature_core::EventId::parse(args.event_id)?;
+    let store = SqliteStore::open(&workspace)?;
+    let event = store.get_event(&event_id)?.ok_or_else(|| {
+        ArmatureError::not_found(format!("event {} was not found", event_id.as_str()))
+    })?;
+    let text = format!(
+        "{}\t{}\t{}",
+        event.id.as_str(),
+        event.event_type,
+        event.source.as_deref().unwrap_or("unknown")
+    );
+    print_data(format, &event, &text)
+}
+
+fn triggers_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let store = SqliteStore::open(&workspace)?;
+    let triggers = store.list_triggers()?;
+    let text = if triggers.is_empty() {
+        "no triggers recorded".to_string()
+    } else {
+        triggers
+            .iter()
+            .map(|trigger| {
+                format!(
+                    "{}\t{}\t{}\t{:?}",
+                    trigger.id.as_str(),
+                    trigger.task_name,
+                    trigger.event_type,
+                    trigger.outcome
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    print_data(format, &triggers, &text)
+}
+
+fn trigger_show(
+    workspace_arg: Option<PathBuf>,
+    args: TriggerShowArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let store = SqliteStore::open(&workspace)?;
+    let triggers = store.list_triggers()?;
+    let trigger = triggers
+        .into_iter()
+        .find(|trigger| trigger.id.as_str() == args.trigger_id)
+        .ok_or_else(|| {
+            ArmatureError::not_found(format!("trigger {:?} was not found", args.trigger_id))
+        })?;
+    let text = format!(
+        "{}\t{}\t{}\t{:?}",
+        trigger.id.as_str(),
+        trigger.task_name,
+        trigger.event_type,
+        trigger.outcome
+    );
+    print_data(format, &trigger, &text)
 }
 
 fn runs_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> ArmatureResult<()> {
@@ -839,19 +1165,43 @@ fn runs_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> Armat
     print_data(format, &runs, &text)
 }
 
+fn run_show(
+    workspace_arg: Option<PathBuf>,
+    args: RunShowArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let run_id = RunId::parse(args.run_id)?;
+    let store = SqliteStore::open(&workspace)?;
+    let run = store.get_run(&run_id)?.ok_or_else(|| {
+        ArmatureError::not_found(format!("run {} was not found", run_id.as_str()))
+    })?;
+    let text = format!(
+        "{}\t{}\t{:?}\t{:?}",
+        run.id.as_str(),
+        run.name,
+        run.origin,
+        run.state
+    );
+    print_data(format, &run, &text)
+}
+
 fn logs_workspace(
     workspace_arg: Option<PathBuf>,
     args: LogsArgs,
     format: OutputFormat,
 ) -> ArmatureResult<()> {
+    if args.follow {
+        return follow_logs_workspace(workspace_arg, args, format);
+    }
     let workspace = resolve_workspace_arg(workspace_arg)?;
     let run_id = RunId::parse(args.run_id)?;
     let store = SqliteStore::open(&workspace)?;
     let logs = store.get_logs(&run_id)?.ok_or_else(|| {
         ArmatureError::not_found(format!("logs for {} were not found", run_id.as_str()))
     })?;
-    let stdout = read_optional_file(Path::new(&logs.stdout_path))?;
-    let stderr = read_optional_file(Path::new(&logs.stderr_path))?;
+    let stdout = read_optional_log_file(Path::new(&logs.stdout_path), args.tail)?;
+    let stderr = read_optional_log_file(Path::new(&logs.stderr_path), args.tail)?;
     let output = LogsOutput {
         run_id: run_id.as_str().to_string(),
         stdout_path: logs.stdout_path.clone(),
@@ -864,6 +1214,77 @@ fn logs_workspace(
         output.stdout_path, output.stdout, output.stderr_path, output.stderr
     );
     print_data(format, &output, &text)
+}
+
+fn follow_logs_workspace(
+    workspace_arg: Option<PathBuf>,
+    args: LogsArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    if format == OutputFormat::Json {
+        return Err(ArmatureError::invalid_input(
+            "log follow streams text; omit --format json",
+        ));
+    }
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let run_id = RunId::parse(args.run_id)?;
+    let store = SqliteStore::open(&workspace)?;
+    let logs = store.get_logs(&run_id)?.ok_or_else(|| {
+        ArmatureError::not_found(format!("logs for {} were not found", run_id.as_str()))
+    })?;
+    let mut stdout_offset = 0;
+    let mut stderr_offset = 0;
+    loop {
+        stdout_offset = write_new_log_bytes(
+            Path::new(&logs.stdout_path),
+            stdout_offset,
+            &mut io::stdout(),
+        )?;
+        stderr_offset = write_new_log_bytes(
+            Path::new(&logs.stderr_path),
+            stderr_offset,
+            &mut io::stderr(),
+        )?;
+        let run = store.get_run(&run_id)?.ok_or_else(|| {
+            ArmatureError::not_found(format!("run {} was not found", run_id.as_str()))
+        })?;
+        if !matches!(
+            run.state,
+            ProcessState::Starting | ProcessState::Running | ProcessState::Stopping
+        ) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Ok(())
+}
+
+fn log_command(
+    workspace_arg: Option<PathBuf>,
+    command: LogCommand,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    match command {
+        LogCommand::Show(args) => logs_workspace(workspace_arg, args, format),
+        LogCommand::Tail(args) => logs_workspace(
+            workspace_arg,
+            LogsArgs {
+                run_id: args.run_id,
+                tail: Some(args.lines),
+                follow: false,
+            },
+            format,
+        ),
+        LogCommand::Follow(args) => logs_workspace(
+            workspace_arg,
+            LogsArgs {
+                run_id: args.run_id,
+                tail: None,
+                follow: true,
+            },
+            format,
+        ),
+    }
 }
 
 fn cancel_run(
@@ -1153,6 +1574,36 @@ fn read_optional_file(path: &Path) -> ArmatureResult<String> {
         Ok(contents) => Ok(contents),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
         Err(error) => Err(error.into()),
+    }
+}
+
+fn read_optional_log_file(path: &Path, tail: Option<usize>) -> ArmatureResult<String> {
+    let contents = read_optional_file(path)?;
+    if let Some(lines) = tail {
+        let mut selected = contents.lines().rev().take(lines).collect::<Vec<_>>();
+        selected.reverse();
+        Ok(selected.join("\n"))
+    } else {
+        Ok(contents)
+    }
+}
+
+fn write_new_log_bytes(
+    path: &Path,
+    offset: usize,
+    writer: &mut impl Write,
+) -> ArmatureResult<usize> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(offset),
+        Err(error) => return Err(error.into()),
+    };
+    if bytes.len() > offset {
+        writer.write_all(&bytes[offset..])?;
+        writer.flush()?;
+        Ok(bytes.len())
+    } else {
+        Ok(offset)
     }
 }
 
