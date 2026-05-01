@@ -1,40 +1,41 @@
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use armature_core::{
-    load_workspace_config, resolve_workspace, ArmatureConfig, ArmatureError, ArmatureResult, RunId,
-    Workspace, WorkspaceRuntimePaths, CONFIG_DIR_NAME, CONFIG_FILE_NAME,
+    load_workspace_config, resolve_workspace, ArmatureConfig, ArmatureError, ArmatureResult,
+    EventId, ProcessState, RunId, Workspace, WorkspaceRuntimePaths, CONFIG_DIR_NAME,
+    CONFIG_FILE_NAME,
 };
 use armature_daemon::{
-    store::SqliteStore, DaemonClient, DaemonServer, InspectResponse, RuntimeServiceStatus,
+    store::{EventFilter, RunFilter, SqliteStore, TriggerFilter},
+    DaemonClient, DaemonServer, InspectResponse, ManualLockRecord, RuntimeServiceStatus,
 };
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 const DETACHED_DAEMON_STDOUT: &str = "daemon.stdout.log";
 const DETACHED_DAEMON_STDERR: &str = "daemon.stderr.log";
-const LOCKS_DIR_NAME: &str = "locks";
-const LOCK_FILE_SUFFIX: &str = ".json";
 const INIT_TEMPLATE: &str = "# Armature v0.3 config\n#\n# Add tasks and services here.\n#\n# [[task]]\n# name = \"example\"\n# run = \"echo hello from armature\"\n";
 const RECIPE_FILE_WATCH_TESTS_CONFIG: &str = "# Armature v0.3 recipe: file-watch tests\n# Edit paths and commands to match your project.\n\n[[task]]\nname = \"test-on-change\"\nwatch = [\"src/**/*\", \"tests/**/*\"]\nrun = \"./scripts/run-tests.sh\"\n";
 const RECIPE_FILE_WATCH_TESTS_SCRIPT: &str = "#!/usr/bin/env sh\nset -eu\n\necho \"running project tests\"\n# Replace this placeholder with your real test command.\n# Examples: cargo test, npm test, pytest\nprintf '%s\\n' \"TODO: run your test command here\"\n";
 const RECIPE_SCHEDULED_STATUS_CONFIG: &str = "# Armature v0.3 recipe: scheduled status script\n# Replace the schedule and script body with your own status check.\n\n[[task]]\nname = \"scheduled-status\"\nschedule = \"*/15 * * * *\"\nrun = \"./scripts/scheduled-status.sh\"\n";
 const RECIPE_SCHEDULED_STATUS_SCRIPT: &str = "#!/usr/bin/env sh\nset -eu\n\nnow=$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")\necho \"status check at $now\"\n# Add whatever local inspection or reporting you need here.\n";
 const RECIPE_EVENT_SOURCE_SERVICE_CONFIG: &str = "# Armature v0.3 recipe: generic event source service\n# This service emits a mechanical event on a fixed loop.\n\n[[service]]\nname = \"generic-event-source\"\nrun = \"./sources/generic-event-source.sh\"\n\n[service.supervision]\nrestart = \"on_failure\"\nmax_restarts = 5\nwithin = \"1m\"\nbackoff = \"exponential\"\n";
-const RECIPE_EVENT_SOURCE_SERVICE_SCRIPT: &str = "#!/usr/bin/env sh\nset -eu\n\ninterval_seconds=\"${ARMATURE_EVENT_SOURCE_INTERVAL_SECONDS:-30}\"\n\necho \"generic event source started; interval=${interval_seconds}s\"\nwhile true; do\n  armature emit generic.event.tick --json \"$(date -u +'{\\\"emitted_at\\\":\\\"%Y-%m-%dT%H:%M:%SZ\\\",\\\"source\\\":\\\"generic-event-source\\\"}')\"\n  sleep \"$interval_seconds\"\ndone\n";
+const RECIPE_EVENT_SOURCE_SERVICE_SCRIPT: &str = "#!/usr/bin/env sh\nset -eu\n\ninterval_seconds=\"${ARMATURE_EVENT_SOURCE_INTERVAL_SECONDS:-30}\"\n\necho \"generic event source started; interval=${interval_seconds}s\"\nwhile true; do\n  armature emit generic.event.tick --source generic-event-source --json \"$(date -u +'{\\\"emitted_at\\\":\\\"%Y-%m-%dT%H:%M:%SZ\\\"}')\"\n  sleep \"$interval_seconds\"\ndone\n";
 const RECIPE_EVENT_HOOK_TASK_CONFIG: &str = "# Armature v0.3 recipe: event hook task\n# Emit `hook.example` to trigger this task.\n\n[[task]]\nname = \"event-hook\"\non = \"hook.example\"\nrun = \"./scripts/on-hook-event.sh\"\n";
 const RECIPE_EVENT_HOOK_TASK_SCRIPT: &str = "#!/usr/bin/env sh\nset -eu\n\necho \"received event: ${ARMATURE_EVENT_TYPE:-unknown}\"\necho \"payload: ${ARMATURE_EVENT_PAYLOAD_JSON:-null}\"\n# Extend this script with the local side effect you want.\n";
 const RECIPE_NAMED_LOCK_CONFIG: &str = "# Armature v0.3 recipe: explicit named lock example\n# This task acquires and releases a named lock itself.\n\n[[task]]\nname = \"with-named-lock\"\nrun = \"./scripts/with-named-lock.sh\"\n";
-const RECIPE_NAMED_LOCK_SCRIPT: &str = "#!/usr/bin/env sh\nset -eu\n\nlock_name=\"shared-resource\"\nacquired=0\ncleanup() {\n  if [ \"$acquired\" -eq 1 ]; then\n    armature lock release \"$lock_name\" >/dev/null\n  fi\n}\ntrap cleanup EXIT INT TERM\n\narmature lock acquire \"$lock_name\" --ttl 10m >/dev/null\nacquired=1\necho \"acquired lock: $lock_name\"\n# Put your critical section here.\nsleep 1\n";
+const RECIPE_NAMED_LOCK_SCRIPT: &str = "#!/usr/bin/env sh\nset -eu\n\nlock_name=\"shared-resource\"\nlock_token=\"\"\ncleanup() {\n  if [ -n \"$lock_token\" ]; then\n    armature lock release \"$lock_name\" --token \"$lock_token\" >/dev/null\n  fi\n}\ntrap cleanup EXIT INT TERM\n\nlock_token=$(armature --format json lock acquire \"$lock_name\" --ttl 10m --reason \"named-lock recipe\" | sed -n 's/.*\"token\": *\"\\([^\"]*\\)\".*/\\1/p')\necho \"acquired lock: $lock_name\"\n# Put your critical section here.\nsleep 1\n";
 
 fn main() {
     if let Err(error) = run() {
@@ -78,18 +79,47 @@ enum Command {
     Up(UpArgs),
     Down,
     Restart(UpArgs),
-    Run(RunArgs),
+    Run {
+        #[command(subcommand)]
+        command: RunCommand,
+    },
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
     Emit(EmitArgs),
-    Status,
-    Ps,
+    Event {
+        #[command(subcommand)]
+        command: EventCommand,
+    },
+    Events(EventsArgs),
+    Trigger {
+        #[command(subcommand)]
+        command: TriggerCommand,
+    },
+    Triggers(TriggersArgs),
+    Wait {
+        #[command(subcommand)]
+        command: WaitCommand,
+    },
+    Subscribe {
+        #[command(subcommand)]
+        command: SubscribeCommand,
+    },
+    Status(JsonOutputArgs),
+    Ps(JsonOutputArgs),
     Tasks,
-    Services,
+    Services(JsonOutputArgs),
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
     },
-    Runs,
+    Runs(RunsArgs),
     Logs(LogsArgs),
+    Log {
+        #[command(subcommand)]
+        command: LogCommand,
+    },
     Cancel(CancelArgs),
     Config {
         #[command(subcommand)]
@@ -115,15 +145,23 @@ impl Command {
             Self::Up(args) => up_workspace(workspace, args, format),
             Self::Down => down_workspace(workspace, format),
             Self::Restart(args) => restart_workspace(workspace, args, format),
-            Self::Run(args) => run_task(workspace, args, format),
+            Self::Run { command } => run_command(workspace, command, format),
+            Self::Task { command } => task_command(workspace, command, format),
             Self::Emit(args) => emit_event(workspace, args, format),
-            Self::Status => status_workspace(workspace, format),
-            Self::Ps => ps_workspace(workspace, format),
+            Self::Event { command } => event_command(workspace, command, format),
+            Self::Events(args) => events_workspace(workspace, args, format),
+            Self::Trigger { command } => trigger_command(workspace, command, format),
+            Self::Triggers(args) => triggers_workspace(workspace, args, format),
+            Self::Wait { command } => wait_command(workspace, command, format),
+            Self::Subscribe { command } => subscribe_command(workspace, command),
+            Self::Status(args) => status_workspace(workspace, args.apply(format)),
+            Self::Ps(args) => ps_workspace(workspace, args.apply(format)),
             Self::Tasks => tasks_workspace(workspace, format),
-            Self::Services => services_workspace(workspace, format),
+            Self::Services(args) => services_workspace(workspace, args.apply(format)),
             Self::Service { command } => service_command(workspace, command, format),
-            Self::Runs => runs_workspace(workspace, format),
+            Self::Runs(args) => runs_workspace(workspace, args, format),
             Self::Logs(args) => logs_workspace(workspace, args, format),
+            Self::Log { command } => log_command(workspace, command, format),
             Self::Cancel(args) => cancel_run(workspace, args, format),
             Self::Config { command } => command.execute(workspace, format),
             Self::Doctor => doctor_workspace(workspace, format),
@@ -271,17 +309,212 @@ struct UpArgs {
 #[derive(Debug, Args)]
 struct RunArgs {
     task_name: String,
+    #[arg(long)]
+    correlation: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskCommand {
+    List,
+    Show(TaskNameArgs),
+    Run(RunArgs),
 }
 
 #[derive(Debug, Args)]
+struct TaskNameArgs {
+    name: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum RunCommand {
+    List(RunsArgs),
+    Show(RunShowArgs),
+    Logs(LogsArgs),
+    Cancel(CancelArgs),
+    #[command(external_subcommand)]
+    TaskAlias(Vec<OsString>),
+}
+
+#[derive(Debug, Args)]
+struct RunShowArgs {
+    run_id: String,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Payload input defaults to an empty JSON object. Use exactly one of --json, --payload-file, or --stdin. This command emits an event to the running daemon; it does not publish, buffer, or replay events."
+)]
 struct EmitArgs {
+    /// Event type matched by task `on = "..."`
+    event_type: String,
+    /// Inline JSON payload.
+    ///
+    /// Kept for compatibility with existing scripts. Use global `--format json`
+    /// before the command for machine-readable command output.
+    #[arg(long, conflicts_with_all = ["payload_file", "stdin"])]
+    json: Option<String>,
+    /// Read the JSON payload from a file.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["json", "stdin"])]
+    payload_file: Option<PathBuf>,
+    /// Read the JSON payload from stdin.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["json", "payload_file"])]
+    stdin: bool,
+    /// Event source recorded in the event log.
+    ///
+    /// Defaults to `cli` for compatibility with existing CLI-emitted events.
+    #[arg(long, default_value = "cli")]
+    source: String,
+    #[arg(long)]
+    correlation: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum EventCommand {
+    List(EventsArgs),
+    Show(EventShowArgs),
+    Emit(EmitArgs),
+}
+
+#[derive(Debug, Args)]
+struct EventShowArgs {
+    event_id: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum TriggerCommand {
+    List(TriggersArgs),
+    Show(TriggerShowArgs),
+}
+
+#[derive(Debug, Args)]
+struct TriggerShowArgs {
+    trigger_id: String,
+}
+
+#[derive(Debug, Args, Clone, Copy)]
+struct JsonOutputArgs {
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+impl JsonOutputArgs {
+    fn apply(self, format: OutputFormat) -> OutputFormat {
+        if self.json {
+            OutputFormat::Json
+        } else {
+            format
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct EventsArgs {
+    #[command(flatten)]
+    output: JsonOutputArgs,
+    #[arg(long = "type")]
+    event_type: Option<String>,
+    #[arg(long)]
+    source: Option<String>,
+    #[arg(long)]
+    correlation: Option<String>,
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct TriggersArgs {
+    #[command(flatten)]
+    output: JsonOutputArgs,
+    #[arg(long)]
+    task: Option<String>,
+    #[arg(long = "event", alias = "event-type")]
+    event_type: Option<String>,
+    #[arg(long)]
+    outcome: Option<String>,
+    #[arg(long)]
+    correlation: Option<String>,
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct RunsArgs {
+    #[command(flatten)]
+    output: JsonOutputArgs,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    origin: Option<String>,
+    #[arg(long)]
+    state: Option<String>,
+    #[arg(long)]
+    correlation: Option<String>,
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Subcommand)]
+enum WaitCommand {
+    Event(WaitEventArgs),
+    Run(WaitRunArgs),
+    Trigger(WaitTriggerArgs),
+    Service(WaitServiceArgs),
+}
+
+#[derive(Debug, Args)]
+struct WaitEventArgs {
     event_type: String,
     #[arg(long)]
-    json: Option<String>,
+    correlation: Option<String>,
+    #[arg(long)]
+    timeout: String,
+}
+
+#[derive(Debug, Args)]
+struct WaitRunArgs {
+    run_id: String,
+    #[arg(long)]
+    state: String,
+    #[arg(long)]
+    timeout: String,
+}
+
+#[derive(Debug, Args)]
+struct WaitTriggerArgs {
+    #[arg(long)]
+    task: Option<String>,
+    #[arg(long = "event", alias = "event-type")]
+    event_type: Option<String>,
+    #[arg(long)]
+    outcome: Option<String>,
+    #[arg(long)]
+    correlation: Option<String>,
+    #[arg(long)]
+    timeout: String,
+}
+
+#[derive(Debug, Args)]
+struct WaitServiceArgs {
+    name: String,
+    #[arg(long)]
+    state: String,
+    #[arg(long)]
+    timeout: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum SubscribeCommand {
+    Events,
+    Runs,
+    Triggers,
 }
 
 #[derive(Debug, Args)]
 struct LogsArgs {
+    #[arg(long, value_name = "LINES")]
+    tail: Option<usize>,
+    #[arg(long, default_value_t = false)]
+    follow: bool,
     run_id: String,
 }
 
@@ -297,6 +530,8 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
+    List(JsonOutputArgs),
+    Show(ServiceShowArgs),
     Start(ServiceNameArgs),
     Stop(ServiceNameArgs),
     Restart(ServiceNameArgs),
@@ -307,11 +542,45 @@ struct ServiceNameArgs {
     name: String,
 }
 
+#[derive(Debug, Args)]
+struct ServiceShowArgs {
+    #[command(flatten)]
+    output: JsonOutputArgs,
+    name: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum LogCommand {
+    Show(LogsArgs),
+    Tail(LogTailArgs),
+    Follow(LogFollowArgs),
+}
+
+#[derive(Debug, Args)]
+struct LogTailArgs {
+    run_id: String,
+    #[arg(long, value_name = "LINES", default_value_t = 100)]
+    lines: usize,
+}
+
+#[derive(Debug, Args)]
+struct LogFollowArgs {
+    run_id: String,
+}
+
 #[derive(Debug, Subcommand)]
 enum LockCommand {
     Acquire(LockAcquireArgs),
+    Renew(LockRenewArgs),
     Release(LockNameArgs),
+    List(LockListArgs),
     Status,
+}
+
+#[derive(Debug, Args)]
+struct LockListArgs {
+    #[arg(long, default_value_t = false)]
+    expired: bool,
 }
 
 #[derive(Debug, Args)]
@@ -319,11 +588,24 @@ struct LockAcquireArgs {
     name: String,
     #[arg(long)]
     ttl: Option<String>,
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct LockRenewArgs {
+    name: String,
+    #[arg(long)]
+    token: String,
+    #[arg(long)]
+    ttl: String,
 }
 
 #[derive(Debug, Args)]
 struct LockNameArgs {
     name: String,
+    #[arg(long)]
+    token: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -379,15 +661,38 @@ struct ServiceView {
     active_run_id: Option<String>,
     stop_override: Option<bool>,
     last_error: Option<String>,
+    health_state: Option<String>,
+    health_active_run_id: Option<String>,
+    health_last_run_id: Option<String>,
+    health_last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct LogsOutput {
     run_id: String,
+    run: Option<armature_core::RunRecord>,
+    run_directory: Option<String>,
     stdout_path: String,
     stderr_path: String,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+    stdout_lines: usize,
+    stderr_lines: usize,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    stdout_missing: bool,
+    stderr_missing: bool,
     stdout: String,
     stderr: String,
+}
+
+#[derive(Debug)]
+struct LogFileSnapshot {
+    contents: String,
+    bytes: u64,
+    lines: usize,
+    truncated: bool,
+    missing: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -405,15 +710,6 @@ struct DoctorOutput {
     daemon_error: Option<String>,
     detached_stdout_path: PathBuf,
     detached_stderr_path: PathBuf,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ManualLockRecord {
-    name: String,
-    owner_pid: u32,
-    acquired_at_ms: i64,
-    expires_at_ms: Option<i64>,
-    manual: bool,
 }
 
 fn init_workspace(
@@ -627,6 +923,7 @@ fn up_workspace(
 fn down_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> ArmatureResult<()> {
     let workspace = resolve_workspace_arg(workspace_arg)?;
     daemon_client(&workspace).shutdown()?;
+    wait_for_daemon_stop(&workspace, Duration::from_secs(3))?;
     print_data(
         format,
         &json!({
@@ -644,9 +941,64 @@ fn restart_workspace(
 ) -> ArmatureResult<()> {
     let workspace = resolve_workspace_arg(workspace_arg)?;
     let client = daemon_client(&workspace);
-    let _ = client.shutdown();
-    wait_for_daemon_stop(&workspace, Duration::from_secs(3));
+    client.shutdown()?;
+    wait_for_daemon_stop(&workspace, Duration::from_secs(3))?;
     up_workspace(Some(workspace.root().to_path_buf()), args, format)
+}
+
+fn task_command(
+    workspace_arg: Option<PathBuf>,
+    command: TaskCommand,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    match command {
+        TaskCommand::List => tasks_workspace(workspace_arg, format),
+        TaskCommand::Show(args) => task_show(workspace_arg, args, format),
+        TaskCommand::Run(args) => run_task(workspace_arg, args, format),
+    }
+}
+
+fn run_command(
+    workspace_arg: Option<PathBuf>,
+    command: RunCommand,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    match command {
+        RunCommand::List(args) => runs_workspace(workspace_arg, args, format),
+        RunCommand::Show(args) => run_show(workspace_arg, args, format),
+        RunCommand::Logs(args) => logs_workspace(workspace_arg, args, format),
+        RunCommand::Cancel(args) => cancel_run(workspace_arg, args, format),
+        RunCommand::TaskAlias(raw) => run_task(workspace_arg, parse_run_alias(raw)?, format),
+    }
+}
+
+fn parse_run_alias(raw: Vec<OsString>) -> ArmatureResult<RunArgs> {
+    let mut values = raw.into_iter();
+    let task_name = values
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(|| ArmatureError::invalid_input("expected task name"))?;
+    let mut correlation = None;
+    while let Some(value) = values.next() {
+        let value = value
+            .into_string()
+            .map_err(|_| ArmatureError::invalid_input("invalid run argument"))?;
+        if value == "--correlation" {
+            let next = values
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| ArmatureError::invalid_input("--correlation requires a value"))?;
+            correlation = Some(next);
+        } else {
+            return Err(ArmatureError::invalid_input(format!(
+                "unknown run alias argument {value:?}"
+            )));
+        }
+    }
+    Ok(RunArgs {
+        task_name,
+        correlation,
+    })
 }
 
 fn run_task(
@@ -655,12 +1007,19 @@ fn run_task(
     format: OutputFormat,
 ) -> ArmatureResult<()> {
     let workspace = resolve_workspace_arg(workspace_arg)?;
-    let run_id = daemon_client(&workspace).start_task(args.task_name.clone())?;
+    let provenance = provenance_from_env(args.correlation)?;
+    let run_id = daemon_client(&workspace).start_task_with_provenance(
+        args.task_name.clone(),
+        provenance.source_run_id,
+        provenance.parent_event_id,
+        provenance.correlation_id.clone(),
+    )?;
     print_data(
         format,
         &json!({
             "run_id": run_id,
             "task": args.task_name,
+            "correlation_id": provenance.correlation_id,
         }),
         &format!("started {}", run_id.as_str()),
     )
@@ -672,22 +1031,457 @@ fn emit_event(
     format: OutputFormat,
 ) -> ArmatureResult<()> {
     let workspace = resolve_workspace_arg(workspace_arg)?;
-    let payload = match args.json {
-        Some(raw) => serde_json::from_str::<Value>(&raw).map_err(|error| {
-            ArmatureError::invalid_input(format!("invalid JSON payload: {error}"))
-        })?,
-        None => json!({}),
-    };
-    daemon_client(&workspace).emit_event(args.event_type.clone(), payload.clone(), None)?;
+    let (payload, payload_source) = read_emit_payload(&args)?;
+    let correlation = args
+        .correlation
+        .clone()
+        .or_else(|| payload_correlation_id(&payload));
+    let provenance = provenance_from_env(correlation)?;
+    daemon_client(&workspace).emit_event_with_provenance(
+        args.event_type.clone(),
+        payload.clone(),
+        Some(args.source.clone()),
+        provenance.source_run_id.clone(),
+        provenance.parent_event_id.clone(),
+        provenance.correlation_id.clone(),
+    )?;
     print_data(
         format,
         &json!({
             "emitted": true,
+            "type": args.event_type,
             "event_type": args.event_type,
             "payload": payload,
+            "payload_source": payload_source,
+            "source": args.source,
+            "source_run_id": provenance.source_run_id,
+            "parent_event_id": provenance.parent_event_id,
+            "correlation_id": provenance.correlation_id,
         }),
         "event emitted",
     )
+}
+
+fn event_command(
+    workspace_arg: Option<PathBuf>,
+    command: EventCommand,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    match command {
+        EventCommand::List(args) => events_workspace(workspace_arg, args, format),
+        EventCommand::Show(args) => event_show(workspace_arg, args, format),
+        EventCommand::Emit(args) => emit_event(workspace_arg, args, format),
+    }
+}
+
+fn trigger_command(
+    workspace_arg: Option<PathBuf>,
+    command: TriggerCommand,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    match command {
+        TriggerCommand::List(args) => triggers_workspace(workspace_arg, args, format),
+        TriggerCommand::Show(args) => trigger_show(workspace_arg, args, format),
+    }
+}
+
+fn read_emit_payload(args: &EmitArgs) -> ArmatureResult<(Value, String)> {
+    if let Some(raw) = args.json.as_deref() {
+        return parse_emit_payload(raw, "--json").map(|payload| (payload, "json".to_string()));
+    }
+
+    if let Some(path) = args.payload_file.as_deref() {
+        let raw = fs::read_to_string(path).map_err(|error| {
+            ArmatureError::invalid_input(format!(
+                "failed to read JSON payload file {}: {error}",
+                path.display()
+            ))
+        })?;
+        return parse_emit_payload(&raw, "--payload-file")
+            .map(|payload| (payload, format!("file:{}", path.display())));
+    }
+
+    if args.stdin {
+        let mut raw = String::new();
+        io::stdin().read_to_string(&mut raw).map_err(|error| {
+            ArmatureError::invalid_input(format!("failed to read JSON payload from stdin: {error}"))
+        })?;
+        return parse_emit_payload(&raw, "--stdin").map(|payload| (payload, "stdin".to_string()));
+    }
+
+    Ok((json!({}), "default-empty-object".to_string()))
+}
+
+#[derive(Debug, Clone)]
+struct EventProvenance {
+    source_run_id: Option<RunId>,
+    parent_event_id: Option<EventId>,
+    correlation_id: Option<String>,
+}
+
+fn provenance_from_env(correlation: Option<String>) -> ArmatureResult<EventProvenance> {
+    let source_run_id = optional_env("ARMATURE_RUN_ID")
+        .map(RunId::parse)
+        .transpose()?;
+    let parent_event_id = optional_env("ARMATURE_EVENT_ID")
+        .map(EventId::parse)
+        .transpose()?;
+    let correlation_id = correlation
+        .or_else(|| optional_env("ARMATURE_CORRELATION_ID"))
+        .filter(|value| !value.is_empty());
+
+    Ok(EventProvenance {
+        source_run_id,
+        parent_event_id,
+        correlation_id,
+    })
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn payload_correlation_id(payload: &Value) -> Option<String> {
+    payload
+        .get("correlation_id")
+        .or_else(|| payload.get("correlationId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_emit_payload(raw: &str, source: &str) -> ArmatureResult<Value> {
+    serde_json::from_str::<Value>(raw).map_err(|error| {
+        ArmatureError::invalid_input(format!("invalid JSON payload from {source}: {error}"))
+    })
+}
+
+fn events_workspace(
+    workspace_arg: Option<PathBuf>,
+    args: EventsArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let store = SqliteStore::open(&workspace)?;
+    let format = args.output.apply(format);
+    let events = store.list_events_filtered(&EventFilter {
+        event_type: args.event_type,
+        source: args.source,
+        correlation: args.correlation,
+        limit: args.limit,
+    })?;
+    let text = if events.is_empty() {
+        "no events recorded".to_string()
+    } else {
+        events
+            .iter()
+            .map(|event| {
+                format!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    event.id.as_str(),
+                    event.time,
+                    event.event_type,
+                    format!("{:?}", event.routing).to_lowercase(),
+                    event
+                        .source
+                        .as_deref()
+                        .unwrap_or(armature_core::model::DEFAULT_EVENT_SOURCE)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    print_data(format, &events, &text)
+}
+
+fn event_show(
+    workspace_arg: Option<PathBuf>,
+    args: EventShowArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let event_id = EventId::parse(args.event_id)?;
+    let store = SqliteStore::open(&workspace)?;
+    let event = store.get_event(&event_id)?.ok_or_else(|| {
+        ArmatureError::not_found(format!("event {} was not found", event_id.as_str()))
+    })?;
+    let text = format!(
+        "{}\t{}\t{}",
+        event.id.as_str(),
+        event.event_type,
+        event
+            .source
+            .as_deref()
+            .unwrap_or(armature_core::model::DEFAULT_EVENT_SOURCE)
+    );
+    print_data(format, &event, &text)
+}
+
+fn triggers_workspace(
+    workspace_arg: Option<PathBuf>,
+    args: TriggersArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let store = SqliteStore::open(&workspace)?;
+    let format = args.output.apply(format);
+    let triggers = store.list_triggers_filtered(&TriggerFilter {
+        task: args.task,
+        event_type: args.event_type,
+        outcome: args.outcome,
+        correlation: args.correlation,
+        limit: args.limit,
+    })?;
+    let text = if triggers.is_empty() {
+        "no triggers recorded".to_string()
+    } else {
+        triggers
+            .iter()
+            .map(|trigger| {
+                format!(
+                    "{}\t{}\t{}\t{}\t{}\trun={}",
+                    trigger.id.as_str(),
+                    trigger.task_name,
+                    trigger.event_type,
+                    format!("{:?}", trigger.admission).to_lowercase(),
+                    format!("{:?}", trigger.outcome).to_lowercase(),
+                    trigger
+                        .run_id
+                        .as_ref()
+                        .map(|run_id| run_id.as_str())
+                        .unwrap_or("none")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    print_data(format, &triggers, &text)
+}
+
+fn trigger_show(
+    workspace_arg: Option<PathBuf>,
+    args: TriggerShowArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let store = SqliteStore::open(&workspace)?;
+    let trigger = store
+        .list_triggers_filtered(&TriggerFilter {
+            task: None,
+            event_type: None,
+            outcome: None,
+            correlation: None,
+            limit: None,
+        })?
+        .into_iter()
+        .find(|trigger| trigger.id.as_str() == args.trigger_id)
+        .ok_or_else(|| {
+            ArmatureError::not_found(format!("trigger {:?} was not found", args.trigger_id))
+        })?;
+    let text = format!(
+        "{}\t{}\t{}\t{:?}",
+        trigger.id.as_str(),
+        trigger.task_name,
+        trigger.event_type,
+        trigger.outcome
+    );
+    print_data(format, &trigger, &text)
+}
+
+fn wait_command(
+    workspace_arg: Option<PathBuf>,
+    command: WaitCommand,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    match command {
+        WaitCommand::Event(args) => wait_event(workspace_arg, args, format),
+        WaitCommand::Run(args) => wait_run(workspace_arg, args, format),
+        WaitCommand::Trigger(args) => wait_trigger(workspace_arg, args, format),
+        WaitCommand::Service(args) => wait_service(workspace_arg, args, format),
+    }
+}
+
+fn wait_event(
+    workspace_arg: Option<PathBuf>,
+    args: WaitEventArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let timeout = parse_duration(&args.timeout)?;
+    let event = wait_until_observed(timeout, "event", || {
+        let store = SqliteStore::open(&workspace)?;
+        Ok(store
+            .list_events_filtered(&EventFilter {
+                event_type: Some(args.event_type.clone()),
+                source: None,
+                correlation: args.correlation.clone(),
+                limit: Some(1),
+            })?
+            .into_iter()
+            .next())
+    })?;
+    let text = format!("event {}", event.id.as_str());
+    print_data(format, &event, &text)
+}
+
+fn wait_run(
+    workspace_arg: Option<PathBuf>,
+    args: WaitRunArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let timeout = parse_duration(&args.timeout)?;
+    let run_id = RunId::parse(args.run_id)?;
+    let run = wait_until_observed(timeout, "run", || {
+        let store = SqliteStore::open(&workspace)?;
+        Ok(store.get_run(&run_id)?.filter(|run| {
+            enum_text(&run.state)
+                .map(|state| state == args.state)
+                .unwrap_or(false)
+        }))
+    })?;
+    let text = format!("run {} {}", run.id.as_str(), enum_text(&run.state)?);
+    print_data(format, &run, &text)
+}
+
+fn wait_trigger(
+    workspace_arg: Option<PathBuf>,
+    args: WaitTriggerArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let timeout = parse_duration(&args.timeout)?;
+    let trigger = wait_until_observed(timeout, "trigger", || {
+        let store = SqliteStore::open(&workspace)?;
+        Ok(store
+            .list_triggers_filtered(&TriggerFilter {
+                task: args.task.clone(),
+                event_type: args.event_type.clone(),
+                outcome: args.outcome.clone(),
+                correlation: args.correlation.clone(),
+                limit: Some(1),
+            })?
+            .into_iter()
+            .next())
+    })?;
+    let text = format!("trigger {}", trigger.id.as_str());
+    print_data(format, &trigger, &text)
+}
+
+fn wait_service(
+    workspace_arg: Option<PathBuf>,
+    args: WaitServiceArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let timeout = parse_duration(&args.timeout)?;
+    let service = wait_until_observed(timeout, "service", || {
+        let inspect = daemon_client(&workspace).inspect()?;
+        Ok(inspect.services.into_iter().find(|service| {
+            service.name == args.name
+                && enum_text(&service.state)
+                    .map(|state| state == args.state)
+                    .unwrap_or(false)
+        }))
+    })?;
+    let text = format!("service {} {}", service.name, enum_text(&service.state)?);
+    print_data(format, &service, &text)
+}
+
+fn subscribe_command(
+    workspace_arg: Option<PathBuf>,
+    command: SubscribeCommand,
+) -> ArmatureResult<()> {
+    match command {
+        SubscribeCommand::Events => subscribe_events(workspace_arg),
+        SubscribeCommand::Runs => subscribe_runs(workspace_arg),
+        SubscribeCommand::Triggers => subscribe_triggers(workspace_arg),
+    }
+}
+
+fn subscribe_events(workspace_arg: Option<PathBuf>) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let mut seen = SqliteStore::open(&workspace)?
+        .list_events()?
+        .into_iter()
+        .map(|event| event.id.as_str().to_string())
+        .collect::<HashSet<_>>();
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        let mut events = SqliteStore::open(&workspace)?.list_events()?;
+        events.reverse();
+        for event in events {
+            if seen.insert(event.id.as_str().to_string()) {
+                write_ndjson(&event)?;
+            }
+        }
+    }
+}
+
+fn subscribe_runs(workspace_arg: Option<PathBuf>) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let mut seen = SqliteStore::open(&workspace)?
+        .list_runs()?
+        .into_iter()
+        .map(|run| Ok(format!("{}:{}", run.id.as_str(), enum_text(&run.state)?)))
+        .collect::<ArmatureResult<HashSet<_>>>()?;
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        let mut runs = SqliteStore::open(&workspace)?.list_runs()?;
+        runs.reverse();
+        for run in runs {
+            let key = format!("{}:{}", run.id.as_str(), enum_text(&run.state)?);
+            if seen.insert(key) {
+                write_ndjson(&run)?;
+            }
+        }
+    }
+}
+
+fn subscribe_triggers(workspace_arg: Option<PathBuf>) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let mut seen = SqliteStore::open(&workspace)?
+        .list_triggers()?
+        .into_iter()
+        .map(|trigger| trigger.id.as_str().to_string())
+        .collect::<HashSet<_>>();
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        let mut triggers = SqliteStore::open(&workspace)?.list_triggers()?;
+        triggers.reverse();
+        for trigger in triggers {
+            if seen.insert(trigger.id.as_str().to_string()) {
+                write_ndjson(&trigger)?;
+            }
+        }
+    }
+}
+
+fn wait_until_observed<T>(
+    timeout: Duration,
+    label: &str,
+    mut observe: impl FnMut() -> ArmatureResult<Option<T>>,
+) -> ArmatureResult<T> {
+    let start = Instant::now();
+    while start.elapsed() <= timeout {
+        if let Some(value) = observe()? {
+            return Ok(value);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(ArmatureError::unavailable(format!(
+        "timed out waiting for {label}"
+    )))
+}
+
+fn write_ndjson<T: Serialize>(value: &T) -> ArmatureResult<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    serde_json::to_writer(&mut handle, value)
+        .map_err(|error| ArmatureError::internal(error.to_string()))?;
+    handle.write_all(b"\n")?;
+    handle.flush()?;
+    Ok(())
 }
 
 fn status_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> ArmatureResult<()> {
@@ -738,8 +1532,8 @@ fn ps_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> Armatur
 fn tasks_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> ArmatureResult<()> {
     let workspace = resolve_workspace_arg(workspace_arg)?;
     let config = load_workspace_config(&workspace)?;
-    let inspect = daemon_client(&workspace).inspect().ok();
-    let tasks = build_task_views(&config, inspect.as_ref());
+    let inspect = daemon_client(&workspace).inspect()?;
+    let tasks = build_task_views(&config, Some(&inspect));
     let text = if tasks.is_empty() {
         "no tasks configured".to_string()
     } else {
@@ -760,23 +1554,47 @@ fn tasks_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> Arma
     print_data(format, &tasks, &text)
 }
 
+fn task_show(
+    workspace_arg: Option<PathBuf>,
+    args: TaskNameArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let config = load_workspace_config(&workspace)?;
+    let inspect = daemon_client(&workspace).inspect()?;
+    let task = build_task_views(&config, Some(&inspect))
+        .into_iter()
+        .find(|task| task.name == args.name)
+        .ok_or_else(|| ArmatureError::not_found(format!("task {:?} was not found", args.name)))?;
+    let text = format!(
+        "{}\nrun {}\nadmission {}\nactive_runs {}",
+        task.name,
+        task.run,
+        task.admission,
+        task.active_run_ids.len()
+    );
+    print_data(format, &task, &text)
+}
+
 fn services_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> ArmatureResult<()> {
     let workspace = resolve_workspace_arg(workspace_arg)?;
     let config = load_workspace_config(&workspace)?;
-    let inspect = daemon_client(&workspace).inspect().ok();
-    let services = build_service_views(&config, inspect.as_ref());
+    let inspect = daemon_client(&workspace).inspect()?;
+    let services = build_service_views(&config, Some(&inspect));
     let text = if services.is_empty() {
         "no services configured".to_string()
     } else {
         services
             .iter()
             .map(|service| {
+                let health = service.health_state.as_deref().unwrap_or("not_configured");
                 format!(
-                    "{}\tenabled={}\trestart={}\tstate={}",
+                    "{}\tenabled={}\trestart={}\tstate={}\thealth={}",
                     service.name,
                     service.enabled,
                     service.restart,
-                    service.state.as_deref().unwrap_or("not_running")
+                    service.state.as_deref().unwrap_or("not_running"),
+                    health
                 )
             })
             .collect::<Vec<_>>()
@@ -785,14 +1603,45 @@ fn services_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> A
     print_data(format, &services, &text)
 }
 
+fn service_show(
+    workspace_arg: Option<PathBuf>,
+    args: ServiceShowArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let config = load_workspace_config(&workspace)?;
+    let inspect = daemon_client(&workspace).inspect()?;
+    let format = args.output.apply(format);
+    let service = build_service_views(&config, Some(&inspect))
+        .into_iter()
+        .find(|service| service.name == args.name)
+        .ok_or_else(|| {
+            ArmatureError::not_found(format!("service {:?} was not found", args.name))
+        })?;
+    let text = format!(
+        "{}\nrun {}\nenabled {}\nstate {}",
+        service.name,
+        service.run,
+        service.enabled,
+        service.state.as_deref().unwrap_or("not_running")
+    );
+    print_data(format, &service, &text)
+}
+
 fn service_command(
     workspace_arg: Option<PathBuf>,
     command: ServiceCommand,
     format: OutputFormat,
 ) -> ArmatureResult<()> {
+    match command {
+        ServiceCommand::List(args) => return services_workspace(workspace_arg, args.apply(format)),
+        ServiceCommand::Show(args) => return service_show(workspace_arg, args, format),
+        _ => {}
+    }
     let workspace = resolve_workspace_arg(workspace_arg)?;
     let client = daemon_client(&workspace);
     let (name, action) = match command {
+        ServiceCommand::List(_) | ServiceCommand::Show(_) => unreachable!(),
         ServiceCommand::Start(args) => {
             client.service_start(args.name.clone())?;
             (args.name, "started")
@@ -816,10 +1665,21 @@ fn service_command(
     )
 }
 
-fn runs_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> ArmatureResult<()> {
+fn runs_workspace(
+    workspace_arg: Option<PathBuf>,
+    args: RunsArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
     let workspace = resolve_workspace_arg(workspace_arg)?;
     let store = SqliteStore::open(&workspace)?;
-    let runs = store.list_runs()?;
+    let format = args.output.apply(format);
+    let runs = store.list_runs_filtered(&RunFilter {
+        name: args.name,
+        origin: args.origin,
+        state: args.state,
+        correlation: args.correlation,
+        limit: args.limit,
+    })?;
     let text = if runs.is_empty() {
         "no runs recorded".to_string()
     } else {
@@ -839,6 +1699,27 @@ fn runs_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> Armat
     print_data(format, &runs, &text)
 }
 
+fn run_show(
+    workspace_arg: Option<PathBuf>,
+    args: RunShowArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let run_id = RunId::parse(args.run_id)?;
+    let store = SqliteStore::open(&workspace)?;
+    let run = store.get_run(&run_id)?.ok_or_else(|| {
+        ArmatureError::not_found(format!("run {} was not found", run_id.as_str()))
+    })?;
+    let text = format!(
+        "{}\t{}\t{:?}\t{:?}",
+        run.id.as_str(),
+        run.name,
+        run.origin,
+        run.state
+    );
+    print_data(format, &run, &text)
+}
+
 fn logs_workspace(
     workspace_arg: Option<PathBuf>,
     args: LogsArgs,
@@ -850,20 +1731,73 @@ fn logs_workspace(
     let logs = store.get_logs(&run_id)?.ok_or_else(|| {
         ArmatureError::not_found(format!("logs for {} were not found", run_id.as_str()))
     })?;
-    let stdout = read_optional_file(Path::new(&logs.stdout_path))?;
-    let stderr = read_optional_file(Path::new(&logs.stderr_path))?;
+    if args.follow && format == OutputFormat::Json {
+        return Err(ArmatureError::invalid_input(
+            "logs --follow streams text output and cannot be combined with JSON output",
+        ));
+    }
+    let run = store.get_run(&run_id)?;
+    let stdout = read_log_file(Path::new(&logs.stdout_path), args.tail)?;
+    let stderr = read_log_file(Path::new(&logs.stderr_path), args.tail)?;
     let output = LogsOutput {
         run_id: run_id.as_str().to_string(),
+        run_directory: run.as_ref().and_then(|record| record.run_directory.clone()),
+        run,
         stdout_path: logs.stdout_path.clone(),
         stderr_path: logs.stderr_path.clone(),
-        stdout,
-        stderr,
+        stdout_bytes: stdout.bytes,
+        stderr_bytes: stderr.bytes,
+        stdout_lines: stdout.lines,
+        stderr_lines: stderr.lines,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+        stdout_missing: stdout.missing,
+        stderr_missing: stderr.missing,
+        stdout: stdout.contents,
+        stderr: stderr.contents,
     };
-    let text = format!(
-        "stdout {}\n{}\n---\nstderr {}\n{}",
-        output.stdout_path, output.stdout, output.stderr_path, output.stderr
-    );
+    let text = format_logs_text(&output, args.tail);
+    if args.follow {
+        println!("{text}");
+        follow_logs_until_complete(
+            &store,
+            &run_id,
+            Path::new(&logs.stdout_path),
+            Path::new(&logs.stderr_path),
+            output.stdout_bytes,
+            output.stderr_bytes,
+        )?;
+        return Ok(());
+    }
     print_data(format, &output, &text)
+}
+
+fn log_command(
+    workspace_arg: Option<PathBuf>,
+    command: LogCommand,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    match command {
+        LogCommand::Show(args) => logs_workspace(workspace_arg, args, format),
+        LogCommand::Tail(args) => logs_workspace(
+            workspace_arg,
+            LogsArgs {
+                run_id: args.run_id,
+                tail: Some(args.lines),
+                follow: false,
+            },
+            format,
+        ),
+        LogCommand::Follow(args) => logs_workspace(
+            workspace_arg,
+            LogsArgs {
+                run_id: args.run_id,
+                tail: None,
+                follow: true,
+            },
+            format,
+        ),
+    }
 }
 
 fn cancel_run(
@@ -924,9 +1858,7 @@ fn lock_command(
     format: OutputFormat,
 ) -> ArmatureResult<()> {
     let workspace = resolve_workspace_arg(workspace_arg)?;
-    let runtime_paths = WorkspaceRuntimePaths::for_workspace(&workspace)?;
-    let lock_dir = runtime_paths.state_root().join(LOCKS_DIR_NAME);
-    fs::create_dir_all(&lock_dir)?;
+    let client = daemon_client(&workspace);
 
     match command {
         LockCommand::Acquire(args) => {
@@ -938,13 +1870,22 @@ fn lock_command(
                         "manual lock acquire requires --ttl so ownership remains inspectable",
                     )
                 })
-                .and_then(parse_duration)
-                .map(Some)?;
-            let record = acquire_manual_lock(&lock_dir, args.name, ttl)?;
+                .and_then(parse_duration)?;
+            let record = client.acquire_lock(args.name, ttl, args.reason)?;
             print_data(format, &record, &format!("lock acquired {}", record.name))
         }
+        LockCommand::Renew(args) => {
+            let ttl = parse_duration(&args.ttl)?;
+            let record = client.renew_lock(args.name, args.token, ttl)?;
+            print_data(format, &record, &format!("lock renewed {}", record.name))
+        }
         LockCommand::Release(args) => {
-            release_manual_lock(&lock_dir, &args.name)?;
+            let token = args.token.ok_or_else(|| {
+                ArmatureError::invalid_input(
+                    "manual lock release requires --token from lock acquire",
+                )
+            })?;
+            client.release_lock(&args.name, token)?;
             print_data(
                 format,
                 &json!({
@@ -954,29 +1895,73 @@ fn lock_command(
                 "lock released",
             )
         }
-        LockCommand::Status => {
-            let locks = list_manual_locks(&lock_dir)?;
-            let text = if locks.is_empty() {
-                "no locks held".to_string()
+        LockCommand::List(args) => {
+            let locks = if args.expired {
+                list_expired_locks(&workspace)?
             } else {
-                locks
-                    .iter()
-                    .map(|lock| {
-                        format!(
-                            "{}\tpid={}\texpires_at={}",
-                            lock.name,
-                            lock.owner_pid,
-                            lock.expires_at_ms
-                                .map(timestamp_text)
-                                .unwrap_or_else(|| "none".to_string())
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                client.locks()?
             };
-            print_data(format, &locks, &text)
+            print_lock_list(format, &locks)
+        }
+        LockCommand::Status => {
+            let locks = client.locks()?;
+            print_lock_list(format, &locks)
         }
     }
+}
+
+fn print_lock_list(format: OutputFormat, locks: &[ManualLockRecord]) -> ArmatureResult<()> {
+    let text = if locks.is_empty() {
+        "no locks held".to_string()
+    } else {
+        locks
+            .iter()
+            .map(|lock| {
+                format!(
+                    "{}\towner={}\tpid={}\texpires_at={}\treason={}",
+                    lock.name,
+                    lock.owner_id,
+                    lock.owner_pid,
+                    lock.expires_at_ms
+                        .map(timestamp_text)
+                        .unwrap_or_else(|| "none".to_string()),
+                    lock.reason.as_deref().unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    print_data(format, &locks, &text)
+}
+
+fn list_expired_locks(workspace: &Workspace) -> ArmatureResult<Vec<ManualLockRecord>> {
+    let runtime_paths = WorkspaceRuntimePaths::for_workspace(workspace)?;
+    let lock_dir = runtime_paths.state_root().join("locks");
+    let mut locks = Vec::new();
+    if !lock_dir.exists() {
+        return Ok(locks);
+    }
+    let now = now_millis();
+    for entry in fs::read_dir(lock_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read(&path)?;
+        let record = serde_json::from_slice::<ManualLockRecord>(&raw).map_err(|error| {
+            ArmatureError::internal(format!("invalid lock record {}: {error}", path.display()))
+        })?;
+        if record
+            .expires_at_ms
+            .map(|expires_at| expires_at <= now)
+            .unwrap_or(false)
+        {
+            locks.push(record);
+        }
+    }
+    locks.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(locks)
 }
 
 fn serve_workspace(workspace_root: PathBuf) -> ArmatureResult<()> {
@@ -1061,15 +2046,19 @@ fn wait_for_daemon(workspace: &Workspace, timeout: Duration) -> ArmatureResult<(
     }
 }
 
-fn wait_for_daemon_stop(workspace: &Workspace, timeout: Duration) {
+fn wait_for_daemon_stop(workspace: &Workspace, timeout: Duration) -> ArmatureResult<()> {
     let start = SystemTime::now();
     let client = daemon_client(workspace);
     while elapsed_since(start) < timeout {
         if client.inspect().is_err() {
-            break;
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+    Err(ArmatureError::unavailable(format!(
+        "daemon did not stop for workspace {}",
+        workspace.root().display()
+    )))
 }
 
 fn build_task_views(config: &ArmatureConfig, inspect: Option<&InspectResponse>) -> Vec<TaskView> {
@@ -1137,6 +2126,20 @@ fn build_service_views(
                     .map(|run_id| run_id.as_str().to_string()),
                 stop_override: runtime.map(|runtime| runtime.stop_override),
                 last_error: runtime.and_then(|runtime| runtime.last_error.clone()),
+                health_state: runtime
+                    .and_then(|runtime| runtime.health.as_ref())
+                    .map(|health| health.state.clone()),
+                health_active_run_id: runtime
+                    .and_then(|runtime| runtime.health.as_ref())
+                    .and_then(|health| health.active_run_id.as_ref())
+                    .map(|run_id| run_id.as_str().to_string()),
+                health_last_run_id: runtime
+                    .and_then(|runtime| runtime.health.as_ref())
+                    .and_then(|health| health.last_run_id.as_ref())
+                    .map(|run_id| run_id.as_str().to_string()),
+                health_last_error: runtime
+                    .and_then(|runtime| runtime.health.as_ref())
+                    .and_then(|health| health.last_error.clone()),
             }
         })
         .collect::<Vec<_>>();
@@ -1148,12 +2151,191 @@ fn service_state_text(service: &RuntimeServiceStatus) -> String {
     format!("{:?}", service.state).to_lowercase()
 }
 
-fn read_optional_file(path: &Path) -> ArmatureResult<String> {
-    match fs::read_to_string(path) {
-        Ok(contents) => Ok(contents),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(error.into()),
+fn read_log_file(path: &Path, tail: Option<usize>) -> ArmatureResult<LogFileSnapshot> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(LogFileSnapshot {
+                contents: String::new(),
+                bytes: 0,
+                lines: 0,
+                truncated: false,
+                missing: true,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let bytes = fs::metadata(path)?.len();
+    let lines = contents.lines().count();
+    let (contents, truncated) = match tail {
+        Some(0) => (String::new(), lines > 0),
+        Some(limit) => tail_lines(&contents, limit),
+        None => (contents, false),
+    };
+
+    Ok(LogFileSnapshot {
+        contents,
+        bytes,
+        lines,
+        truncated,
+        missing: false,
+    })
+}
+
+fn tail_lines(contents: &str, limit: usize) -> (String, bool) {
+    let lines = contents.lines().count();
+    if lines <= limit {
+        return (contents.to_string(), false);
     }
+
+    let mut selected = contents
+        .split_inclusive('\n')
+        .rev()
+        .take(limit)
+        .collect::<Vec<_>>();
+    selected.reverse();
+    (selected.concat(), true)
+}
+
+fn format_logs_text(output: &LogsOutput, tail: Option<usize>) -> String {
+    let mut lines = vec![format!("run {}", output.run_id)];
+    if let Some(run) = &output.run {
+        lines.push(format!("name: {}", run.name));
+        lines.push(format!(
+            "origin: {}  state: {}",
+            format!("{:?}", run.origin).to_lowercase(),
+            format!("{:?}", run.state).to_lowercase()
+        ));
+        lines.push(format!("command: {}", run.command));
+        lines.push(format!("started: {}", run.start_time));
+        if let Some(end_time) = &run.end_time {
+            lines.push(format!("ended: {end_time}"));
+        }
+        if let Some(exit_code) = run.exit_code {
+            lines.push(format!("exit_code: {exit_code}"));
+        }
+        if let Some(signal) = run.signal {
+            lines.push(format!("signal: {signal}"));
+        }
+        if run.killed {
+            lines.push("killed: true".to_string());
+        }
+        if let Some(config_version) = &run.config_version {
+            lines.push(format!("config_version: {config_version}"));
+        }
+        if let Some(event_id) = &run.event_id {
+            lines.push(format!("event_id: {}", event_id.as_str()));
+        }
+        if let Some(restart_of) = &run.restart_of {
+            lines.push(format!("restart_of: {}", restart_of.as_str()));
+        }
+        if let Some(attempt) = run.attempt {
+            lines.push(format!("attempt: {attempt}"));
+        }
+    }
+    if let Some(run_directory) = &output.run_directory {
+        lines.push(format!("run_directory: {run_directory}"));
+    }
+    if let Some(limit) = tail {
+        lines.push(format!("tail: last {limit} lines per stream"));
+    }
+
+    lines.push(String::new());
+    lines.push(format_log_stream_text(
+        "stdout",
+        &output.stdout_path,
+        output.stdout_bytes,
+        output.stdout_lines,
+        output.stdout_truncated,
+        output.stdout_missing,
+        &output.stdout,
+    ));
+    lines.push(format_log_stream_text(
+        "stderr",
+        &output.stderr_path,
+        output.stderr_bytes,
+        output.stderr_lines,
+        output.stderr_truncated,
+        output.stderr_missing,
+        &output.stderr,
+    ));
+    lines.join("\n")
+}
+
+fn format_log_stream_text(
+    label: &str,
+    path: &str,
+    bytes: u64,
+    lines: usize,
+    truncated: bool,
+    missing: bool,
+    contents: &str,
+) -> String {
+    let mut output = format!("{label} {path} ({bytes} bytes, {lines} lines");
+    if truncated {
+        output.push_str(", truncated");
+    }
+    if missing {
+        output.push_str(", missing");
+    }
+    output.push_str(")\n");
+    if contents.is_empty() {
+        output.push_str("(empty)\n");
+    } else {
+        output.push_str(contents);
+        if !contents.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    output
+}
+
+fn follow_logs_until_complete(
+    store: &SqliteStore,
+    run_id: &RunId,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    mut stdout_offset: u64,
+    mut stderr_offset: u64,
+) -> ArmatureResult<()> {
+    loop {
+        std::thread::sleep(Duration::from_millis(200));
+        stdout_offset = print_appended_log_bytes("stdout", stdout_path, stdout_offset)?;
+        stderr_offset = print_appended_log_bytes("stderr", stderr_path, stderr_offset)?;
+
+        let Some(run) = store.get_run(run_id)? else {
+            return Ok(());
+        };
+        if !matches!(
+            run.state,
+            ProcessState::Starting | ProcessState::Running | ProcessState::Stopping
+        ) {
+            let _ = print_appended_log_bytes("stdout", stdout_path, stdout_offset)?;
+            let _ = print_appended_log_bytes("stderr", stderr_path, stderr_offset)?;
+            return Ok(());
+        }
+    }
+}
+
+fn print_appended_log_bytes(label: &str, path: &Path, offset: u64) -> ArmatureResult<u64> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(offset),
+        Err(error) => return Err(error.into()),
+    };
+    if bytes.len() as u64 <= offset {
+        return Ok(offset);
+    }
+
+    let appended = &bytes[offset as usize..];
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "--- {label} appended ---")?;
+    stdout.write_all(appended)?;
+    if !appended.ends_with(b"\n") {
+        writeln!(stdout)?;
+    }
+    stdout.flush()?;
+    Ok(bytes.len() as u64)
 }
 
 fn parse_duration(input: &str) -> ArmatureResult<Duration> {
@@ -1172,124 +2354,28 @@ fn parse_duration(input: &str) -> ArmatureResult<Duration> {
     )))
 }
 
-fn acquire_manual_lock(
-    lock_dir: &Path,
-    name: String,
-    ttl: Option<Duration>,
-) -> ArmatureResult<ManualLockRecord> {
-    let path = lock_file_path(lock_dir, &name);
-    if let Some(existing) = read_lock_if_fresh(&path)? {
-        return Err(ArmatureError::conflict(format!(
-            "lock {:?} is already held by pid {}",
-            existing.name, existing.owner_pid
-        )));
-    }
-
-    let acquired_at_ms = now_millis();
-    let expires_at_ms = ttl.map(|ttl| acquired_at_ms + ttl.as_millis() as i64);
-    let record = ManualLockRecord {
-        name,
-        owner_pid: std::process::id(),
-        acquired_at_ms,
-        expires_at_ms,
-        manual: true,
-    };
-    let contents = serde_json::to_vec_pretty(&record)
-        .map_err(|error| ArmatureError::internal(error.to_string()))?;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|error| match error.kind() {
-            io::ErrorKind::AlreadyExists => {
-                ArmatureError::conflict(format!("lock {:?} is already held", record.name))
-            }
-            _ => ArmatureError::internal(error.to_string()),
-        })?;
-    use std::io::Write as _;
-    file.write_all(&contents)?;
-    Ok(record)
-}
-
-fn release_manual_lock(lock_dir: &Path, name: &str) -> ArmatureResult<()> {
-    let path = lock_file_path(lock_dir, name);
-    if !path.exists() {
-        return Err(ArmatureError::not_found(format!(
-            "lock {:?} is not held",
-            name
-        )));
-    }
-    fs::remove_file(path)?;
-    Ok(())
-}
-
-fn list_manual_locks(lock_dir: &Path) -> ArmatureResult<Vec<ManualLockRecord>> {
-    let mut locks = Vec::new();
-    for entry in fs::read_dir(lock_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        if let Some(lock) = read_lock_if_fresh(&path)? {
-            locks.push(lock);
-        }
-    }
-    locks.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(locks)
-}
-
-fn read_lock_if_fresh(path: &Path) -> ArmatureResult<Option<ManualLockRecord>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = fs::read(path)?;
-    let record: ManualLockRecord = serde_json::from_slice(&raw)
-        .map_err(|error| ArmatureError::internal(format!("invalid lock record: {error}")))?;
-    if lock_is_stale(&record) {
-        let _ = fs::remove_file(path);
-        return Ok(None);
-    }
-    Ok(Some(record))
-}
-
-fn lock_is_stale(record: &ManualLockRecord) -> bool {
-    if let Some(expires_at_ms) = record.expires_at_ms {
-        if now_millis() >= expires_at_ms {
-            return true;
-        }
-    }
-    if record.manual {
-        return false;
-    }
-    !process_exists(record.owner_pid)
-}
-
-fn process_exists(pid: u32) -> bool {
-    let result = unsafe { libc::kill(pid as i32, 0) };
-    if result == 0 {
-        return true;
-    }
-    let error = io::Error::last_os_error();
-    !matches!(error.raw_os_error(), Some(code) if code == libc::ESRCH)
-}
-
-fn lock_file_path(lock_dir: &Path, name: &str) -> PathBuf {
-    let mut hasher = Sha256::new();
-    hasher.update(name.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
-    lock_dir.join(format!("{digest}{LOCK_FILE_SUFFIX}"))
+fn elapsed_since(start: SystemTime) -> Duration {
+    start.elapsed().unwrap_or_default()
 }
 
 fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system time should be after UNIX_EPOCH")
+        .unwrap_or_default()
         .as_millis() as i64
 }
 
-fn elapsed_since(start: SystemTime) -> Duration {
-    start.elapsed().unwrap_or_default()
+fn enum_text<T>(value: &T) -> ArmatureResult<String>
+where
+    T: Serialize,
+{
+    let encoded =
+        serde_json::to_string(value).map_err(|error| ArmatureError::internal(error.to_string()))?;
+    encoded
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .map(str::to_string)
+        .ok_or_else(|| ArmatureError::internal("expected enum to serialize as a JSON string"))
 }
 
 fn timestamp_text(timestamp_ms: i64) -> String {
@@ -1318,19 +2404,143 @@ where
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::path::Path;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
-    use clap::CommandFactory;
+    use armature_core::{resolve_workspace, WorkspaceRuntimePaths};
+    use clap::{CommandFactory, Parser};
     use tempfile::TempDir;
 
     use super::{
-        init_recipe_workspace, list_manual_locks, lock_file_path, parse_duration, Cli,
-        ManualLockRecord, OutputFormat, RecipeName, CONFIG_DIR_NAME, CONFIG_FILE_NAME,
+        doctor_workspace, init_recipe_workspace, parse_duration, services_workspace,
+        tasks_workspace, wait_for_daemon_stop, Cli, Command, OutputFormat, RecipeName,
+        CONFIG_DIR_NAME, CONFIG_FILE_NAME,
     };
 
     #[test]
     fn cli_command_tree_builds() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn runtime_status_commands_accept_json_output_alias() {
+        for command in ["status", "ps", "services", "runs", "events", "triggers"] {
+            let cli = Cli::try_parse_from(["armature", command, "--json"]).unwrap();
+
+            assert_eq!(cli.format, OutputFormat::Text);
+            let output = match cli.command {
+                Command::Status(args) | Command::Ps(args) | Command::Services(args) => args,
+                Command::Runs(args) => args.output,
+                Command::Events(args) => args.output,
+                Command::Triggers(args) => args.output,
+                other => panic!("unexpected command parsed for {command}: {other:?}"),
+            };
+            assert!(output.json);
+            assert_eq!(output.apply(cli.format), OutputFormat::Json);
+        }
+    }
+
+    #[test]
+    fn global_format_json_still_controls_runtime_status_output() {
+        let cli = Cli::try_parse_from(["armature", "--format", "json", "status"]).unwrap();
+
+        assert_eq!(cli.format, OutputFormat::Json);
+        let Command::Status(args) = cli.command else {
+            panic!("expected status command");
+        };
+        assert!(!args.json);
+        assert_eq!(args.apply(cli.format), OutputFormat::Json);
+    }
+
+    #[test]
+    fn emit_json_still_parses_payload_json() {
+        let cli = Cli::try_parse_from([
+            "armature",
+            "emit",
+            "hook.example",
+            "--json",
+            "{\"ok\":true}",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.format, OutputFormat::Text);
+        let Command::Emit(args) = cli.command else {
+            panic!("expected emit command");
+        };
+        assert_eq!(args.event_type, "hook.example");
+        assert_eq!(args.json.as_deref(), Some("{\"ok\":true}"));
+        assert_eq!(args.payload_file, None);
+        assert!(!args.stdin);
+        assert_eq!(args.source, "cli");
+    }
+
+    #[test]
+    fn emit_accepts_explicit_event_source() {
+        let cli = Cli::try_parse_from(["armature", "emit", "hook.example", "--source", "manual"])
+            .unwrap();
+
+        let Command::Emit(args) = cli.command else {
+            panic!("expected emit command");
+        };
+        assert_eq!(args.source, "manual");
+    }
+
+    #[test]
+    fn emit_accepts_payload_file_and_stdin_sources() {
+        let cli = Cli::try_parse_from([
+            "armature",
+            "emit",
+            "hook.example",
+            "--payload-file",
+            "payload.json",
+        ])
+        .unwrap();
+
+        let Command::Emit(args) = cli.command else {
+            panic!("expected emit command");
+        };
+        assert_eq!(
+            args.payload_file.as_deref(),
+            Some(Path::new("payload.json"))
+        );
+        assert!(!args.stdin);
+
+        let cli = Cli::try_parse_from(["armature", "emit", "hook.example", "--stdin"]).unwrap();
+
+        let Command::Emit(args) = cli.command else {
+            panic!("expected emit command");
+        };
+        assert!(args.payload_file.is_none());
+        assert!(args.stdin);
+    }
+
+    #[test]
+    fn emit_payload_sources_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from([
+            "armature",
+            "emit",
+            "hook.example",
+            "--json",
+            "{}",
+            "--stdin",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "armature",
+            "emit",
+            "hook.example",
+            "--json",
+            "{}",
+            "--payload-file",
+            "payload.json",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1343,21 +2553,44 @@ mod tests {
     }
 
     #[test]
-    fn status_lists_manual_locks_from_disk() {
+    fn tasks_requires_running_daemon() {
         let dir = TempDir::new().unwrap();
-        let record = ManualLockRecord {
-            name: "branch:main".to_string(),
-            owner_pid: std::process::id(),
-            acquired_at_ms: 1,
-            expires_at_ms: None,
-            manual: true,
-        };
-        let path = lock_file_path(dir.path(), &record.name);
-        fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+        write_workspace_config(
+            dir.path(),
+            "[[task]]\nname = \"test\"\nrun = \"echo test\"\n",
+        );
 
-        let locks = list_manual_locks(dir.path()).unwrap();
-        assert_eq!(locks.len(), 1);
-        assert_eq!(locks[0].name, "branch:main");
+        let error = tasks_workspace(Some(dir.path().to_path_buf()), OutputFormat::Json)
+            .expect_err("tasks should require a live daemon");
+
+        assert_eq!(error.kind.as_ref(), "unavailable");
+        assert!(error.to_string().contains("failed to connect to daemon"));
+    }
+
+    #[test]
+    fn services_requires_running_daemon() {
+        let dir = TempDir::new().unwrap();
+        write_workspace_config(
+            dir.path(),
+            "[[service]]\nname = \"worker\"\nrun = \"echo worker\"\n",
+        );
+
+        let error = services_workspace(Some(dir.path().to_path_buf()), OutputFormat::Json)
+            .expect_err("services should require a live daemon");
+
+        assert_eq!(error.kind.as_ref(), "unavailable");
+        assert!(error.to_string().contains("failed to connect to daemon"));
+    }
+
+    #[test]
+    fn doctor_remains_offline_tolerant() {
+        let dir = TempDir::new().unwrap();
+        write_workspace_config(
+            dir.path(),
+            "[[task]]\nname = \"test\"\nrun = \"echo test\"\n",
+        );
+
+        doctor_workspace(Some(dir.path().to_path_buf()), OutputFormat::Json).unwrap();
     }
 
     #[test]
@@ -1391,7 +2624,7 @@ mod tests {
                 RecipeName::NamedLock,
                 "scripts/with-named-lock.sh",
                 "name = \"with-named-lock\"",
-                "armature lock acquire",
+                "lock acquire",
             ),
         ];
 
@@ -1440,5 +2673,67 @@ mod tests {
             .join(CONFIG_DIR_NAME)
             .join(CONFIG_FILE_NAME)
             .exists());
+    }
+
+    #[test]
+    fn wait_for_daemon_stop_succeeds_when_daemon_is_unreachable() {
+        let dir = TempDir::new().unwrap();
+        write_workspace_config(dir.path(), "");
+        let workspace = resolve_workspace(Some(dir.path()), dir.path()).unwrap();
+
+        wait_for_daemon_stop(&workspace, std::time::Duration::from_millis(10)).unwrap();
+    }
+
+    #[test]
+    fn wait_for_daemon_stop_errors_when_daemon_stays_reachable() {
+        let dir = TempDir::new().unwrap();
+        write_workspace_config(dir.path(), "");
+        let workspace = resolve_workspace(Some(dir.path()), dir.path()).unwrap();
+        let runtime_paths = WorkspaceRuntimePaths::for_workspace(&workspace).unwrap();
+        runtime_paths.ensure_state_root().unwrap();
+        let socket_path = runtime_paths.socket_path();
+        let _ = fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            while !stop_server.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = String::new();
+                        BufReader::new(stream.try_clone().unwrap())
+                            .read_line(&mut request)
+                            .unwrap();
+                        stream
+                            .write_all(
+                                br#"{"status":"ok","payload":{"kind":"inspect","config_version":"0.3","socket_path":"","pid_path":"","services":[],"tasks":[],"active_runs":[]}}"#,
+                            )
+                            .unwrap();
+                        stream.write_all(b"\n").unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let error =
+            wait_for_daemon_stop(&workspace, std::time::Duration::from_millis(30)).unwrap_err();
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = fs::remove_file(socket_path);
+
+        assert_eq!(error.kind.as_ref(), "unavailable");
+        assert!(error.message.contains("daemon did not stop"));
+    }
+
+    fn write_workspace_config(root: &std::path::Path, contents: &str) {
+        let config_dir = root.join(CONFIG_DIR_NAME);
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join(CONFIG_FILE_NAME), contents).unwrap();
     }
 }

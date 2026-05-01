@@ -2,9 +2,11 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
 use std::str::FromStr;
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,14 +24,15 @@ use serde_json::{json, Value};
 use crate::duration::parse_duration;
 use crate::process::{signal_process_group, spawn_shell_command};
 use crate::protocol::{
-    DaemonRequest, DaemonResponse, InspectResponse, ResponsePayload, RuntimeServiceStatus,
-    RuntimeTaskStatus,
+    DaemonRequest, DaemonResponse, InspectResponse, ManualLockRecord, ResponsePayload,
+    RuntimeHealthStatus, RuntimeServiceStatus, RuntimeTaskStatus,
 };
-use crate::store::SqliteStore;
+use crate::store::{ManualLockOwner, ManualLockStore, NewRun, SqliteStore};
 
 const LOOP_SLEEP: Duration = Duration::from_millis(25);
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const DEFAULT_WATCH_SETTLE: Duration = Duration::from_millis(300);
+const LOCKS_DIR_NAME: &str = "locks";
 
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
@@ -90,16 +93,30 @@ impl DaemonServer {
         }
 
         let handle_socket_path = socket_path.clone();
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
         let join_handle = thread::spawn(move || {
-            let result = Runtime::new(workspace, runtime_paths, options)
-                .and_then(|mut runtime| runtime.run());
+            let result = match Runtime::new(workspace, runtime_paths, options) {
+                Ok(mut runtime) => {
+                    let _ = startup_tx.send(Ok(()));
+                    runtime.run()
+                }
+                Err(error) => {
+                    let _ = startup_tx.send(Err(error.clone()));
+                    Err(error)
+                }
+            };
             let _ = fs::remove_file(socket_path);
             let _ = fs::remove_file(pid_path);
             let _ = fs::remove_file(lock_path);
             result
         });
 
-        wait_for_socket(&handle_socket_path, Duration::from_secs(1))?;
+        wait_for_startup(
+            &startup_rx,
+            &join_handle,
+            &handle_socket_path,
+            Duration::from_secs(1),
+        )?;
 
         Ok(DaemonHandle {
             socket_path: handle_socket_path,
@@ -159,7 +176,22 @@ impl DaemonClient {
     }
 
     pub fn start_task(&self, name: impl Into<String>) -> ArmatureResult<RunId> {
-        match self.send(DaemonRequest::StartTask { name: name.into() })? {
+        self.start_task_with_provenance(name, None, None, None)
+    }
+
+    pub fn start_task_with_provenance(
+        &self,
+        name: impl Into<String>,
+        source_run_id: Option<RunId>,
+        parent_event_id: Option<EventId>,
+        correlation_id: Option<String>,
+    ) -> ArmatureResult<RunId> {
+        match self.send(DaemonRequest::StartTask {
+            name: name.into(),
+            source_run_id,
+            parent_event_id,
+            correlation_id,
+        })? {
             ResponsePayload::StartedRun { run_id } => Ok(run_id),
             _ => Err(ArmatureError::internal("unexpected task start response")),
         }
@@ -171,10 +203,25 @@ impl DaemonClient {
         payload: Value,
         source: Option<String>,
     ) -> ArmatureResult<()> {
+        self.emit_event_with_provenance(event_type, payload, source, None, None, None)
+    }
+
+    pub fn emit_event_with_provenance(
+        &self,
+        event_type: impl Into<String>,
+        payload: Value,
+        source: Option<String>,
+        source_run_id: Option<RunId>,
+        parent_event_id: Option<EventId>,
+        correlation_id: Option<String>,
+    ) -> ArmatureResult<()> {
         self.expect_empty(DaemonRequest::EmitEvent {
             event_type: event_type.into(),
             payload,
             source,
+            source_run_id,
+            parent_event_id,
+            correlation_id,
         })
     }
 
@@ -182,6 +229,59 @@ impl DaemonClient {
         self.expect_empty(DaemonRequest::CancelRun {
             run_id: run_id.into(),
         })
+    }
+
+    pub fn acquire_lock(
+        &self,
+        name: impl Into<String>,
+        ttl: Duration,
+        reason: Option<String>,
+    ) -> ArmatureResult<ManualLockRecord> {
+        let owner_pid = std::process::id();
+        match self.send(DaemonRequest::LockAcquire {
+            name: name.into(),
+            ttl_ms: ttl.as_millis() as u64,
+            owner_pid,
+            owner_id: lock_owner_id(owner_pid),
+            reason,
+        })? {
+            ResponsePayload::LockAcquired { lock } => Ok(lock),
+            _ => Err(ArmatureError::internal("unexpected lock acquire response")),
+        }
+    }
+
+    pub fn renew_lock(
+        &self,
+        name: impl Into<String>,
+        token: impl Into<String>,
+        ttl: Duration,
+    ) -> ArmatureResult<ManualLockRecord> {
+        match self.send(DaemonRequest::LockRenew {
+            name: name.into(),
+            token: token.into(),
+            ttl_ms: ttl.as_millis() as u64,
+        })? {
+            ResponsePayload::LockRenewed { lock } => Ok(lock),
+            _ => Err(ArmatureError::internal("unexpected lock renew response")),
+        }
+    }
+
+    pub fn release_lock(
+        &self,
+        name: impl Into<String>,
+        token: impl Into<String>,
+    ) -> ArmatureResult<()> {
+        self.expect_empty(DaemonRequest::LockRelease {
+            name: name.into(),
+            token: token.into(),
+        })
+    }
+
+    pub fn locks(&self) -> ArmatureResult<Vec<ManualLockRecord>> {
+        match self.send(DaemonRequest::LockStatus)? {
+            ResponsePayload::Locks { locks } => Ok(locks),
+            _ => Err(ArmatureError::internal("unexpected lock status response")),
+        }
     }
 
     pub fn service_stop(&self, name: impl Into<String>) -> ArmatureResult<()> {
@@ -250,10 +350,35 @@ struct ManagedService {
     config: ServiceConfig,
     stop_override: bool,
     active_run_id: Option<String>,
+    health: Option<ManagedHealth>,
     restart_attempts: VecDeque<Instant>,
+    pending_restart: Option<RestartLineage>,
     next_start_at: Option<Instant>,
     exhausted: bool,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestartLineage {
+    restart_of: RunId,
+    attempt: u32,
+}
+
+#[derive(Clone)]
+struct ManagedHealth {
+    state: HealthState,
+    active_run_id: Option<String>,
+    last_run_id: Option<String>,
+    last_error: Option<String>,
+    next_check_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HealthState {
+    Unknown,
+    Checking,
+    Healthy,
+    Unhealthy,
 }
 
 struct ManagedTask {
@@ -300,6 +425,7 @@ struct FileFingerprint {
 enum RunKind {
     Task,
     Service,
+    HealthCheck,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -327,6 +453,7 @@ impl Runtime {
             .set_nonblocking(true)
             .map_err(|error| ArmatureError::internal(error.to_string()))?;
         let store = SqliteStore::open_with_paths(runtime_paths.clone())?;
+        recover_unfinished_runs(&store)?;
         let config = load_workspace_config(&workspace)?;
         let mut runtime = Self {
             workspace,
@@ -357,6 +484,7 @@ impl Runtime {
             self.poll_runs()?;
             if !self.shutdown_requested {
                 self.reconcile_services()?;
+                self.poll_health_checks()?;
             } else {
                 self.stop_all_runs(StopReason::Shutdown)?;
             }
@@ -395,6 +523,10 @@ impl Runtime {
     }
 
     fn handle_request_inner(&mut self, request: DaemonRequest) -> ArmatureResult<ResponsePayload> {
+        if self.shutdown_requested && !request_allowed_during_shutdown(&request) {
+            return Err(ArmatureError::invalid_state("daemon is shutting down"));
+        }
+
         match request {
             DaemonRequest::Inspect => Ok(ResponsePayload::Inspect(self.inspect())),
             DaemonRequest::Events => Ok(ResponsePayload::Events {
@@ -406,21 +538,78 @@ impl Runtime {
             DaemonRequest::Runs => Ok(ResponsePayload::Runs {
                 runs: self.store.list_runs()?,
             }),
-            DaemonRequest::StartTask { name } => {
-                let run_id = self.start_task(&name)?;
+            DaemonRequest::StartTask {
+                name,
+                source_run_id,
+                parent_event_id,
+                correlation_id,
+            } => {
+                let run_id =
+                    self.start_task(&name, source_run_id, parent_event_id, correlation_id)?;
                 Ok(ResponsePayload::StartedRun { run_id })
             }
             DaemonRequest::EmitEvent {
                 event_type,
                 payload,
                 source,
+                source_run_id,
+                parent_event_id,
+                correlation_id,
             } => {
-                self.emit_user_event(event_type, payload, source)?;
+                self.emit_user_event(
+                    event_type,
+                    payload,
+                    source,
+                    source_run_id,
+                    parent_event_id,
+                    correlation_id,
+                )?;
                 Ok(ResponsePayload::Empty)
             }
             DaemonRequest::CancelRun { run_id } => {
                 self.cancel_run(&run_id, StopReason::Cancelled)?;
                 Ok(ResponsePayload::Empty)
+            }
+            DaemonRequest::LockAcquire {
+                name,
+                ttl_ms,
+                owner_pid,
+                owner_id,
+                reason,
+            } => {
+                let lock =
+                    ManualLockStore::new(self.runtime_paths.state_root().join(LOCKS_DIR_NAME))
+                        .acquire(
+                            name,
+                            ManualLockOwner {
+                                pid: owner_pid,
+                                id: owner_id,
+                            },
+                            reason,
+                            Duration::from_millis(ttl_ms),
+                        )?;
+                Ok(ResponsePayload::LockAcquired { lock })
+            }
+            DaemonRequest::LockRenew {
+                name,
+                token,
+                ttl_ms,
+            } => {
+                let lock =
+                    ManualLockStore::new(self.runtime_paths.state_root().join(LOCKS_DIR_NAME))
+                        .renew(&name, &token, Duration::from_millis(ttl_ms))?;
+                Ok(ResponsePayload::LockRenewed { lock })
+            }
+            DaemonRequest::LockRelease { name, token } => {
+                ManualLockStore::new(self.runtime_paths.state_root().join(LOCKS_DIR_NAME))
+                    .release(&name, &token)?;
+                Ok(ResponsePayload::Empty)
+            }
+            DaemonRequest::LockStatus => {
+                let locks =
+                    ManualLockStore::new(self.runtime_paths.state_root().join(LOCKS_DIR_NAME))
+                        .list()?;
+                Ok(ResponsePayload::Locks { locks })
             }
             DaemonRequest::ServiceStart { name } => {
                 let service = self.service_mut(&name)?;
@@ -430,9 +619,23 @@ impl Runtime {
                 Ok(ResponsePayload::Empty)
             }
             DaemonRequest::ServiceStop { name } => {
-                let service = self.service_mut(&name)?;
-                service.stop_override = true;
-                if let Some(run_id) = service.active_run_id.clone() {
+                let run_ids = {
+                    let service = self.service_mut(&name)?;
+                    service.stop_override = true;
+                    let mut run_ids = Vec::new();
+                    if let Some(run_id) = service.active_run_id.clone() {
+                        run_ids.push(run_id);
+                    }
+                    if let Some(run_id) = service
+                        .health
+                        .as_ref()
+                        .and_then(|health| health.active_run_id.clone())
+                    {
+                        run_ids.push(run_id);
+                    }
+                    run_ids
+                };
+                for run_id in run_ids {
                     self.cancel_run(&run_id, StopReason::ServiceUpdate)?;
                 }
                 Ok(ResponsePayload::Empty)
@@ -446,6 +649,14 @@ impl Runtime {
                     service.active_run_id.clone()
                 };
                 if let Some(run_id) = active_run_id {
+                    self.cancel_run(&run_id, StopReason::ServiceUpdate)?;
+                }
+                let health_run_id = self
+                    .services
+                    .get(&name)
+                    .and_then(|service| service.health.as_ref())
+                    .and_then(|health| health.active_run_id.clone());
+                if let Some(run_id) = health_run_id {
                     self.cancel_run(&run_id, StopReason::ServiceUpdate)?;
                 }
                 Ok(ResponsePayload::Empty)
@@ -471,6 +682,7 @@ impl Runtime {
                 stop_override: service.stop_override,
                 state: service_state(service),
                 supervision_state: supervision_state(service).to_string(),
+                health: service.health.as_ref().map(runtime_health_status),
                 active_run_id: service
                     .active_run_id
                     .as_deref()
@@ -516,7 +728,13 @@ impl Runtime {
         }
     }
 
-    fn start_task(&mut self, name: &str) -> ArmatureResult<RunId> {
+    fn start_task(
+        &mut self,
+        name: &str,
+        source_run_id: Option<RunId>,
+        parent_event_id: Option<EventId>,
+        correlation_id: Option<String>,
+    ) -> ArmatureResult<RunId> {
         if !self.tasks.contains_key(name) {
             return Err(ArmatureError::not_found(format!(
                 "task {name:?} was not found"
@@ -526,10 +744,14 @@ impl Runtime {
         let event = EventRecord {
             id: EventId::new(),
             event_type: "manual.run.requested".to_string(),
+            time: Utc::now().to_rfc3339(),
             payload: json!({ "task": name }),
             routing: EventRouting::Manual,
             config_version: Some(self.config.version.clone()),
             source: Some("manual".to_string()),
+            source_run_id,
+            parent_event_id,
+            correlation_id,
         };
         self.store.record_event(&event)?;
 
@@ -546,14 +768,21 @@ impl Runtime {
         event_type: String,
         payload: Value,
         source: Option<String>,
+        source_run_id: Option<RunId>,
+        parent_event_id: Option<EventId>,
+        correlation_id: Option<String>,
     ) -> ArmatureResult<()> {
         let event = EventRecord {
             id: EventId::new(),
             event_type,
+            time: Utc::now().to_rfc3339(),
             payload,
             routing: EventRouting::Event,
             config_version: Some(self.config.version.clone()),
-            source,
+            source: source.or_else(|| Some("user".to_string())),
+            source_run_id,
+            parent_event_id,
+            correlation_id,
         };
         self.store.record_event(&event)?;
         let _ = self.route_event(event, RouteTarget::AllMatching)?;
@@ -585,11 +814,19 @@ impl Runtime {
         let running_services = self
             .services
             .iter()
-            .filter_map(|(name, service)| {
-                service
-                    .active_run_id
+            .flat_map(|(name, service)| {
+                let mut run_ids = Vec::new();
+                if let Some(run_id) = &service.active_run_id {
+                    run_ids.push(run_id.clone());
+                }
+                if let Some(run_id) = service
+                    .health
                     .as_ref()
-                    .map(|run_id| (name.clone(), run_id.clone()))
+                    .and_then(|health| health.active_run_id.clone())
+                {
+                    run_ids.push(run_id);
+                }
+                run_ids.into_iter().map(|run_id| (name.clone(), run_id))
             })
             .collect::<Vec<_>>();
 
@@ -623,14 +860,31 @@ impl Runtime {
                 .as_ref()
                 .map(|entry| entry.stop_override)
                 .unwrap_or(false);
-            let active_run_id = existing.and_then(|entry| entry.active_run_id);
+            let active_run_id = existing
+                .as_ref()
+                .and_then(|entry| entry.active_run_id.clone());
+            let pending_restart = existing
+                .as_ref()
+                .and_then(|entry| entry.pending_restart.clone());
+            let existing_health = existing.as_ref().and_then(|entry| entry.health.clone());
+            let health = config.health.as_ref().map(|_| {
+                existing_health.unwrap_or(ManagedHealth {
+                    state: HealthState::Unknown,
+                    active_run_id: None,
+                    last_run_id: None,
+                    last_error: None,
+                    next_check_at: None,
+                })
+            });
             next.insert(
                 config.name.clone(),
                 ManagedService {
                     config: config.clone(),
                     stop_override,
                     active_run_id,
+                    health,
                     restart_attempts: VecDeque::new(),
+                    pending_restart,
                     next_start_at: None,
                     exhausted: false,
                     last_error: None,
@@ -726,6 +980,34 @@ impl Runtime {
         Ok(())
     }
 
+    fn poll_health_checks(&mut self) -> ArmatureResult<()> {
+        let now = Instant::now();
+        let service_names = self.services.keys().cloned().collect::<Vec<_>>();
+        for name in service_names {
+            let should_check = {
+                let service = self.service(&name)?;
+                service.config.enabled
+                    && !service.stop_override
+                    && service.active_run_id.is_some()
+                    && service
+                        .health
+                        .as_ref()
+                        .map(|health| {
+                            health.active_run_id.is_none()
+                                && health
+                                    .next_check_at
+                                    .map(|deadline| deadline <= now)
+                                    .unwrap_or(true)
+                        })
+                        .unwrap_or(false)
+            };
+            if should_check {
+                self.spawn_health_check(&name)?;
+            }
+        }
+        Ok(())
+    }
+
     fn poll_schedules(&mut self) -> ArmatureResult<()> {
         let now = Utc::now();
         let task_names = self.schedules.keys().cloned().collect::<Vec<_>>();
@@ -748,6 +1030,7 @@ impl Runtime {
             let event = EventRecord {
                 id: EventId::new(),
                 event_type: "timer.fired".to_string(),
+                time: Utc::now().to_rfc3339(),
                 payload: json!({
                     "task": task_name,
                     "schedule": schedule_literal,
@@ -756,6 +1039,9 @@ impl Runtime {
                 routing: EventRouting::Schedule,
                 config_version: Some(self.config.version.clone()),
                 source: Some(format!("schedule:{task_name}")),
+                source_run_id: None,
+                parent_event_id: None,
+                correlation_id: None,
             };
             self.store.record_event(&event)?;
             let _ = self.route_event(event, RouteTarget::Task(task_name.clone()))?;
@@ -804,6 +1090,7 @@ impl Runtime {
             let event = EventRecord {
                 id: EventId::new(),
                 event_type: "file.changed".to_string(),
+                time: Utc::now().to_rfc3339(),
                 payload: json!({
                     "task": task_name,
                     "paths": relative_paths,
@@ -811,6 +1098,9 @@ impl Runtime {
                 routing: EventRouting::Watch,
                 config_version: Some(self.config.version.clone()),
                 source: Some(format!("watch:{task_name}")),
+                source_run_id: None,
+                parent_event_id: None,
+                correlation_id: None,
             };
             self.store.record_event(&event)?;
             let _ = self.route_event(event, RouteTarget::Task(task_name.clone()))?;
@@ -1011,6 +1301,7 @@ impl Runtime {
         let kill_after = optional_duration(task.resources.kill_after.as_deref())?;
         let prepared = self.store.create_run(
             task.name.clone(),
+            task.run.clone(),
             RunOrigin::Task,
             Some(self.config.version.clone()),
             event.as_ref().map(|record| record.id.clone()),
@@ -1026,6 +1317,8 @@ impl Runtime {
             &prepared.paths.stderr,
             &run_envs(
                 "task",
+                &self.workspace,
+                &self.runtime_paths,
                 &prepared.record,
                 self.config.version.as_str(),
                 event.as_ref(),
@@ -1058,12 +1351,22 @@ impl Runtime {
     fn spawn_service(&mut self, name: &str) -> ArmatureResult<()> {
         let config = self.service(name)?.config.clone();
         let kill_after = optional_duration(config.resources.kill_after.as_deref())?;
-        let prepared = self.store.create_run(
-            config.name.clone(),
-            RunOrigin::Service,
-            Some(self.config.version.clone()),
-            None,
-        )?;
+        let pending_restart = self.service(name)?.pending_restart.clone();
+        let prepared = self.store.create_run_record(NewRun {
+            name: config.name.clone(),
+            command: config.run.clone(),
+            origin: if pending_restart.is_some() {
+                RunOrigin::Restart
+            } else {
+                RunOrigin::Service
+            },
+            config_version: Some(self.config.version.clone()),
+            event_id: None,
+            restart_of: pending_restart
+                .as_ref()
+                .map(|lineage| lineage.restart_of.clone()),
+            attempt: pending_restart.as_ref().map(|lineage| lineage.attempt),
+        })?;
         write_run_meta(&prepared.paths.meta, &prepared.record, "service")?;
         let child = spawn_shell_command(
             &config.run,
@@ -1072,6 +1375,8 @@ impl Runtime {
             &prepared.paths.stderr,
             &run_envs(
                 "service",
+                &self.workspace,
+                &self.runtime_paths,
                 &prepared.record,
                 self.config.version.as_str(),
                 None,
@@ -1098,8 +1403,69 @@ impl Runtime {
         );
         let service = self.service_mut(name)?;
         service.active_run_id = Some(run_id);
+        service.pending_restart = None;
         service.last_error = None;
         service.next_start_at = None;
+        if let Some(health) = &mut service.health {
+            health.next_check_at = Some(Instant::now());
+        }
+        Ok(())
+    }
+
+    fn spawn_health_check(&mut self, service_name: &str) -> ArmatureResult<()> {
+        let config = self.service(service_name)?.config.clone();
+        let health_config = config.health.as_ref().ok_or_else(|| {
+            ArmatureError::invalid_state(format!(
+                "service {service_name:?} does not have a health check configured"
+            ))
+        })?;
+        let timeout = optional_duration(health_config.timeout.as_deref())?;
+        let prepared = self.store.create_run(
+            config.name.clone(),
+            health_config.check.clone(),
+            RunOrigin::HealthCheck,
+            Some(self.config.version.clone()),
+            None,
+        )?;
+        write_run_meta(&prepared.paths.meta, &prepared.record, "health_check")?;
+        let child = spawn_shell_command(
+            &health_config.check,
+            self.workspace.root(),
+            &prepared.paths.stdout,
+            &prepared.paths.stderr,
+            &run_envs(
+                "health_check",
+                &self.workspace,
+                &self.runtime_paths,
+                &prepared.record,
+                self.config.version.as_str(),
+                None,
+                &prepared.paths.event,
+            ),
+        )?;
+        self.store
+            .update_run_state(&prepared.record.id, ProcessState::Running)?;
+        let run_id = prepared.record.id.as_str().to_string();
+        let mut record = prepared.record;
+        record.state = ProcessState::Running;
+        self.active_runs.insert(
+            run_id.clone(),
+            ManagedRun {
+                record,
+                child,
+                kind: RunKind::HealthCheck,
+                task_name: Some(config.name.clone()),
+                kill_after: timeout,
+                started_at: Instant::now(),
+                stop_started_at: None,
+                stop_reason: None,
+            },
+        );
+        if let Some(health) = &mut self.service_mut(service_name)?.health {
+            health.state = HealthState::Checking;
+            health.active_run_id = Some(run_id);
+            health.last_error = None;
+        }
         Ok(())
     }
 
@@ -1179,27 +1545,54 @@ impl Runtime {
         } else {
             ProcessState::Failed
         };
-        self.store
-            .update_run_state(&managed.record.id, final_state)?;
+        let signal = status.signal();
+        self.store.finish_run(
+            &managed.record.id,
+            final_state,
+            status.code(),
+            signal,
+            signal.is_some(),
+        )?;
+        refresh_run_meta(
+            &self.store,
+            &managed.record.id,
+            run_kind_meta_name(&managed.kind),
+        )?;
 
         match managed.kind {
             RunKind::Service => {
-                let service = self.service_mut(&managed.record.name)?;
-                service.active_run_id = None;
-                if let Some(reason) = managed.stop_reason {
-                    match reason {
-                        StopReason::ServiceUpdate | StopReason::Shutdown => {}
-                        StopReason::Cancelled => {
-                            service.last_error = Some("cancelled".to_string());
+                let active_health_run_id =
+                    if let Some(service) = self.services.get_mut(&managed.record.name) {
+                        service.active_run_id = None;
+                        if let Some(reason) = managed.stop_reason {
+                            match reason {
+                                StopReason::ServiceUpdate | StopReason::Shutdown => {}
+                                StopReason::Cancelled => {
+                                    service.last_error = Some("cancelled".to_string());
+                                }
+                                StopReason::TimedOut => {
+                                    service.last_error = Some("timed out".to_string());
+                                    schedule_restart(
+                                        service,
+                                        &managed.record,
+                                        &status,
+                                        Instant::now(),
+                                    )?;
+                                }
+                                StopReason::AdmissionRestart => {}
+                            }
+                        } else {
+                            schedule_restart(service, &managed.record, &status, Instant::now())?;
                         }
-                        StopReason::TimedOut => {
-                            service.last_error = Some("timed out".to_string());
-                            schedule_restart(service, &status, Instant::now())?;
-                        }
-                        StopReason::AdmissionRestart => {}
-                    }
-                } else {
-                    schedule_restart(service, &status, Instant::now())?;
+                        service
+                            .health
+                            .as_ref()
+                            .and_then(|health| health.active_run_id.clone())
+                    } else {
+                        None
+                    };
+                if let Some(run_id) = active_health_run_id {
+                    self.cancel_run(&run_id, StopReason::ServiceUpdate)?;
                 }
             }
             RunKind::Task => {
@@ -1207,8 +1600,63 @@ impl Runtime {
                     if let Some(task) = self.tasks.get_mut(task_name) {
                         task.active_run_ids
                             .retain(|active_id| active_id != managed.record.id.as_str());
+                        self.maybe_start_next_pending(task_name)?;
                     }
-                    self.maybe_start_next_pending(task_name)?;
+                }
+            }
+            RunKind::HealthCheck => {
+                if let Some(service_name) = &managed.task_name {
+                    let every = self
+                        .services
+                        .get(service_name)
+                        .and_then(|service| service.config.health.as_ref())
+                        .map(|health| parse_duration(&health.every))
+                        .transpose()?;
+                    if let Some(service) = self.services.get_mut(service_name) {
+                        if let Some(health) = &mut service.health {
+                            health.active_run_id = None;
+                            health.last_run_id = Some(managed.record.id.as_str().to_string());
+                            if success {
+                                health.state = HealthState::Healthy;
+                                health.last_error = None;
+                            } else {
+                                match managed.stop_reason {
+                                    Some(StopReason::TimedOut) => {
+                                        health.state = HealthState::Unhealthy;
+                                        health.last_error =
+                                            Some("health check timed out".to_string());
+                                        service.last_error = health.last_error.clone();
+                                    }
+                                    None => {
+                                        health.state = HealthState::Unhealthy;
+                                        health.last_error = Some("health check failed".to_string());
+                                        service.last_error = health.last_error.clone();
+                                    }
+                                    Some(StopReason::ServiceUpdate) => {
+                                        health.state = HealthState::Unknown;
+                                        health.last_error =
+                                            Some("health check stopped".to_string());
+                                    }
+                                    Some(StopReason::Shutdown) => {
+                                        health.state = HealthState::Unknown;
+                                        health.last_error =
+                                            Some("health check stopped for shutdown".to_string());
+                                    }
+                                    Some(StopReason::Cancelled) => {
+                                        health.state = HealthState::Unknown;
+                                        health.last_error =
+                                            Some("health check cancelled".to_string());
+                                    }
+                                    Some(StopReason::AdmissionRestart) => {
+                                        health.state = HealthState::Unknown;
+                                        health.last_error =
+                                            Some("health check stopped".to_string());
+                                    }
+                                }
+                            }
+                            health.next_check_at = every.map(|duration| Instant::now() + duration);
+                        }
+                    }
                 }
             }
         }
@@ -1261,45 +1709,156 @@ struct RouteResult {
     started_run_id: Option<RunId>,
 }
 
+fn request_allowed_during_shutdown(request: &DaemonRequest) -> bool {
+    matches!(
+        request,
+        DaemonRequest::Inspect
+            | DaemonRequest::Events
+            | DaemonRequest::Triggers
+            | DaemonRequest::Runs
+            | DaemonRequest::LockRenew { .. }
+            | DaemonRequest::LockRelease { .. }
+            | DaemonRequest::LockStatus
+            | DaemonRequest::Shutdown
+    )
+}
+
+fn recover_unfinished_runs(store: &SqliteStore) -> ArmatureResult<()> {
+    for run in store.list_unfinished_runs()? {
+        if let Some(stderr_path) = &run.stderr_path {
+            append_recovery_note(Path::new(stderr_path), &run)?;
+        }
+        store.finish_run(&run.id, ProcessState::Failed, None, None, false)?;
+        refresh_run_meta(store, &run.id, run_origin_meta_name(&run.origin))?;
+    }
+    Ok(())
+}
+
+fn append_recovery_note(path: &Path, run: &RunRecord) -> ArmatureResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(
+        file,
+        "[armature] {} recovery: run {} marked failed during daemon startup; previous state was {:?}; no exit code or signal was observed",
+        Utc::now().to_rfc3339(),
+        run.id.as_str(),
+        run.state
+    )?;
+    Ok(())
+}
+
+fn refresh_run_meta(store: &SqliteStore, run_id: &RunId, kind: &str) -> ArmatureResult<()> {
+    if let Some(run) = store.get_run(run_id)? {
+        if let Some(run_directory) = &run.run_directory {
+            write_run_meta(&Path::new(run_directory).join("meta.json"), &run, kind)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_kind_meta_name(kind: &RunKind) -> &'static str {
+    match kind {
+        RunKind::Task => "task",
+        RunKind::Service => "service",
+        RunKind::HealthCheck => "health_check",
+    }
+}
+
+fn run_origin_meta_name(origin: &RunOrigin) -> &'static str {
+    match origin {
+        RunOrigin::Task => "task",
+        RunOrigin::Service => "service",
+        RunOrigin::HealthCheck => "health_check",
+        RunOrigin::Restart => "service",
+    }
+}
+
 fn bind_listener(path: impl AsRef<Path>) -> ArmatureResult<UnixListener> {
     UnixListener::bind(path)
         .map_err(|error| ArmatureError::internal(format!("failed to bind daemon socket: {error}")))
 }
 
-fn wait_for_socket(path: &Path, timeout: Duration) -> ArmatureResult<()> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if path.exists() {
-            return Ok(());
+fn wait_for_startup(
+    startup_rx: &mpsc::Receiver<ArmatureResult<()>>,
+    join_handle: &JoinHandle<ArmatureResult<()>>,
+    path: &Path,
+    timeout: Duration,
+) -> ArmatureResult<()> {
+    match startup_rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(ArmatureError::unavailable(format!(
+            "daemon socket did not appear at {} within {:?}",
+            path.display(),
+            timeout
+        ))),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            if join_handle.is_finished() {
+                Err(ArmatureError::internal(
+                    "daemon thread exited during startup",
+                ))
+            } else {
+                Err(ArmatureError::internal(
+                    "daemon startup channel closed before readiness was reported",
+                ))
+            }
         }
-        thread::sleep(Duration::from_millis(10));
     }
-    Err(ArmatureError::unavailable(format!(
-        "daemon socket did not appear at {} within {:?}",
-        path.display(),
-        timeout
-    )))
 }
 
 fn acquire_lock(path: &Path, pid: u32) -> ArmatureResult<()> {
     use std::fs::OpenOptions;
-    let file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                ArmatureError::conflict(format!(
-                    "workspace daemon lock already exists at {}",
-                    path.display()
-                ))
-            } else {
-                ArmatureError::internal(error.to_string())
+    loop {
+        match OpenOptions::new().create_new(true).write(true).open(path) {
+            Ok(file) => {
+                drop(file);
+                fs::write(path, format!("{pid}\n"))?;
+                return Ok(());
             }
-        })?;
-    drop(file);
-    fs::write(path, format!("{pid}\n"))?;
-    Ok(())
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if lock_holder_is_alive(path) {
+                    return Err(ArmatureError::conflict(format!(
+                        "workspace daemon lock already exists at {}",
+                        path.display()
+                    )));
+                }
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(ArmatureError::internal(error.to_string())),
+        }
+    }
+}
+
+fn lock_holder_is_alive(path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return true;
+    };
+    let Ok(pid) = contents.trim().parse::<u32>() else {
+        return true;
+    };
+    pid_is_alive(pid)
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn lock_owner_id(owner_pid: u32) -> String {
+    std::env::var("ARMATURE_RUN_ID").unwrap_or_else(|_| format!("pid:{owner_pid}"))
 }
 
 fn read_json_line<T: DeserializeOwned>(stream: &mut UnixStream) -> ArmatureResult<T> {
@@ -1321,6 +1880,8 @@ fn write_json_line<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> A
 
 fn run_envs(
     kind: &str,
+    workspace: &Workspace,
+    runtime_paths: &WorkspaceRuntimePaths,
     record: &RunRecord,
     config_version: &str,
     event: Option<&EventRecord>,
@@ -1329,6 +1890,22 @@ fn run_envs(
     let mut envs = vec![
         ("ARMATURE_KIND".to_string(), kind.to_string()),
         ("ARMATURE_NAME".to_string(), record.name.clone()),
+        (
+            "ARMATURE_WORKSPACE".to_string(),
+            runtime_paths.workspace_root().display().to_string(),
+        ),
+        (
+            "ARMATURE_WORKSPACE_ROOT".to_string(),
+            runtime_paths.workspace_root().display().to_string(),
+        ),
+        (
+            "ARMATURE_CONFIG_DIR".to_string(),
+            workspace.config_dir().display().to_string(),
+        ),
+        (
+            "ARMATURE_STATE_DIR".to_string(),
+            runtime_paths.state_root().display().to_string(),
+        ),
         (
             "ARMATURE_RUN_ID".to_string(),
             record.id.as_str().to_string(),
@@ -1347,6 +1924,15 @@ fn run_envs(
     if let Some(stderr_path) = &record.stderr_path {
         envs.push(("ARMATURE_STDERR_LOG".to_string(), stderr_path.clone()));
     }
+    if let Some(restart_of) = &record.restart_of {
+        envs.push((
+            "ARMATURE_RESTART_OF".to_string(),
+            restart_of.as_str().to_string(),
+        ));
+    }
+    if let Some(attempt) = record.attempt {
+        envs.push(("ARMATURE_RESTART_ATTEMPT".to_string(), attempt.to_string()));
+    }
     if let Some(event) = event {
         envs.push((
             "ARMATURE_EVENT_ID".to_string(),
@@ -1357,10 +1943,23 @@ fn run_envs(
             "ARMATURE_EVENT_JSON".to_string(),
             serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string()),
         ));
+        let payload_json =
+            serde_json::to_string(&event.payload).unwrap_or_else(|_| "null".to_string());
+        envs.push((
+            "ARMATURE_EVENT_PAYLOAD_JSON".to_string(),
+            payload_json.clone(),
+        ));
+        envs.push(("ARMATURE_PAYLOAD_JSON".to_string(), payload_json));
         envs.push((
             "ARMATURE_EVENT_PATH".to_string(),
             event_path.display().to_string(),
         ));
+        if let Some(correlation_id) = &event.correlation_id {
+            envs.push((
+                "ARMATURE_CORRELATION_ID".to_string(),
+                correlation_id.clone(),
+            ));
+        }
     }
     envs
 }
@@ -1369,8 +1968,19 @@ fn write_run_meta(path: &Path, record: &RunRecord, kind: &str) -> ArmatureResult
     let value = serde_json::json!({
         "run_id": record.id.as_str(),
         "name": record.name,
+        "command": record.command,
         "kind": kind,
+        "origin": format!("{:?}", record.origin).to_lowercase(),
+        "state": format!("{:?}", record.state).to_lowercase(),
+        "start_time": record.start_time,
+        "end_time": record.end_time,
+        "exit_code": record.exit_code,
+        "signal": record.signal,
+        "killed": record.killed,
         "config_version": record.config_version,
+        "event_id": record.event_id.as_ref().map(|event_id| event_id.as_str()),
+        "restartOf": record.restart_of.as_ref().map(|run_id| run_id.as_str()),
+        "attempt": record.attempt,
         "run_directory": record.run_directory,
         "stdout_path": record.stdout_path,
         "stderr_path": record.stderr_path,
@@ -1398,6 +2008,7 @@ fn optional_duration(value: Option<&str>) -> ArmatureResult<Option<Duration>> {
 
 fn schedule_restart(
     service: &mut ManagedService,
+    run: &RunRecord,
     status: &ExitStatus,
     now: Instant,
 ) -> ArmatureResult<()> {
@@ -1429,10 +2040,15 @@ fn schedule_restart(
     if service.restart_attempts.len() >= max_restarts {
         service.exhausted = true;
         service.last_error = Some("restart budget exhausted".to_string());
+        service.pending_restart = None;
         return Ok(());
     }
 
     service.restart_attempts.push_back(now);
+    service.pending_restart = Some(RestartLineage {
+        restart_of: run.restart_of.clone().unwrap_or_else(|| run.id.clone()),
+        attempt: run.attempt.unwrap_or(0).saturating_add(1),
+    });
     let delay = if let Some(start_delay) = service.config.supervision.start_delay.as_deref() {
         parse_duration(start_delay)?
     } else {
@@ -1472,6 +2088,30 @@ fn service_state(service: &ManagedService) -> ProcessState {
         ProcessState::Failed
     } else {
         ProcessState::Idle
+    }
+}
+
+fn runtime_health_status(health: &ManagedHealth) -> RuntimeHealthStatus {
+    RuntimeHealthStatus {
+        state: health_state_label(health.state).to_string(),
+        active_run_id: health
+            .active_run_id
+            .as_deref()
+            .and_then(|value| RunId::parse(value).ok()),
+        last_run_id: health
+            .last_run_id
+            .as_deref()
+            .and_then(|value| RunId::parse(value).ok()),
+        last_error: health.last_error.clone(),
+    }
+}
+
+fn health_state_label(state: HealthState) -> &'static str {
+    match state {
+        HealthState::Unknown => "unknown",
+        HealthState::Checking => "checking",
+        HealthState::Healthy => "healthy",
+        HealthState::Unhealthy => "unhealthy",
     }
 }
 
@@ -1566,15 +2206,127 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use armature_core::{discover_workspace, AdmissionPolicy, ProcessState, TriggerOutcome};
+    use armature_core::{
+        discover_workspace, AdmissionPolicy, ProcessState, RunOrigin, TriggerOutcome,
+    };
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{DaemonOptions, DaemonServer};
+    use super::{acquire_lock, DaemonOptions, DaemonServer};
+
+    #[test]
+    fn acquire_lock_replaces_stale_dead_pid_lock() {
+        let lock_dir = TempDir::new().unwrap();
+        let lock_path = lock_dir.path().join("workspace.lock");
+        fs::write(&lock_path, "999999999\n").unwrap();
+
+        acquire_lock(&lock_path, std::process::id()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(lock_path).unwrap(),
+            format!("{}\n", std::process::id())
+        );
+    }
+
+    #[test]
+    fn acquire_lock_rejects_live_pid_lock() {
+        let lock_dir = TempDir::new().unwrap();
+        let lock_path = lock_dir.path().join("workspace.lock");
+        fs::write(&lock_path, format!("{}\n", std::process::id())).unwrap();
+
+        let error = acquire_lock(&lock_path, std::process::id()).unwrap_err();
+
+        assert_eq!(error.kind.as_ref(), "conflict");
+        assert_eq!(
+            fs::read_to_string(lock_path).unwrap(),
+            format!("{}\n", std::process::id())
+        );
+    }
+
+    #[test]
+    fn manual_locks_round_trip_through_daemon_transport() {
+        let _guard = lock_tests();
+        let fixture = Fixture::new(
+            r#"
+[[task]]
+name = "noop"
+run = "true"
+"#,
+        );
+        let workspace = discover_workspace(fixture.root()).unwrap();
+        let handle = DaemonServer::start_with_options(
+            workspace,
+            DaemonOptions {
+                poll_interval: Duration::from_millis(20),
+                termination_grace: Duration::from_millis(100),
+            },
+        )
+        .unwrap();
+        let client = handle.client();
+
+        assert!(client.locks().unwrap().is_empty());
+
+        let lock = client
+            .acquire_lock(
+                "branch:main",
+                Duration::from_secs(10),
+                Some("runtime test".to_string()),
+            )
+            .unwrap();
+        assert_eq!(lock.name, "branch:main");
+        assert_eq!(lock.owner_pid, std::process::id());
+        assert_eq!(lock.owner_id, format!("pid:{}", std::process::id()));
+        assert_eq!(lock.reason.as_deref(), Some("runtime test"));
+        assert!(lock.token.starts_with("lock_"));
+        assert!(lock.manual);
+        assert!(lock.expires_at_ms.is_some());
+
+        let conflict = client
+            .acquire_lock("branch:main", Duration::from_secs(10), None)
+            .unwrap_err();
+        assert_eq!(conflict.kind.as_ref(), "conflict");
+
+        let stale_token = lock.token.clone();
+        let renewed = client
+            .renew_lock("branch:main", &lock.token, Duration::from_secs(20))
+            .unwrap();
+        assert_eq!(renewed.token, lock.token);
+        assert!(renewed.renewed_at_ms.is_some());
+
+        let locks = client.locks().unwrap();
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].name, "branch:main");
+
+        let mismatch = client
+            .release_lock("branch:main", "wrong-token")
+            .unwrap_err();
+        assert_eq!(mismatch.kind.as_ref(), "conflict");
+
+        client.release_lock("branch:main", stale_token).unwrap();
+        assert!(client.locks().unwrap().is_empty());
+
+        let expired = client
+            .acquire_lock("branch:main", Duration::from_millis(50), None)
+            .unwrap();
+        thread::sleep(Duration::from_millis(80));
+        let newer = client
+            .acquire_lock("branch:main", Duration::from_secs(10), None)
+            .unwrap();
+        assert_ne!(expired.token, newer.token);
+        let stale_release = client
+            .release_lock("branch:main", expired.token)
+            .unwrap_err();
+        assert_eq!(stale_release.kind.as_ref(), "conflict");
+        assert_eq!(client.locks().unwrap().len(), 1);
+        client.release_lock("branch:main", newer.token).unwrap();
+
+        client.shutdown().unwrap();
+        handle.join().unwrap();
+    }
 
     #[test]
     fn enabled_service_reconciles_and_survives_invalid_reload() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = lock_tests();
         let fixture = Fixture::new(
             r#"
 [[service]]
@@ -1615,7 +2367,7 @@ run = "printf ready > service.txt && sleep 2"
 
     #[test]
     fn service_restarts_on_failure_and_tasks_do_not_restart_by_default() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = lock_tests();
         let fixture = Fixture::new(
             r#"
 [[task]]
@@ -1646,6 +2398,25 @@ start_delay = "20ms"
             || read_file(fixture.root().join("counter.txt")).trim() == "2",
             Duration::from_secs(3),
         );
+        let runs = client.runs().unwrap();
+        let original = runs
+            .iter()
+            .find(|run| run.name == "flaky" && run.origin == RunOrigin::Service)
+            .unwrap();
+        let restart = runs
+            .iter()
+            .find(|run| run.name == "flaky" && run.origin == RunOrigin::Restart)
+            .unwrap();
+        assert_eq!(restart.restart_of.as_ref(), Some(&original.id));
+        assert_eq!(restart.attempt, Some(1));
+        let meta_path = Path::new(restart.run_directory.as_ref().unwrap()).join("meta.json");
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(meta_path).unwrap()).unwrap();
+        assert_eq!(
+            meta["restartOf"],
+            restart.restart_of.as_ref().unwrap().as_str()
+        );
+        assert_eq!(meta["attempt"], 1);
 
         let run_id = client.start_task("once").unwrap();
         wait_for(
@@ -1670,8 +2441,182 @@ start_delay = "20ms"
     }
 
     #[test]
+    fn triggered_tasks_do_not_restart_by_default() {
+        let _guard = lock_tests();
+        let fixture = Fixture::new(
+            r#"
+[[task]]
+name = "once"
+on = "fail-once"
+run = "count=$(cat task-count.txt 2>/dev/null || echo 0); count=$((count + 1)); echo $count > task-count.txt; exit 7"
+"#,
+        );
+        let workspace = discover_workspace(fixture.root()).unwrap();
+        let handle = DaemonServer::start_with_options(
+            workspace,
+            DaemonOptions {
+                poll_interval: Duration::from_millis(20),
+                termination_grace: Duration::from_millis(100),
+            },
+        )
+        .unwrap();
+        let client = handle.client();
+
+        client
+            .emit_event("fail-once", serde_json::json!({}), None)
+            .unwrap();
+        wait_for(
+            || {
+                client
+                    .triggers()
+                    .unwrap()
+                    .iter()
+                    .any(|trigger| trigger.task_name == "once" && trigger.run_id.is_some())
+            },
+            Duration::from_secs(2),
+        );
+        let trigger = client
+            .triggers()
+            .unwrap()
+            .into_iter()
+            .find(|trigger| trigger.task_name == "once")
+            .unwrap();
+        let run_id = trigger.run_id.unwrap();
+        wait_for(
+            || {
+                client
+                    .runs()
+                    .unwrap()
+                    .iter()
+                    .find(|run| run.id == run_id)
+                    .map(|run| run.state == ProcessState::Failed)
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(2),
+        );
+
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(read_file(fixture.root().join("task-count.txt")).trim(), "1");
+
+        client.shutdown().unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn service_health_checks_are_recorded_and_exposed() {
+        let _guard = lock_tests();
+        let fixture = Fixture::new(
+            r#"
+[[service]]
+name = "worker"
+run = "sleep 5"
+
+[service.health]
+check = "count=$(cat health-count.txt 2>/dev/null || echo 0); count=$((count + 1)); echo $count > health-count.txt; if [ \"$count\" -lt 2 ]; then exit 0; else exit 7; fi"
+every = "500ms"
+timeout = "500ms"
+"#,
+        );
+        let workspace = discover_workspace(fixture.root()).unwrap();
+        let handle = DaemonServer::start_with_options(
+            workspace,
+            DaemonOptions {
+                poll_interval: Duration::from_millis(20),
+                termination_grace: Duration::from_millis(100),
+            },
+        )
+        .unwrap();
+        let client = handle.client();
+
+        wait_for(
+            || read_file(fixture.root().join("health-count.txt")).trim() == "2",
+            Duration::from_secs(2),
+        );
+        wait_for(
+            || {
+                client
+                    .inspect()
+                    .unwrap()
+                    .services
+                    .iter()
+                    .find(|service| service.name == "worker")
+                    .and_then(|service| service.health.as_ref())
+                    .map(|health| health.state.as_str() == "unhealthy")
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(2),
+        );
+
+        let status = client.inspect().unwrap();
+        let health = status.services[0].health.as_ref().unwrap();
+        assert_eq!(health.state, "unhealthy");
+        assert_eq!(health.last_error.as_deref(), Some("health check failed"));
+        assert!(health.last_run_id.is_some());
+
+        let runs = client.runs().unwrap();
+        assert!(runs.iter().any(|run| {
+            run.name == "worker"
+                && run.origin == RunOrigin::HealthCheck
+                && run.state == ProcessState::Failed
+        }));
+
+        client.shutdown().unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn service_health_check_timeout_is_unhealthy() {
+        let _guard = lock_tests();
+        let fixture = Fixture::new(
+            r#"
+[[service]]
+name = "worker"
+run = "sleep 5"
+
+[service.health]
+check = "sleep 5"
+every = "500ms"
+timeout = "50ms"
+"#,
+        );
+        let workspace = discover_workspace(fixture.root()).unwrap();
+        let handle = DaemonServer::start_with_options(
+            workspace,
+            DaemonOptions {
+                poll_interval: Duration::from_millis(20),
+                termination_grace: Duration::from_millis(50),
+            },
+        )
+        .unwrap();
+        let client = handle.client();
+
+        wait_for(
+            || {
+                client
+                    .inspect()
+                    .unwrap()
+                    .services
+                    .iter()
+                    .find(|service| service.name == "worker")
+                    .and_then(|service| service.health.as_ref())
+                    .map(|health| health.last_error.as_deref() == Some("health check timed out"))
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(2),
+        );
+
+        let status = client.inspect().unwrap();
+        let health = status.services[0].health.as_ref().unwrap();
+        assert_eq!(health.state, "unhealthy");
+        assert_eq!(health.last_error.as_deref(), Some("health check timed out"));
+
+        client.shutdown().unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn cancel_run_terminates_process_group_after_timeout() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = lock_tests();
         let fixture = Fixture::new(
             r#"
 [[task]]
@@ -1713,14 +2658,58 @@ kill_after = "5s"
     }
 
     #[test]
+    fn rejects_new_work_after_shutdown_while_service_drains() {
+        let _guard = lock_tests();
+        let fixture = Fixture::new(
+            r#"
+[[task]]
+name = "later"
+run = "printf later > later.txt"
+
+[[service]]
+name = "slow-stop"
+run = "trap 'sleep 1; exit 0' TERM; printf ready > service.txt; while true; do sleep 1; done"
+"#,
+        );
+        let workspace = discover_workspace(fixture.root()).unwrap();
+        let handle = DaemonServer::start_with_options(
+            workspace,
+            DaemonOptions {
+                poll_interval: Duration::from_millis(20),
+                termination_grace: Duration::from_secs(2),
+            },
+        )
+        .unwrap();
+        let client = handle.client();
+
+        wait_for(
+            || fixture.root().join("service.txt").is_file(),
+            Duration::from_secs(2),
+        );
+
+        client.shutdown().unwrap();
+        wait_for(
+            || !client.inspect().unwrap().active_runs.is_empty(),
+            Duration::from_secs(1),
+        );
+
+        let error = client.start_task("later").unwrap_err();
+        assert_eq!(error.kind.as_ref(), "invalid_state");
+        assert_eq!(error.message.as_ref(), "daemon is shutting down");
+        assert!(!fixture.root().join("later.txt").exists());
+
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn emit_event_routes_tasks_and_writes_event_artifacts() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = lock_tests();
         let fixture = Fixture::new(
             r#"
 [[task]]
 name = "react"
 on = "tool.run.completed"
-run = "printf '%s' \"$ARMATURE_EVENT_TYPE\" > event-type.txt; printf '%s' \"$ARMATURE_EVENT_ID\" > event-id.txt; printf '%s' \"$ARMATURE_EVENT_PATH\" > event-path.txt; cp \"$ARMATURE_EVENT_PATH\" event-copy.json"
+run = "printf '%s' \"$ARMATURE_EVENT_TYPE\" > event-type.txt; printf '%s' \"$ARMATURE_EVENT_ID\" > event-id.txt; printf '%s' \"$ARMATURE_EVENT_PATH\" > event-path.txt; printf '%s' \"$ARMATURE_EVENT_JSON\" > event-json.txt; printf '%s' \"$ARMATURE_EVENT_PAYLOAD_JSON\" > event-payload-json.txt; printf '%s' \"$ARMATURE_PAYLOAD_JSON\" > payload-json.txt; printf '%s' \"$ARMATURE_WORKSPACE\" > workspace.txt; printf '%s' \"$ARMATURE_WORKSPACE_ROOT\" > workspace-root.txt; printf '%s' \"$ARMATURE_CONFIG_DIR\" > config-dir.txt; printf '%s' \"$ARMATURE_STATE_DIR\" > state-dir.txt; printf '%s' \"$ARMATURE_RUN_DIR\" > run-dir.txt; printf '%s' \"$ARMATURE_CONFIG_VERSION\" > config-version.txt; cp \"$ARMATURE_EVENT_PATH\" event-copy.json"
 "#,
         );
         let workspace = discover_workspace(fixture.root()).unwrap();
@@ -1750,6 +2739,7 @@ run = "printf '%s' \"$ARMATURE_EVENT_TYPE\" > event-type.txt; printf '%s' \"$ARM
         let events = client.events().unwrap();
         let triggers = client.triggers().unwrap();
         assert_eq!(events[0].event_type, "tool.run.completed");
+        assert_eq!(events[0].source.as_deref(), Some("tests"));
         assert_eq!(triggers[0].outcome, TriggerOutcome::Started);
         assert_eq!(
             read_file(fixture.root().join("event-type.txt")).trim(),
@@ -1759,13 +2749,61 @@ run = "printf '%s' \"$ARMATURE_EVENT_TYPE\" > event-type.txt; printf '%s' \"$ARM
         let event_path = read_file(fixture.root().join("event-path.txt"));
         assert!(Path::new(event_path.trim()).is_file());
 
+        let status = client.inspect().unwrap();
+        let runs = client.runs().unwrap();
+        let run = runs.iter().find(|run| run.name == "react").unwrap();
+        assert_eq!(
+            read_file(fixture.root().join("workspace.txt")).trim(),
+            fs::canonicalize(fixture.root())
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            read_file(fixture.root().join("workspace-root.txt")).trim(),
+            read_file(fixture.root().join("workspace.txt")).trim()
+        );
+        assert_eq!(
+            read_file(fixture.root().join("config-dir.txt")).trim(),
+            fixture.root().join(".armature").display().to_string()
+        );
+        assert!(
+            Path::new(read_file(fixture.root().join("state-dir.txt")).trim())
+                .starts_with(fixture._state_home.path())
+        );
+        assert_eq!(
+            read_file(fixture.root().join("run-dir.txt")).trim(),
+            run.run_directory.as_deref().unwrap()
+        );
+        assert_eq!(
+            read_file(fixture.root().join("config-version.txt")).trim(),
+            status.config_version
+        );
+        assert_eq!(
+            read_file(fixture.root().join("payload-json.txt")).trim(),
+            r#"{"runId":"abc123"}"#
+        );
+        assert_eq!(
+            read_file(fixture.root().join("event-payload-json.txt")).trim(),
+            r#"{"runId":"abc123"}"#
+        );
+        let event_json: serde_json::Value =
+            serde_json::from_str(&read_file(fixture.root().join("event-json.txt"))).unwrap();
+        assert_eq!(event_json["payload"], json!({ "runId": "abc123" }));
+
+        client.emit_event("unmatched", json!({}), None).unwrap();
+        let events = client.events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.event_type == "unmatched" && event.source.as_deref() == Some("user")
+        }));
+
         client.shutdown().unwrap();
         handle.join().unwrap();
     }
 
     #[test]
     fn admission_outcomes_remain_inspectable() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = lock_tests();
         let fixture = Fixture::new(
             r#"
 [[task]]
@@ -1893,7 +2931,7 @@ when_busy = "restart"
 
     #[test]
     fn schedules_and_watches_emit_mechanical_events() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = lock_tests();
         let fixture = Fixture::new(
             r#"
 [[task]]
@@ -1987,5 +3025,11 @@ run = "printf w >> watch.log"
     fn test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
+        test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }

@@ -309,12 +309,16 @@ An event **MAY** contain:
 ```ts
 type OptionalArmatureEventFields = {
   workspace?: string
-  runId?: string
-  causationId?: string
-  correlationId?: string
+  source_run_id?: string
+  parent_event_id?: string
+  correlation_id?: string
   labels?: Record<string, string>
 }
 ```
+
+Older SDKs or user payloads may use camelCase fields, but Armature-owned event
+envelope fields **SHOULD** use the snake_case names above for consistency with
+run and trigger records.
 
 Armature **MUST NOT** assign domain semantics to event types.
 
@@ -697,8 +701,14 @@ run = "tsx scripts/review-branch.ts"
 Manual invocation:
 
 ```bash
-armature run review-branch --json '{"branch":"feature-x"}'
+armature run review-branch
 ```
+
+If a task needs structured input, the recommended v0.3 path is to emit an event
+with a payload and let an event-triggered task receive it, or to have the task
+read project files. Future dynamic-management work may add explicit ad hoc run
+payload support, but task invocation must remain a mechanical process launch,
+not a workflow call.
 
 ---
 
@@ -713,6 +723,7 @@ ARMATURE_RUN_ID
 ARMATURE_NAME
 ARMATURE_KIND          # task | service
 ARMATURE_WORKSPACE
+ARMATURE_WORKSPACE_ROOT
 ARMATURE_CONFIG_DIR
 ARMATURE_STATE_DIR
 ARMATURE_RUN_DIR
@@ -720,6 +731,7 @@ ARMATURE_EVENT_JSON
 ARMATURE_EVENT_PATH
 ARMATURE_PAYLOAD_JSON
 ARMATURE_CONFIG_VERSION
+ARMATURE_CORRELATION_ID
 ```
 
 For small events, `ARMATURE_EVENT_JSON` is acceptable.
@@ -1029,7 +1041,7 @@ The latter belongs in user code.
 
 ## 24. Named Locks
 
-Armature **MAY** provide raw named locks.
+Armature **MAY** provide named locks.
 
 Locks are daemon-worthy because inter-process mutual exclusion is mechanical and error-prone.
 
@@ -1041,13 +1053,15 @@ named by user code
 opaque to the daemon
 inspectable
 not inferred from domain concepts
+bounded by a lease or equivalent recovery mechanism
 ```
 
 CLI example:
 
 ```bash
-armature lock acquire branch:main
-armature lock release branch:main
+armature lock acquire branch:main --ttl 10m --reason "review request req-482"
+armature lock renew branch:main --token lock_... --ttl 10m
+armature lock release branch:main --token lock_...
 ```
 
 TypeScript SDK example:
@@ -1070,15 +1084,28 @@ Recommended owner fields:
 
 ```text
 lock name
+fencing token
 owner run id, if acquired by a run
+owner name, if known
 owner process id, if known
+correlation id, if known
+reason, if supplied
 acquired time
+renewed time
 optional lease expiration
 ```
 
-If a lock is acquired by a run and that run exits, Armature **SHOULD** release the lock automatically.
+Lock release **SHOULD** require a fencing token so an old holder cannot release a newer lease with the same name.
 
-If a lock is acquired outside a run, Armature **SHOULD** either require an explicit lease duration or mark the lock as manually owned and inspectable.
+An implementation **MAY** allow tokenless release only when the caller is mechanically identifiable as the owning Armature run.
+
+If a lock is acquired by a run and that run exits, Armature **SHOULD** release the lock automatically or allow the lease to expire.
+
+If a lock is acquired outside a run, Armature **SHOULD** require an explicit lease duration and make the owner inspectable.
+
+Armature **SHOULD** provide an explicit administrative force-release operation that requires a reason and records the previous owner/token for audit.
+
+Armature **SHOULD** provide an ergonomic `lock with` command or SDK helper that acquires a lock, runs a command or callback, and releases with the returned token.
 
 Armature **SHOULD** expose held locks through a CLI or status interface.
 
@@ -1096,6 +1123,18 @@ Required baseline mechanism:
 armature emit review.ready --json '{"branch":"feature-x"}'
 ```
 
+Payloads **SHOULD** also be accepted from a file or standard input for agent
+ergonomics:
+
+```bash
+armature emit review.ready --payload-file payload.json
+cat payload.json | armature emit review.ready --stdin
+```
+
+`emit` is the canonical event creation verb. Armature **SHOULD NOT** add a
+separate `publish` command unless it is a pure alias with identical event
+semantics and no broker-style guarantees.
+
 Event emission **MUST** be usable from any language.
 
 A TypeScript SDK **MAY** wrap it:
@@ -1109,9 +1148,9 @@ await emit("review.ready", { branch: "feature-x" })
 When an event is emitted from inside a run, Armature **SHOULD** attach mechanical lineage:
 
 ```text
-runId
-causationId
-correlationId
+source_run_id
+parent_event_id
+correlation_id
 ```
 
 Lineage is mechanical. It supports debugging. It is not a workflow model.
@@ -1120,18 +1159,20 @@ Lineage is mechanical. It supports debugging. It is not a workflow model.
 
 ## 26. Causation and Correlation
 
-Armature **SHOULD** support two optional event fields:
+Armature **SHOULD** support optional event causality fields:
 
 ```text
-causationId
-correlationId
+source_run_id
+parent_event_id
+correlation_id
 ```
 
 Recommended meanings:
 
 ```text
-causationId    the event that directly caused this event, if known
-correlationId  a shared id for a broader episode, if known
+source_run_id  the Armature run that emitted this event, if known
+parent_event_id the Armature event visible to that run, if known
+correlation_id a shared id for a broader episode, if known
 ```
 
 Armature may propagate these mechanically.
@@ -1248,6 +1289,8 @@ armature services
 armature tasks
 armature runs
 armature logs <run-id>
+armature events
+armature triggers
 ```
 
 JSON form **SHOULD** be supported:
@@ -1257,7 +1300,13 @@ armature status --json
 armature ps --json
 armature services --json
 armature runs --json
+armature events --json
+armature triggers --json
 ```
+
+Record list commands **SHOULD** support practical mechanical filters such as
+event type, source, task name, run state, trigger outcome, correlation id, and
+limit. These filters are runtime inspection, not a workflow query language.
 
 Runtime status is core because user scripts and coding agents may need to reason over mechanical runtime facts.
 
@@ -1638,7 +1687,12 @@ If no, it likely introduces framework creep.
 
 Armature **MUST** provide a CLI.
 
-A conforming CLI **SHOULD** include commands equivalent to:
+The CLI **SHOULD** expose a stable object model. The v0.3 top-level commands are
+acceptable ergonomic aliases, but future dynamic-management work should prefer
+canonical object-oriented forms described in
+`spec/dynamic-management-interface.md`.
+
+A conforming v0.3 CLI **SHOULD** include commands equivalent to:
 
 ```bash
 armature init
@@ -1652,6 +1706,8 @@ armature tasks
 armature services
 armature runs
 armature logs <run-id>
+armature events
+armature triggers
 armature emit <event-type> --json <payload>
 armature run <task-name>
 armature cancel <run-id>
@@ -1662,19 +1718,35 @@ armature doctor
 Optional but recommended:
 
 ```bash
-armature events
-armature sources
 armature plan
-armature start
-armature stop
-armature lock acquire <name>
-armature lock release <name>
+armature lock acquire <name> --ttl <duration>
+armature lock renew <name> --token <token> --ttl <duration>
+armature lock release <name> --token <token>
 armature service restart <name>
 armature service stop <name>
 armature service start <name>
 ```
 
 The CLI should make Armature feel inspectable, not magical.
+
+Canonical future object forms include:
+
+```bash
+armature task list
+armature task run <name>
+armature task add <name> --on <event> -- <cmd...>
+armature service list
+armature service add <name> -- <cmd...>
+armature run list
+armature run start --name <name> -- <cmd...>
+armature event emit <type> --json <payload>
+armature trigger list
+armature lock with <name> --ttl <duration> -- <cmd...>
+armature wait event <type> --correlation <id>
+```
+
+These object forms **MUST** remain mechanical. Dynamic task/service creation
+creates runtime definitions; it does not create workflow state.
 
 ---
 
