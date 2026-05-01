@@ -22,7 +22,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 use crate::duration::parse_duration;
-use crate::process::{signal_process_group, spawn_shell_command};
+use crate::process::{signal_process_group, spawn_command, spawn_shell_command};
 use crate::protocol::{
     DaemonRequest, DaemonResponse, InspectResponse, ManualLockRecord, ResponsePayload,
     RuntimeHealthStatus, RuntimeServiceStatus, RuntimeTaskStatus,
@@ -194,6 +194,35 @@ impl DaemonClient {
         })? {
             ResponsePayload::StartedRun { run_id } => Ok(run_id),
             _ => Err(ArmatureError::internal("unexpected task start response")),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_adhoc(
+        &self,
+        name: impl Into<String>,
+        command: Vec<String>,
+        cwd: Option<PathBuf>,
+        env: Vec<(String, String)>,
+        timeout: Option<Duration>,
+        payload: Value,
+        source_run_id: Option<RunId>,
+        parent_event_id: Option<EventId>,
+        correlation_id: Option<String>,
+    ) -> ArmatureResult<RunId> {
+        match self.send(DaemonRequest::StartAdhoc {
+            name: name.into(),
+            command,
+            cwd,
+            env,
+            timeout_ms: timeout.map(|duration| duration.as_millis() as u64),
+            payload,
+            source_run_id,
+            parent_event_id,
+            correlation_id,
+        })? {
+            ResponsePayload::StartedRun { run_id } => Ok(run_id),
+            _ => Err(ArmatureError::internal("unexpected ad hoc start response")),
         }
     }
 
@@ -403,6 +432,18 @@ struct ManagedRun {
     stop_reason: Option<StopReason>,
 }
 
+struct AdhocRunRequest {
+    name: String,
+    command: Vec<String>,
+    cwd: Option<PathBuf>,
+    env: Vec<(String, String)>,
+    timeout: Option<Duration>,
+    payload: Value,
+    source_run_id: Option<RunId>,
+    parent_event_id: Option<EventId>,
+    correlation_id: Option<String>,
+}
+
 #[derive(Clone)]
 struct ScheduleState {
     schedule: Schedule,
@@ -426,6 +467,7 @@ enum RunKind {
     Task,
     Service,
     HealthCheck,
+    Adhoc,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -546,6 +588,30 @@ impl Runtime {
             } => {
                 let run_id =
                     self.start_task(&name, source_run_id, parent_event_id, correlation_id)?;
+                Ok(ResponsePayload::StartedRun { run_id })
+            }
+            DaemonRequest::StartAdhoc {
+                name,
+                command,
+                cwd,
+                env,
+                timeout_ms,
+                payload,
+                source_run_id,
+                parent_event_id,
+                correlation_id,
+            } => {
+                let run_id = self.start_adhoc(AdhocRunRequest {
+                    name,
+                    command,
+                    cwd,
+                    env,
+                    timeout: timeout_ms.map(Duration::from_millis),
+                    payload,
+                    source_run_id,
+                    parent_event_id,
+                    correlation_id,
+                })?;
                 Ok(ResponsePayload::StartedRun { run_id })
             }
             DaemonRequest::EmitEvent {
@@ -761,6 +827,40 @@ impl Runtime {
                 "task {name:?} did not start immediately because admission policy queued or rejected it"
             ))
         })
+    }
+
+    fn start_adhoc(&mut self, request: AdhocRunRequest) -> ArmatureResult<RunId> {
+        if request.name.trim().is_empty() {
+            return Err(ArmatureError::invalid_input(
+                "ad hoc run name cannot be empty",
+            ));
+        }
+        if request.command.is_empty() {
+            return Err(ArmatureError::invalid_input(
+                "ad hoc command cannot be empty",
+            ));
+        }
+        let event = EventRecord {
+            id: EventId::new(),
+            event_type: "adhoc.run.requested".to_string(),
+            time: Utc::now().to_rfc3339(),
+            payload: request.payload,
+            routing: EventRouting::Manual,
+            config_version: Some(self.config.version.clone()),
+            source: Some("adhoc".to_string()),
+            source_run_id: request.source_run_id,
+            parent_event_id: request.parent_event_id,
+            correlation_id: request.correlation_id,
+        };
+        self.store.record_event(&event)?;
+        self.spawn_adhoc(
+            request.name,
+            request.command,
+            request.cwd,
+            request.env,
+            request.timeout,
+            event,
+        )
     }
 
     fn emit_user_event(
@@ -1348,6 +1448,64 @@ impl Runtime {
         Ok(run_id)
     }
 
+    fn spawn_adhoc(
+        &mut self,
+        name: String,
+        command: Vec<String>,
+        cwd: Option<PathBuf>,
+        env: Vec<(String, String)>,
+        timeout: Option<Duration>,
+        event: EventRecord,
+    ) -> ArmatureResult<RunId> {
+        let command_text = command_display(&command);
+        let prepared = self.store.create_run(
+            name.clone(),
+            command_text,
+            RunOrigin::Adhoc,
+            Some(self.config.version.clone()),
+            Some(event.id.clone()),
+        )?;
+        write_event_artifact(&prepared.paths.event, &event)?;
+        write_run_meta(&prepared.paths.meta, &prepared.record, "adhoc")?;
+        let cwd = resolve_run_cwd(self.workspace.root(), cwd)?;
+        let mut envs = run_envs(
+            "adhoc",
+            &self.workspace,
+            &self.runtime_paths,
+            &prepared.record,
+            self.config.version.as_str(),
+            Some(&event),
+            &prepared.paths.event,
+        );
+        envs.extend(env);
+        let child = spawn_command(
+            &command,
+            &cwd,
+            &prepared.paths.stdout,
+            &prepared.paths.stderr,
+            &envs,
+        )?;
+        self.store
+            .update_run_state(&prepared.record.id, ProcessState::Running)?;
+        let mut record = prepared.record;
+        record.state = ProcessState::Running;
+        let run_id = record.id.clone();
+        self.active_runs.insert(
+            run_id.as_str().to_string(),
+            ManagedRun {
+                record,
+                child,
+                kind: RunKind::Adhoc,
+                task_name: None,
+                kill_after: timeout,
+                started_at: Instant::now(),
+                stop_started_at: None,
+                stop_reason: None,
+            },
+        );
+        Ok(run_id)
+    }
+
     fn spawn_service(&mut self, name: &str) -> ArmatureResult<()> {
         let config = self.service(name)?.config.clone();
         let kill_after = optional_duration(config.resources.kill_after.as_deref())?;
@@ -1659,6 +1817,7 @@ impl Runtime {
                     }
                 }
             }
+            RunKind::Adhoc => {}
         }
 
         Ok(())
@@ -1766,6 +1925,7 @@ fn run_kind_meta_name(kind: &RunKind) -> &'static str {
         RunKind::Task => "task",
         RunKind::Service => "service",
         RunKind::HealthCheck => "health_check",
+        RunKind::Adhoc => "adhoc",
     }
 }
 
@@ -1775,6 +1935,7 @@ fn run_origin_meta_name(origin: &RunOrigin) -> &'static str {
         RunOrigin::Service => "service",
         RunOrigin::HealthCheck => "health_check",
         RunOrigin::Restart => "service",
+        RunOrigin::Adhoc => "adhoc",
     }
 }
 
@@ -2004,6 +2165,38 @@ fn write_event_artifact(path: &Path, event: &EventRecord) -> ArmatureResult<()> 
 
 fn optional_duration(value: Option<&str>) -> ArmatureResult<Option<Duration>> {
     value.map(parse_duration).transpose()
+}
+
+fn resolve_run_cwd(workspace_root: &Path, cwd: Option<PathBuf>) -> ArmatureResult<PathBuf> {
+    let resolved = match cwd {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => workspace_root.join(path),
+        None => workspace_root.to_path_buf(),
+    };
+    if !resolved.is_dir() {
+        return Err(ArmatureError::invalid_input(format!(
+            "cwd {} is not a directory",
+            resolved.display()
+        )));
+    }
+    Ok(resolved)
+}
+
+fn command_display(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|part| {
+            if part
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':'))
+            {
+                part.clone()
+            } else {
+                format!("'{}'", part.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn schedule_restart(

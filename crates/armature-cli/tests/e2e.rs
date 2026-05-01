@@ -1492,6 +1492,139 @@ fn wait_and_subscribe_agent_flow() {
 }
 
 #[test]
+fn adhoc_run_is_tracked_and_cancelable() {
+    let sandbox = Sandbox::new("");
+    sandbox.write_file("work/.keep", "");
+    sandbox.ok(["up"]);
+
+    let started = sandbox.json([
+        "--format",
+        "json",
+        "run",
+        "start",
+        "--name",
+        "adhoc-env",
+        "--correlation",
+        "corr-adhoc",
+        "--cwd",
+        "work",
+        "--env",
+        "EXTRA=from-env",
+        "--json",
+        r#"{"message":"payload"}"#,
+        "--",
+        "sh",
+        "-c",
+        "printf '%s|%s|%s|%s' \"$PWD\" \"$EXTRA\" \"$ARMATURE_KIND\" \"$ARMATURE_PAYLOAD_JSON\"; printf 'err-line' >&2",
+    ]);
+    let run_id = started["run_id"].as_str().expect("run id");
+
+    let completed = sandbox.json([
+        "--format",
+        "json",
+        "wait",
+        "run",
+        run_id,
+        "--state",
+        "exited",
+        "--timeout",
+        "5s",
+    ]);
+    assert_eq!(completed["origin"], "adhoc");
+    assert_eq!(completed["name"], "adhoc-env");
+    assert_eq!(completed["event_id"].as_str().is_some(), true);
+
+    let logs = sandbox.json(["--format", "json", "run", "logs", run_id]);
+    assert!(logs["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("work|from-env|adhoc|{\"message\":\"payload\"}"));
+    assert!(logs["stderr"].as_str().unwrap().contains("err-line"));
+
+    let events = sandbox.json([
+        "event",
+        "list",
+        "--json",
+        "--type",
+        "adhoc.run.requested",
+        "--correlation",
+        "corr-adhoc",
+    ]);
+    assert_eq!(events.as_array().expect("events").len(), 1);
+    assert_eq!(events[0]["source"], "adhoc");
+
+    let runs = sandbox.json([
+        "run",
+        "list",
+        "--json",
+        "--origin",
+        "adhoc",
+        "--correlation",
+        "corr-adhoc",
+    ]);
+    assert_eq!(runs.as_array().expect("runs").len(), 1);
+    assert_eq!(runs[0]["id"], run_id);
+
+    let cancel_started = sandbox.json([
+        "--format",
+        "json",
+        "exec",
+        "--name",
+        "adhoc-cancel",
+        "--",
+        "sh",
+        "-c",
+        "sleep 30",
+    ]);
+    let cancel_run_id = cancel_started["run_id"].as_str().expect("cancel run id");
+    sandbox.ok(["run", "cancel", cancel_run_id]);
+    let cancelled = sandbox.json([
+        "--format",
+        "json",
+        "wait",
+        "run",
+        cancel_run_id,
+        "--state",
+        "failed",
+        "--timeout",
+        "5s",
+    ]);
+    assert_eq!(cancelled["origin"], "adhoc");
+    assert_eq!(cancelled["killed"], true);
+
+    let timeout_started = sandbox.json([
+        "--format",
+        "json",
+        "run",
+        "start",
+        "--name",
+        "adhoc-timeout",
+        "--timeout",
+        "100ms",
+        "--",
+        "sh",
+        "-c",
+        "sleep 30",
+    ]);
+    let timeout_run_id = timeout_started["run_id"].as_str().expect("timeout run id");
+    let timed_out = sandbox.json([
+        "--format",
+        "json",
+        "wait",
+        "run",
+        timeout_run_id,
+        "--state",
+        "failed",
+        "--timeout",
+        "5s",
+    ]);
+    assert_eq!(timed_out["origin"], "adhoc");
+    assert_eq!(timed_out["killed"], true);
+
+    sandbox.ok(["down"]);
+}
+
+#[test]
 fn sustained_event_watch_and_service_load_stays_responsive() {
     run_sustained_load_scenario(18, 6, 3, Duration::from_secs(8));
 }

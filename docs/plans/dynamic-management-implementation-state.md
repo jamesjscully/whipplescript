@@ -28,7 +28,7 @@ this file for design expansion; the authoritative design remains in:
 | --- | --- | --- | --- | --- |
 | object-cli | done | `armature-dynamic-object-cli` | Codex | Pushed `d47985d`; integrated into primary checkout; checks: `cargo test -p armature-cli --bin armature`, `cargo test -p armature-cli --test e2e`. |
 | query-wait | done | `armature-dynamic-query-wait` | Codex | Added filters, wait commands, subscribe streams, and e2e observation coverage. |
-| adhoc-run | pending | `armature-dynamic-adhoc-run` | - | Add tracked ad hoc run execution via `run start` / `exec`. |
+| adhoc-run | done | `armature-dynamic-adhoc-run` | Codex | Added tracked ad hoc `run start` / `exec`; checks: `cargo test -p armature-cli --test e2e adhoc_run_is_tracked_and_cancelable`; `cargo test`. |
 | locks | pending | `armature-dynamic-locks` | - | Add force-release, show/list filters, `lock with`, and recovery audit. |
 | dynamic-services | pending | `armature-dynamic-services` | - | Add ephemeral dynamic service definitions. |
 | dynamic-tasks | pending | `armature-dynamic-tasks` | - | Add ephemeral dynamic task definitions. |
@@ -55,13 +55,15 @@ test -p armature-cli --test e2e`.
 
 Done. Added run/trigger correlation filters, `wait` commands for events/runs/
 triggers/services, NDJSON `subscribe` streams for events/runs/triggers, `lock
-list --expired`, and e2e coverage in `wait_and_subscribe_agent_flow`. Commit:
-`Add query wait observation commands`. Checks: `cargo test -p armature-cli
+list --expired`, and e2e coverage in `wait_and_subscribe_agent_flow`. Checks: `cargo test -p armature-cli
 --test e2e wait_and_subscribe_agent_flow`; `cargo test`.
 
 ### adhoc-run
 
-Pending.
+Done. Added daemon-mediated ad hoc finite command execution through `run start`
+and `exec`, with `adhoc` run origin, provenance/correlation event linkage,
+cwd/env/payload/timeout support, logs, cancellation, and e2e coverage. Checks: `cargo test -p armature-cli --test e2e
+adhoc_run_is_tracked_and_cancelable`; `cargo test`.
 
 ### locks
 

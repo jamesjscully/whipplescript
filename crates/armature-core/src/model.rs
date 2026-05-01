@@ -31,6 +31,7 @@ pub enum RunOrigin {
     Service,
     HealthCheck,
     Restart,
+    Adhoc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

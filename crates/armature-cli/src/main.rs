@@ -79,6 +79,7 @@ enum Command {
     Up(UpArgs),
     Down,
     Restart(UpArgs),
+    Exec(AdhocRunArgs),
     Run {
         #[command(subcommand)]
         command: RunCommand,
@@ -145,6 +146,7 @@ impl Command {
             Self::Up(args) => up_workspace(workspace, args, format),
             Self::Down => down_workspace(workspace, format),
             Self::Restart(args) => restart_workspace(workspace, args, format),
+            Self::Exec(args) => run_adhoc(workspace, args, format),
             Self::Run { command } => run_command(workspace, command, format),
             Self::Task { command } => task_command(workspace, command, format),
             Self::Emit(args) => emit_event(workspace, args, format),
@@ -327,6 +329,7 @@ struct TaskNameArgs {
 
 #[derive(Debug, Subcommand)]
 enum RunCommand {
+    Start(AdhocRunArgs),
     List(RunsArgs),
     Show(RunShowArgs),
     Logs(LogsArgs),
@@ -338,6 +341,32 @@ enum RunCommand {
 #[derive(Debug, Args)]
 struct RunShowArgs {
     run_id: String,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    trailing_var_arg = true,
+    after_help = "Starts one finite ad hoc command through the daemon. Payload input defaults to an empty JSON object. Use -- to separate Armature options from the command."
+)]
+struct AdhocRunArgs {
+    #[arg(long)]
+    name: String,
+    #[arg(long)]
+    correlation: Option<String>,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    env: Vec<String>,
+    #[arg(long)]
+    timeout: Option<String>,
+    #[arg(long, conflicts_with_all = ["payload_file", "stdin"])]
+    json: Option<String>,
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["json", "stdin"])]
+    payload_file: Option<PathBuf>,
+    #[arg(long, default_value_t = false, conflicts_with_all = ["json", "payload_file"])]
+    stdin: bool,
+    #[arg(required = true, num_args = 1.., allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -964,6 +993,7 @@ fn run_command(
     format: OutputFormat,
 ) -> ArmatureResult<()> {
     match command {
+        RunCommand::Start(args) => run_adhoc(workspace_arg, args, format),
         RunCommand::List(args) => runs_workspace(workspace_arg, args, format),
         RunCommand::Show(args) => run_show(workspace_arg, args, format),
         RunCommand::Logs(args) => logs_workspace(workspace_arg, args, format),
@@ -1019,6 +1049,48 @@ fn run_task(
         &json!({
             "run_id": run_id,
             "task": args.task_name,
+            "correlation_id": provenance.correlation_id,
+        }),
+        &format!("started {}", run_id.as_str()),
+    )
+}
+
+fn run_adhoc(
+    workspace_arg: Option<PathBuf>,
+    args: AdhocRunArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let (payload, payload_source) = read_adhoc_payload(&args)?;
+    let correlation = args
+        .correlation
+        .clone()
+        .or_else(|| payload_correlation_id(&payload));
+    let provenance = provenance_from_env(correlation)?;
+    let env = parse_env_pairs(&args.env)?;
+    let timeout = args.timeout.as_deref().map(parse_duration).transpose()?;
+    let run_id = daemon_client(&workspace).start_adhoc(
+        args.name.clone(),
+        args.command.clone(),
+        args.cwd.clone(),
+        env,
+        timeout,
+        payload.clone(),
+        provenance.source_run_id.clone(),
+        provenance.parent_event_id.clone(),
+        provenance.correlation_id.clone(),
+    )?;
+    print_data(
+        format,
+        &json!({
+            "run_id": run_id,
+            "name": args.name,
+            "origin": "adhoc",
+            "command": args.command,
+            "payload": payload,
+            "payload_source": payload_source,
+            "source_run_id": provenance.source_run_id,
+            "parent_event_id": provenance.parent_event_id,
             "correlation_id": provenance.correlation_id,
         }),
         &format!("started {}", run_id.as_str()),
@@ -1110,6 +1182,51 @@ fn read_emit_payload(args: &EmitArgs) -> ArmatureResult<(Value, String)> {
     }
 
     Ok((json!({}), "default-empty-object".to_string()))
+}
+
+fn read_adhoc_payload(args: &AdhocRunArgs) -> ArmatureResult<(Value, String)> {
+    if let Some(raw) = args.json.as_deref() {
+        return parse_emit_payload(raw, "--json").map(|payload| (payload, "json".to_string()));
+    }
+
+    if let Some(path) = args.payload_file.as_deref() {
+        let raw = fs::read_to_string(path).map_err(|error| {
+            ArmatureError::invalid_input(format!(
+                "failed to read JSON payload file {}: {error}",
+                path.display()
+            ))
+        })?;
+        return parse_emit_payload(&raw, "--payload-file")
+            .map(|payload| (payload, format!("file:{}", path.display())));
+    }
+
+    if args.stdin {
+        let mut raw = String::new();
+        io::stdin().read_to_string(&mut raw).map_err(|error| {
+            ArmatureError::invalid_input(format!("failed to read JSON payload from stdin: {error}"))
+        })?;
+        return parse_emit_payload(&raw, "--stdin").map(|payload| (payload, "stdin".to_string()));
+    }
+
+    Ok((json!({}), "default-empty-object".to_string()))
+}
+
+fn parse_env_pairs(raw: &[String]) -> ArmatureResult<Vec<(String, String)>> {
+    raw.iter()
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').ok_or_else(|| {
+                ArmatureError::invalid_input(format!(
+                    "invalid env value {pair:?}: expected KEY=VALUE"
+                ))
+            })?;
+            if key.is_empty() {
+                return Err(ArmatureError::invalid_input(
+                    "env key cannot be empty in KEY=VALUE",
+                ));
+            }
+            Ok((key.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]

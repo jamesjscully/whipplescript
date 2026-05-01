@@ -1,6 +1,7 @@
 use armature_core::{EventRecord, ProcessState, RunId, RunRecord, TriggerRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -11,6 +12,17 @@ pub enum DaemonRequest {
     Runs,
     StartTask {
         name: String,
+        source_run_id: Option<RunId>,
+        parent_event_id: Option<armature_core::EventId>,
+        correlation_id: Option<String>,
+    },
+    StartAdhoc {
+        name: String,
+        command: Vec<String>,
+        cwd: Option<PathBuf>,
+        env: Vec<(String, String)>,
+        timeout_ms: Option<u64>,
+        payload: Value,
         source_run_id: Option<RunId>,
         parent_event_id: Option<armature_core::EventId>,
         correlation_id: Option<String>,
