@@ -1,43 +1,107 @@
 # `@armature/sdk`
 
-Thin TypeScript helpers for Armature v0.3.
-
-The SDK wraps the existing Armature CLI and runtime environment. It does not add a
+Thin TypeScript helpers for Armature v0.3. The SDK shells out to the Armature CLI
+and reads Armature-provided runtime environment variables; it does not add a
 second runtime, workflow DSL, or orchestration layer.
 
-## Install Surface
+## Setup
 
-Armature injects runtime context into tasks and services:
+Make the `armature` binary available on `PATH`, or pass a binary path:
 
 ```ts
-import { getEvent, getRunContext } from "@armature/sdk"
+import { createArmature } from "@armature/sdk"
 
-const context = getRunContext()
-const event = getEvent<{ runId: string }>()
-
-console.log(context.runId, event.payload.runId)
+const armature = createArmature({
+  bin: "/path/to/armature",
+  workspace: "/path/to/workspace",
+})
 ```
 
-## Emit And Inspect
+Every CLI-backed call requests JSON output and returns typed objects.
+
+## Runtime Context
+
+Task and service processes can read their run and event context:
 
 ```ts
-import { armature, emit } from "@armature/sdk"
+import { getEvent, getPayload, getRunContext } from "@armature/sdk"
 
-await emit("tool.run.completed", { runId: "run_123", ok: true })
+const context = getRunContext()
+const event = getEvent<{ runId: string; ok: boolean }>()
+const payload = getPayload<{ runId: string; ok: boolean }>()
 
-const status = await armature.status()
+console.log(context.runId, context.runDirectory, event.event_type, payload.ok)
+```
+
+`getEvent()` reads `ARMATURE_EVENT_JSON`, `ARMATURE_EVENT`, or
+`ARMATURE_EVENT_PATH`. `getRunContext()` also exposes
+`ARMATURE_CORRELATION_ID` as `correlationId`.
+
+When SDK code calls `emit()` from inside an Armature-managed task or service, the
+CLI records mechanical provenance inherited from the process environment:
+`source_run_id`, `parent_event_id`, and optional `correlation_id`.
+
+```ts
+await emit("review.ready", { ok: true }, { correlation: "corr-123" })
+```
+
+## Daemon And Inspection
+
+```ts
+import { armature } from "@armature/sdk"
+
+await armature.up()
+await armature.restart()
+
+const snapshot = await armature.status()
+const tasks = await armature.tasks()
 const services = await armature.services()
 const runs = await armature.runs()
+const logOutput = await armature.logs(runs[0].id)
+
+console.log(snapshot, tasks, services, logOutput)
+
+await armature.down()
+```
+
+Equivalent named exports are available for common calls:
+
+```ts
+import { emit, logs, run, runs, services, status, tasks } from "@armature/sdk"
+
+const started = await run("test")
+await emit("build.completed", { runId: started.run_id, ok: true })
+console.log(await status(), await tasks(), await services(), await runs())
+console.log(await logs(started.run_id))
+```
+
+`logs(runId)` returns captured stdout/stderr plus the run record, run directory,
+log paths, byte counts, line counts, truncation flags, and missing-file flags
+exposed by `armature --format json logs`.
+
+## Services
+
+```ts
+import { armature } from "@armature/sdk"
+
+await armature.startService("worker")
+await armature.restartService("worker")
+await armature.stopService("worker")
 ```
 
 ## Locks
 
 ```ts
-import { withLock } from "@armature/sdk"
+import { lock, locks, renewLock, unlock, withLock } from "@armature/sdk"
 
 await withLock("branch:main", async () => {
-  // do user-space coordination work here
+  // user-space critical section
 }, { ttl: "2m" })
+
+const held = await lock("artifact-cache", "10m", "cache refresh")
+await renewLock(held.name, held.token, "10m")
+console.log(await locks())
+await unlock(held.name, held.token)
 ```
 
 ## Files And Structured Logs
@@ -51,18 +115,19 @@ const result = await readJson<{ ok: boolean }>("result.json")
 log({ level: "info", message: "result written", ok: result.ok })
 ```
 
-## Client Options
+## Errors
 
-Use `createArmature()` when you need an explicit binary path or workspace override:
+CLI failures and invalid JSON are reported as `ArmatureSdkError` with a stable
+`kind` and optional `details` object:
 
 ```ts
-import { createArmature } from "@armature/sdk"
+import { ArmatureSdkError, status } from "@armature/sdk"
 
-const sdk = createArmature({
-  bin: process.env.ARMATURE_BIN,
-  workspace: "/path/to/workspace",
-  lockTtl: "30s",
-})
-
-await sdk.run("build")
+try {
+  await status()
+} catch (error) {
+  if (error instanceof ArmatureSdkError) {
+    console.error(error.kind, error.details)
+  }
+}
 ```

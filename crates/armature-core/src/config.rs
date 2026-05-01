@@ -455,13 +455,21 @@ fn normalize_supervision(
         )));
     }
 
-    Ok(SupervisionPolicyConfig {
+    let config = SupervisionPolicyConfig {
         restart,
         max_restarts: supervision.max_restarts,
         within,
         backoff: supervision.backoff,
         start_delay,
-    })
+    };
+
+    if kind == "task" && config != SupervisionPolicyConfig::default() {
+        return Err(ArmatureError::invalid_input(format!(
+            "task {name} sets non-default supervision, but task restart supervision is not supported; remove [task.supervision] or set restart = \"never\" with no restart controls"
+        )));
+    }
+
+    Ok(config)
 }
 
 fn normalize_health(
@@ -822,6 +830,22 @@ mod tests {
         assert!(error
             .to_string()
             .contains("must set both supervision.max_restarts and supervision.within together"));
+    }
+
+    #[test]
+    fn rejects_non_default_task_supervision() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("armature.toml");
+        fs::write(
+            &path,
+            "[[task]]\nname = \"once\"\nrun = \"false\"\n\n[task.supervision]\nrestart = \"on_failure\"\n",
+        )
+        .unwrap();
+
+        let error = load_config(&path).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("task once sets non-default supervision"));
     }
 
     #[test]
