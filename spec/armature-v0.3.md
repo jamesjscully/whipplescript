@@ -1046,8 +1046,10 @@ not inferred from domain concepts
 CLI example:
 
 ```bash
-armature lock acquire branch:main
-armature lock release branch:main
+armature lock acquire branch:main --ttl 10m --reason "edit main"
+armature lock release branch:main --token lock_...
+armature lock force-release branch:main --reason "holder exited"
+armature lock with branch:main --ttl 2m --reason "run tests" -- npm test
 ```
 
 TypeScript SDK example:
@@ -1055,7 +1057,7 @@ TypeScript SDK example:
 ```ts
 await withLock("branch:main", async () => {
   await mutateMainBranch()
-})
+}, { ttl: "2m", reason: "edit main" })
 ```
 
 Armature does not know what `branch:main` means. It only provides atomic exclusion.
@@ -1597,6 +1599,7 @@ runtime status queries
 subprocess execution
 structured logging
 optional named locks
+canonical object CLI commands
 ```
 
 Acceptable SDK helpers:
@@ -1609,9 +1612,23 @@ status()
 runs()
 services()
 withLock()
+armature.task.list()
+armature.task.run()
+armature.task.add()
+armature.service.add()
+armature.run.start()
+armature.run.list()
+armature.event.emit()
+armature.wait.event()
+armature.lock.withCommand()
 log()
 readJson()
 ```
+
+Dynamic task and service SDK helpers **MUST** remain wrappers over runtime
+definition commands. They **MUST NOT** persist hidden workflow state, rewrite
+user config without explicit consent, or add daemon-level meanings for retries,
+deduplication, fanout, joins, or agent graphs.
 
 Suspicious SDK helpers:
 

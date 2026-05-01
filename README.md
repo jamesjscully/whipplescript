@@ -108,9 +108,90 @@ armature service start worker
 armature service stop worker
 armature service restart worker
 
-armature --format json lock acquire branch:main --ttl 10m
-armature lock status
-armature lock release branch:main
+armature --format json lock acquire branch:main --ttl 10m --reason "edit branch"
+armature lock list
+armature lock show branch:main
+armature lock renew branch:main --token lock_... --ttl 10m
+armature lock release branch:main --token lock_...
+armature lock force-release branch:main --reason "holder exited"
+armature lock with branch:main --ttl 2m --reason "run tests" -- npm test
+```
+
+## Dynamic Runtime Definitions
+
+Tasks and services can also be registered at runtime without editing
+`.armature/armature.toml`:
+
+```sh
+armature service add github-source --restart on_failure --reason "event bridge" -- node sources/github.mjs
+armature task add reviewer --on plan.ready -- node agents/reviewer.mjs
+
+armature service list --dynamic
+armature task list --dynamic
+armature task remove reviewer
+armature service remove github-source
+```
+
+Dynamic definitions are ephemeral runtime definitions. They are inspectable and
+marked `dynamic: true`, but they are not workflow state and Armature does not
+persist them into user config.
+
+## Agent Desire Path
+
+```sh
+armature up
+armature service add github-source -- node sources/github.mjs
+armature task add planner --on agent.requested -- node planner.mjs
+armature event emit agent.requested --correlation req-1 --payload-file request.json
+armature wait event work.completed --correlation req-1 --timeout 5m
+armature run list --correlation req-1
+armature lock with repo:main --ttl 1m --reason "final check" -- echo ok
+armature down
+```
+
+User-authored scripts own planning, retries, deduplication, fanout, review
+logic, and success criteria. Armature records and supervises the mechanical
+runtime facts.
+
+## TypeScript SDK
+
+`@armature/sdk` is a thin CLI-backed helper layer:
+
+```ts
+import { createArmature, getEvent, getRunContext } from "@armature/sdk"
+
+const armature = createArmature({ workspace: process.cwd() })
+const context = getRunContext()
+const event = getEvent<{ requestId: string }>()
+
+await armature.task.add("reviewer", ["node", "reviewer.mjs"], {
+  on: "plan.ready",
+  correlation: event.correlation_id ?? event.payload.requestId,
+})
+await armature.event.emit("review.registered", {
+  runId: context.runId,
+})
+await armature.wait.event("review.completed", {
+  correlation: event.correlation_id ?? event.payload.requestId,
+  timeout: "5m",
+})
+```
+
+The SDK wraps the same CLI/runtime environment surface available to shell
+scripts. It does not create a second runtime.
+
+## Migration Notes
+
+Canonical object commands are preferred in new docs and scripts:
+
+```text
+armature tasks             -> armature task list
+armature services          -> armature service list
+armature runs              -> armature run list
+armature logs <run-id>     -> armature run logs <run-id>
+armature cancel <run-id>   -> armature run cancel <run-id>
+armature emit <type>       -> armature event emit <type>
+armature run <task>        -> armature task run <task>
 ```
 
 Armature owns mechanical invocation truth: triggers, launches, process state,
