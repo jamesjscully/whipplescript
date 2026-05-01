@@ -11,11 +11,16 @@ export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue
 
 export interface ArmatureEvent<TPayload extends JsonValue = JsonValue> {
   id?: string;
+  type?: string;
   event_type: string;
+  time?: string;
   payload: TPayload;
   routing?: string;
   config_version?: string | null;
   source?: string | null;
+  source_run_id?: string | null;
+  parent_event_id?: string | null;
+  correlation_id?: string | null;
 }
 
 export interface RunContext {
@@ -30,6 +35,7 @@ export interface RunContext {
   eventType?: string;
   eventJson?: string;
   eventPath?: string;
+  correlationId?: string;
   workspace?: string;
 }
 
@@ -72,10 +78,18 @@ export interface ServiceStatus {
 export interface RunRecord {
   id: string;
   name: string;
+  command?: string;
   origin: string;
   state: string;
+  start_time?: string;
+  end_time?: string | null;
+  exit_code?: number | null;
+  signal?: number | null;
+  killed?: boolean;
   config_version?: string | null;
   event_id?: string | null;
+  restartOf?: string | null;
+  attempt?: number | null;
   run_directory?: string | null;
   stdout_path?: string | null;
   stderr_path?: string | null;
@@ -84,12 +98,18 @@ export interface RunRecord {
 export interface RunStartResult {
   run_id: string;
   task: string;
+  correlation_id?: string | null;
 }
 
 export interface EmitResult<TPayload extends JsonValue = JsonValue> {
   emitted: true;
+  type?: string;
   event_type: string;
   payload: TPayload;
+  source?: string;
+  source_run_id?: string | null;
+  parent_event_id?: string | null;
+  correlation_id?: string | null;
 }
 
 export interface ServiceCommandResult {
@@ -99,8 +119,18 @@ export interface ServiceCommandResult {
 
 export interface LogsResult {
   run_id: string;
+  run?: RunRecord | null;
+  run_directory?: string | null;
   stdout_path: string;
   stderr_path: string;
+  stdout_bytes?: number;
+  stderr_bytes?: number;
+  stdout_lines?: number;
+  stderr_lines?: number;
+  stdout_truncated?: boolean;
+  stderr_truncated?: boolean;
+  stdout_missing?: boolean;
+  stderr_missing?: boolean;
   stdout: string;
   stderr: string;
 }
@@ -150,7 +180,11 @@ export interface DownResult {
 export interface ManualLockRecord {
   name: string;
   owner_pid: number;
+  owner_id: string;
+  reason?: string | null;
+  token: string;
   acquired_at_ms: number;
+  renewed_at_ms?: number | null;
   expires_at_ms?: number | null;
   manual: boolean;
 }
@@ -172,6 +206,16 @@ export interface ArmatureClientOptions {
 
 export interface WithLockOptions {
   ttl?: string;
+  reason?: string;
+}
+
+export interface RunOptions {
+  correlation?: string;
+}
+
+export interface EmitOptions {
+  source?: string;
+  correlation?: string;
 }
 
 export class ArmatureSdkError extends Error {
@@ -276,18 +320,28 @@ export class ArmatureClient {
     return runCli<UpResult>(["restart"], this.options);
   }
 
-  run(taskName: string): Promise<RunStartResult> {
-    return runCli<RunStartResult>(["run", taskName], this.options);
+  run(taskName: string, options: RunOptions = {}): Promise<RunStartResult> {
+    const args = ["run", taskName];
+    if (options.correlation) {
+      args.push("--correlation", options.correlation);
+    }
+    return runCli<RunStartResult>(args, this.options);
   }
 
   emit<TPayload extends JsonValue = JsonValue>(
     eventType: string,
-    payload: TPayload = {} as TPayload
+    payload: TPayload = {} as TPayload,
+    options: EmitOptions = {}
   ): Promise<EmitResult<TPayload>> {
-    return runCli<EmitResult<TPayload>>(
-      ["emit", eventType, "--json", JSON.stringify(payload)],
-      this.options
-    );
+    const args = ["emit", eventType];
+    if (options.source) {
+      args.push("--source", options.source);
+    }
+    if (options.correlation) {
+      args.push("--correlation", options.correlation);
+    }
+    args.push("--json", JSON.stringify(payload));
+    return runCli<EmitResult<TPayload>>(args, this.options);
   }
 
   status(): Promise<StatusSnapshot> {
@@ -338,12 +392,24 @@ export class ArmatureClient {
     return runCli<DoctorResult>(["doctor"], this.options);
   }
 
-  lock(name: string, ttl = this.options.lockTtl ?? "5m"): Promise<ManualLockRecord> {
-    return runCli<ManualLockRecord>(["lock", "acquire", name, "--ttl", ttl], this.options);
+  lock(
+    name: string,
+    ttl = this.options.lockTtl ?? "5m",
+    reason?: string
+  ): Promise<ManualLockRecord> {
+    const args = ["lock", "acquire", name, "--ttl", ttl];
+    if (reason) {
+      args.push("--reason", reason);
+    }
+    return runCli<ManualLockRecord>(args, this.options);
   }
 
-  unlock(name: string): Promise<LockReleaseResult> {
-    return runCli<LockReleaseResult>(["lock", "release", name], this.options);
+  renewLock(name: string, token: string, ttl: string): Promise<ManualLockRecord> {
+    return runCli<ManualLockRecord>(["lock", "renew", name, "--token", token, "--ttl", ttl], this.options);
+  }
+
+  unlock(name: string, token: string): Promise<LockReleaseResult> {
+    return runCli<LockReleaseResult>(["lock", "release", name, "--token", token], this.options);
   }
 
   locks(): Promise<ManualLockRecord[]> {
@@ -355,11 +421,11 @@ export class ArmatureClient {
     fn: () => Promise<T> | T,
     options: WithLockOptions = {}
   ): Promise<T> {
-    await this.lock(name, options.ttl);
+    const lock = await this.lock(name, options.ttl, options.reason);
     try {
       return await fn();
     } finally {
-      await this.unlock(name);
+      await this.unlock(name, lock.token);
     }
   }
 }
@@ -383,6 +449,7 @@ export function getRunContext(env: NodeJS.ProcessEnv = process.env): RunContext 
     eventType: env.ARMATURE_EVENT_TYPE,
     eventJson: env.ARMATURE_EVENT_JSON ?? env.ARMATURE_EVENT,
     eventPath: env.ARMATURE_EVENT_PATH,
+    correlationId: env.ARMATURE_CORRELATION_ID,
     workspace: env.ARMATURE_WORKSPACE ?? env.ARMATURE_WORKSPACE_ROOT
   };
 }
@@ -413,13 +480,14 @@ export async function writeJson(path: string, value: JsonValue): Promise<void> {
 
 export async function emit<TPayload extends JsonValue = JsonValue>(
   eventType: string,
-  payload: TPayload = {} as TPayload
+  payload: TPayload = {} as TPayload,
+  options: EmitOptions = {}
 ): Promise<EmitResult<TPayload>> {
-  return armature.emit(eventType, payload);
+  return armature.emit(eventType, payload, options);
 }
 
-export async function run(taskName: string): Promise<RunStartResult> {
-  return armature.run(taskName);
+export async function run(taskName: string, options: RunOptions = {}): Promise<RunStartResult> {
+  return armature.run(taskName, options);
 }
 
 export async function status(): Promise<StatusSnapshot> {
@@ -446,12 +514,16 @@ export async function cancel(runId: string): Promise<CancelResult> {
   return armature.cancel(runId);
 }
 
-export async function lock(name: string, ttl?: string): Promise<ManualLockRecord> {
-  return armature.lock(name, ttl);
+export async function lock(name: string, ttl?: string, reason?: string): Promise<ManualLockRecord> {
+  return armature.lock(name, ttl, reason);
 }
 
-export async function unlock(name: string): Promise<LockReleaseResult> {
-  return armature.unlock(name);
+export async function renewLock(name: string, token: string, ttl: string): Promise<ManualLockRecord> {
+  return armature.renewLock(name, token, ttl);
+}
+
+export async function unlock(name: string, token: string): Promise<LockReleaseResult> {
+  return armature.unlock(name, token);
 }
 
 export async function locks(): Promise<ManualLockRecord[]> {
