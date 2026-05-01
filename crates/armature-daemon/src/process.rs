@@ -40,6 +40,46 @@ pub fn spawn_shell_command(
         .map_err(|error| ArmatureError::internal(format!("failed to spawn command: {error}")))
 }
 
+pub fn spawn_command(
+    command: &[String],
+    cwd: &Path,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    envs: &[(String, String)],
+) -> ArmatureResult<Child> {
+    let Some((program, args)) = command.split_first() else {
+        return Err(ArmatureError::invalid_input(
+            "ad hoc command cannot be empty",
+        ));
+    };
+
+    let stdout_file = File::create(stdout_path)?;
+    let stderr_file = File::create(stderr_path)?;
+    let mut child = Command::new(program);
+    child
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+
+    for (key, value) in envs {
+        child.env(key, value);
+    }
+
+    unsafe {
+        child.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    child
+        .spawn()
+        .map_err(|error| ArmatureError::internal(format!("failed to spawn command: {error}")))
+}
+
 pub fn signal_process_group(pid: u32, signal: i32) -> ArmatureResult<()> {
     let pgid = pid as i32;
     let result = unsafe { libc::kill(-pgid, signal) };

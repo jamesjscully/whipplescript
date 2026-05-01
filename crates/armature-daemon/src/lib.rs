@@ -5,7 +5,7 @@ mod runtime;
 pub mod store;
 
 pub use protocol::{
-    DaemonRequest, DaemonResponse, InspectResponse, ResponsePayload, RuntimeServiceStatus,
-    RuntimeTaskStatus,
+    DaemonRequest, DaemonResponse, InspectResponse, ManualLockRecord, ResponsePayload,
+    RuntimeServiceStatus, RuntimeTaskStatus,
 };
 pub use runtime::{DaemonClient, DaemonHandle, DaemonOptions, DaemonServer};
