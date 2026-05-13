@@ -16,6 +16,7 @@ import {
   lock,
   locks,
   log,
+  overview,
   readJson,
   renewLock,
   run,
@@ -61,6 +62,60 @@ if (command === "status") {
     services: 2,
     tasks: 3,
     active_runs: 1
+  });
+} else if (command === "overview" || command === "overview --recent 3") {
+  send({
+    workspace_root: "/workspace",
+    config_path: "/workspace/.armature/armature.toml",
+    config_version: "cfg_123",
+    daemon_running: true,
+    socket_path: "/state/daemon.sock",
+    pid_path: "/state/daemon.pid",
+    tasks: [{
+      name: "watch",
+      run: "npm test",
+      dynamic: false,
+      schedule: null,
+      watch: ["src/**/*.ts"],
+      on: null,
+      admission: "queue_one",
+      active_run_ids: ["run_123"],
+      queued_triggers: 1,
+      latest_run: {
+        id: "run_123",
+        name: "watch",
+        command: "npm test",
+        origin: "task",
+        state: "running",
+        start_time: "2026-05-13T12:00:00Z",
+        killed: false
+      },
+      latest_failure: null
+    }],
+    services: [],
+    active_runs: [{
+      id: "run_123",
+      name: "watch",
+      command: "npm test",
+      origin: "task",
+      state: "running",
+      start_time: "2026-05-13T12:00:00Z",
+      killed: false
+    }],
+    recent_events: [{
+      id: "evt_1",
+      event_type: "runtime.tick",
+      payload: { ok: true },
+      correlation_id: "corr-sdk"
+    }],
+    recent_triggers: [{
+      id: "trig_1",
+      task_name: "watch",
+      event_type: "runtime.tick",
+      outcome: "queued",
+      run_id: null
+    }],
+    recent_failures: []
   });
 } else if (command === "task list") {
   send([{
@@ -421,6 +476,7 @@ test("client wrappers call the CLI with json output and workspace options", asyn
   });
 
   const currentStatus = await sdk.status();
+  const currentOverview = await sdk.overview({ recent: 3 });
   const currentTasks = await sdk.tasks();
   const runResult = await sdk.run("build");
   const emitResult = await sdk.emit("runtime.tick", { ok: true });
@@ -430,6 +486,7 @@ test("client wrappers call the CLI with json output and workspace options", asyn
   const downResult = await sdk.down();
 
   assert.equal(currentStatus.config_version, "cfg_123");
+  assert.equal(currentOverview.tasks[0]?.queued_triggers, 1);
   assert.equal(currentTasks[0]?.name, "watch");
   assert.equal(runResult.run_id, "run_123");
   assert.equal(emitResult.payload.ok, true);
@@ -447,9 +504,10 @@ test("client wrappers call the CLI with json output and workspace options", asyn
     .map((line) => JSON.parse(line) as string[]);
 
   assert.deepEqual(calls[0], ["--format", "json", "--workspace", "/workspace", "status"]);
-  assert.deepEqual(calls[1], ["--format", "json", "--workspace", "/workspace", "task", "list"]);
-  assert.deepEqual(calls[2], ["--format", "json", "--workspace", "/workspace", "run", "build"]);
-  assert.deepEqual(calls[3], [
+  assert.deepEqual(calls[1], ["--format", "json", "--workspace", "/workspace", "overview", "--recent", "3"]);
+  assert.deepEqual(calls[2], ["--format", "json", "--workspace", "/workspace", "task", "list"]);
+  assert.deepEqual(calls[3], ["--format", "json", "--workspace", "/workspace", "run", "build"]);
+  assert.deepEqual(calls[4], [
     "--format",
     "json",
     "--workspace",
@@ -583,6 +641,7 @@ test("top-level helpers use the default client", async () => {
 
   try {
     assert.equal((await status()).config_version, "cfg_123");
+    assert.equal((await overview()).daemon_running, true);
     assert.equal((await tasks())[0]?.name, "watch");
     assert.equal((await run("build")).task, "build");
     assert.equal((await emit("runtime.tick", { ok: true })).event_type, "runtime.tick");

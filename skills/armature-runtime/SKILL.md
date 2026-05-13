@@ -19,6 +19,7 @@ Do not introduce workflow DAGs, durable promises, semantic retries, semantic ded
 3. Validate config before starting or reloading: `armature config check`.
 4. Start the daemon with `armature up`, or use `armature dev` / `armature up --foreground` while debugging.
 5. Prefer machine-readable output while scripting: put `--format json` before the command, for example `armature --format json status`.
+6. Use `armature overview` for the compact operational picture before writing custom status scripts.
 
 ## Static Definitions
 
@@ -86,6 +87,7 @@ armature run list --correlation req-123
 armature run show <run-id>
 armature run logs <run-id>
 armature run cancel <run-id>
+armature overview --json
 armature wait event work.completed --correlation req-123 --timeout 5m
 armature subscribe events
 ```
@@ -103,6 +105,8 @@ printf '%s\n' '{"ok":true}' | armature event emit build.completed --stdin
 ```
 
 Use exactly one payload source: `--json`, `--payload-file`, or `--stdin`. If no payload is supplied, Armature records `{}`.
+
+Prefer `--payload-file` or `--stdin` for non-trivial payloads. Shell quoting bugs can quickly become project state if scheduled/event-triggered scripts trust malformed input. Event handlers should validate payload shape before mutating repo-owned state.
 
 Armature records accepted events before routing them. Trigger outcomes are inspectable and can be `started`, `queued`, `coalesced`, `rejected`, or `superseded` depending on admission policy.
 
@@ -167,6 +171,7 @@ await withLock("repo:main", async () => {
 Start with:
 
 ```sh
+armature overview
 armature status
 armature doctor
 armature task list
@@ -176,7 +181,17 @@ armature event list --json
 armature trigger list --json
 ```
 
+`armature overview` summarizes configured tasks/services, live active run ids, queued trigger counts, latest run per task/service, recent failures, recent events, and recent trigger outcomes. Treat it as a mechanical status view, not a workflow verdict.
+
 For a failed run, inspect `armature run show <run-id>` and `armature run logs <run-id>`. Logs include stdout/stderr paths, byte counts, line counts, and captured stream contents. Recovered runs may include a recovery note if they were active when a previous daemon exited.
+
+For recurring agent loops, a good pattern is:
+
+1. A scheduled director task wakes up on a cron interval.
+2. The director reads repo-owned state, exits if active work already exists, and emits a request event only when new work should start.
+3. Event-triggered tasks handle request/completion/quality events.
+4. Repo scripts own `tasks.json`, artifacts, quality gates, locking, dedupe, and semantic success/failure.
+5. Armature owns timers, event dispatch, run capture, logs, trigger outcomes, waits, and compact inspection.
 
 ## Validation
 

@@ -458,14 +458,22 @@ Armature **SHOULD** expose runtime state through CLI and JSON interfaces.
 Examples:
 
 ```bash
+armature overview
 armature status
 armature ps
 armature services
 armature tasks
 armature runs
+armature overview --json
 armature status --json
 armature ps --json
 ```
+
+`armature overview` **SHOULD** provide a compact read-only projection of
+mechanical runtime state for operators and agents. It should include configured
+tasks and services, active runs, latest run per task/service where known, queued
+trigger counts, recent trigger outcomes, recent events, and recent failures.
+This overview **MUST NOT** infer semantic workflow status from user artifacts.
 
 Runtime state is daemon-owned. Workflow meta-state is user-owned.
 
@@ -729,6 +737,7 @@ ARMATURE_STATE_DIR
 ARMATURE_RUN_DIR
 ARMATURE_EVENT_JSON
 ARMATURE_EVENT_PATH
+ARMATURE_EVENT_PAYLOAD_JSON
 ARMATURE_PAYLOAD_JSON
 ARMATURE_CONFIG_VERSION
 ARMATURE_CORRELATION_ID

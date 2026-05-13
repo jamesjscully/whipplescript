@@ -139,6 +139,14 @@ source as `cli`. Override that provenance with `--source`, for example
 `--stdin` for payload input. For machine-readable command output, put the global
 format flag before the command: `armature --format json emit ...`.
 
+Event payloads are JSON values recorded with the event. For shell scripts,
+prefer `--payload-file` or `--stdin` once payloads stop being tiny; this avoids
+quoting bugs and makes script-side validation easier. Event-triggered task
+processes receive the recorded event through environment variables:
+`ARMATURE_EVENT_TYPE`, `ARMATURE_EVENT_JSON`, `ARMATURE_EVENT_PATH`, and
+`ARMATURE_EVENT_PAYLOAD_JSON`. Scripts should validate payload shape before
+turning an event into project state.
+
 Accepted events are appended to the local event log before task routing and can
 be inspected with `armature event list --json` or the `armature events --json`
 alias. Trigger admission is inspectable with `armature trigger list --json` or
@@ -164,6 +172,7 @@ them.
 ## Inspect Work
 
 ```sh
+armature overview
 armature status
 armature task list
 armature task show test
@@ -177,6 +186,12 @@ armature log tail <run-id> --lines 100
 armature run cancel <run-id>
 armature doctor
 ```
+
+`armature overview` is the compact operational view for agent-style projects. It
+summarizes configured tasks and services, active run ids, queued trigger counts,
+latest run per task/service, recent failures, recent events, and recent trigger
+outcomes. It is a read-only projection over Armature's mechanical state; it does
+not infer workflow status from your project artifacts.
 
 The v0.3 aliases remain available:
 
@@ -264,6 +279,7 @@ armature service add github-source -- node sources/github.mjs
 armature task add planner --on agent.requested -- node planner.mjs
 armature event emit agent.requested --correlation req-1 --payload-file request.json
 armature wait event work.completed --correlation req-1 --timeout 5m
+armature overview --json
 armature run list --correlation req-1
 armature lock with repo:main --ttl 1m --reason "final check" -- echo ok
 armature down
@@ -272,6 +288,13 @@ armature down
 User-authored scripts own planning, retries, deduplication, fanout, review
 logic, and success criteria. Armature records and supervises the mechanical
 runtime facts.
+
+For recurring agent loops, a common pattern is a scheduled director task that
+checks script-owned state, emits request events when work should start, and
+exits without emitting when active project work already exists. Event-triggered
+tasks then handle request/completion/quality-gate events. Keep state such as
+`tasks.json`, artifacts, quality decisions, and locks in the repo scripts; use
+Armature to make the timers, dispatch, logs, and run history inspectable.
 
 ## TypeScript SDK
 

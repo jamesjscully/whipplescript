@@ -103,12 +103,13 @@ await armature.up()
 await armature.restart()
 
 const snapshot = await armature.status()
+const overview = await armature.overview()
 const tasks = await armature.tasks()
 const services = await armature.services()
 const runs = await armature.runs()
 const logOutput = await armature.logs(runs[0].id)
 
-console.log(snapshot, tasks, services, logOutput)
+console.log(snapshot, overview, tasks, services, logOutput)
 
 await armature.down()
 ```
@@ -116,13 +117,17 @@ await armature.down()
 Equivalent named exports are available for common calls:
 
 ```ts
-import { emit, logs, run, runs, services, status, tasks } from "@armature/sdk"
+import { emit, logs, overview, run, runs, services, status, tasks } from "@armature/sdk"
 
 const started = await run("test")
 await emit("build.completed", { runId: started.run_id, ok: true })
-console.log(await status(), await tasks(), await services(), await runs())
+console.log(await status(), await overview(), await tasks(), await services(), await runs())
 console.log(await logs(started.run_id))
 ```
+
+`overview()` wraps `armature overview` and returns the compact mechanical status
+view: configured tasks/services, active runs, latest run per task/service, queued
+trigger counts, recent failures, recent events, and recent triggers.
 
 `logs(runId)` returns captured stdout/stderr plus the run record, run directory,
 log paths, byte counts, line counts, truncation flags, and missing-file flags

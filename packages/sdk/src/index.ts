@@ -50,6 +50,66 @@ export interface StatusSnapshot {
   active_runs: number;
 }
 
+export interface RunSummary {
+  id: string;
+  name: string;
+  command: string;
+  origin: string;
+  state: string;
+  start_time: string;
+  end_time?: string | null;
+  exit_code?: number | null;
+  signal?: number | null;
+  killed: boolean;
+  event_id?: string | null;
+  stdout_path?: string | null;
+  stderr_path?: string | null;
+}
+
+export interface TaskOverview {
+  name: string;
+  run: string;
+  dynamic: boolean;
+  schedule?: string | null;
+  watch: string[];
+  on?: string | null;
+  admission: string;
+  active_run_ids: string[];
+  queued_triggers: number;
+  latest_run?: RunSummary | null;
+  latest_failure?: RunSummary | null;
+}
+
+export interface ServiceOverview {
+  name: string;
+  run: string;
+  enabled: boolean;
+  dynamic: boolean;
+  restart: string;
+  state?: string | null;
+  active_run_id?: string | null;
+  stop_override?: boolean | null;
+  health_state?: string | null;
+  last_error?: string | null;
+  latest_run?: RunSummary | null;
+  latest_failure?: RunSummary | null;
+}
+
+export interface OverviewSnapshot {
+  workspace_root: string;
+  config_path: string;
+  config_version: string;
+  daemon_running: boolean;
+  socket_path?: string | null;
+  pid_path?: string | null;
+  tasks: TaskOverview[];
+  services: ServiceOverview[];
+  active_runs: RunSummary[];
+  recent_events: ArmatureEvent[];
+  recent_triggers: TriggerRecord[];
+  recent_failures: RunSummary[];
+}
+
 export interface TaskStatus {
   name: string;
   run: string;
@@ -220,6 +280,10 @@ export interface EmitOptions {
 
 export interface ListOptions {
   limit?: number;
+}
+
+export interface OverviewOptions {
+  recent?: number;
 }
 
 export interface TaskListOptions {
@@ -596,6 +660,12 @@ export class ArmatureClient {
     return runCli<UpResult>(["restart"], this.options);
   }
 
+  overview(options: OverviewOptions = {}): Promise<OverviewSnapshot> {
+    const args = ["overview"];
+    pushOptions(args, { recent: options.recent });
+    return runCli<OverviewSnapshot>(args, this.options);
+  }
+
   private runTask(taskName: string, options: RunOptions = {}): Promise<RunStartResult> {
     const args = ["run", taskName];
     if (options.correlation) {
@@ -876,6 +946,10 @@ export async function run(taskName: string, options: RunOptions = {}): Promise<R
 
 export async function status(): Promise<StatusSnapshot> {
   return armature.status();
+}
+
+export async function overview(options: OverviewOptions = {}): Promise<OverviewSnapshot> {
+  return armature.overview(options);
 }
 
 export async function tasks(): Promise<TaskStatus[]> {

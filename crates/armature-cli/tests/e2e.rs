@@ -856,6 +856,29 @@ fn object_cli_aliases() {
         trigger_id
     );
 
+    let overview = sandbox.json(["--format", "json", "overview"]);
+    assert_eq!(overview["daemon_running"], true);
+    assert!(overview["active_runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|run| { run["name"] == "worker" && run["state"] == "running" }));
+    assert!(overview["tasks"].as_array().unwrap().iter().any(|task| {
+        task["name"] == "hello"
+            && task["latest_run"]["name"] == "hello"
+            && task["latest_run"]["state"] == "exited"
+    }));
+    assert!(overview["recent_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| { event["event_type"] == "object.event" }));
+    assert!(overview["recent_triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|trigger| { trigger["task_name"] == "on-object" }));
+
     sandbox.ok(["down"]);
 }
 

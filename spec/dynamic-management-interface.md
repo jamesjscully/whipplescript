@@ -259,6 +259,24 @@ subscribe  stream future changes as newline-delimited JSON
 They should not add workflow semantics. They only observe mechanical runtime
 state.
 
+### 3.11 Overview
+
+Overview is a compact read-only runtime projection for humans and agents:
+
+```text
+configured tasks and services
+active runs
+latest run per task/service
+queued trigger counts
+recent trigger outcomes
+recent events
+recent failures
+```
+
+Overview should reduce custom status scripting for agent projects without
+becoming a workflow verdict. It must not inspect or interpret repo-owned
+application state such as task ledgers, quality decisions, or artifacts.
+
 ## 4. Canonical CLI
 
 The canonical CLI should map to object types.
@@ -682,6 +700,7 @@ armature event list --type plan.ready --correlation req-123
 armature trigger list --task reviewer --outcome rejected
 armature run list --name worker --state failed
 armature lock list --expired
+armature overview --json
 ```
 
 Filtering is not a workflow query language. It is runtime inspection.

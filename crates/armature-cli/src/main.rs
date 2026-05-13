@@ -107,6 +107,7 @@ enum Command {
         #[command(subcommand)]
         command: SubscribeCommand,
     },
+    Overview(OverviewArgs),
     Status(JsonOutputArgs),
     Ps(JsonOutputArgs),
     Tasks,
@@ -156,6 +157,7 @@ impl Command {
             Self::Triggers(args) => triggers_workspace(workspace, args, format),
             Self::Wait { command } => wait_command(workspace, command, format),
             Self::Subscribe { command } => subscribe_command(workspace, command),
+            Self::Overview(args) => overview_workspace(workspace, args, format),
             Self::Status(args) => status_workspace(workspace, args.apply(format)),
             Self::Ps(args) => ps_workspace(workspace, args.apply(format)),
             Self::Tasks => tasks_workspace(workspace, format),
@@ -570,6 +572,14 @@ enum SubscribeCommand {
 }
 
 #[derive(Debug, Args)]
+struct OverviewArgs {
+    #[command(flatten)]
+    output: JsonOutputArgs,
+    #[arg(long, default_value_t = 10)]
+    recent: usize,
+}
+
+#[derive(Debug, Args)]
 struct LogsArgs {
     #[arg(long, value_name = "LINES")]
     tail: Option<usize>,
@@ -764,6 +774,70 @@ struct StatusOutput<'a> {
 #[derive(Debug, Serialize)]
 struct PsOutput {
     runs: Vec<armature_core::RunRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct OverviewOutput {
+    workspace_root: PathBuf,
+    config_path: PathBuf,
+    config_version: String,
+    daemon_running: bool,
+    socket_path: Option<String>,
+    pid_path: Option<String>,
+    tasks: Vec<TaskOverview>,
+    services: Vec<ServiceOverview>,
+    active_runs: Vec<RunSummary>,
+    recent_events: Vec<armature_core::EventRecord>,
+    recent_triggers: Vec<armature_core::TriggerRecord>,
+    recent_failures: Vec<RunSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskOverview {
+    name: String,
+    run: String,
+    dynamic: bool,
+    schedule: Option<String>,
+    watch: Vec<String>,
+    on: Option<String>,
+    admission: String,
+    active_run_ids: Vec<String>,
+    queued_triggers: usize,
+    latest_run: Option<RunSummary>,
+    latest_failure: Option<RunSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct ServiceOverview {
+    name: String,
+    run: String,
+    enabled: bool,
+    dynamic: bool,
+    restart: String,
+    state: Option<String>,
+    active_run_id: Option<String>,
+    stop_override: Option<bool>,
+    health_state: Option<String>,
+    last_error: Option<String>,
+    latest_run: Option<RunSummary>,
+    latest_failure: Option<RunSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RunSummary {
+    id: String,
+    name: String,
+    command: String,
+    origin: String,
+    state: String,
+    start_time: String,
+    end_time: Option<String>,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    killed: bool,
+    event_id: Option<String>,
+    stdout_path: Option<String>,
+    stderr_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1758,6 +1832,131 @@ fn status_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> Arm
     print_data(format, &output, &text)
 }
 
+fn overview_workspace(
+    workspace_arg: Option<PathBuf>,
+    args: OverviewArgs,
+    format: OutputFormat,
+) -> ArmatureResult<()> {
+    let workspace = resolve_workspace_arg(workspace_arg)?;
+    let config = load_workspace_config(&workspace)?;
+    let store = SqliteStore::open(&workspace)?;
+    let inspect = daemon_client(&workspace).inspect().ok();
+    let runs = store.list_runs()?;
+    let recent_events = store.list_events_filtered(&EventFilter {
+        event_type: None,
+        source: None,
+        correlation: None,
+        limit: Some(args.recent),
+    })?;
+    let recent_triggers = store.list_triggers_filtered(&TriggerFilter {
+        task: None,
+        event_type: None,
+        outcome: None,
+        correlation: None,
+        limit: Some(args.recent),
+    })?;
+    let recent_failures = runs
+        .iter()
+        .filter(|run| run_failed(run))
+        .take(args.recent)
+        .map(run_summary)
+        .collect::<Vec<_>>();
+    let task_views = build_task_views(&config, inspect.as_ref());
+    let service_views = build_service_views(&config, inspect.as_ref());
+    let tasks = task_views
+        .into_iter()
+        .map(|task| {
+            let latest_run = runs
+                .iter()
+                .find(|run| {
+                    run.name == task.name && matches!(run.origin, armature_core::RunOrigin::Task)
+                })
+                .map(run_summary);
+            let latest_failure = runs
+                .iter()
+                .find(|run| {
+                    run.name == task.name
+                        && matches!(run.origin, armature_core::RunOrigin::Task)
+                        && run_failed(run)
+                })
+                .map(run_summary);
+            TaskOverview {
+                name: task.name,
+                run: task.run,
+                dynamic: task.dynamic,
+                schedule: task.schedule,
+                watch: task.watch,
+                on: task.on,
+                admission: task.admission,
+                active_run_ids: task.active_run_ids,
+                queued_triggers: task.queued_triggers,
+                latest_run,
+                latest_failure,
+            }
+        })
+        .collect::<Vec<_>>();
+    let services = service_views
+        .into_iter()
+        .map(|service| {
+            let latest_run = runs
+                .iter()
+                .find(|run| {
+                    run.name == service.name
+                        && matches!(
+                            run.origin,
+                            armature_core::RunOrigin::Service | armature_core::RunOrigin::Restart
+                        )
+                })
+                .map(run_summary);
+            let latest_failure = runs
+                .iter()
+                .find(|run| {
+                    run.name == service.name
+                        && matches!(
+                            run.origin,
+                            armature_core::RunOrigin::Service | armature_core::RunOrigin::Restart
+                        )
+                        && run_failed(run)
+                })
+                .map(run_summary);
+            ServiceOverview {
+                name: service.name,
+                run: service.run,
+                enabled: service.enabled,
+                dynamic: service.dynamic,
+                restart: service.restart,
+                state: service.state,
+                active_run_id: service.active_run_id,
+                stop_override: service.stop_override,
+                health_state: service.health_state,
+                last_error: service.last_error,
+                latest_run,
+                latest_failure,
+            }
+        })
+        .collect::<Vec<_>>();
+    let active_runs = inspect
+        .as_ref()
+        .map(|inspect| inspect.active_runs.iter().map(run_summary).collect())
+        .unwrap_or_default();
+    let output = OverviewOutput {
+        workspace_root: workspace.root().to_path_buf(),
+        config_path: workspace.config_path().to_path_buf(),
+        config_version: config.version,
+        daemon_running: inspect.is_some(),
+        socket_path: inspect.as_ref().map(|inspect| inspect.socket_path.clone()),
+        pid_path: inspect.as_ref().map(|inspect| inspect.pid_path.clone()),
+        tasks,
+        services,
+        active_runs,
+        recent_events,
+        recent_triggers,
+        recent_failures,
+    };
+    let text = format_overview_text(&output);
+    print_data(args.output.apply(format), &output, &text)
+}
+
 fn ps_workspace(workspace_arg: Option<PathBuf>, format: OutputFormat) -> ArmatureResult<()> {
     let workspace = resolve_workspace_arg(workspace_arg)?;
     let inspect = daemon_client(&workspace).inspect()?;
@@ -2741,6 +2940,193 @@ fn build_service_views(
     views
 }
 
+fn run_summary(run: &armature_core::RunRecord) -> RunSummary {
+    RunSummary {
+        id: run.id.as_str().to_string(),
+        name: run.name.clone(),
+        command: run.command.clone(),
+        origin: format!("{:?}", run.origin).to_lowercase(),
+        state: format!("{:?}", run.state).to_lowercase(),
+        start_time: run.start_time.clone(),
+        end_time: run.end_time.clone(),
+        exit_code: run.exit_code,
+        signal: run.signal,
+        killed: run.killed,
+        event_id: run
+            .event_id
+            .as_ref()
+            .map(|event_id| event_id.as_str().to_string()),
+        stdout_path: run.stdout_path.clone(),
+        stderr_path: run.stderr_path.clone(),
+    }
+}
+
+fn run_failed(run: &armature_core::RunRecord) -> bool {
+    matches!(run.state, ProcessState::Failed)
+        || run.exit_code.map(|code| code != 0).unwrap_or(false)
+        || run.signal.is_some()
+        || run.killed
+}
+
+fn format_overview_text(output: &OverviewOutput) -> String {
+    let mut lines = vec![
+        format!("workspace {}", output.workspace_root.display()),
+        format!("config {}", output.config_version),
+        format!(
+            "daemon {}",
+            if output.daemon_running {
+                "running"
+            } else {
+                "not_running"
+            }
+        ),
+    ];
+    if let Some(socket_path) = &output.socket_path {
+        lines.push(format!("socket {socket_path}"));
+    }
+    lines.push(String::new());
+    lines.push("tasks".to_string());
+    if output.tasks.is_empty() {
+        lines.push("  none".to_string());
+    } else {
+        for task in &output.tasks {
+            let triggers = overview_task_triggers(task);
+            let latest = task
+                .latest_run
+                .as_ref()
+                .map(format_run_inline)
+                .unwrap_or_else(|| "none".to_string());
+            let failure = task
+                .latest_failure
+                .as_ref()
+                .map(format_run_inline)
+                .unwrap_or_else(|| "none".to_string());
+            lines.push(format!(
+                "  {}\t{}\tactive={}\tqueued={}\tlatest={}\tfailure={}",
+                task.name,
+                triggers,
+                task.active_run_ids.len(),
+                task.queued_triggers,
+                latest,
+                failure
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push("services".to_string());
+    if output.services.is_empty() {
+        lines.push("  none".to_string());
+    } else {
+        for service in &output.services {
+            let latest = service
+                .latest_run
+                .as_ref()
+                .map(format_run_inline)
+                .unwrap_or_else(|| "none".to_string());
+            let failure = service
+                .latest_failure
+                .as_ref()
+                .map(format_run_inline)
+                .unwrap_or_else(|| "none".to_string());
+            lines.push(format!(
+                "  {}\tstate={}\trestart={}\tactive={}\tlatest={}\tfailure={}",
+                service.name,
+                service.state.as_deref().unwrap_or("not_running"),
+                service.restart,
+                service.active_run_id.as_deref().unwrap_or("none"),
+                latest,
+                failure
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push("active runs".to_string());
+    if output.active_runs.is_empty() {
+        lines.push("  none".to_string());
+    } else {
+        for run in &output.active_runs {
+            lines.push(format!("  {}", format_run_inline(run)));
+        }
+    }
+    lines.push(String::new());
+    lines.push("recent failures".to_string());
+    if output.recent_failures.is_empty() {
+        lines.push("  none".to_string());
+    } else {
+        for run in &output.recent_failures {
+            lines.push(format!("  {}", format_run_inline(run)));
+        }
+    }
+    lines.push(String::new());
+    lines.push("recent events".to_string());
+    if output.recent_events.is_empty() {
+        lines.push("  none".to_string());
+    } else {
+        for event in &output.recent_events {
+            lines.push(format!(
+                "  {}\t{}\tsource={}\tcorrelation={}",
+                event.id.as_str(),
+                event.event_type,
+                event
+                    .source
+                    .as_deref()
+                    .unwrap_or(armature_core::model::DEFAULT_EVENT_SOURCE),
+                event.correlation_id.as_deref().unwrap_or("none")
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push("recent triggers".to_string());
+    if output.recent_triggers.is_empty() {
+        lines.push("  none".to_string());
+    } else {
+        for trigger in &output.recent_triggers {
+            lines.push(format!(
+                "  {}\t{}\t{}\toutcome={}\trun={}",
+                trigger.id.as_str(),
+                trigger.task_name,
+                trigger.event_type,
+                format!("{:?}", trigger.outcome).to_lowercase(),
+                trigger
+                    .run_id
+                    .as_ref()
+                    .map(|run_id| run_id.as_str())
+                    .unwrap_or("none")
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn overview_task_triggers(task: &TaskOverview) -> String {
+    let mut triggers = Vec::new();
+    if let Some(schedule) = &task.schedule {
+        triggers.push(format!("schedule={schedule}"));
+    }
+    if let Some(event_type) = &task.on {
+        triggers.push(format!("event={event_type}"));
+    }
+    if !task.watch.is_empty() {
+        triggers.push(format!("watch={}", task.watch.len()));
+    }
+    if triggers.is_empty() {
+        "manual".to_string()
+    } else {
+        triggers.join(",")
+    }
+}
+
+fn format_run_inline(run: &RunSummary) -> String {
+    let mut text = format!("{}:{}:{}", run.id, run.name, run.state);
+    if let Some(exit_code) = run.exit_code {
+        text.push_str(&format!(" exit={exit_code}"));
+    }
+    if let Some(signal) = run.signal {
+        text.push_str(&format!(" signal={signal}"));
+    }
+    text
+}
+
 fn service_state_text(service: &RuntimeServiceStatus) -> String {
     format!("{:?}", service.state).to_lowercase()
 }
@@ -3012,9 +3398,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        doctor_workspace, init_recipe_workspace, parse_duration, services_workspace,
-        tasks_workspace, wait_for_daemon_stop, Cli, Command, OutputFormat, RecipeName,
-        CONFIG_DIR_NAME, CONFIG_FILE_NAME,
+        doctor_workspace, init_recipe_workspace, overview_workspace, parse_duration,
+        services_workspace, tasks_workspace, wait_for_daemon_stop, Cli, Command, JsonOutputArgs,
+        OutputFormat, OverviewArgs, RecipeName, CONFIG_DIR_NAME, CONFIG_FILE_NAME,
     };
 
     #[test]
@@ -3024,11 +3410,14 @@ mod tests {
 
     #[test]
     fn runtime_status_commands_accept_json_output_alias() {
-        for command in ["status", "ps", "services", "runs", "events", "triggers"] {
+        for command in [
+            "overview", "status", "ps", "services", "runs", "events", "triggers",
+        ] {
             let cli = Cli::try_parse_from(["armature", command, "--json"]).unwrap();
 
             assert_eq!(cli.format, OutputFormat::Text);
             let output = match cli.command {
+                Command::Overview(args) => args.output,
                 Command::Status(args) | Command::Ps(args) | Command::Services(args) => args,
                 Command::Runs(args) => args.output,
                 Command::Events(args) => args.output,
@@ -3185,6 +3574,25 @@ mod tests {
         );
 
         doctor_workspace(Some(dir.path().to_path_buf()), OutputFormat::Json).unwrap();
+    }
+
+    #[test]
+    fn overview_remains_offline_tolerant() {
+        let dir = TempDir::new().unwrap();
+        write_workspace_config(
+            dir.path(),
+            "[[task]]\nname = \"test\"\nschedule = \"*/15 * * * *\"\nrun = \"echo test\"\n",
+        );
+
+        overview_workspace(
+            Some(dir.path().to_path_buf()),
+            OverviewArgs {
+                output: JsonOutputArgs { json: true },
+                recent: 5,
+            },
+            OutputFormat::Text,
+        )
+        .unwrap();
     }
 
     #[test]
