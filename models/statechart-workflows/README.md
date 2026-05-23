@@ -1,0 +1,69 @@
+# Statechart Workflow Formal Models
+
+This directory is for hand-written and generated models of the workflow
+semantics.
+
+The first model should be hand-written and small. Its job is to pressure-test
+the language and runtime semantics before implementation hardens.
+
+Initial model files:
+
+```text
+SpecImplementation.tla
+SpecImplementation.cfg
+SpecImplementation.maude
+```
+
+Maude was added at the Phase 1 reevaluation checkpoint because the first TLA
+model intentionally abstracts away executable small-step behavior. The Maude
+model currently checks the same bounded workflow safety envelope as an
+executable rewrite system. It should grow toward handler lookup, event ordering,
+raised events, and durable effect commit semantics as those details harden.
+
+The model should include bounded work items, workflow states, `finished` events,
+`idle` observation events, nondeterministic coerce outputs, active invocation
+counters, visible work item statuses, capability facts, and human-review
+visibility.
+
+The hand-written model should be written against the native `.armature` DSL and
+WorkflowIR semantics. Generated models should consume validated WorkflowIR, not
+raw source text.
+
+The current `SpecImplementation.tla` file is a hand-written Phase 1 model.
+`tlaplus`, Java, and Maude are available through the repository Nix flake:
+
+```sh
+nix develop -c tlc -deadlock -config models/statechart-workflows/SpecImplementation.cfg models/statechart-workflows/SpecImplementation.tla
+nix develop -c maude models/statechart-workflows/SpecImplementation.maude
+nix develop -c maude --version
+scripts/check-formal-models.sh
+```
+
+`scripts/check-formal-models.sh` checks both tracks: the source-controlled
+hand-written TLA+/Maude models in this directory and the generated TLA+/Maude
+models produced from `examples/workflows/spec-implementation.armature` through
+`armature check`.
+
+TLC result recorded during the initial implementation pass:
+
+```text
+137 states generated
+88 distinct states found
+complete state graph depth 13
+no errors found
+```
+
+Maude result recorded during the initial implementation pass:
+
+```text
+search found no invariant-violating solution
+106 states explored
+5783 rewrites
+```
+
+Apalache is not currently pinned. Phase 1 should either add an Apalache
+installation path or continue with TLC plus Maude first.
+
+Generated models should eventually live under `.armature/build/models/` for a
+specific workflow build. This directory is for source-controlled design models
+and fixtures.

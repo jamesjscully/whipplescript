@@ -1,0 +1,69 @@
+machine SimpleSupervisor
+initial watching
+
+data {
+  seenRuns string[]
+  lastIdleNudgeAt time? = nil
+}
+
+agent director = thread("director")
+
+event finished {
+  name string
+  runId string
+  ok bool
+}
+
+event idle {
+  activeRuns int
+  unfinishedItems int
+}
+
+state watching {
+  on finished as run
+    guard !(run.runId in data.seenRuns)
+  {
+    case run.name {
+      matches "worker-*" -> {
+        assign data.seenRuns = data.seenRuns.append(run.runId)
+
+        send director """
+        Agent run {{ run.runId }} completed.
+        Inspect logs and update the plan.
+        """
+
+        stay
+      }
+
+      matches "quality-*" -> {
+        assign data.seenRuns = data.seenRuns.append(run.runId)
+
+        send director """
+        Quality run {{ run.runId }} completed.
+        Inspect the result and update the plan.
+        """
+
+        stay
+      }
+
+      _ -> {
+        stay
+      }
+    }
+  }
+
+  on idle as observation
+    guard observation.activeRuns == 0
+    guard observation.unfinishedItems > 0
+    guard data.lastIdleNudgeAt == nil || elapsedSince(data.lastIdleNudgeAt) >= 2m
+  {
+    assign data.lastIdleNudgeAt = now()
+
+    send director """
+    The implementation loop appears idle.
+    Inspect the plan and restart work or record the blocker.
+    """
+
+    stay
+  }
+}

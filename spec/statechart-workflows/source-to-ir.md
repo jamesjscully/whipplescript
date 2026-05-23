@@ -1,0 +1,507 @@
+# Source To IR Lowering
+
+Status: design proposal
+
+`.armature` files use a native statechart DSL. The runtime executes only
+validated WorkflowIR; it never interprets raw source directly.
+
+This document defines the source-to-IR contract so parser, validator, runtime,
+model generator, examples, and diagnostics do not drift.
+
+## Pipeline
+
+The source pipeline is:
+
+```text
+read .armature file
+lex and parse Armature DSL
+build parsed syntax tree with source spans
+lower BAML-shaped enum/class/coerce declarations
+normalize statechart source into WorkflowIR
+validate WorkflowIR
+optionally generate BAML artifacts and verification models
+```
+
+## Source Unit
+
+Source:
+
+```armature
+machine implementationLoop
+initial running
+```
+
+IR:
+
+```json
+{
+  "workflow": {
+    "name": "implementationLoop",
+    "initial": "running"
+  }
+}
+```
+
+A source file defines exactly one machine. `machine` names it. `initial` is
+required at machine scope and for every compound state that has child states.
+
+## Declarations
+
+The parser recognizes these top-level declarations:
+
+```text
+machine
+initial
+data
+agent
+capability
+enum
+class
+coerce
+state
+invariant
+```
+
+Nested `state` declarations may contain:
+
+```text
+initial
+entry
+always
+on
+state
+final
+```
+
+## Data
+
+Source:
+
+```armature
+data {
+  seenRuns string[] = []
+  lastIdleNudgeAt time? = nil
+}
+```
+
+IR:
+
+```json
+{
+  "context_schema": {
+    "seenRuns": {
+      "type": "list",
+      "inner": {"type": "string"}
+    },
+    "lastIdleNudgeAt": {
+      "type": "optional",
+      "inner": {"type": "time"}
+    }
+  },
+  "context_initializers": {
+    "seenRuns": {
+      "op": "list",
+      "items": []
+    },
+    "lastIdleNudgeAt": {
+      "op": "literal",
+      "value": null
+    }
+  }
+}
+```
+
+The IR may keep the historical name `context_schema`, but the source language
+uses `data`.
+
+## Agents
+
+Source:
+
+```armature
+agent director = thread("director")
+agent worker = codingAgent() {
+  maxActive 4
+}
+```
+
+IR:
+
+```json
+{
+  "agents": {
+    "director": {
+      "target": {"type": "thread", "id": "director"}
+    },
+    "worker": {
+      "target": {"type": "coding_agent"},
+      "max_active": 4
+    }
+  }
+}
+```
+
+Agents are simple named targets. They do not imply wildcard group behavior.
+Pattern matching over event fields handles groups.
+
+## Capabilities
+
+Source:
+
+```armature
+capability plan = adapter("implementationPlan")
+```
+
+IR:
+
+```json
+{
+  "capabilities": {
+    "plan": {
+      "adapter": "implementationPlan"
+    }
+  }
+}
+```
+
+Capability operation schemas come from the adapter registry and workspace
+policy, not from arbitrary code in the workflow file.
+
+## BAML-Shaped Types
+
+Source:
+
+```armature
+enum RunKind {
+  WorkerComplete
+  WorkerFailed
+}
+
+class RunClassification {
+  kind RunKind
+  workItemId string?
+  reason string
+}
+```
+
+IR:
+
+```json
+{
+  "types": {
+    "RunKind": {
+      "type": "enum",
+      "values": ["WorkerComplete", "WorkerFailed"]
+    },
+    "RunClassification": {
+      "type": "record",
+      "fields": [
+        {"name": "kind", "schema": {"type": "ref", "name": "RunKind"}},
+        {
+          "name": "workItemId",
+          "schema": {
+            "type": "optional",
+            "inner": {"type": "string"}
+          }
+        },
+        {"name": "reason", "schema": {"type": "string"}}
+      ]
+    }
+  }
+}
+```
+
+These declarations must be accepted by Armature's type checker and lowerable to
+BAML when referenced by a `coerce` declaration.
+
+## Coerce Declarations
+
+Source:
+
+```armature
+coerce classifyRun(run RunSummary) -> RunClassification {
+  model "gpt-4o-mini"
+
+  prompt """
+  Classify this finished agent run.
+
+  {{ run }}
+
+  {{ ctx.output_format }}
+  """
+}
+```
+
+IR:
+
+```json
+{
+  "coerce_functions": {
+    "classifyRun": {
+      "params": [
+        {"name": "run", "schema": {"type": "ref", "name": "RunSummary"}}
+      ],
+      "output": {"type": "ref", "name": "RunClassification"},
+      "model": "gpt-4o-mini",
+      "prompt_span": "workflow.armature:36:3",
+      "generated_baml_artifact": ".armature/build/workflows/implementationLoop/baml_src/classifyRun.baml"
+    }
+  }
+}
+```
+
+The compiler generates BAML from Armature declarations. Generated BAML artifacts
+are derived build outputs.
+
+## Statechart Handlers
+
+Source:
+
+```armature
+state running {
+  initial watching
+
+  on finished as run
+    guard !(run.id in data.seenRuns)
+  {
+    assign data.seenRuns = data.seenRuns.append(run.id)
+    goto choosing
+  }
+
+  state watching {
+    on idle {
+      stay
+    }
+  }
+}
+```
+
+IR:
+
+```json
+{
+  "statechart": {
+    "initial": "running",
+    "states": {
+      "running": {
+        "initial": "watching",
+        "on": [
+          {
+            "event": "finished",
+            "binding": "run",
+            "guard": {
+              "op": "not",
+              "expr": {
+                "op": "in",
+                "left": {"path": "event.run.id"},
+                "right": {"path": "context.seenRuns"}
+              }
+            },
+            "steps": [
+              {
+                "action": "assign",
+                "target": {"path": "context.seenRuns"},
+                "value": {
+                  "op": "call",
+                  "name": "append",
+                  "receiver": {"path": "context.seenRuns"},
+                  "args": [{"path": "event.run.id"}]
+                }
+              }
+            ],
+            "outcome": {"type": "goto", "target": "choosing"}
+          }
+        ],
+        "states": {
+          "watching": {
+            "on": [
+              {
+                "event": "idle",
+                "steps": [],
+                "outcome": {"type": "stay"}
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Object keys are not source syntax. Source constructs lower to explicit IR nodes
+with spans.
+
+## Actions And Effects
+
+Source:
+
+```armature
+let next = coerce chooseNextStep(planText)
+let classification = classifyRun(summary)
+assign data.lastIdleNudgeAt = now()
+send director "Worker failed"
+start worker { task next.workItemId }
+askHuman(next.reason)
+plan.markDone(next.workItemId)
+```
+
+Normalization:
+
+- `coerce chooseNextStep(...)` and `chooseNextStep(...)` both lower to the
+  `coerce` effect when the callee resolves to a `coerce` declaration.
+- `assign` lowers to a deterministic data update.
+- `send`, `start`, and `askHuman` lower to built-in adapter effects.
+- `plan.markDone(...)` lowers to an adapter capability operation whose schema is
+  supplied by the capability registry.
+- `case` lowers to a structured `case` step. Each arm keeps its pattern, nested
+  steps, and arm-local transition so branch outcomes cannot leak into the
+  parent event handler.
+
+Unknown calls fail validation. There are no arbitrary user-defined functions.
+
+Current `case` IR shape:
+
+```json
+{
+  "effect": "case",
+  "args": {
+    "expr": {"op": "path", "path": "run.name"}
+  },
+  "assign": null,
+  "case_arms": [
+    {
+      "pattern": {"type": "matches", "pattern": "worker-*"},
+      "steps": [],
+      "transition": "choosing"
+    },
+    {
+      "pattern": {"type": "wildcard"},
+      "steps": [],
+      "transition": null
+    }
+  ],
+  "span": null
+}
+```
+
+## Expression Grammar
+
+The first expression grammar is deliberately small:
+
+```text
+Expr        := Or
+Or          := And ("||" And)*
+And         := Equality ("&&" Equality)*
+Equality    := Compare (("==" | "!=") Compare)?
+Compare     := Membership (("<" | "<=" | ">" | ">=") Membership)?
+Membership  := Unary ("in" Unary)?
+Unary       := "!" Unary | Primary
+Primary     := Path | String | Number | Boolean | Nil | Duration | Call | Object | List | "(" Expr ")"
+Call        := Identifier "(" ArgList? ")"
+Path        := Identifier ("." Identifier)*
+Object      := "{" ObjectField* "}"
+ObjectField := Identifier Expr
+List        := "[" (Expr ("," Expr)*)? "]"
+ArgList     := Expr ("," Expr)*
+```
+
+`matches` is a pattern operator available in `case` arms and guard expressions:
+
+```armature
+case run.name {
+  matches "worker-*" -> { ... }
+  _ -> { stay }
+}
+```
+
+Supported literals:
+
+```text
+true
+false
+nil
+integers
+floats
+durations such as 2m
+triple-quoted strings
+double-quoted strings
+bare enum identifiers when schema context allows them
+```
+
+No mutation, loops, recursion, imports, reflection, or host callbacks are
+allowed.
+
+## String Interpolation
+
+Armature strings use `{{ expr }}` interpolation:
+
+```armature
+send director """
+Worker failed: {{ classification.reason }}
+"""
+```
+
+Each interpolation contains an expression. If a string is exactly one
+interpolation, the lowered value preserves the expression's type instead of
+forcing a string.
+
+Prompt blocks inside `coerce` declarations are passed to BAML as prompt
+templates. Armature expression interpolation is not active inside prompt blocks;
+BAML/Jinja owns that syntax.
+
+## Handler Outcomes
+
+Handler blocks may end with one explicit outcome:
+
+```text
+stay
+goto <state>
+```
+
+`stay` lowers to no state transition. `goto <state>` lowers to a transition to
+the named state. If a handler has no explicit outcome, v0 lowers it as no state
+transition after effects complete. `finish`, `fail`, `exit`, `after`, and
+`parallel` are not implemented in v0 source lowering.
+If a handler includes `stay` or `goto`, that outcome must be terminal in the
+action block. The parser rejects later statements and repeated outcomes.
+
+## Invariants
+
+Supported built-in invariants may be referenced by name:
+
+```armature
+invariant agentCapabilitiesRespected
+```
+
+Expression invariants must be named:
+
+```armature
+invariant seenRunsShapeStable {
+  assert data.seenRuns == data.seenRuns
+}
+```
+
+The v0 source parser accepts one `assert <expr>` statement per invariant block.
+Invariant names must be unique across built-in and expression invariants.
+Unknown built-in invariant names and unsupported invariant forms fail
+validation.
+
+## Diagnostics
+
+Lowering must preserve source spans for:
+
+- machine metadata
+- data declarations
+- agents
+- capabilities
+- types
+- coerce declarations
+- states
+- handlers
+- guards
+- expressions
+- actions
+- invariants
+
+Diagnostics should point at source spans, not only generated IR nodes.

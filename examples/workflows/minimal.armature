@@ -1,0 +1,23 @@
+machine Minimal
+initial waiting
+
+data {
+  lastMessage string? = nil
+}
+
+event start {
+  message string
+}
+
+state waiting {
+  on start as evt {
+    assign data.lastMessage = evt.message
+    goto complete
+  }
+}
+
+state complete {
+  final
+}
+
+invariant declaredEffectsOnly

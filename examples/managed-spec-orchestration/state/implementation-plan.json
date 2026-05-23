@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 1,
+  "workstream": "spec-implementation",
+  "updatedAt": "2026-05-21T00:00:00.000Z",
+  "items": [
+    {
+      "id": "db-auth-foundation",
+      "title": "Implement database and auth foundations",
+      "area": "backend",
+      "specs": [
+        "specs/02-database.md",
+        "specs/03-auth.md"
+      ],
+      "status": "ready",
+      "dependsOn": [],
+      "lease": null,
+      "attempts": 0,
+      "threadId": null,
+      "qualityThreadId": null,
+      "artifacts": [],
+      "checks": [],
+      "notes": []
+    },
+    {
+      "id": "api-websocket-runtime",
+      "title": "Implement API and WebSocket runtime",
+      "area": "backend",
+      "specs": [
+        "specs/04-api.md",
+        "specs/05-websocket.md"
+      ],
+      "status": "blocked",
+      "dependsOn": [
+        "db-auth-foundation"
+      ],
+      "lease": null,
+      "attempts": 0,
+      "threadId": null,
+      "qualityThreadId": null,
+      "artifacts": [],
+      "checks": [],
+      "notes": [
+        "Needs auth/session primitives before API routes can be finalized."
+      ]
+    },
+    {
+      "id": "pi-policy-sandbox",
+      "title": "Implement Pi policy and sandbox enforcement",
+      "area": "runtime",
+      "specs": [
+        "specs/06-pi-integration.md",
+        "specs/16-agent-policy-and-control-plane.md"
+      ],
+      "status": "ready",
+      "dependsOn": [
+        "db-auth-foundation"
+      ],
+      "lease": null,
+      "attempts": 0,
+      "threadId": null,
+      "qualityThreadId": null,
+      "artifacts": [],
+      "checks": [],
+      "notes": []
+    },
+    {
+      "id": "workspace-task-queue",
+      "title": "Implement workspace lifecycle and human task queue",
+      "area": "workspace",
+      "specs": [
+        "specs/08-workspace.md",
+        "specs/15-task-queue.md"
+      ],
+      "status": "ready",
+      "dependsOn": [
+        "db-auth-foundation"
+      ],
+      "lease": null,
+      "attempts": 0,
+      "threadId": null,
+      "qualityThreadId": null,
+      "artifacts": [],
+      "checks": [],
+      "notes": []
+    }
+  ]
+}

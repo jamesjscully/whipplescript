@@ -1,0 +1,4 @@
+interface:
+  display_name: "Armature Statecharts"
+  short_description: "Author and inspect restricted Armature .armature workflows"
+  default_prompt: "Use $armature-statechart to author, validate, run, inspect, or repair Armature .armature statechart workflows, adapter manifests, durable events, and formal checks."

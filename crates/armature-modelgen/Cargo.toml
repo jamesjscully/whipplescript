@@ -1,0 +1,10 @@
+[package]
+name = "armature-modelgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+armature-workflow = { path = "../armature-workflow" }
+serde_json.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,11 @@
+{
+  "mode": "enterprise",
+  "allowed_capabilities": [
+    "askHuman",
+    "adapter.agent.start",
+    "message_agents",
+    "resource.plan.read",
+    "resource.plan.write"
+  ],
+  "denied_capabilities": []
+}

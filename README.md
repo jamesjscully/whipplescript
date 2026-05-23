@@ -1,345 +1,189 @@
 # armature
 
-Armature is a lightweight local daemon and CLI for running ordinary programs from
-schedules, file changes, emitted events, and supervised long-running services.
-
-## Install
-
-Build the CLI from this repository:
-
-```sh
-cargo build -p armature-cli
-alias armature="$PWD/target/debug/armature"
-```
-
-The TypeScript SDK lives in `packages/sdk` and wraps the installed CLI.
-
-## Initialize A Workspace
-
-```sh
-armature init
-```
-
-This creates `.armature/armature.toml`. Armature discovers workspaces by searching
-upward for that file, or you can pass `--workspace /path/to/workspace`.
-
-Example config:
-
-```toml
-[[task]]
-name = "test"
-watch = ["src/**/*", "tests/**/*"]
-settle = "500ms"
-run = "cargo test"
-
-[task.admission]
-when_busy = "queue_one"
-
-[[task]]
-name = "nightly-status"
-schedule = "0 9 * * *"
-run = "./scripts/status.sh"
-
-[[task]]
-name = "on-build-event"
-on = "build.completed"
-run = "./scripts/on-build-completed.sh"
-
-[[service]]
-name = "worker"
-run = "./scripts/worker.sh"
-
-[service.supervision]
-restart = "on_failure"
-max_restarts = 5
-within = "1m"
-backoff = "exponential"
-
-[service.health]
-check = "./scripts/worker-health.sh"
-every = "10s"
-timeout = "2s"
-```
-
-Check the config before starting the daemon:
-
-```sh
-armature config check
-```
-
-Starter recipes are available with:
-
-```sh
-armature init recipe file-watch-tests
-armature init recipe scheduled-status-script
-armature init recipe event-source-service
-armature init recipe event-hook-task
-armature init recipe named-lock
-```
-
-## Run The Daemon
-
-Start detached:
-
-```sh
-armature up
-```
-
-Run in the foreground while developing:
-
-```sh
-armature dev
-# equivalent to:
-armature up --foreground
-```
-
-Reload after config changes:
-
-```sh
-armature up
-```
-
-If a daemon is already running, `armature up` validates and hot-reloads the
-current config. Invalid reloads are rejected and the previous valid config stays
-active. Removed or changed services are stopped and reconciled from the new
-config; in-flight task runs are left to finish unless they are explicitly
-cancelled or the daemon is stopped. `armature restart` stops active runs as part
-of daemon shutdown, then starts the daemon again from the latest valid config.
-
-Stop the daemon:
-
-```sh
-armature down
-```
-
-## Trigger Work
-
-Run a task manually:
-
-```sh
-armature task run test
-# alias:
-armature run test
-```
-
-Emit an event for `on = "..."` tasks:
-
-```sh
-armature event emit build.completed --json '{"runId":"run_123","ok":true}'
-# alias:
-armature emit build.completed --json '{"runId":"run_123","ok":true}'
-armature emit build.completed --correlation corr-123 --json '{"ok":true}'
-armature emit build.completed --payload-file event.json
-printf '%s\n' '{"runId":"run_123","ok":true}' | armature emit build.completed --stdin
-```
-
-`armature emit` defaults to an empty object payload (`{}`) and records the event
-source as `cli`. Override that provenance with `--source`, for example
-`--source agent:reviewer`. Use exactly one of `--json`, `--payload-file`, or
-`--stdin` for payload input. For machine-readable command output, put the global
-format flag before the command: `armature --format json emit ...`.
-
-Event payloads are JSON values recorded with the event. For shell scripts,
-prefer `--payload-file` or `--stdin` once payloads stop being tiny; this avoids
-quoting bugs and makes script-side validation easier. Event-triggered task
-processes receive the recorded event through environment variables:
-`ARMATURE_EVENT_TYPE`, `ARMATURE_EVENT_JSON`, `ARMATURE_EVENT_PATH`, and
-`ARMATURE_EVENT_PAYLOAD_JSON`. Scripts should validate payload shape before
-turning an event into project state.
-
-Accepted events are appended to the local event log before task routing and can
-be inspected with `armature event list --json` or the `armature events --json`
-alias. Trigger admission is inspectable with `armature trigger list --json` or
-the `armature triggers --json` alias: busy tasks may record `started`, `queued`,
-`coalesced`, `rejected`, or `superseded` outcomes depending on `when_busy`.
-
-Armature does not provide durable queues, replay cursors, or exactly-once
-delivery. If the daemon is down, `armature emit` fails instead of buffering for
-later delivery; duplicate emits are recorded as separate events, and user code
-owns semantic deduplication.
-
-Task and service processes receive Armature context in environment variables such
-as `ARMATURE_RUN_ID`, `ARMATURE_RUN_DIR`, `ARMATURE_WORKSPACE_ROOT`,
-`ARMATURE_EVENT_TYPE`, `ARMATURE_EVENT_JSON`, and `ARMATURE_EVENT_PATH`.
-When `armature emit` or `armature run` is called from inside an
-Armature-managed process, the CLI forwards mechanical provenance from
-`ARMATURE_RUN_ID` and `ARMATURE_EVENT_ID`; recorded events may include
-`source_run_id`, `parent_event_id`, and `correlation_id`. Correlation can be set
-with `--correlation` or propagated with `ARMATURE_CORRELATION_ID`. These fields
-track invocation causality only; Armature does not infer workflows or traces from
-them.
-
-## Inspect Work
-
-```sh
-armature overview
-armature status
-armature task list
-armature task show test
-armature service list
-armature service show worker
-armature ps
-armature run list
-armature run show <run-id>
-armature run logs <run-id>
-armature log tail <run-id> --lines 100
-armature run cancel <run-id>
-armature doctor
-```
-
-`armature overview` is the compact operational view for agent-style projects. It
-summarizes configured tasks and services, active run ids, queued trigger counts,
-latest run per task/service, recent failures, recent events, and recent trigger
-outcomes. It is a read-only projection over Armature's mechanical state; it does
-not infer workflow status from your project artifacts.
-
-The v0.3 aliases remain available:
-
-```sh
-armature tasks
-armature services
-armature runs
-armature logs <run-id>
-armature logs --tail 100 <run-id>
-armature cancel <run-id>
-armature events
-armature triggers
-```
-
-Use `--format json` globally, or `--json` on supported inspection commands:
-
-```sh
-armature --format json status
-armature runs --json
-```
-
-`armature logs` prints run metadata, stdout/stderr paths, stream sizes, line
-counts, and the captured stream contents. Use `--tail <lines>` to limit each
-stream while keeping the original byte and line counts visible. If the daemon
-recovers a run that was active when a previous daemon exited, stderr and
-`meta.json` include a recovery note and final failed state.
-
-## Services And Health
-
-Configured services are reconciled by the daemon. They can be controlled manually:
-
-```sh
-armature service list
-armature service show worker
-armature service start worker
-armature service stop worker
-armature service restart worker
-```
-
-Health checks run as configured under `[service.health]`; service state and recent
-errors are visible through `armature services` and `armature status`.
-
-## Manual Locks
-
-Use named locks for simple local coordination between scripts:
-
-```sh
-armature --format json lock acquire branch:main --ttl 10m --reason "deploy"
-armature lock list
-armature lock show branch:main
-armature lock renew branch:main --token "$TOKEN" --ttl 10m
-armature lock release branch:main --token "$TOKEN"
-armature lock force-release branch:main --reason "holder exited"
-armature lock with branch:main --ttl 2m --reason "run tests" -- npm test
-```
-
-Locks are workspace-scoped and TTL-backed. Acquire returns a fencing token; renew
-and release require that token so an expired holder cannot release a newer lock.
-Use `force-release` only as an explicit recovery action.
-
-## Dynamic Runtime Definitions
-
-Tasks and services can also be registered at runtime without editing
-`.armature/armature.toml`:
-
-```sh
-armature service add github-source --restart on_failure --reason "event bridge" -- node sources/github.mjs
-armature task add reviewer --on plan.ready -- node agents/reviewer.mjs
-
-armature service list --dynamic
-armature task list --dynamic
-armature task remove reviewer
-armature service remove github-source
-```
-
-Dynamic definitions are ephemeral runtime definitions. They are inspectable and
-marked `dynamic: true`, but they are not workflow state and Armature does not
-persist them into user config.
-
-## Agent Desire Path
-
-```sh
-armature up
-armature service add github-source -- node sources/github.mjs
-armature task add planner --on agent.requested -- node planner.mjs
-armature event emit agent.requested --correlation req-1 --payload-file request.json
-armature wait event work.completed --correlation req-1 --timeout 5m
-armature overview --json
-armature run list --correlation req-1
-armature lock with repo:main --ttl 1m --reason "final check" -- echo ok
-armature down
-```
-
-User-authored scripts own planning, retries, deduplication, fanout, review
-logic, and success criteria. Armature records and supervises the mechanical
-runtime facts.
-
-For recurring agent loops, a common pattern is a scheduled director task that
-checks script-owned state, emits request events when work should start, and
-exits without emitting when active project work already exists. Event-triggered
-tasks then handle request/completion/quality-gate events. Keep state such as
-`tasks.json`, artifacts, quality decisions, and locks in the repo scripts; use
-Armature to make the timers, dispatch, logs, and run history inspectable.
-
-## TypeScript SDK
-
-The SDK provides typed helpers over the CLI and Armature runtime environment:
-
-```ts
-import { createArmature, emit, getEvent, getRunContext, status, withLock } from "@armature/sdk"
-
-const armature = createArmature({ workspace: process.cwd() })
-const context = getRunContext()
-const event = getEvent<{ runId: string; ok: boolean }>()
-
-await armature.task.add("reviewer", ["node", "reviewer.mjs"], {
-  on: "plan.ready",
-  correlation: event.correlation_id ?? event.payload.runId,
-})
-await emit("build.completed", { runId: context.runId ?? "manual", ok: true })
-await armature.wait.event("review.completed", {
-  correlation: event.correlation_id ?? event.payload.runId,
-  timeout: "5m",
-})
-await withLock("branch:main", async () => {
-  console.log(await status())
-}, { ttl: "2m", reason: "inspect status" })
-```
-
-The SDK wraps the same CLI/runtime environment surface available to shell
-scripts. It does not create a second runtime. See `packages/sdk/README.md` for
-the full SDK surface.
-
-## Migration Notes
-
-Canonical object commands are preferred in new docs and scripts:
+Armature is being rebuilt as a restricted statechart workflow runtime for
+orchestrating coding agents.
+
+The current product surface is native `.armature` workflow files, validated
+workflow IR, durable event queues, append-only transition/effect logs, trusted
+Rust adapters, and an initial `validate` / `emit` / `run` / `status` /
+`overview` / `events` / `log` / `build` / `check` / `emit-model` /
+`emit-config` / `prove` / `validate-adapter` / `validate-policy` CLI.
+Workflow files do not execute arbitrary TypeScript, shell, or host-language
+code.
+
+## Active Workspace
+
+New implementation work lives in these crates:
 
 ```text
-armature tasks             -> armature task list
-armature services          -> armature service list
-armature runs              -> armature run list
-armature logs <run-id>     -> armature run logs <run-id>
-armature cancel <run-id>   -> armature run cancel <run-id>
-armature emit <type>       -> armature event emit <type>
-armature run <task>        -> armature task run <task>
+crates/armature-workflow   native DSL parser, IR, schemas, diagnostics, validation
+crates/armature-engine     durable queue/log/state and interpreter skeleton
+crates/armature-adapters   trusted adapter manifests and dispatchers for BAML, humans, agents, legacy bridges
+crates/armature-modelgen   TLA+/Apalache/Maude/Veil model generation
+crates/armature-cli        small workflow CLI for validate/emit/run/status/overview/events/log/build/check/model iteration
 ```
 
-## Current Caveat
+Specs live in [`spec/statechart-workflows`](spec/statechart-workflows).
+Examples live in [`examples/workflows`](examples/workflows).
+Fake adapter manifests live in [`examples/adapters`](examples/adapters).
+Example capability policies live in [`examples/policies`](examples/policies).
+Formal-model work starts in [`models/statechart-workflows`](models/statechart-workflows).
+The companion coding-agent skill lives in
+[`skills/armature-statechart`](skills/armature-statechart).
 
-Armature v0.3 uses Unix sockets and Unix process groups, so the current runtime
-targets Unix-like systems.
+## Legacy Runtime
+
+The previous v0.3 task/service/script runner has been moved to
+[`legacy/v0.3-runtime`](legacy/v0.3-runtime). It remains useful reference
+material for CLI patterns, process/log capture, packaging, tests, and migration
+ideas, but it is not the foundation for the new workflow product.
+
+Compatibility with the old runtime should happen only through explicit adapters
+or migration tooling.
+
+## Development
+
+Run the active Rust workspace checks with:
+
+```sh
+cargo fmt --all --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+The parser currently accepts the minimal native DSL fixture and the static
+surface of the larger spec implementation fixture: top-level `agent`,
+`capability`, `enum`, `class`, `coerce` declarations, nested states, guards,
+entry and `always` blocks, `case` arm bodies, `let`, object/list/call
+expressions, and basic effect statements.
+
+```text
+examples/workflows/minimal.armature
+examples/workflows/simple-supervisor.armature
+```
+
+The larger spec implementation example is still ahead of full runtime
+execution. It parses and validates for static declarations and structured
+`case` branches, but real capability adapters and real BAML dispatch are not
+executed by the runtime yet. The current runtime
+evaluates the supported guard-expression subset, executes supported `case`
+branches, executes `always` transitions with loop protection, and supports
+hierarchical initial-state descent plus parent event fallback. It also persists
+fake effect dispatch records for `start`, `send`, `askHuman`, `raise`, and
+capability-call steps, including evaluated payload arguments for the supported
+expression subset. `raise` enqueues a durable workflow event after the current
+transition commits. Transition-local `let` bindings are supported for later
+expressions in the same transition or entry execution. Deterministic built-ins
+currently include list `append`, `now`, and `elapsedSince`. Expression
+invariants in IR are checked after processed transitions, and invariant
+failures roll the interpreter back before state is saved. Tests and adapter
+scaffolding can inject fake read-call and `coerce` outputs; real capability and
+BAML dispatch are still future adapter steps. The CLI `run` command can also
+load JSON adapter manifests with `--adapter-manifest`; when present,
+adapter manifests are validated, adapter-backed effects are checked against the
+manifest, and failures are logged durably. Manifest `required_capabilities` are
+preserved on adapter outcomes, including runtime policy denials, and surfaced
+through status/log JSON.
+The runtime enforces declared agent `maxActive` limits before dispatching
+`start` effects; over-capacity starts are recorded as durable failed effects.
+Static validation requires bounded starts to have a processable `finished`
+event with a required `name` string for active-invocation retirement. Processed
+completion names are matched against the longest started-agent prefix.
+The `validate` command accepts the same manifest flag for static
+adapter-backed effect checks. Commands that validate or dispatch
+adapter-backed effects also accept `--policy <json>` capability documents.
+Policy documents currently support exact `allowed_capabilities`,
+`denied_capabilities`, and `local` / `team` / `enterprise` modes. Unknown
+capabilities warn in local mode and become errors under stricter modes
+according to effect category and write-like capability names. The manifest
+dispatcher enforces the same supplied policy at runtime before dispatching each
+adapter-backed effect. `emit` and `run --event` can also use manifest event
+schemas for adapter-originated events that are not declared directly in the
+workflow. Runtime string interpolation supports path
+expressions such as `{{ classification.reason }}`. Static validation checks
+nested expression calls and dotted paths against declared data fields, event
+bindings, `let` locals, declared coerce functions, declared capabilities,
+declared raised events, and supported built-ins. Status JSON includes the
+current state, pending event count, queued event summaries, the recent
+transition, recent effect summaries, recent failures, and a first
+active-invocation projection derived from durable `start` effects and processed
+`finished` events, including declared `max_active` limits when present in IR.
+Validation failures are reported through CLI diagnostics outside `validate` too,
+so commands such as `build`, `check`, and `emit-model` do not collapse workflow
+schema errors to a generic failure. Parser diagnostics include source locations
+for common current-token errors, and CLI-loaded workflows report the actual file
+path. Validator diagnostics use declaration and step spans for common static
+errors such as invalid `maxActive`, undeclared agents, undeclared capabilities,
+bad transitions, bad raises, bad assignments, and invalid expression paths or
+calls. Adapter-manifest workflow diagnostics also point at the effect step or
+handler that requested unsupported adapter authority. CLI-loaded workflows also
+preserve `workflow.source_path` in emitted IR and build artifacts.
+`overview` renders validation health plus the same runtime projection as a
+compact human-readable summary with current state, pending/queued events, active
+invocations, latest transition, latest effects, required capabilities, effect
+errors, and recent failures. Its JSON shape is `{ validation, status }`; invalid
+source that cannot lower to IR still returns validation diagnostics with
+`status: null`.
+`emit-model` can currently emit small TLA+ and Maude state-transition
+overapproximations from validated IR. Both generated backends include bounded
+active invocation counters and max-active safety checks. The generated TLA+
+model also abstracts `coerce` calls as nondeterministic choices over finite
+declared output spaces, with a `CoerceType` invariant that keeps each function's
+stored value inside its declared schema abstraction. It also tracks the last
+abstract effect label with a `DeclaredEffectType` invariant; ordinary effects
+such as `send`, `askHuman`, `raise`, and capability calls are represented as
+stuttering observations, while bounded `start` effects update active counters.
+Generated TLA+ and Maude artifacts also annotate declared built-in invariants
+with their current coverage layer.
+Because generated models do not yet include workflow data, `emit-model` and
+`check` reject IR with expression invariants instead of silently omitting them.
+`check` can run either TLC or Maude when the tools are installed directly or
+available through the repository Nix flake. `check` and `emit-model` accept
+`--adapter-manifest` and `--policy`, and validate adapter-backed workflow
+effects before emitting or checking the formal abstraction.
+`build` writes `workflow-ir.json`, generated BAML source in
+`baml_src/workflow.baml`, plus generated TLA, TLA check config, and Maude
+models. If
+`--adapter-manifest` or `--policy` is supplied, `build` validates the workflow
+against those contracts and writes `adapter-manifests.json` and
+`policy-documents.json` bundles beside the other artifacts.
+`skills/armature-statechart` contains the companion skill for coding agents. It
+documents the restricted workflow boundary, the statechart authoring pattern,
+coerce usage, adapter manifests, debug commands, and common repairs.
+Schema validation follows BAML-style optional fields: a `?` field may be absent
+or `null`, while non-optional fields must be present.
+
+Current CLI smoke commands:
+
+```sh
+cargo run -p armature-cli -- validate examples/workflows/minimal.armature --json
+cargo run -p armature-cli -- validate examples/workflows/minimal.armature --adapter-manifest path/to/adapter.json --json
+cargo run -p armature-cli -- validate examples/workflows/spec-implementation.armature --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --json
+cargo run -p armature-cli -- validate examples/workflows/spec-implementation.armature --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --json
+cargo run -p armature-cli -- validate-adapter examples/adapters/spec-implementation.fake-adapter.json --json
+cargo run -p armature-cli -- validate-policy examples/policies/spec-implementation.enterprise-policy.json --json
+cargo run -p armature-cli -- emit examples/workflows/minimal.armature --event start --payload '{"message":"hello"}' --json
+cargo run -p armature-cli -- emit examples/workflows/minimal.armature --event finished --payload '{"name":"worker-1"}' --adapter-manifest path/to/adapter.json --json
+cargo run -p armature-cli -- run examples/workflows/minimal.armature --event start --payload '{"message":"hello"}' --json
+cargo run -p armature-cli -- run examples/workflows/minimal.armature --adapter-manifest path/to/adapter.json --json
+cargo run -p armature-cli -- run examples/workflows/minimal.armature --json
+cargo run -p armature-cli -- status examples/workflows/minimal.armature --json
+cargo run -p armature-cli -- overview examples/workflows/minimal.armature
+cargo run -p armature-cli -- events examples/workflows/minimal.armature --json
+cargo run -p armature-cli -- log examples/workflows/minimal.armature --json
+cargo run -p armature-cli -- build examples/workflows/minimal.armature --json
+cargo run -p armature-cli -- build examples/workflows/spec-implementation.armature --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --json
+cargo run -p armature-cli -- check examples/workflows/minimal.armature --target tla --json
+cargo run -p armature-cli -- check examples/workflows/minimal.armature --target maude --json
+cargo run -p armature-cli -- check examples/workflows/spec-implementation.armature --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --target tla --json
+cargo run -p armature-cli -- emit-model examples/workflows/minimal.armature --target tla
+cargo run -p armature-cli -- emit-config examples/workflows/minimal.armature --target tla
+cargo run -p armature-cli -- emit-model examples/workflows/minimal.armature --target maude
+cargo run -p armature-cli -- emit-model examples/workflows/spec-implementation.armature --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --target maude
+```
+
+Maude checks are embedded in the generated `.maude` file, so `emit-config` is
+only meaningful for TLA in the current implementation.
+`prove` is reserved for stronger proof-oriented backends and currently returns a
+clear not-implemented diagnostic after validating the workflow and supplied
+contracts. Use `--json` for a structured unavailable response.

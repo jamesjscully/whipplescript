@@ -2,4 +2,4 @@ target/
 dist/
 node_modules/
 .DS_Store
-
+**/.armature/workflows/*.sqlite

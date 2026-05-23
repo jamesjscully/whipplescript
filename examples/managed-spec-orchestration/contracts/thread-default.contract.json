@@ -1,0 +1,34 @@
+{
+  "contractVersion": 1,
+  "scope": {
+    "type": "thread-default",
+    "id": "spec-worker-thread"
+  },
+  "thread": {
+    "mergePolicy": "auto-merge-after-quality-pass",
+    "isolation": "worktree",
+    "heartbeatEvery": "90s",
+    "staleAfter": "8m",
+    "terminalStates": [
+      "completed",
+      "failed",
+      "blocked",
+      "needs-human-review"
+    ]
+  },
+  "workerRules": [
+    "Claim exactly one implementation item.",
+    "Do not edit the contracts directory.",
+    "Do not modify unrelated implementation-plan items.",
+    "Write progress heartbeat before and after long operations.",
+    "Record commands run and their results in the item.",
+    "Emit completed only after code, docs, and tests are coherent.",
+    "Emit blocked with a concrete blocker instead of spinning."
+  ],
+  "qualityGateRules": [
+    "Review only the claimed item and its declared dependencies.",
+    "Run the contract-required checks when available.",
+    "Reject missing tests unless the item records a defensible reason.",
+    "Escalate ambiguous product decisions to a human-review bean."
+  ]
+}
