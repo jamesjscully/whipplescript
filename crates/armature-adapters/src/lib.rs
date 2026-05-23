@@ -5,6 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityPolicyDocument {
@@ -14,10 +17,38 @@ pub struct CapabilityPolicyDocument {
     pub allowed_capabilities: Vec<String>,
     #[serde(default)]
     pub denied_capabilities: Vec<String>,
+    #[serde(default)]
+    pub allow_baml_network: Option<bool>,
+    #[serde(default)]
+    pub allowed_baml_urls: Vec<String>,
+    #[serde(default)]
+    pub allow_managed_baml_server: Option<bool>,
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    #[serde(default)]
+    pub allowed_env_vars: Vec<String>,
+    #[serde(default)]
+    pub store_baml_raw_responses: Option<bool>,
 }
 
 fn default_policy_mode() -> armature_workflow::policy::PolicyMode {
     armature_workflow::policy::PolicyMode::Local
+}
+
+impl Default for CapabilityPolicyDocument {
+    fn default() -> Self {
+        Self {
+            mode: default_policy_mode(),
+            allowed_capabilities: Vec::new(),
+            denied_capabilities: Vec::new(),
+            allow_baml_network: None,
+            allowed_baml_urls: Vec::new(),
+            allow_managed_baml_server: None,
+            allowed_models: Vec::new(),
+            allowed_env_vars: Vec::new(),
+            store_baml_raw_responses: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -57,6 +88,396 @@ pub enum AdapterModel {
     Deterministic,
     NondeterministicOutcome { values: Vec<String> },
     Opaque,
+}
+
+pub fn json_plan_adapter_manifest() -> AdapterManifest {
+    let mut effects = BTreeMap::new();
+    effects.insert(
+        "plan.snapshot".to_string(),
+        AdapterEffect {
+            category: armature_engine::effects::EffectCategory::SyncValue,
+            required_capabilities: vec!["resource.plan.read".to_string()],
+            input: armature_workflow::schema::Schema::Json,
+            output: armature_workflow::schema::Schema::String,
+            idempotent: true,
+            failure_categories: vec!["resource_unavailable".to_string()],
+            model: Some(AdapterModel::Deterministic),
+        },
+    );
+    effects.insert(
+        "plan.unfinishedItems".to_string(),
+        AdapterEffect {
+            category: armature_engine::effects::EffectCategory::SyncValue,
+            required_capabilities: vec!["resource.plan.read".to_string()],
+            input: armature_workflow::schema::Schema::Json,
+            output: armature_workflow::schema::Schema::Int,
+            idempotent: true,
+            failure_categories: vec!["resource_unavailable".to_string()],
+            model: Some(AdapterModel::Deterministic),
+        },
+    );
+    effects.insert(
+        "plan.nextReadyItem".to_string(),
+        AdapterEffect {
+            category: armature_engine::effects::EffectCategory::SyncValue,
+            required_capabilities: vec!["resource.plan.read".to_string()],
+            input: armature_workflow::schema::Schema::Json,
+            output: armature_workflow::schema::Schema::Json,
+            idempotent: true,
+            failure_categories: vec!["resource_unavailable".to_string()],
+            model: Some(AdapterModel::Deterministic),
+        },
+    );
+    for effect_name in [
+        "plan.markReadyForQuality",
+        "plan.markBlocked",
+        "plan.markDone",
+    ] {
+        effects.insert(
+            effect_name.to_string(),
+            AdapterEffect {
+                category: armature_engine::effects::EffectCategory::SyncValue,
+                required_capabilities: vec!["resource.plan.write".to_string()],
+                input: armature_workflow::schema::Schema::Json,
+                output: armature_workflow::schema::Schema::Json,
+                idempotent: true,
+                failure_categories: vec!["resource_unavailable".to_string()],
+                model: Some(AdapterModel::Opaque),
+            },
+        );
+    }
+
+    AdapterManifest {
+        name: "json-plan-file".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        types: BTreeMap::new(),
+        effects,
+        events: BTreeMap::new(),
+    }
+}
+
+pub fn json_human_review_response_event_schema() -> armature_workflow::schema::Schema {
+    armature_workflow::schema::Schema::Record {
+        fields: vec![
+            armature_workflow::schema::Field {
+                name: "reviewId".to_string(),
+                schema: armature_workflow::schema::Schema::String,
+            },
+            armature_workflow::schema::Field {
+                name: "decision".to_string(),
+                schema: armature_workflow::schema::Schema::String,
+            },
+            armature_workflow::schema::Field {
+                name: "response".to_string(),
+                schema: armature_workflow::schema::Schema::Optional {
+                    inner: Box::new(armature_workflow::schema::Schema::String),
+                },
+            },
+        ],
+    }
+}
+
+pub fn json_human_review_response_event_manifest() -> AdapterManifest {
+    let mut events = BTreeMap::new();
+    events.insert(
+        "humanReview.responded".to_string(),
+        json_human_review_response_event_schema(),
+    );
+
+    AdapterManifest {
+        name: "json-human-review-response-events".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        types: BTreeMap::new(),
+        effects: BTreeMap::new(),
+        events,
+    }
+}
+
+pub fn json_human_review_adapter_manifest() -> AdapterManifest {
+    let mut effects = BTreeMap::new();
+    effects.insert(
+        "askHuman".to_string(),
+        AdapterEffect {
+            category: armature_engine::effects::EffectCategory::HumanObligation,
+            required_capabilities: vec!["askHuman".to_string()],
+            input: armature_workflow::schema::Schema::Json,
+            output: armature_workflow::schema::Schema::Json,
+            idempotent: true,
+            failure_categories: vec!["review_unavailable".to_string()],
+            model: Some(AdapterModel::Opaque),
+        },
+    );
+    let events = json_human_review_response_event_manifest().events;
+
+    AdapterManifest {
+        name: "json-human-review-file".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        types: BTreeMap::new(),
+        effects,
+        events,
+    }
+}
+
+pub fn json_agent_adapter_manifest() -> AdapterManifest {
+    let mut effects = BTreeMap::new();
+    effects.insert(
+        "start".to_string(),
+        AdapterEffect {
+            category: armature_engine::effects::EffectCategory::AsyncInvocation,
+            required_capabilities: vec!["adapter.agent.start".to_string()],
+            input: armature_workflow::schema::Schema::Json,
+            output: armature_workflow::schema::Schema::Json,
+            idempotent: true,
+            failure_categories: vec!["adapter_failure".to_string(), "timeout".to_string()],
+            model: Some(AdapterModel::NondeterministicOutcome {
+                values: vec![
+                    "accepted".to_string(),
+                    "rejected".to_string(),
+                    "failed".to_string(),
+                ],
+            }),
+        },
+    );
+    effects.insert(
+        "send".to_string(),
+        AdapterEffect {
+            category: armature_engine::effects::EffectCategory::Message,
+            required_capabilities: vec!["message_agents".to_string()],
+            input: armature_workflow::schema::Schema::Json,
+            output: armature_workflow::schema::Schema::Json,
+            idempotent: true,
+            failure_categories: vec!["delivery_failed".to_string()],
+            model: Some(AdapterModel::Opaque),
+        },
+    );
+
+    AdapterManifest {
+        name: "json-agent-file".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        types: BTreeMap::new(),
+        effects,
+        events: BTreeMap::new(),
+    }
+}
+
+pub fn json_agent_finished_event_schema() -> armature_workflow::schema::Schema {
+    armature_workflow::schema::Schema::Record {
+        fields: vec![
+            armature_workflow::schema::Field {
+                name: "id".to_string(),
+                schema: armature_workflow::schema::Schema::String,
+            },
+            armature_workflow::schema::Field {
+                name: "name".to_string(),
+                schema: armature_workflow::schema::Schema::String,
+            },
+            armature_workflow::schema::Field {
+                name: "status".to_string(),
+                schema: armature_workflow::schema::Schema::String,
+            },
+            armature_workflow::schema::Field {
+                name: "stdoutTail".to_string(),
+                schema: armature_workflow::schema::Schema::String,
+            },
+            armature_workflow::schema::Field {
+                name: "stderrTail".to_string(),
+                schema: armature_workflow::schema::Schema::String,
+            },
+            armature_workflow::schema::Field {
+                name: "exitCode".to_string(),
+                schema: armature_workflow::schema::Schema::Optional {
+                    inner: Box::new(armature_workflow::schema::Schema::Int),
+                },
+            },
+        ],
+    }
+}
+
+pub fn json_agent_finished_event_manifest() -> AdapterManifest {
+    let mut events = BTreeMap::new();
+    events.insert("finished".to_string(), json_agent_finished_event_schema());
+
+    AdapterManifest {
+        name: "json-agent-finished-events".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        types: BTreeMap::new(),
+        effects: BTreeMap::new(),
+        events,
+    }
+}
+
+pub fn record_human_review_response(
+    path: &Path,
+    payload: &serde_json::Value,
+) -> Result<(), armature_engine::effects::EffectError> {
+    let review_id = payload
+        .get("reviewId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            armature_engine::effects::EffectError::Unsupported(
+                "humanReview.responded requires string field `reviewId`".to_string(),
+            )
+        })?;
+    let decision = payload
+        .get("decision")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            armature_engine::effects::EffectError::Unsupported(
+                "humanReview.responded requires string field `decision`".to_string(),
+            )
+        })?;
+    let response = payload
+        .get("response")
+        .filter(|value| !value.is_null())
+        .cloned();
+
+    let _lock = JsonFileLock::acquire(path)?;
+    let mut document = read_json_document_or_default(path, serde_json::json!({ "reviews": [] }))?;
+    let document_object = document.as_object_mut().ok_or_else(|| {
+        armature_engine::effects::EffectError::Unsupported(
+            "human review file root must be an object".to_string(),
+        )
+    })?;
+
+    let reviews = document_object
+        .entry("reviews")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let reviews = reviews.as_array_mut().ok_or_else(|| {
+        armature_engine::effects::EffectError::Unsupported(
+            "human review file field `reviews` must be an array".to_string(),
+        )
+    })?;
+
+    for review in reviews.iter_mut() {
+        if review.get("id").and_then(serde_json::Value::as_str) == Some(review_id) {
+            let Some(review_object) = review.as_object_mut() else {
+                continue;
+            };
+            review_object.insert(
+                "status".to_string(),
+                serde_json::Value::String("responded".to_string()),
+            );
+            review_object.insert(
+                "decision".to_string(),
+                serde_json::Value::String(decision.to_string()),
+            );
+            if let Some(response) = response.clone() {
+                review_object.insert("response".to_string(), response);
+            }
+        }
+    }
+
+    let responses = document_object
+        .entry("responses")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let responses = responses.as_array_mut().ok_or_else(|| {
+        armature_engine::effects::EffectError::Unsupported(
+            "human review file field `responses` must be an array".to_string(),
+        )
+    })?;
+    if !responses.iter().any(|existing| {
+        existing.get("reviewId").and_then(serde_json::Value::as_str) == Some(review_id)
+    }) {
+        responses.push(payload.clone());
+    }
+
+    write_json_document(path, &document)
+}
+
+pub fn record_agent_finished_event(
+    path: &Path,
+    payload: &serde_json::Value,
+) -> Result<(), armature_engine::effects::EffectError> {
+    let run_id = payload
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            armature_engine::effects::EffectError::Unsupported(
+                "finished requires string field `id`".to_string(),
+            )
+        })?;
+    let name = payload
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            armature_engine::effects::EffectError::Unsupported(
+                "finished requires string field `name`".to_string(),
+            )
+        })?;
+    let status = payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            armature_engine::effects::EffectError::Unsupported(
+                "finished requires string field `status`".to_string(),
+            )
+        })?;
+
+    let _lock = JsonFileLock::acquire(path)?;
+    let mut document = read_json_document_or_default(
+        path,
+        serde_json::json!({
+            "invocations": [],
+            "messages": []
+        }),
+    )?;
+    let document_object = document.as_object_mut().ok_or_else(|| {
+        armature_engine::effects::EffectError::Unsupported(
+            "agent file root must be an object".to_string(),
+        )
+    })?;
+
+    let invocations = document_object
+        .entry("invocations")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let invocations = invocations.as_array_mut().ok_or_else(|| {
+        armature_engine::effects::EffectError::Unsupported(
+            "agent file field `invocations` must be an array".to_string(),
+        )
+    })?;
+
+    if let Some(invocation) = invocations.iter_mut().rev().find(|invocation| {
+        invocation.get("id").and_then(serde_json::Value::as_str) == Some(run_id)
+            || invocation
+                .get("agent")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|agent| name == agent || name.starts_with(&format!("{agent}-")))
+    }) {
+        if let Some(invocation_object) = invocation.as_object_mut() {
+            invocation_object.insert(
+                "status".to_string(),
+                serde_json::Value::String("finished".to_string()),
+            );
+            invocation_object.insert(
+                "completion_id".to_string(),
+                serde_json::Value::String(run_id.to_string()),
+            );
+            invocation_object.insert(
+                "completion_status".to_string(),
+                serde_json::Value::String(status.to_string()),
+            );
+            if let Some(exit_code) = payload.get("exitCode").filter(|value| !value.is_null()) {
+                invocation_object.insert("exit_code".to_string(), exit_code.clone());
+            }
+        }
+    }
+
+    let completions = document_object
+        .entry("completions")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let completions = completions.as_array_mut().ok_or_else(|| {
+        armature_engine::effects::EffectError::Unsupported(
+            "agent file field `completions` must be an array".to_string(),
+        )
+    })?;
+    if !completions
+        .iter()
+        .any(|existing| existing.get("id").and_then(serde_json::Value::as_str) == Some(run_id))
+    {
+        completions.push(payload.clone());
+    }
+
+    write_json_document(path, &document)
 }
 
 pub fn validate_adapter_manifests(
@@ -253,6 +674,24 @@ pub fn validate_policy_documents(
             "denied_capabilities",
             &policy.denied_capabilities,
         );
+        validate_policy_token_list(
+            &mut diagnostics,
+            index,
+            "allowed_baml_urls",
+            &policy.allowed_baml_urls,
+        );
+        validate_policy_token_list(
+            &mut diagnostics,
+            index,
+            "allowed_models",
+            &policy.allowed_models,
+        );
+        validate_policy_token_list(
+            &mut diagnostics,
+            index,
+            "allowed_env_vars",
+            &policy.allowed_env_vars,
+        );
 
         let allowed = policy
             .allowed_capabilities
@@ -268,6 +707,109 @@ pub fn validate_policy_documents(
     }
 
     diagnostics
+}
+
+pub fn validate_baml_http_policy(
+    policies: &[CapabilityPolicyDocument],
+    url: &str,
+) -> Vec<armature_workflow::Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let strictest_mode = policies
+        .iter()
+        .map(|policy| policy.mode)
+        .max_by_key(policy_mode_rank)
+        .unwrap_or(armature_workflow::policy::PolicyMode::Local);
+
+    if policies.iter().any(|policy| {
+        policy
+            .denied_capabilities
+            .iter()
+            .any(|denied| denied == "baml.coerce")
+    }) {
+        diagnostics.push(error(
+            "BAML HTTP coerce requires denied capability `baml.coerce`. Fix: remove `baml.coerce` from denied_capabilities only if model access is intended."
+                .to_string(),
+        ));
+    } else if !policies.iter().any(|policy| {
+        policy
+            .allowed_capabilities
+            .iter()
+            .any(|allowed| allowed == "baml.coerce")
+    }) {
+        let severity = if unknown_capability_is_error(
+            strictest_mode,
+            armature_engine::effects::EffectCategory::SyncValue,
+            "baml.coerce",
+        ) {
+            armature_workflow::Severity::Error
+        } else {
+            armature_workflow::Severity::Warning
+        };
+        diagnostics.push(diagnostic_at(
+            severity,
+            "BAML HTTP coerce requires capability `baml.coerce` that is not allowed by supplied policy. Fix: add `baml.coerce` to allowed_capabilities only if model access is intended."
+                .to_string(),
+            None,
+        ));
+    }
+
+    if policies
+        .iter()
+        .any(|policy| policy.allow_baml_network == Some(false))
+    {
+        diagnostics.push(error(
+            "BAML HTTP network execution is denied by supplied policy. Fix: set `allow_baml_network: true` only if network model access is intended."
+                .to_string(),
+        ));
+    } else if !policies
+        .iter()
+        .any(|policy| policy.allow_baml_network == Some(true))
+        && strictest_mode == armature_workflow::policy::PolicyMode::Enterprise
+    {
+        diagnostics.push(error(
+            "BAML HTTP network execution requires `allow_baml_network: true` in enterprise policy. Fix: set `allow_baml_network: true` only for approved BAML HTTP endpoints."
+                .to_string(),
+        ));
+    }
+
+    let allowed_urls = policies
+        .iter()
+        .flat_map(|policy| policy.allowed_baml_urls.iter())
+        .collect::<BTreeSet<&String>>();
+    if !allowed_urls.is_empty() {
+        if !allowed_urls.iter().any(|allowed| allowed.as_str() == url) {
+            diagnostics.push(error(format!(
+                "BAML HTTP URL `{url}` is not allowed by supplied policy. Fix: add the exact URL to allowed_baml_urls only if this endpoint is approved."
+            )));
+        }
+    } else if strictest_mode == armature_workflow::policy::PolicyMode::Enterprise {
+        diagnostics.push(error(format!(
+            "BAML HTTP URL `{url}` requires an exact `allowed_baml_urls` entry in enterprise policy. Fix: add the exact URL to allowed_baml_urls only if this endpoint is approved."
+        )));
+    }
+
+    diagnostics
+}
+
+pub fn should_store_baml_raw_response(policies: &[CapabilityPolicyDocument]) -> bool {
+    if policies
+        .iter()
+        .any(|policy| policy.store_baml_raw_responses == Some(false))
+    {
+        return false;
+    }
+    if policies
+        .iter()
+        .any(|policy| policy.store_baml_raw_responses == Some(true))
+    {
+        return true;
+    }
+    let strictest_mode = policies
+        .iter()
+        .map(|policy| policy.mode)
+        .max_by_key(policy_mode_rank)
+        .unwrap_or(armature_workflow::policy::PolicyMode::Local);
+    strictest_mode != armature_workflow::policy::PolicyMode::Enterprise
 }
 
 fn validate_type_cycles(
@@ -2016,7 +2558,7 @@ fn validate_required_capability(
             .any(|denied| denied == capability)
     }) {
         diagnostics.push(error_at(
-            format!("{owner} effect `{effect_name}` requires denied capability `{capability}`"),
+            format!("{owner} effect `{effect_name}` requires denied capability `{capability}`. Fix: remove `{capability}` from denied_capabilities only if this authority is intended, otherwise remove or replace the effect."),
             span,
         ));
         return;
@@ -2044,7 +2586,7 @@ fn validate_required_capability(
     diagnostics.push(diagnostic_at(
         severity,
         format!(
-            "{owner} effect `{effect_name}` requires capability `{capability}` that is not allowed by supplied policy"
+            "{owner} effect `{effect_name}` requires capability `{capability}` that is not allowed by supplied policy. Fix: add `{capability}` to allowed_capabilities only if this authority is intended, otherwise remove or replace the effect."
         ),
         span,
     ));
@@ -2121,6 +2663,31 @@ fn validate_policy_capability_list(
         if !seen.insert(capability) {
             diagnostics.push(error(format!(
                 "policy document {policy_index} field `{field}` repeats capability `{capability}`"
+            )));
+        }
+    }
+}
+
+fn validate_policy_token_list(
+    diagnostics: &mut Vec<armature_workflow::Diagnostic>,
+    policy_index: usize,
+    field: &str,
+    values: &[String],
+) {
+    let mut seen = BTreeSet::new();
+    for value in values {
+        if value.trim().is_empty() {
+            diagnostics.push(error(format!(
+                "policy document {policy_index} field `{field}` contains an empty value"
+            )));
+        } else if has_invalid_token_characters(value) {
+            diagnostics.push(error(format!(
+                "policy document {policy_index} field `{field}` value `{value}` contains whitespace or control characters"
+            )));
+        }
+        if !seen.insert(value) {
+            diagnostics.push(error(format!(
+                "policy document {policy_index} field `{field}` repeats value `{value}`"
             )));
         }
     }
@@ -2741,6 +3308,9 @@ pub struct ManifestEffectDispatcher {
     manifests: Vec<AdapterManifest>,
     policies: Vec<CapabilityPolicyDocument>,
     fake_outputs: BTreeMap<String, serde_json::Value>,
+    json_plan_file: Option<PathBuf>,
+    human_review_file: Option<PathBuf>,
+    agent_file: Option<PathBuf>,
 }
 
 impl ManifestEffectDispatcher {
@@ -2749,6 +3319,9 @@ impl ManifestEffectDispatcher {
             manifests: vec![manifest],
             policies: Vec::new(),
             fake_outputs: BTreeMap::new(),
+            json_plan_file: None,
+            human_review_file: None,
+            agent_file: None,
         }
     }
 
@@ -2757,6 +3330,9 @@ impl ManifestEffectDispatcher {
             manifests,
             policies: Vec::new(),
             fake_outputs: BTreeMap::new(),
+            json_plan_file: None,
+            human_review_file: None,
+            agent_file: None,
         }
     }
 
@@ -2771,6 +3347,21 @@ impl ManifestEffectDispatcher {
         output: serde_json::Value,
     ) -> Self {
         self.fake_outputs.insert(effect.into(), output);
+        self
+    }
+
+    pub fn with_json_plan_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.json_plan_file = Some(path.into());
+        self
+    }
+
+    pub fn with_human_review_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.human_review_file = Some(path.into());
+        self
+    }
+
+    pub fn with_agent_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.agent_file = Some(path.into());
         self
     }
 
@@ -2826,6 +3417,66 @@ impl armature_engine::effects::EffectDispatcher for ManifestEffectDispatcher {
 
         enforce_runtime_policy(&self.policies, &request, effect)?;
 
+        if let Some(path) = &self.json_plan_file {
+            if let Some(output) = dispatch_json_plan_effect(path, &request)? {
+                if !effect
+                    .output
+                    .accepts_json_with_types(&output, &manifest.types)
+                {
+                    return Err(armature_engine::effects::EffectError::Unsupported(format!(
+                        "effect `{}` JSON plan output does not match adapter `{}` manifest schema",
+                        request.effect, manifest.name
+                    )));
+                }
+
+                return Ok(successful_outcome(
+                    request,
+                    Some(output),
+                    effect.required_capabilities.clone(),
+                ));
+            }
+        }
+
+        if let Some(path) = &self.human_review_file {
+            if let Some(output) = dispatch_human_review_effect(path, &request)? {
+                if !effect
+                    .output
+                    .accepts_json_with_types(&output, &manifest.types)
+                {
+                    return Err(armature_engine::effects::EffectError::Unsupported(format!(
+                        "effect `{}` human review output does not match adapter `{}` manifest schema",
+                        request.effect, manifest.name
+                    )));
+                }
+
+                return Ok(successful_outcome(
+                    request,
+                    Some(output),
+                    effect.required_capabilities.clone(),
+                ));
+            }
+        }
+
+        if let Some(path) = &self.agent_file {
+            if let Some(output) = dispatch_agent_file_effect(path, &request)? {
+                if !effect
+                    .output
+                    .accepts_json_with_types(&output, &manifest.types)
+                {
+                    return Err(armature_engine::effects::EffectError::Unsupported(format!(
+                        "effect `{}` agent file output does not match adapter `{}` manifest schema",
+                        request.effect, manifest.name
+                    )));
+                }
+
+                return Ok(successful_outcome(
+                    request,
+                    Some(output),
+                    effect.required_capabilities.clone(),
+                ));
+            }
+        }
+
         let output = self.fake_outputs.get(&request.effect).cloned();
         if let Some(output) = &output {
             if !effect
@@ -2865,6 +3516,544 @@ fn enforce_runtime_policy(
     Ok(())
 }
 
+fn dispatch_json_plan_effect(
+    path: &Path,
+    request: &armature_engine::effects::EffectRequest,
+) -> Result<Option<serde_json::Value>, armature_engine::effects::EffectError> {
+    match request.effect.as_str() {
+        "plan.snapshot" => {
+            let contents = std::fs::read_to_string(path).map_err(|error| {
+                armature_engine::effects::EffectError::Unsupported(format!(
+                    "failed to read JSON plan file `{}`: {error}",
+                    path.display()
+                ))
+            })?;
+            Ok(Some(serde_json::Value::String(contents)))
+        }
+        "plan.unfinishedItems" => {
+            let plan = read_json_plan(path)?;
+            Ok(Some(serde_json::json!(count_unfinished_items(&plan)?)))
+        }
+        "plan.nextReadyItem" => {
+            let plan = read_json_plan(path)?;
+            Ok(Some(
+                next_ready_item(&plan)?.unwrap_or(serde_json::Value::Null),
+            ))
+        }
+        "plan.markReadyForQuality" => update_json_plan_status(
+            path,
+            request,
+            PlanStatusUpdate {
+                status: "ready_for_quality",
+                reason_arg: None,
+            },
+        )
+        .map(Some),
+        "plan.markDone" => update_json_plan_status(
+            path,
+            request,
+            PlanStatusUpdate {
+                status: "done",
+                reason_arg: None,
+            },
+        )
+        .map(Some),
+        "plan.markBlocked" => update_json_plan_status(
+            path,
+            request,
+            PlanStatusUpdate {
+                status: "blocked",
+                reason_arg: Some(1),
+            },
+        )
+        .map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn dispatch_human_review_effect(
+    path: &Path,
+    request: &armature_engine::effects::EffectRequest,
+) -> Result<Option<serde_json::Value>, armature_engine::effects::EffectError> {
+    if request.effect != "askHuman" {
+        return Ok(None);
+    }
+
+    let reason = request
+        .args
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            armature_engine::effects::EffectError::Unsupported(
+                "askHuman requires a string `reason` argument".to_string(),
+            )
+        })?;
+    let review_id = format!("review-{}", request.effect_id);
+    let obligation = serde_json::json!({
+        "id": review_id,
+        "status": "open",
+        "reason": reason,
+        "workflow_id": request.workflow_id,
+        "effect_id": request.effect_id,
+        "transition_id": request.transition_id,
+        "idempotency_key": request.idempotency_key,
+    });
+
+    append_human_review_obligation(path, obligation.clone())?;
+    Ok(Some(obligation))
+}
+
+fn append_human_review_obligation(
+    path: &Path,
+    obligation: serde_json::Value,
+) -> Result<(), armature_engine::effects::EffectError> {
+    let _lock = JsonFileLock::acquire(path)?;
+    let mut document = if path.exists() {
+        let contents = std::fs::read_to_string(path).map_err(|error| {
+            armature_engine::effects::EffectError::Unsupported(format!(
+                "failed to read human review file `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        serde_json::from_str(&contents).map_err(|error| {
+            armature_engine::effects::EffectError::Unsupported(format!(
+                "human review file `{}` is not valid JSON: {error}",
+                path.display()
+            ))
+        })?
+    } else {
+        serde_json::json!({ "reviews": [] })
+    };
+
+    let Some(document_object) = document.as_object_mut() else {
+        return Err(armature_engine::effects::EffectError::Unsupported(
+            "human review file root must be an object".to_string(),
+        ));
+    };
+    let reviews = document_object
+        .entry("reviews")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let Some(reviews) = reviews.as_array_mut() else {
+        return Err(armature_engine::effects::EffectError::Unsupported(
+            "human review file field `reviews` must be an array".to_string(),
+        ));
+    };
+
+    let idempotency_key = obligation
+        .get("idempotency_key")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    if let Some(idempotency_key) = idempotency_key {
+        if reviews.iter().any(|review| {
+            review
+                .get("idempotency_key")
+                .and_then(serde_json::Value::as_str)
+                == Some(idempotency_key.as_str())
+        }) {
+            write_json_document(path, &document)?;
+            return Ok(());
+        }
+    }
+
+    reviews.push(obligation);
+    write_json_document(path, &document)
+}
+
+fn dispatch_agent_file_effect(
+    path: &Path,
+    request: &armature_engine::effects::EffectRequest,
+) -> Result<Option<serde_json::Value>, armature_engine::effects::EffectError> {
+    match request.effect.as_str() {
+        "start" => {
+            let input = request
+                .args
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| request.args.clone());
+            let invocation = serde_json::json!({
+                "id": request.idempotency_key,
+                "status": "started",
+                "agent": request.target,
+                "workflow_id": request.workflow_id,
+                "effect_id": request.effect_id,
+                "transition_id": request.transition_id,
+                "input": input,
+            });
+            append_agent_record(path, "invocations", invocation.clone())?;
+            Ok(Some(invocation))
+        }
+        "send" => {
+            let message = serde_json::json!({
+                "id": request.idempotency_key,
+                "status": "sent",
+                "agent": request.target,
+                "workflow_id": request.workflow_id,
+                "effect_id": request.effect_id,
+                "transition_id": request.transition_id,
+                "message": request.args.get("message").cloned().unwrap_or(serde_json::Value::Null),
+            });
+            append_agent_record(path, "messages", message.clone())?;
+            Ok(Some(message))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn append_agent_record(
+    path: &Path,
+    collection: &str,
+    record: serde_json::Value,
+) -> Result<(), armature_engine::effects::EffectError> {
+    let _lock = JsonFileLock::acquire(path)?;
+    let mut document = if path.exists() {
+        let contents = std::fs::read_to_string(path).map_err(|error| {
+            armature_engine::effects::EffectError::Unsupported(format!(
+                "failed to read agent file `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        serde_json::from_str(&contents).map_err(|error| {
+            armature_engine::effects::EffectError::Unsupported(format!(
+                "agent file `{}` is not valid JSON: {error}",
+                path.display()
+            ))
+        })?
+    } else {
+        serde_json::json!({
+            "invocations": [],
+            "messages": []
+        })
+    };
+
+    let Some(document_object) = document.as_object_mut() else {
+        return Err(armature_engine::effects::EffectError::Unsupported(
+            "agent file root must be an object".to_string(),
+        ));
+    };
+    let records = document_object
+        .entry(collection)
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let Some(records) = records.as_array_mut() else {
+        return Err(armature_engine::effects::EffectError::Unsupported(format!(
+            "agent file field `{collection}` must be an array"
+        )));
+    };
+
+    let id = record
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    if let Some(id) = id {
+        if records.iter().any(|existing| {
+            existing.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+        }) {
+            write_json_document(path, &document)?;
+            return Ok(());
+        }
+    }
+
+    records.push(record);
+    write_json_document(path, &document)
+}
+
+struct PlanStatusUpdate<'a> {
+    status: &'a str,
+    reason_arg: Option<usize>,
+}
+
+fn update_json_plan_status(
+    path: &Path,
+    request: &armature_engine::effects::EffectRequest,
+    update: PlanStatusUpdate<'_>,
+) -> Result<serde_json::Value, armature_engine::effects::EffectError> {
+    let _lock = JsonFileLock::acquire(path)?;
+    let mut plan = read_json_plan(path)?;
+    let work_item_id = plan_call_string_arg(request, 0)?;
+    let reason = update
+        .reason_arg
+        .map(|index| plan_call_string_arg(request, index))
+        .transpose()?;
+
+    let updated_existing_task =
+        update_task_array_status(&mut plan, &work_item_id, update.status, reason.as_deref())?;
+    if !updated_existing_task {
+        update_status_map(&mut plan, &work_item_id, update.status, reason.as_deref())?;
+    }
+
+    write_json_document(path, &plan)?;
+    Ok(serde_json::json!({
+        "workItemId": work_item_id,
+        "status": update.status,
+        "updated": true
+    }))
+}
+
+fn count_unfinished_items(
+    plan: &serde_json::Value,
+) -> Result<i64, armature_engine::effects::EffectError> {
+    if let Some(tasks) = plan.get("tasks") {
+        let Some(tasks) = tasks.as_array() else {
+            return Err(armature_engine::effects::EffectError::Unsupported(
+                "JSON plan field `tasks` must be an array".to_string(),
+            ));
+        };
+        return Ok(tasks
+            .iter()
+            .filter(|task| task_status(task) != Some("done"))
+            .count() as i64);
+    }
+
+    if let Some(statuses) = plan.get("statuses") {
+        let Some(statuses) = statuses.as_object() else {
+            return Err(armature_engine::effects::EffectError::Unsupported(
+                "JSON plan field `statuses` must be an object".to_string(),
+            ));
+        };
+        return Ok(statuses
+            .values()
+            .filter(|status| task_status(status) != Some("done"))
+            .count() as i64);
+    }
+
+    Ok(0)
+}
+
+fn next_ready_item(
+    plan: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, armature_engine::effects::EffectError> {
+    let Some(tasks) = plan.get("tasks") else {
+        return Ok(None);
+    };
+    let Some(tasks) = tasks.as_array() else {
+        return Err(armature_engine::effects::EffectError::Unsupported(
+            "JSON plan field `tasks` must be an array".to_string(),
+        ));
+    };
+    Ok(tasks
+        .iter()
+        .find(|task| {
+            matches!(
+                task_status(task),
+                None | Some("todo") | Some("ready") | Some("ready_for_implementation")
+            )
+        })
+        .cloned())
+}
+
+fn task_status(task: &serde_json::Value) -> Option<&str> {
+    task.get("status")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| task.as_str())
+}
+
+struct JsonFileLock {
+    path: PathBuf,
+}
+
+impl JsonFileLock {
+    fn acquire(path: &Path) -> Result<Self, armature_engine::effects::EffectError> {
+        let lock_path = json_file_lock_path(path);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => return Ok(Self { path: lock_path }),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    if Instant::now() >= deadline {
+                        return Err(armature_engine::effects::EffectError::Unsupported(format!(
+                            "timed out waiting for JSON plan lock `{}`",
+                            lock_path.display()
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => {
+                    return Err(armature_engine::effects::EffectError::Unsupported(format!(
+                        "failed to acquire JSON plan lock `{}`: {error}",
+                        lock_path.display()
+                    )));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for JsonFileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn json_file_lock_path(path: &Path) -> PathBuf {
+    let mut path = path.as_os_str().to_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
+fn read_json_plan(path: &Path) -> Result<serde_json::Value, armature_engine::effects::EffectError> {
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        armature_engine::effects::EffectError::Unsupported(format!(
+            "failed to read JSON plan file `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_str(&contents).map_err(|error| {
+        armature_engine::effects::EffectError::Unsupported(format!(
+            "JSON plan file `{}` is not valid JSON: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn read_json_document_or_default(
+    path: &Path,
+    default: serde_json::Value,
+) -> Result<serde_json::Value, armature_engine::effects::EffectError> {
+    if !path.exists() {
+        return Ok(default);
+    }
+
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        armature_engine::effects::EffectError::Unsupported(format!(
+            "failed to read JSON file `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_str(&contents).map_err(|error| {
+        armature_engine::effects::EffectError::Unsupported(format!(
+            "JSON file `{}` is not valid JSON: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn write_json_document(
+    path: &Path,
+    plan: &serde_json::Value,
+) -> Result<(), armature_engine::effects::EffectError> {
+    let contents = serde_json::to_string_pretty(plan).map_err(|error| {
+        armature_engine::effects::EffectError::Unsupported(format!(
+            "failed to serialize JSON plan update for `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, format!("{contents}\n")).map_err(|error| {
+        armature_engine::effects::EffectError::Unsupported(format!(
+            "failed to write temporary JSON plan file `{}`: {error}",
+            tmp_path.display()
+        ))
+    })?;
+    std::fs::rename(&tmp_path, path).map_err(|error| {
+        armature_engine::effects::EffectError::Unsupported(format!(
+            "failed to replace JSON plan file `{}`: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn plan_call_string_arg(
+    request: &armature_engine::effects::EffectRequest,
+    index: usize,
+) -> Result<String, armature_engine::effects::EffectError> {
+    let Some(value) = request
+        .args
+        .get("call_args")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|args| args.get(index))
+    else {
+        return Err(armature_engine::effects::EffectError::Unsupported(format!(
+            "effect `{}` requires string call argument {index}",
+            request.effect
+        )));
+    };
+
+    value.as_str().map(str::to_string).ok_or_else(|| {
+        armature_engine::effects::EffectError::Unsupported(format!(
+            "effect `{}` call argument {index} must be a string",
+            request.effect
+        ))
+    })
+}
+
+fn update_task_array_status(
+    plan: &mut serde_json::Value,
+    work_item_id: &str,
+    status: &str,
+    reason: Option<&str>,
+) -> Result<bool, armature_engine::effects::EffectError> {
+    let Some(tasks) = plan.get_mut("tasks") else {
+        return Ok(false);
+    };
+    let Some(tasks) = tasks.as_array_mut() else {
+        return Err(armature_engine::effects::EffectError::Unsupported(
+            "JSON plan field `tasks` must be an array".to_string(),
+        ));
+    };
+
+    for task in tasks {
+        let Some(task_object) = task.as_object_mut() else {
+            continue;
+        };
+        if task_object.get("id").and_then(serde_json::Value::as_str) == Some(work_item_id) {
+            task_object.insert(
+                "status".to_string(),
+                serde_json::Value::String(status.to_string()),
+            );
+            if let Some(reason) = reason {
+                task_object.insert(
+                    "blockedReason".to_string(),
+                    serde_json::Value::String(reason.to_string()),
+                );
+            }
+            return Ok(true);
+        }
+    }
+
+    Err(armature_engine::effects::EffectError::Unsupported(format!(
+        "JSON plan file has `tasks`, but no task with id `{work_item_id}`"
+    )))
+}
+
+fn update_status_map(
+    plan: &mut serde_json::Value,
+    work_item_id: &str,
+    status: &str,
+    reason: Option<&str>,
+) -> Result<(), armature_engine::effects::EffectError> {
+    let Some(plan_object) = plan.as_object_mut() else {
+        return Err(armature_engine::effects::EffectError::Unsupported(
+            "JSON plan root must be an object".to_string(),
+        ));
+    };
+
+    let statuses = plan_object
+        .entry("statuses")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(statuses) = statuses.as_object_mut() else {
+        return Err(armature_engine::effects::EffectError::Unsupported(
+            "JSON plan field `statuses` must be an object".to_string(),
+        ));
+    };
+
+    let mut item = serde_json::Map::new();
+    item.insert(
+        "status".to_string(),
+        serde_json::Value::String(status.to_string()),
+    );
+    if let Some(reason) = reason {
+        item.insert(
+            "blockedReason".to_string(),
+            serde_json::Value::String(reason.to_string()),
+        );
+    }
+    statuses.insert(work_item_id.to_string(), serde_json::Value::Object(item));
+    Ok(())
+}
+
 fn runtime_policy_allows(
     policies: &[CapabilityPolicyDocument],
     category: armature_engine::effects::EffectCategory,
@@ -2882,7 +4071,7 @@ fn runtime_policy_allows(
             .any(|denied| denied == capability)
     }) {
         return Err(format!(
-            "effect `{effect_name}` requires denied capability `{capability}`"
+            "effect `{effect_name}` requires denied capability `{capability}`. Fix: remove `{capability}` from denied_capabilities only if this authority is intended, otherwise remove or replace the effect."
         ));
     }
 
@@ -2902,7 +4091,7 @@ fn runtime_policy_allows(
         .unwrap_or(armature_workflow::policy::PolicyMode::Local);
     if unknown_capability_is_error(strictest_mode, category, capability) {
         Err(format!(
-            "effect `{effect_name}` requires capability `{capability}` that is not allowed by supplied policy"
+            "effect `{effect_name}` requires capability `{capability}` that is not allowed by supplied policy. Fix: add `{capability}` to allowed_capabilities only if this authority is intended, otherwise remove or replace the effect."
         ))
     } else {
         Ok(())
@@ -2940,42 +4129,6 @@ fn successful_outcome(
         output,
         error: None,
         completed_at: None,
-    }
-}
-
-pub mod baml {
-    use thiserror::Error;
-
-    #[derive(Debug, Error)]
-    pub enum BamlAdapterError {
-        #[error("BAML adapter is not implemented yet")]
-        NotImplemented,
-    }
-
-    pub trait BamlAdapter {
-        fn coerce(
-            &mut self,
-            function: &str,
-            input: serde_json::Value,
-        ) -> Result<serde_json::Value, BamlAdapterError>;
-    }
-}
-
-pub mod human {
-    use thiserror::Error;
-
-    #[derive(Debug, Error)]
-    pub enum HumanReviewError {
-        #[error("human review adapter is not implemented yet")]
-        NotImplemented,
-    }
-
-    pub trait HumanReviewAdapter {
-        fn ask_human(&mut self, reason: &str) -> Result<String, HumanReviewError>;
-
-        fn ask_human_effect_name(&self) -> &'static str {
-            "askHuman"
-        }
     }
 }
 
@@ -3027,6 +4180,48 @@ mod tests {
                 model: Some(AdapterModel::Deterministic),
             },
         );
+        effects.insert(
+            "plan.unfinishedItems".to_string(),
+            AdapterEffect {
+                category: EffectCategory::SyncValue,
+                required_capabilities: vec!["resource.plan.read".to_string()],
+                input: Schema::Json,
+                output: Schema::Int,
+                idempotent: true,
+                failure_categories: Vec::new(),
+                model: Some(AdapterModel::Deterministic),
+            },
+        );
+        effects.insert(
+            "plan.nextReadyItem".to_string(),
+            AdapterEffect {
+                category: EffectCategory::SyncValue,
+                required_capabilities: vec!["resource.plan.read".to_string()],
+                input: Schema::Json,
+                output: Schema::Json,
+                idempotent: true,
+                failure_categories: Vec::new(),
+                model: Some(AdapterModel::Deterministic),
+            },
+        );
+        for effect_name in [
+            "plan.markReadyForQuality",
+            "plan.markBlocked",
+            "plan.markDone",
+        ] {
+            effects.insert(
+                effect_name.to_string(),
+                AdapterEffect {
+                    category: EffectCategory::SyncValue,
+                    required_capabilities: vec!["resource.plan.write".to_string()],
+                    input: Schema::Json,
+                    output: Schema::Json,
+                    idempotent: true,
+                    failure_categories: Vec::new(),
+                    model: Some(AdapterModel::Opaque),
+                },
+            );
+        }
         effects.insert(
             "start".to_string(),
             AdapterEffect {
@@ -3085,6 +4280,244 @@ mod tests {
             outcome.required_capabilities,
             vec!["resource.plan.read".to_string()]
         );
+    }
+
+    #[test]
+    fn manifest_dispatcher_reads_and_updates_json_plan_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan_path = dir.path().join("plan.json");
+        std::fs::write(
+            &plan_path,
+            serde_json::to_string_pretty(&json!({
+                "tasks": [
+                    {"id": "W1", "status": "todo", "title": "Implement W1"},
+                    {"id": "W0", "status": "done", "title": "Already done"}
+                ]
+            }))
+            .expect("plan serializes"),
+        )
+        .expect("plan writes");
+
+        let mut dispatcher =
+            ManifestEffectDispatcher::new(manifest()).with_json_plan_file(&plan_path);
+        let snapshot = dispatcher
+            .dispatch(request(
+                "plan.snapshot",
+                EffectCategory::SyncValue,
+                json!({}),
+            ))
+            .expect("snapshot succeeds");
+        assert!(snapshot
+            .output
+            .and_then(|value| value.as_str().map(str::to_string))
+            .expect("snapshot output")
+            .contains("Implement W1"));
+
+        let unfinished = dispatcher
+            .dispatch(request(
+                "plan.unfinishedItems",
+                EffectCategory::SyncValue,
+                json!({}),
+            ))
+            .expect("unfinished item count succeeds");
+        assert_eq!(unfinished.output, Some(json!(1)));
+
+        let next_ready = dispatcher
+            .dispatch(request(
+                "plan.nextReadyItem",
+                EffectCategory::SyncValue,
+                json!({}),
+            ))
+            .expect("next ready item succeeds");
+        assert_eq!(next_ready.output.as_ref().expect("output")["id"], "W1");
+
+        let ready = dispatcher
+            .dispatch(request(
+                "plan.markReadyForQuality",
+                EffectCategory::SyncValue,
+                json!({"call_args": ["W1"]}),
+            ))
+            .expect("status update succeeds");
+        assert_eq!(ready.status, EffectOutcomeStatus::Succeeded);
+
+        let blocked = dispatcher
+            .dispatch(request(
+                "plan.markBlocked",
+                EffectCategory::SyncValue,
+                json!({"call_args": ["W1", "needs changes"]}),
+            ))
+            .expect("blocked update succeeds");
+        assert_eq!(blocked.status, EffectOutcomeStatus::Succeeded);
+
+        let plan: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&plan_path).expect("updated plan reads"))
+                .expect("updated plan parses");
+        assert_eq!(plan["tasks"][0]["status"], "blocked");
+        assert_eq!(plan["tasks"][0]["blockedReason"], "needs changes");
+        assert!(!super::json_file_lock_path(&plan_path).exists());
+    }
+
+    #[test]
+    fn manifest_dispatcher_writes_human_review_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let review_path = dir.path().join("reviews.json");
+        let mut manifest = manifest();
+        manifest
+            .effects
+            .extend(super::json_human_review_adapter_manifest().effects);
+        let mut dispatcher =
+            ManifestEffectDispatcher::new(manifest).with_human_review_file(&review_path);
+
+        let outcome = dispatcher
+            .dispatch(request(
+                "askHuman",
+                EffectCategory::HumanObligation,
+                json!({"reason": "review needed"}),
+            ))
+            .expect("human review dispatch succeeds");
+
+        assert_eq!(outcome.status, EffectOutcomeStatus::Accepted);
+        let reviews: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&review_path).expect("review file reads"),
+        )
+        .expect("review file parses");
+        assert_eq!(reviews["reviews"][0]["status"], "open");
+        assert_eq!(reviews["reviews"][0]["reason"], "review needed");
+        assert!(!super::json_file_lock_path(&review_path).exists());
+    }
+
+    #[test]
+    fn manifest_dispatcher_writes_agent_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_path = dir.path().join("agents.json");
+        let mut manifest = manifest();
+        manifest
+            .effects
+            .extend(super::json_agent_adapter_manifest().effects);
+        let mut dispatcher = ManifestEffectDispatcher::new(manifest).with_agent_file(&agent_path);
+
+        let mut start = request(
+            "start",
+            EffectCategory::AsyncInvocation,
+            json!({"task": "W1", "message": "Implement W1"}),
+        );
+        start.target = Some("worker".to_string());
+        let start_outcome = dispatcher.dispatch(start).expect("start dispatch succeeds");
+        assert_eq!(start_outcome.status, EffectOutcomeStatus::Accepted);
+
+        let mut send = request(
+            "send",
+            EffectCategory::Message,
+            json!({"message": "please inspect"}),
+        );
+        send.target = Some("director".to_string());
+        let send_outcome = dispatcher.dispatch(send).expect("send dispatch succeeds");
+        assert_eq!(send_outcome.status, EffectOutcomeStatus::Accepted);
+
+        let agents: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&agent_path).expect("agent file reads"))
+                .expect("agent file parses");
+        assert_eq!(agents["invocations"][0]["agent"], "worker");
+        assert_eq!(agents["invocations"][0]["status"], "started");
+        assert_eq!(agents["messages"][0]["agent"], "director");
+        assert_eq!(agents["messages"][0]["message"], "please inspect");
+        assert!(!super::json_file_lock_path(&agent_path).exists());
+    }
+
+    #[test]
+    fn record_human_review_response_updates_review_and_deduplicates_response() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let review_path = dir.path().join("reviews.json");
+        std::fs::write(
+            &review_path,
+            serde_json::to_string_pretty(&json!({
+                "reviews": [
+                    {"id": "review-1", "status": "open", "reason": "approve deploy"},
+                    {"id": "review-2", "status": "open", "reason": "leave open"}
+                ]
+            }))
+            .expect("review document serializes"),
+        )
+        .expect("review document writes");
+
+        let payload = json!({
+            "reviewId": "review-1",
+            "decision": "approved",
+            "response": "ship it"
+        });
+        super::record_human_review_response(&review_path, &payload)
+            .expect("review response records");
+        super::record_human_review_response(&review_path, &payload)
+            .expect("duplicate review response is idempotent");
+
+        let reviews: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&review_path).expect("review file reads"),
+        )
+        .expect("review file parses");
+        assert_eq!(reviews["reviews"][0]["status"], "responded");
+        assert_eq!(reviews["reviews"][0]["decision"], "approved");
+        assert_eq!(reviews["reviews"][0]["response"], "ship it");
+        assert_eq!(reviews["reviews"][1]["status"], "open");
+        assert_eq!(
+            reviews["responses"]
+                .as_array()
+                .expect("responses array")
+                .len(),
+            1
+        );
+        assert_eq!(reviews["responses"][0], payload);
+        assert!(!super::json_file_lock_path(&review_path).exists());
+    }
+
+    #[test]
+    fn record_agent_finished_event_marks_latest_matching_invocation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_path = dir.path().join("agents.json");
+        std::fs::write(
+            &agent_path,
+            serde_json::to_string_pretty(&json!({
+                "invocations": [
+                    {"id": "start-1", "agent": "worker", "status": "started"},
+                    {"id": "start-2", "agent": "worker", "status": "started"},
+                    {"id": "quality-1", "agent": "quality", "status": "started"}
+                ],
+                "messages": []
+            }))
+            .expect("agent document serializes"),
+        )
+        .expect("agent document writes");
+
+        let payload = json!({
+            "id": "run-99",
+            "name": "worker-99",
+            "status": "succeeded",
+            "stdoutTail": "done",
+            "stderrTail": "",
+            "exitCode": 0
+        });
+        super::record_agent_finished_event(&agent_path, &payload)
+            .expect("agent completion records");
+        super::record_agent_finished_event(&agent_path, &payload)
+            .expect("duplicate agent completion is idempotent");
+
+        let agents: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&agent_path).expect("agent file reads"))
+                .expect("agent file parses");
+        assert_eq!(agents["invocations"][0]["status"], "started");
+        assert_eq!(agents["invocations"][1]["status"], "finished");
+        assert_eq!(agents["invocations"][1]["completion_id"], "run-99");
+        assert_eq!(agents["invocations"][1]["completion_status"], "succeeded");
+        assert_eq!(agents["invocations"][1]["exit_code"], 0);
+        assert_eq!(agents["invocations"][2]["status"], "started");
+        assert_eq!(
+            agents["completions"]
+                .as_array()
+                .expect("completions array")
+                .len(),
+            1
+        );
+        assert_eq!(agents["completions"][0], payload);
+        assert!(!super::json_file_lock_path(&agent_path).exists());
     }
 
     #[test]
@@ -3165,6 +4598,7 @@ mod tests {
             mode: armature_workflow::policy::PolicyMode::Enterprise,
             allowed_capabilities: vec!["resource.plan.read".to_string()],
             denied_capabilities: vec!["resource.plan.read".to_string()],
+            ..Default::default()
         };
         let mut dispatcher = ManifestEffectDispatcher::new(manifest()).with_policies(vec![policy]);
 
@@ -3179,6 +4613,9 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires denied capability `resource.plan.read`"));
+        assert!(error
+            .to_string()
+            .contains("Fix: remove `resource.plan.read` from denied_capabilities"));
         assert_eq!(
             error.required_capabilities(),
             &["resource.plan.read".to_string()]
@@ -3191,6 +4628,7 @@ mod tests {
             mode: armature_workflow::policy::PolicyMode::Local,
             allowed_capabilities: Vec::new(),
             denied_capabilities: Vec::new(),
+            ..Default::default()
         };
         let mut dispatcher = ManifestEffectDispatcher::new(manifest())
             .with_policies(vec![policy])
@@ -3205,6 +4643,78 @@ mod tests {
             .expect("local unknown capability is warning-only");
 
         assert_eq!(outcome.status, EffectOutcomeStatus::Succeeded);
+    }
+
+    #[test]
+    fn baml_http_policy_requires_enterprise_network_and_url_allowlist() {
+        let policy = CapabilityPolicyDocument {
+            mode: armature_workflow::policy::PolicyMode::Enterprise,
+            allowed_capabilities: vec!["baml.coerce".to_string()],
+            allow_baml_network: Some(true),
+            allowed_baml_urls: vec!["http://127.0.0.1:2024".to_string()],
+            ..Default::default()
+        };
+
+        assert!(crate::validate_baml_http_policy(
+            std::slice::from_ref(&policy),
+            "http://127.0.0.1:2024",
+        )
+        .is_empty());
+
+        let diagnostics = crate::validate_baml_http_policy(&[policy], "http://127.0.0.1:2025");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("is not allowed")));
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("Fix: add the exact URL to allowed_baml_urls")));
+    }
+
+    #[test]
+    fn baml_http_policy_rejects_denied_capability_and_network() {
+        let policy = CapabilityPolicyDocument {
+            mode: armature_workflow::policy::PolicyMode::Enterprise,
+            denied_capabilities: vec!["baml.coerce".to_string()],
+            allow_baml_network: Some(false),
+            ..Default::default()
+        };
+
+        let diagnostics = crate::validate_baml_http_policy(&[policy], "http://127.0.0.1:2024");
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("denied capability `baml.coerce`")));
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("Fix: remove `baml.coerce` from denied_capabilities")));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("network execution is denied")));
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("Fix: set `allow_baml_network: true`")));
+    }
+
+    #[test]
+    fn baml_raw_response_policy_redacts_enterprise_by_default() {
+        let enterprise = CapabilityPolicyDocument {
+            mode: armature_workflow::policy::PolicyMode::Enterprise,
+            ..Default::default()
+        };
+        assert!(!crate::should_store_baml_raw_response(&[enterprise]));
+
+        let opted_in = CapabilityPolicyDocument {
+            mode: armature_workflow::policy::PolicyMode::Enterprise,
+            store_baml_raw_responses: Some(true),
+            ..Default::default()
+        };
+        assert!(crate::should_store_baml_raw_response(&[opted_in]));
+
+        let denied = CapabilityPolicyDocument {
+            mode: armature_workflow::policy::PolicyMode::Local,
+            store_baml_raw_responses: Some(false),
+            ..Default::default()
+        };
+        assert!(!crate::should_store_baml_raw_response(&[denied]));
     }
 
     #[test]
@@ -3434,6 +4944,7 @@ state waiting {
             mode: armature_workflow::policy::PolicyMode::Enterprise,
             allowed_capabilities: vec!["message_agents".to_string()],
             denied_capabilities: vec!["message_agents".to_string()],
+            ..Default::default()
         };
 
         let diagnostics = crate::validate_workflow_policy(&ir, &[manifest_with_send()], &[policy]);
@@ -3447,6 +4958,9 @@ state waiting {
             })
             .expect("denied capability diagnostic");
         assert_eq!(diagnostic.severity, armature_workflow::Severity::Error);
+        assert!(diagnostic
+            .message
+            .contains("Fix: remove `message_agents` from denied_capabilities"));
         assert_eq!(
             diagnostic.span.as_ref().map(|span| span.start_line),
             Some(13)
@@ -3473,6 +4987,7 @@ state waiting {
             mode: armature_workflow::policy::PolicyMode::Local,
             allowed_capabilities: Vec::new(),
             denied_capabilities: Vec::new(),
+            ..Default::default()
         };
 
         let diagnostics = crate::validate_workflow_policy(&ir, &[manifest()], &[policy]);
@@ -3486,6 +5001,9 @@ state waiting {
             })
             .expect("unknown capability diagnostic");
         assert_eq!(diagnostic.severity, armature_workflow::Severity::Warning);
+        assert!(diagnostic
+            .message
+            .contains("Fix: add `resource.plan.read` to allowed_capabilities"));
     }
 
     #[test]
@@ -3525,6 +5043,7 @@ state waiting {
             mode: armature_workflow::policy::PolicyMode::Team,
             allowed_capabilities: Vec::new(),
             denied_capabilities: Vec::new(),
+            ..Default::default()
         };
 
         let diagnostics = crate::validate_workflow_policy(&ir, &[manifest], &[policy]);
@@ -3538,6 +5057,9 @@ state waiting {
             })
             .expect("unknown write capability diagnostic");
         assert_eq!(diagnostic.severity, armature_workflow::Severity::Error);
+        assert!(diagnostic
+            .message
+            .contains("Fix: add `resource.plan.write` to allowed_capabilities"));
     }
 
     #[test]
@@ -3579,6 +5101,7 @@ state waiting {
             mode: armature_workflow::policy::PolicyMode::Enterprise,
             allowed_capabilities: Vec::new(),
             denied_capabilities: Vec::new(),
+            ..Default::default()
         };
 
         let diagnostics = crate::validate_workflow_policy(&ir, &[manifest], &[policy]);
@@ -3629,6 +5152,7 @@ invariant needsPlanRead {
             mode: armature_workflow::policy::PolicyMode::Enterprise,
             allowed_capabilities: Vec::new(),
             denied_capabilities: Vec::new(),
+            ..Default::default()
         };
 
         let diagnostics = crate::validate_workflow_policy(&ir, &[manifest], &[policy]);

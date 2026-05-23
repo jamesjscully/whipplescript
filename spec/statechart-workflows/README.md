@@ -68,7 +68,6 @@ The source format should keep the whole workflow in one place, including:
 - agent declarations
 - capability contracts
 - events
-- timers
 - states
 - transitions
 - BAML-shaped `class`, `enum`, and `coerce` declarations
@@ -92,8 +91,12 @@ and policy-checked adapters.
 - [grammar.md](grammar.md) sketches the v0 grammar and parser architecture.
 - [source-to-ir.md](source-to-ir.md) defines parsing, expression lowering,
   interpolation, and source-to-IR normalization.
+- [expression-primitives.md](expression-primitives.md) defines the small
+  orchestration-grade expression kernel and explicitly excludes general-purpose
+  data programming.
 - [baml-integration.md](baml-integration.md) defines how Armature `class`,
-  `enum`, and `coerce` declarations lower to BAML artifacts.
+  `enum`, and `coerce` declarations lower to BAML artifacts and execute through
+  BAML HTTP.
 - [workflow-ir.md](workflow-ir.md) defines the normalized representation shared
   by parser, validator, runtime, adapters, and model generators.
 - [component-contracts.md](component-contracts.md) defines typed interfaces
@@ -103,11 +106,20 @@ and policy-checked adapters.
 - [event-queue.md](event-queue.md) defines durable event queue semantics.
 - [storage.md](storage.md) defines the SQLite-backed durable queue/log/state
   storage model.
+- [database-migrations.md](database-migrations.md) describes the SQLite schema
+  migration contract.
 - [policy.md](policy.md) defines capability modes and authority resolution.
 - [runtime-semantics.md](runtime-semantics.md) defines the trusted interpreter
   semantics.
+- [operations.md](operations.md) explains how to inspect and repair stuck
+  workflows.
+- [migration.md](migration.md) maps legacy Armature script concepts onto the
+  statechart workflow surface.
+- [release-checklist.md](release-checklist.md) defines release and upgrade
+  checks for this track.
 - [verification.md](verification.md) describes how workflow invariants compile
-  to model-checkable/provable transition systems, with Veil as the first target.
+  to model-checkable/provable transition systems, with TLA+/Apalache first for
+  counterexamples and Veil as a longer-term proof-oriented target.
 - [implementation-plan.md](implementation-plan.md) sequences specification,
   formal modeling, runtime scaffolding, generated validation, and gates.
 - [reuse-boundary.md](reuse-boundary.md) defines what may be kept from the

@@ -1161,9 +1161,19 @@ pub mod source {
         }
 
         fn parse_agent_ctor(&mut self) -> Option<AgentTarget> {
+            if self.syntax.peek() == Some(SyntaxKind::AdapterKw) {
+                self.syntax.bump();
+                self.expect(SyntaxKind::LParen);
+                let name = self
+                    .expect(SyntaxKind::String)
+                    .map(|token| decode_string_literal(&token.text));
+                self.expect(SyntaxKind::RParen);
+                return name.map(|name| AgentTarget::Adapter { name });
+            }
+
             let ctor = self.expect_ident("agent constructor")?;
             self.expect(SyntaxKind::LParen);
-            let target = match ctor.as_str() {
+            match ctor.as_str() {
                 "thread" => {
                     let name = self
                         .expect(SyntaxKind::String)
@@ -1181,8 +1191,7 @@ pub mod source {
                     self.skip_balanced_parens();
                     None
                 }
-            };
-            target
+            }
         }
 
         fn parse_agent_options(&mut self) -> Option<u32> {
@@ -2813,6 +2822,7 @@ pub mod validate {
         event_binding: Option<String>,
         event_name: Option<String>,
         locals: BTreeMap<String, crate::schema::Schema>,
+        non_null_paths: BTreeSet<String>,
     }
 
     impl ExprScope {
@@ -2821,8 +2831,120 @@ pub mod validate {
                 event_binding: binding.map(str::to_string),
                 event_name: Some(event_name.to_string()),
                 locals: BTreeMap::new(),
+                non_null_paths: BTreeSet::new(),
             }
         }
+
+        fn apply_guard_refinements(&mut self, guard: &Expr) {
+            collect_non_null_paths(guard, &mut self.non_null_paths);
+        }
+
+        fn apply_case_pattern_refinements(
+            &mut self,
+            scrutinee: &Expr,
+            pattern: &crate::ir::CasePattern,
+            nil_previously_matched: bool,
+        ) {
+            let Expr::Path { path } = scrutinee else {
+                return;
+            };
+
+            if case_pattern_proves_non_null(pattern, nil_previously_matched) {
+                self.non_null_paths.insert(path.clone());
+            }
+        }
+    }
+
+    fn collect_non_null_paths(expr: &Expr, paths: &mut BTreeSet<String>) {
+        match expr {
+            Expr::And { exprs } => {
+                for expr in exprs {
+                    collect_non_null_paths(expr, paths);
+                }
+            }
+            Expr::Or { exprs } => {
+                if let Some(common_paths) = common_non_null_paths(exprs) {
+                    paths.extend(common_paths);
+                }
+            }
+            Expr::Neq { left, right } => {
+                if let (Expr::Path { path }, true) = (&**left, is_nil_expr(right)) {
+                    paths.insert(path.clone());
+                } else if let (true, Expr::Path { path }) = (is_nil_expr(left), &**right) {
+                    paths.insert(path.clone());
+                }
+            }
+            Expr::Not { expr } => collect_negated_non_null_paths(expr, paths),
+            _ => {}
+        }
+    }
+
+    fn collect_negated_non_null_paths(expr: &Expr, paths: &mut BTreeSet<String>) {
+        match expr {
+            Expr::Eq { left, right } => {
+                if let (Expr::Path { path }, true) = (&**left, is_nil_expr(right)) {
+                    paths.insert(path.clone());
+                } else if let (true, Expr::Path { path }) = (is_nil_expr(left), &**right) {
+                    paths.insert(path.clone());
+                }
+            }
+            Expr::Or { exprs } => {
+                for expr in exprs {
+                    collect_negated_non_null_paths(expr, paths);
+                }
+            }
+            Expr::Not { expr } => collect_non_null_paths(expr, paths),
+            _ => {}
+        }
+    }
+
+    fn common_non_null_paths(exprs: &[Expr]) -> Option<BTreeSet<String>> {
+        let mut exprs = exprs.iter();
+        let first = exprs.next()?;
+        let mut common = BTreeSet::new();
+        collect_non_null_paths(first, &mut common);
+
+        for expr in exprs {
+            let mut paths = BTreeSet::new();
+            collect_non_null_paths(expr, &mut paths);
+            common = common.intersection(&paths).cloned().collect();
+            if common.is_empty() {
+                break;
+            }
+        }
+
+        Some(common)
+    }
+
+    fn is_nil_expr(expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::Literal {
+                value
+            } if value.is_null()
+        )
+    }
+
+    fn case_pattern_proves_non_null(
+        pattern: &crate::ir::CasePattern,
+        nil_previously_matched: bool,
+    ) -> bool {
+        match pattern {
+            crate::ir::CasePattern::Identifier { .. } | crate::ir::CasePattern::Matches { .. } => {
+                true
+            }
+            crate::ir::CasePattern::Literal { value } => !value.is_null(),
+            crate::ir::CasePattern::Wildcard => nil_previously_matched,
+        }
+    }
+
+    fn case_pattern_matches_nil(pattern: &crate::ir::CasePattern) -> bool {
+        matches!(
+            pattern,
+            crate::ir::CasePattern::Literal {
+                value
+            } if value.is_null()
+        )
     }
 
     pub fn validate_ir(ir: &WorkflowIr) -> ValidationReport {
@@ -3514,15 +3636,15 @@ pub mod validate {
     ) {
         let mut unguarded_handlers = BTreeSet::new();
         for handler in &state.on {
+            let base_scope =
+                ExprScope::with_event_binding(&handler.event, handler.binding.as_deref());
             if let Some(guard) = &handler.guard {
-                let scope =
-                    ExprScope::with_event_binding(&handler.event, handler.binding.as_deref());
                 validate_expr(
                     diagnostics,
                     &format!("state `{state_name}` handler `{}` guard", handler.event),
                     ir,
                     guard,
-                    &scope,
+                    &base_scope,
                     &handler.span,
                 );
                 validate_boolean_expr(
@@ -3530,7 +3652,7 @@ pub mod validate {
                     &format!("state `{state_name}` handler `{}` guard", handler.event),
                     ir,
                     guard,
-                    &scope,
+                    &base_scope,
                     &handler.span,
                 );
             } else if !unguarded_handlers.insert(handler.event.clone()) {
@@ -3562,8 +3684,10 @@ pub mod validate {
                 }
             }
 
-            let mut scope =
-                ExprScope::with_event_binding(&handler.event, handler.binding.as_deref());
+            let mut scope = base_scope;
+            if let Some(guard) = &handler.guard {
+                scope.apply_guard_refinements(guard);
+            }
             validate_steps(
                 diagnostics,
                 state_name,
@@ -3779,8 +3903,6 @@ pub mod validate {
             "coerce",
             "askHuman",
             "raise",
-            "sleep",
-            "stop",
             "capability_call",
         ];
 
@@ -4011,6 +4133,11 @@ pub mod validate {
             ));
         }
 
+        let scrutinee = step
+            .args
+            .get("expr")
+            .and_then(|value| serde_json::from_value::<Expr>(value.clone()).ok());
+        let mut nil_previously_matched = false;
         for arm in &step.case_arms {
             if let Some(target) = &arm.transition {
                 if !state_names.contains(target) {
@@ -4024,6 +4151,13 @@ pub mod validate {
             }
 
             let mut arm_scope = scope.clone();
+            if let Some(scrutinee) = &scrutinee {
+                arm_scope.apply_case_pattern_refinements(
+                    scrutinee,
+                    &arm.pattern,
+                    nil_previously_matched,
+                );
+            }
             validate_steps(
                 diagnostics,
                 state_name,
@@ -4032,6 +4166,7 @@ pub mod validate {
                 &arm.steps,
                 &mut arm_scope,
             );
+            nil_previously_matched |= case_pattern_matches_nil(&arm.pattern);
         }
     }
 
@@ -4130,7 +4265,7 @@ pub mod validate {
         let Some(item_schema) = collection_item_schema(ir, &right_schema) else {
             diagnostics.push(error_at(
                 format!(
-                    "{owner} uses `in` with `{}` collection; expected list or set",
+                    "{owner} uses `in` with `{}` collection; expected list, set, or map",
                     schema_kind(&right_schema)
                 ),
                 span,
@@ -4194,6 +4329,8 @@ pub mod validate {
             crate::schema::Schema::List { inner } | crate::schema::Schema::Set { inner } => {
                 Some((**inner).clone())
             }
+            crate::schema::Schema::Map { key, .. } => Some((**key).clone()),
+            crate::schema::Schema::Optional { inner } => collection_item_schema(ir, inner),
             crate::schema::Schema::Ref { name } => ir
                 .types
                 .get(name)
@@ -4215,9 +4352,45 @@ pub mod validate {
             | crate::schema::Schema::Agent
             | crate::schema::Schema::Literal { .. }
             | crate::schema::Schema::Enum { .. }
-            | crate::schema::Schema::Optional { .. }
-            | crate::schema::Schema::Map { .. }
             | crate::schema::Schema::Record { .. } => None,
+        }
+    }
+
+    fn map_key_schema(
+        ir: &WorkflowIr,
+        schema: &crate::schema::Schema,
+    ) -> Option<crate::schema::Schema> {
+        match schema {
+            crate::schema::Schema::Json => Some(crate::schema::Schema::Json),
+            crate::schema::Schema::Map { key, .. } => Some((**key).clone()),
+            crate::schema::Schema::Optional { inner } => map_key_schema(ir, inner),
+            crate::schema::Schema::Ref { name } => ir
+                .types
+                .get(name)
+                .and_then(|schema| map_key_schema(ir, schema)),
+            crate::schema::Schema::Union { variants } => variants
+                .iter()
+                .find_map(|schema| map_key_schema(ir, schema)),
+            _ => None,
+        }
+    }
+
+    fn map_value_schema(
+        ir: &WorkflowIr,
+        schema: &crate::schema::Schema,
+    ) -> Option<crate::schema::Schema> {
+        match schema {
+            crate::schema::Schema::Json => Some(crate::schema::Schema::Json),
+            crate::schema::Schema::Map { value, .. } => Some((**value).clone()),
+            crate::schema::Schema::Optional { inner } => map_value_schema(ir, inner),
+            crate::schema::Schema::Ref { name } => ir
+                .types
+                .get(name)
+                .and_then(|schema| map_value_schema(ir, schema)),
+            crate::schema::Schema::Union { variants } => variants
+                .iter()
+                .find_map(|schema| map_value_schema(ir, schema)),
+            _ => None,
         }
     }
 
@@ -4251,7 +4424,22 @@ pub mod validate {
             };
 
             if let Some((_, nested_path)) = rest.split_once('.') {
-                validate_schema_path(diagnostics, owner, ir, schema, nested_path, path, span);
+                let context = SchemaPathValidation {
+                    owner,
+                    ir,
+                    scope,
+                    full_path: path,
+                    span,
+                };
+                let current_path = format!("data.{field}");
+                validate_schema_path_inner(
+                    diagnostics,
+                    &context,
+                    schema,
+                    nested_path,
+                    &current_path,
+                    0,
+                );
             }
             return;
         }
@@ -4259,14 +4447,35 @@ pub mod validate {
         if scope.event_binding.as_deref() == Some(root) {
             if let Some(event_name) = &scope.event_name {
                 if let Some(event) = ir.events.get(event_name) {
-                    validate_schema_path(diagnostics, owner, ir, &event.payload, rest, path, span);
+                    let context = SchemaPathValidation {
+                        owner,
+                        ir,
+                        scope,
+                        span,
+                        full_path: path,
+                    };
+                    validate_schema_path_inner(
+                        diagnostics,
+                        &context,
+                        &event.payload,
+                        rest,
+                        root,
+                        0,
+                    );
                 }
             }
             return;
         }
 
         if let Some(schema) = scope.locals.get(root) {
-            validate_schema_path(diagnostics, owner, ir, schema, rest, path, span);
+            let context = SchemaPathValidation {
+                owner,
+                ir,
+                scope,
+                span,
+                full_path: path,
+            };
+            validate_schema_path_inner(diagnostics, &context, schema, rest, root, 0);
             return;
         }
 
@@ -4276,27 +4485,10 @@ pub mod validate {
         ));
     }
 
-    fn validate_schema_path(
-        diagnostics: &mut Vec<Diagnostic>,
-        owner: &str,
-        ir: &WorkflowIr,
-        schema: &crate::schema::Schema,
-        nested_path: &str,
-        full_path: &str,
-        span: &Option<SourceSpan>,
-    ) {
-        let context = SchemaPathValidation {
-            owner,
-            ir,
-            full_path,
-            span,
-        };
-        validate_schema_path_inner(diagnostics, &context, schema, nested_path, 0);
-    }
-
     struct SchemaPathValidation<'a> {
         owner: &'a str,
         ir: &'a WorkflowIr,
+        scope: &'a ExprScope,
         full_path: &'a str,
         span: &'a Option<SourceSpan>,
     }
@@ -4306,6 +4498,7 @@ pub mod validate {
         context: &SchemaPathValidation<'_>,
         schema: &crate::schema::Schema,
         nested_path: &str,
+        current_path: &str,
         depth: usize,
     ) {
         if nested_path.is_empty() || depth > 16 {
@@ -4314,7 +4507,23 @@ pub mod validate {
 
         match schema {
             crate::schema::Schema::Optional { inner } => {
-                validate_schema_path_inner(diagnostics, context, inner, nested_path, depth + 1);
+                if !context.scope.non_null_paths.contains(current_path) {
+                    diagnostics.push(error_at(
+                        format!(
+                            "{} references nested field through optional path `{current_path}` in `{}`; guard `{current_path} != nil` first",
+                            context.owner, context.full_path
+                        ),
+                        context.span,
+                    ));
+                }
+                validate_schema_path_inner(
+                    diagnostics,
+                    context,
+                    inner,
+                    nested_path,
+                    current_path,
+                    depth + 1,
+                );
             }
             crate::schema::Schema::Ref { name } => {
                 if let Some(resolved) = context.ir.types.get(name) {
@@ -4323,6 +4532,7 @@ pub mod validate {
                         context,
                         resolved,
                         nested_path,
+                        current_path,
                         depth + 1,
                     );
                 }
@@ -4343,7 +4553,15 @@ pub mod validate {
                     return;
                 };
 
-                validate_schema_path_inner(diagnostics, context, &field.schema, rest, depth + 1);
+                let field_path = format!("{current_path}.{segment}");
+                validate_schema_path_inner(
+                    diagnostics,
+                    context,
+                    &field.schema,
+                    rest,
+                    &field_path,
+                    depth + 1,
+                );
             }
             crate::schema::Schema::Union { variants } => {
                 if !variants
@@ -4427,7 +4645,7 @@ pub mod validate {
         match expr {
             Expr::Literal { value } => Some(infer_literal_schema(value)),
             Expr::Path { path } => resolve_path_schema(ir, scope, path),
-            Expr::Call { name, .. } => infer_call_schema(ir, scope, name),
+            Expr::Call { name, args } => infer_call_schema(ir, scope, name, args),
             Expr::Object { fields } => Some(crate::schema::Schema::Record {
                 fields: fields
                     .iter()
@@ -4509,6 +4727,7 @@ pub mod validate {
         ir: &WorkflowIr,
         scope: &ExprScope,
         name: &str,
+        args: &[Expr],
     ) -> Option<crate::schema::Schema> {
         if let Some(function_name) = name.strip_prefix("coerce ") {
             return ir
@@ -4525,11 +4744,58 @@ pub mod validate {
             return Some(crate::schema::Schema::Time);
         }
 
-        if name == "elapsedSince" {
+        if name == "elapsedSince" || name == "time.elapsedSince" {
             return Some(crate::schema::Schema::Duration);
         }
 
+        match name {
+            "list.length" => return Some(crate::schema::Schema::Int),
+            "list.isEmpty" | "list.contains" => return Some(crate::schema::Schema::Boolean),
+            "list.append" | "list.remove" => {
+                return args
+                    .first()
+                    .and_then(|arg| infer_expr_schema(ir, scope, arg))
+                    .or(Some(crate::schema::Schema::Json));
+            }
+            "list.first" => {
+                return args
+                    .first()
+                    .and_then(|arg| infer_expr_schema(ir, scope, arg))
+                    .and_then(|schema| collection_item_schema(ir, &schema))
+                    .map(|schema| crate::schema::Schema::Optional {
+                        inner: Box::new(schema),
+                    })
+                    .or(Some(crate::schema::Schema::Json));
+            }
+            "map.get" => {
+                return args
+                    .first()
+                    .and_then(|arg| infer_expr_schema(ir, scope, arg))
+                    .and_then(|schema| map_value_schema(ir, &schema))
+                    .map(|schema| crate::schema::Schema::Optional {
+                        inner: Box::new(schema),
+                    })
+                    .or(Some(crate::schema::Schema::Json));
+            }
+            "map.set" | "map.remove" => {
+                return args
+                    .first()
+                    .and_then(|arg| infer_expr_schema(ir, scope, arg))
+                    .or(Some(crate::schema::Schema::Json));
+            }
+            "map.containsKey" => return Some(crate::schema::Schema::Boolean),
+            "text.trim" => return Some(crate::schema::Schema::String),
+            "text.contains" | "text.startsWith" | "text.endsWith" | "text.matchesGlob" => {
+                return Some(crate::schema::Schema::Boolean);
+            }
+            _ => {}
+        }
+
         if let Some(receiver) = name.strip_suffix(".append") {
+            return resolve_path_schema(ir, scope, receiver);
+        }
+
+        if let Some(receiver) = name.strip_suffix(".remove") {
             return resolve_path_schema(ir, scope, receiver);
         }
 
@@ -4546,20 +4812,42 @@ pub mod validate {
         if root == "data" {
             let (field, nested) = rest.split_once('.').unwrap_or((rest, ""));
             let schema = ir.context_schema.get(field)?;
-            return resolve_schema_path(ir, schema, nested, 0);
+            let resolved = resolve_schema_path(ir, schema, nested, 0)?;
+            return Some(refine_non_null_path(scope, path, resolved));
         }
 
         if scope.event_binding.as_deref() == Some(root) {
             let event_name = scope.event_name.as_ref()?;
             let schema = &ir.events.get(event_name)?.payload;
-            return resolve_schema_path(ir, schema, rest, 0);
+            let resolved = resolve_schema_path(ir, schema, rest, 0)?;
+            return Some(refine_non_null_path(scope, path, resolved));
         }
 
         if let Some(schema) = scope.locals.get(root) {
-            return resolve_schema_path(ir, schema, rest, 0);
+            let resolved = resolve_schema_path(ir, schema, rest, 0)?;
+            return Some(refine_non_null_path(scope, path, resolved));
         }
 
         None
+    }
+
+    fn refine_non_null_path(
+        scope: &ExprScope,
+        path: &str,
+        schema: crate::schema::Schema,
+    ) -> crate::schema::Schema {
+        if scope.non_null_paths.contains(path) {
+            strip_outer_optional(schema)
+        } else {
+            schema
+        }
+    }
+
+    fn strip_outer_optional(schema: crate::schema::Schema) -> crate::schema::Schema {
+        match schema {
+            crate::schema::Schema::Optional { inner } => *inner,
+            schema => schema,
+        }
     }
 
     fn resolve_schema_path(
@@ -4618,6 +4906,12 @@ pub mod validate {
         span: &Option<SourceSpan>,
     ) {
         let arity = args.len();
+        let context = CallValidation {
+            owner,
+            ir,
+            scope,
+            span,
+        };
         if let Some(function_name) = name.strip_prefix("coerce ") {
             validate_coerce_call(
                 diagnostics,
@@ -4646,19 +4940,17 @@ pub mod validate {
                 }
                 return;
             }
-            "elapsedSince" => {
+            "elapsedSince" | "time.elapsedSince" => {
                 if arity != 1 {
                     diagnostics.push(error_at(
-                        format!(
-                            "{owner} calls `elapsedSince` with {arity} argument(s); expected 1"
-                        ),
+                        format!("{owner} calls `{name}` with {arity} argument(s); expected 1"),
                         span,
                     ));
                 } else if let Some(schema) = infer_expr_schema(ir, scope, &args[0]) {
                     if !schema_accepts_time(&schema) {
                         diagnostics.push(error_at(
                             format!(
-                                "{owner} calls `elapsedSince` with `{}` argument; expected `time` or `time?`",
+                                "{owner} calls `{name}` with `{}` argument; expected `time` or `time?`",
                                 schema_kind(&schema)
                             ),
                             span,
@@ -4667,11 +4959,38 @@ pub mod validate {
                 }
                 return;
             }
+            "list.length" | "list.isEmpty" | "list.first" => {
+                validate_list_helper(diagnostics, &context, name, args, 1, None);
+                return;
+            }
+            "list.contains" | "list.append" | "list.remove" => {
+                validate_list_helper(diagnostics, &context, name, args, 2, Some(1));
+                return;
+            }
+            "map.get" | "map.remove" | "map.containsKey" => {
+                validate_map_helper(diagnostics, &context, name, args, 2, None);
+                return;
+            }
+            "map.set" => {
+                validate_map_helper(diagnostics, &context, name, args, 3, Some(2));
+                return;
+            }
+            "text.trim" => {
+                validate_text_helper(diagnostics, &context, name, args, 1);
+                return;
+            }
+            "text.contains" | "text.startsWith" | "text.endsWith" | "text.matchesGlob" => {
+                validate_text_helper(diagnostics, &context, name, args, 2);
+                return;
+            }
             _ => {}
         }
 
-        if name.ends_with(".append") {
-            let receiver = name.trim_end_matches(".append");
+        if name.ends_with(".append") || name.ends_with(".remove") {
+            let receiver = name
+                .strip_suffix(".append")
+                .or_else(|| name.strip_suffix(".remove"))
+                .unwrap_or(name);
             validate_path(diagnostics, owner, ir, scope, receiver, span);
             if arity != 1 {
                 diagnostics.push(error_at(
@@ -4684,7 +5003,7 @@ pub mod validate {
                     owner,
                     ir,
                     scope,
-                    AppendArgument {
+                    CollectionItemArgument {
                         call_name: name,
                         receiver_schema: &receiver_schema,
                         arg: &args[0],
@@ -4708,6 +5027,13 @@ pub mod validate {
         ));
     }
 
+    struct CallValidation<'a> {
+        owner: &'a str,
+        ir: &'a WorkflowIr,
+        scope: &'a ExprScope,
+        span: &'a Option<SourceSpan>,
+    }
+
     fn schema_accepts_time(schema: &crate::schema::Schema) -> bool {
         match schema {
             crate::schema::Schema::Time | crate::schema::Schema::Json => true,
@@ -4717,12 +5043,179 @@ pub mod validate {
         }
     }
 
+    fn validate_list_helper(
+        diagnostics: &mut Vec<Diagnostic>,
+        context: &CallValidation<'_>,
+        name: &str,
+        args: &[Expr],
+        expected_arity: usize,
+        item_arg_index: Option<usize>,
+    ) {
+        if args.len() != expected_arity {
+            diagnostics.push(error_at(
+                format!(
+                    "{} calls `{name}` with {} argument(s); expected {expected_arity}",
+                    context.owner,
+                    args.len()
+                ),
+                context.span,
+            ));
+            return;
+        }
+
+        let Some(receiver_schema) = infer_expr_schema(context.ir, context.scope, &args[0]) else {
+            return;
+        };
+        let Some(item_schema) = append_item_schema(context.ir, &receiver_schema) else {
+            if !matches!(receiver_schema, crate::schema::Schema::Json) {
+                diagnostics.push(error_at(
+                    format!(
+                        "{} calls `{name}` with `{}` collection; expected list or set",
+                        context.owner,
+                        schema_kind(&receiver_schema)
+                    ),
+                    context.span,
+                ));
+            }
+            return;
+        };
+
+        if let Some(index) = item_arg_index {
+            let Some(arg_schema) = infer_expr_schema(context.ir, context.scope, &args[index])
+            else {
+                return;
+            };
+            if !schema_accepts_schema(context.ir, &item_schema, &arg_schema, 0) {
+                diagnostics.push(error_at(
+                    format!(
+                        "{} calls `{name}` with `{}` item; expected `{}`",
+                        context.owner,
+                        schema_kind(&arg_schema),
+                        schema_kind(&item_schema)
+                    ),
+                    context.span,
+                ));
+            }
+        }
+    }
+
+    fn validate_map_helper(
+        diagnostics: &mut Vec<Diagnostic>,
+        context: &CallValidation<'_>,
+        name: &str,
+        args: &[Expr],
+        expected_arity: usize,
+        value_arg_index: Option<usize>,
+    ) {
+        if args.len() != expected_arity {
+            diagnostics.push(error_at(
+                format!(
+                    "{} calls `{name}` with {} argument(s); expected {expected_arity}",
+                    context.owner,
+                    args.len()
+                ),
+                context.span,
+            ));
+            return;
+        }
+
+        let Some(map_schema) = infer_expr_schema(context.ir, context.scope, &args[0]) else {
+            return;
+        };
+        let Some(key_schema) = map_key_schema(context.ir, &map_schema) else {
+            if !matches!(map_schema, crate::schema::Schema::Json) {
+                diagnostics.push(error_at(
+                    format!(
+                        "{} calls `{name}` with `{}` map; expected map",
+                        context.owner,
+                        schema_kind(&map_schema)
+                    ),
+                    context.span,
+                ));
+            }
+            return;
+        };
+
+        let Some(actual_key_schema) = infer_expr_schema(context.ir, context.scope, &args[1]) else {
+            return;
+        };
+        if !schema_accepts_schema(context.ir, &key_schema, &actual_key_schema, 0) {
+            diagnostics.push(error_at(
+                format!(
+                    "{} calls `{name}` with `{}` key; expected `{}`",
+                    context.owner,
+                    schema_kind(&actual_key_schema),
+                    schema_kind(&key_schema)
+                ),
+                context.span,
+            ));
+        }
+
+        if let Some(index) = value_arg_index {
+            let Some(value_schema) = map_value_schema(context.ir, &map_schema) else {
+                return;
+            };
+            let Some(actual_value_schema) =
+                infer_expr_schema(context.ir, context.scope, &args[index])
+            else {
+                return;
+            };
+            if !schema_accepts_schema(context.ir, &value_schema, &actual_value_schema, 0) {
+                diagnostics.push(error_at(
+                    format!(
+                        "{} calls `{name}` with `{}` value; expected `{}`",
+                        context.owner,
+                        schema_kind(&actual_value_schema),
+                        schema_kind(&value_schema)
+                    ),
+                    context.span,
+                ));
+            }
+        }
+    }
+
+    fn validate_text_helper(
+        diagnostics: &mut Vec<Diagnostic>,
+        context: &CallValidation<'_>,
+        name: &str,
+        args: &[Expr],
+        expected_arity: usize,
+    ) {
+        if args.len() != expected_arity {
+            diagnostics.push(error_at(
+                format!(
+                    "{} calls `{name}` with {} argument(s); expected {expected_arity}",
+                    context.owner,
+                    args.len()
+                ),
+                context.span,
+            ));
+            return;
+        }
+
+        for arg in args {
+            let Some(schema) = infer_expr_schema(context.ir, context.scope, arg) else {
+                continue;
+            };
+            if !schema_accepts_schema(context.ir, &crate::schema::Schema::String, &schema, 0) {
+                diagnostics.push(error_at(
+                    format!(
+                        "{} calls `{name}` with `{}` text argument; expected `string`",
+                        context.owner,
+                        schema_kind(&schema)
+                    ),
+                    context.span,
+                ));
+            }
+        }
+    }
+
     fn validate_append_argument(
         diagnostics: &mut Vec<Diagnostic>,
         owner: &str,
         ir: &WorkflowIr,
         scope: &ExprScope,
-        append: AppendArgument<'_>,
+        append: CollectionItemArgument<'_>,
         span: &Option<SourceSpan>,
     ) {
         let Some(item_schema) = append_item_schema(ir, append.receiver_schema) else {
@@ -4756,7 +5249,7 @@ pub mod validate {
         }
     }
 
-    struct AppendArgument<'a> {
+    struct CollectionItemArgument<'a> {
         call_name: &'a str,
         receiver_schema: &'a crate::schema::Schema,
         arg: &'a Expr,
@@ -4985,9 +5478,19 @@ pub mod validate {
             return;
         };
 
-        if !ir.agents.contains_key(agent) {
+        let Some(agent_decl) = ir.agents.get(agent) else {
             diagnostics.push(error_at(
                 format!("state `{state_name}` uses undeclared agent `{agent}`"),
+                &step.span,
+            ));
+            return;
+        };
+
+        if step.effect == "start"
+            && matches!(agent_decl.target, crate::ir::AgentTarget::Thread { .. })
+        {
+            diagnostics.push(error_at(
+                format!("state `{state_name}` starts thread agent `{agent}`; use `send` for thread agents or declare a codingAgent/adapter target"),
                 &step.span,
             ));
         }
@@ -5327,6 +5830,7 @@ machine TopLevel
 initial done
 
 agent director = thread("director")
+agent external = adapter("untie")
 agent worker = codingAgent() {
   maxActive 4
 }
@@ -5375,6 +5879,12 @@ state done {
             ir.agents["director"].target,
             crate::ir::AgentTarget::Thread {
                 name: "director".to_string()
+            }
+        );
+        assert_eq!(
+            ir.agents["external"].target,
+            crate::ir::AgentTarget::Adapter {
+                name: "untie".to_string()
             }
         );
         assert_eq!(
@@ -6113,6 +6623,76 @@ state done {
     }
 
     #[test]
+    fn validation_rejects_reserved_timer_and_terminal_effects_in_ir() {
+        let mut ir = crate::parse_source(
+            r#"
+machine ReservedEffects
+initial waiting
+
+state waiting {
+  final
+}
+"#,
+        )
+        .expect("source parses");
+        ir.statechart.states.get_mut("waiting").unwrap().entry = vec![
+            crate::ir::Step {
+                effect: "sleep".to_string(),
+                args: std::collections::BTreeMap::new(),
+                assign: None,
+                case_arms: Vec::new(),
+                span: None,
+            },
+            crate::ir::Step {
+                effect: "stop".to_string(),
+                args: std::collections::BTreeMap::new(),
+                assign: None,
+                case_arms: Vec::new(),
+                span: None,
+            },
+        ];
+
+        let report = crate::validate_ir(&ir);
+
+        assert!(!report.is_ok());
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unknown effect `sleep`")));
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unknown effect `stop`")));
+    }
+
+    #[test]
+    fn validation_rejects_starting_thread_agents() {
+        let source = r#"
+machine BadStartTarget
+initial waiting
+
+agent director = thread("director")
+
+event go {}
+
+state waiting {
+  on go {
+    start director
+    stay
+  }
+}
+"#;
+
+        let ir = crate::parse_source(source).expect("source parses");
+        let report = crate::validate_ir(&ir);
+
+        assert!(!report.is_ok());
+        assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("starts thread agent `director`; use `send`")));
+    }
+
+    #[test]
     fn validation_rejects_raising_unknown_events() {
         let source = r#"
 machine BadRaise
@@ -6372,6 +6952,95 @@ state waiting {
     }
 
     #[test]
+    fn validation_accepts_documented_collection_map_and_text_helpers() {
+        let source = r#"
+machine HelperWorkflow
+initial waiting
+
+data {
+  seen string[] = []
+  names map<string, string> = {}
+  first string? = nil
+  found string? = nil
+  hasRun bool = false
+  count int = 0
+}
+
+event go {
+  id string
+  message string
+}
+
+state waiting {
+  on go as evt
+    guard text.contains(evt.message, "ready") || list.isEmpty(data.seen)
+  {
+    assign data.seen = list.append(data.seen, evt.id)
+    assign data.seen = data.seen.remove("old")
+    assign data.first = list.first(data.seen)
+    assign data.names = map.set(data.names, evt.id, text.trim(evt.message))
+    assign data.found = map.get(data.names, evt.id)
+    assign data.hasRun = list.contains(data.seen, evt.id) && map.containsKey(data.names, evt.id)
+    assign data.count = list.length(data.seen)
+  }
+}
+"#;
+
+        let ir = crate::parse_source(source).expect("source parses");
+        let report = crate::validate_ir(&ir);
+        assert!(report.is_ok(), "{:#?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validation_rejects_invalid_collection_map_and_text_helpers() {
+        let source = r#"
+machine BadHelperWorkflow
+initial waiting
+
+data {
+  seen string[] = []
+  counts map<string, int> = {}
+  count int = 0
+}
+
+event go {
+  id string
+  numeric int
+}
+
+state waiting {
+  on go as evt {
+    assign data.count = list.length(data.count)
+    assign data.seen = list.append(data.seen, evt.numeric)
+    assign data.counts = map.set(data.counts, evt.numeric, 1)
+    assign data.counts = map.set(data.counts, evt.id, evt.id)
+    assign data.count = text.contains(evt.numeric, "x")
+  }
+}
+"#;
+
+        let ir = crate::parse_source(source).expect("source parses");
+        let report = crate::validate_ir(&ir);
+
+        assert!(!report.is_ok());
+        assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("calls `list.length` with `int` collection; expected list or set")));
+        assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("calls `list.append` with `int` item; expected `string`")));
+        assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("calls `map.set` with `int` key; expected `string`")));
+        assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("calls `map.set` with `string` value; expected `int`")));
+        assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("calls `text.contains` with `int` text argument; expected `string`")));
+    }
+
+    #[test]
     fn validation_rejects_non_boolean_guards_and_boolean_operands() {
         let source = r#"
 machine BadGuardTypes
@@ -6560,7 +7229,7 @@ state waiting {
         assert!(!report.is_ok());
         assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
             .message
-            .contains("uses `in` with `int` collection; expected list or set")));
+            .contains("uses `in` with `int` collection; expected list, set, or map")));
         assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("uses `in` with `int` item; expected `string`")));
@@ -6653,6 +7322,371 @@ state waiting {
         assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("assigns `optional` value to `data.count`; expected `int`")));
+    }
+
+    #[test]
+    fn validation_allows_guarded_optional_assignment_to_required_data() {
+        let source = r#"
+machine GuardedOptionalAssignment
+initial waiting
+
+data {
+  count int = 0
+}
+
+event go {
+  maybeCount int?
+}
+
+state waiting {
+  on go as evt
+    guard evt.maybeCount != nil
+  {
+    assign data.count = evt.maybeCount
+  }
+}
+"#;
+
+        let ir = crate::parse_source(source).expect("source parses");
+        let report = crate::validate_ir(&ir);
+
+        assert!(report.is_ok(), "{:#?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validation_allows_reversed_guarded_optional_assignment_to_required_data() {
+        let source = r#"
+machine ReversedGuardedOptionalAssignment
+initial waiting
+
+data {
+  maybeCount int? = nil
+  count int = 0
+}
+
+event go {}
+
+state waiting {
+  on go
+    guard nil != data.maybeCount
+  {
+    assign data.count = data.maybeCount
+  }
+}
+"#;
+
+        let ir = crate::parse_source(source).expect("source parses");
+        let report = crate::validate_ir(&ir);
+
+        assert!(report.is_ok(), "{:#?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validation_rejects_unguarded_nested_optional_field_access() {
+        let source = r#"
+machine BadNestedOptionalAccess
+initial waiting
+
+class User {
+  status string
+}
+
+data {
+  user User? = nil
+  status string = ""
+}
+
+event go {}
+
+state waiting {
+  on go {
+    assign data.status = data.user.status
+  }
+}
+"#;
+
+        let ir = crate::parse_source(source).expect("source parses");
+        let report = crate::validate_ir(&ir);
+
+        assert!(!report.is_ok());
+        assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("references nested field through optional path `data.user`")));
+    }
+
+    #[test]
+    fn validation_allows_guarded_nested_optional_field_access() {
+        let source = r#"
+machine GuardedNestedOptionalAccess
+initial waiting
+
+class User {
+  status string
+}
+
+data {
+  user User? = nil
+  status string = ""
+}
+
+event go {}
+
+state waiting {
+  on go
+    guard data.user != nil
+  {
+    assign data.status = data.user.status
+  }
+}
+"#;
+
+        let ir = crate::parse_source(source).expect("source parses");
+        let report = crate::validate_ir(&ir);
+
+        assert!(report.is_ok(), "{:#?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validation_allows_negated_nil_guarded_nested_optional_field_access() {
+        let source = r#"
+machine NegatedNilGuardedNestedOptionalAccess
+initial waiting
+
+class User {
+  status string
+}
+
+data {
+  user User? = nil
+  status string = ""
+}
+
+event go {}
+
+state waiting {
+  on go
+    guard !(data.user == nil)
+  {
+    assign data.status = data.user.status
+  }
+}
+"#;
+
+        let ir = crate::parse_source(source).expect("source parses");
+        let report = crate::validate_ir(&ir);
+
+        assert!(report.is_ok(), "{:#?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validation_allows_shared_or_guard_optional_refinement() {
+        let source = r#"
+machine OrGuardedNestedOptionalAccess
+initial waiting
+
+class User {
+  status string
+}
+
+data {
+  user User? = nil
+  urgent bool = false
+  status string = ""
+}
+
+event go {}
+
+state waiting {
+  on go
+    guard (data.user != nil && data.urgent) || (data.user != nil && !data.urgent)
+  {
+    assign data.status = data.user.status
+  }
+}
+"#;
+
+        let ir = crate::parse_source(source).expect("source parses");
+        let report = crate::validate_ir(&ir);
+
+        assert!(report.is_ok(), "{:#?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validation_allows_demorgan_guard_optional_refinement() {
+        let source = r#"
+machine DemorganGuardedNestedOptionalAccess
+initial waiting
+
+class User {
+  status string
+}
+
+data {
+  user User? = nil
+  blocked bool = false
+  status string = ""
+}
+
+event go {}
+
+state waiting {
+  on go
+    guard !(data.user == nil || data.blocked)
+  {
+    assign data.status = data.user.status
+  }
+}
+"#;
+
+        let ir = crate::parse_source(source).expect("source parses");
+        let report = crate::validate_ir(&ir);
+
+        assert!(report.is_ok(), "{:#?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validation_allows_double_negated_guard_optional_refinement() {
+        let source = r#"
+machine DoubleNegatedGuardedNestedOptionalAccess
+initial waiting
+
+class User {
+  status string
+}
+
+data {
+  user User? = nil
+  status string = ""
+}
+
+event go {}
+
+state waiting {
+  on go
+    guard !!(data.user != nil)
+  {
+    assign data.status = data.user.status
+  }
+}
+"#;
+
+        let ir = crate::parse_source(source).expect("source parses");
+        let report = crate::validate_ir(&ir);
+
+        assert!(report.is_ok(), "{:#?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validation_allows_case_literal_to_refine_optional_assignment() {
+        let source = r#"
+machine CaseRefinesOptionalAssignment
+initial waiting
+
+data {
+  status string = ""
+}
+
+event go {
+  maybeStatus string?
+}
+
+state waiting {
+  on go as evt {
+    case evt.maybeStatus {
+      "ready" -> {
+        assign data.status = evt.maybeStatus
+        stay
+      }
+
+      _ -> {
+        stay
+      }
+    }
+  }
+}
+"#;
+
+        let ir = crate::parse_source(source).expect("source parses");
+        let report = crate::validate_ir(&ir);
+
+        assert!(report.is_ok(), "{:#?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validation_allows_case_nil_then_wildcard_to_refine_optional_field_access() {
+        let source = r#"
+machine CaseRefinesNestedOptionalAccess
+initial waiting
+
+class User {
+  status string
+}
+
+data {
+  user User? = nil
+  status string = ""
+}
+
+event go {}
+
+state waiting {
+  on go {
+    case data.user {
+      nil -> {
+        stay
+      }
+
+      _ -> {
+        assign data.status = data.user.status
+        stay
+      }
+    }
+  }
+}
+"#;
+
+        let ir = crate::parse_source(source).expect("source parses");
+        let report = crate::validate_ir(&ir);
+
+        assert!(report.is_ok(), "{:#?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validation_rejects_case_wildcard_without_nil_refinement_for_optional_field_access() {
+        let source = r#"
+machine CaseWildcardDoesNotRefineNestedOptionalAccess
+initial waiting
+
+class User {
+  status string
+}
+
+data {
+  user User? = nil
+  status string = ""
+}
+
+event go {}
+
+state waiting {
+  on go {
+    case data.user {
+      _ -> {
+        assign data.status = data.user.status
+        stay
+      }
+    }
+  }
+}
+"#;
+
+        let ir = crate::parse_source(source).expect("source parses");
+        let report = crate::validate_ir(&ir);
+
+        assert!(!report.is_ok());
+        assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("references nested field through optional path `data.user`")));
     }
 
     #[test]

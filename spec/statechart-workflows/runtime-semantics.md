@@ -13,7 +13,7 @@ and allowed by the active contracts.
 It may call:
 
 - un-tie agent/session APIs
-- generated BAML functions for `coerce`
+- BAML HTTP functions for `coerce`
 - allowlisted adapter actions
 - legacy Armature APIs only through explicit compatibility adapters, if used
 
@@ -37,7 +37,6 @@ data
 event_cursor
 seen_run_ids
 active_invocations
-timers
 last_transition_at
 failure_count
 ```
@@ -63,7 +62,7 @@ Detailed effect semantics are defined in [effects.md](effects.md).
 
 ## Event Processing
 
-Events enter the interpreter from adapters, timers, workflow `raise` effects,
+Events enter the interpreter from adapters, workflow `raise` effects,
 compatibility bridges, or explicit user actions.
 
 Every event has:
@@ -96,6 +95,13 @@ Guards are pure expressions over:
 Guards cannot perform effects. They cannot call agents. They cannot inspect
 undeclared files. They cannot invoke arbitrary code.
 
+The expression language is intentionally small. It supports orchestration-grade
+field access, matching, boolean guards, small collection helpers, string
+interpolation, time/duration helpers, and typed value calls. It does not support
+loops, lambdas, user-defined functions, general map/filter/reduce, numeric
+libraries, regex, or inline multimodal manipulation. The exact primitive set is
+defined in [expression-primitives.md](expression-primitives.md).
+
 ## Actions And Effects
 
 Actions are declared in the statechart. Effects are the runtime operations
@@ -105,7 +111,7 @@ For example:
 
 ```armature
 start worker {
-  workItem selection.workItemId
+  workItemId selection.workItemId
 }
 ```
 
@@ -116,7 +122,7 @@ compiles to an effect like:
   "type": "start",
   "agent": "worker",
   "input": {
-    "work_item": "impl-017"
+    "workItemId": "impl-017"
   },
   "idempotency_key": "workflow/spec-implementation/state/selecting/event/evt-123/action/0"
 }
@@ -130,8 +136,10 @@ Before dispatch, the runtime verifies:
 - the requested input matches the agent contract
 - the target thread/session sandbox can satisfy the requested capability set
 
-If validation fails, the transition is blocked and the workflow enters a
-diagnostic state or creates a human-review obligation.
+If validation fails before commit, the transition is not committed. The runtime
+marks the triggering event failed, records durable diagnostics, and leaves the
+workflow in its pre-event state. If a workflow wants a diagnostic state or
+human-review obligation, it must model that path explicitly.
 
 After a handled event, entry actions, and `always` transitions have reached a
 stable state, the runtime evaluates expression invariants over the resulting
@@ -155,11 +163,19 @@ preferred in examples where model-dependent control flow should be obvious.
 `coerce` calls are deterministic from the workflow runtime's point of view once
 the model response is recorded.
 
+The selected v1 backend is BAML HTTP. The runtime either connects to a supplied
+`--baml-url` or, in later managed mode, launches `baml-cli serve --from
+<baml_src>`. The call uses named JSON arguments derived from the `coerce`
+declaration's parameter names.
+
 The runtime records:
 
 ```text
 coerce function name
-input payload
+named input payload
+idempotency key
+BAML HTTP backend URL or managed process metadata
+BAML source artifact hash
 model/provider metadata
 raw response
 parsed structured output
@@ -167,8 +183,15 @@ validation errors, if any
 ```
 
 `coerce` is a synchronous value effect. If a BAML call fails parsing or schema
-validation, no later steps in the transition run. The statechart must have an
-explicit failure transition or the workflow enters a built-in blocked state.
+validation, no later steps in the transition run. In implemented v0 semantics,
+the triggering event is marked failed, tentative state changes are discarded,
+and durable diagnostics plus coerce failure records make the failure visible in
+`status`, `overview`, `events`, and `log`. Explicit failure transitions are
+future syntax; v0 does not create a hidden built-in blocked state.
+
+Successful coerce results are reused by idempotency key during replay. The
+runtime must not silently call BAML again for the same committed transition and
+produce a different branch decision.
 
 ## External Work
 
@@ -215,17 +238,9 @@ processed `finished` event retires them.
 
 ## Timers
 
-Timers are durable. A timer declaration records:
-
-```text
-timer name
-fire_at
-correlation scope
-repeat policy
-```
-
-Timer events are ordinary events. The runtime must tolerate missed process
-wakeups by firing overdue timers when the interpreter resumes.
+Timers are reserved for a later runtime slice. The implemented v0 runtime does
+not schedule durable timer events; recurring loops should be driven by explicit
+external observations, for example an `idle` event from a supervisor.
 
 ## Concurrency
 
@@ -259,6 +274,9 @@ one `finished` handler. The processed `finished.name` value identifies the
 agent by prefix, for example `worker-01` decrements the active count for
 `worker`. If agent names overlap, the runtime uses the longest matching started
 agent prefix, so `worker-team-01` is attributed to `worker-team`, not `worker`.
+The built-in JSON agent-file bridge uses the standard completion payload
+`{id string, name string, status string, stdoutTail string, stderrTail string,
+exitCode int?}` for `emit --agent-file` intake.
 
 ## Failure Semantics
 
@@ -281,7 +299,7 @@ internal_error
 Each category must have a default policy:
 
 - retry if safe and bounded
-- transition to blocked
+- fail visibly with a durable status/log reason
 - create human review
 - fail workflow
 
@@ -301,12 +319,17 @@ latest transition
 pending events
 blocked reason
 recent failures
-next timers
 latest coerce decisions
+latest coerce failures
+workflow data snapshot or redacted summary
 ```
 
 This is a core part of the product. If the user cannot see why the workflow is
 waiting, the workflow system has failed its purpose.
+
+`blocked reason` is not a hidden runtime state. It is reserved for explicit
+durable blockers produced by policy/runtime failure handling or by
+workflow-authored blocked states.
 
 Status is a projection over durable workflow records. It must not call adapters
 for hidden live data. Adapter observations must be recorded first as events or

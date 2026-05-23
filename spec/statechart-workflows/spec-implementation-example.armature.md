@@ -1,13 +1,11 @@
 # Spec Implementation Workflow Example
 
-Status: illustrative source sketch
+Status: implemented example fixture
 
-This file sketches the workflow we want for a large spec implementation effort.
-It replaces ad hoc director scripts with a constrained hierarchical statechart,
-BAML-shaped typed coercions, and explicit capability boundaries.
-
-The syntax is illustrative `.armature` source. It is not yet accepted by any
-parser.
+This file mirrors the live example at
+`examples/workflows/spec-implementation.armature`. The workflow replaces ad hoc
+director scripts with a constrained hierarchical statechart, BAML-shaped typed
+coercions, and explicit capability boundaries.
 
 ```armature
 machine specImplementation
@@ -27,6 +25,20 @@ agent quality = codingAgent() {
 }
 
 capability plan = adapter("implementationPlan")
+
+event finished {
+  id string
+  name string
+  status string
+  stdoutTail string
+  stderrTail string
+  exitCode int?
+}
+
+event idle {
+  activeRuns int
+  unfinishedItems int
+}
 
 enum RunKind {
   WorkerComplete
@@ -182,9 +194,9 @@ state running {
   }
 
   state watching {
-    on idle
-      guard activeRuns() == 0
-      guard plan.unfinishedItems() > 0
+    on idle as observation
+      guard observation.activeRuns == 0
+      guard observation.unfinishedItems > 0
       guard elapsedSince(data.lastIdleNudgeAt) >= 2m
     {
       assign data.lastIdleNudgeAt = now()

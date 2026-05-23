@@ -1,6 +1,6 @@
 # Workflow Storage
 
-Status: design proposal
+Status: implemented compact schema plus future normalization notes
 
 The first implementation should use SQLite for durable workflow state.
 
@@ -34,154 +34,181 @@ One workspace owns one workflow database by default:
 The database may contain multiple workflow instances. Each table includes
 `workflow_id`.
 
-## Core Tables
+## Implemented Core Tables
 
-### `workflow_instances`
+The current implementation uses a compact schema. Structured envelopes are
+stored as JSON records, while the fields needed for durable lookup and status
+queries are indexed as columns. This keeps the first implementation simple
+without losing typed validation at the runtime boundary.
 
-Materialized workflow instance metadata:
+### `armature_meta`
+
+Schema metadata:
 
 ```text
-workflow_id TEXT PRIMARY KEY
+key TEXT PRIMARY KEY NOT NULL
+value TEXT NOT NULL
+```
+
+The implemented schema version is `2`. Runtime startup rejects databases with a
+newer unsupported schema version.
+
+### `workflow_state`
+
+Current state and workflow data projection:
+
+```text
+workflow_id TEXT PRIMARY KEY NOT NULL
 workflow_name TEXT NOT NULL
-workflow_version TEXT NOT NULL
-ir_hash TEXT NOT NULL
 current_state TEXT NOT NULL
-status TEXT NOT NULL
-blocked_reason TEXT
-created_at TEXT NOT NULL
-updated_at TEXT NOT NULL
+context_json TEXT NOT NULL
 ```
 
-### `workflow_context`
-
-Materialized typed workflow-local context:
-
-```text
-workflow_id TEXT NOT NULL
-path TEXT NOT NULL
-schema_ref TEXT NOT NULL
-value_json TEXT NOT NULL
-updated_at TEXT NOT NULL
-PRIMARY KEY (workflow_id, path)
-```
-
-Every write to this table must be validated against `context_schema`.
+Every state write is validated by the interpreter against WorkflowIR semantics
+before persistence. A future normalized store may split individual data paths
+into a separate table, but v1 status reads from `context_json`.
 
 ### `workflow_events`
 
 Durable event queue:
 
 ```text
+seq INTEGER PRIMARY KEY AUTOINCREMENT
 workflow_id TEXT NOT NULL
 event_id TEXT NOT NULL
-event_type TEXT NOT NULL
-payload_json TEXT NOT NULL
-source_json TEXT
-occurred_at TEXT
-enqueued_at TEXT NOT NULL
-correlation_id TEXT
-causation_id TEXT
-dedupe_key TEXT
 status TEXT NOT NULL
-attempt_count INTEGER NOT NULL
-last_error TEXT
+event_json TEXT NOT NULL
+UNIQUE(workflow_id, event_id)
+```
+
+Indexes:
+
+```text
+(workflow_id, status, seq)
+```
+
+`event_json` contains the full typed event envelope:
+
+```json
+{
+  "event_id": "evt_...",
+  "workflow_id": "ImplementationLoop",
+  "event_type": "finished",
+  "payload": {},
+  "source": null,
+  "occurred_at": null,
+  "enqueued_at": null,
+  "correlation_id": null,
+  "causation_id": null,
+  "dedupe_key": null,
+  "status": "queued",
+  "attempt_count": 0,
+  "last_error": null
+}
+```
+
+The separate `status` column mirrors the JSON status for efficient queue and
+inspection queries. `attempt_count` and `last_error` currently live inside the
+event envelope.
+
+### `workflow_log`
+
+Append-only transition and effect records:
+
+```text
+seq INTEGER PRIMARY KEY AUTOINCREMENT
+workflow_id TEXT NOT NULL
+record_json TEXT NOT NULL
+```
+
+`record_json` stores typed transition and effect log records. Status and
+overview projections derive latest transitions, effects, active invocations,
+policy blockers, and recent failures from this append-only log.
+
+### `coerce_calls`
+
+Durable synchronous value-call records for BAML-backed `coerce` calls:
+
+```text
+seq INTEGER PRIMARY KEY AUTOINCREMENT
+coerce_call_id TEXT NOT NULL UNIQUE
+workflow_id TEXT NOT NULL
 workflow_version TEXT NOT NULL
-PRIMARY KEY or UNIQUE (workflow_id, event_id)
-```
-
-Indexes:
-
-```text
-(workflow_id, status, enqueued_at, event_id)
-(workflow_id, dedupe_key)
-```
-
-### `workflow_transitions`
-
-Append-only transition records:
-
-```text
-transition_id TEXT PRIMARY KEY
-workflow_id TEXT NOT NULL
-from_state TEXT NOT NULL
-to_state TEXT NOT NULL
+transition_id TEXT
 event_id TEXT
-guard_json TEXT
-context_patch_json TEXT NOT NULL
-sync_effects_json TEXT NOT NULL
-async_effect_ids_json TEXT NOT NULL
-diagnostics_json TEXT NOT NULL
-created_at TEXT NOT NULL
-```
-
-No updates are allowed except possibly archival metadata added later.
-
-### `workflow_effects`
-
-Append-only intended and dispatched effect records:
-
-```text
-effect_id TEXT PRIMARY KEY
-workflow_id TEXT NOT NULL
-transition_id TEXT NOT NULL
-effect TEXT NOT NULL
-category TEXT NOT NULL
-target TEXT
-args_json TEXT NOT NULL
+step_path TEXT NOT NULL
+function_name TEXT NOT NULL
 idempotency_key TEXT NOT NULL
-required_capabilities_json TEXT NOT NULL
+backend_json TEXT NOT NULL
+args_json TEXT NOT NULL
 status TEXT NOT NULL
-outcome_json TEXT
+http_status INTEGER
+raw_response_json TEXT
+parsed_output_json TEXT
 error TEXT
+duration_ms INTEGER
 created_at TEXT NOT NULL
-updated_at TEXT NOT NULL
 ```
 
 Indexes:
 
 ```text
-(workflow_id, status)
-(idempotency_key)
+(workflow_id, function_name, seq DESC)
+UNIQUE (workflow_id, idempotency_key) WHERE status = 'succeeded'
 ```
 
-### `workflow_artifacts`
+Rules:
 
-Build/model/BAML artifacts:
+- successful records are reused by idempotency key during replay
+- failed attempts are append-only and remain visible in status
+- argument and output JSON are schema-validated against WorkflowIR before use
+- raw response storage is controlled by policy and may be replaced with a
+  redaction marker before persistence, but parsed output and errors must be
+  durable enough for audit and replay
+- status projections include latest successful coerce decisions and latest
+  failures
+
+## Future Normalized Tables
+
+These tables remain reasonable future normalization targets once the compact
+schema proves insufficient for operations or analytics:
 
 ```text
-artifact_id TEXT PRIMARY KEY
-workflow_id TEXT NOT NULL
-kind TEXT NOT NULL
-path TEXT NOT NULL
-hash TEXT NOT NULL
-created_at TEXT NOT NULL
+workflow_instances
+workflow_context
+workflow_transitions
+workflow_effects
+workflow_artifacts
 ```
+
+They are not required for the current runtime because `workflow_state`,
+`workflow_events`, `workflow_log`, and `coerce_calls` already provide durable
+state, queueing, audit, coerce replay, and status projection.
 
 ## Transaction Rules
 
-Event processing uses one SQLite transaction for prepare/commit:
+Event processing uses SQLite transactions around each durable phase:
 
 ```text
 mark event processing
 evaluate transition prepare work
-append transition record
-update materialized context/current state
-append intended async effects
+append transition/effect log records
+update current state and workflow data
 mark event processed or ignored
 commit
 ```
 
-Async effect dispatch happens after commit and records outcomes in separate
-transactions.
+Dequeue marks the event `processing` and increments `attempt_count`.
+Successful/ignored event completion commits the terminal event status, state,
+and log records together. Failed transitions mark the event `failed` and append
+failure log records without saving tentative state.
 
-The event row, materialized state, transition record, and intended effect
-records are committed together. There must not be a visible state where an
-event is marked processed but the state/log projection still reflects the old
-state, or the reverse.
+Async effect dispatch records outcomes in durable effect log records. There
+must not be a visible state where an event is marked processed but the
+state/log projection still reflects the old state, or the reverse.
 
-If the process crashes after commit and before dispatch completes, recovery
-queries `workflow_effects` for intended/dispatched effects and reconciles by
-idempotency key.
+If the process crashes while an event is `processing`, recovery requeues it and
+preserves `attempt_count` for operator visibility.
 
 ## Recovery
 
@@ -190,23 +217,14 @@ On startup:
 1. Return stale `processing` events to `queued`.
 2. Preserve and increment `attempt_count` on each dequeue so repeated recovery
    is visible in status and logs.
-3. Find intended/dispatched effects without terminal outcomes.
-4. Reconcile those effects through their adapter idempotency keys.
-5. Enqueue overdue timers.
-6. Resume normal event processing.
+3. Resume normal event processing.
+
+Durable timers are reserved for a later runtime slice; current recovery has no
+timer queue to scan.
 
 ## Migration
 
-The database stores a schema version. Runtime startup must reject databases with
-newer unsupported schema versions and migrate older supported versions.
-
-The first implementation records this in an `armature_meta` table:
-
-```text
-key TEXT PRIMARY KEY
-value TEXT NOT NULL
-```
-
-with `schema_version = 1`. Migration code may create the metadata table for
-older stores that predate version tracking, but it must fail closed when the
-stored version is newer than the runtime supports.
+The database stores a schema version in `armature_meta`.
+Migration code may create the metadata table for older stores that predate
+version tracking, but it must fail closed when the stored version is newer than
+the runtime supports.

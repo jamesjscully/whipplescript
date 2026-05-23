@@ -1,4 +1,10 @@
 mod SPEC-IMPLEMENTATION is
+  *** Hand-written executable abstraction for the spec implementation workflow.
+  *** Coerce decisions are folded into nondeterministic rewrite choices. The
+  *** selected runtime executes real coerce through BAML HTTP and records
+  *** replay-safe coerce_calls, but HTTP transport and replay storage are not
+  *** modeled here.
+
   protecting BOOL .
   protecting NAT .
 
@@ -9,8 +15,8 @@ mod SPEC-IMPLEMENTATION is
   ops todo workerActive readyForQuality qualityActive doneStatus blockedStatus humanReview
     : -> Status [ctor] .
 
-  ops none idleNudge startWorker startQuality planMarkReadyForQuality planMarkDone
-      planMarkBlocked sendDirector askHuman
+  ops none idleNudge coerceChooseNextStep coerceClassifyRun startWorker startQuality
+      planMarkReadyForQuality planMarkDone planMarkBlocked sendDirector askHuman
     : -> Effect [ctor] .
 
   ops noTarget worker quality director human plan : -> Target [ctor] .

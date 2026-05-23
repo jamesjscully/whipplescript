@@ -1,6 +1,6 @@
 # Durable Event Queue
 
-Status: design proposal
+Status: implemented v0 contract plus future queue policy notes
 
 The event queue is the interpreter's durable input boundary. Events are typed,
 persisted, ordered, and processed with explicit status.
@@ -25,8 +25,9 @@ attempt_count
 last_error
 ```
 
-`event_id` is globally unique. `workflow_id` scopes the event to one workflow
-instance.
+`event_id` is immutable and unique within its `workflow_id`. `workflow_id`
+scopes the event to one workflow instance, so two workflows may contain the same
+external event id without colliding.
 
 ## Statuses
 
@@ -41,7 +42,8 @@ failed
 dead_lettered
 ```
 
-Ignored events are durable records with reasons. They are not silent drops.
+Ignored events are durable records with reasons stored in `last_error`. They
+are not silent drops.
 
 Valid status transitions:
 
@@ -59,10 +61,11 @@ No other status transition is valid.
 
 ## Ordering
 
-Within one workflow instance, the interpreter processes events in queue order:
+Within one workflow instance, the interpreter processes events in insertion
+order:
 
 ```text
-enqueued_at, then event_id
+SQLite seq
 ```
 
 The runtime processes one event at a time per workflow instance. Different
@@ -81,9 +84,14 @@ The interpreter must make event handling idempotent by recording:
 
 After a crash:
 
-- `processing` events older than the recovery lease are returned to `queued`
-- committed transitions are not re-applied
-- intended effects are reconciled by idempotency key
+- `processing` events are returned to `queued` on runtime startup
+- `attempt_count` is preserved and incremented on the next dequeue
+- committed terminal events are not re-applied
+
+The first implementation does not persist a recovery lease or a separate
+intended-effect table. Effect outcomes are durable log records, and future
+adapter-specific reconciliation can add idempotency repair without changing the
+event envelope.
 
 ## Event Admission
 
@@ -92,7 +100,6 @@ Events may enter from:
 ```text
 CLI emit
 adapters
-timers
 workflow `raise` effects
 compatibility bridges
 ```
@@ -109,7 +116,7 @@ Before enqueue:
 
 Dedupe is optional and explicit.
 
-If an event has a `dedupe_key`, the workflow may configure:
+If an event has a `dedupe_key`, a future workflow revision may configure:
 
 ```text
 allow_duplicates
@@ -118,8 +125,9 @@ replace_queued
 coalesce_payload
 ```
 
-The default is `allow_duplicates`. Semantic dedupe should usually be represented
-in workflow context, such as `seen_run_ids`, because that is modelable.
+The implemented default is `allow_duplicates`. Semantic dedupe should usually be
+represented in workflow data, such as `seenRunIds`, because that is modelable
+and visible in status.
 
 ## Fanout
 
@@ -131,26 +139,12 @@ cursor ambiguity.
 
 ## Timers
 
-Timers enqueue ordinary events when due.
-
-Timer records contain:
-
-```text
-timer_id
-workflow_id
-event_type
-payload
-fire_at
-repeat_policy
-dedupe_key
-```
-
-When the interpreter resumes after downtime, overdue timers are enqueued before
-normal event processing continues.
+Timers are reserved for a later runtime slice. The implemented v0 event queue
+does not own timer records or enqueue overdue timer events.
 
 ## Runtime Observation Events
 
-Some events are produced by runtime observers rather than `sleep`.
+Some events are produced by runtime observers.
 
 Example:
 
@@ -160,8 +154,7 @@ idle
 
 `idle` is an observation event emitted by an adapter or built-in observer when
 configured idle conditions are true, such as no active invocations and
-unfinished work. It is not the same primitive as `sleep`, though both enter the
-same durable queue.
+unfinished work.
 
 Observation events must still be declared in the workflow event schema and
 record their source.
@@ -186,15 +179,17 @@ The default during early development should be `keep_all`.
 Event commands:
 
 ```text
-armature emit <event-type> --json <payload>
-armature events [workflow]
-armature events [workflow] --status failed
-armature events [workflow] --json
-armature retry-event <event-id>
+armature emit workflow.armature --event <event-type> --payload <json>
+armature events workflow.armature
+armature events workflow.armature --status failed
+armature events workflow.armature --status dead_lettered
+armature events workflow.armature --json
+armature retry-event workflow.armature --event-id <event-id>
 ```
 
 `retry-event` is an administrative command. It should require that the event is
-currently failed or dead-lettered.
+currently failed or dead-lettered. The implemented command requeues the event,
+clears `last_error`, and preserves `attempt_count` for operator visibility.
 
 ## Type Validation
 

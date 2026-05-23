@@ -74,31 +74,49 @@ workspace configuration says otherwise.
 
 ## Agents
 
-Agent declarations normalize thread, pool, role, capabilities, and concurrency:
+Agent declarations normalize source-level thread, coding-agent, and
+adapter-backed targets plus optional concurrency:
 
 ```json
 {
+  "director": {
+    "target": {
+      "type": "thread",
+      "name": "director"
+    },
+    "max_active": null,
+    "capabilities": [],
+    "owns": [],
+    "contract": null
+  },
   "worker": {
     "target": {
-      "type": "pool",
-      "name": "spec-workers"
+      "type": "coding_agent"
     },
     "max_active": 4,
-    "capabilities": [
-      "read_repo",
-      "edit_code",
-      "run_tests",
-      "write_artifacts"
-    ],
-    "owns": ["implementation_items"],
+    "capabilities": [],
+    "owns": [],
+    "contract": null
+  },
+  "external": {
+    "target": {
+      "type": "adapter",
+      "name": "untie"
+    },
+    "max_active": null,
+    "capabilities": [],
+    "owns": [],
     "contract": null
   }
 }
 ```
 
-The runtime never infers additional authority from the target. If the target
-cannot satisfy the requested capabilities, effect dispatch fails before the
-agent is invoked.
+Thread agents are message targets. `start` targets must be `coding_agent` or
+adapter-backed agents. The runtime never infers additional authority from the
+target. `capabilities`, `owns`, and `contract` are reserved IR fields for
+future target-specific policy checks; the v0 source syntax does not populate
+them, and adapter manifests plus workspace policy remain the implemented
+authority boundary.
 
 ## Events
 
@@ -185,9 +203,12 @@ The IR records coerce function schemas and the generated BAML artifact location:
 ```json
 {
   "classifyRun": {
-    "input": {"type": "ref", "name": "RunSummary"},
+    "params": [
+      {"name": "run", "schema": {"type": "ref", "name": "RunSummary"}}
+    ],
     "output": {"type": "ref", "name": "RunClassification"},
-    "artifact": ".armature/build/workflows/SpecImplementation/baml_src/classifyRun.baml"
+    "model": "gpt-4o-mini",
+    "generated_baml_artifact": ".armature/build/workflows/SpecImplementation/baml_src/workflow.baml"
   }
 }
 ```
@@ -238,10 +259,22 @@ The statechart contains states, handlers, transitions, and final states:
     "choosing": {
       "entry": [
         {
-          "action": "coerce",
-          "function": "chooseNextStep",
-          "input": {"path": "plan.snapshot"},
-          "assign": "next"
+          "action": "let",
+          "assign": "planText",
+          "value": {
+            "op": "call",
+            "name": "plan.snapshot",
+            "args": []
+          }
+        },
+        {
+          "action": "let",
+          "assign": "next",
+          "value": {
+            "op": "call",
+            "name": "coerce chooseNextStep",
+            "args": [{"path": "planText"}]
+          }
         }
       ],
       "always": [
@@ -293,7 +326,9 @@ initializer, adapter, and event payload validation.
 
 ## Expressions
 
-Expressions are pure. The initial expression set:
+Expressions are pure unless they are declared synchronous value calls evaluated
+during transition prepare. The initial expression set is the orchestration
+kernel defined in [expression-primitives.md](expression-primitives.md):
 
 ```text
 literal
@@ -302,12 +337,19 @@ eq
 neq
 lt/lte/gt/gte
 and/or/not
-contains
-exists over bounded collections
-call to allowlisted pure helper
+membership
+object/list construction
+case patterns
+string interpolation paths
+allowlisted list/map/text/time helpers
+coerce calls
+capability value calls
 ```
 
-Expression evaluation cannot perform effects.
+Expression evaluation cannot dispatch asynchronous effects, mutate workflow
+data, call agents, inspect undeclared files, or execute host code. `coerce` and
+capability value calls are synchronous value effects with explicit schemas,
+policy, logs, and failure behavior.
 
 ## Actions
 
@@ -340,8 +382,6 @@ coerce     call BAML to produce typed data
 assign     update workflow-local durable data
 askHuman   create a visible human-review obligation
 raise      publish a typed event
-sleep      create a durable timer
-stop       enter a terminal state
 ```
 
 Adapter-backed capability effects such as `plan.snapshot()` and
@@ -356,7 +396,7 @@ Invariants are either named built-ins or supported expressions:
 [
   {
     "type": "builtin",
-    "name": "agent_capabilities_respected"
+    "name": "agentCapabilitiesRespected"
   },
   {
     "type": "expression",

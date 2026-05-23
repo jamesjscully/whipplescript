@@ -474,7 +474,8 @@ coerce classifyRun(run RunSummary) -> RunClassification {
 }
 ```
 
-`coerce` declarations lower to generated BAML functions. Their input and output
+`coerce` declarations lower to generated BAML source. Runtime `coerce`
+execution uses BAML HTTP against that generated source, so input and output
 types must be BAML-compatible.
 
 Both call forms are accepted:
@@ -564,8 +565,13 @@ membership:     in, !(x in y)
 patterns:       matches "worker-*"
 boolean:        && || !
 branching:      case
-pure built-ins: now(), elapsedSince(...), activeRuns()
+built-ins:      now(), elapsedSince(...), activeRuns()
 ```
+
+The full v1 primitive boundary is defined in
+[expression-primitives.md](expression-primitives.md). Complex computation
+belongs behind `coerce` or declared adapter capabilities, not inline workflow
+expressions.
 
 No mutation, loops, recursion, imports, reflection, subprocess execution, or
 arbitrary host-language callbacks are allowed.

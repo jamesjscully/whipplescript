@@ -69,7 +69,7 @@ IR -> modelgen            validate modelable subset
 ```
 
 Implementation DTOs may temporarily carry `serde_json::Value` for payloads,
-effect args, or context patches, but those values are not "untyped" at the
+effect args, or durable workflow data snapshots, but those values are not "untyped" at the
 boundary. Each occurrence must be paired with a schema from `WorkflowIr` or an
 `AdapterManifest`, and the receiver must validate before use.
 
@@ -194,6 +194,10 @@ Effect outcome:
 }
 ```
 
+Durable effect log records also retain the request `idempotency_key`. The
+status projection includes that key on `recent_effects[]` so retries and adapter
+reconciliation can refer to the same stable handle that dispatch used.
+
 Rules:
 
 - adapters must treat `idempotency_key` as stable and replay-safe
@@ -201,9 +205,116 @@ Rules:
 - async effects may return only acceptance/outcome metadata; external work
   completes through later events
 - synchronous value effects return typed output during transition prepare
-- built-in event/timer/terminal effects are runtime-owned; adapter manifests
-  authorize adapter-backed effects such as `start`, `send`, `askHuman`,
-  `coerce`, and capability operations
+- built-in event effects are runtime-owned; adapter manifests authorize
+  adapter-backed effects such as `start`, `send`, `askHuman`, and capability
+  operations. `coerce` uses the separate coerce executor contract rather than
+  the adapter-manifest effect path. Timer and terminal effects are reserved for
+  later grammar/runtime slices.
+
+File-backed local adapter records:
+
+```json
+{
+  "invocations": [
+    {
+      "id": "implementationLoop:evt_01H:tr_01H:handler.0",
+      "status": "started",
+      "agent": "worker",
+      "workflow_id": "implementationLoop",
+      "effect_id": "tr_01H:handler.0",
+      "transition_id": "tr_01H",
+      "input": {"task": "W1", "message": "Implement W1"}
+    }
+  ],
+  "messages": [
+    {
+      "id": "implementationLoop:evt_01H:tr_01H:handler.1",
+      "status": "sent",
+      "agent": "director",
+      "workflow_id": "implementationLoop",
+      "effect_id": "tr_01H:handler.1",
+      "transition_id": "tr_01H",
+      "message": "Worker finished W1"
+    }
+  ]
+}
+```
+
+The JSON agent file bridge is an inspectable local adapter slice, not a real
+agent API. It must deduplicate by idempotency key, preserve authored `start`
+input without the internal request envelope, and write atomically under the
+same short-lived lock-file convention as other JSON file adapters.
+`emit --agent-file ... --event finished` also appends a `completions` record and
+marks the latest matching invocation as `finished` when the built-in completion
+payload can be matched by run id or agent-name prefix.
+
+The JSON plan file bridge supports a deliberately small read surface:
+`plan.snapshot()` returns the raw JSON document as text,
+`plan.unfinishedItems()` returns the count of task/status entries whose status
+is not `done`, and `plan.nextReadyItem()` returns the first task whose status is
+missing, `todo`, `ready`, or `ready_for_implementation`, or `null` when no such
+task exists. Status writes remain idempotent task/status updates keyed by work
+item id.
+
+## Coerce Executor Contract
+
+`coerce` is a synchronous value effect backed by BAML HTTP in v1.
+
+Request:
+
+```json
+{
+  "coerce_call_id": "coerce_01H...",
+  "workflow_id": "implementationLoop",
+  "workflow_version": "statechart-workflow-ir/v0",
+  "transition_id": "tr_01H...",
+  "event_id": "evt_01H...",
+  "step_path": "state:choosing/entry/0",
+  "function_name": "chooseNextStep",
+  "idempotency_key": "implementationLoop/statechart-workflow-ir/v0/evt_01H/0/state:choosing/entry/0/chooseNextStep",
+  "args": {
+    "planText": "W1 ready"
+  },
+  "output_schema": {"type": "ref", "name": "NextStep"},
+  "backend": {
+    "kind": "baml_http",
+    "url": "http://127.0.0.1:2024",
+    "baml_src_hash": "sha256:..."
+  },
+  "timeout_ms": 60000
+}
+```
+
+Outcome:
+
+```json
+{
+  "coerce_call_id": "coerce_01H...",
+  "status": "succeeded",
+  "http_status": 200,
+  "parsed_output": {
+    "action": "StartWorker",
+    "workItemId": "W1",
+    "reason": "ready",
+    "message": "Implement W1"
+  },
+  "raw_response": {"redacted": true},
+  "error": null,
+  "duration_ms": 1350
+}
+```
+
+Rules:
+
+- arguments are named by `coerce` parameter names, even if the source call uses
+  positional syntax
+- argument values are schema-validated before the HTTP call
+- parsed output is schema-validated after the HTTP call
+- successful outputs are reused by idempotency key during replay
+- failed attempts are durable records and may be retried only through explicit
+  runtime retry policy
+- the executor cannot dispatch workflow effects or mutate workflow data
+- BAML HTTP internals are not modeled by formal backends
 
 ## Adapter Manifest Contract
 
@@ -280,6 +391,53 @@ Rules:
   requires the schemas to match after resolving refs in their respective type
   maps
 
+Built-in JSON human-review response event:
+
+```json
+{
+  "humanReview.responded": {
+    "type": "record",
+    "fields": {
+      "reviewId": "string",
+      "decision": "string",
+      "response": {"type": "optional", "inner": "string"}
+    }
+  }
+}
+```
+
+`emit --review-file <json>` loads this event schema without also loading the
+`askHuman` effect, so response intake can coexist with explicit review effect
+manifests. It also appends a `responses` record to the JSON review file and
+marks the matching open review as `responded` when `reviewId` matches a stored
+review id.
+
+Built-in JSON agent completion event:
+
+```json
+{
+  "finished": {
+    "type": "record",
+    "fields": {
+      "id": "string",
+      "name": "string",
+      "status": "string",
+      "stdoutTail": "string",
+      "stderrTail": "string",
+      "exitCode": {"type": "optional", "inner": "int"}
+    }
+  }
+}
+```
+
+`emit --agent-file <json>` loads this event schema without also loading the
+`start` and `send` effects. Bounded-start workflows still declare a compatible
+`finished` event in source so active invocation accounting is statically
+visible. If a workflow declares its own narrower `finished` payload and uses
+`run --event finished`, that event is processed as workflow input only; the JSON
+agent completion bridge updates the file when the built-in `emit --agent-file`
+completion schema is used.
+
 Manifests can be checked without a workflow:
 
 ```text
@@ -313,7 +471,8 @@ Policy decision:
 Rules:
 
 - runtime dispatch requires an `allow` or mode-accepted `allow_with_warning`
-- denied policy decisions are durable blocked records
+- denied policy decisions are durable denial/failure records and appear in
+  policy diagnostics or status blockers
 - every policy decision is visible in diagnostics when it blocks execution
 
 ## Transition Log Contract
@@ -322,17 +481,13 @@ Transition record:
 
 ```json
 {
+  "type": "transition",
   "transition_id": "tr_01H...",
   "workflow_id": "wf_01H...",
   "from_state": "selecting",
   "to_state": "supervising",
-  "event_id": "evt_01H...",
-  "guard": "next.kind == 'StartWorker'",
-  "context_patch": [],
-  "sync_effects": [],
-  "async_effects": ["eff_01H..."],
-  "diagnostics": [],
-  "created_at": "2026-05-22T18:00:02Z"
+  "event_type": "idle",
+  "event_id": "evt_01H..."
 }
 ```
 
@@ -340,7 +495,9 @@ Rules:
 
 - transition records are append-only
 - materialized current state must be reconstructable from logs plus snapshots
-- context patches are typed and target declared context paths
+- data writes are type-checked before the transition is committed
+- intended and terminal effect records are stored separately and linked by
+  `transition_id`
 - records are persisted in SQLite from the first runtime implementation
 
 ## Status Projection Contract
@@ -351,16 +508,26 @@ Status is a read-only projection:
 {
   "workflow_id": "wf_01H...",
   "workflow_name": "spec-implementation",
-  "state": "supervising",
-  "blocked": null,
+  "current_state": "supervising",
+  "blocked_reason": null,
   "pending_events": 2,
   "active_invocations": [
     {"agent": "worker", "count": 3, "max": 4}
   ],
+  "data_summary": {
+    "seenRuns": 12,
+    "lastIdleNudgeAt": "2026-05-23T10:00:00Z"
+  },
   "latest_transition": "tr_01H...",
-  "latest_decisions": [],
-  "recent_failures": [],
-  "next_timers": []
+  "latest_coerce_calls": [
+    {
+      "function_name": "chooseNextStep",
+      "status": "succeeded",
+      "parsed_output": {"action": "StartWorker"}
+    }
+  ],
+  "policy_blockers": [],
+  "recent_failures": []
 }
 ```
 

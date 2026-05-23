@@ -5,6 +5,17 @@ fn armature() -> Command {
     Command::new(env!("CARGO_BIN_EXE_armature"))
 }
 
+fn formal_checks_available() -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(
+            "(command -v tlc >/dev/null 2>&1 && command -v maude >/dev/null 2>&1) || command -v nix >/dev/null 2>&1",
+        )
+        .status()
+        .expect("tool probe runs")
+        .success()
+}
+
 fn workflow_source() -> &'static str {
     r#"
 machine CliWorkflow
@@ -55,6 +66,81 @@ fn validate_accepts_workflow() {
 
     assert_eq!(output["ok"], true);
     assert_eq!(output["diagnostics"], Value::Array(Vec::new()));
+}
+
+#[test]
+fn init_scaffolds_valid_local_project_and_refuses_overwrite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let output = run_json(
+        armature()
+            .arg("init")
+            .arg(dir.path())
+            .arg("--name")
+            .arg("DemoWorkflow")
+            .arg("--json"),
+    );
+
+    let workflow = dir.path().join("workflow.armature");
+    let policy = dir.path().join(".armature/policy.json");
+    let state_dir = dir.path().join(".armature/state");
+    let workflow_store_dir = dir.path().join(".armature/workflows");
+    assert_eq!(output["workflow_name"], "DemoWorkflow");
+    assert_eq!(
+        output["workflow"].as_str(),
+        Some(workflow.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        output["policy"].as_str(),
+        Some(policy.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        output["state_dir"].as_str(),
+        Some(state_dir.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        output["workflow_store_dir"].as_str(),
+        Some(workflow_store_dir.to_string_lossy().as_ref())
+    );
+    assert!(state_dir.is_dir());
+    assert!(workflow_store_dir.is_dir());
+    let workflow_source = std::fs::read_to_string(&workflow).expect("workflow reads");
+    assert!(workflow_source.contains("machine DemoWorkflow"));
+
+    let validation = run_json(armature().arg("validate").arg(&workflow).arg("--json"));
+    assert_eq!(validation["ok"], true);
+
+    let policy_validation = run_json(armature().arg("validate-policy").arg(&policy).arg("--json"));
+    assert_eq!(policy_validation["ok"], true);
+
+    let duplicate = armature()
+        .arg("init")
+        .arg(dir.path())
+        .output()
+        .expect("command runs");
+    assert!(!duplicate.status.success());
+    let stderr = String::from_utf8_lossy(&duplicate.stderr);
+    assert!(stderr.contains("refusing to overwrite existing"));
+
+    let forced = armature()
+        .arg("init")
+        .arg(dir.path())
+        .arg("--force")
+        .output()
+        .expect("command runs");
+    assert!(forced.status.success());
+
+    let invalid = armature()
+        .arg("init")
+        .arg(dir.path())
+        .arg("--name")
+        .arg("bad name")
+        .arg("--force")
+        .output()
+        .expect("command runs");
+    assert!(!invalid.status.success());
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.contains("invalid workflow name `bad name`"));
 }
 
 #[test]
@@ -150,10 +236,24 @@ state done {
 }
 
 #[test]
+fn events_help_uses_durable_status_spellings() {
+    let output = armature()
+        .arg("events")
+        .arg("--help")
+        .output()
+        .expect("command runs");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("dead_lettered"));
+}
+
+#[test]
 fn emit_run_status_events_and_log_share_the_same_store() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = write_workflow(&dir);
     let store = dir.path().join("workflow.sqlite");
+    let agent_file = dir.path().join("agents.json");
 
     let emitted = run_json(
         armature()
@@ -180,6 +280,73 @@ fn emit_run_status_events_and_log_share_the_same_store() {
     );
     assert_eq!(events["events"][0]["status"], "queued");
 
+    let queued_events = run_json(
+        armature()
+            .arg("events")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--status")
+            .arg("queued")
+            .arg("--json"),
+    );
+    assert_eq!(queued_events["events"][0]["event_type"], "go");
+
+    let queued_events_text = armature()
+        .arg("events")
+        .arg(&file)
+        .arg("--store")
+        .arg(&store)
+        .arg("--status")
+        .arg("queued")
+        .output()
+        .expect("command runs");
+    assert!(queued_events_text.status.success());
+    let stdout = String::from_utf8_lossy(&queued_events_text.stdout);
+    assert!(stdout.contains(" go queued"));
+
+    let dead_lettered_events = run_json(
+        armature()
+            .arg("events")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--status")
+            .arg("dead_lettered")
+            .arg("--json"),
+    );
+    assert_eq!(dead_lettered_events["events"], Value::Array(Vec::new()));
+
+    let dead_lettered_alias_events = run_json(
+        armature()
+            .arg("events")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--status")
+            .arg("dead-lettered")
+            .arg("--json"),
+    );
+    assert_eq!(
+        dead_lettered_alias_events["events"],
+        Value::Array(Vec::new())
+    );
+
+    let processed_events_before_run = run_json(
+        armature()
+            .arg("events")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--status")
+            .arg("processed")
+            .arg("--json"),
+    );
+    assert_eq!(
+        processed_events_before_run["events"],
+        Value::Array(Vec::new())
+    );
+
     let run = run_json(
         armature()
             .arg("run")
@@ -196,18 +363,57 @@ fn emit_run_status_events_and_log_share_the_same_store() {
         "hello"
     );
 
+    let processed_events = run_json(
+        armature()
+            .arg("events")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--status")
+            .arg("processed")
+            .arg("--json"),
+    );
+    assert_eq!(processed_events["events"][0]["event_type"], "go");
+    assert_eq!(processed_events["events"][0]["status"], "processed");
+
     let status = run_json(
         armature()
             .arg("status")
             .arg(&file)
             .arg("--store")
             .arg(&store)
+            .arg("--agent-file")
+            .arg(&agent_file)
             .arg("--json"),
     );
     assert_eq!(status["current_state"], "done");
     assert_eq!(status["recent_effects"][0]["effect"], "send");
     assert_eq!(status["recent_effects"][0]["status"], "succeeded");
+    assert!(status["recent_effects"][0]["idempotency_key"]
+        .as_str()
+        .is_some_and(|key| key.contains("CliWorkflow:")));
     assert_eq!(status["recent_effects"][0]["args"]["message"], "hello");
+    assert_eq!(status["data_summary"], serde_json::json!({}));
+    assert_eq!(status["policy_blockers"], serde_json::json!([]));
+
+    let status_text = armature()
+        .arg("status")
+        .arg(&file)
+        .arg("--store")
+        .arg(&store)
+        .arg("--agent-file")
+        .arg(&agent_file)
+        .output()
+        .expect("command runs");
+    assert!(status_text.status.success());
+    let stdout = String::from_utf8_lossy(&status_text.stdout);
+    assert!(stdout.contains("workflow: CliWorkflow"));
+    assert!(stdout.contains("state: done"));
+    assert!(stdout.contains("waiting: idle; no queued events or active invocations"));
+    assert!(stdout.contains("data summary: none"));
+    assert!(stdout.contains("latest effects:"));
+    assert!(stdout.contains("send director Succeeded"));
+    assert!(stdout.contains("policy blockers: none"));
 
     let overview = run_json(
         armature()
@@ -215,18 +421,24 @@ fn emit_run_status_events_and_log_share_the_same_store() {
             .arg(&file)
             .arg("--store")
             .arg(&store)
+            .arg("--agent-file")
+            .arg(&agent_file)
             .arg("--json"),
     );
     assert_eq!(overview["validation"]["ok"], true);
     assert_eq!(overview["status"]["current_state"], "done");
     assert_eq!(overview["status"]["pending_events"], 0);
     assert_eq!(overview["status"]["recent_effects"][0]["effect"], "send");
+    assert_eq!(overview["status"]["data_summary"], serde_json::json!({}));
+    assert_eq!(overview["status"]["policy_blockers"], serde_json::json!([]));
 
     let overview_text = armature()
         .arg("overview")
         .arg(&file)
         .arg("--store")
         .arg(&store)
+        .arg("--agent-file")
+        .arg(&agent_file)
         .output()
         .expect("command runs");
     assert!(overview_text.status.success());
@@ -234,7 +446,10 @@ fn emit_run_status_events_and_log_share_the_same_store() {
     assert!(stdout.contains("validation: ok"));
     assert!(stdout.contains("workflow: CliWorkflow"));
     assert!(stdout.contains("state: done"));
+    assert!(stdout.contains("waiting: idle; no queued events or active invocations"));
+    assert!(stdout.contains("data summary: none"));
     assert!(stdout.contains("latest effects:"));
+    assert!(stdout.contains("policy blockers: none"));
 
     let log = run_json(
         armature()
@@ -246,6 +461,723 @@ fn emit_run_status_events_and_log_share_the_same_store() {
     );
     assert_eq!(log["records"][0]["type"], "effect");
     assert_eq!(log["records"][0]["status"], "succeeded");
+}
+
+#[test]
+fn retry_event_requeues_only_failed_and_dead_lettered_events() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_workflow(&dir);
+    let store = dir.path().join("workflow.sqlite");
+    let missing_store = dir.path().join("missing.sqlite");
+
+    let missing_retry = armature()
+        .arg("retry-event")
+        .arg(&file)
+        .arg("--store")
+        .arg(&missing_store)
+        .arg("--event-id")
+        .arg("evt_missing")
+        .output()
+        .expect("command runs");
+    assert!(!missing_retry.status.success());
+    assert!(
+        !missing_store.exists(),
+        "retry-event must not create an empty store when the target event is absent"
+    );
+    let stderr = String::from_utf8_lossy(&missing_retry.stderr);
+    assert!(stderr.contains("workflow event not found"));
+
+    let mut last_event_id = String::new();
+    for retryable_status in ["failed", "dead_lettered"] {
+        let emitted = run_json(
+            armature()
+                .arg("emit")
+                .arg(&file)
+                .arg("--event")
+                .arg("go")
+                .arg("--payload")
+                .arg(r#"{"message":"retry me"}"#)
+                .arg("--store")
+                .arg(&store)
+                .arg("--json"),
+        );
+        let event_id = emitted["event"]["event_id"]
+            .as_str()
+            .expect("event id")
+            .to_string();
+        let mut event_json = emitted["event"].clone();
+        event_json["status"] = serde_json::json!(retryable_status);
+        event_json["last_error"] = serde_json::json!("simulated failure");
+
+        let connection = rusqlite::Connection::open(&store).expect("store opens");
+        connection
+            .execute(
+                "UPDATE workflow_events SET status = ?1, event_json = ?2 WHERE event_id = ?3",
+                rusqlite::params![retryable_status, event_json.to_string(), &event_id],
+            )
+            .expect("event is marked retryable");
+
+        let events_text = armature()
+            .arg("events")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--status")
+            .arg(retryable_status)
+            .output()
+            .expect("command runs");
+        assert!(events_text.status.success());
+        let stdout = String::from_utf8_lossy(&events_text.stdout);
+        assert!(stdout.contains("error=simulated failure"));
+
+        let retried = run_json(
+            armature()
+                .arg("retry-event")
+                .arg(&file)
+                .arg("--store")
+                .arg(&store)
+                .arg("--event-id")
+                .arg(&event_id)
+                .arg("--json"),
+        );
+        assert_eq!(retried["event"]["event_id"], event_id);
+        assert_eq!(retried["event"]["status"], "queued");
+        assert_eq!(retried["event"]["last_error"], Value::Null);
+        last_event_id = event_id;
+    }
+
+    let mut event_json = run_json(
+        armature()
+            .arg("emit")
+            .arg(&file)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"retry text"}"#)
+            .arg("--store")
+            .arg(&store)
+            .arg("--json"),
+    )["event"]
+        .clone();
+    let text_retry_event_id = event_json["event_id"]
+        .as_str()
+        .expect("event id")
+        .to_string();
+    event_json["status"] = serde_json::json!("failed");
+    event_json["last_error"] = serde_json::json!("simulated text failure");
+    let connection = rusqlite::Connection::open(&store).expect("store opens");
+    connection
+        .execute(
+            "UPDATE workflow_events SET status = ?1, event_json = ?2 WHERE event_id = ?3",
+            rusqlite::params!["failed", event_json.to_string(), &text_retry_event_id],
+        )
+        .expect("event is marked failed");
+
+    let retry_text = armature()
+        .arg("retry-event")
+        .arg(&file)
+        .arg("--store")
+        .arg(&store)
+        .arg("--event-id")
+        .arg(&text_retry_event_id)
+        .output()
+        .expect("command runs");
+    assert!(retry_text.status.success());
+    let stdout = String::from_utf8_lossy(&retry_text.stdout);
+    assert!(stdout.contains(&format!("retried {text_retry_event_id} status=queued")));
+    assert!(stdout.contains("pending_events="));
+
+    let retry_again = armature()
+        .arg("retry-event")
+        .arg(&file)
+        .arg("--store")
+        .arg(&store)
+        .arg("--event-id")
+        .arg(&last_event_id)
+        .output()
+        .expect("command runs");
+    assert!(!retry_again.status.success());
+    let stderr = String::from_utf8_lossy(&retry_again.stderr);
+    assert!(stderr.contains("cannot be retried from status queued"));
+}
+
+#[test]
+fn status_and_overview_surface_workflow_data_summary() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("data-summary.armature");
+    std::fs::write(
+        &file,
+        r#"
+machine DataSummaryWorkflow
+initial waiting
+
+class WorkItem {
+  id string
+  status string
+}
+
+data {
+  seen string[] = []
+  count int = 0
+  first string = ""
+  item WorkItem = { id "W1", status "ready" }
+}
+
+event finished {
+  runId string
+}
+
+state waiting {
+  on finished as run {
+    assign data.seen = data.seen.append(run.runId)
+    assign data.count = list.length(data.seen)
+    assign data.first = run.runId
+    assign data.item = { id "W1", status "done" }
+    goto done
+  }
+}
+
+state done {
+  final
+}
+"#,
+    )
+    .expect("workflow writes");
+    let store = dir.path().join("workflow.sqlite");
+
+    let run = run_json(
+        armature()
+            .arg("run")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event")
+            .arg("finished")
+            .arg("--payload")
+            .arg(r#"{"runId":"worker-1"}"#)
+            .arg("--json"),
+    );
+    assert_eq!(run["status"]["current_state"], "done");
+    assert_eq!(
+        run["status"]["data_summary"],
+        serde_json::json!({
+            "count": 1,
+            "first": "worker-1",
+            "item": {"fields": 2},
+            "seen": 1
+        })
+    );
+
+    let status = run_json(
+        armature()
+            .arg("status")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--json"),
+    );
+    assert_eq!(status["data"]["seen"], serde_json::json!(["worker-1"]));
+    assert_eq!(
+        status["data_summary"],
+        serde_json::json!({
+            "count": 1,
+            "first": "worker-1",
+            "item": {"fields": 2},
+            "seen": 1
+        })
+    );
+
+    let overview = run_json(
+        armature()
+            .arg("overview")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--json"),
+    );
+    assert_eq!(overview["status"]["data_summary"], status["data_summary"]);
+
+    let status_text = armature()
+        .arg("status")
+        .arg(&file)
+        .arg("--store")
+        .arg(&store)
+        .output()
+        .expect("command runs");
+    assert!(status_text.status.success());
+    let stdout = String::from_utf8_lossy(&status_text.stdout);
+    assert!(stdout
+        .contains(r#"data summary: {"count":1,"first":"worker-1","item":{"fields":2},"seen":1}"#));
+}
+
+#[test]
+fn run_can_use_baml_http_coerce_without_fake_outputs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("baml-http.armature");
+    std::fs::write(
+        &file,
+        r#"
+machine BamlHttpWorkflow
+initial waiting
+
+data {
+  result string = ""
+}
+
+event go {
+  message string
+}
+
+coerce classify(message string) -> string {
+  prompt """
+Classify this message.
+
+{{ message }}
+  """
+}
+
+state waiting {
+  on go as evt {
+    let classification = coerce classify(evt.message)
+    assign data.result = classification
+    goto done
+  }
+}
+
+state done {
+  final
+}
+"#,
+    )
+    .expect("workflow writes");
+    let store = dir.path().join("workflow.sqlite");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server binds");
+    let address = listener.local_addr().expect("test server address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request accepted");
+        let mut request = [0_u8; 4096];
+        let bytes_read = std::io::Read::read(&mut stream, &mut request).expect("request reads");
+        let request = String::from_utf8_lossy(&request[..bytes_read]);
+        assert!(request.starts_with("POST /call/classify "));
+        assert!(request.contains(r#""message":"hello""#));
+        let body = r#""done""#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        std::io::Write::write_all(&mut stream, response.as_bytes()).expect("response writes");
+    });
+
+    let output = run_json(
+        armature()
+            .arg("run")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"hello"}"#)
+            .arg("--baml-url")
+            .arg(format!("http://{address}"))
+            .arg("--json"),
+    );
+
+    assert_eq!(output["outcome"]["status"], "processed");
+    assert_eq!(output["status"]["current_state"], "done");
+    assert_eq!(output["status"]["data"]["result"], "done");
+    assert_eq!(
+        output["status"]["latest_coerce_calls"][0]["function_name"],
+        "classify"
+    );
+    assert_eq!(
+        output["status"]["latest_coerce_calls"][0]["parsed_output"],
+        "done"
+    );
+    assert_eq!(
+        output["status"]["latest_coerce_calls"][0]["backend"]["kind"],
+        "baml_http"
+    );
+    assert!(
+        output["status"]["latest_coerce_calls"][0]["backend"]["baml_src_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("sha256:"))
+    );
+    let stored_step_path: String = rusqlite::Connection::open(&store)
+        .expect("store opens")
+        .query_row(
+            "SELECT step_path FROM coerce_calls WHERE workflow_id = 'BamlHttpWorkflow'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("coerce step path reads");
+    assert_eq!(stored_step_path, "handler.0");
+    let stored_raw_response: String = rusqlite::Connection::open(&store)
+        .expect("store opens")
+        .query_row(
+            "SELECT raw_response_json FROM coerce_calls WHERE workflow_id = 'BamlHttpWorkflow'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("coerce raw response reads");
+    assert_eq!(stored_raw_response, r#""done""#);
+    handle.join().expect("test server joins");
+}
+
+#[test]
+fn run_rejects_duplicate_fake_outputs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("fake-duplicates.armature");
+    std::fs::write(
+        &file,
+        r#"
+machine FakeDuplicates
+initial waiting
+
+event go {}
+
+coerce classify() -> string {
+  prompt "Classify"
+}
+
+state waiting {
+  on go {
+    let result = coerce classify()
+    stay
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let output = armature()
+        .arg("run")
+        .arg(&file)
+        .arg("--event")
+        .arg("go")
+        .arg("--fake-coerce-output")
+        .arg(r#"classify="one""#)
+        .arg("--fake-coerce-output")
+        .arg(r#"classify="two""#)
+        .output()
+        .expect("command runs");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("duplicate fake output `classify`"));
+}
+
+#[test]
+fn run_rejects_fake_output_names_with_whitespace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("fake-whitespace.armature");
+    std::fs::write(
+        &file,
+        r#"
+machine FakeWhitespace
+initial waiting
+
+event go {}
+
+coerce classify() -> string {
+  prompt "Classify"
+}
+
+state waiting {
+  on go {
+    let result = coerce classify()
+    stay
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let output = armature()
+        .arg("run")
+        .arg(&file)
+        .arg("--event")
+        .arg("go")
+        .arg("--fake-coerce-output")
+        .arg(r#"classify result="one""#)
+        .output()
+        .expect("command runs");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(r#"invalid fake output `classify result="one"`"#));
+}
+
+#[test]
+fn run_redacts_baml_http_raw_response_by_enterprise_policy_default() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("baml-http.armature");
+    std::fs::write(
+        &file,
+        r#"
+machine BamlHttpWorkflow
+initial waiting
+
+data {
+  result string = ""
+}
+
+event go {
+  message string
+}
+
+coerce classify(message string) -> string {
+  prompt """
+Classify this message.
+
+{{ message }}
+  """
+}
+
+state waiting {
+  on go as evt {
+    let classification = coerce classify(evt.message)
+    assign data.result = classification
+    goto done
+  }
+}
+
+state done {
+  final
+}
+"#,
+    )
+    .expect("workflow writes");
+    let store = dir.path().join("workflow.sqlite");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server binds");
+    let address = listener.local_addr().expect("test server address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request accepted");
+        let mut request = [0_u8; 4096];
+        let _bytes_read = std::io::Read::read(&mut stream, &mut request).expect("request reads");
+        let body = r#""done""#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        std::io::Write::write_all(&mut stream, response.as_bytes()).expect("response writes");
+    });
+    let policy = dir.path().join("policy.json");
+    std::fs::write(
+        &policy,
+        format!(
+            r#"{{
+  "mode": "enterprise",
+  "allowed_capabilities": ["baml.coerce"],
+  "allow_baml_network": true,
+  "allowed_baml_urls": ["http://{address}"]
+}}"#
+        ),
+    )
+    .expect("policy writes");
+
+    let output = run_json(
+        armature()
+            .arg("run")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"hello"}"#)
+            .arg("--baml-url")
+            .arg(format!("http://{address}"))
+            .arg("--policy")
+            .arg(&policy)
+            .arg("--json"),
+    );
+
+    assert_eq!(output["outcome"]["status"], "processed");
+    assert_eq!(output["status"]["data"]["result"], "done");
+    let (raw_response, parsed_output): (String, String) = rusqlite::Connection::open(&store)
+        .expect("store opens")
+        .query_row(
+            "SELECT raw_response_json, parsed_output_json FROM coerce_calls WHERE workflow_id = 'BamlHttpWorkflow'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("coerce response fields read");
+    assert_eq!(
+        serde_json::from_str::<Value>(&raw_response).expect("raw response parses"),
+        serde_json::json!({"redacted": true, "reason": "policy"})
+    );
+    assert_eq!(parsed_output, r#""done""#);
+    handle.join().expect("test server joins");
+}
+
+#[test]
+fn status_text_surfaces_latest_coerce_failures() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("baml-http-failure.armature");
+    std::fs::write(
+        &file,
+        r#"
+machine BamlHttpFailureWorkflow
+initial waiting
+
+data {
+  result string = ""
+}
+
+event go {
+  message string
+}
+
+coerce classify(message string) -> string {
+  prompt """
+Classify this message.
+
+{{ message }}
+  """
+}
+
+state waiting {
+  on go as evt {
+    let classification = coerce classify(evt.message)
+    assign data.result = classification
+    goto done
+  }
+}
+
+state done {
+  final
+}
+"#,
+    )
+    .expect("workflow writes");
+    let store = dir.path().join("workflow.sqlite");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server binds");
+    let address = listener.local_addr().expect("test server address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request accepted");
+        let mut request = [0_u8; 4096];
+        let _bytes_read = std::io::Read::read(&mut stream, &mut request).expect("request reads");
+        let body = r#"{"error":"model unavailable"}"#;
+        let response = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        std::io::Write::write_all(&mut stream, response.as_bytes()).expect("response writes");
+    });
+
+    let run = armature()
+        .arg("run")
+        .arg(&file)
+        .arg("--store")
+        .arg(&store)
+        .arg("--event")
+        .arg("go")
+        .arg("--payload")
+        .arg(r#"{"message":"hello"}"#)
+        .arg("--baml-url")
+        .arg(format!("http://{address}"))
+        .arg("--json")
+        .output()
+        .expect("command runs");
+    assert!(!run.status.success());
+    handle.join().expect("test server joins");
+
+    let status = run_json(
+        armature()
+            .arg("status")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--json"),
+    );
+    assert_eq!(
+        status["latest_coerce_failures"][0]["function_name"],
+        "classify"
+    );
+    assert_eq!(status["latest_coerce_failures"][0]["status"], "failed");
+    assert_eq!(status["latest_coerce_failures"][0]["http_status"], 503);
+
+    let status_text = armature()
+        .arg("status")
+        .arg(&file)
+        .arg("--store")
+        .arg(&store)
+        .output()
+        .expect("command runs");
+    assert!(status_text.status.success());
+    let stdout = String::from_utf8_lossy(&status_text.stdout);
+    assert!(stdout.contains("latest coerce failures:"));
+    assert!(stdout.contains("classify Failed http=Some(503)"));
+}
+
+#[test]
+fn run_rejects_baml_http_url_disallowed_by_enterprise_policy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("baml-http.armature");
+    std::fs::write(
+        &file,
+        r#"
+machine BamlHttpWorkflow
+initial waiting
+
+event go {
+  message string
+}
+
+coerce classify(message string) -> string {
+  prompt """
+Classify this message.
+
+{{ message }}
+  """
+}
+
+state waiting {
+  on go as evt {
+    let classification = coerce classify(evt.message)
+    goto done
+  }
+}
+
+state done {
+  final
+}
+"#,
+    )
+    .expect("workflow writes");
+    let policy = dir.path().join("policy.json");
+    std::fs::write(
+        &policy,
+        r#"{
+  "mode": "enterprise",
+  "allowed_capabilities": ["baml.coerce"],
+  "allow_baml_network": true,
+  "allowed_baml_urls": ["http://127.0.0.1:2024"]
+}"#,
+    )
+    .expect("policy writes");
+
+    let output = armature()
+        .arg("run")
+        .arg(&file)
+        .arg("--event")
+        .arg("go")
+        .arg("--payload")
+        .arg(r#"{"message":"hello"}"#)
+        .arg("--baml-url")
+        .arg("http://127.0.0.1:2025")
+        .arg("--policy")
+        .arg(&policy)
+        .output()
+        .expect("command runs");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("BAML HTTP URL `http://127.0.0.1:2025` is not allowed"));
 }
 
 #[test]
@@ -317,6 +1249,297 @@ fn overview_reports_adapter_manifest_validation() {
         .any(|diagnostic| diagnostic["message"]
             .as_str()
             .is_some_and(|message| message.contains("effect `send` is not declared"))));
+
+    let overview_text = armature()
+        .arg("overview")
+        .arg(&file)
+        .arg("--adapter-manifest")
+        .arg(&manifest)
+        .output()
+        .expect("command runs");
+    assert!(overview_text.status.success());
+    let stdout = String::from_utf8_lossy(&overview_text.stdout);
+    assert!(stdout.contains("waiting: validation failed; inspect diagnostics above"));
+}
+
+#[test]
+fn status_validates_adapter_manifest_contracts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_workflow(&dir);
+    let manifest = dir.path().join("adapter.json");
+    std::fs::write(
+        &manifest,
+        r#"{
+  "name": "empty-adapter",
+  "version": "0.1.0",
+  "effects": {},
+  "events": {}
+}"#,
+    )
+    .expect("manifest writes");
+
+    let output = armature()
+        .arg("status")
+        .arg(&file)
+        .arg("--adapter-manifest")
+        .arg(&manifest)
+        .output()
+        .expect("command runs");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("workflow contract validation failed"));
+    assert!(stderr.contains("effect `send` is not declared"));
+}
+
+#[test]
+fn events_and_log_accept_validation_context_flags() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_workflow(&dir);
+    let store = dir.path().join("workflow.sqlite");
+    let agent_file = dir.path().join("agents.json");
+    let policy = dir.path().join("policy.json");
+    std::fs::write(
+        &policy,
+        r#"{
+  "mode": "local",
+  "allowed_capabilities": ["message_agents"],
+  "denied_capabilities": []
+}"#,
+    )
+    .expect("policy writes");
+
+    run_json(
+        armature()
+            .arg("emit")
+            .arg(&file)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"hello"}"#)
+            .arg("--store")
+            .arg(&store)
+            .arg("--json"),
+    );
+
+    let events = run_json(
+        armature()
+            .arg("events")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--agent-file")
+            .arg(&agent_file)
+            .arg("--policy")
+            .arg(&policy)
+            .arg("--json"),
+    );
+    assert_eq!(events["events"][0]["event_type"], "go");
+
+    let log = run_json(
+        armature()
+            .arg("log")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--agent-file")
+            .arg(&agent_file)
+            .arg("--policy")
+            .arg(&policy)
+            .arg("--json"),
+    );
+    assert_eq!(log["records"], Value::Array(Vec::new()));
+}
+
+#[test]
+fn events_and_log_reject_unbounded_limits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_workflow(&dir);
+    let excessive_limit = usize::MAX.to_string();
+
+    for command_name in ["events", "log"] {
+        let output = armature()
+            .arg(command_name)
+            .arg(&file)
+            .arg("--limit")
+            .arg(&excessive_limit)
+            .output()
+            .expect("command runs");
+
+        assert!(!output.status.success(), "{command_name} should fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(&format!("limit for {command_name} must be <= 10000")));
+    }
+}
+
+#[test]
+fn events_and_log_validate_adapter_manifest_contracts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_workflow(&dir);
+    let manifest = dir.path().join("adapter.json");
+    std::fs::write(
+        &manifest,
+        r#"{
+  "name": "empty-adapter",
+  "version": "0.1.0",
+  "effects": {},
+  "events": {}
+}"#,
+    )
+    .expect("manifest writes");
+
+    for command_name in ["events", "log"] {
+        let output = armature()
+            .arg(command_name)
+            .arg(&file)
+            .arg("--adapter-manifest")
+            .arg(&manifest)
+            .output()
+            .expect("command runs");
+
+        assert!(!output.status.success(), "{command_name} should fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("workflow contract validation failed"));
+        assert!(stderr.contains("effect `send` is not declared"));
+    }
+}
+
+#[test]
+fn status_and_overview_validate_policy_documents() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_workflow(&dir);
+    let policy = dir.path().join("bad-policy.json");
+    std::fs::write(
+        &policy,
+        r#"{
+  "mode": "local",
+  "allowed_capabilities": ["message_agents", "message_agents"],
+  "denied_capabilities": []
+}"#,
+    )
+    .expect("policy writes");
+
+    let status = armature()
+        .arg("status")
+        .arg(&file)
+        .arg("--policy")
+        .arg(&policy)
+        .output()
+        .expect("command runs");
+    assert!(!status.status.success());
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert!(stderr.contains("policy document validation failed"));
+    assert!(stderr.contains("repeats capability `message_agents`"));
+
+    for command_name in ["events", "log"] {
+        let output = armature()
+            .arg(command_name)
+            .arg(&file)
+            .arg("--policy")
+            .arg(&policy)
+            .output()
+            .expect("command runs");
+
+        assert!(!output.status.success(), "{command_name} should fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("policy document validation failed"));
+        assert!(stderr.contains("repeats capability `message_agents`"));
+    }
+
+    let overview = run_json(
+        armature()
+            .arg("overview")
+            .arg(&file)
+            .arg("--policy")
+            .arg(&policy)
+            .arg("--json"),
+    );
+    assert_eq!(overview["validation"]["ok"], false);
+    assert_eq!(overview["status"]["current_state"], "waiting");
+    assert!(overview["validation"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .any(|diagnostic| diagnostic["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("repeats capability `message_agents`"))));
+}
+
+#[test]
+fn status_and_overview_do_not_read_file_backed_adapter_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("plan-only.armature");
+    std::fs::write(
+        &file,
+        r#"
+machine PlanOnly
+initial waiting
+
+data {
+  snapshot string? = nil
+}
+
+capability plan = adapter("implementationPlan")
+
+state waiting {
+  entry {
+    let text = plan.snapshot()
+    assign data.snapshot = text
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+    let missing_plan = dir.path().join("missing-plan.json");
+
+    let status = run_json(
+        armature()
+            .arg("status")
+            .arg(&file)
+            .arg("--plan-file")
+            .arg(&missing_plan)
+            .arg("--json"),
+    );
+    assert_eq!(status["current_state"], "waiting");
+    assert_eq!(status["data"]["snapshot"], Value::Null);
+
+    let overview = run_json(
+        armature()
+            .arg("overview")
+            .arg(&file)
+            .arg("--plan-file")
+            .arg(&missing_plan)
+            .arg("--json"),
+    );
+    assert_eq!(overview["validation"]["ok"], true);
+    assert_eq!(overview["status"]["current_state"], "waiting");
+
+    let events = run_json(
+        armature()
+            .arg("events")
+            .arg(&file)
+            .arg("--plan-file")
+            .arg(&missing_plan)
+            .arg("--json"),
+    );
+    assert_eq!(events["workflow_id"], "PlanOnly");
+    assert_eq!(events["events"], Value::Array(Vec::new()));
+
+    let log = run_json(
+        armature()
+            .arg("log")
+            .arg(&file)
+            .arg("--plan-file")
+            .arg(&missing_plan)
+            .arg("--json"),
+    );
+    assert_eq!(log["workflow_id"], "PlanOnly");
+    assert_eq!(log["records"], Value::Array(Vec::new()));
+
+    assert!(
+        !missing_plan.exists(),
+        "inspection commands must not create or read backing files"
+    );
 }
 
 #[test]
@@ -401,6 +1624,25 @@ fn validate_uses_adapter_manifest_for_static_effect_checks() {
         .ends_with("workflow.armature"));
     assert_eq!(effect_diagnostic["span"]["start_line"], 13);
     assert_eq!(effect_diagnostic["span"]["start_column"], 5);
+}
+
+#[test]
+fn validate_accepts_file_backed_adapter_flags_for_static_effect_checks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_workflow(&dir);
+    let agents = dir.path().join("agents.json");
+
+    let output = run_json(
+        armature()
+            .arg("validate")
+            .arg(&file)
+            .arg("--agent-file")
+            .arg(&agents)
+            .arg("--json"),
+    );
+
+    assert_eq!(output["ok"], true);
+    assert_eq!(output["diagnostics"], Value::Array(Vec::new()));
 }
 
 #[test]
@@ -512,6 +1754,9 @@ fn validate_applies_local_policy_as_warnings() {
         .expect("policy diagnostic exists");
     assert_eq!(diagnostic["severity"], "Warning");
     assert_eq!(diagnostic["span"]["start_line"], 13);
+    assert!(diagnostic["message"].as_str().is_some_and(
+        |message| message.contains("Fix: add `message_agents` to allowed_capabilities")
+    ));
 }
 
 #[test]
@@ -568,9 +1813,11 @@ fn validate_applies_enterprise_policy_as_errors() {
         .as_array()
         .expect("diagnostics")
         .iter()
-        .any(|diagnostic| diagnostic["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("requires capability `message_agents`"))));
+        .any(
+            |diagnostic| diagnostic["message"].as_str().is_some_and(|message| message
+                .contains("requires capability `message_agents`")
+                && message.contains("Fix: add `message_agents` to allowed_capabilities"))
+        ));
 }
 
 #[test]
@@ -817,6 +2064,32 @@ fn validate_policy_accepts_policy_without_workflow() {
 }
 
 #[test]
+fn validate_accepts_template_with_local_file_backed_policy() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates dir")
+        .parent()
+        .expect("repo root");
+    let workflow = repo_root.join("examples/templates/simple-agent-supervisor.armature");
+    let policy = repo_root.join("examples/policies/local-file-backed.policy.json");
+    let agents = repo_root.join("target/tmp/agents.json");
+
+    let output = run_json(
+        armature()
+            .arg("validate")
+            .arg(&workflow)
+            .arg("--agent-file")
+            .arg(&agents)
+            .arg("--policy")
+            .arg(&policy)
+            .arg("--json"),
+    );
+
+    assert_eq!(output["ok"], true);
+    assert_eq!(output["diagnostics"], Value::Array(Vec::new()));
+}
+
+#[test]
 fn validate_policy_reports_policy_diagnostics() {
     let dir = tempfile::tempdir().expect("tempdir");
     let policy = dir.path().join("policy.json");
@@ -929,6 +2202,7 @@ fn run_surfaces_manifest_required_capabilities_in_status_and_log() {
     assert!(overview_text.status.success());
     let stdout = String::from_utf8_lossy(&overview_text.stdout);
     assert!(stdout.contains("requires=message_agents"));
+    assert!(stdout.contains("waiting: idle; no queued events or active invocations"));
 
     let log = run_json(
         armature()
@@ -1107,6 +2381,37 @@ fn emit_requires_adapter_event_schema_when_event_names_overlap() {
 }
 
 #[test]
+fn emit_validates_policy_documents() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_workflow(&dir);
+    let policy = dir.path().join("policy.json");
+    std::fs::write(
+        &policy,
+        r#"{
+  "mode": "local",
+  "allowed_capabilities": ["bad capability"]
+}"#,
+    )
+    .expect("policy writes");
+
+    let output = armature()
+        .arg("emit")
+        .arg(&file)
+        .arg("--event")
+        .arg("go")
+        .arg("--payload")
+        .arg(r#"{"message":"hello"}"#)
+        .arg("--policy")
+        .arg(&policy)
+        .output()
+        .expect("command runs");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("capability `bad capability` contains whitespace or control characters"));
+}
+
+#[test]
 fn emit_model_outputs_tla_module() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = write_workflow(&dir);
@@ -1246,9 +2551,14 @@ fn emit_config_validates_adapter_manifest_contracts() {
 }
 
 #[test]
-fn prove_validates_then_reports_unavailable() {
+fn prove_runs_generated_checks_when_formal_tools_are_available() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = write_workflow(&dir);
+
+    if !formal_checks_available() {
+        eprintln!("skipping prove success test because formal tools are unavailable");
+        return;
+    }
 
     let output = armature()
         .arg("prove")
@@ -1256,15 +2566,22 @@ fn prove_validates_then_reports_unavailable() {
         .output()
         .expect("command runs");
 
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("prove is not implemented yet"));
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("== tla =="));
+    assert!(stdout.contains("== maude =="));
+    assert!(stdout.contains("ok"));
 }
 
 #[test]
-fn prove_json_reports_unavailable() {
+fn prove_json_reports_generated_check_results_when_formal_tools_are_available() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = write_workflow(&dir);
+
+    if !formal_checks_available() {
+        eprintln!("skipping prove json success test because formal tools are unavailable");
+        return;
+    }
 
     let output = armature()
         .arg("prove")
@@ -1273,12 +2590,17 @@ fn prove_json_reports_unavailable() {
         .output()
         .expect("command runs");
 
-    assert!(!output.status.success());
+    assert!(output.status.success());
     let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
-    assert_eq!(stdout["ok"], false);
-    assert_eq!(stdout["available"], false);
-    assert_eq!(stdout["suggested_command"], "armature check --target tla");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("prove is not implemented yet"));
+    assert_eq!(stdout["ok"], true);
+    assert_eq!(stdout["available"], true);
+    assert_eq!(
+        stdout["suggested_command"],
+        "armature check --target tla; armature check --target maude"
+    );
+    assert_eq!(stdout["checks"].as_array().expect("checks").len(), 2);
+    assert_eq!(stdout["checks"][0]["target"], "tla");
+    assert_eq!(stdout["checks"][1]["target"], "maude");
 }
 
 #[test]
@@ -1310,7 +2632,6 @@ fn prove_validates_adapter_manifest_contracts_before_unavailable() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("workflow contract validation failed"));
     assert!(stderr.contains("effect `send` is not declared"));
-    assert!(!stderr.contains("prove is not implemented yet"));
 }
 
 #[test]
@@ -1426,6 +2747,9 @@ fn build_writes_ir_and_tla_artifacts() {
     let tla_model = output["tla_model"].as_str().expect("tla_model path");
     let tla_config = output["tla_config"].as_str().expect("tla_config path");
     let maude_model = output["maude_model"].as_str().expect("maude_model path");
+    let artifact_hashes_json = output["artifact_hashes_json"]
+        .as_str()
+        .expect("artifact_hashes_json path");
     assert!(output["adapter_manifest_bundle"].is_null());
     assert!(output["policy_document_bundle"].is_null());
     assert_eq!(output["workflow_id"], "CliWorkflow");
@@ -1434,9 +2758,25 @@ fn build_writes_ir_and_tla_artifacts() {
     assert!(std::path::Path::new(tla_model).exists());
     assert!(std::path::Path::new(tla_config).exists());
     assert!(std::path::Path::new(maude_model).exists());
+    assert!(std::path::Path::new(artifact_hashes_json).exists());
+    assert!(output["artifact_hashes"]["workflow-ir.json"]
+        .as_str()
+        .expect("ir hash")
+        .starts_with("sha256:"));
+    assert!(output["artifact_hashes"]["baml_src/workflow.baml"]
+        .as_str()
+        .expect("baml hash")
+        .starts_with("sha256:"));
     assert!(tla_model.ends_with("Armature_CliWorkflow.tla"));
     assert!(tla_config.ends_with("Armature_CliWorkflow.cfg"));
     assert!(maude_model.ends_with("ARMATURE-CLIWORKFLOW.maude"));
+    let artifact_hashes: Value =
+        serde_json::from_str(&std::fs::read_to_string(artifact_hashes_json).expect("hashes read"))
+            .expect("hashes parse");
+    assert_eq!(
+        artifact_hashes["workflow-ir.json"],
+        output["artifact_hashes"]["workflow-ir.json"]
+    );
     let ir = std::fs::read_to_string(ir_json).expect("ir reads");
     assert!(ir.contains("\"schema_version\""));
     assert!(ir.contains(&format!("\"source_path\": \"{}\"", file.display())));
@@ -1493,9 +2833,40 @@ fn build_validates_and_bundles_adapter_manifests() {
         .as_str()
         .expect("adapter manifest bundle path");
     assert!(std::path::Path::new(bundle).exists());
+    assert!(output["artifact_hashes"]["adapter-manifests.json"]
+        .as_str()
+        .expect("adapter bundle hash")
+        .starts_with("sha256:"));
     assert!(std::fs::read_to_string(bundle)
         .expect("bundle reads")
         .contains("\"message-adapter\""));
+}
+
+#[test]
+fn build_accepts_and_bundles_file_backed_adapter_flags() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_workflow(&dir);
+    let out = dir.path().join("build");
+    let agents = dir.path().join("agents.json");
+
+    let output = run_json(
+        armature()
+            .arg("build")
+            .arg(&file)
+            .arg("--out")
+            .arg(&out)
+            .arg("--agent-file")
+            .arg(&agents)
+            .arg("--json"),
+    );
+
+    let bundle = output["adapter_manifest_bundle"]
+        .as_str()
+        .expect("adapter manifest bundle path");
+    assert!(std::path::Path::new(bundle).exists());
+    assert!(std::fs::read_to_string(bundle)
+        .expect("bundle reads")
+        .contains("\"json-agent-file\""));
 }
 
 #[test]
@@ -1552,6 +2923,10 @@ fn build_validates_and_bundles_policy_documents() {
         .as_str()
         .expect("policy bundle path");
     assert!(std::path::Path::new(bundle).exists());
+    assert!(output["artifact_hashes"]["policy-documents.json"]
+        .as_str()
+        .expect("policy bundle hash")
+        .starts_with("sha256:"));
     assert!(std::fs::read_to_string(bundle)
         .expect("bundle reads")
         .contains("\"allowed_capabilities\""));

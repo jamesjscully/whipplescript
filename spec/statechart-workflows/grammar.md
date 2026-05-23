@@ -77,6 +77,7 @@ AgentDecl =
 AgentCtor =
     "thread" "(" String ")"
   | "codingAgent" "(" ")"
+  | "adapter" "(" String ")"
 
 AgentOptions =
   Block<AgentOption>
@@ -89,6 +90,8 @@ declared `maxActive` limit, v0 requires a declared `finished` event with a
 required `name string` field and at least one `finished` handler. The runtime
 uses processed `finished.name` values with agent-name prefixes such as
 `worker-01` to retire active invocations.
+Thread agents are message targets and cannot be used with `start`. Started work
+must target `codingAgent()` or an adapter-backed agent.
 
 CapabilityDecl =
   "capability" Ident "=" "adapter" "(" String ")"
@@ -149,7 +152,7 @@ are validation errors.
 ## Actions
 
 ```ebnf
-ActionBlock = "{" Statement* Outcome "}"
+ActionBlock = "{" Statement* Outcome? "}"
 
 Statement =
     LetStmt
@@ -296,6 +299,7 @@ initial
 data with typed fields and optional initial values
 events with typed fields
 agent declarations with maxActive
+agent adapter targets
 capability declarations
 enum and class declarations
 coerce declarations

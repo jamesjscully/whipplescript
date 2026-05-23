@@ -19,8 +19,6 @@ async_invocation
 message
 human_obligation
 event
-timer
-terminal
 ```
 
 The category determines transaction timing, output shape, and model-generation
@@ -71,14 +69,17 @@ adapter summaries, if declared
 ```
 
 These effects run before the transition commits. The runtime records their
-inputs and outputs in the transition log.
+inputs and outputs durably. `coerce` calls additionally write `coerce_calls`
+records so model decisions are replay-safe and visible in status.
 
 If a synchronous value effect fails, no later steps in the transition run. The
-workflow enters an explicit failure transition if one is declared; otherwise it
-enters the built-in blocked state.
+implemented v0 runtime marks the triggering event failed, discards tentative
+state changes, writes durable diagnostics, and surfaces the failure through
+`status`/`overview` recent failures. Explicit failure transitions are future
+workflow syntax; there is no hidden built-in blocked state in v0.
 
-`coerce` is backed by generated BAML. Adapter value calls are backed by declared
-capabilities.
+`coerce` is backed by BAML HTTP over generated `baml_src` artifacts. Adapter
+value calls are backed by declared capabilities.
 
 ### 3. Asynchronous Invocation Effects
 
@@ -130,7 +131,12 @@ askHuman
 ```
 
 `askHuman` is asynchronous. It creates or updates a durable human-review item
-with an idempotency key. Human response arrives later as a typed event.
+with an idempotency key. Human response arrives later as a typed
+`humanReview.responded` event. The built-in JSON review-file bridge uses:
+
+```text
+{ reviewId string, decision string, response string? }
+```
 
 ### 6. Event Effects
 
@@ -147,38 +153,14 @@ must conform to a declared event schema.
 
 ### 7. Timer Effects
 
-Timer effects create durable future events.
-
-Initial effect:
-
-```text
-sleep
-```
-
-`sleep` schedules a timer event. It does not suspend the interpreter thread.
-
-Example:
-
-```armature
-after 2m {
-  raise idle
-}
-```
-
-Timer events are ordinary queued events when they fire.
+Timer effects are reserved for a later grammar/runtime slice. The implemented
+v0 source surface does not include `sleep` or `after`; use explicit external
+observations such as an `idle` event for recurring supervisor loops.
 
 ### 8. Terminal Effects
 
-Terminal effects enter a terminal state.
-
-Initial effect:
-
-```text
-stop
-```
-
-Most workflows should use `goto` to a final state instead. `stop` exists for
-explicit cancellation/failure semantics.
+Terminal effects are reserved for a later grammar/runtime slice. Implemented v0
+workflows enter terminal states with `goto` to a state that contains `final`.
 
 ## Built-In Versus Adapter Effects
 
@@ -187,14 +169,11 @@ Built-in effects:
 ```text
 assign
 raise
-sleep
-stop
 ```
 
 Adapter-backed effects:
 
 ```text
-coerce
 capability value calls such as plan.snapshot
 capability mutation calls such as plan.markDone
 start
@@ -202,9 +181,19 @@ send
 askHuman
 ```
 
+Executor-backed effects:
+
+```text
+coerce
+```
+
 Adapter-backed effects still have schemas and model-generation semantics. A
 workflow may use them only when an adapter declares support and policy permits
 the requested capability.
+
+Executor-backed `coerce` has the same schema, policy, idempotency, and logging
+requirements, but it is executed through the BAML HTTP coerce executor rather
+than an adapter manifest effect.
 
 ## Effect Schema Shape
 
@@ -314,7 +303,8 @@ Commit and dispatch:
 
 - append transition record
 - persist new workflow state
-- append intended asynchronous effect records
+- append intended asynchronous effect records, including the stable
+  `idempotency_key`
 - dispatch asynchronous effects idempotently
 - append effect outcome records
 
@@ -336,6 +326,10 @@ Adapters must either:
 - declare that they are not idempotent, in which case the validator rejects them
   for effects that can be replayed after commit.
 
+The durable effect log stores each effect's `idempotency_key`, and status JSON
+exposes it in `recent_effects[]`. This gives operators and adapters a stable
+repair/reconciliation handle without reading interpreter internals.
+
 ## Failure Categories
 
 Minimum categories:
@@ -352,8 +346,8 @@ timeout
 internal_error
 ```
 
-Default behavior is fail visible and enter blocked unless the workflow declares
-an explicit failure handler.
+Default behavior is fail visible with durable diagnostics unless the workflow
+declares an explicit failure handler or an authored blocked/human-review path.
 
 ## Circuit Breakers
 
@@ -364,8 +358,7 @@ max_consecutive_failures
 max_effect_retries
 max_baml_parse_failures
 max_starts_per_window
-max_timer_events_per_window
 ```
 
-When a circuit breaker trips, the workflow enters blocked with a clear status
-message.
+Circuit breakers are not implemented in v0. When added, they should produce a
+clear durable status reason instead of relying on hidden workflow state.

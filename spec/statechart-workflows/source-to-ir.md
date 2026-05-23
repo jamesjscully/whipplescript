@@ -120,6 +120,7 @@ Source:
 
 ```armature
 agent director = thread("director")
+agent external = adapter("untie")
 agent worker = codingAgent() {
   maxActive 4
 }
@@ -131,7 +132,10 @@ IR:
 {
   "agents": {
     "director": {
-      "target": {"type": "thread", "id": "director"}
+      "target": {"type": "thread", "name": "director"}
+    },
+    "external": {
+      "target": {"type": "adapter", "name": "untie"}
     },
     "worker": {
       "target": {"type": "coding_agent"},
@@ -142,7 +146,9 @@ IR:
 ```
 
 Agents are simple named targets. They do not imply wildcard group behavior.
-Pattern matching over event fields handles groups.
+Pattern matching over event fields handles groups. Thread agents are message
+targets for `send`; `start` targets must be `codingAgent()` or adapter-backed
+agents.
 
 ## Capabilities
 
@@ -387,7 +393,8 @@ Current `case` IR shape:
 
 ## Expression Grammar
 
-The first expression grammar is deliberately small:
+The first expression grammar is deliberately small and must stay aligned with
+[expression-primitives.md](expression-primitives.md):
 
 ```text
 Expr        := Or
@@ -406,7 +413,8 @@ List        := "[" (Expr ("," Expr)*)? "]"
 ArgList     := Expr ("," Expr)*
 ```
 
-`matches` is a pattern operator available in `case` arms and guard expressions:
+`matches` is a pattern operator available in `case` arms. Guard-level glob
+matching should use the explicit `text.matchesGlob(value, pattern)` helper:
 
 ```armature
 case run.name {
@@ -434,7 +442,7 @@ allowed.
 
 ## String Interpolation
 
-Armature strings use `{{ expr }}` interpolation:
+Armature strings use `{{ path }}` interpolation in v1:
 
 ```armature
 send director """
@@ -442,9 +450,10 @@ Worker failed: {{ classification.reason }}
 """
 ```
 
-Each interpolation contains an expression. If a string is exactly one
-interpolation, the lowered value preserves the expression's type instead of
-forcing a string.
+Each interpolation contains a path, not an arbitrary expression. If a string is
+exactly one interpolation, the lowered value preserves the path value's type
+instead of forcing a string. General expressions inside interpolation are
+deferred so message formatting does not become a second expression language.
 
 Prompt blocks inside `coerce` declarations are passed to BAML as prompt
 templates. Armature expression interpolation is not active inside prompt blocks;

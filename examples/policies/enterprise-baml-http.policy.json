@@ -1,12 +1,7 @@
 {
   "mode": "enterprise",
   "allowed_capabilities": [
-    "askHuman",
-    "adapter.agent.start",
-    "baml.coerce",
-    "message_agents",
-    "resource.plan.read",
-    "resource.plan.write"
+    "baml.coerce"
   ],
   "denied_capabilities": [],
   "allow_baml_network": true,

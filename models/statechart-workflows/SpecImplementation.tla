@@ -4,9 +4,14 @@ EXTENDS Naturals, FiniteSets, Sequences
 \* Hand-written Phase 1 model for the spec implementation workflow.
 \*
 \* This is intentionally an abstract WorkflowIR/runtime model, not a parser
-\* model. Coerce outputs are represented by nondeterministic transitions:
+\* model. Coerce outputs are represented by nondeterministic transition choices:
 \* worker/quality completions may pass or fail, and the director may choose to
 \* start worker work, start quality work, ask a human, wait, or finish.
+\*
+\* The selected runtime implementation executes real coerce calls through BAML
+\* HTTP and stores replay-safe coerce call records. Those transport, storage, and
+\* retry details are intentionally not modeled here. The model asks whether the
+\* workflow remains safe for any schema-valid coerce outcome.
 
 CONSTANTS WorkItems, MaxWorkers, MaxQuality
 

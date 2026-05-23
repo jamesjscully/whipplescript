@@ -1,0 +1,48 @@
+machine simpleAgentSupervisor
+initial watching
+
+data {
+  seenRuns string[] = []
+}
+
+agent director = thread("director")
+agent worker = codingAgent() {
+  maxActive 1
+}
+
+event idle {
+  activeRuns int
+  unfinishedItems int
+}
+
+event finished {
+  id string
+  name string
+  status string
+  stdoutTail string
+  stderrTail string
+  exitCode int?
+}
+
+state watching {
+  on idle as observation
+    guard observation.activeRuns == 0
+    guard observation.unfinishedItems > 0
+  {
+    start worker {
+      message "Begin the next ready implementation task."
+    }
+    stay
+  }
+
+  on finished as run
+    guard !(run.id in data.seenRuns)
+  {
+    assign data.seenRuns = data.seenRuns.append(run.id)
+    send director """
+      Agent run {{ run.id }} for {{ run.name }} finished with status {{ run.status }}.
+      Inspect the result and update the plan.
+    """
+    stay
+  }
+}

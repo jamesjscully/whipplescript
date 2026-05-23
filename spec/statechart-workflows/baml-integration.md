@@ -99,7 +99,6 @@ Armature declarations are canonical. Generated BAML artifacts are derived:
 
 ```text
 .armature/build/workflows/<machine>/baml_src/*.baml
-.armature/build/workflows/<machine>/baml_client/*, if generated clients are used
 ```
 
 The generated BAML source includes only declarations reachable from `coerce`
@@ -107,17 +106,200 @@ function inputs and outputs. Workflow-only `class` or `enum` declarations that
 are used only for events, data, or adapter schemas remain in WorkflowIR but are
 not emitted into `workflow.baml`.
 
-The runtime may use either:
+The v1 runtime uses BAML HTTP as the selected execution path. Armature either
+connects to an existing BAML server or, in a later managed mode, starts:
 
-- the BAML Rust SDK with in-memory generated source, or
-- generated BAML client artifacts,
+```sh
+baml-cli serve --from <build-dir>/baml_src
+```
 
-as an implementation detail.
+The Rust runtime then calls:
 
-The spec should prefer the Rust SDK path if it proves stable because it avoids
-checked-in generated clients. Local probing showed the current Rust crate may
-require `protoc` at build time, so implementation plans must include that tool
-in development and CI images if the SDK is adopted directly.
+```text
+POST /call/<function_name>
+```
+
+with named JSON arguments. Generated TypeScript clients and the BAML Rust SDK
+are not part of the v1 `coerce` execution plan. They may be revisited later if
+the HTTP path proves insufficient.
+
+## Coerce Execution Contract
+
+`coerce` is a synchronous value effect. It may produce a typed value used by the
+same transition. It may not directly start agents, enqueue events, edit files,
+or mutate workflow data.
+
+Runtime sequence:
+
+```text
+evaluate coerce argument expressions
+validate each argument against the declared parameter schema
+build named JSON argument object
+check durable coerce call log for an existing successful idempotency key
+if present, reuse the recorded parsed output
+otherwise call BAML HTTP
+validate returned JSON against the declared output schema
+record input, backend, raw metadata, parsed output, validation result, and error
+continue transition with the parsed value
+```
+
+Request shape:
+
+```json
+{
+  "planText": "W1 ready",
+  "recentRuns": []
+}
+```
+
+The source syntax can look positional:
+
+```armature
+let next = coerce chooseNextStep(planText, recentRuns)
+```
+
+but lowering preserves parameter names from the `coerce` declaration so the
+HTTP request is named:
+
+```json
+{
+  "planText": "...",
+  "recentRuns": []
+}
+```
+
+The runtime must reject too many, too few, or schema-invalid arguments before
+calling BAML.
+
+## Backend Modes
+
+### External BAML Server
+
+The first implementation should support an external server:
+
+```sh
+armature run workflow.armature --baml-url http://127.0.0.1:2024
+```
+
+The user or hosting environment is responsible for starting `baml-cli serve`
+against the generated `baml_src` directory.
+
+Advantages:
+
+- smallest Armature implementation slice
+- clearer enterprise deployment boundary
+- no process supervision required for the first real `coerce` path
+- simple integration testing when `baml-cli` and provider credentials exist
+
+### Managed BAML Server
+
+Managed mode is a later convenience:
+
+```sh
+armature run workflow.armature --manage-baml
+```
+
+Armature starts `baml-cli serve --from <build-dir>/baml_src`, captures logs, and
+stops the server when the workflow host stops. This mode may reuse process and
+log-capture lessons from the legacy runtime, but the legacy runtime should not
+own the `coerce` semantics.
+
+Managed mode must record:
+
+- server command and version
+- generated `baml_src` hash
+- selected port or socket
+- stdout/stderr paths or captured log records
+- startup and health-check failures
+
+## Idempotency And Replay
+
+Every `coerce` call has a stable idempotency key:
+
+```text
+workflow_id/workflow_version/event_id/step_path/function_name/args_json
+```
+
+If the runtime finds a successful record for that key, it reuses the parsed
+output. It must not call BAML again for a committed transition and silently
+produce a different decision.
+
+`transition_attempt` is intentionally not part of the v0 runtime key. Retrying a
+failed call appends a new failed or successful attempt; once a successful record
+exists for the same event, step, function, and arguments, replay reuses it.
+
+If a previous failed record exists for the same key, retry behavior is governed
+by workflow failure policy and circuit breakers. Retries append new attempts;
+they do not overwrite the previous record.
+
+## Durable Coerce Call Record
+
+The storage layer should persist a `coerce_calls` record with:
+
+```json
+{
+  "coerce_call_id": "coerce_01H...",
+  "workflow_id": "implementationLoop",
+  "workflow_version": "statechart-workflow-ir/v0",
+  "transition_id": "tr_01H...",
+  "event_id": "evt_01H...",
+  "step_path": "state:choosing/entry/0",
+  "function_name": "chooseNextStep",
+  "idempotency_key": "implementationLoop/statechart-workflow-ir/v0/evt_01H/state:choosing/entry/0/chooseNextStep/{\"planText\":\"W1 ready\"}",
+  "backend": {
+    "kind": "baml_http",
+    "url": "http://127.0.0.1:2024",
+    "baml_src_hash": "sha256:..."
+  },
+  "args": {
+    "planText": "W1 ready"
+  },
+  "status": "succeeded",
+  "http_status": 200,
+  "raw_response": {
+    "redacted": true
+  },
+  "parsed_output": {
+    "action": "StartWorker",
+    "workItemId": "W1",
+    "reason": "ready",
+    "message": "Implement W1"
+  },
+  "error": null,
+  "duration_ms": 1350,
+  "created_at": "2026-05-23T10:00:00Z"
+}
+```
+
+Raw response storage is controlled by policy and may be replaced with a
+redaction marker before persistence. Parsed output and error category must
+remain visible enough for replay and status.
+
+## Failure Behavior
+
+Failure categories:
+
+```text
+baml_server_unavailable
+baml_http_error
+baml_timeout
+baml_parse_failure
+baml_schema_validation_failure
+baml_policy_denied
+internal_error
+```
+
+When `coerce` fails:
+
+- no later steps in the transition run
+- tentative state changes from the failed transition are discarded
+- the queued event is marked failed or routed through a declared failure path
+  when supported
+- a durable coerce call record is written
+- status and overview show the latest coerce failure
+
+Default behavior is visible blocked/failure. Silent fallback values are not
+allowed.
 
 ## Supported Declaration Surface
 
@@ -145,6 +327,7 @@ BAML int                 -> Schema::Int
 BAML float               -> Schema::Float
 BAML bool                -> Schema::Boolean
 BAML null                -> Schema::Null
+BAML image/audio/pdf/video -> reserved opaque media schemas, once enabled
 BAML string/int/bool literal -> Schema::Literal
 BAML Type?               -> Schema::Optional
 BAML Type[]              -> Schema::List
@@ -173,12 +356,22 @@ exist in `data`, event payloads, and adapter schemas, but they are not valid
 BAML boundary types unless an adapter or compiler rule maps them explicitly to a
 BAML-compatible representation.
 
+Multimodal BAML types such as `image`, `audio`, `pdf`, and `video` are reserved
+for future opaque media schema support. The current runtime must reject them
+unless the schema layer, policy layer, and BAML HTTP executor all explicitly
+support the media representation being passed.
+
 BAML does not support `set` or `tuple`. If Armature supports set-like durable
 data internally, it must not emit that type as a BAML input/output schema.
 
 BAML does not support generic `any/json` as a preferred structured boundary. If
 a workflow needs arbitrary JSON at a model boundary, it should pass a string or
 use a more specific class/map/union schema.
+
+BAML-compatible schemas do not imply full inline operations in the Armature
+expression language. Armature can store, compare where meaningful, route, and
+pass values through typed boundaries. The supported operation set is defined in
+[expression-primitives.md](expression-primitives.md).
 
 ## Coerce Calls
 
@@ -233,7 +426,7 @@ coerce choose(planText string) -> NextStep {
 }
 ```
 
-The compiler expands this to a BAML client declaration according to workspace
+The compiler expands this to generated BAML source according to workspace
 defaults and policy. Policy controls:
 
 ```text
@@ -242,6 +435,8 @@ allowed model names
 allowed environment variables
 whether network/model calls are allowed
 whether BAML tools are allowed
+allowed BAML HTTP URLs
+whether Armature may manage a local baml-cli serve process
 ```
 
 Advanced explicit client declarations may be added later, but they should stay
@@ -271,6 +466,11 @@ Armature should not support multimodal coerce inputs in the first
 implementation unless adapter policy explicitly enables them. URL-based media
 can create SSRF and egress risks, so multimodal values need explicit policy,
 allowlists, and audit records.
+
+When enabled, multimodal values are opaque in Armature expressions. Workflows may
+store them, pass them to BAML, pass them to declared adapters, or test for
+presence. They may not inspect, transform, fetch, transcode, or parse media
+inline.
 
 ## Model Generation
 

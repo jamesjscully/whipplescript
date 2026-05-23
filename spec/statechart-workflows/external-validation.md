@@ -28,13 +28,16 @@ Confirmed:
 - HJSON can be converted to ordinary JSON.
 - Rust-side parsing is available through `deser-hjson`.
 
-Direct probes:
+Historical direct probes:
 
 ```text
-npx hjson -j examples/workflows/minimal.armature
-npx hjson -j examples/workflows/spec-implementation.armature
-deser-hjson parse of both example workflow files
+npx hjson -j temporary candidate HJSON workflow fixtures
+deser-hjson parse of temporary candidate HJSON workflow fixtures
 ```
+
+These probes were run against the former HJSON-shaped workflow sketches, not
+against the current native `.armature` source files. Current `.armature` files
+are parsed only by Armature's native parser.
 
 Correction found:
 
@@ -63,6 +66,7 @@ values inside inline arrays and inline objects.
 Validated against:
 
 - Boundary documentation for TypeScript setup and `baml-cli generate`
+- Boundary documentation for `baml-cli serve`
 - Boundary language reference for functions, `client<llm>`, enums, and
   `ctx.output_format`
 - local generation with `@boundaryml/baml@0.220.0`, matching the un-tie repo
@@ -75,6 +79,9 @@ Confirmed:
 - `prompt #"... "#` with `{{ ctx.output_format }}` is valid.
 - BAML enums require values that start with an uppercase letter.
 - Generated TypeScript client code is produced by `baml-cli generate`.
+- `baml-cli serve --from <PATH>` is the selected v1 execution path for
+  Armature `coerce`, using BAML HTTP instead of generated TypeScript or the Rust
+  SDK.
 - The Rust crate exposes a lower-level runtime surface including in-memory
   source loading, dynamic values, parsing, calls, and type builder APIs.
 
@@ -85,6 +92,8 @@ construct BAML source equivalent to Armature-shaped enum/class/coerce declaratio
 write that source into baml_src/
 run npm exec --package @boundaryml/baml@0.220.0 -- baml-cli generate
 attempt a Rust SDK probe with baml = 0.221.0
+inspect `baml-cli serve` documentation for the HTTP `/call/<function_name>`
+execution path
 ```
 
 Corrections found:
@@ -95,6 +104,9 @@ Corrections found:
 - Direct Rust SDK use currently requires `protoc` in this local environment; the
   probe failed before runtime execution because `protobuf-compiler` is not
   installed.
+- Because BAML HTTP is now selected for v1, generated TypeScript and direct Rust
+  SDK probes are retained as historical validation notes rather than current
+  implementation direction.
 
 ## TLA+ / Apalache
 
@@ -132,7 +144,13 @@ Required before relying on this path:
   Apalache
 - refine the Maude executable semantics model as handler lookup, event ordering,
   raised events, and effect commit semantics become concrete
-- add the repeatable command to CI when the workflow stabilizes
+
+Implemented repeatable path:
+
+- `scripts/check-formal-models.sh` runs the source-controlled TLA+/Maude models
+  and `armature prove` against the generated fixture model.
+- `.github/workflows/ci.yml` runs `scripts/check-formal-models.sh` in the
+  formal CI job through the repository Nix flake.
 
 ## Veil
 

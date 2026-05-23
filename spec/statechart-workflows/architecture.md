@@ -15,6 +15,7 @@ durable event queues
 append-only transition/effect logs
 trusted Rust interpreter
 typed effects
+typed synchronous value calls
 runtime status
 optional formal verification
 ```
@@ -37,6 +38,13 @@ optional verification gates
 
 The workflow runtime must not support arbitrary TypeScript or shell as workflow
 logic.
+
+The workflow expression language is deliberately small. BAML-compatible types
+are schemas, not a commitment to implement a general-purpose data language.
+The supported expression primitives are defined in
+[expression-primitives.md](expression-primitives.md). Complex ranking,
+summarization, parsing, multimodal work, and domain policy should be expressed
+as typed `coerce` functions or adapter capabilities.
 
 ## Candidate Architectures
 
@@ -187,11 +195,13 @@ Responsibilities:
 - validate that workflow calls reference declared coerce functions
 - expose coerce input/output schemas to the workflow validator
 - make coerce outputs available as typed values in the IR
+- write generated `baml_src` artifacts that can be served by `baml-cli serve`
 
 Non-responsibilities:
 
 - using BAML as a control-flow runtime
 - allowing BAML to return arbitrary executable plans
+- requiring generated TypeScript clients for normal `coerce` execution
 
 ### 3. Workflow IR
 
@@ -269,13 +279,18 @@ coerce     call BAML to produce typed data from input
 assign     update workflow-local durable data
 askHuman   create a visible human-review obligation
 raise      publish a typed event
-sleep      create a durable timer
-stop       enter a terminal state
 ```
 
 Adapter-backed capability effects such as `plan.snapshot()` or
 `plan.markDone(...)` may be
 registered by adapters. They are not free-form workflow code.
+
+`coerce` and adapter value operations are synchronous typed value calls, not
+workflow control-flow authority. They produce values that the statechart may
+branch on. Any resulting `start`, `send`, `askHuman`, `raise`, or adapter write
+is still an explicit Armature effect with its own schema and capability checks.
+The v1 `coerce` backend is BAML HTTP via `baml-cli serve`; TypeScript codegen is
+not part of the selected execution path.
 
 Each effect has:
 
@@ -323,6 +338,30 @@ legacy Armature adapter, if compatibility is needed
 Adapters should be narrow and capability-checked. They are trusted runtime code,
 not workflow-authored code.
 
+### 8a. Coerce Execution Layer
+
+The coerce execution layer evaluates BAML-backed synchronous value calls.
+
+Supported backend modes:
+
+```text
+external BAML HTTP server supplied with --baml-url
+managed local BAML HTTP server launched with baml-cli serve --from <baml_src>
+```
+
+The first implementation should support the external server mode before managed
+process supervision. Managed mode can reuse process/logging lessons from the
+legacy runtime, but the legacy runtime should not own `coerce` semantics.
+
+The coerce layer is intentionally below the language boundary:
+
+- it receives typed JSON inputs
+- it returns typed JSON outputs
+- Rust validates the output against WorkflowIR schemas
+- it cannot enqueue events or dispatch workflow effects directly
+- effectful host access must be represented as adapter capabilities, not hidden
+  `coerce` behavior
+
 ### 9. Status And Diagnostics
 
 Workflow status is a product feature, not an afterthought.
@@ -331,17 +370,25 @@ The status view should show:
 
 ```text
 workflow state
+workflow data snapshot or redacted summary
 latest transition
 pending events
 ignored events
 active effects
 active invocations
-next timers
 latest BAML calls
 blocked reason
 recent failures
 invariant/check status
 ```
+
+`blocked reason` is reserved for explicit durable blockers. Implemented v0
+mostly reports stuck work through recent failures, policy blockers, queued
+events, active invocations, and latest coerce failures rather than creating a
+hidden blocked state.
+
+Durable timers are a planned extension. They are not part of the implemented v0
+DSL surface; `after` remains reserved in the grammar.
 
 The strongest user-facing improvement over scripts is that stuck workflows must
 be legible.
@@ -371,12 +418,13 @@ It does not model:
 - LLM internals
 - arbitrary file contents
 - host implementation details
+- BAML HTTP server internals
 
 ### 11. Durable Event Queue
 
 The durable event queue is the interpreter's input boundary. It owns event
 ordering, statuses, retry/recovery behavior, dedupe policy, fanout semantics,
-timer admission, and retention.
+and retention. Timer admission is reserved for a later runtime slice.
 
 The queue semantics are defined in [event-queue.md](event-queue.md).
 The SQLite storage model is defined in [storage.md](storage.md).

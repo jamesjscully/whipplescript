@@ -25,6 +25,33 @@ The model should include bounded work items, workflow states, `finished` events,
 counters, visible work item statuses, capability facts, and human-review
 visibility.
 
+Phase 0 remodeling checkpoint for the Option A/BAML HTTP direction:
+
+- no semantic remodel is needed before implementing the `CoerceExecutor`
+  boundary
+- real `coerce` execution through BAML HTTP remains outside the formal model
+- durable `coerce_calls` idempotency and replay are runtime/storage invariants,
+  not statechart safety choices
+- the useful formal obligation remains: for any schema-valid coerce output, the
+  workflow preserves its control-state, active-invocation, visibility, and
+  declared-effect invariants
+- the existing hand-written TLA+ and Maude models continue to represent coerce
+  as nondeterministic choices folded into workflow transitions
+
+Invariant coverage assignment for the next implementation slices:
+
+```text
+max active workers/quality          TLA, Maude, runtime enforcement, tests
+visible started/failed work         TLA, Maude, status e2e
+declared effect surface             TLA, generated model, static validation
+coerce output schema validity       static validation, runtime enforcement, tests
+coerce idempotent replay            SQLite/runtime tests, e2e recovery tests
+BAML HTTP transport failures        runtime tests, opt-in integration tests
+expression primitive type safety    static validation, runtime tests
+workflow data expression invariants runtime enforcement now, generated model later
+adapter capability authority        static validation, runtime policy, adapter tests
+```
+
 The hand-written model should be written against the native `.armature` DSL and
 WorkflowIR semantics. Generated models should consume validated WorkflowIR, not
 raw source text.

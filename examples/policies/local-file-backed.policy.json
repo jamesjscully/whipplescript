@@ -1,18 +1,15 @@
 {
-  "mode": "enterprise",
+  "mode": "local",
   "allowed_capabilities": [
     "askHuman",
     "adapter.agent.start",
-    "baml.coerce",
     "message_agents",
     "resource.plan.read",
     "resource.plan.write"
   ],
   "denied_capabilities": [],
-  "allow_baml_network": true,
-  "allowed_baml_urls": [
-    "http://127.0.0.1:2024"
-  ],
+  "allow_baml_network": false,
+  "allowed_baml_urls": [],
   "allow_managed_baml_server": false,
   "allowed_models": [],
   "allowed_env_vars": [],

@@ -27,13 +27,19 @@ Keep this boundary clear:
    build with `cargo build -p armature-cli` and use `target/debug/armature`.
 2. Find the workflow file, usually `examples/workflows/*.armature` or a repo
    workflow under `.armature/workflows/`.
-3. Validate before running:
+3. For a new local project, scaffold the default files first:
+
+   ```sh
+   armature init path/to/project --name MyWorkflow --json
+   ```
+
+4. Validate before running:
 
    ```sh
    armature validate path/to/workflow.armature --json
    ```
 
-4. If the workflow uses adapter-backed effects, validate with every manifest:
+5. If the workflow uses adapter-backed effects, validate with every manifest:
 
    ```sh
    armature validate path/to/workflow.armature \
@@ -41,10 +47,21 @@ Keep this boundary clear:
      --json
    ```
 
-5. Start inspection with `overview`, not custom status scripts:
+   For the built-in JSON file-backed adapters, use the shortcut flags instead
+   of writing a manifest by hand:
 
    ```sh
-   armature overview path/to/workflow.armature --json
+   armature validate path/to/workflow.armature \
+     --plan-file plan.json \
+     --review-file reviews.json \
+     --agent-file agents.json \
+     --json
+   ```
+
+6. Start inspection with `overview`, not custom status scripts:
+
+   ```sh
+   armature overview path/to/workflow.armature --agent-file agents.json --json
    ```
 
 ## Authoring Shape
@@ -303,6 +320,10 @@ Process one queued event:
 armature run workflow.armature --json
 ```
 
+For deterministic development runs, use each `--fake-coerce-output NAME=JSON`
+or `--fake-call-output NAME=JSON` name at most once. Duplicate fake output names
+are rejected, and names may not contain whitespace or control characters.
+
 Or enqueue and process one event:
 
 ```sh
@@ -313,20 +334,63 @@ armature run workflow.armature \
   --json
 ```
 
+Use built-in file-backed adapters for local end-to-end workflows:
+
+```sh
+armature run workflow.armature \
+  --plan-file plan.json \
+  --review-file reviews.json \
+  --agent-file agents.json \
+  --event idle \
+  --payload '{"activeRuns":0,"unfinishedItems":1}' \
+  --json
+```
+
+Typed adapter-originated events can be enqueued without custom manifests:
+
+```sh
+armature emit workflow.armature \
+  --agent-file agents.json \
+  --event finished \
+  --payload '{"id":"run-1","name":"worker-1","status":"succeeded","stdoutTail":"","stderrTail":"","exitCode":0}' \
+  --json
+
+armature emit workflow.armature \
+  --review-file reviews.json \
+  --event humanReview.responded \
+  --payload '{"reviewId":"review-1","decision":"approved","response":"ship it"}' \
+  --json
+```
+
 Inspect durable state:
 
 ```sh
 armature overview workflow.armature --adapter-manifest adapter.json --json
 armature overview workflow.armature --adapter-manifest adapter.json --policy policy.json --json
-armature status workflow.armature --json
-armature events workflow.armature --json
-armature log workflow.armature --json
+armature overview workflow.armature --agent-file agents.json --json
+armature status workflow.armature --agent-file agents.json --policy policy.json --json
+armature events workflow.armature --agent-file agents.json --policy policy.json --json
+armature events workflow.armature --status failed --json
+armature events workflow.armature --status dead_lettered --json
+armature retry-event workflow.armature --event-id evt_cli_... --json
+armature log workflow.armature --agent-file agents.json --policy policy.json --json
 ```
+
+`events --limit` and `log --limit` are bounded inspection controls; keep them
+at or below 10,000 records.
+Plain `events --status failed` text output includes retry-relevant attempt
+counts when nonzero and `last_error` when present; use `--json` when a coding
+agent needs the full event payload.
+Plain `retry-event` text output confirms `status=queued` and the resulting
+`pending_events` count after an administrative retry.
 
 Use a dedicated `--store path/to/workflow.sqlite` when testing multiple runs or
 when you need repeatable fixtures.
-The human `overview` output includes latest effect status, required
-capabilities, and effect errors. Use `--json` when a coding agent needs the
+The human `overview` and `status` outputs include current state, queued events,
+active invocations, latest effects, required capabilities, policy blockers,
+recent failures, latest coerce calls, latest coerce failures, and summarized
+workflow data. JSON status also exposes `recent_effects[].idempotency_key` for
+adapter reconciliation and repair. Use `--json` when a coding agent needs the
 same fields in a machine-readable shape.
 
 ## Formal Checks
@@ -350,6 +414,7 @@ available:
 armature check workflow.armature --target tla --json
 armature check workflow.armature --target maude --json
 armature check workflow.armature --adapter-manifest adapter.json --policy policy.json --target tla --json
+armature check workflow.armature --agent-file agents.json --target tla --json
 ```
 
 Formal models are abstractions. They are useful for lifecycle invariants such
@@ -357,9 +422,9 @@ as known states and `maxActive` limits; they do not prove real LLM behavior,
 external adapter behavior, or repo-specific quality.
 When an adapter manifest or policy is supplied, Armature validates
 adapter-backed workflow effects before emitting or checking the abstraction.
-`prove` is reserved for stronger future backends. It currently validates the
-workflow/contracts and then reports unavailable; use `check` for bounded
-verification.
+`prove` validates the workflow/contracts and runs the current generated
+verification bundle, TLA+ plus Maude when those tools are available. Use
+`check --target tla` or `check --target maude` when you need one backend.
 
 ## Debugging
 
@@ -368,18 +433,26 @@ Start with diagnostics, then state:
 ```sh
 armature validate workflow.armature --adapter-manifest adapter.json
 armature overview workflow.armature --adapter-manifest adapter.json
-armature events workflow.armature
-armature log workflow.armature
+armature events workflow.armature --adapter-manifest adapter.json
+armature log workflow.armature --adapter-manifest adapter.json
 ```
 
 Common repairs:
 
 - `effect ... is not declared`: add or load the right adapter manifest, or
-  remove the unsupported effect.
+  remove the unsupported effect. For local JSON adapters, prefer
+  `--agent-file`, `--plan-file`, or `--review-file` before inventing a custom
+  manifest.
 - `expects category`: fix the manifest category to match the language effect.
+- `policy document validation failed`: fix duplicate, empty, or invalid policy
+  entries before changing the workflow.
 - `requires denied capability` or `requires capability ... not allowed`: update
   the policy document only if that authority is intended; otherwise remove or
   replace the effect.
+- `payload does not match schema for event`: fix the emitted JSON to match the
+  workflow event or built-in adapter event. `emit --agent-file` supplies the
+  standard `finished` payload shape; `emit --review-file` supplies
+  `humanReview.responded`.
 - `initial state ... is not declared`: update `initial` or add the state.
 - `uses undeclared capability`: add a `capability name = adapter("...")`
   declaration or remove the call.
@@ -402,9 +475,16 @@ Read these files when details matter:
 - `spec/statechart-workflows/runtime-semantics.md` for interpreter behavior.
 - `spec/statechart-workflows/effects.md` for effect categories.
 - `spec/statechart-workflows/component-contracts.md` for typed boundaries.
+- `spec/statechart-workflows/operations.md` for stuck workflow repair.
+- `spec/statechart-workflows/migration.md` for legacy script-runner migration.
+- `spec/statechart-workflows/database-migrations.md` for SQLite migration
+  rules.
+- `spec/statechart-workflows/release-checklist.md` for release and upgrade
+  checks.
 - `spec/statechart-workflows/verification.md` for model-checking strategy.
 - `examples/workflows/minimal.armature` for the smallest valid workflow.
 - `examples/workflows/simple-supervisor.armature` for a compact completion and
   idle-observation workflow.
 - `examples/workflows/spec-implementation.armature` for the richer orchestration
   example.
+- `examples/templates/` for copyable starting points.

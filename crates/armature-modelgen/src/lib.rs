@@ -24,9 +24,9 @@ pub enum ModelgenError {
     #[error("separate check config for {0:?} is not supported; the generated model contains its check command")]
     SeparateConfigUnsupported(ModelTarget),
     #[error(
-        "expression invariant `{0}` cannot be represented by the current generated model abstraction"
+        "expression invariant `{name}` cannot be represented by the current generated model abstraction: {reason}"
     )]
-    UnsupportedExpressionInvariant(String),
+    UnsupportedExpressionInvariant { name: String, reason: String },
 }
 
 pub fn emit_model(ir: &WorkflowIr, target: ModelTarget) -> Result<String, ModelgenError> {
@@ -67,11 +67,91 @@ pub fn emit_tla_check_config() -> String {
 
 fn ensure_generated_model_invariants_supported(ir: &WorkflowIr) -> Result<(), ModelgenError> {
     for invariant in &ir.invariants {
-        if let armature_workflow::ir::Invariant::Expression { name, .. } = invariant {
-            return Err(ModelgenError::UnsupportedExpressionInvariant(name.clone()));
+        if let armature_workflow::ir::Invariant::Expression { name, expr, .. } = invariant {
+            return Err(ModelgenError::UnsupportedExpressionInvariant {
+                name: name.clone(),
+                reason: unsupported_expression_invariant_reason(expr),
+            });
         }
     }
     Ok(())
+}
+
+fn unsupported_expression_invariant_reason(expr: &Expr) -> String {
+    let mut roots = BTreeSet::new();
+    collect_path_roots(expr, &mut roots);
+    if roots.contains("data") {
+        return "workflow data is not included in the generated model yet".to_string();
+    }
+    if roots.iter().any(|root| root != "data") {
+        return format!(
+            "path root(s) {} are outside the current generated model",
+            roots.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+    if contains_call(expr) {
+        return "expression calls are not included in generated invariant models yet".to_string();
+    }
+    "only built-in invariants are currently modeled".to_string()
+}
+
+fn collect_path_roots(expr: &Expr, roots: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Path { path } => {
+            let root = path.split_once('.').map(|(root, _)| root).unwrap_or(path);
+            roots.insert(root.to_string());
+        }
+        Expr::Eq { left, right }
+        | Expr::Neq { left, right }
+        | Expr::Lt { left, right }
+        | Expr::Lte { left, right }
+        | Expr::Gt { left, right }
+        | Expr::Gte { left, right }
+        | Expr::In { left, right } => {
+            collect_path_roots(left, roots);
+            collect_path_roots(right, roots);
+        }
+        Expr::And { exprs } | Expr::Or { exprs } => {
+            for expr in exprs {
+                collect_path_roots(expr, roots);
+            }
+        }
+        Expr::Not { expr } => collect_path_roots(expr, roots),
+        Expr::Call { args, .. } => {
+            for expr in args {
+                collect_path_roots(expr, roots);
+            }
+        }
+        Expr::Object { fields } => {
+            for expr in fields.values() {
+                collect_path_roots(expr, roots);
+            }
+        }
+        Expr::List { items } => {
+            for expr in items {
+                collect_path_roots(expr, roots);
+            }
+        }
+        Expr::Literal { .. } => {}
+    }
+}
+
+fn contains_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { .. } => true,
+        Expr::Eq { left, right }
+        | Expr::Neq { left, right }
+        | Expr::Lt { left, right }
+        | Expr::Lte { left, right }
+        | Expr::Gt { left, right }
+        | Expr::Gte { left, right }
+        | Expr::In { left, right } => contains_call(left) || contains_call(right),
+        Expr::And { exprs } | Expr::Or { exprs } => exprs.iter().any(contains_call),
+        Expr::Not { expr } => contains_call(expr),
+        Expr::Object { fields } => fields.values().any(contains_call),
+        Expr::List { items } => items.iter().any(contains_call),
+        Expr::Literal { .. } | Expr::Path { .. } => false,
+    }
 }
 
 fn emit_tla_model(ir: &WorkflowIr) -> String {
@@ -1464,6 +1544,38 @@ invariant countWithinBound {
         assert!(error
             .to_string()
             .contains("expression invariant `countWithinBound` cannot be represented"));
+        assert!(error
+            .to_string()
+            .contains("workflow data is not included in the generated model yet"));
+    }
+
+    #[test]
+    fn rejects_expression_invariants_with_calls_until_calls_are_modeled() {
+        let source = r#"
+machine CallInvariant
+initial done
+
+state done {
+  final
+}
+
+invariant textWorks {
+  assert text.contains("abc", "a")
+}
+"#;
+        let ir = armature_workflow::parse_source(source).expect("source parses");
+        let report = armature_workflow::validate_ir(&ir);
+        assert!(report.is_ok(), "{:#?}", report.diagnostics);
+
+        let error = crate::emit_model(&ir, crate::ModelTarget::Tla)
+            .expect_err("expression call invariant is not modelable yet");
+
+        assert!(error
+            .to_string()
+            .contains("expression invariant `textWorks` cannot be represented"));
+        assert!(error
+            .to_string()
+            .contains("expression calls are not included in generated invariant models yet"));
     }
 
     #[test]

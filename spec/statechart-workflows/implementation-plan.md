@@ -2,401 +2,706 @@
 
 Status: working plan
 
-This plan sequences the work so formal modeling pressures the design before the
-runtime hardens, without making formal verification a constant blocker during
-early scaffolding.
+This plan starts from the current Rust statechart runtime work, not from a blank
+repository. The implementation direction is now:
 
-## Phase 0: Proposal Specification
+```text
+native .armature statechart DSL
+small orchestration expression kernel
+Rust parser, validator, interpreter, modelgen, and CLI
+SQLite durable queue/log/state/coerce storage
+BAML HTTP for real coerce execution
+adapter manifests for external effects
+TLA+/Maude generated checks, with Veil later
+```
 
-Goal: write enough specification to align on product shape and semantics.
+The north star is a workflow scripting language for agent orchestration that
+feels natural to coding agents and humans without granting arbitrary
+programming-language authority.
 
-Deliverables:
+## Current Baseline
 
-- architecture document
-- product surface and CLI document
-- authoring format sketch
-- workflow IR sketch
-- runtime semantics document
-- verification strategy
-- explicit existing-system reuse boundary
-- concrete spec implementation workflow example
-- initial implementation plan
+The active implementation already has these pieces:
+
+- native `.armature` parser/lowering scaffold using `logos` and `rowan`
+- WorkflowIR structs, schema validation, and source diagnostics
+- support for `machine`, `initial`, `data`, `event`, `agent`, `capability`,
+  `enum`, `class`, `coerce`, nested `state`, `on`, `entry`, `always`, `case`,
+  `let`, `assign`, `start`, `send`, `askHuman`, `raise`, `stay`, `goto`, and
+  invariants over the implemented subset
+- agent targets include `thread`, `codingAgent`, and adapter-backed agents;
+  validation rejects starting thread-only agents
+- SQLite workflow store with event queue, state, transition logs, effect logs,
+  durable coerce call records, recovery for processing events, and schema
+  version metadata
+- interpreter support for synthetic events, parent-state event fallback,
+  entry/always loop protection, fake adapter dispatch, fake coerce executor
+  outputs, BAML HTTP coerce execution, fake capability value outputs, and
+  adapter-backed capability value calls
+- adapter manifest validation and runtime policy enforcement for adapter-backed
+  effects
+- generated TLA+ and Maude model targets for the current control-state and
+  active-invocation abstraction
+- CLI commands for validate, emit, run, status, overview, events, log, build,
+  check, emit-model, emit-config, prove, validate-adapter, and validate-policy
+- `prove` validates contracts and runs the current generated verification
+  bundle, TLA+ plus Maude
+- deterministic e2e coverage around the CLI/runtime boundary using fake outputs
+- CLI `run --baml-url` support for calling an already-running `baml-cli serve`
+  endpoint
+- `run --baml-url` policy enforcement for `baml.coerce`, BAML network access,
+  and exact URL allowlists
+- runtime `coerce` persistence/replay through durable coerce records
+- runtime BAML HTTP records include generated BAML source hashes and stable
+  interpreter step locators such as `handler.0`, `entry.0.0`, and
+  `always.guard`
+- expression validation/runtime support for the v1 primitive helpers in
+  [expression-primitives.md](expression-primitives.md), including list, map,
+  text, time, coerce, and capability value calls
+- status projection for workflow data, summarized workflow data, latest coerce
+  calls, latest coerce failures, and policy blockers from durable storage
+- opt-in real BAML HTTP e2e coverage gated by `ARMATURE_RUN_BAML_E2E=1` and
+  `ARMATURE_BAML_URL`
+- first scoped JSON plan file adapter slice through `run --plan-file`, covering
+  plan snapshot reads and task status updates for ready-for-quality, done, and
+  blocked; plan-only workflows get a built-in JSON plan manifest automatically
+- first human-review bridge through `run --review-file`, covering durable JSON
+  review obligation creation for `askHuman`, plus typed response event intake
+  through `emit --review-file`
+- first local agent/thread bridge through `run --agent-file`, covering durable
+  JSON invocation records for `start` and message records for `send`, plus
+  typed completion event intake through `emit --agent-file`
+
+Known major gaps:
+
+- expression validation implements optional-presence proof for direct nil
+  comparisons, conjunctions, shared non-null facts across disjunctions,
+  De Morgan-style negated disjunctions, double negation, and ordered
+  case-pattern refinement; it intentionally does not yet attempt full SAT-style
+  boolean reasoning
+- generated formal models do not yet include workflow data or expression
+  invariants
+- real external agent/thread API adapters and fuller plan/state adapters remain
+  future work
+- managed `baml-cli serve` process mode is not part of the first real coerce
+  slice
+
+## Phase 0: Remodeling Checkpoint
+
+Goal: decide whether the formal models and IR abstraction need a small remodel
+before changing runtime semantics for real `coerce`.
+
+This phase should be quick and focused. It should not reopen browser
+portability, generated TypeScript execution, HJSON, or arbitrary scripting.
+
+Questions to answer:
+
+- Does the current generated TLA+/Maude abstraction still match the selected
+  language after the expression primitive boundary was narrowed?
+- Should `coerce` appear in the model as an abstract synchronous value event,
+  or is the current per-function nondeterministic output map sufficient?
+- Does the model need to distinguish successful coerce reuse from fresh coerce
+  execution, or can idempotency remain a runtime/storage invariant?
+- Which expression primitives must be represented formally now, and which can
+  stay as static/runtime validation obligations?
+- Do we need a hand-written update to the existing spec implementation model
+  before coding, or are generated-model notes plus runtime tests enough?
+
+Recommended work:
+
+1. Review `models/statechart-workflows/SpecImplementation.tla` and
+   `SpecImplementation.maude` against the selected semantics.
+2. Add comments or small state variables only if they clarify the selected
+   `coerce` abstraction.
+3. Keep BAML HTTP, provider behavior, prompts, raw responses, and network
+   failures out of the formal model.
+4. Model `coerce` as nondeterministic schema-valid output. Runtime handles
+   idempotency and durable replay.
+5. Explicitly classify every invariant in the implementation plan as one of:
+   static validation, runtime enforcement, generated model, hand-written model,
+   property test, adapter contract test, or future work.
 
 Exit criteria:
 
-- the team can explain the runtime boundary in one paragraph
-- the team can list every trusted component
-- the team can identify what user-authored workflow source can and cannot do
-- the team can explain which old Armature concepts are kept, dropped, or
-  reframed
-- the example workflow feels simpler than the equivalent script
+- the plan states whether formal artifacts need immediate changes
+- no runtime code proceeds under ambiguous `coerce` semantics
+- any model changes still pass the existing formal check script
+- if no model changes are needed, the rationale is recorded in this file or a
+  short model README note
 
-## Phase 1: Hand-Written Formal Model
+## Phase 1: Normalize Code Boundaries
 
-Goal: pressure-test the semantics before implementation.
+Goal: align existing code structure with the selected architecture before
+adding new behavior.
 
-This phase should model the language semantics, not the whole product.
+### 1.1 Workflow Crate
 
-Model:
+Work in `crates/armature-workflow`:
 
-```text
-bounded work items
-workflow states
-finished events
-idle observation events
-coerce run classification as nondeterministic output
-coerce next-action selection as nondeterministic output
-worker and quality active counters
-work item statuses
-capability facts
-failure visibility
-human review visibility
-```
-
-Do not model:
-
-```text
-actual LLM behavior
-actual prompts
-actual resource contents beyond bounded abstractions
-full compatibility adapter/runtime behavior
-full un-tie session behavior
-Git state
-networking
-```
-
-Initial properties:
-
-```text
-active_workers <= max_workers
-active_quality <= max_quality
-no duplicate active work item
-started work is always visible
-failed work is completed, blocked, failed, or human_review
-undeclared capabilities cannot be invoked
-unknown agents cannot be targeted
-idle unfinished work cannot be silently ignored forever in the model's bounded horizon
-```
-
-Recommended sequence:
-
-1. Write a compact TLA+/Apalache-style model or equivalent transition-system
-   model for the example workflow using the native DSL/IR semantics.
-2. Install/provision the selected checker in CI or developer tooling.
-3. Run bounded checks and collect counterexamples.
-4. Revise the workflow semantics and specs.
-5. Reevaluate whether Maude should be added immediately as an executable
-   rewriting-semantics model.
-6. If Maude is warranted, model the same WorkflowIR/runtime semantics and use
-   it to pressure handler lookup, event ordering, raised events, and effect
-   commit behavior.
-7. Re-express the same model in Veil or write a small Veil companion model.
-8. Pin the Veil/Lake dependency version before treating Veil output as more
-   than an exploratory artifact.
-9. Decide which formal backend should be the first generated target.
+- keep `class`, `enum`, and `coerce` declarations as the source of truth
+- keep generated BAML source as a derived artifact
+- add schema variants or reserved-type diagnostics for media types only when
+  the parser, validator, runtime, policy, and BAML HTTP executor all support
+  the representation
+- tighten static expression validation toward
+  [expression-primitives.md](expression-primitives.md)
+- reject undeclared calls, unsupported helpers, general-purpose operations,
+  and optional-field access that is not guarded or pattern-proven
+- keep source diagnostics in source vocabulary: say `data`, not internal
+  `context`, unless discussing IR JSON
 
 Exit criteria:
 
-- at least one hand-written model exists
-- the model finds or rules out the expected obvious failure modes
-- the specs have been revised based on model feedback
-- the Maude decision is documented with rationale
-- each important invariant is assigned to static validation, property tests,
-  TLA+/Apalache, optional Maude, future Veil work, runtime enforcement, or
-  adapter contract tests
-- the chosen IR still appears lowerable to Veil or another formal backend
+- unsupported expression primitives fail validation with source spans
+- supported helpers have stable names and schemas
+- BAML boundary types are validated before build/runtime
 
-## Phase 2: Runtime Skeleton
+### 1.2 Engine Boundary
 
-Goal: create the smallest executable workflow stack with fake or narrow
-adapters.
+Work in `crates/armature-engine`:
 
-Deliverables:
+- introduce `CoerceExecutor` as a runtime dependency, separate from
+  `EffectDispatcher`
+- move fake coerce behavior behind `FakeCoerceExecutor`
+- remove direct interpreter dependence on `fake_coerce_outputs` as the
+  production execution path
+- keep deterministic fake outputs available for unit and e2e tests
+- introduce DTOs for `CoerceRequest`, `CoerceOutcome`, `CoerceBackend`,
+  `CoerceStatus`, and `CoerceErrorCategory`
+- make coerce failures distinct from `UnsupportedExpression`
 
-- workflow crate/module skeleton
-- native `.armature` parser for the restricted statechart DSL, using `logos`
-  for lexing and `rowan` for a lossless syntax tree
-- typed AST/lowering pass from rowan syntax tree to WorkflowIR
-- IR structs
-- static validator shell
-- golden fixture tests:
+Proposed trait shape:
 
-```text
-examples/workflows/minimal.armature -> expected WorkflowIr JSON
-examples/workflows/minimal.armature -> expected validation report
-synthetic event sequence -> expected status projection
+```rust
+pub trait CoerceExecutor {
+    fn coerce(&mut self, request: CoerceRequest) -> Result<CoerceOutcome, CoerceError>;
+}
 ```
 
-- SQLite-backed durable workflow state store
-- SQLite-backed event queue, transition log, and effect log
-- single-instance interpreter loop
-- manifest-driven fake adapters
-- CLI commands:
-
-```text
-armature validate <file>
-armature emit <file> --event <event> --payload <json>
-armature run <file>
-armature status [workflow]
-armature events [workflow]
-armature log [workflow]
-armature build <file>
-armature check <file> [--adapter-manifest <manifest>]
-```
-
-Implementation guidance:
-
-- do not build an in-memory state machine and add persistence later; the first
-  interpreter slice should append durable records
-- implement only the minimal grammar needed for `minimal.armature`; do not add
-  general-purpose programming constructs while building the parser
-- preserve comments, whitespace, malformed tokens, and source spans in the rowan
-  tree even when lowering fails
-- add property tests for parser/lowering invariants as soon as the AST shape is
-  stable enough to make them valuable
-- validate every `serde_json::Value` against `WorkflowIr` or `AdapterManifest`
-  schemas before use
-- consume adapter manifests before real adapters exist, including fake `coerce`,
-  `start`, `send`, `askHuman`, and capability operation support
-- keep effect dispatch idempotency in the first skeleton
-- record transitions even if adapters are fake
-- do not add arbitrary scripting escape hatches
+The engine owns argument evaluation, schema validation, idempotency lookup, and
+storage. The executor owns only the backend call.
 
 Exit criteria:
 
-- `minimal.armature` can be parsed and lowered into golden IR
-- validator output is snapshot-tested
-- the interpreter can process synthetic events
-- event, transition, effect, and current state records are persisted in SQLite
-- status explains current state and recent transitions
-- validator catches unknown states, agents, actions, and capabilities
+- fake and real coerce can share one request/outcome boundary
+- interpreter code can evaluate `coerce` without knowing whether the backend is
+  fake or BAML HTTP
+- failures carry categories useful for status and retry policy
 
-## Phase 3: Real Adapters
+### 1.3 Adapter Crate
 
-Goal: connect the skeleton to useful runtime systems.
+Work in `crates/armature-adapters`:
 
-Deliverables:
-
-- un-tie thread/session adapter
-- BAML execution adapter
-- scoped plan/state file adapter
-- human review adapter or event bridge
-- legacy Armature event/run adapter only if it clearly serves the new workflow
-  model
-
-Exit criteria:
-
-- a workflow can start work or message a declared agent target
-- a workflow can observe a real completion event from at least one adapter
-- BAML calls are recorded with input, raw output, parsed output, and failures
-- adapter failures become durable workflow state
-
-## Phase 4: Generated Formal Models
-
-Goal: generate model artifacts from the same IR the interpreter executes.
-
-Deliverables:
-
-- formal model generator for the implemented subset
-- generated model fixtures for the spec implementation workflow
-- CLI command:
-
-```text
-armature emit-model <file> --target <target> [--adapter-manifest <manifest>]
-```
-
-Target choices:
-
-```text
-tla
-apalache
-maude
-veil
-```
-
-The first target should be whichever gives the fastest useful counterexamples.
-Maude is a candidate reference-semantics target if executable rewriting exposes
-bugs more directly than a state-space checker. Veil remains the preferred
-long-term proof-oriented target if the ergonomics are acceptable.
-
-Current implementation note: the first generated targets are TLA+ and a small
-Maude rewriting model over the validated IR's state-transition abstraction.
-Generated TLA+ and Maude currently include declared agent `maxActive` limits,
-active invocation counters, start increments, completion decrements, and
-max-active safety checks. Generated TLA+ also includes finite `coerce` output
-spaces for enum/literal/bool/null/ref-record discriminants, nondeterministic
-coerce transitions, and a `CoerceType` invariant over the function output map.
-It also tracks the last abstract effect label with a `DeclaredEffectType`
-invariant as the first generated effect-surface check. Ordinary effects such as
-`send`, `askHuman`, `raise`, and capability calls are modeled as stuttering
-observations; bounded `start` effects remain counter-updating actions.
-Generated Maude records the same finite coerce spaces as model comments while
-keeping the current rewriting abstraction focused on control state and active
-invocation counters. The runtime enforces the same max-active limit before
-dispatching `start` effects. Generated artifacts annotate declared built-in
-invariants with their current coverage layer, and model emission fails closed
-for expression invariants until workflow data is represented in the formal
-abstraction. The hand-written TLA+/Maude models remain the stronger
-specification pressure until generated models include workflow data and deeper
-effect/capability invariants.
+- remove or demote the placeholder `BamlAdapter` trait if it conflicts with
+  the engine-facing `CoerceExecutor`: implemented by removing the placeholder
+  trait; real `coerce` uses the engine `CoerceExecutor`
+- keep adapter manifests for external effects such as `start`, `send`,
+  `askHuman`, and capability operations
+- do not model `coerce` as a normal adapter-manifest effect in v1
+- if dependency direction becomes awkward, move shared DTOs into a small
+  contracts module or crate instead of letting adapters depend on interpreter
+  internals
 
 Exit criteria:
 
-- generated model includes states, events, counters, coerce output spaces, and
-  selected invariants
-- generated model is emitted from validated WorkflowIR, not raw `.armature`
-  source
-- generated model agrees with the hand-written model on core properties
-- model generation failures produce actionable diagnostics
-- build artifacts include validated adapter-manifest and policy-document bundles
-  when supplied, so effect/event schemas, required capabilities, and authority
-  assumptions are reproducible with the generated IR and models
+- adapter-backed effects and executor-backed coerce have separate, clear
+  boundaries
+- no adapter manifest is required just to call BAML HTTP `coerce`
 
-## Phase 5: Validation Commands
+## Phase 2: Durable Coerce Storage
 
-Goal: expose verification as product commands without making it mandatory.
+Goal: make `coerce` replay-safe and inspectable before calling any real model.
 
-Deliverables:
+Work in `crates/armature-engine` storage:
+
+- add a `coerce_calls` table matching [storage.md](storage.md)
+- add migration/version handling for the new table
+- add indexes for latest calls per workflow/function and successful
+  idempotency-key lookup
+- add store methods:
+  - `find_successful_coerce_call(workflow_id, idempotency_key)`
+  - `append_coerce_call_attempt(record)`
+  - `latest_coerce_calls(workflow_id, limit)`
+  - `latest_coerce_failures(workflow_id, limit)`
+- include coerce records in log/status projections without mixing them into
+  asynchronous effect dispatch logs
+
+Idempotency key shape:
 
 ```text
-armature validate <file>
-armature validate-adapter <manifest>
-armature validate-policy <policy>
-armature check <file> [--adapter-manifest <manifest>]
-armature prove <file>
-armature run <file>
-armature status [workflow]
-armature emit-model <file> --target <target> [--adapter-manifest <manifest>]
-armature emit-config <file> --target <target> [--adapter-manifest <manifest>]
+workflow_id/workflow_version/event_id/transition_attempt/step_path/function_name
 ```
 
-Expected behavior:
-
-- `validate` is fast and local
-- `check` runs bounded model checks when tooling is installed
-- `prove` runs stronger backend-specific verification when available
-- until a proof backend is implemented, `prove` validates workflow, adapter, and
-  policy contracts before returning a clear unavailable result
-- missing formal tools produce clear installation/configuration diagnostics
+Current runtime step locators use the interpreter path through handler, entry,
+always, guard, and invariant evaluation. A future source-map layer may replace
+these with source-span-backed paths, but replay safety does not depend on that.
 
 Exit criteria:
 
-- users can inspect generated artifacts
-- CI can run `validate` without heavyweight dependencies
-- advanced users can opt into `check` or `prove`
+- successful coerce outputs can be reused by idempotency key
+- failed coerce attempts are append-only and visible
+- schema migrations preserve existing stores or fail closed on unsupported
+  versions
+- tests cover insert, lookup, duplicate success behavior, latest calls, and
+  latest failures
 
-## Phase 6: Optional Gates
+## Phase 3: BAML HTTP Executor
 
-Goal: allow teams to require validation at appropriate boundaries.
+Goal: implement real `coerce` through BAML HTTP with external server mode first.
 
-Gate levels:
+Work in engine and CLI:
+
+- implement `BamlHttpCoerceExecutor`
+- add CLI flag:
 
 ```text
-none
-validate
-check
-prove
+--baml-url http://127.0.0.1:2024
 ```
 
-Possible enforcement points:
+- call:
 
 ```text
-before workflow start
-before workflow publish
-before enterprise/stable workflow enablement
-in CI
+POST /call/<function_name>
+```
+
+with named JSON arguments derived from the `coerce` declaration parameter names
+- support request timeouts
+- classify backend errors:
+  - `baml_server_unavailable`
+  - `baml_http_error`
+  - `baml_timeout`
+  - `baml_parse_failure`
+  - `baml_schema_validation_failure`
+  - `baml_policy_denied`
+  - `internal_error`
+- persist raw response metadata according to policy; allow redaction of raw
+  provider output while retaining parsed output and failure details
+
+Implementation sequence:
+
+1. Add HTTP client dependency in the smallest crate that needs it.
+2. Add executor construction in CLI when `--baml-url` is provided.
+3. Build generated `baml_src` before real coerce execution.
+4. Compute and record generated BAML artifact hash.
+5. Validate arguments before calling HTTP.
+6. Validate parsed output after HTTP.
+7. Reuse successful output before HTTP.
+8. Append failure records on all backend and schema errors.
+
+Testing:
+
+- unit test request construction and output validation
+- unit test error classification with a local tiny HTTP test server if useful
+- deterministic e2e should continue using `FakeCoerceExecutor`
+- add opt-in real BAML integration test gated by:
+
+```text
+ARMATURE_RUN_BAML_E2E=1
+BAML server URL or managed test setup
+provider credentials or compatible local provider
 ```
 
 Exit criteria:
 
-- gates are configurable per workspace or workflow
-- gates can be disabled during early development
-- stable/enterprise mode can require at least static validation
+- an external BAML server can satisfy a real workflow `coerce`
+- replay of the same committed transition does not call BAML again
+- coerce failure is visible through failed events, durable diagnostics, and
+  latest coerce failure status; v0 does not create a hidden blocked state
+- fake e2e tests still pass without network/provider credentials
 
-## Phase 7: Product Hardening
+## Phase 4: Status, Overview, And Debuggability
+
+Goal: make real and fake workflows legible when they wait, fail, or choose a
+branch.
+
+Work in engine and CLI:
+
+- include workflow data summary in `status` and `overview`
+- include latest coerce calls and failures
+- show current state, active invocations, pending events, latest transition,
+  latest effects, recent failures, policy blockers, and latest coerce decisions
+  together
+- avoid printing raw BAML responses when policy redacts them; general workflow
+  data redaction is a later policy slice
+- avoid adapter calls during status projection; status reads durable records
+  only
+
+Suggested status JSON additions:
+
+```json
+{
+  "data_summary": {},
+  "latest_coerce_calls": [],
+  "latest_coerce_failures": [],
+  "policy_blockers": []
+}
+```
+
+Exit criteria:
+
+- `armature status --json` exposes coerce and data summary fields
+- `armature overview` renders those fields compactly for humans
+- policy-denied effect dispatches are projected as first-class policy blockers
+- no status command performs hidden live adapter or BAML calls
+- e2e tests assert status includes current state, queued events, active
+  invocations, data summaries, and coerce decisions/failures where applicable
+
+## Phase 5: Expression Kernel Completion
+
+Goal: finish the useful 99% orchestration primitives without drifting into a
+general-purpose language.
+
+Implement and validate the v1 primitive set:
+
+- literals: string, block string, int, float, duration, bool, nil, object, list
+- paths and field access over `data`, event bindings, and `let` bindings
+- equality and ordering over compatible scalar schemas
+- boolean logic
+- membership
+- case patterns over enum/literal/glob/wildcard
+- object/list construction
+- path-only string interpolation
+- list helpers:
+  - `list.length`
+  - `list.isEmpty`
+  - `list.contains`
+  - `list.append`
+  - `list.remove`
+  - `list.first`
+  - receiver sugar for `xs.append(value)` and `xs.remove(value)`
+- map helpers:
+  - `map.get`
+  - `map.set`
+  - `map.remove`
+  - `map.containsKey`
+- text helpers:
+  - `text.trim`
+  - `text.contains`
+  - `text.startsWith`
+  - `text.endsWith`
+  - `text.matchesGlob`
+- time helpers:
+  - `now`
+  - `elapsedSince`
+  - `time.elapsedSince`
+- typed value calls:
+  - `coerce`
+  - direct calls to coerce declarations
+  - capability value calls
+
+Reject:
+
+- loops
+- recursion
+- user-defined functions
+- lambdas
+- map/filter/reduce
+- sorting
+- general arithmetic libraries
+- regex
+- arbitrary string processing
+- inline multimodal manipulation
+- implicit type coercions
+- imports or host callbacks
+
+Exit criteria:
+
+- every supported primitive has validation tests and runtime tests
+- every rejected construct has a targeted diagnostic
+- examples use only supported primitives
+- formal model generation either models the primitive or explicitly fails with
+  an actionable unsupported-construct diagnostic
+
+## Phase 6: Formal Model Updates
+
+Goal: keep verification useful as runtime semantics become more complete.
+
+Work in `crates/armature-modelgen` and `models/statechart-workflows`:
+
+- keep BAML HTTP internals out of generated and hand-written models
+- model coerce as nondeterministic schema-valid output
+- model bounded outputs for enums, literals, bools, nulls, unions, and record
+  discriminants
+- add workflow data abstraction only for fields needed by invariants
+- decide whether each expression primitive is:
+  - modeled directly
+  - statically validated and elided
+  - runtime-enforced only
+  - unsupported for model generation
+- preserve fail-closed behavior for expression invariants that cannot be
+  represented
+- keep Maude as a possible reference-semantics pressure tool for handler lookup,
+  raised events, and effect commit ordering
+- keep Veil as a later proof-oriented target after semantics stabilize
+
+Exit criteria:
+
+- generated TLA+/Maude artifacts still pass existing formal checks
+- modelgen diagnostics clearly explain unsupported expression/invariant cases
+- generated models agree with the hand-written model on control-state,
+  active-invocation, and coerce-output abstractions
+
+## Phase 7: Real Adapter Slices
+
+Goal: connect the runtime to useful external systems without weakening the
+language boundary.
+
+Implement in this order:
+
+1. **Scoped plan/state adapter**
+   - read plan snapshot: implemented for JSON plan files through
+     `run --plan-file`
+   - count unfinished work: implemented for JSON plan files through
+     `plan.unfinishedItems()`
+   - read next ready item: implemented for JSON plan files through
+     `plan.nextReadyItem()`
+   - mark ready for quality: implemented for JSON plan files
+   - mark done: implemented for JSON plan files
+   - mark blocked: implemented for JSON plan files
+   - use lock or compare-and-write for file-backed state: implemented for JSON
+     plan writes with a short-lived lock file plus atomic temp-file replacement
+   - expose schemas and required capabilities through manifests: implemented
+     through adapter manifests, with built-in JSON manifest injection for
+     `run --plan-file` when no explicit `plan.*` manifest is loaded
+
+2. **Human review adapter or event bridge**
+   - create visible review obligations: implemented for JSON review files
+     through `run --review-file`
+   - expose schemas and required capabilities through manifests: implemented
+     through adapter manifests, with built-in JSON manifest injection when no
+     explicit `askHuman` manifest is loaded
+   - accept typed human-response events: implemented for
+     `emit --review-file` through the built-in `humanReview.responded` schema
+   - update local review records from typed responses: implemented for
+     `emit --review-file`
+   - keep idempotency keys stable: implemented for JSON review obligation
+     records
+
+3. **Agent/thread adapter**
+   - start declared agent work: implemented for JSON agent files through
+     `run --agent-file`
+   - send messages to declared targets: implemented for JSON agent files
+     through `run --agent-file`
+   - expose schemas and required capabilities through manifests: implemented
+     through adapter manifests, with built-in JSON manifest injection when no
+     explicit `start` or `send` manifest is loaded
+   - observe typed completion events: implemented for `emit --agent-file`
+     through the built-in `finished` schema
+   - record typed completions in the local agent file and mark matching
+     invocations finished: implemented for `emit --agent-file`
+   - enforce target compatibility: partially implemented through declared
+     `thread`/`codingAgent`/adapter targets, a static rejection for starting
+     thread-only agents, effect schema validation, and capability policy;
+     external agent-specific contract checks remain adapter work
+
+4. **Legacy compatibility adapter**
+   - only if it clearly helps migration
+   - must not shape WorkflowIR or source semantics
+   - must not reintroduce arbitrary script authority as normal workflow logic
+
+Exit criteria:
+
+- a real workflow can start agent work, receive completion, update plan state,
+  and ask for human review
+- all adapter effects are manifest-described, policy-checked, idempotent where
+  required, and logged durably
+- adapter failures produce visible workflow state
+
+## Phase 8: CLI, Build, And Policy Completion
+
+Goal: make the product commands coherent for local and enterprise usage.
+
+CLI work:
+
+- ensure all commands that validate or execute workflows accept
+  `--adapter-manifest` and `--policy` consistently: implemented for
+  validate, run, status, overview, build, check, prove, emit-model, and
+  emit-config; events and log accept them as validation-only inspection
+  context; emit accepts adapter manifests for typed event intake and policy
+  documents for policy-document validation
+- ensure file-backed adapter convenience flags are accepted by runtime and
+  inspection commands: implemented for `run`, `emit` where event intake needs
+  typed adapter events, and for `validate`, `build`, `check`, `prove`,
+  `emit-model`, `emit-config`, `status`, `overview`, `events`, and `log` as
+  validation-only or build-metadata context
+- keep `events --limit` and `log --limit` bounded: implemented with a 10,000
+  record cap before querying SQLite
+- support event inspection by queue state: implemented for `events --status`
+  using durable status-filtered storage queries
+- support administrative retry of failed queue records: implemented for
+  `retry-event --event-id`, limited to `failed` and `dead_lettered` events,
+  preserving attempt counts and clearing `last_error`
+- add `--baml-url` to commands that may execute real coerce
+- keep `--fake-coerce-output` as testing/development-only
+  - duplicate fake output names are rejected to avoid silent test fixture
+    overrides
+  - fake output names containing whitespace or control characters are rejected
+- add `--manage-baml` only after external URL mode is reliable
+- keep `build` producing:
+  - `workflow-ir.json`: implemented
+  - `baml_src/workflow.baml`: implemented
+  - generated model files: implemented for TLA+, TLA config, and Maude
+  - adapter manifest bundle, when supplied: implemented
+  - policy document bundle, when supplied: implemented
+  - artifact hashes: implemented through `artifact-hashes.json` and
+    `build --json` hash output
+
+Policy work:
+
+- keep the initial exact capability policy shape stable
+- BAML-specific policy knobs:
+  - `allow_baml_network`: implemented for `run --baml-url`
+  - `allowed_baml_urls`: implemented as exact URL allowlist for `run --baml-url`
+  - `allow_managed_baml_server`: schema field reserved until managed process
+    mode exists
+  - `allowed_models`: schema field validated and reserved until Armature owns
+    provider/model selection
+  - `allowed_env_vars`: schema field validated and reserved until managed
+    process mode owns environment projection
+- make raw response redaction policy explicit: implemented through
+  `store_baml_raw_responses`; enterprise redacts by default, explicit false
+  always redacts, and parsed output remains durable for replay/status
+- keep `baml.coerce` as the capability name for structured model output
+
+Exit criteria:
+
+- command behavior is consistent across validate/build/run/check/status
+- policy document validation failures are reported as policy failures, not as
+  adapter manifest failures
+- local mode stays easy
+- enterprise mode can deny unknown capabilities and disallowed BAML URLs
+- build artifacts are sufficient to reproduce validation/model assumptions
+
+## Phase 9: End-To-End Testing
+
+Goal: prove the whole product path works, not only unit slices.
+
+Required e2e layers:
+
+1. **Deterministic fake e2e**
+   - no network
+   - no provider keys
+   - fake coerce executor
+   - fake adapter manifest
+   - spec implementation workflow reaches expected states
+   - duplicate events are ignored or handled correctly
+   - status/overview explain current state
+
+2. **Recovery e2e**
+   - simulate processing-event crash
+   - confirm startup requeues safely
+   - confirm attempt counts are visible
+   - confirm no duplicate active invocation projection
+
+3. **Formal command e2e**
+   - run `check` with TLA/Maude when tools are installed
+   - skip clearly when tools are absent
+
+4. **Real BAML HTTP e2e**
+   - opt-in only
+   - generated `baml_src`
+   - external `--baml-url` or managed test server
+   - provider/local-model credentials supplied by environment
+   - assert durable `coerce_calls` records and status projection
+
+5. **Adapter e2e**
+   - file-backed local adapter e2e implemented for start work, process a
+     typed `finished` event, update plan state, ask human, and send a
+     completion message
+   - real external adapter e2e remains future work once a non-file agent
+     adapter exists
+
+CI expectations:
+
+```sh
+cargo fmt --all --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build -p armature-cli
+scripts/check-docs.sh
+scripts/check-e2e.sh
+scripts/check-formal-models.sh
+```
+
+`scripts/check-docs.sh` is intentionally more than a smoke test. It validates
+and builds the documented supervisor template, runs it with the local
+file-backed agent adapter, checks that `overview` reports the active worker,
+checks that `overview` reports summarized workflow data in both active and
+settled states,
+emits a typed completion event, processes the queued event, and checks that
+`overview` reports an idle settled workflow. It also exercises the local
+human-review bridge by creating an `askHuman` obligation, emitting a typed
+`humanReview.responded` event, and checking that the review JSON file records
+the response.
+
+Opt-in real BAML tests should not make normal CI require provider keys.
+
+Exit criteria:
+
+- fake e2e covers the normal workflow loop
+- recovery e2e covers durable queue behavior
+- formal checks are wired into CI or clearly skippable
+- `prove` exercises all currently supported generated verification backends
+- real BAML e2e is documented and runnable by a developer with credentials
+- CLI regression coverage asserts durable workflow data summaries in both
+  `status` and `overview`
+- documentation smoke coverage asserts summarized workflow data for the
+  supervisor template lifecycle
+
+## Phase 10: Product Hardening
 
 Goal: make the system practical for nontechnical and enterprise users.
 
 Deliverables:
 
-- workflow status in `armature overview`
-- readable diagnostics for agents and humans
-- schema/version migration story
-- workflow templates
-- companion skill updates
+- workflow templates: started with
+  `examples/templates/simple-agent-supervisor.armature`
+  - the documented local lifecycle is covered by `scripts/check-docs.sh`
+- companion skill updates: current `skills/armature-statechart` documents
+  file-backed adapter shortcuts, typed response/completion event intake, and
+  debugging flow
 - example workflows
-- enterprise capability policy examples
-- documentation for common stuck states
+- enterprise capability policy examples: expanded under `examples/policies/`
+- documentation for common stuck states: added
+  [operations.md](operations.md)
+- diagnostics written for coding agents and operators: capability policy
+  diagnostics include conservative `Fix:` hints naming exact policy fields
+- migration notes from legacy Armature: added [migration.md](migration.md)
+- schema/database migration story: added
+  [database-migrations.md](database-migrations.md)
+- release checklist: added [release-checklist.md](release-checklist.md)
 
 Exit criteria:
 
-- a nontechnical user can inspect why a workflow is waiting
+- a nontechnical user can inspect why a workflow is waiting: text `overview`
+  includes a derived `waiting:` line from durable status
+- the documented template path demonstrates both "active worker" and "settled
+  idle" status without custom scripts
 - a coding agent can repair a workflow from diagnostics without reading runtime
   internals
-- capability violations are explained in terms of contracts and agents
-- the spec implementation workflow works end to end in a real repo
+- capability violations are explained in terms of contracts and targets
+- `spec-implementation.armature` works end to end against real adapters in a
+  real repo
+- the old TypeScript/script-runner mental model is clearly documented as legacy
 
-Current implementation note: `armature overview` now renders validation health
-plus the durable status projection as a compact current-state, queued-event,
-active-invocation, latest-transition, latest-effect, and recent-failure summary.
-It is intentionally derived from the same projection as `status` so the first
-product-facing view does not introduce a second runtime state model. Invalid
-source that cannot lower to IR still returns validation diagnostics with no
-runtime status.
+## Completion Definition
 
-Current implementation note: CLI validation diagnostics are now carried through
-shared error handling, so commands outside `validate` can report concrete
-workflow diagnostics instead of only returning a generic validation failure.
-Parser diagnostics now attach source locations for common current-token errors;
-CLI-loaded workflows preserve the actual file path in those locations.
-Validator diagnostics now use declaration and executable-step spans for common
-static errors such as invalid `maxActive`, undeclared effect targets, bad
-transitions, bad raises, bad assignments, and invalid expression paths or calls.
-Adapter-manifest workflow diagnostics also point at the effect step or handler
-that requested unsupported adapter authority. CLI-loaded workflows also preserve
-`workflow.source_path` in emitted IR and build artifacts.
+The v1 track is complete when:
 
-Current implementation note: `check` and `emit-model` accept
-`--adapter-manifest` and `--policy`, and validate adapter-backed workflow
-effects before emitting or checking the formal abstraction. The generated models
-still consume only WorkflowIR, but the CLI no longer lets explicitly supplied
-adapter or policy contracts be silently ignored.
-
-Current implementation note: the first policy document shape is JSON with
-`mode`, `allowed_capabilities`, and `denied_capabilities`. Exact denied
-capabilities are errors in every mode. Unknown capabilities warn in local mode
-and become errors under stricter modes according to effect category and
-write-like capability names. The manifest dispatcher enforces supplied policy
-documents again at runtime before dispatching adapter-backed effects. `build`
-writes supplied policy documents to `policy-documents.json` beside adapter
-manifests and generated model artifacts.
-
-Current implementation note: the new companion coding-agent skill lives at
-`skills/armature-statechart`. It replaces the legacy v0.3 runtime skill for the
-new product surface and teaches agents to author restricted `.armature`
-statecharts, keep external authority behind adapter manifests, use typed
-`coerce` decisions instead of unconstrained control scripts, inspect durable
-state with `overview`, and repair common lifecycle/capability failures.
-
-## First Implementation Slice
-
-The first slice should be deliberately narrow:
-
-```text
-one workflow instance
-synthetic events
-Armature DSL -> IR lowering for minimal.armature
-golden IR fixture
-static validator subset with golden validation report
-SQLite durable event queue
-SQLite append-only transition/effect logs
-fake send/start/coerce effects
-status view
-adapter manifests for fake effects
-```
-
-This lets us validate the semantics and runtime loop before real adapters.
-
-The checked formal model should not block parser/IR/validator work, but it
-should block deeper interpreter semantics beyond this first synthetic-event
-slice.
+- `.armature` source is the primary product surface
+- the implemented expression kernel matches
+  [expression-primitives.md](expression-primitives.md)
+- real `coerce` uses BAML HTTP with durable replay-safe records
+- SQLite state, queue, transitions, effects, and coerce calls are durable and
+  recoverable
+- status and overview explain current state, workflow data summary, pending
+  events, active invocations, latest effects, latest coerce calls, failures, and
+  policy blockers
+- generated formal models cover the implemented control-state and
+  active-invocation semantics and fail closed for unsupported data invariants
+- fake e2e, recovery e2e, formal command e2e, and opt-in real BAML HTTP e2e
+  exist
+- at least one real adapter path can start agent work and process completion
+  events
+- enterprise policy can deny unknown capabilities and disallowed BAML execution
+  surfaces

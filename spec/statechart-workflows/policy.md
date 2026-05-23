@@ -126,19 +126,47 @@ BAML is available only through the `coerce` effect.
 Policy controls:
 
 ```text
-which BAML clients/providers may be used
+which BAML providers may be used
 which model environment variables may be read
 whether network/model access is allowed
 which BAML tools, if any, may be exposed
+which BAML HTTP server URLs may be called
+whether Armature may launch a managed `baml-cli serve` process
 ```
 
 The first implementation should treat BAML as structured model output only. BAML
 tools that perform side effects should be disabled unless explicitly enabled by
 adapter policy and represented as ordinary workflow effects.
 
-BAML clients are generated from Armature `coerce` declarations and workspace
-defaults in the first implementation. Policy validates whether the selected
-providers, models, and environment variables are allowed.
+BAML source is generated from Armature `coerce` declarations and workspace
+defaults in the first implementation. Runtime `coerce` execution uses BAML HTTP.
+Policy validates whether the selected providers, models, environment variables,
+server URLs, and managed-process mode are allowed.
+
+Implemented BAML policy fields:
+
+```json
+{
+  "allowed_capabilities": ["baml.coerce"],
+  "allow_baml_network": true,
+  "allowed_baml_urls": ["http://127.0.0.1:2024"],
+  "allow_managed_baml_server": false,
+  "allowed_models": ["gpt-4o-mini"],
+  "allowed_env_vars": ["OPENAI_API_KEY"],
+  "store_baml_raw_responses": false
+}
+```
+
+`run --baml-url` enforces `baml.coerce`, `allow_baml_network`, and exact
+`allowed_baml_urls` before making any HTTP request. `allow_managed_baml_server`,
+`allowed_models`, and `allowed_env_vars` are parsed and validated now, but they
+become enforceable only when Armature owns managed BAML process launch or
+provider/model selection. `baml.coerce` remains the capability name for
+BAML-backed structured model output. Raw BAML HTTP response storage is
+controlled by `store_baml_raw_responses`: explicit `false` always redacts,
+explicit `true` stores raw responses, enterprise mode redacts by default, and
+local/team modes store by default unless policy says otherwise. Parsed output
+remains durable for replay and status either way.
 
 ## Resource Policy
 
@@ -189,6 +217,10 @@ enterprise  deny and unknown are errors
 
 Runtime enforcement still checks every effect before dispatch. A validation
 warning is not a permanent grant of authority.
+Capability diagnostics include a `Fix:` hint that names the exact policy field
+to review. These hints are intentionally conservative: they say to add or remove
+capabilities only when the authority is intended, and otherwise to remove or
+replace the effect.
 
 ## Initial Policy Document
 
@@ -199,11 +231,18 @@ The first implemented policy document is intentionally small JSON:
   "mode": "enterprise",
   "allowed_capabilities": [
     "adapter.agent.start",
+    "baml.coerce",
     "message_agents",
     "resource.plan.read",
     "resource.plan.write"
   ],
-  "denied_capabilities": []
+  "denied_capabilities": [],
+  "allow_baml_network": true,
+  "allowed_baml_urls": ["http://127.0.0.1:2024"],
+  "allow_managed_baml_server": false,
+  "allowed_models": [],
+  "allowed_env_vars": [],
+  "store_baml_raw_responses": false
 }
 ```
 
@@ -218,6 +257,15 @@ Rules:
 - unknown capabilities are errors in `enterprise`
 - unknown capabilities are errors in `team` for starts, messages, human
   obligations, `adapter.*`, and write-like capability names containing `.write`
+- denied `baml.coerce` blocks `run --baml-url`
+- enterprise `run --baml-url` requires `baml.coerce`,
+  `allow_baml_network: true`, and an exact matching `allowed_baml_urls` entry
+- local mode remains permissive for BAML HTTP unless a supplied policy denies
+  `baml.coerce`, denies BAML network, or provides an allowlist that does not
+  include the requested URL
+- BAML raw responses are redacted before storage when
+  `store_baml_raw_responses` is false or when enterprise policy omits an
+  explicit raw-response storage decision
 
 This is not the final enterprise policy system. It is the first typed boundary
 that lets `validate`, `overview`, `run`, `build`, `check`, and `emit-model`
@@ -239,7 +287,12 @@ which layer allowed or denied it?
 what declaration would fix it?
 ```
 
-Example:
+Target-specific policy is not a v0 source feature yet. In the implemented
+surface, target compatibility is limited to declared agent targets, adapter
+manifest schemas, and workspace capability policy. Per-agent capability
+contracts should live in adapter policy or a future target-policy layer.
+
+Future diagnostic shape:
 
 ```text
 Denied: start(worker) requires adapter.untie.start

@@ -10,13 +10,14 @@ surface.
 - `minimal.armature` is a tiny statechart shape for parser/runtime scaffolding.
 - `simple-supervisor.armature` is a compact director notification workflow for
   completion and idle observation events.
+- `baml-coerce-smoke.armature` is a small opt-in real BAML HTTP smoke workflow.
 - `spec-implementation.armature` is the target managed spec implementation
   workflow.
 
-The parser accepts both examples as static fixtures. Runtime execution is still
-minimal: it currently processes the small durable event flow in
-`minimal.armature`, while the spec implementation example drives parser,
-validation, and later interpreter work.
+The examples are used by parser, validation, runtime, formal-check, and e2e
+tests. Normal CI uses deterministic fake adapter/coerce outputs; the BAML smoke
+workflow runs only when a developer opts in with `ARMATURE_RUN_BAML_E2E=1` and
+`ARMATURE_BAML_URL`.
 
 ## Policies
 
@@ -25,6 +26,17 @@ validation, and later interpreter work.
 - `spec-implementation.enterprise-policy.json` allows the fake spec
   implementation adapter's required capabilities in deny-by-default enterprise
   mode.
+- `local-file-backed.policy.json` allows the built-in JSON plan, review, and
+  agent-file adapter capabilities for local development while keeping BAML
+  network disabled.
+- `enterprise-baml-http.policy.json` allows only `baml.coerce` against an exact
+  local BAML HTTP URL and redacts raw responses.
+
+## Templates
+
+[`templates/`](templates/) contains copyable workflow starting points. Start
+with `simple-agent-supervisor.armature` when you need a small worker lifecycle
+loop that uses the built-in JSON agent-file adapter.
 
 ## Managed Spec Orchestration
 

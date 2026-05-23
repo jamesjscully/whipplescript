@@ -43,6 +43,7 @@ It should not model:
 
 - prompt text
 - LLM behavior
+- BAML HTTP server behavior
 - real files
 - Git state
 - network behavior
@@ -150,11 +151,14 @@ The generated model should include:
 - capability declarations
 - bounded work item abstractions
 - coerce outputs as nondeterministic values constrained by schema
+- Armature expression primitives as pure deterministic operations over bounded
+  typed values
 
 The generated model should not include:
 
 - prompt text
 - model weights
+- BAML HTTP protocol behavior
 - arbitrary logs
 - arbitrary file contents
 - host-language implementation details
@@ -173,9 +177,11 @@ coerce output spaces as comments while its executable rewriting model remains
 focused on control-state and active-invocation invariants.
 
 Because generated models do not yet include workflow data, model generation
-fails closed when the IR contains expression invariants. The runtime still
-enforces those expression invariants after transitions; generated verification
-must add data abstraction before it can claim coverage for them.
+fails closed when the IR contains expression invariants. Diagnostics should
+explain the specific unsupported surface, for example that workflow data is not
+included in the generated model yet. The runtime still enforces those expression
+invariants after transitions; generated verification must add data abstraction
+before it can claim coverage for them.
 
 ## Veil Strategy
 

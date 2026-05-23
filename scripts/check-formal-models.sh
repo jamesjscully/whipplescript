@@ -27,6 +27,11 @@ run_generated_checks() {
     --policy examples/policies/spec-implementation.enterprise-policy.json \
     --target maude \
     --json >/dev/null
+  cargo run -q -p armature-cli -- prove \
+    examples/workflows/spec-implementation.armature \
+    --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
+    --policy examples/policies/spec-implementation.enterprise-policy.json \
+    --json >/dev/null
 }
 
 if command -v tlc >/dev/null 2>&1 && command -v maude >/dev/null 2>&1; then
@@ -50,6 +55,11 @@ elif command -v nix >/dev/null 2>&1; then
       --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
       --policy examples/policies/spec-implementation.enterprise-policy.json \
       --target maude \
+      --json >/dev/null
+    cargo run -q -p armature-cli -- prove \
+      examples/workflows/spec-implementation.armature \
+      --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
+      --policy examples/policies/spec-implementation.enterprise-policy.json \
       --json >/dev/null
   '
 else
