@@ -46,10 +46,12 @@ data {
 
 agent director = thread("director")
 agent worker = codingAgent() {
+  profile "repo-writer"
   maxActive 2
 }
 
 agent quality = codingAgent() {
+  profile "repo-reader"
   maxActive 1
 }
 
@@ -373,9 +375,9 @@ state watching {
 }
 ```
 
-The runtime projects active invocations from successful `start` effects and
-processed `finished.name` values. Completion names should be prefixed with the
-agent name, such as `worker-01` or `quality-review-01`. When agent names
+The runtime projects active invocations from native `agent_invocations` rows
+and processed `finished.name` values. Completion names should be prefixed with
+the agent name, such as `worker-01` or `quality-review-01`. When agent names
 overlap, the longest matching started-agent prefix wins.
 
 Group-like behavior is expressed in guards or pattern matching over event data:
@@ -584,7 +586,7 @@ Built-in effect-like statements:
 assign     update workflow-local durable data
 raise      enqueue an internal event
 send       send a message to a declared target
-start      launch external agent work
+start      launch native harness-managed agent work
 askHuman   create a human-review obligation
 coerce     run typed model interpretation
 ```

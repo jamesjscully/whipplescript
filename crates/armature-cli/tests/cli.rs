@@ -46,6 +46,36 @@ fn write_workflow(dir: &tempfile::TempDir) -> std::path::PathBuf {
     file
 }
 
+fn adapter_workflow_source() -> &'static str {
+    r#"
+machine CliWorkflow
+initial waiting
+
+agent director = adapter("director")
+
+event go {
+  message string
+}
+
+state waiting {
+  on go as evt {
+    send director evt.message
+    goto done
+  }
+}
+
+state done {
+  final
+}
+"#
+}
+
+fn write_adapter_workflow(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let file = dir.path().join("workflow.armature");
+    std::fs::write(&file, adapter_workflow_source()).expect("workflow writes");
+    file
+}
+
 fn run_json(command: &mut Command) -> Value {
     let output = command.output().expect("command runs");
     assert!(
@@ -249,6 +279,32 @@ fn events_help_uses_durable_status_spellings() {
 }
 
 #[test]
+fn core_command_help_describes_shared_options() {
+    for command in ["emit", "run", "status"] {
+        let output = armature()
+            .arg(command)
+            .arg("--help")
+            .output()
+            .expect("command runs");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("SQLite workflow store path"), "{command}");
+        assert!(stdout.contains("Adapter manifest JSON file"), "{command}");
+        assert!(stdout.contains("Capability policy JSON file"), "{command}");
+    }
+
+    let run_help = armature()
+        .arg("run")
+        .arg("--help")
+        .output()
+        .expect("command runs");
+    let stdout = String::from_utf8_lossy(&run_help.stdout);
+    assert!(stdout.contains("Workflow event type to enqueue before processing"));
+    assert!(stdout.contains("JSON payload for --event"));
+}
+
+#[test]
 fn emit_run_status_events_and_log_share_the_same_store() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = write_workflow(&dir);
@@ -388,7 +444,7 @@ fn emit_run_status_events_and_log_share_the_same_store() {
     );
     assert_eq!(status["current_state"], "done");
     assert_eq!(status["recent_effects"][0]["effect"], "send");
-    assert_eq!(status["recent_effects"][0]["status"], "succeeded");
+    assert_eq!(status["recent_effects"][0]["status"], "dispatched");
     assert!(status["recent_effects"][0]["idempotency_key"]
         .as_str()
         .is_some_and(|key| key.contains("CliWorkflow:")));
@@ -412,7 +468,7 @@ fn emit_run_status_events_and_log_share_the_same_store() {
     assert!(stdout.contains("waiting: idle; no queued events or active invocations"));
     assert!(stdout.contains("data summary: none"));
     assert!(stdout.contains("latest effects:"));
-    assert!(stdout.contains("send director Succeeded"));
+    assert!(stdout.contains("send director Dispatched"));
     assert!(stdout.contains("policy blockers: none"));
 
     let overview = run_json(
@@ -460,7 +516,7 @@ fn emit_run_status_events_and_log_share_the_same_store() {
             .arg("--json"),
     );
     assert_eq!(log["records"][0]["type"], "effect");
-    assert_eq!(log["records"][0]["status"], "succeeded");
+    assert_eq!(log["records"][0]["status"], "dispatched");
 }
 
 #[test]
@@ -708,6 +764,21 @@ state done {
     let stdout = String::from_utf8_lossy(&status_text.stdout);
     assert!(stdout
         .contains(r#"data summary: {"count":1,"first":"worker-1","item":{"fields":2},"seen":1}"#));
+
+    let compact_status = armature()
+        .arg("status")
+        .arg(&file)
+        .arg("--store")
+        .arg(&store)
+        .arg("--compact")
+        .output()
+        .expect("command runs");
+    assert!(compact_status.status.success());
+    let stdout = String::from_utf8_lossy(&compact_status.stdout);
+    assert!(stdout.contains("workflow: DataSummaryWorkflow"));
+    assert!(stdout.contains("state: done"));
+    assert!(stdout.contains("waiting: idle; no queued events or active invocations"));
+    assert!(stdout.contains("current blockers: none"));
 }
 
 #[test]
@@ -1100,6 +1171,13 @@ state done {
     );
     assert_eq!(status["latest_coerce_failures"][0]["status"], "failed");
     assert_eq!(status["latest_coerce_failures"][0]["http_status"], 503);
+    assert_eq!(
+        status["current_coerce_failure"]["function_name"],
+        "classify"
+    );
+    assert!(status["current_blockers"][0]
+        .as_str()
+        .is_some_and(|blocker| blocker.contains("coerce `classify` failed")));
 
     let status_text = armature()
         .arg("status")
@@ -1110,8 +1188,126 @@ state done {
         .expect("command runs");
     assert!(status_text.status.success());
     let stdout = String::from_utf8_lossy(&status_text.stdout);
-    assert!(stdout.contains("latest coerce failures:"));
+    assert!(stdout.contains("current blockers:"));
+    assert!(stdout.contains("current coerce failure: classify Failed http=Some(503)"));
+    assert!(stdout.contains("latest coerce failures (history):"));
     assert!(stdout.contains("classify Failed http=Some(503)"));
+}
+
+#[test]
+fn retry_success_clears_current_coerce_failure_but_keeps_history() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("coerce-retry.armature");
+    std::fs::write(
+        &file,
+        r#"
+machine CoerceRetry
+initial waiting
+
+event go {
+  message string
+}
+
+coerce classify(message string) -> string {
+  prompt """
+classify
+  """
+}
+
+state waiting {
+  on go as evt {
+    let classification = coerce classify(evt.message)
+    goto done
+  }
+}
+
+state done {
+  final
+}
+"#,
+    )
+    .expect("workflow writes");
+    let store = dir.path().join("workflow.sqlite");
+
+    let failed = armature()
+        .arg("run")
+        .arg(&file)
+        .arg("--store")
+        .arg(&store)
+        .arg("--event")
+        .arg("go")
+        .arg("--payload")
+        .arg(r#"{"message":"hello"}"#)
+        .arg("--json")
+        .output()
+        .expect("command runs");
+    assert!(!failed.status.success());
+
+    let failed_events = run_json(
+        armature()
+            .arg("events")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--status")
+            .arg("failed")
+            .arg("--json"),
+    );
+    let event_id = failed_events["events"][0]["event_id"]
+        .as_str()
+        .expect("event id");
+
+    let retry = run_json(
+        armature()
+            .arg("retry-event")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event-id")
+            .arg(event_id)
+            .arg("--json"),
+    );
+    assert_eq!(retry["event"]["status"], "queued");
+    assert!(retry["status"]["current_coerce_failure"].is_null());
+    assert_eq!(
+        retry["status"]["current_blockers"],
+        Value::Array(Vec::new())
+    );
+    assert_eq!(retry["status"]["pending_events"], 1);
+
+    let processed = run_json(
+        armature()
+            .arg("run")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--fake-coerce-output")
+            .arg(r#"classify="ok""#)
+            .arg("--json"),
+    );
+    assert_eq!(processed["outcome"]["status"], "processed");
+    assert!(processed["status"]["current_coerce_failure"].is_null());
+    assert_eq!(
+        processed["status"]["current_blockers"],
+        Value::Array(Vec::new())
+    );
+    assert_eq!(
+        processed["status"]["latest_coerce_failures"][0]["function_name"],
+        "classify"
+    );
+
+    let status_text = armature()
+        .arg("status")
+        .arg(&file)
+        .arg("--store")
+        .arg(&store)
+        .output()
+        .expect("command runs");
+    assert!(status_text.status.success());
+    let stdout = String::from_utf8_lossy(&status_text.stdout);
+    assert!(stdout.contains("current blockers: none"));
+    assert!(stdout.contains("current coerce failure: none"));
+    assert!(stdout.contains("latest coerce failures (history):"));
 }
 
 #[test]
@@ -1218,7 +1414,7 @@ initial waiting
 #[test]
 fn overview_reports_adapter_manifest_validation() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let file = write_workflow(&dir);
+    let file = write_adapter_workflow(&dir);
     let manifest = dir.path().join("adapter.json");
     std::fs::write(
         &manifest,
@@ -1265,7 +1461,7 @@ fn overview_reports_adapter_manifest_validation() {
 #[test]
 fn status_validates_adapter_manifest_contracts() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let file = write_workflow(&dir);
+    let file = write_adapter_workflow(&dir);
     let manifest = dir.path().join("adapter.json");
     std::fs::write(
         &manifest,
@@ -1375,7 +1571,7 @@ fn events_and_log_reject_unbounded_limits() {
 #[test]
 fn events_and_log_validate_adapter_manifest_contracts() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let file = write_workflow(&dir);
+    let file = write_adapter_workflow(&dir);
     let manifest = dir.path().join("adapter.json");
     std::fs::write(
         &manifest,
@@ -1545,7 +1741,7 @@ state waiting {
 #[test]
 fn run_rejects_manifest_missing_effect_before_dispatch() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let file = write_workflow(&dir);
+    let file = write_adapter_workflow(&dir);
     let store = dir.path().join("workflow.sqlite");
     let manifest = dir.path().join("adapter.json");
     std::fs::write(
@@ -1584,7 +1780,7 @@ fn run_rejects_manifest_missing_effect_before_dispatch() {
 #[test]
 fn validate_uses_adapter_manifest_for_static_effect_checks() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let file = write_workflow(&dir);
+    let file = write_adapter_workflow(&dir);
     let manifest = dir.path().join("adapter.json");
     std::fs::write(
         &manifest,
@@ -1648,7 +1844,7 @@ fn validate_accepts_file_backed_adapter_flags_for_static_effect_checks() {
 #[test]
 fn validate_reports_adapter_manifest_input_shape_mismatches() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let file = write_workflow(&dir);
+    let file = write_adapter_workflow(&dir);
     let manifest = dir.path().join("adapter.json");
     std::fs::write(
         &manifest,
@@ -1697,7 +1893,7 @@ fn validate_reports_adapter_manifest_input_shape_mismatches() {
 #[test]
 fn validate_applies_local_policy_as_warnings() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let file = write_workflow(&dir);
+    let file = write_adapter_workflow(&dir);
     let manifest = dir.path().join("adapter.json");
     std::fs::write(
         &manifest,
@@ -1762,7 +1958,7 @@ fn validate_applies_local_policy_as_warnings() {
 #[test]
 fn validate_applies_enterprise_policy_as_errors() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let file = write_workflow(&dir);
+    let file = write_adapter_workflow(&dir);
     let manifest = dir.path().join("adapter.json");
     std::fs::write(
         &manifest,
@@ -2150,6 +2346,14 @@ fn validate_policy_requires_at_least_one_policy() {
 fn run_surfaces_manifest_required_capabilities_in_status_and_log() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = write_workflow(&dir);
+    std::fs::write(
+        &file,
+        workflow_source().replace(
+            r#"agent director = thread("director")"#,
+            r#"agent director = adapter("director")"#,
+        ),
+    )
+    .expect("workflow rewrites");
     let store = dir.path().join("workflow.sqlite");
     let manifest = dir.path().join("adapter.json");
     std::fs::write(
@@ -2285,8 +2489,9 @@ fn emit_rejects_invalid_payload_before_enqueueing() {
         .expect("command runs");
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("payload does not match schema for event `go`"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(
+        "payload does not match schema for event `go`: $.message expected string, got int"
+    ));
 }
 
 #[test]
@@ -2376,8 +2581,9 @@ fn emit_requires_adapter_event_schema_when_event_names_overlap() {
         .expect("command runs");
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("payload does not match schema for event `go`"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(
+        "payload does not match schema for event `go`: $.message is not declared in schema"
+    ));
 }
 
 #[test]
@@ -2520,7 +2726,7 @@ fn emit_config_rejects_maude_blank_config() {
 #[test]
 fn emit_config_validates_adapter_manifest_contracts() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let file = write_workflow(&dir);
+    let file = write_adapter_workflow(&dir);
     let manifest = dir.path().join("adapter.json");
     std::fs::write(
         &manifest,
@@ -2606,7 +2812,7 @@ fn prove_json_reports_generated_check_results_when_formal_tools_are_available() 
 #[test]
 fn prove_validates_adapter_manifest_contracts_before_unavailable() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let file = write_workflow(&dir);
+    let file = write_adapter_workflow(&dir);
     let manifest = dir.path().join("adapter.json");
     std::fs::write(
         &manifest,
@@ -2662,7 +2868,7 @@ fn emit_model_outputs_maude_module() {
 #[test]
 fn emit_model_validates_adapter_manifest_contracts() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let file = write_workflow(&dir);
+    let file = write_adapter_workflow(&dir);
     let manifest = dir.path().join("adapter.json");
     std::fs::write(
         &manifest,
@@ -2695,7 +2901,7 @@ fn emit_model_validates_adapter_manifest_contracts() {
 #[test]
 fn check_validates_adapter_manifest_contracts_before_running_formal_tools() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let file = write_workflow(&dir);
+    let file = write_adapter_workflow(&dir);
     let manifest = dir.path().join("adapter.json");
     std::fs::write(
         &manifest,
@@ -2997,6 +3203,8 @@ state done {
     assert!(baml.contains("enabled true"));
     assert!(baml.contains("model \"gpt-4o-mini\""));
     assert!(baml.contains("{{ planText }}"));
+    assert!(baml.contains("  prompt #\"\nChoose.\n\n{{ planText }}\n\"#\n"));
+    assert!(!baml.contains("\n  \"#"));
     assert!(ir.contains("\"generated_baml_artifact\""));
     assert!(ir.contains("workflow.baml"));
 }

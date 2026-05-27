@@ -5,7 +5,7 @@ infrastructure, not the authoring surface.
 
 ## Current Contract
 
-- The store records schema version `2` in `armature_meta`.
+- The store records schema version `4` in `armature_meta`.
 - Startup creates missing tables for the current version.
 - Startup rejects newer schema versions instead of trying to run against an
   unknown layout.

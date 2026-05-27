@@ -171,8 +171,8 @@ calls become nondeterministic updates to a per-function output map, and
 abstraction. The same generated TLA+ model tracks the last abstract effect label
 and checks `DeclaredEffectType`, which is the first generated effect-surface
 invariant. Ordinary effects such as `send`, `askHuman`, `raise`, and capability
-calls are emitted as stuttering effect observations; bounded `start` effects
-stay coupled to active-counter updates. Generated Maude currently lists the same
+calls are emitted as stuttering effect observations; bounded native `start`
+effects stay coupled to active-counter updates. Generated Maude currently lists the same
 coerce output spaces as comments while its executable rewriting model remains
 focused on control-state and active-invocation invariants.
 

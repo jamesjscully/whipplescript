@@ -60,6 +60,784 @@ fn active_count(status: &Value, agent: &str) -> u64 {
 }
 
 #[test]
+fn e2e_native_harness_runs_command_provider_to_finished_event() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workflow = dir.path().join("native-harness.armature");
+    let store = dir.path().join("workflow.sqlite");
+    let config = dir.path().join("harness.json");
+
+    std::fs::write(
+        &workflow,
+        r#"
+machine NativeHarness
+initial waiting
+
+agent worker = codingAgent() {
+  maxActive 1
+}
+
+event go {
+  message string
+}
+
+event finished {
+  id string
+  name string
+  status string
+  summary string
+  exitCode int?
+}
+
+data {
+  done bool = false
+}
+
+state waiting {
+  on go as evt {
+    start worker {
+      message evt.message
+    }
+    stay
+  }
+
+  on finished as run {
+    assign data.done = true
+    goto done
+  }
+}
+
+state done {
+  final
+}
+"#,
+    )
+    .expect("workflow writes");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{
+  "agents": {{
+    "worker": {{
+      "provider": "command",
+      "command": ["sh", "-c", "printf 'completed %s\n' \"$ARMATURE_PROMPT\""],
+      "cwd": "{}",
+      "timeoutSeconds": 30
+    }}
+  }}
+}}"#,
+            dir.path().display()
+        ),
+    )
+    .expect("config writes");
+
+    let started = run_json(
+        armature()
+            .arg("run")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"hello"}"#)
+            .arg("--json"),
+    );
+    assert_eq!(
+        started["status"]["active_invocations"][0]["agent"],
+        "worker"
+    );
+
+    let harness = run_json(
+        armature()
+            .arg("harness")
+            .arg("once")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--config")
+            .arg(&config)
+            .arg("--json"),
+    );
+    assert_eq!(harness["completion_event"]["event_type"], "finished");
+    assert_eq!(
+        harness["completion_event"]["payload"]["status"],
+        "succeeded"
+    );
+
+    let finished = run_json(
+        armature()
+            .arg("run")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--json"),
+    );
+    assert_eq!(finished["status"]["current_state"], "done");
+    assert_eq!(finished["status"]["data"]["done"], true);
+    assert_eq!(
+        finished["status"]["active_invocations"],
+        Value::Array(vec![])
+    );
+}
+
+#[test]
+fn e2e_harness_profile_policy_resolves_agent_profile() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workflow = dir.path().join("profile-harness.armature");
+    let store = dir.path().join("workflow.sqlite");
+    let config = dir.path().join("harness.json");
+    let policy = dir.path().join("harness-policy.json");
+
+    std::fs::write(
+        &workflow,
+        r#"
+machine ProfileHarness
+initial waiting
+
+agent worker = codingAgent() {
+  profile "repo-writer"
+  maxActive 1
+}
+
+event go {
+  message string
+}
+
+event finished {
+  id string
+  name string
+  status string
+  summary string
+  exitCode int?
+}
+
+state waiting {
+  on go as evt {
+    start worker {
+      message evt.message
+    }
+    stay
+  }
+
+  on finished as run {
+    stay
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+    std::fs::write(&config, r#"{"agents":{}}"#).expect("config writes");
+    std::fs::write(
+        &policy,
+        format!(
+            r#"{{
+  "mode": "custom",
+  "defaultProfile": "repo-writer",
+  "allowCommandProvider": true,
+  "profiles": {{
+    "repo-writer": {{
+      "description": "Use for implementation work in this test repository.",
+      "provider": "command",
+      "command": ["sh", "-c", "printf 'profiled %s\n' \"$ARMATURE_PROMPT\""],
+      "cwd": "{}",
+      "timeoutSeconds": 30,
+      "filesystem": "workspace_write",
+      "network": "denied",
+      "allowedEnv": [],
+      "allowedTools": ["read", "edit", "test"],
+      "enforcement": "best_effort"
+    }}
+  }}
+}}"#,
+            dir.path().display()
+        ),
+    )
+    .expect("policy writes");
+
+    run_json(
+        armature()
+            .arg("validate")
+            .arg(&workflow)
+            .arg("--profile-policy")
+            .arg(&policy)
+            .arg("--json"),
+    );
+
+    run_json(
+        armature()
+            .arg("run")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"hello"}"#)
+            .arg("--json"),
+    );
+
+    let harness = run_json(
+        armature()
+            .arg("harness")
+            .arg("once")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--config")
+            .arg(&config)
+            .arg("--profile-policy")
+            .arg(&policy)
+            .arg("--json"),
+    );
+    assert_eq!(
+        harness["invocation"]["requested_profile"],
+        Value::String("repo-writer".to_string())
+    );
+    assert_eq!(
+        harness["completion_event"]["payload"]["summary"],
+        "profiled hello"
+    );
+
+    let harness_status = run_json(
+        armature()
+            .arg("harness")
+            .arg("status")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--profile-policy")
+            .arg(&policy)
+            .arg("--json"),
+    );
+    assert_eq!(
+        harness_status["invocations"][0]["resolved_profile"],
+        Value::String("repo-writer".to_string())
+    );
+    assert!(harness_status["harness_events"]
+        .as_array()
+        .expect("harness events")
+        .iter()
+        .any(|event| event["kind"] == "provider_started"
+            && event["payload"]["resolvedProfile"] == "repo-writer"));
+}
+
+#[test]
+fn e2e_harness_run_can_drive_workflow_and_record_timeouts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workflow = dir.path().join("drive-harness.armature");
+    let store = dir.path().join("workflow.sqlite");
+    let config = dir.path().join("harness.json");
+
+    std::fs::write(
+        &workflow,
+        r#"
+machine DriveHarness
+initial waiting
+
+agent worker = codingAgent() {
+  maxActive 1
+}
+
+event go {
+  message string
+}
+
+event finished {
+  id string
+  name string
+  status string
+  summary string
+  exitCode int?
+}
+
+data {
+  finishedStatus string? = nil
+}
+
+state waiting {
+  on go as evt {
+    start worker {
+      message evt.message
+    }
+    stay
+  }
+
+  on finished as run {
+    assign data.finishedStatus = run.status
+    goto done
+  }
+}
+
+state done {
+  final
+}
+"#,
+    )
+    .expect("workflow writes");
+    std::fs::write(
+        &config,
+        r#"{
+  "agents": {
+    "worker": {
+      "provider": "command",
+      "command": ["sh", "-c", "sleep 2"],
+      "timeoutSeconds": 1
+    }
+  }
+}"#,
+    )
+    .expect("config writes");
+
+    run_json(
+        armature()
+            .arg("run")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"hello"}"#)
+            .arg("--json"),
+    );
+
+    let harness = run_json(
+        armature()
+            .arg("harness")
+            .arg("run")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--config")
+            .arg(&config)
+            .arg("--drive-workflow")
+            .arg("--max-iterations")
+            .arg("5")
+            .arg("--json"),
+    );
+    assert_eq!(harness[0]["provider_timed_out"], true);
+
+    let status = run_json(
+        armature()
+            .arg("status")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--json"),
+    );
+    assert_eq!(status["current_state"], "done");
+    assert_eq!(status["data"]["finishedStatus"], "timed_out");
+
+    let harness_status = run_json(
+        armature()
+            .arg("harness")
+            .arg("status")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--json"),
+    );
+    assert_eq!(harness_status["invocations"][0]["status"], "timed_out");
+    assert_eq!(harness_status["completions"][0]["status"], "timed_out");
+    assert_eq!(harness_status["workflow_status"]["current_state"], "done");
+    assert!(harness_status["harness_events"]
+        .as_array()
+        .expect("harness events")
+        .iter()
+        .any(|event| event["kind"] == "provider_timed_out"));
+    assert!(harness_status["recent_failures"]
+        .as_array()
+        .expect("recent failures")
+        .iter()
+        .any(|event| event["kind"] == "provider_timed_out"));
+}
+
+#[test]
+fn e2e_harness_recovers_expired_leases_and_records_desire_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workflow = dir.path().join("lease-harness.armature");
+    let store = dir.path().join("workflow.sqlite");
+    let config = dir.path().join("harness.json");
+
+    std::fs::write(
+        &workflow,
+        r#"
+machine LeaseHarness
+initial waiting
+
+agent worker = codingAgent() {
+  maxActive 1
+}
+
+event go {
+  message string
+}
+
+event finished {
+  id string
+  name string
+  status string
+  summary string
+  exitCode int?
+}
+
+state waiting {
+  on go as evt {
+    start worker {
+      message evt.message
+    }
+    stay
+  }
+
+  on finished {
+    goto done
+  }
+}
+
+state done {
+  final
+}
+"#,
+    )
+    .expect("workflow writes");
+    std::fs::write(
+        &config,
+        r#"{
+  "agents": {
+    "worker": {
+      "provider": "command",
+      "command": ["sh", "-c", "printf 'recovered'"],
+      "timeoutSeconds": 30
+    }
+  }
+}"#,
+    )
+    .expect("config writes");
+
+    run_json(
+        armature()
+            .arg("run")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"hello"}"#)
+            .arg("--json"),
+    );
+    let connection = rusqlite::Connection::open(&store).expect("store opens");
+    connection
+        .execute(
+            r#"
+            UPDATE agent_invocations
+            SET status = 'claimed', claimed_by = 'dead-worker', claim_expires_at = '0'
+            "#,
+            [],
+        )
+        .expect("lease forced expired");
+
+    let harness = run_json(
+        armature()
+            .arg("harness")
+            .arg("run")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--config")
+            .arg(&config)
+            .arg("--drive-workflow")
+            .arg("--max-iterations")
+            .arg("5")
+            .arg("--json"),
+    );
+    assert_eq!(
+        harness[0]["completion_event"]["payload"]["summary"],
+        "recovered"
+    );
+
+    let harness_status = run_json(
+        armature()
+            .arg("harness")
+            .arg("status")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--json"),
+    );
+    assert!(harness_status["harness_events"]
+        .as_array()
+        .expect("harness events")
+        .iter()
+        .any(|event| event["kind"] == "lease_expired"));
+}
+
+#[test]
+fn e2e_harness_records_unknown_agent_and_provider_command_failures() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workflow = dir.path().join("desire-harness.armature");
+    let store = dir.path().join("workflow.sqlite");
+    let missing_config = dir.path().join("missing-harness.json");
+    let failing_config = dir.path().join("failing-harness.json");
+
+    std::fs::write(
+        &workflow,
+        r#"
+machine DesireHarness
+initial waiting
+
+agent worker = codingAgent() {
+  maxActive 2
+}
+
+event go {
+  message string
+}
+
+event finished {
+  id string
+  name string
+  status string
+  summary string
+  exitCode int?
+}
+
+state waiting {
+  on go as evt {
+    start worker {
+      message evt.message
+    }
+    stay
+  }
+
+  on finished {
+    stay
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+    std::fs::write(&missing_config, r#"{"agents":{}}"#).expect("missing config writes");
+    std::fs::write(
+        &failing_config,
+        r#"{
+  "agents": {
+    "worker": {
+      "provider": "command",
+      "command": ["sh", "-c", "printf 'bad command' >&2; exit 7"],
+      "timeoutSeconds": 30
+    }
+  }
+}"#,
+    )
+    .expect("failing config writes");
+
+    run_json(
+        armature()
+            .arg("run")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"hello"}"#)
+            .arg("--json"),
+    );
+    let output = armature()
+        .arg("harness")
+        .arg("once")
+        .arg(&workflow)
+        .arg("--store")
+        .arg(&store)
+        .arg("--config")
+        .arg(&missing_config)
+        .arg("--json")
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success());
+
+    let missing_status = run_json(
+        armature()
+            .arg("harness")
+            .arg("status")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--json"),
+    );
+    assert!(missing_status["recent_failures"]
+        .as_array()
+        .expect("recent failures")
+        .iter()
+        .any(|event| event["kind"] == "unknown_agent"));
+
+    run_json(
+        armature()
+            .arg("harness")
+            .arg("once")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--config")
+            .arg(&failing_config)
+            .arg("--json"),
+    );
+    let failing_status = run_json(
+        armature()
+            .arg("harness")
+            .arg("status")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--json"),
+    );
+    assert!(failing_status["recent_failures"]
+        .as_array()
+        .expect("recent failures")
+        .iter()
+        .any(|event| event["kind"] == "provider_command_failed"));
+}
+
+#[test]
+fn e2e_harness_records_workflow_validation_failures() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workflow = dir.path().join("bad-harness.armature");
+    let store = dir.path().join("workflow.sqlite");
+    let config = dir.path().join("harness.json");
+
+    std::fs::write(
+        &workflow,
+        r#"
+machine BadHarness
+initial missing
+
+state waiting {
+  final
+}
+"#,
+    )
+    .expect("workflow writes");
+    std::fs::write(&config, r#"{"agents":{}}"#).expect("config writes");
+
+    let output = armature()
+        .arg("harness")
+        .arg("run")
+        .arg(&workflow)
+        .arg("--store")
+        .arg(&store)
+        .arg("--config")
+        .arg(&config)
+        .arg("--drive-workflow")
+        .arg("--json")
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success());
+
+    let connection = rusqlite::Connection::open(&store).expect("store opens");
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM harness_events WHERE kind = 'workflow_validation_failed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("event count reads");
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn e2e_harness_provider_preset_can_use_command_template() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workflow = dir.path().join("preset-harness.armature");
+    let store = dir.path().join("workflow.sqlite");
+    let config = dir.path().join("harness.json");
+
+    std::fs::write(
+        &workflow,
+        r#"
+machine PresetHarness
+initial waiting
+
+agent worker = codingAgent() {
+  maxActive 1
+}
+
+event go {
+  message string
+}
+
+event finished {
+  id string
+  name string
+  status string
+  summary string
+  exitCode int?
+}
+
+state waiting {
+  on go as evt {
+    start worker {
+      message evt.message
+    }
+    stay
+  }
+
+  on finished {
+    stay
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+    std::fs::write(
+        &config,
+        r#"{
+  "agents": {
+    "worker": {
+      "provider": "claude",
+      "command": ["sh", "-c", "printf '%s' \"$1\"", "sh", "{{prompt}}"],
+      "timeoutSeconds": 30
+    }
+  }
+}"#,
+    )
+    .expect("config writes");
+
+    run_json(
+        armature()
+            .arg("run")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"hello preset"}"#)
+            .arg("--json"),
+    );
+
+    let harness = run_json(
+        armature()
+            .arg("harness")
+            .arg("once")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--config")
+            .arg(&config)
+            .arg("--json"),
+    );
+    assert_eq!(
+        harness["completion_event"]["payload"]["status"],
+        "succeeded"
+    );
+    assert_eq!(
+        harness["completion_event"]["payload"]["summary"],
+        "hello preset"
+    );
+}
+
+#[test]
 fn e2e_spec_implementation_runs_idle_worker_quality_loop_to_done() {
     let (workflow, manifest, policy) = spec_command();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -552,174 +1330,12 @@ state waiting {
 }
 
 #[test]
-fn e2e_agent_file_supplies_builtin_agent_manifest() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let workflow = dir.path().join("agent-only.armature");
-    let store = dir.path().join("agent-only.sqlite");
-    let agents = dir.path().join("agents.json");
-    std::fs::write(
-        &workflow,
-        r#"
-machine AgentOnly
-initial waiting
-
-agent director = thread("director")
-agent worker = codingAgent()
-
-event go {
-  message string
-}
-
-state waiting {
-  on go as evt {
-    start worker {
-      task "W1"
-      message evt.message
-    }
-    send director evt.message
-    goto waiting
-  }
-}
-"#,
-    )
-    .expect("workflow writes");
-
-    let run = run_json(
-        armature()
-            .arg("run")
-            .arg(&workflow)
-            .arg("--store")
-            .arg(&store)
-            .arg("--agent-file")
-            .arg(&agents)
-            .arg("--event")
-            .arg("go")
-            .arg("--payload")
-            .arg(r#"{"message":"please inspect W1"}"#)
-            .arg("--json"),
-    );
-
-    assert_eq!(run["outcome"]["status"], "processed");
-    let recent_effects = run["status"]["recent_effects"]
-        .as_array()
-        .expect("recent effects array");
-    assert!(recent_effects
-        .iter()
-        .any(|effect| effect["effect"] == "start" && effect["status"] == "dispatched"));
-    assert!(recent_effects
-        .iter()
-        .any(|effect| effect["effect"] == "send" && effect["status"] == "dispatched"));
-
-    let agents: Value =
-        serde_json::from_str(&std::fs::read_to_string(&agents).expect("agent file reads"))
-            .expect("agent file parses");
-    assert_eq!(agents["invocations"][0]["status"], "started");
-    assert_eq!(agents["invocations"][0]["agent"], "worker");
-    assert_eq!(
-        agents["invocations"][0]["input"]["message"],
-        "please inspect W1"
-    );
-    assert_eq!(agents["messages"][0]["status"], "sent");
-    assert_eq!(agents["messages"][0]["agent"], "director");
-    assert_eq!(agents["messages"][0]["message"], "please inspect W1");
-}
-
-#[test]
-fn e2e_agent_file_supplies_builtin_finished_event_schema() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let workflow = dir.path().join("agent-finished.armature");
-    let store = dir.path().join("agent-finished.sqlite");
-    let agents = dir.path().join("agents.json");
-    std::fs::write(
-        &workflow,
-        r#"
-machine AgentFinished
-initial waiting
-
-agent worker = codingAgent()
-
-event go {}
-
-state waiting {
-  on go {
-    start worker
-    stay
-  }
-}
-"#,
-    )
-    .expect("workflow writes");
-
-    let started = run_json(
-        armature()
-            .arg("run")
-            .arg(&workflow)
-            .arg("--store")
-            .arg(&store)
-            .arg("--agent-file")
-            .arg(&agents)
-            .arg("--event")
-            .arg("go")
-            .arg("--json"),
-    );
-    assert_eq!(started["outcome"]["status"], "processed");
-
-    let emitted = run_json(
-        armature()
-            .arg("emit")
-            .arg(&workflow)
-            .arg("--store")
-            .arg(&store)
-            .arg("--agent-file")
-            .arg(&agents)
-            .arg("--event")
-            .arg("finished")
-            .arg("--payload")
-            .arg(
-                r#"{"id":"run-1","name":"worker-1","status":"succeeded","stdoutTail":"","stderrTail":"","exitCode":0}"#,
-            )
-            .arg("--json"),
-    );
-
-    assert_eq!(emitted["event"]["event_type"], "finished");
-    assert_eq!(emitted["event"]["payload"]["name"], "worker-1");
-    assert_eq!(emitted["status"]["pending_events"], 1);
-    let completion_records: Value =
-        serde_json::from_str(&std::fs::read_to_string(&agents).expect("agent file reads"))
-            .expect("agent file parses");
-    assert_eq!(completion_records["invocations"][0]["status"], "finished");
-    assert_eq!(
-        completion_records["invocations"][0]["completion_id"],
-        "run-1"
-    );
-    assert_eq!(completion_records["completions"][0]["id"], "run-1");
-    assert_eq!(completion_records["completions"][0]["name"], "worker-1");
-
-    let invalid = armature()
-        .arg("emit")
-        .arg(&workflow)
-        .arg("--store")
-        .arg(&store)
-        .arg("--agent-file")
-        .arg(&agents)
-        .arg("--event")
-        .arg("finished")
-        .arg("--payload")
-        .arg(r#"{"id":"run-2","name":"worker-2"}"#)
-        .arg("--json")
-        .output()
-        .expect("command runs");
-    assert!(!invalid.status.success());
-}
-
-#[test]
 fn e2e_file_backed_adapters_cover_agent_plan_and_review_loop() {
     let dir = tempfile::tempdir().expect("tempdir");
     let workflow = dir.path().join("adapter-loop.armature");
     let store = dir.path().join("adapter-loop.sqlite");
     let plan = dir.path().join("plan.json");
     let reviews = dir.path().join("reviews.json");
-    let agents = dir.path().join("agents.json");
     std::fs::write(
         &workflow,
         r#"
@@ -775,8 +1391,6 @@ state done {
             .arg(&plan)
             .arg("--review-file")
             .arg(&reviews)
-            .arg("--agent-file")
-            .arg(&agents)
             .arg("--event")
             .arg("idle")
             .arg("--json"),
@@ -784,12 +1398,6 @@ state done {
     assert_eq!(first["outcome"]["status"], "processed");
     assert_eq!(first["status"]["current_state"], "watching");
     assert_eq!(active_count(&first["status"], "worker"), 1);
-
-    let agent_records: Value =
-        serde_json::from_str(&std::fs::read_to_string(&agents).expect("agent file reads"))
-            .expect("agent file parses");
-    assert_eq!(agent_records["invocations"][0]["agent"], "worker");
-    assert_eq!(agent_records["invocations"][0]["input"]["task"], "W1");
 
     let review_records: Value =
         serde_json::from_str(&std::fs::read_to_string(&reviews).expect("review file reads"))
@@ -839,8 +1447,6 @@ state done {
             .arg(&plan)
             .arg("--review-file")
             .arg(&reviews)
-            .arg("--agent-file")
-            .arg(&agents)
             .arg("--json"),
     );
     assert_eq!(ignored_review_response["outcome"]["status"], "ignored");
@@ -855,8 +1461,6 @@ state done {
             .arg(&plan)
             .arg("--review-file")
             .arg(&reviews)
-            .arg("--agent-file")
-            .arg(&agents)
             .arg("--event")
             .arg("finished")
             .arg("--payload")
@@ -871,12 +1475,6 @@ state done {
         serde_json::from_str(&std::fs::read_to_string(&plan).expect("plan file reads"))
             .expect("plan file parses");
     assert_eq!(updated_plan["tasks"][0]["status"], "done");
-
-    let updated_agents: Value =
-        serde_json::from_str(&std::fs::read_to_string(&agents).expect("agent file reads"))
-            .expect("agent file parses");
-    assert_eq!(updated_agents["messages"][0]["agent"], "director");
-    assert_eq!(updated_agents["messages"][0]["message"], "worker-01");
 }
 
 #[test]

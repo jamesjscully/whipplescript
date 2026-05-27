@@ -75,15 +75,17 @@ records so model decisions are replay-safe and visible in status.
 If a synchronous value effect fails, no later steps in the transition run. The
 implemented v0 runtime marks the triggering event failed, discards tentative
 state changes, writes durable diagnostics, and surfaces the failure through
-`status`/`overview` recent failures. Explicit failure transitions are future
-workflow syntax; there is no hidden built-in blocked state in v0.
+`status`/`overview` current blockers while retaining it in historical recent
+failures. Explicit failure transitions are future workflow syntax; there is no
+hidden built-in blocked state in v0.
 
 `coerce` is backed by BAML HTTP over generated `baml_src` artifacts. Adapter
 value calls are backed by declared capabilities.
 
-### 3. Asynchronous Invocation Effects
+### 3. Native Agent Invocation Effects
 
-Asynchronous invocation effects start external work and return an invocation id.
+Native agent invocation effects start local harness-managed agent work and
+return an invocation id.
 
 Initial effect:
 
@@ -91,9 +93,11 @@ Initial effect:
 start
 ```
 
-`start` commits the workflow transition before dispatching the external
-invocation. Dispatch uses a durable idempotency key. The result of external work
-arrives later as a typed event.
+For local agents, `start` commits the workflow transition and inserts an
+`agent_invocations` row in the same SQLite transaction. The harness later claims
+that row, runs the configured provider, records artifacts, and enqueues a typed
+completion event. For explicitly adapter-backed agents, `start` may dispatch
+through a manifest-backed adapter after the transition commit.
 
 The runtime must record:
 
@@ -101,9 +105,10 @@ The runtime must record:
 target
 input
 idempotency key
-accepted/rejected status
 invocation id, if accepted
-capability decision
+status
+claim/provider metadata, when available
+capability decision, for adapter-backed starts
 ```
 
 ### 4. Message Effects
@@ -116,9 +121,10 @@ Initial effect:
 send
 ```
 
-The first implementation treats `send` as an asynchronous effect with delivery
-acknowledgement. The transition commits before dispatch. Failure becomes a
-durable effect failure and may block the workflow depending on handler policy.
+For local agents, `send` inserts an `agent_messages` row in the same transaction
+as the transition that produced it. The harness or provider adapter later
+delivers the message or records a visible failure. Adapter-backed sends may
+dispatch through a manifest-backed adapter after the transition commit.
 
 ### 5. Human Obligation Effects
 
@@ -169,6 +175,8 @@ Built-in effects:
 ```text
 assign
 raise
+start, for local harness agents
+send, for local harness agents
 ```
 
 Adapter-backed effects:
@@ -176,9 +184,8 @@ Adapter-backed effects:
 ```text
 capability value calls such as plan.snapshot
 capability mutation calls such as plan.markDone
-start
-send
 askHuman
+start/send only for explicitly adapter-backed agents
 ```
 
 Executor-backed effects:
@@ -205,15 +212,15 @@ Every effect schema is described by:
   "category": "async_invocation",
   "input": {"type": "json"},
   "output": {"type": "json"},
-  "required_capabilities": ["adapter.untie.start"],
+  "required_capabilities": ["agent.worker.start"],
   "idempotent": true,
   "timeout_ms_default": 600000,
   "failure_categories": ["blocked_by_capability", "adapter_failure", "timeout"]
 }
 ```
 
-For runtime-dispatched effects, the manifest `input` schema describes the
-effect request's `args` envelope. This includes routing fields inserted by the
+For adapter-dispatched effects, the manifest `input` schema describes the effect
+request's `args` envelope. This includes routing fields inserted by the
 language:
 
 - `send director "hello"` dispatches `{agent: "director", message: "hello"}`
@@ -225,10 +232,13 @@ language:
 If an optional authored argument is absent, its key is omitted from the request
 envelope.
 Static validation rejects adapter-backed step effects whose request envelope
-cannot satisfy the manifest input schema. When the workflow expression has a
-known schema, including a manifest-declared capability output schema, validation
-uses that schema for the corresponding envelope field instead of treating it as
-untyped JSON. The runtime revalidates the concrete JSON values before dispatch.
+cannot satisfy the manifest input schema. Native local `start` and `send`
+validate against the declared agent target and the built-in agent ledger
+contract instead of requiring an adapter manifest. When the workflow expression
+has a known schema, including a manifest-declared capability output schema,
+validation uses that schema for the corresponding envelope field instead of
+treating it as untyped JSON. The runtime revalidates the concrete JSON values
+before dispatch or native ledger insertion.
 When an adapter dispatches an effect, the accepted outcome records the
 manifest's `required_capabilities`. Status projections prefer the outcome's
 capability list and fall back to the intended effect request, so operators can

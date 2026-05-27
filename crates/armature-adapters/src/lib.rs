@@ -1142,7 +1142,7 @@ fn validate_steps_effects(
     steps: &[armature_workflow::ir::Step],
 ) {
     for step in steps {
-        if let Some(request) = adapter_effect_request_shape(step) {
+        if let Some(request) = adapter_effect_request_shape(ir, step) {
             validate_effect_shape(
                 diagnostics,
                 registry,
@@ -1325,6 +1325,9 @@ fn validate_step_request_adapter_input(
     step: &armature_workflow::ir::Step,
     scope: &AdapterExprScope,
 ) {
+    if is_native_agent_step(ir, step) {
+        return;
+    }
     let Some(request) = precise_adapter_effect_request_shape(registry, ir, scope, step) else {
         return;
     };
@@ -2326,7 +2329,7 @@ fn validate_steps_policy(
     steps: &[armature_workflow::ir::Step],
 ) {
     for step in steps {
-        if let Some(request) = adapter_effect_request_shape(step) {
+        if let Some(request) = adapter_effect_request_shape(ir, step) {
             validate_effect_policy(
                 diagnostics,
                 registry,
@@ -2508,8 +2511,13 @@ impl AdapterEffectRequestShape {
 }
 
 fn adapter_effect_request_shape(
+    ir: &armature_workflow::WorkflowIr,
     step: &armature_workflow::ir::Step,
 ) -> Option<AdapterEffectRequestShape> {
+    if is_native_agent_step(ir, step) {
+        return None;
+    }
+
     match step.effect.as_str() {
         "send" => Some(AdapterEffectRequestShape {
             effect_name: "send".to_string(),
@@ -2540,6 +2548,25 @@ fn adapter_effect_request_shape(
         }
         _ => None,
     }
+}
+
+fn is_native_agent_step(
+    ir: &armature_workflow::WorkflowIr,
+    step: &armature_workflow::ir::Step,
+) -> bool {
+    if !matches!(step.effect.as_str(), "start" | "send") {
+        return false;
+    }
+    step.args
+        .get("agent")
+        .and_then(|value| value.as_str())
+        .and_then(|agent| ir.agents.get(agent))
+        .is_some_and(|agent| {
+            !matches!(
+                agent.target,
+                armature_workflow::ir::AgentTarget::Adapter { .. }
+            )
+        })
 }
 
 fn validate_required_capability(
@@ -4895,7 +4922,7 @@ mod tests {
 machine ManifestValidation
 initial waiting
 
-agent director = thread("director")
+agent director = adapter("director")
 
 event go {
   message string
@@ -4926,7 +4953,7 @@ state done {
 machine PolicyValidation
 initial waiting
 
-agent director = thread("director")
+agent director = adapter("director")
 
 event go {
   message string
@@ -5178,7 +5205,7 @@ invariant needsPlanRead {
 machine ManifestValidation
 initial waiting
 
-agent director = thread("director")
+agent director = adapter("director")
 capability plan = adapter("implementationPlan")
 
 event go {
@@ -5226,7 +5253,7 @@ state done {
 machine ManifestValidation
 initial waiting
 
-agent director = thread("director")
+agent director = adapter("director")
 
 event go {}
 
@@ -5332,7 +5359,7 @@ state done {
 machine ManifestValidation
 initial waiting
 
-agent worker = thread("worker")
+agent worker = adapter("worker")
 
 event go {}
 
@@ -5496,7 +5523,7 @@ state done {
 machine ManifestValidation
 initial waiting
 
-agent worker = thread("worker")
+agent worker = adapter("worker")
 
 event go {}
 

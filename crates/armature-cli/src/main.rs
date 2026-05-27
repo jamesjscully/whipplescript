@@ -2,13 +2,17 @@ use armature_engine::queue::{EventStatus, WorkflowEvent};
 use armature_engine::storage::WorkflowStore;
 use armature_engine::WorkflowRuntime;
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::process::Output;
+use std::process::Stdio;
+use std::thread;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const MAX_INSPECTION_LIMIT: usize = 10_000;
@@ -74,10 +78,15 @@ enum Command {
     /// Parse and statically validate a workflow file.
     Validate {
         file: PathBuf,
+        /// Adapter manifest JSON file to include in validation.
         #[arg(long = "adapter-manifest")]
         adapter_manifests: Vec<PathBuf>,
+        /// Capability policy JSON file to enforce during validation.
         #[arg(long = "policy")]
         policy_documents: Vec<PathBuf>,
+        /// Harness profile policy JSON file to validate native provider authority.
+        #[arg(long = "profile-policy")]
+        profile_policy: Option<PathBuf>,
         /// Include the built-in JSON plan adapter manifest for validation.
         #[arg(long = "plan-file")]
         plan_file: Option<PathBuf>,
@@ -85,7 +94,7 @@ enum Command {
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
         /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file")]
+        #[arg(long = "agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -102,39 +111,49 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Add one event to a workflow queue without processing it.
+    /// Queue one typed workflow event without processing it.
     Emit {
         file: PathBuf,
+        /// Workflow event type to enqueue.
         #[arg(long)]
         event: String,
+        /// JSON payload for the event.
         #[arg(long, default_value = "{}")]
         payload: String,
+        /// SQLite workflow store path.
         #[arg(long)]
         store: Option<PathBuf>,
+        /// Adapter manifest JSON file providing extra event schemas.
         #[arg(long = "adapter-manifest")]
         adapter_manifests: Vec<PathBuf>,
+        /// Capability policy JSON file to validate before enqueueing.
         #[arg(long = "policy")]
         policy_documents: Vec<PathBuf>,
         /// Supply built-in human-review response event schema for emit intake.
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
         /// Supply built-in agent completion event schema for emit intake.
-        #[arg(long = "agent-file")]
+        #[arg(long = "agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
-    /// Run one queued event through a workflow.
+    /// Process one queued event, or enqueue and process one event when --event is supplied.
     Run {
         file: PathBuf,
+        /// Workflow event type to enqueue before processing.
         #[arg(long)]
         event: Option<String>,
+        /// JSON payload for --event.
         #[arg(long, default_value = "{}")]
         payload: String,
+        /// SQLite workflow store path.
         #[arg(long)]
         store: Option<PathBuf>,
+        /// Adapter manifest JSON file to validate and dispatch effects.
         #[arg(long = "adapter-manifest")]
         adapter_manifests: Vec<PathBuf>,
+        /// Capability policy JSON file to enforce while dispatching effects.
         #[arg(long = "policy")]
         policy_documents: Vec<PathBuf>,
         /// Testing: provide deterministic coerce output as NAME=JSON.
@@ -150,7 +169,7 @@ enum Command {
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
         /// Use a JSON file as the built-in agent invocation/message store.
-        #[arg(long = "agent-file")]
+        #[arg(long = "agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         /// Call real BAML functions through an already-running baml-cli serve endpoint.
         #[arg(long = "baml-url")]
@@ -163,10 +182,13 @@ enum Command {
     /// Show persisted workflow status.
     Status {
         file: PathBuf,
+        /// SQLite workflow store path.
         #[arg(long)]
         store: Option<PathBuf>,
+        /// Adapter manifest JSON file to include in status validation.
         #[arg(long = "adapter-manifest")]
         adapter_manifests: Vec<PathBuf>,
+        /// Capability policy JSON file to include in status validation.
         #[arg(long = "policy")]
         policy_documents: Vec<PathBuf>,
         /// Include the built-in JSON plan adapter manifest for validation.
@@ -176,18 +198,24 @@ enum Command {
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
         /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file")]
+        #[arg(long = "agent-file", hide = true)]
         agent_file: Option<PathBuf>,
+        /// Print a compact operator-oriented status summary.
+        #[arg(long)]
+        compact: bool,
         #[arg(long)]
         json: bool,
     },
     /// Show a compact workflow overview for humans and agents.
     Overview {
         file: PathBuf,
+        /// SQLite workflow store path.
         #[arg(long)]
         store: Option<PathBuf>,
+        /// Adapter manifest JSON file to include in overview validation.
         #[arg(long = "adapter-manifest")]
         adapter_manifests: Vec<PathBuf>,
+        /// Capability policy JSON file to include in overview validation.
         #[arg(long = "policy")]
         policy_documents: Vec<PathBuf>,
         /// Include the built-in JSON plan adapter manifest for validation.
@@ -197,7 +225,7 @@ enum Command {
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
         /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file")]
+        #[arg(long = "agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -205,10 +233,13 @@ enum Command {
     /// Show durable workflow events.
     Events {
         file: PathBuf,
+        /// SQLite workflow store path.
         #[arg(long)]
         store: Option<PathBuf>,
+        /// Adapter manifest JSON file to include in event-schema validation.
         #[arg(long = "adapter-manifest")]
         adapter_manifests: Vec<PathBuf>,
+        /// Capability policy JSON file to validate before reading events.
         #[arg(long = "policy")]
         policy_documents: Vec<PathBuf>,
         /// Include the built-in JSON plan adapter manifest for validation.
@@ -218,10 +249,12 @@ enum Command {
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
         /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file")]
+        #[arg(long = "agent-file", hide = true)]
         agent_file: Option<PathBuf>,
+        /// Durable event status to filter by.
         #[arg(long, value_enum)]
         status: Option<CliEventStatus>,
+        /// Maximum number of event records to print.
         #[arg(long, default_value_t = 50)]
         limit: usize,
         #[arg(long)]
@@ -230,12 +263,16 @@ enum Command {
     /// Retry a failed or dead-lettered workflow event.
     RetryEvent {
         file: PathBuf,
+        /// Failed or dead-lettered event id to requeue.
         #[arg(long = "event-id")]
         event_id: String,
+        /// SQLite workflow store path.
         #[arg(long)]
         store: Option<PathBuf>,
+        /// Adapter manifest JSON file to include in validation.
         #[arg(long = "adapter-manifest")]
         adapter_manifests: Vec<PathBuf>,
+        /// Capability policy JSON file to include in validation.
         #[arg(long = "policy")]
         policy_documents: Vec<PathBuf>,
         /// Include the built-in JSON plan adapter manifest for validation.
@@ -245,7 +282,7 @@ enum Command {
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
         /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file")]
+        #[arg(long = "agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -253,10 +290,13 @@ enum Command {
     /// Show the append-only workflow log.
     Log {
         file: PathBuf,
+        /// SQLite workflow store path.
         #[arg(long)]
         store: Option<PathBuf>,
+        /// Adapter manifest JSON file to include in validation.
         #[arg(long = "adapter-manifest")]
         adapter_manifests: Vec<PathBuf>,
+        /// Capability policy JSON file to include in validation.
         #[arg(long = "policy")]
         policy_documents: Vec<PathBuf>,
         /// Include the built-in JSON plan adapter manifest for validation.
@@ -266,8 +306,9 @@ enum Command {
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
         /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file")]
+        #[arg(long = "agent-file", hide = true)]
         agent_file: Option<PathBuf>,
+        /// Maximum number of log records to print.
         #[arg(long, default_value_t = 50)]
         limit: usize,
         #[arg(long)]
@@ -276,10 +317,13 @@ enum Command {
     /// Run a bounded formal check for a workflow file.
     Check {
         file: PathBuf,
+        /// Formal model backend to check.
         #[arg(long, value_enum, default_value_t = CliModelTarget::Tla)]
         target: CliModelTarget,
+        /// Adapter manifest JSON file to include before checking.
         #[arg(long = "adapter-manifest")]
         adapter_manifests: Vec<PathBuf>,
+        /// Capability policy JSON file to include before checking.
         #[arg(long = "policy")]
         policy_documents: Vec<PathBuf>,
         /// Include the built-in JSON plan adapter manifest for validation.
@@ -289,16 +333,23 @@ enum Command {
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
         /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file")]
+        #[arg(long = "agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
+    /// Run or inspect the native local agent harness.
+    Harness {
+        #[command(subcommand)]
+        command: HarnessCommand,
+    },
     /// Run stronger proof-oriented verification when available.
     Prove {
         file: PathBuf,
+        /// Adapter manifest JSON file to include before proof checks.
         #[arg(long = "adapter-manifest")]
         adapter_manifests: Vec<PathBuf>,
+        /// Capability policy JSON file to include before proof checks.
         #[arg(long = "policy")]
         policy_documents: Vec<PathBuf>,
         /// Include the built-in JSON plan adapter manifest for validation.
@@ -308,7 +359,7 @@ enum Command {
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
         /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file")]
+        #[arg(long = "agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -316,10 +367,13 @@ enum Command {
     /// Compile a workflow into build artifacts.
     Build {
         file: PathBuf,
+        /// Output directory for generated artifacts.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Adapter manifest JSON file to bundle with the build.
         #[arg(long = "adapter-manifest")]
         adapter_manifests: Vec<PathBuf>,
+        /// Capability policy JSON file to bundle with the build.
         #[arg(long = "policy")]
         policy_documents: Vec<PathBuf>,
         /// Include the built-in JSON plan adapter manifest in validation/build metadata.
@@ -329,7 +383,7 @@ enum Command {
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
         /// Include the built-in JSON agent adapter manifest in validation/build metadata.
-        #[arg(long = "agent-file")]
+        #[arg(long = "agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -337,10 +391,13 @@ enum Command {
     /// Emit a formal model from a workflow file.
     EmitModel {
         file: PathBuf,
+        /// Formal model backend to emit.
         #[arg(long, value_enum, default_value_t = CliModelTarget::Tla)]
         target: CliModelTarget,
+        /// Adapter manifest JSON file to include while emitting the model.
         #[arg(long = "adapter-manifest")]
         adapter_manifests: Vec<PathBuf>,
+        /// Capability policy JSON file to include while emitting the model.
         #[arg(long = "policy")]
         policy_documents: Vec<PathBuf>,
         /// Include the built-in JSON plan adapter manifest for validation.
@@ -350,16 +407,19 @@ enum Command {
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
         /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file")]
+        #[arg(long = "agent-file", hide = true)]
         agent_file: Option<PathBuf>,
     },
     /// Emit a checker config for a generated formal model.
     EmitConfig {
         file: PathBuf,
+        /// Formal checker backend to configure.
         #[arg(long, value_enum, default_value_t = CliModelTarget::Tla)]
         target: CliModelTarget,
+        /// Adapter manifest JSON file to include while emitting config.
         #[arg(long = "adapter-manifest")]
         adapter_manifests: Vec<PathBuf>,
+        /// Capability policy JSON file to include while emitting config.
         #[arg(long = "policy")]
         policy_documents: Vec<PathBuf>,
         /// Include the built-in JSON plan adapter manifest for validation.
@@ -369,8 +429,83 @@ enum Command {
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
         /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file")]
+        #[arg(long = "agent-file", hide = true)]
         agent_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HarnessCommand {
+    /// Claim and run at most one queued native agent invocation.
+    Once {
+        file: PathBuf,
+        /// SQLite workflow store path.
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Harness provider config JSON file.
+        #[arg(long)]
+        config: PathBuf,
+        /// Harness profile policy JSON file.
+        #[arg(long = "profile-policy")]
+        profile_policy: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Poll the native agent ledger and run queued invocations.
+    Run {
+        file: PathBuf,
+        /// SQLite workflow store path.
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Harness provider config JSON file.
+        #[arg(long)]
+        config: PathBuf,
+        /// Harness profile policy JSON file.
+        #[arg(long = "profile-policy")]
+        profile_policy: Option<PathBuf>,
+        /// Also process queued workflow events between provider runs.
+        #[arg(long = "drive-workflow")]
+        drive_workflow: bool,
+        /// Adapter manifest JSON file to validate and dispatch effects while driving workflow events.
+        #[arg(long = "adapter-manifest")]
+        adapter_manifests: Vec<PathBuf>,
+        /// Capability policy JSON file to enforce while driving workflow events.
+        #[arg(long = "policy")]
+        policy_documents: Vec<PathBuf>,
+        /// Testing: provide deterministic coerce output as NAME=JSON while driving workflow events.
+        #[arg(long = "fake-coerce-output")]
+        fake_coerce_outputs: Vec<String>,
+        /// Testing: provide deterministic capability/expression call output as NAME=JSON while driving workflow events.
+        #[arg(long = "fake-call-output")]
+        fake_call_outputs: Vec<String>,
+        /// Use a JSON file as the built-in plan adapter backing store while driving workflow events.
+        #[arg(long = "plan-file")]
+        plan_file: Option<PathBuf>,
+        /// Use a JSON file as the built-in human-review obligation store while driving workflow events.
+        #[arg(long = "review-file")]
+        review_file: Option<PathBuf>,
+        /// Call real BAML functions through an already-running baml-cli serve endpoint.
+        #[arg(long = "baml-url")]
+        baml_url: Option<String>,
+        #[arg(long = "baml-timeout-ms", default_value_t = 30_000)]
+        baml_timeout_ms: u64,
+        /// Maximum loop iterations; omit for continuous operation.
+        #[arg(long = "max-iterations")]
+        max_iterations: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show native harness ledger state.
+    Status {
+        file: PathBuf,
+        /// SQLite workflow store path.
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Harness profile policy JSON file.
+        #[arg(long = "profile-policy")]
+        profile_policy: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -447,6 +582,52 @@ enum CliError {
     PolicyDocument {
         path: PathBuf,
         source: serde_json::Error,
+    },
+    #[error("failed to parse harness config `{path}`: {source}")]
+    HarnessConfig {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    #[error("failed to parse harness profile policy `{path}`: {source}")]
+    HarnessProfilePolicy {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    #[error("harness profile policy validation failed: {message}")]
+    HarnessProfilePolicyValidation {
+        message: String,
+        diagnostics: Vec<armature_workflow::Diagnostic>,
+    },
+    #[error("harness profile `{profile}` for agent `{agent}` is not defined")]
+    MissingHarnessProfile { agent: String, profile: String },
+    #[error("harness profile policy has no default profile for agent `{agent}`")]
+    MissingDefaultHarnessProfile { agent: String },
+    #[error("harness profile `{profile}` for agent `{agent}` resolves to provider `{provider}`, but config for that agent uses provider `{configured_provider}`")]
+    HarnessProfileProviderMismatch {
+        agent: String,
+        profile: String,
+        provider: String,
+        configured_provider: String,
+    },
+    #[error("harness profile `{profile}` for agent `{agent}` uses command provider but command provider is not allowed by policy")]
+    HarnessCommandProviderDenied { agent: String, profile: String },
+    #[error("harness config has no provider for agent `{0}`")]
+    MissingHarnessProvider(String),
+    #[error("harness provider `{provider}` for agent `{agent}` is not supported yet")]
+    UnsupportedHarnessProvider { agent: String, provider: String },
+    #[error("harness provider for agent `{agent}` has an empty command")]
+    EmptyHarnessCommand { agent: String },
+    #[error(
+        "failed to collect harness provider output for invocation `{invocation_id}`: {source}"
+    )]
+    HarnessOutput {
+        invocation_id: String,
+        source: std::io::Error,
+    },
+    #[error("failed to execute harness provider for invocation `{invocation_id}`: {source}")]
+    HarnessExecution {
+        invocation_id: String,
+        source: std::io::Error,
     },
     #[error("adapter manifest validation failed: {message}")]
     AdapterManifestValidation {
@@ -571,6 +752,103 @@ struct BuildOutput {
     artifact_hashes: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct HarnessConfig {
+    agents: BTreeMap<String, HarnessAgentConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HarnessAgentConfig {
+    provider: String,
+    #[serde(default)]
+    command: Vec<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HarnessProfilePolicy {
+    mode: HarnessProfileMode,
+    #[serde(default)]
+    default_profile: Option<String>,
+    #[serde(default)]
+    allow_command_provider: Option<bool>,
+    #[serde(default)]
+    profiles: BTreeMap<String, HarnessProfileDefinition>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HarnessProfileMode {
+    Permissive,
+    Separated,
+    Custom,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HarnessProfileDefinition {
+    description: String,
+    provider: String,
+    #[serde(default)]
+    command: Vec<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    timeout_seconds: Option<u64>,
+    #[serde(default)]
+    filesystem: Option<String>,
+    #[serde(default)]
+    network: Option<String>,
+    #[serde(default)]
+    allowed_env: Vec<String>,
+    #[serde(default)]
+    allowed_tools: Vec<String>,
+    #[serde(default)]
+    enforcement: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedHarnessProvider {
+    profile: Option<String>,
+    config: HarnessAgentConfig,
+    requested_authority: serde_json::Value,
+    enforced_authority: serde_json::Value,
+    enforcement: String,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HarnessOnceOutput {
+    workflow_id: String,
+    invocation: Option<armature_engine::storage::AgentInvocationRecord>,
+    completion_event: Option<WorkflowEvent>,
+    provider_status: Option<i32>,
+    provider_timed_out: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct HarnessStatusOutput {
+    workflow_id: String,
+    workflow_status: Option<armature_engine::status::WorkflowStatus>,
+    invocations: Vec<armature_engine::storage::AgentInvocationRecord>,
+    completions: Vec<armature_engine::storage::AgentCompletionRecord>,
+    harness_events: Vec<armature_engine::storage::HarnessEventRecord>,
+    recent_failures: Vec<armature_engine::storage::HarnessEventRecord>,
+}
+
+struct HarnessProviderOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: Option<i32>,
+    success: bool,
+    timed_out: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct OverviewOutput {
     validation: ValidateOutput,
@@ -607,6 +885,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             file,
             adapter_manifests,
             policy_documents,
+            profile_policy,
             plan_file,
             review_file,
             agent_file,
@@ -618,6 +897,10 @@ fn run(cli: Cli) -> Result<(), CliError> {
             let mut diagnostics = parsed.diagnostics;
             if let Some(ir) = parsed.ir {
                 diagnostics.extend(armature_workflow::validate_ir(&ir).diagnostics);
+                if let Some(path) = &profile_policy {
+                    let policy = load_harness_profile_policy(path)?;
+                    diagnostics.extend(validate_harness_profile_policy(&ir, &policy));
+                }
                 let policies = load_policy_documents(&policy_documents)?;
                 if !adapter_manifests.is_empty()
                     || plan_file.is_some()
@@ -856,6 +1139,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             plan_file,
             review_file,
             agent_file,
+            compact,
             json,
         } => {
             let status = load_status_for_file(
@@ -870,6 +1154,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
 
             if json {
                 print_json(&status)?;
+            } else if compact {
+                print_compact_status(&status);
             } else {
                 print_status(&status);
             }
@@ -1082,6 +1368,121 @@ fn run(cli: Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Command::Harness { command } => match command {
+            HarnessCommand::Once {
+                file,
+                store,
+                config,
+                profile_policy,
+                json,
+            } => {
+                let output = run_harness_once(&file, store, &config, profile_policy.as_deref())?;
+                if json {
+                    print_json(&output)?;
+                } else if let Some(invocation) = output.invocation {
+                    println!(
+                        "{} {}",
+                        invocation.invocation_id,
+                        output
+                            .completion_event
+                            .as_ref()
+                            .map(|event| event.event_id.as_str())
+                            .unwrap_or("no-event")
+                    );
+                } else {
+                    println!("idle");
+                }
+                Ok(())
+            }
+            HarnessCommand::Run {
+                file,
+                store,
+                config,
+                profile_policy,
+                drive_workflow,
+                adapter_manifests,
+                policy_documents,
+                fake_coerce_outputs,
+                fake_call_outputs,
+                plan_file,
+                review_file,
+                baml_url,
+                baml_timeout_ms,
+                max_iterations,
+                json,
+            } => {
+                let mut outputs = Vec::new();
+                let max_iterations = max_iterations.unwrap_or(usize::MAX);
+                for _ in 0..max_iterations {
+                    let mut did_work = false;
+                    if drive_workflow {
+                        let processed = match process_workflow_once(
+                            &file,
+                            store.clone(),
+                            &adapter_manifests,
+                            &policy_documents,
+                            &fake_coerce_outputs,
+                            &fake_call_outputs,
+                            plan_file.clone(),
+                            review_file.clone(),
+                            baml_url.clone(),
+                            baml_timeout_ms,
+                        ) {
+                            Ok(processed) => processed,
+                            Err(error) => {
+                                append_harness_observation_best_effort(
+                                    &file,
+                                    store.clone(),
+                                    "workflow_validation_failed",
+                                    serde_json::json!({"error": error.to_string()}),
+                                );
+                                return Err(error);
+                            }
+                        };
+                        did_work |= processed;
+                    }
+                    let output =
+                        run_harness_once(&file, store.clone(), &config, profile_policy.as_deref())?;
+                    did_work |= output.invocation.is_some();
+                    outputs.push(output);
+                    if !did_work {
+                        append_harness_observation_best_effort(
+                            &file,
+                            store.clone(),
+                            "idle_without_work",
+                            serde_json::json!({"driveWorkflow": drive_workflow}),
+                        );
+                        break;
+                    }
+                }
+                if json {
+                    print_json(&outputs)?;
+                } else {
+                    println!("{}", outputs.len());
+                }
+                Ok(())
+            }
+            HarnessCommand::Status {
+                file,
+                store,
+                profile_policy,
+                json,
+            } => {
+                let output = harness_status(&file, store, profile_policy.as_deref())?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    println!("invocations: {}", output.invocations.len());
+                    for invocation in output.invocations {
+                        println!(
+                            "{} {} {:?}",
+                            invocation.invocation_id, invocation.agent, invocation.status
+                        );
+                    }
+                }
+                Ok(())
+            }
+        },
         Command::Prove {
             file,
             adapter_manifests,
@@ -1309,7 +1710,10 @@ fn load_status_for_file(
             recent_effects: Vec::new(),
             latest_coerce_calls: Vec::new(),
             latest_coerce_failures: Vec::new(),
+            current_coerce_failure: None,
+            current_effect_failures: Vec::new(),
             policy_blockers: Vec::new(),
+            current_blockers: Vec::new(),
             recent_failures: Vec::new(),
         })
     }
@@ -1373,7 +1777,10 @@ fn load_overview_for_file(
                 recent_effects: Vec::new(),
                 latest_coerce_calls: Vec::new(),
                 latest_coerce_failures: Vec::new(),
+                current_coerce_failure: None,
+                current_effect_failures: Vec::new(),
                 policy_blockers: Vec::new(),
+                current_blockers: Vec::new(),
                 recent_failures: Vec::new(),
             }
         })
@@ -1676,6 +2083,21 @@ fn policy_document_validation_error(diagnostics: Vec<armature_workflow::Diagnost
     }
 }
 
+fn harness_profile_policy_validation_error(
+    diagnostics: Vec<armature_workflow::Diagnostic>,
+) -> CliError {
+    let message = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == armature_workflow::Severity::Error)
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    CliError::HarnessProfilePolicyValidation {
+        message,
+        diagnostics,
+    }
+}
+
 fn workflow_contract_validation_error(diagnostics: Vec<armature_workflow::Diagnostic>) -> CliError {
     let message = diagnostics
         .iter()
@@ -1775,6 +2197,9 @@ fn print_cli_error(error: &CliError) {
         CliError::Validation { diagnostics } => print_diagnostics(diagnostics),
         CliError::AdapterManifestValidation { diagnostics, .. } => print_diagnostics(diagnostics),
         CliError::PolicyDocumentValidation { diagnostics, .. } => print_diagnostics(diagnostics),
+        CliError::HarnessProfilePolicyValidation { diagnostics, .. } => {
+            print_diagnostics(diagnostics)
+        }
         CliError::WorkflowContractValidation { diagnostics, .. } => print_diagnostics(diagnostics),
         _ => {}
     }
@@ -1898,10 +2323,28 @@ fn print_overview(overview: &OverviewOutput) {
         }
     }
 
-    if status.recent_failures.is_empty() {
-        println!("recent failures: none");
+    if status.current_effect_failures.is_empty() {
+        println!("current effect failures: none");
     } else {
-        println!("recent failures:");
+        println!("current effect failures:");
+        for failure in &status.current_effect_failures {
+            println!("  {failure}");
+        }
+    }
+
+    if status.current_blockers.is_empty() {
+        println!("current blockers: none");
+    } else {
+        println!("current blockers:");
+        for blocker in &status.current_blockers {
+            println!("  {blocker}");
+        }
+    }
+
+    if status.recent_failures.is_empty() {
+        println!("recent failures (history): none");
+    } else {
+        println!("recent failures (history):");
         for failure in &status.recent_failures {
             println!("  {failure}");
         }
@@ -1933,10 +2376,24 @@ fn print_overview(overview: &OverviewOutput) {
         }
     }
 
-    if status.latest_coerce_failures.is_empty() {
-        println!("latest coerce failures: none");
+    if let Some(call) = &status.current_coerce_failure {
+        let error = call
+            .error
+            .as_deref()
+            .map(|error| format!(" error={error}"))
+            .unwrap_or_default();
+        println!(
+            "current coerce failure: {} {:?} http={:?}{}",
+            call.function_name, call.status, call.http_status, error
+        );
     } else {
-        println!("latest coerce failures:");
+        println!("current coerce failure: none");
+    }
+
+    if status.latest_coerce_failures.is_empty() {
+        println!("latest coerce failures (history): none");
+    } else {
+        println!("latest coerce failures (history):");
         for call in &status.latest_coerce_failures {
             let error = call
                 .error
@@ -2031,10 +2488,28 @@ fn print_status(status: &armature_engine::status::WorkflowStatus) {
         }
     }
 
-    if status.recent_failures.is_empty() {
-        println!("recent failures: none");
+    if status.current_effect_failures.is_empty() {
+        println!("current effect failures: none");
     } else {
-        println!("recent failures:");
+        println!("current effect failures:");
+        for failure in &status.current_effect_failures {
+            println!("  {failure}");
+        }
+    }
+
+    if status.current_blockers.is_empty() {
+        println!("current blockers: none");
+    } else {
+        println!("current blockers:");
+        for blocker in &status.current_blockers {
+            println!("  {blocker}");
+        }
+    }
+
+    if status.recent_failures.is_empty() {
+        println!("recent failures (history): none");
+    } else {
+        println!("recent failures (history):");
         for failure in &status.recent_failures {
             println!("  {failure}");
         }
@@ -2066,10 +2541,24 @@ fn print_status(status: &armature_engine::status::WorkflowStatus) {
         }
     }
 
-    if status.latest_coerce_failures.is_empty() {
-        println!("latest coerce failures: none");
+    if let Some(call) = &status.current_coerce_failure {
+        let error = call
+            .error
+            .as_deref()
+            .map(|error| format!(" error={error}"))
+            .unwrap_or_default();
+        println!(
+            "current coerce failure: {} {:?} http={:?}{}",
+            call.function_name, call.status, call.http_status, error
+        );
     } else {
-        println!("latest coerce failures:");
+        println!("current coerce failure: none");
+    }
+
+    if status.latest_coerce_failures.is_empty() {
+        println!("latest coerce failures (history): none");
+    } else {
+        println!("latest coerce failures (history):");
         for call in &status.latest_coerce_failures {
             let error = call
                 .error
@@ -2081,6 +2570,46 @@ fn print_status(status: &armature_engine::status::WorkflowStatus) {
                 call.function_name, call.status, call.http_status, error
             );
         }
+    }
+}
+
+fn print_compact_status(status: &armature_engine::status::WorkflowStatus) {
+    println!("workflow: {}", status.workflow_name);
+    println!("state: {}", status.current_state);
+    println!("waiting: {}", status_waiting_reason(status));
+    println!("pending events: {}", status.pending_events);
+    if status.active_invocations.is_empty() {
+        println!("active: none");
+    } else {
+        let active = status
+            .active_invocations
+            .iter()
+            .map(|invocation| match invocation.max {
+                Some(max) => format!("{}={}/{}", invocation.agent, invocation.count, max),
+                None => format!("{}={}", invocation.agent, invocation.count),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("active: {active}");
+    }
+    if status.current_blockers.is_empty() {
+        println!("current blockers: none");
+    } else {
+        println!("current blockers:");
+        for blocker in &status.current_blockers {
+            println!("  {blocker}");
+        }
+    }
+    if !status.current_effect_failures.is_empty() {
+        println!("current effect failures:");
+        for failure in &status.current_effect_failures {
+            println!("  {failure}");
+        }
+    }
+    if let Some(transition) = &status.recent_transition {
+        println!("latest transition: {transition}");
+    } else {
+        println!("latest transition: none");
     }
 }
 
@@ -2101,8 +2630,8 @@ fn status_waiting_reason(status: &armature_engine::status::WorkflowStatus) -> St
     if let Some(blocker) = status.policy_blockers.first() {
         return format!("policy blocked: {blocker}");
     }
-    if let Some(failure) = status.recent_failures.first() {
-        return format!("recent failure: {failure}");
+    if let Some(blocker) = status.current_blockers.first() {
+        return format!("current blocker: {blocker}");
     }
     if status.pending_events > 0 {
         return format!("{} queued event(s) ready to process", status.pending_events);
@@ -2119,6 +2648,1049 @@ fn status_waiting_reason(status: &armature_engine::status::WorkflowStatus) -> St
     "idle; no queued events or active invocations".to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn process_workflow_once(
+    file: &PathBuf,
+    store_path: Option<PathBuf>,
+    adapter_manifests: &[PathBuf],
+    policy_documents: &[PathBuf],
+    fake_coerce_outputs: &[String],
+    fake_call_outputs: &[String],
+    plan_file: Option<PathBuf>,
+    review_file: Option<PathBuf>,
+    baml_url: Option<String>,
+    baml_timeout_ms: u64,
+) -> Result<bool, CliError> {
+    let mut manifests = load_valid_adapter_manifests(adapter_manifests)?;
+    if plan_file.is_some() {
+        add_json_plan_manifest_if_needed(&mut manifests);
+    }
+    if review_file.is_some() {
+        add_json_human_review_manifest_if_needed(&mut manifests);
+    }
+    let policies = load_valid_policy_documents(policy_documents)?;
+    let parsed_fake_coerce_outputs = parse_fake_outputs(fake_coerce_outputs)?;
+    if parsed_fake_coerce_outputs.is_empty() {
+        if let Some(url) = &baml_url {
+            let diagnostics = armature_adapters::validate_baml_http_policy(&policies, url);
+            if diagnostics_have_errors(&diagnostics) {
+                return Err(policy_document_validation_error(diagnostics));
+            }
+        }
+    }
+    let ir = load_valid_ir_with_contracts(file, &manifests, &policies)?;
+    let workflow_id = ir.workflow.name.clone();
+    let store_baml_raw_response = armature_adapters::should_store_baml_raw_response(&policies);
+    let store_path = store_path.unwrap_or_else(|| default_store_path(file, &workflow_id));
+    ensure_parent_dir(&store_path)?;
+    let store = WorkflowStore::open(&store_path)?;
+    let dispatcher =
+        adapter_dispatcher_from_manifests(manifests, policies, plan_file, review_file, None);
+    let coerce_executor = coerce_executor_for_run(
+        parsed_fake_coerce_outputs,
+        baml_url,
+        Some(baml_timeout_ms),
+        &ir,
+        store_baml_raw_response,
+    );
+    let fake_call_outputs = parse_fake_outputs(fake_call_outputs)?;
+    let mut runtime = WorkflowRuntime::with_dispatcher_and_coerce_executor(
+        ir,
+        store,
+        dispatcher,
+        coerce_executor,
+    )?
+    .with_fake_call_outputs(fake_call_outputs);
+    runtime
+        .process_next_event()
+        .map(|outcome| outcome.is_some())
+        .map_err(Into::into)
+}
+
+fn run_harness_once(
+    file: &PathBuf,
+    store_path: Option<PathBuf>,
+    config_path: &Path,
+    profile_policy_path: Option<&Path>,
+) -> Result<HarnessOnceOutput, CliError> {
+    let ir = load_valid_ir(file)?;
+    let workflow_id = ir.workflow.name.clone();
+    let store_path = store_path.unwrap_or_else(|| default_store_path(file, &workflow_id));
+    ensure_parent_dir(&store_path)?;
+    let store = WorkflowStore::open(&store_path)?;
+    let config = load_harness_config(config_path)?;
+    let profile_policy = profile_policy_path
+        .map(load_harness_profile_policy)
+        .transpose()?;
+    if let Some(policy) = &profile_policy {
+        let diagnostics = validate_harness_profile_policy(&ir, policy);
+        if diagnostics_have_errors(&diagnostics) {
+            return Err(harness_profile_policy_validation_error(diagnostics));
+        }
+    }
+    recover_expired_harness_leases(&store, &workflow_id)?;
+    let Some(invocation) = store
+        .queued_agent_invocations(&workflow_id, 1)?
+        .into_iter()
+        .next()
+    else {
+        return Ok(HarnessOnceOutput {
+            workflow_id,
+            invocation: None,
+            completion_event: None,
+            provider_status: None,
+            provider_timed_out: false,
+        });
+    };
+
+    let resolved_provider =
+        resolve_harness_provider(&ir, &config, profile_policy.as_ref(), &invocation).map_err(
+            |error| {
+                let kind = if matches!(error, CliError::MissingHarnessProvider(_)) {
+                    "unknown_agent"
+                } else {
+                    "profile_resolution_failed"
+                };
+                let _ = append_harness_event(
+                    &store,
+                    &workflow_id,
+                    Some(&invocation.invocation_id),
+                    kind,
+                    serde_json::json!({
+                        "agent": invocation.agent,
+                        "configuredAgents": config.agents.keys().cloned().collect::<Vec<_>>(),
+                        "error": error.to_string(),
+                    }),
+                );
+                error
+            },
+        )?;
+    let agent_config = &resolved_provider.config;
+    let provider_command = resolve_harness_provider_command(agent_config, &invocation)?;
+
+    let worker_id = format!("armature-cli-{}", std::process::id());
+    let lease_ms = agent_config
+        .timeout_seconds
+        .unwrap_or(300)
+        .saturating_add(60)
+        .saturating_mul(1_000);
+    let lease_until = (current_unix_millis().saturating_add(lease_ms)).to_string();
+    let Some(claimed) =
+        store.claim_agent_invocation(&invocation.invocation_id, &worker_id, &lease_until)?
+    else {
+        return Ok(HarnessOnceOutput {
+            workflow_id,
+            invocation: None,
+            completion_event: None,
+            provider_status: None,
+            provider_timed_out: false,
+        });
+    };
+
+    let run_dir = store_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("runs")
+        .join(&claimed.invocation_id);
+    fs::create_dir_all(&run_dir).map_err(|source| CliError::CreateDir {
+        path: run_dir.clone(),
+        source,
+    })?;
+    let stdout_path = run_dir.join("stdout.log");
+    let stderr_path = run_dir.join("stderr.log");
+    let run_dir_display = run_dir.display().to_string();
+    let stdout_path_display = stdout_path.display().to_string();
+    let stderr_path_display = stderr_path.display().to_string();
+    store.mark_agent_invocation_started(
+        armature_engine::storage::AgentInvocationStartedUpdate {
+            invocation_id: &claimed.invocation_id,
+            provider: Some(&agent_config.provider),
+            provider_run_id: Some(&claimed.invocation_id),
+            resolved_profile: resolved_provider.profile.as_deref(),
+            profile_enforcement: Some(&resolved_provider.enforcement),
+            run_dir: Some(&run_dir_display),
+            stdout_path: Some(&stdout_path_display),
+            stderr_path: Some(&stderr_path_display),
+        },
+    )?;
+    append_harness_event(
+        &store,
+        &workflow_id,
+        Some(&claimed.invocation_id),
+        "provider_started",
+        serde_json::json!({
+            "agent": claimed.agent,
+            "requestedProfile": &claimed.requested_profile,
+            "resolvedProfile": &resolved_provider.profile,
+            "provider": agent_config.provider,
+            "command": provider_command,
+            "requestedAuthority": &resolved_provider.requested_authority,
+            "enforcedAuthority": &resolved_provider.enforced_authority,
+            "enforcement": &resolved_provider.enforcement,
+            "warnings": &resolved_provider.warnings,
+        }),
+    )?;
+
+    let output = run_harness_command(
+        agent_config,
+        &provider_command,
+        &claimed,
+        &workflow_id,
+        &run_dir,
+    )?;
+    fs::write(&stdout_path, &output.stdout).map_err(|source| CliError::Write {
+        path: stdout_path.clone(),
+        source,
+    })?;
+    fs::write(&stderr_path, &output.stderr).map_err(|source| CliError::Write {
+        path: stderr_path.clone(),
+        source,
+    })?;
+
+    let exit_code = output.exit_code;
+    let succeeded = output.success;
+    let completion_status = if output.timed_out {
+        "timed_out"
+    } else if succeeded {
+        "succeeded"
+    } else {
+        "failed"
+    };
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let summary = if succeeded {
+        tail_text(&stdout_text, 500)
+    } else {
+        tail_text(&stderr_text, 500)
+    };
+    let invocation_status = if output.timed_out {
+        armature_engine::storage::AgentInvocationStatus::TimedOut
+    } else if succeeded {
+        armature_engine::storage::AgentInvocationStatus::Succeeded
+    } else {
+        armature_engine::storage::AgentInvocationStatus::Failed
+    };
+    store.mark_agent_invocation_exited(
+        &claimed.invocation_id,
+        invocation_status,
+        exit_code,
+        (!succeeded).then_some(summary.as_str()),
+    )?;
+    append_harness_event(
+        &store,
+        &workflow_id,
+        Some(&claimed.invocation_id),
+        "provider_exited",
+        serde_json::json!({
+            "status": completion_status,
+            "exitCode": exit_code,
+            "timedOut": output.timed_out,
+            "stdoutPath": stdout_path,
+            "stderrPath": stderr_path,
+        }),
+    )?;
+    if output.timed_out {
+        append_harness_event(
+            &store,
+            &workflow_id,
+            Some(&claimed.invocation_id),
+            "provider_timed_out",
+            serde_json::json!({
+                "timeoutSeconds": agent_config.timeout_seconds,
+                "command": provider_command,
+            }),
+        )?;
+    } else if !succeeded {
+        append_harness_event(
+            &store,
+            &workflow_id,
+            Some(&claimed.invocation_id),
+            "provider_command_failed",
+            serde_json::json!({
+                "exitCode": exit_code,
+                "stderr": tail_text(&stderr_text, 500),
+                "command": provider_command,
+            }),
+        )?;
+    }
+
+    let payload = serde_json::json!({
+        "id": claimed.invocation_id,
+        "name": claimed.agent,
+        "status": completion_status,
+        "summary": summary,
+        "exitCode": exit_code,
+    });
+    let mut completion_event = match build_cli_event(
+        &ir,
+        &[],
+        &workflow_id,
+        "finished".to_string(),
+        serde_json::to_string(&payload)?,
+    ) {
+        Ok(event) => event,
+        Err(error) => {
+            store.mark_agent_invocation_exited(
+                &claimed.invocation_id,
+                armature_engine::storage::AgentInvocationStatus::CompletionRejected,
+                exit_code,
+                Some(&error.to_string()),
+            )?;
+            append_harness_event(
+                &store,
+                &workflow_id,
+                Some(&claimed.invocation_id),
+                "completion_schema_mismatch",
+                serde_json::json!({"error": error.to_string(), "payload": payload}),
+            )?;
+            return Err(error);
+        }
+    };
+    completion_event.source = Some(armature_engine::queue::EventSource {
+        kind: "harness".to_string(),
+        name: Some(agent_config.provider.clone()),
+    });
+    let completion = armature_engine::storage::AgentCompletionRecord {
+        workflow_id: workflow_id.clone(),
+        completion_id: format!("cmp_{}", ulid::Ulid::new()),
+        invocation_id: claimed.invocation_id.clone(),
+        agent: claimed.agent.clone(),
+        status: completion_status.to_string(),
+        summary: Some(summary),
+        exit_code,
+        event_id: Some(completion_event.event_id.clone()),
+        payload,
+        created_at: current_unix_millis().to_string(),
+    };
+    let inserted_completion = store.record_agent_completion(&completion, &completion_event)?;
+    if inserted_completion {
+        append_harness_event(
+            &store,
+            &workflow_id,
+            Some(&claimed.invocation_id),
+            "completion_enqueued",
+            serde_json::json!({"eventId": completion_event.event_id}),
+        )?;
+    } else {
+        append_harness_event(
+            &store,
+            &workflow_id,
+            Some(&claimed.invocation_id),
+            "duplicate_completion_ignored",
+            serde_json::json!({"eventId": completion_event.event_id}),
+        )?;
+    }
+
+    Ok(HarnessOnceOutput {
+        workflow_id,
+        invocation: Some(claimed),
+        completion_event: Some(completion_event),
+        provider_status: exit_code,
+        provider_timed_out: output.timed_out,
+    })
+}
+
+fn harness_status(
+    file: &PathBuf,
+    store_path: Option<PathBuf>,
+    profile_policy_path: Option<&Path>,
+) -> Result<HarnessStatusOutput, CliError> {
+    let ir = load_valid_ir(file)?;
+    if let Some(path) = profile_policy_path {
+        let policy = load_harness_profile_policy(path)?;
+        let diagnostics = validate_harness_profile_policy(&ir, &policy);
+        if diagnostics_have_errors(&diagnostics) {
+            return Err(harness_profile_policy_validation_error(diagnostics));
+        }
+    }
+    let workflow_id = ir.workflow.name.clone();
+    let store_path = store_path.unwrap_or_else(|| default_store_path(file, &workflow_id));
+    if !store_path.exists() {
+        return Ok(HarnessStatusOutput {
+            workflow_id,
+            workflow_status: None,
+            invocations: Vec::new(),
+            completions: Vec::new(),
+            harness_events: Vec::new(),
+            recent_failures: Vec::new(),
+        });
+    }
+    let store = WorkflowStore::open(&store_path)?;
+    recover_expired_harness_leases(&store, &workflow_id)?;
+    let harness_events = store.recent_harness_events(&workflow_id, 50)?;
+    let recent_failures = harness_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind.as_str(),
+                "provider_command_failed"
+                    | "provider_timed_out"
+                    | "workflow_validation_failed"
+                    | "unknown_agent"
+                    | "profile_resolution_failed"
+                    | "completion_schema_mismatch"
+                    | "lease_expired"
+            )
+        })
+        .cloned()
+        .collect();
+    Ok(HarnessStatusOutput {
+        invocations: store.recent_agent_invocations(&workflow_id, 50)?,
+        completions: store.recent_agent_completions(&workflow_id, 50)?,
+        workflow_status: Some(stored_status(&ir, &store, &workflow_id)?),
+        harness_events,
+        recent_failures,
+        workflow_id,
+    })
+}
+
+fn recover_expired_harness_leases(
+    store: &WorkflowStore,
+    workflow_id: &str,
+) -> Result<Vec<armature_engine::storage::AgentInvocationRecord>, CliError> {
+    let now = current_unix_millis().to_string();
+    let recovered = store.recover_expired_agent_leases(workflow_id, &now)?;
+    for invocation in &recovered {
+        append_harness_event(
+            store,
+            workflow_id,
+            Some(&invocation.invocation_id),
+            "lease_expired",
+            serde_json::json!({
+                "agent": invocation.agent,
+                "previousStatus": invocation.status,
+                "claimedBy": invocation.claimed_by,
+                "claimExpiresAt": invocation.claim_expires_at,
+            }),
+        )?;
+    }
+    Ok(recovered)
+}
+
+fn append_harness_observation_best_effort(
+    file: &PathBuf,
+    store_path: Option<PathBuf>,
+    kind: &str,
+    payload: serde_json::Value,
+) {
+    let Ok(source) = load_source(file) else {
+        return;
+    };
+    let parsed = armature_workflow::parse_syntax_with_file(&source, file.display().to_string());
+    let workflow_id = parsed
+        .ir
+        .as_ref()
+        .map(|ir| ir.workflow.name.clone())
+        .or_else(|| {
+            file.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let store_path = match store_path {
+        Some(path) => path,
+        None if parsed.ir.is_some() => default_store_path(file, &workflow_id),
+        None => return,
+    };
+    let Ok(store) = WorkflowStore::open(&store_path) else {
+        return;
+    };
+    let _ = append_harness_event(&store, &workflow_id, None, kind, payload);
+}
+
+fn load_harness_config(path: &Path) -> Result<HarnessConfig, CliError> {
+    let contents = fs::read_to_string(path).map_err(|source| CliError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    serde_json::from_str(&contents).map_err(|source| CliError::HarnessConfig {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn load_harness_profile_policy(path: &Path) -> Result<HarnessProfilePolicy, CliError> {
+    let contents = fs::read_to_string(path).map_err(|source| CliError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    serde_json::from_str(&contents).map_err(|source| CliError::HarnessProfilePolicy {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn validate_harness_profile_policy(
+    ir: &armature_workflow::WorkflowIr,
+    policy: &HarnessProfilePolicy,
+) -> Vec<armature_workflow::Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for (name, profile) in &policy.profiles {
+        if !valid_profile_name(name) {
+            diagnostics.push(profile_policy_error(format!(
+                "harness profile `{name}` must be non-empty and contain no whitespace/control characters"
+            )));
+        }
+        if profile.description.trim().is_empty() {
+            diagnostics.push(profile_policy_error(format!(
+                "harness profile `{name}` must include a non-empty description"
+            )));
+        }
+        validate_harness_provider_name(&mut diagnostics, name, &profile.provider);
+        validate_authority_value(
+            &mut diagnostics,
+            name,
+            "filesystem",
+            profile.filesystem.as_deref(),
+            &["provider_default", "none", "read_only", "workspace_write"],
+        );
+        validate_authority_value(
+            &mut diagnostics,
+            name,
+            "network",
+            profile.network.as_deref(),
+            &["provider_default", "denied", "allowed"],
+        );
+        validate_authority_value(
+            &mut diagnostics,
+            name,
+            "enforcement",
+            profile.enforcement.as_deref(),
+            &["native", "best_effort", "external", "native_or_best_effort"],
+        );
+    }
+
+    if matches!(policy.mode, HarnessProfileMode::Custom) {
+        if policy.default_profile.is_none() {
+            diagnostics.push(profile_policy_error(
+                "custom harness profile policy must declare defaultProfile".to_string(),
+            ));
+        }
+        for builtin in [
+            "permissive",
+            "research",
+            "repo-reader",
+            "repo-writer",
+            "human-review",
+        ] {
+            let _ = builtin;
+        }
+    }
+
+    if let Some(default_profile) = &policy.default_profile {
+        if !profile_exists(policy, default_profile) {
+            diagnostics.push(profile_policy_error(format!(
+                "default harness profile `{default_profile}` is not defined"
+            )));
+        }
+    }
+
+    for (agent_name, agent) in &ir.agents {
+        let Some(profile) = agent.profile.as_ref() else {
+            continue;
+        };
+        if !valid_profile_name(profile) {
+            diagnostics.push(profile_policy_error(format!(
+                "agent `{agent_name}` references invalid harness profile `{profile}`"
+            )));
+        } else if !profile_exists(policy, profile) {
+            diagnostics.push(profile_policy_error(format!(
+                "agent `{agent_name}` references undefined harness profile `{profile}`"
+            )));
+        }
+    }
+
+    diagnostics
+}
+
+fn validate_harness_provider_name(
+    diagnostics: &mut Vec<armature_workflow::Diagnostic>,
+    profile: &str,
+    provider: &str,
+) {
+    if !matches!(provider, "command" | "codex" | "claude" | "pi") {
+        diagnostics.push(profile_policy_error(format!(
+            "harness profile `{profile}` uses unsupported provider `{provider}`"
+        )));
+    }
+}
+
+fn validate_authority_value(
+    diagnostics: &mut Vec<armature_workflow::Diagnostic>,
+    profile: &str,
+    field: &str,
+    value: Option<&str>,
+    allowed: &[&str],
+) {
+    let Some(value) = value else {
+        return;
+    };
+    if !allowed.contains(&value) {
+        diagnostics.push(profile_policy_error(format!(
+            "harness profile `{profile}` has invalid {field} `{value}`"
+        )));
+    }
+}
+
+fn profile_policy_error(message: String) -> armature_workflow::Diagnostic {
+    armature_workflow::Diagnostic {
+        severity: armature_workflow::Severity::Error,
+        message,
+        span: None,
+    }
+}
+
+fn valid_profile_name(name: &str) -> bool {
+    !name.trim().is_empty()
+        && !name
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+}
+
+fn profile_exists(policy: &HarnessProfilePolicy, profile: &str) -> bool {
+    policy.profiles.contains_key(profile)
+        || !matches!(policy.mode, HarnessProfileMode::Custom)
+            && builtin_harness_profile(profile).is_some()
+}
+
+fn builtin_harness_profile(profile: &str) -> Option<HarnessProfileDefinition> {
+    let definition = match profile {
+        "research" => HarnessProfileDefinition {
+            description:
+                "Use for external documentation and web research. Do not edit repository files."
+                    .to_string(),
+            provider: "codex".to_string(),
+            command: Vec::new(),
+            args: Vec::new(),
+            cwd: None,
+            timeout_seconds: Some(1200),
+            filesystem: Some("read_only".to_string()),
+            network: Some("allowed".to_string()),
+            allowed_env: vec!["OPENAI_API_KEY".to_string()],
+            allowed_tools: vec!["read".to_string(), "web".to_string()],
+            enforcement: Some("native_or_best_effort".to_string()),
+        },
+        "repo-reader" => HarnessProfileDefinition {
+            description: "Use for repository inspection without edits.".to_string(),
+            provider: "codex".to_string(),
+            command: Vec::new(),
+            args: Vec::new(),
+            cwd: None,
+            timeout_seconds: Some(1200),
+            filesystem: Some("read_only".to_string()),
+            network: Some("denied".to_string()),
+            allowed_env: vec!["OPENAI_API_KEY".to_string()],
+            allowed_tools: vec!["read".to_string()],
+            enforcement: Some("native_or_best_effort".to_string()),
+        },
+        "repo-writer" => HarnessProfileDefinition {
+            description: "Use for implementation work after the task is clear.".to_string(),
+            provider: "codex".to_string(),
+            command: Vec::new(),
+            args: Vec::new(),
+            cwd: None,
+            timeout_seconds: Some(1800),
+            filesystem: Some("workspace_write".to_string()),
+            network: Some("denied".to_string()),
+            allowed_env: vec!["OPENAI_API_KEY".to_string()],
+            allowed_tools: vec!["read".to_string(), "edit".to_string(), "test".to_string()],
+            enforcement: Some("native_or_best_effort".to_string()),
+        },
+        "human-review" => HarnessProfileDefinition {
+            description: "Use for structured approval or decision collection.".to_string(),
+            provider: "command".to_string(),
+            command: Vec::new(),
+            args: Vec::new(),
+            cwd: None,
+            timeout_seconds: Some(300),
+            filesystem: Some("none".to_string()),
+            network: Some("denied".to_string()),
+            allowed_env: Vec::new(),
+            allowed_tools: Vec::new(),
+            enforcement: Some("native".to_string()),
+        },
+        _ => return None,
+    };
+    Some(definition)
+}
+
+fn resolve_harness_provider_command(
+    config: &HarnessAgentConfig,
+    invocation: &armature_engine::storage::AgentInvocationRecord,
+) -> Result<Vec<String>, CliError> {
+    if !matches!(
+        config.provider.as_str(),
+        "command" | "codex" | "claude" | "pi"
+    ) {
+        return Err(CliError::UnsupportedHarnessProvider {
+            agent: invocation.agent.clone(),
+            provider: config.provider.clone(),
+        });
+    }
+    let mut command = if !config.command.is_empty() {
+        config.command.clone()
+    } else {
+        match config.provider.as_str() {
+            "command" => {
+                return Err(CliError::EmptyHarnessCommand {
+                    agent: invocation.agent.clone(),
+                });
+            }
+            "codex" => vec![
+                "codex".to_string(),
+                "exec".to_string(),
+                "{{prompt}}".to_string(),
+            ],
+            "claude" => vec![
+                "claude".to_string(),
+                "-p".to_string(),
+                "{{prompt}}".to_string(),
+            ],
+            "pi" => vec![
+                "pi".to_string(),
+                "run".to_string(),
+                "{{prompt}}".to_string(),
+            ],
+            provider => {
+                return Err(CliError::UnsupportedHarnessProvider {
+                    agent: invocation.agent.clone(),
+                    provider: provider.to_string(),
+                });
+            }
+        }
+    };
+    command.extend(config.args.clone());
+    if command.is_empty() {
+        return Err(CliError::EmptyHarnessCommand {
+            agent: invocation.agent.clone(),
+        });
+    }
+    Ok(command)
+}
+
+fn resolve_harness_provider(
+    ir: &armature_workflow::WorkflowIr,
+    config: &HarnessConfig,
+    policy: Option<&HarnessProfilePolicy>,
+    invocation: &armature_engine::storage::AgentInvocationRecord,
+) -> Result<ResolvedHarnessProvider, CliError> {
+    let Some(policy) = policy else {
+        let config = config
+            .agents
+            .get(&invocation.agent)
+            .ok_or_else(|| CliError::MissingHarnessProvider(invocation.agent.clone()))?;
+        return Ok(ResolvedHarnessProvider {
+            profile: None,
+            config: config.clone(),
+            requested_authority: serde_json::json!({"mode": "legacy_config"}),
+            enforced_authority: serde_json::json!({"mode": "legacy_config"}),
+            enforcement: "legacy_config".to_string(),
+            warnings: Vec::new(),
+        });
+    };
+
+    let agent_profile = invocation.requested_profile.clone().or_else(|| {
+        ir.agents
+            .get(&invocation.agent)
+            .and_then(|agent| agent.profile.clone())
+    });
+    let profile_name = match agent_profile.or_else(|| policy.default_profile.clone()) {
+        Some(profile) => profile,
+        None if matches!(policy.mode, HarnessProfileMode::Permissive) => "permissive".to_string(),
+        None => {
+            return Err(CliError::MissingDefaultHarnessProfile {
+                agent: invocation.agent.clone(),
+            });
+        }
+    };
+
+    if profile_name == "permissive" && !policy.profiles.contains_key("permissive") {
+        let config = config
+            .agents
+            .get(&invocation.agent)
+            .ok_or_else(|| CliError::MissingHarnessProvider(invocation.agent.clone()))?;
+        return Ok(ResolvedHarnessProvider {
+            profile: Some(profile_name),
+            config: config.clone(),
+            requested_authority: serde_json::json!({
+                "filesystem": "provider_default",
+                "network": "provider_default"
+            }),
+            enforced_authority: serde_json::json!({
+                "filesystem": "provider_default",
+                "network": "provider_default"
+            }),
+            enforcement: "best_effort".to_string(),
+            warnings: vec![
+                "permissive profile uses concrete harness config provider defaults".to_string(),
+            ],
+        });
+    }
+
+    let profile = policy
+        .profiles
+        .get(&profile_name)
+        .cloned()
+        .or_else(|| {
+            (!matches!(policy.mode, HarnessProfileMode::Custom))
+                .then(|| builtin_harness_profile(&profile_name))
+                .flatten()
+        })
+        .ok_or_else(|| CliError::MissingHarnessProfile {
+            agent: invocation.agent.clone(),
+            profile: profile_name.clone(),
+        })?;
+
+    let command_provider_allowed = policy
+        .allow_command_provider
+        .unwrap_or(matches!(policy.mode, HarnessProfileMode::Permissive));
+    if profile.provider == "command" && !command_provider_allowed {
+        return Err(CliError::HarnessCommandProviderDenied {
+            agent: invocation.agent.clone(),
+            profile: profile_name,
+        });
+    }
+
+    let configured_agent = config.agents.get(&invocation.agent);
+    if let Some(configured_agent) = configured_agent {
+        if configured_agent.provider != profile.provider {
+            return Err(CliError::HarnessProfileProviderMismatch {
+                agent: invocation.agent.clone(),
+                profile: profile_name,
+                provider: profile.provider.clone(),
+                configured_provider: configured_agent.provider.clone(),
+            });
+        }
+    }
+
+    let mut resolved_config = configured_agent.cloned().unwrap_or(HarnessAgentConfig {
+        provider: profile.provider.clone(),
+        command: Vec::new(),
+        args: Vec::new(),
+        cwd: None,
+        timeout_seconds: None,
+    });
+    resolved_config.provider = profile.provider.clone();
+    if !profile.command.is_empty() {
+        resolved_config.command = profile.command.clone();
+    }
+    if !profile.args.is_empty() {
+        resolved_config.args = profile.args.clone();
+    }
+    if profile.cwd.is_some() {
+        resolved_config.cwd = profile.cwd.clone();
+    }
+    if profile.timeout_seconds.is_some() {
+        resolved_config.timeout_seconds = profile.timeout_seconds;
+    }
+
+    let requested_authority = serde_json::json!({
+        "filesystem": profile.filesystem.as_deref().unwrap_or("provider_default"),
+        "network": profile.network.as_deref().unwrap_or("provider_default"),
+        "allowedEnv": profile.allowed_env,
+        "allowedTools": profile.allowed_tools,
+    });
+    let enforcement = profile
+        .enforcement
+        .clone()
+        .unwrap_or_else(|| "best_effort".to_string());
+    let mut warnings = Vec::new();
+    if matches!(
+        enforcement.as_str(),
+        "best_effort" | "native_or_best_effort"
+    ) {
+        warnings.push(format!(
+            "provider `{}` restrictions are recorded as `{}` until provider-specific sandbox flags are mapped",
+            resolved_config.provider, enforcement
+        ));
+    }
+    let enforced_authority = serde_json::json!({
+        "provider": resolved_config.provider,
+        "enforcement": enforcement,
+        "filesystem": profile.filesystem.as_deref().unwrap_or("provider_default"),
+        "network": profile.network.as_deref().unwrap_or("provider_default"),
+    });
+
+    Ok(ResolvedHarnessProvider {
+        profile: Some(profile_name),
+        config: resolved_config,
+        requested_authority,
+        enforced_authority,
+        enforcement,
+        warnings,
+    })
+}
+
+fn expand_harness_arg(
+    arg: &str,
+    invocation: &armature_engine::storage::AgentInvocationRecord,
+    run_dir: &Path,
+) -> Result<String, CliError> {
+    let input_json = serde_json::to_string(&invocation.input)?;
+    let prompt = invocation
+        .input
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| input_json.clone());
+    Ok(arg
+        .replace("{{prompt}}", &prompt)
+        .replace("{{inputJson}}", &input_json)
+        .replace("{{invocationId}}", &invocation.invocation_id)
+        .replace("{{agent}}", &invocation.agent)
+        .replace("{{runDir}}", &run_dir.display().to_string()))
+}
+
+fn run_harness_command(
+    config: &HarnessAgentConfig,
+    provider_command: &[String],
+    invocation: &armature_engine::storage::AgentInvocationRecord,
+    workflow_id: &str,
+    run_dir: &Path,
+) -> Result<HarnessProviderOutput, CliError> {
+    let expanded_command = provider_command
+        .iter()
+        .map(|arg| expand_harness_arg(arg, invocation, run_dir))
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some((program, args)) = expanded_command.split_first() else {
+        return Err(CliError::EmptyHarnessCommand {
+            agent: invocation.agent.clone(),
+        });
+    };
+    let mut command = ProcessCommand::new(program);
+    command.args(args);
+    if let Some(cwd) = &config.cwd {
+        command.current_dir(cwd);
+    }
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.env("ARMATURE_WORKFLOW_ID", workflow_id);
+    command.env("ARMATURE_INVOCATION_ID", &invocation.invocation_id);
+    command.env("ARMATURE_AGENT", &invocation.agent);
+    command.env(
+        "ARMATURE_INPUT_JSON",
+        serde_json::to_string(&invocation.input)?,
+    );
+    command.env("ARMATURE_RUN_DIR", run_dir);
+    if let Some(message) = invocation
+        .input
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+    {
+        command.env("ARMATURE_PROMPT", message);
+    } else {
+        command.env("ARMATURE_PROMPT", serde_json::to_string(&invocation.input)?);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|source| CliError::HarnessExecution {
+            invocation_id: invocation.invocation_id.clone(),
+            source,
+        })?;
+    let stdout_reader = child.stdout.take().map(|pipe| {
+        thread::spawn(move || {
+            let mut pipe = pipe;
+            let mut output = Vec::new();
+            pipe.read_to_end(&mut output).map(|_| output)
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|pipe| {
+        thread::spawn(move || {
+            let mut pipe = pipe;
+            let mut output = Vec::new();
+            pipe.read_to_end(&mut output).map(|_| output)
+        })
+    });
+    let deadline = config
+        .timeout_seconds
+        .map(|seconds| Instant::now() + Duration::from_secs(seconds));
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| CliError::HarnessExecution {
+                invocation_id: invocation.invocation_id.clone(),
+                source,
+            })?
+        {
+            break status;
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            timed_out = true;
+            child.kill().map_err(|source| CliError::HarnessExecution {
+                invocation_id: invocation.invocation_id.clone(),
+                source,
+            })?;
+            break child.wait().map_err(|source| CliError::HarnessExecution {
+                invocation_id: invocation.invocation_id.clone(),
+                source,
+            })?;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = match stdout_reader {
+        Some(reader) => reader
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("stdout reader panicked")))
+            .map_err(|source| CliError::HarnessOutput {
+                invocation_id: invocation.invocation_id.clone(),
+                source,
+            })?,
+        None => Vec::new(),
+    };
+    let mut stderr = match stderr_reader {
+        Some(reader) => reader
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("stderr reader panicked")))
+            .map_err(|source| CliError::HarnessOutput {
+                invocation_id: invocation.invocation_id.clone(),
+                source,
+            })?,
+        None => Vec::new(),
+    };
+    if timed_out && stderr.is_empty() {
+        stderr.extend_from_slice(b"provider timed out");
+    }
+    Ok(HarnessProviderOutput {
+        stdout,
+        stderr,
+        exit_code: status.code(),
+        success: status.success() && !timed_out,
+        timed_out,
+    })
+}
+
+fn append_harness_event(
+    store: &WorkflowStore,
+    workflow_id: &str,
+    invocation_id: Option<&str>,
+    kind: &str,
+    payload: serde_json::Value,
+) -> Result<(), CliError> {
+    store.append_harness_event(&armature_engine::storage::HarnessEventRecord {
+        workflow_id: workflow_id.to_string(),
+        event_id: format!("harness_{}", ulid::Ulid::new()),
+        invocation_id: invocation_id.map(str::to_string),
+        kind: kind.to_string(),
+        payload,
+        created_at: current_unix_millis().to_string(),
+    })?;
+    Ok(())
+}
+
+fn tail_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars().rev().take(max_chars).collect::<Vec<_>>();
+    chars.reverse();
+    chars.into_iter().collect::<String>().trim().to_string()
+}
+
+fn current_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 fn build_cli_event(
     ir: &armature_workflow::WorkflowIr,
     manifests: &[armature_adapters::AdapterManifest],
@@ -2128,17 +3700,19 @@ fn build_cli_event(
 ) -> Result<WorkflowEvent, CliError> {
     let payload: serde_json::Value = serde_json::from_str(&payload)?;
     let mut declared = false;
-    let mut schema_matches = true;
+    let mut mismatch = None;
 
     if let Some(event_schema) = ir.events.get(&event_type).map(|event| &event.payload) {
         declared = true;
-        schema_matches &= event_schema.accepts_json_with_types(&payload, &ir.types);
+        mismatch = event_schema.explain_json_mismatch(&payload, &ir.types);
     }
 
     for manifest in manifests {
         if let Some(event_schema) = manifest.events.get(&event_type) {
             declared = true;
-            schema_matches &= event_schema.accepts_json_with_types(&payload, &manifest.types);
+            if mismatch.is_none() {
+                mismatch = event_schema.explain_json_mismatch(&payload, &manifest.types);
+            }
         }
     }
 
@@ -2148,9 +3722,9 @@ fn build_cli_event(
         )));
     }
 
-    if !schema_matches {
+    if let Some(reason) = mismatch {
         return Err(CliError::InvalidEvent(format!(
-            "payload does not match schema for event `{event_type}`"
+            "payload does not match schema for event `{event_type}`: {reason}"
         )));
     }
 
@@ -2597,17 +4171,43 @@ fn emit_baml_source(ir: &armature_workflow::WorkflowIr) -> String {
                 output.push_str(&format!("  client {client_name}\n"));
             }
         }
-        output.push_str("  prompt #\"");
-        output.push('\n');
-        output.push_str(function.prompt.as_deref().unwrap_or(""));
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push_str("  \"#\n");
+        output.push_str("  prompt #\"\n");
+        output.push_str(&normalize_baml_prompt(
+            function.prompt.as_deref().unwrap_or(""),
+        ));
+        output.push_str("\n\"#\n");
         output.push_str("}\n\n");
     }
 
     output
+}
+
+fn normalize_baml_prompt(prompt: &str) -> String {
+    let mut lines = prompt.lines().collect::<Vec<_>>();
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+
+    let common_indent = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.as_bytes()
+                .iter()
+                .take_while(|byte| **byte == b' ' || **byte == b'\t')
+                .count()
+        })
+        .min()
+        .unwrap_or(0);
+
+    lines
+        .into_iter()
+        .map(|line| line.get(common_indent..).unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn baml_reachable_types(ir: &armature_workflow::WorkflowIr) -> BTreeSet<String> {

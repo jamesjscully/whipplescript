@@ -274,14 +274,16 @@ Initial effects:
 
 ```text
 send       send a message to an existing agent or thread
-start      begin asynchronous external work
+start      begin native harness-managed agent work
 coerce     call BAML to produce typed data from input
 assign     update workflow-local durable data
 askHuman   create a visible human-review obligation
 raise      publish a typed event
 ```
 
-Adapter-backed capability effects such as `plan.snapshot()` or
+Native local agent effects such as `start worker { ... }` and
+`send director "..."` persist to the SQLite agent ledger and are claimed by the
+local harness. Adapter-backed capability effects such as `plan.snapshot()` or
 `plan.markDone(...)` may be
 registered by adapters. They are not free-form workflow code.
 
@@ -289,6 +291,8 @@ registered by adapters. They are not free-form workflow code.
 workflow control-flow authority. They produce values that the statechart may
 branch on. Any resulting `start`, `send`, `askHuman`, `raise`, or adapter write
 is still an explicit Armature effect with its own schema and capability checks.
+For local agents, `start`/`send` are native ledger writes rather than adapter
+dispatch.
 The v1 `coerce` backend is BAML HTTP via `baml-cli serve`; TypeScript codegen is
 not part of the selected execution path.
 
@@ -320,23 +324,30 @@ This is the critical bridge to enterprise and un-tie-style environments.
 The resolution algorithm and local/team/enterprise modes are defined in
 [policy.md](policy.md).
 
-### 8. Adapter Layer
+### 8. Native Harness And Adapter Layer
 
-Adapters connect effects and observations to real systems.
+The native harness connects local agent effects to provider processes. Adapters
+connect explicitly external effects and observations to real systems.
 
 Likely adapters:
 
 ```text
+native command/Codex/Claude/Pi harness providers
 un-tie thread/session adapter
-BAML adapter
 human review adapter
 filesystem state adapter, scoped to declared files
 external process adapter, if explicitly enabled
 legacy Armature adapter, if compatibility is needed
 ```
 
-Adapters should be narrow and capability-checked. They are trusted runtime code,
-not workflow-authored code.
+Harness providers and adapters should be narrow and capability-checked. They
+are trusted runtime code, not workflow-authored code.
+
+Harness provider authority is resolved through profiles, not raw provider names
+in workflow logic. A workflow agent may request a semantic profile such as
+`research` or `repo-writer`; the harness policy maps that profile to concrete
+provider commands, filesystem/network posture, environment allowlists, timeout,
+and enforcement mode. See [harness-profiles.md](harness-profiles.md).
 
 ### 8a. Coerce Execution Layer
 
@@ -378,14 +389,18 @@ active effects
 active invocations
 latest BAML calls
 blocked reason
-recent failures
+current effect failures
+current blockers
+recent failures history
 invariant/check status
 ```
 
 `blocked reason` is reserved for explicit durable blockers. Implemented v0
-mostly reports stuck work through recent failures, policy blockers, queued
-events, active invocations, and latest coerce failures rather than creating a
-hidden blocked state.
+mostly reports stuck work through current blockers, current effect failures,
+policy blockers, queued events, active invocations, and the current coerce
+failure rather than creating a hidden blocked state. Historical recent failures
+and latest coerce failures remain visible for audit after retries or later
+successful coerce calls.
 
 Durable timers are a planned extension. They are not part of the implemented v0
 DSL surface; `after` remains reserved in the grammar.

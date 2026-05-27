@@ -7,6 +7,7 @@ data {
 
 agent director = thread("director")
 agent worker = codingAgent() {
+  profile "repo-writer"
   maxActive 1
 }
 
@@ -19,8 +20,7 @@ event finished {
   id string
   name string
   status string
-  stdoutTail string
-  stderrTail string
+  summary string
   exitCode int?
 }
 

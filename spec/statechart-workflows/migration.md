@@ -26,7 +26,7 @@ runtime lessons but changes the product surface.
 | --- | --- |
 | scheduled task | external observation event such as `idle` |
 | event trigger | `on <event>` handler |
-| launch-agent script | `start <agent>` effect through an adapter manifest |
+| launch-agent script | native `start <agent>` invocation claimed by the harness |
 | message script | `send <agent>` effect |
 | quality gate script | typed `coerce` decision or bounded adapter effect |
 | custom status script | `overview`, `status`, `events`, and `log` |
@@ -41,7 +41,8 @@ runtime lessons but changes the product surface.
    declarations where an LLM must classify or choose.
 3. Replace script side effects with declared effects:
    `start`, `send`, `askHuman`, `raise`, or a capability call.
-4. Move external authority into an adapter manifest with required capabilities.
+4. Move local agent execution into the native harness config; move explicitly
+   external authority into an adapter manifest with required capabilities.
 5. Move repo or plan state behind a capability such as `plan.snapshot()` or a
    file-backed adapter during local development.
 6. Validate with manifests and policies before running.
@@ -55,7 +56,7 @@ as trusted runtime code, not as workflow source.
 
 Acceptable script use:
 
-- a narrow adapter command that starts an agent
+- a narrow provider command run by the native harness
 - a bridge that writes a typed event into Armature
 - a repo-specific plan adapter hidden behind a manifest capability
 

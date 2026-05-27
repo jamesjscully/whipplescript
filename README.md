@@ -88,18 +88,21 @@ workflows can still pass explicit manifests for production plan adapters.
 the built-in human-review manifest when needed. `emit --review-file <json>`
 also supplies the built-in `humanReview.responded` event schema for typed
 review responses with `{reviewId, decision, response?}` payloads.
-`run --agent-file <json>` provides the first local agent/thread bridge: `start`
-appends an invocation record and `send` appends a message record to the JSON
-file, with a built-in manifest supplied when no explicit `start`/`send`
-manifest is loaded. `emit --agent-file <json>` supplies the built-in
-`finished` completion event schema with
-`{id, name, status, stdoutTail, stderrTail, exitCode?}` payloads. Managed
-inspection commands also accept the file-backed adapter flags for contract
-validation while reading only durable runtime state.
-BAML process supervision and real agent API integrations are still adapter
-integration work. The e2e suite covers the runtime boundary using fake
-manifests, explicit fake outputs, the JSON plan file adapter, the JSON review
-file bridge, and the JSON agent file bridge. The current runtime evaluates the
+Local agents are native runtime resources: `start` writes durable queued
+invocations to SQLite, `send` writes durable messages, and
+`armature harness once|run|status` claims invocations, runs configured
+providers, records completions, and enqueues typed `finished` workflow events.
+The harness supports the generic `command` provider, thin `codex`/`claude`/`pi`
+command presets, `timeoutSeconds`, command placeholders such as `{{prompt}}`,
+and `harness run --drive-workflow` for a single supervisor loop that processes
+provider completions back through the workflow. The next governed execution
+surface is harness profile policy: workflows request semantic profiles such as
+`research`, `repo-reader`, `repo-writer`, or `human-review`, and policy maps
+those profiles to concrete providers, filesystem/network posture, environment
+allowlists, timeout, and enforcement mode. The e2e suite covers the
+runtime boundary using fake manifests, explicit fake outputs, the JSON plan
+file adapter, the JSON review file bridge, and the native command harness. The
+current runtime evaluates the
 supported expression kernel, executes supported `case` branches, executes
 `always` transitions with loop protection, and supports
 hierarchical initial-state descent plus parent event fallback. It also persists
@@ -148,7 +151,9 @@ nested expression calls and dotted paths against declared data fields, event
 bindings, `let` locals, declared coerce functions, declared capabilities,
 declared raised events, and supported built-ins. Status JSON includes the
 current state, pending event count, queued event summaries, the recent
-transition, recent effect summaries, recent failures, and a first
+transition, recent effect summaries, current effect failures, current blockers,
+historical recent failures, the current coerce failure only while its event is
+still unresolved, historical latest coerce failures, and a first
 active-invocation projection derived from durable `start` effects and processed
 `finished` events, including declared `max_active` limits when present in IR.
 Validation failures are reported through CLI diagnostics outside `validate` too,
@@ -167,14 +172,19 @@ and policy-token entries.
 `overview` renders validation health plus the same runtime projection as a
 compact human-readable summary with current state, pending/queued events, active
 invocations, latest transition, latest effects, effect idempotency keys,
-required capabilities, effect errors, data summaries, policy blockers, recent
-failures, latest coerce calls, and latest coerce failures. Its JSON shape is
-`{ validation, status }`;
+required capabilities, effect errors, data summaries, policy blockers, current
+effect failures, current blockers, historical recent failures, latest coerce
+calls, the current coerce failure only while its event is unresolved, and
+historical latest coerce failures. Its JSON shape is `{ validation, status }`;
+status JSON exposes `current_effect_failures`, `current_coerce_failure`, and
+`current_blockers` directly.
 invalid source that cannot lower to IR still returns validation diagnostics
 with `status: null`.
 `status` also accepts `--adapter-manifest` and `--policy` so operators can
 project durable state under the same contracts used for validation, build, and
-run; status projection still performs no live adapter calls.
+run; status projection still performs no live adapter calls. `status --compact`
+prints a short operator view with workflow, state, waiting reason, pending
+events, active invocations, current blockers, and latest transition.
 `events` and `log` accept the same adapter, policy, and file-backed shortcut
 flags as validation-only context before reading durable records. Their
 `--limit` values are capped at 10,000 records to keep inspection commands
@@ -225,11 +235,14 @@ cargo run -p armature-cli -- run examples/workflows/minimal.armature --json
 cargo run -p armature-cli -- run examples/workflows/spec-implementation.armature --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --event idle --payload '{"activeRuns":0,"unfinishedItems":1}' --fake-call-output 'plan.snapshot="W1 ready"' --fake-coerce-output 'chooseNextStep={"action":"StartWorker","workItemId":"W1","reason":"ready","message":"Implement W1"}' --json
 cargo run -p armature-cli -- status examples/workflows/minimal.armature --json
 cargo run -p armature-cli -- overview examples/workflows/minimal.armature
-cargo run -p armature-cli -- events examples/workflows/minimal.armature --agent-file target/tmp/agents.json --json
+cargo run -p armature-cli -- harness status examples/workflows/minimal.armature --json
+cargo run -p armature-cli -- harness once examples/workflows/minimal.armature --config harness.json --json
+cargo run -p armature-cli -- harness run examples/workflows/minimal.armature --config harness.json --drive-workflow --max-iterations 10 --json
+cargo run -p armature-cli -- events examples/workflows/minimal.armature --json
 cargo run -p armature-cli -- events examples/workflows/minimal.armature --status failed --json
 cargo run -p armature-cli -- events examples/workflows/minimal.armature --status dead_lettered --json
 cargo run -p armature-cli -- retry-event examples/workflows/minimal.armature --event-id evt_cli_... --json
-cargo run -p armature-cli -- log examples/workflows/minimal.armature --agent-file target/tmp/agents.json --json
+cargo run -p armature-cli -- log examples/workflows/minimal.armature --json
 cargo run -p armature-cli -- build examples/workflows/minimal.armature --json
 cargo run -p armature-cli -- build examples/workflows/spec-implementation.armature --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --json
 cargo run -p armature-cli -- check examples/workflows/minimal.armature --target tla --json

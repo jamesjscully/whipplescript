@@ -296,7 +296,8 @@ When `coerce` fails:
 - the queued event is marked failed or routed through a declared failure path
   when supported
 - a durable coerce call record is written
-- status and overview show the latest coerce failure
+- status and overview show a current coerce failure while the failed event is
+  unresolved, and keep latest coerce failures as historical diagnostics
 
 Default behavior is visible blocked/failure. Silent fallback values are not
 allowed.

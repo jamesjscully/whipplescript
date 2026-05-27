@@ -55,12 +55,12 @@ workflow.armature
     baml_src/
     models/
   state/
-    events/
-    transitions.log
-    effects.log
-    current.json
   workflows/
     <workflow-name>.sqlite
+  runs/
+    <invocation-id>/
+      stdout.log
+      stderr.log
   policy.json
 ```
 
@@ -116,7 +116,9 @@ use.
 Parses `.armature` source, generates BAML source artifacts for `coerce`, builds
 IR, and runs static validation. `--adapter-manifest` validates adapter-backed
 effect contracts, and `--policy` validates manifest-required capabilities
-against explicit capability policy documents.
+against explicit capability policy documents. `--profile-policy` validates
+agent profile references and the harness authority policy that will later
+resolve native provider launches.
 
 Checks:
 
@@ -126,6 +128,7 @@ Checks:
 - guards and expressions
 - effect names and argument schemas
 - declared agents
+- declared harness profiles, when a profile policy is supplied
 - declared capability references
 - coerce function schemas
 - obvious unbounded loops
@@ -187,6 +190,7 @@ The command:
 - starts the Rust interpreter
 - connects declared adapters
 - connects a BAML HTTP server when real `coerce` calls are enabled
+- records native local agent invocations in SQLite
 - begins processing durable events
 
 It does not execute arbitrary TypeScript or shell workflow logic.
@@ -202,7 +206,6 @@ File-backed local adapter slices use:
 ```text
 --plan-file plan.json
 --review-file reviews.json
---agent-file agents.json
 ```
 
 `--plan-file` backs `plan.snapshot()`, `plan.unfinishedItems()`,
@@ -211,16 +214,108 @@ File-backed local adapter slices use:
 `armature emit`, `--review-file` supplies the typed
 `humanReview.responded` adapter event schema so review responses can be
 validated before entering the durable queue.
-`--agent-file` backs `start` and `send` by appending inspectable invocation and
-message records. For `armature emit`, `--agent-file` supplies the typed
-`finished` completion event schema used by the file-backed agent bridge. These
-flags can supply built-in JSON adapter manifests for workflows that only need
-those surfaces; larger workflows can still pass explicit adapter manifests.
+
+Local agent `start` and `send` do not use a JSON side file. They write native
+SQLite ledger records that are claimed by `armature harness`. Explicit
+adapter-backed agents can still be supplied through adapter manifests.
+
+These file-backed flags can supply built-in JSON adapter manifests for workflows
+that only need those plan/review surfaces; larger workflows can still pass
+explicit adapter manifests.
 `status` and `overview` accept the same file-backed flags for validation
 context, but they must not call adapters or read those JSON files.
 
 Managed `baml-cli serve` process mode may be added later, but the first real
 execution path should use an explicitly supplied BAML HTTP URL.
+
+### `armature harness once [file] --config <config> [--profile-policy <policy>]`
+
+Claims one queued native agent invocation, runs the configured provider, records
+stdout/stderr artifacts, records a durable completion, and enqueues the typed
+workflow completion event. This command is the deterministic testable unit of
+the local harness.
+
+Provider config maps declared Armature agents to provider runners:
+
+```json
+{
+  "agents": {
+    "worker": {
+      "provider": "command",
+      "command": ["sh", "-c", "printf '%s\n' \"$ARMATURE_PROMPT\""],
+      "cwd": ".",
+      "timeoutSeconds": 1800
+    }
+  }
+}
+```
+
+Supported `provider` values are `command`, `codex`, `claude`, and `pi`.
+`command` requires `command`. Presets supply a default command template but may
+also receive an explicit `command` override and extra `args`.
+
+Governed environments should pass `--profile-policy` and use source-level agent
+profiles instead of exposing raw command/provider choices in workflow logic:
+
+```armature
+agent researcher = codingAgent() {
+  profile "research"
+  maxActive 2
+}
+
+agent worker = codingAgent() {
+  profile "repo-writer"
+  maxActive 3
+}
+```
+
+The profile policy resolves semantic profiles to concrete provider runners,
+filesystem posture, network posture, environment allowlists, tool hints,
+timeout, and enforcement mode. Local experiments may keep using `--config`
+directly. The long-term product path is a profile policy that can embed or
+reference concrete runner config while keeping workflow source portable.
+
+Command strings support these placeholders before execution:
+
+- `{{prompt}}`
+- `{{inputJson}}`
+- `{{invocationId}}`
+- `{{agent}}`
+- `{{runDir}}`
+
+`timeoutSeconds` is enforced by the harness. A timeout kills the provider
+process, records `provider_timed_out`, marks the invocation `timed_out`, and
+enqueues a `finished` event with `status: "timed_out"` when the workflow
+declares a compatible completion event.
+
+Failed provider commands are recorded as harness events so repeated agent
+mistakes become desire-path signals.
+
+### `armature harness run [file] --config <config> [--profile-policy <policy>] [--drive-workflow]`
+
+Runs the harness supervisor loop. The MVP may poll the SQLite ledger for queued
+work; polling is a wakeup strategy, not the data model. The durable truth is the
+event/invocation ledger.
+
+Without `--drive-workflow`, the loop claims and runs queued native invocations.
+With `--drive-workflow`, it also processes queued workflow events between
+provider runs, so a `finished` event can immediately update workflow state and
+schedule follow-on work.
+
+The loop:
+
+- recover expired claims
+- claim queued invocations
+- run providers
+- enqueue typed completions
+- avoid corrupting claims on shutdown
+
+### `armature harness status [file]`
+
+Shows native harness state: queued invocations, claimed/running invocations,
+recent completions, recent provider failures, stdout/stderr artifact paths, and
+recent desire-path observations. It includes the projected workflow `status`
+when a store exists, but it must not call providers for hidden live data.
 
 ### `armature emit [file] --event <event> --payload <payload>`
 
@@ -261,12 +356,28 @@ active:
 queued events: none
 latest transition: running.watching.on.finished[0]
 latest effects:
-  start worker Dispatched requires=adapter.agent.start
-recent failures: none
+  start worker Dispatched requires=agent.worker.start
+current effect failures: none
+current blockers: none
+recent failures (history): none
 policy blockers: none
 latest coerce:
   chooseNextStep Succeeded http=None
-latest coerce failures: none
+current coerce failure: none
+latest coerce failures (history): none
+```
+
+`armature status [file] --compact` prints the same durable projection in a
+short operator view:
+
+```text
+workflow: spec-implementation
+state: running.watching
+waiting: waiting for active invocation(s): worker=3, quality=1
+pending events: 0
+active: worker=3/4, quality=1/2
+current blockers: none
+latest transition: running.watching.on.finished[0]
 ```
 
 ### `armature events [file]`

@@ -12,7 +12,7 @@ and allowed by the active contracts.
 
 It may call:
 
-- un-tie agent/session APIs
+- the native local agent harness ledger
 - BAML HTTP functions for `coerce`
 - allowlisted adapter actions
 - legacy Armature APIs only through explicit compatibility adapters, if used
@@ -52,8 +52,9 @@ run synchronous value effects
 apply deterministic data effects to tentative state
 validate asynchronous effects
 record intended effects
+record native agent invocations/messages
 commit transition
-dispatch asynchronous effects idempotently
+dispatch explicitly adapter-backed asynchronous effects idempotently
 record effect results
 ```
 
@@ -62,8 +63,8 @@ Detailed effect semantics are defined in [effects.md](effects.md).
 
 ## Event Processing
 
-Events enter the interpreter from adapters, workflow `raise` effects,
-compatibility bridges, or explicit user actions.
+Events enter the interpreter from the native harness, adapters, workflow `raise`
+effects, compatibility bridges, or explicit user actions.
 
 Every event has:
 
@@ -128,7 +129,7 @@ compiles to an effect like:
 }
 ```
 
-Before dispatch, the runtime verifies:
+Before commit, the runtime verifies:
 
 - the agent exists
 - the action is allowed for the agent
@@ -193,30 +194,36 @@ Successful coerce results are reused by idempotency key during replay. The
 runtime must not silently call BAML again for the same committed transition and
 produce a different branch decision.
 
-## External Work
+## Agent Work
 
-The user-facing primitive for asynchronous external work is `start`.
+The user-facing primitive for asynchronous agent work is `start`.
+
+For local agents, `start` creates a durable invocation in the native agent
+ledger. For explicitly adapter-backed agents, `start` may still call a declared
+adapter capability.
 
 `start` begins work through a declared target:
 
 ```text
-agent
-adapter
+local agent harness
+explicit adapter-backed agent
 legacy task, if compatibility is enabled
 ```
 
-The `start` effect completes when the external invocation is accepted. The
-result of that external work arrives later as a typed event. The interpreter
-must record the invocation id before returning to the statechart.
+The local `start` effect completes when the invocation row is recorded. The
+result of that work arrives later as a typed event written by the harness. The
+interpreter must record the invocation id before the transition is committed.
 
-`start` commits the transition before dispatch. Dispatch is reconciled by
-idempotency key after crashes.
+Local `start` commits the transition, effect log, and invocation row in one
+SQLite transaction. Adapter-backed `start` records intended effects durably and
+uses idempotency keys to reconcile dispatch after crashes.
 
 The transition commit is atomic over event status, durable state, transition
-logs, and intended effect logs. Adapter dispatch and effect outcome logs happen
-after that commit. If the process crashes after an event is dequeued but before
-the transition commit, startup recovery requeues the `processing` event and
-preserves its incremented attempt count.
+logs, intended effect logs, and native invocation/message rows. Adapter dispatch
+and adapter effect outcome logs happen after that commit. If the process
+crashes after an event is dequeued but before the transition commit, startup
+recovery requeues the `processing` event and preserves its incremented attempt
+count.
 
 Post-commit effect failures do not unwind a processed transition. The runtime
 records an intended effect followed by a failed effect outcome. For `raise`, a
@@ -233,8 +240,10 @@ rejected  -> failed
 failed    -> failed
 ```
 
-Accepted `start` outcomes still count as active invocations until a matching
-processed `finished` event retires them.
+Queued, claimed, and running native invocations count as active until a matching
+validated completion and processed `finished` event retire them. Adapter-backed
+`start` outcomes follow the same logical convention, but the adapter must expose
+enough durable identity for reconciliation.
 
 ## Timers
 
@@ -256,17 +265,17 @@ work_item.status
 ```
 
 The interpreter must reject transitions that would exceed declared bounds.
-In the current runtime skeleton, this is enforced at `start` dispatch time:
-before a `start` effect is dispatched, the runtime projects active invocations
-from durable successful `start` effects minus processed `finished` events. If
-the target agent is already at its declared `maxActive`, the `start` effect is
-recorded as a durable failed effect and is not dispatched.
+The runtime enforces this before creating a native invocation or dispatching an
+adapter-backed start. It projects active invocations from native
+`agent_invocations` rows plus compatible adapter-backed records, minus valid
+processed completions. If the target agent is already at its declared
+`maxActive`, the `start` effect is recorded as a durable failed effect and no
+new invocation is created.
 
 Effect projections use the latest durable outcome for each `effect_id`.
 Reconciliation may append multiple outcome records for one effect, but active
-invocation counts must count a `start` effect at most once. If a later outcome
-marks that same effect failed or rejected, it no longer contributes to the
-active count.
+invocation counts must count a `start` effect at most once. Native invocation
+idempotency keys prevent replay from creating duplicate active work.
 
 The v0 completion convention is explicit: bounded `start` workflows must
 declare a `finished` event with required `name string` and must process at least
@@ -274,9 +283,10 @@ one `finished` handler. The processed `finished.name` value identifies the
 agent by prefix, for example `worker-01` decrements the active count for
 `worker`. If agent names overlap, the runtime uses the longest matching started
 agent prefix, so `worker-team-01` is attributed to `worker-team`, not `worker`.
-The built-in JSON agent-file bridge uses the standard completion payload
-`{id string, name string, status string, stdoutTail string, stderrTail string,
-exitCode int?}` for `emit --agent-file` intake.
+The native harness uses the standard completion payload
+`{id string, name string, status string, summary string, exitCode int?}`.
+Provider stdout/stderr are stored as artifacts referenced from the invocation
+row, not embedded in the workflow event payload.
 
 ## Failure Semantics
 
@@ -291,6 +301,7 @@ blocked_by_validation
 adapter_failure
 baml_parse_failure
 external_invocation_failed
+completion_schema_mismatch
 resource_conflict
 timeout
 internal_error
@@ -315,12 +326,16 @@ Statechart workflows should expose a status view with:
 workflow name
 current state
 active invocations
+queued/running harness invocations
 latest transition
 pending events
 blocked reason
-recent failures
+current effect failures
+current blockers
+recent failures history
 latest coerce decisions
-latest coerce failures
+current coerce failure
+latest coerce failures history
 workflow data snapshot or redacted summary
 ```
 
@@ -331,6 +346,17 @@ waiting, the workflow system has failed its purpose.
 durable blockers produced by policy/runtime failure handling or by
 workflow-authored blocked states.
 
+Current blockers describe unresolved failed/dead-lettered events and policy
+denials. Current effect failures describe failed effects from the latest status
+projection, such as a `start` rejected by `maxActive`, without necessarily
+making them the waiting reason. Recent failures and latest coerce failures are
+historical diagnostics; they remain visible after a retry succeeds so operators
+can audit what happened without confusing old failures for the current waiting
+reason. A failed coerce call is current only while the triggering event remains
+failed or dead-lettered; retrying the event makes the old coerce failure
+historical while the retry is queued.
+
 Status is a projection over durable workflow records. It must not call adapters
-for hidden live data. Adapter observations must be recorded first as events or
-effect outcomes.
+or providers for hidden live data. Adapter and harness observations must be
+recorded first as events, effect outcomes, invocation rows, completion rows, or
+harness events.

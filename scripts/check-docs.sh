@@ -10,11 +10,22 @@ trap 'rm -rf "$tmpdir"' EXIT
 template="examples/templates/simple-agent-supervisor.armature"
 template_policy="examples/policies/local-file-backed.policy.json"
 template_store="$tmpdir/template.sqlite"
-template_agents="$tmpdir/agents.json"
+template_harness="$tmpdir/harness.json"
 review_template="$tmpdir/review-template.armature"
 review_store="$tmpdir/review.sqlite"
 review_file="$tmpdir/reviews.json"
 init_dir="$tmpdir/init-project"
+
+cat >"$template_harness" <<'EOF'
+{
+  "agents": {
+    "worker": {
+      "provider": "command",
+      "command": ["sh", "-c", "printf 'worker complete'"]
+    }
+  }
+}
+EOF
 
 target/debug/armature init "$init_dir" --name DocsSmoke --json >/dev/null
 grep -q 'machine DocsSmoke' "$init_dir/workflow.armature"
@@ -25,13 +36,11 @@ test -d "$init_dir/.armature/workflows"
 
 target/debug/armature validate \
   "$template" \
-  --agent-file "$template_agents" \
   --policy "$template_policy" \
   --json >/dev/null
 
 target/debug/armature build \
   "$template" \
-  --agent-file "$template_agents" \
   --policy "$template_policy" \
   --out "$tmpdir/template-build" \
   --json >/dev/null
@@ -39,62 +48,59 @@ target/debug/armature build \
 target/debug/armature run \
   "$template" \
   --store "$template_store" \
-  --agent-file "$template_agents" \
   --policy "$template_policy" \
   --event idle \
   --payload '{"activeRuns":0,"unfinishedItems":1}' \
   --json >/dev/null
 
-grep -q '"invocations"' "$template_agents"
+target/debug/armature harness status \
+  "$template" \
+  --store "$template_store" \
+  --json >/dev/null
 
 overview="$(target/debug/armature overview \
   "$template" \
   --store "$template_store" \
-  --agent-file "$template_agents" \
   --policy "$template_policy")"
 grep -q 'waiting: waiting for active invocation(s): worker=1' <<<"$overview"
 grep -q 'data summary: {"seenRuns":0}' <<<"$overview"
 
-target/debug/armature emit \
+target/debug/armature harness once \
   "$template" \
   --store "$template_store" \
-  --agent-file "$template_agents" \
-  --event finished \
-  --payload '{"id":"run-1","name":"worker-1","status":"succeeded","stdoutTail":"","stderrTail":"","exitCode":0}' \
+  --config "$template_harness" \
   --json >/dev/null
-
-grep -q '"completions"' "$template_agents"
-grep -q '"completion_id": "run-1"' "$template_agents"
-grep -q '"status": "finished"' "$template_agents"
 
 target/debug/armature run \
   "$template" \
   --store "$template_store" \
-  --agent-file "$template_agents" \
   --policy "$template_policy" \
   --json >/dev/null
-
-grep -q '"messages"' "$template_agents"
 
 settled_overview="$(target/debug/armature overview \
   "$template" \
   --store "$template_store" \
-  --agent-file "$template_agents" \
   --policy "$template_policy")"
 grep -q 'waiting: idle; no queued events or active invocations' <<<"$settled_overview"
 grep -q 'data summary: {"seenRuns":1}' <<<"$settled_overview"
 
+compact_status="$(target/debug/armature status \
+  "$template" \
+  --store "$template_store" \
+  --policy "$template_policy" \
+  --compact)"
+grep -q 'waiting: idle; no queued events or active invocations' <<<"$compact_status"
+grep -q 'current blockers: none' <<<"$compact_status"
+
 target/debug/armature events \
   "$template" \
   --store "$template_store" \
-  --agent-file "$template_agents" \
   --policy "$template_policy" \
   --json >/dev/null
 
 target/debug/armature log \
   "$template" \
   --store "$template_store" \
-  --agent-file "$template_agents" \
   --policy "$template_policy" \
   --json >/dev/null
 
@@ -159,21 +165,32 @@ grep -q 'last_error' spec/statechart-workflows/product-surface.md
 grep -q 'last_error' spec/statechart-workflows/operations.md
 grep -q 'pending_events' skills/armature-statechart/SKILL.md
 grep -q 'pending event count' spec/statechart-workflows/product-surface.md
+grep -q 'armature status \[file\] --compact' spec/statechart-workflows/product-surface.md
+grep -q 'status --compact' README.md
+grep -q 'status --compact' skills/armature-statechart/SKILL.md
+grep -q 'current_effect_failures' README.md
+grep -q 'current_effect_failures' skills/armature-statechart/SKILL.md
+grep -q 'current_coerce_failure' README.md
+grep -q 'current_coerce_failure' skills/armature-statechart/SKILL.md
+grep -q 'current effect failures' spec/statechart-workflows/runtime-semantics.md
+grep -q 'current blockers' spec/statechart-workflows/runtime-semantics.md
+grep -q 'agent worker = codingAgent()' skills/armature-statechart/SKILL.md
+grep -q 'payload does not match schema for event' skills/armature-statechart/SKILL.md
 grep -q 'creating an empty workflow store' spec/statechart-workflows/operations.md
 grep -Fq 'recent_effects[].idempotency_key' skills/armature-statechart/SKILL.md
 grep -q 'effect idempotency keys' README.md
 grep -q 'status JSON' spec/statechart-workflows/effects.md
 grep -Fq 'recent_effects[]' spec/statechart-workflows/component-contracts.md
-grep -q 'no hidden built-in blocked state in v0' spec/statechart-workflows/effects.md
+grep -q 'hidden built-in blocked state in v0' spec/statechart-workflows/effects.md
 grep -q 'v0 does not create a hidden built-in blocked state' \
   spec/statechart-workflows/runtime-semantics.md
 grep -q 'workflow_events' spec/statechart-workflows/storage.md
 grep -q 'event_json TEXT NOT NULL' spec/statechart-workflows/storage.md
-grep -q "schema version is \`2\`" spec/statechart-workflows/storage.md
+grep -q "schema version is \`4\`" spec/statechart-workflows/storage.md
 grep -q 'unique within its `workflow_id`' spec/statechart-workflows/event-queue.md
 grep -q 'Ignored events are durable records with reasons stored in `last_error`' \
   spec/statechart-workflows/event-queue.md
-grep -q 'schema version `2`' spec/statechart-workflows/database-migrations.md
+grep -q 'schema version `4`' spec/statechart-workflows/database-migrations.md
 grep -q 'UNIQUE(workflow_id, event_id)' spec/statechart-workflows/database-migrations.md
 
 target/debug/armature validate-policy \

@@ -4,7 +4,7 @@
 //! effect dispatch contracts, and status projections. It executes validated
 //! workflow IR from `armature-workflow`.
 
-use armature_workflow::{expr::Expr, ir::State, WorkflowIr};
+use armature_workflow::{expr::Expr, ir::AgentTarget, ir::State, WorkflowIr};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -186,6 +186,8 @@ pub mod effects {
     pub enum EffectError {
         #[error("effect `{0}` is not supported by this adapter")]
         Unsupported(String),
+        #[error("{0}")]
+        RuntimeRejected(String),
         #[error("{message}")]
         CapabilityDenied {
             message: String,
@@ -200,7 +202,7 @@ pub mod effects {
                     required_capabilities,
                     ..
                 } => required_capabilities,
-                Self::Unsupported(_) => &[],
+                Self::Unsupported(_) | Self::RuntimeRejected(_) => &[],
             }
         }
     }
@@ -725,7 +727,13 @@ pub mod status {
         #[serde(default)]
         pub latest_coerce_failures: Vec<CoerceCallSummary>,
         #[serde(default)]
+        pub current_coerce_failure: Option<CoerceCallSummary>,
+        #[serde(default)]
+        pub current_effect_failures: Vec<String>,
+        #[serde(default)]
         pub policy_blockers: Vec<String>,
+        #[serde(default)]
+        pub current_blockers: Vec<String>,
         pub recent_failures: Vec<String>,
     }
 
@@ -776,10 +784,103 @@ pub mod storage {
     use crate::queue::{EventStatus, WorkflowEvent};
     use crate::state::WorkflowState;
     use rusqlite::{params, Connection, OptionalExtension};
+    use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
     use std::rc::Rc;
     use thiserror::Error;
 
-    const STORAGE_SCHEMA_VERSION: u32 = 2;
+    const STORAGE_SCHEMA_VERSION: u32 = 4;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentInvocationStatus {
+        Queued,
+        Claimed,
+        Running,
+        Succeeded,
+        Failed,
+        Cancelled,
+        TimedOut,
+        CompletionRejected,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct AgentInvocationRecord {
+        pub workflow_id: String,
+        pub invocation_id: String,
+        pub agent: String,
+        pub effect_id: String,
+        pub transition_id: String,
+        pub event_id: Option<String>,
+        pub idempotency_key: String,
+        pub input: serde_json::Value,
+        pub requested_profile: Option<String>,
+        pub resolved_profile: Option<String>,
+        pub profile_enforcement: Option<String>,
+        pub status: AgentInvocationStatus,
+        pub claimed_by: Option<String>,
+        pub claim_expires_at: Option<String>,
+        pub provider: Option<String>,
+        pub provider_run_id: Option<String>,
+        pub run_dir: Option<String>,
+        pub stdout_path: Option<String>,
+        pub stderr_path: Option<String>,
+        pub exit_code: Option<i32>,
+        pub error: Option<String>,
+        pub created_at: String,
+        pub updated_at: String,
+    }
+
+    pub struct AgentInvocationStartedUpdate<'a> {
+        pub invocation_id: &'a str,
+        pub provider: Option<&'a str>,
+        pub provider_run_id: Option<&'a str>,
+        pub resolved_profile: Option<&'a str>,
+        pub profile_enforcement: Option<&'a str>,
+        pub run_dir: Option<&'a str>,
+        pub stdout_path: Option<&'a str>,
+        pub stderr_path: Option<&'a str>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct AgentMessageRecord {
+        pub workflow_id: String,
+        pub message_id: String,
+        pub agent: String,
+        pub invocation_id: Option<String>,
+        pub effect_id: String,
+        pub transition_id: String,
+        pub event_id: Option<String>,
+        pub idempotency_key: String,
+        pub message: serde_json::Value,
+        pub status: String,
+        pub created_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct AgentCompletionRecord {
+        pub workflow_id: String,
+        pub completion_id: String,
+        pub invocation_id: String,
+        pub agent: String,
+        pub status: String,
+        pub summary: Option<String>,
+        pub exit_code: Option<i32>,
+        pub event_id: Option<String>,
+        pub payload: serde_json::Value,
+        pub created_at: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct HarnessEventRecord {
+        pub workflow_id: String,
+        pub event_id: String,
+        pub invocation_id: Option<String>,
+        pub kind: String,
+        pub payload: serde_json::Value,
+        pub created_at: String,
+    }
 
     #[derive(Debug, Error)]
     pub enum StorageError {
@@ -912,9 +1013,101 @@ pub mod storage {
                 CREATE UNIQUE INDEX IF NOT EXISTS coerce_calls_success_idempotency
                   ON coerce_calls(workflow_id, idempotency_key)
                   WHERE status = 'succeeded';
+
+                CREATE TABLE IF NOT EXISTS agent_invocations (
+                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                  workflow_id TEXT NOT NULL,
+                  invocation_id TEXT NOT NULL UNIQUE,
+                  agent TEXT NOT NULL,
+                  effect_id TEXT NOT NULL,
+                  transition_id TEXT NOT NULL,
+                  event_id TEXT,
+                  idempotency_key TEXT NOT NULL,
+                  input_json TEXT NOT NULL,
+                  requested_profile TEXT,
+                  resolved_profile TEXT,
+                  profile_enforcement TEXT,
+                  status TEXT NOT NULL,
+                  claimed_by TEXT,
+                  claim_expires_at TEXT,
+                  provider TEXT,
+                  provider_run_id TEXT,
+                  run_dir TEXT,
+                  stdout_path TEXT,
+                  stderr_path TEXT,
+                  exit_code INTEGER,
+                  error TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  UNIQUE(workflow_id, idempotency_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS agent_invocations_status
+                  ON agent_invocations(workflow_id, status, seq);
+
+                CREATE INDEX IF NOT EXISTS agent_invocations_agent_status
+                  ON agent_invocations(workflow_id, agent, status);
+
+                CREATE INDEX IF NOT EXISTS agent_invocations_claim_expiry
+                  ON agent_invocations(claim_expires_at);
+
+                CREATE INDEX IF NOT EXISTS agent_invocations_provider_run
+                  ON agent_invocations(provider, provider_run_id);
+
+                CREATE TABLE IF NOT EXISTS agent_messages (
+                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                  workflow_id TEXT NOT NULL,
+                  message_id TEXT NOT NULL UNIQUE,
+                  agent TEXT NOT NULL,
+                  invocation_id TEXT,
+                  effect_id TEXT NOT NULL,
+                  transition_id TEXT NOT NULL,
+                  event_id TEXT,
+                  idempotency_key TEXT NOT NULL,
+                  message_json TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  UNIQUE(workflow_id, idempotency_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_completions (
+                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                  workflow_id TEXT NOT NULL,
+                  completion_id TEXT NOT NULL UNIQUE,
+                  invocation_id TEXT NOT NULL,
+                  agent TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  summary TEXT,
+                  exit_code INTEGER,
+                  event_id TEXT,
+                  payload_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  UNIQUE(workflow_id, invocation_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS harness_events (
+                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                  workflow_id TEXT NOT NULL,
+                  event_id TEXT NOT NULL UNIQUE,
+                  invocation_id TEXT,
+                  kind TEXT NOT NULL,
+                  payload_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS harness_events_recent
+                  ON harness_events(workflow_id, seq DESC);
+
+                CREATE INDEX IF NOT EXISTS harness_events_kind_recent
+                  ON harness_events(workflow_id, kind, seq DESC);
+
+                CREATE INDEX IF NOT EXISTS harness_events_invocation
+                  ON harness_events(invocation_id, seq);
                 "#,
             )?;
             self.migrate_workflow_event_identity()?;
+            self.migrate_agent_invocation_profiles()?;
             self.set_storage_schema_version(STORAGE_SCHEMA_VERSION)?;
             Ok(())
         }
@@ -1032,6 +1225,37 @@ pub mod storage {
                 }
             }
 
+            Ok(false)
+        }
+
+        fn migrate_agent_invocation_profiles(&self) -> Result<(), StorageError> {
+            for column in [
+                "requested_profile",
+                "resolved_profile",
+                "profile_enforcement",
+            ] {
+                if self.table_has_column("agent_invocations", column)? {
+                    continue;
+                }
+                self.connection.execute(
+                    &format!("ALTER TABLE agent_invocations ADD COLUMN {column} TEXT"),
+                    [],
+                )?;
+            }
+            Ok(())
+        }
+
+        fn table_has_column(&self, table: &str, column: &str) -> Result<bool, StorageError> {
+            let escaped_table = table.replace('\'', "''");
+            let mut columns = self
+                .connection
+                .prepare(&format!("PRAGMA table_info('{escaped_table}')"))?;
+            let names = columns.query_map([], |row| row.get::<_, String>(1))?;
+            for name in names {
+                if name? == column {
+                    return Ok(true);
+                }
+            }
             Ok(false)
         }
 
@@ -1365,6 +1589,8 @@ pub mod storage {
             status: EventStatus,
             state: &WorkflowState,
             records: &[WorkflowLogRecord],
+            agent_invocations: &[AgentInvocationRecord],
+            agent_messages: &[AgentMessageRecord],
         ) -> Result<(), StorageError> {
             let transaction = self.connection.unchecked_transaction()?;
             let mut event = event.clone();
@@ -1372,6 +1598,12 @@ pub mod storage {
             update_event_status_in(&transaction, &event)?;
             save_state_in(&transaction, state)?;
             append_log_records_in(&transaction, &state.workflow_name, records)?;
+            for invocation in agent_invocations {
+                insert_agent_invocation_in(&transaction, invocation)?;
+            }
+            for message in agent_messages {
+                insert_agent_message_in(&transaction, message)?;
+            }
             transaction.commit()?;
             Ok(())
         }
@@ -1403,6 +1635,378 @@ pub mod storage {
                 params![workflow_id, serde_json::to_string(record)?],
             )?;
             Ok(())
+        }
+
+        pub fn insert_agent_invocation(
+            &self,
+            record: &AgentInvocationRecord,
+        ) -> Result<(), StorageError> {
+            insert_agent_invocation_in(&self.connection, record)
+        }
+
+        pub fn insert_agent_message(
+            &self,
+            record: &AgentMessageRecord,
+        ) -> Result<(), StorageError> {
+            insert_agent_message_in(&self.connection, record)
+        }
+
+        pub fn queued_agent_invocations(
+            &self,
+            workflow_id: &str,
+            limit: usize,
+        ) -> Result<Vec<AgentInvocationRecord>, StorageError> {
+            let mut statement = self.connection.prepare(
+                r#"
+                SELECT
+                  workflow_id, invocation_id, agent, effect_id, transition_id,
+                  event_id, idempotency_key, input_json, requested_profile,
+                  resolved_profile, profile_enforcement, status, claimed_by,
+                  claim_expires_at, provider, provider_run_id, run_dir,
+                  stdout_path, stderr_path, exit_code, error, created_at, updated_at
+                FROM agent_invocations
+                WHERE workflow_id = ?1 AND status = 'queued'
+                ORDER BY seq
+                LIMIT ?2
+                "#,
+            )?;
+            let rows = statement.query_map(
+                params![workflow_id, limit as i64],
+                agent_invocation_record_from_row,
+            )?;
+            let mut records = Vec::new();
+            for row in rows {
+                records.push(row?);
+            }
+            Ok(records)
+        }
+
+        pub fn recent_agent_invocations(
+            &self,
+            workflow_id: &str,
+            limit: usize,
+        ) -> Result<Vec<AgentInvocationRecord>, StorageError> {
+            let mut statement = self.connection.prepare(
+                r#"
+                SELECT
+                  workflow_id, invocation_id, agent, effect_id, transition_id,
+                  event_id, idempotency_key, input_json, requested_profile,
+                  resolved_profile, profile_enforcement, status, claimed_by,
+                  claim_expires_at, provider, provider_run_id, run_dir,
+                  stdout_path, stderr_path, exit_code, error, created_at, updated_at
+                FROM agent_invocations
+                WHERE workflow_id = ?1
+                ORDER BY seq DESC
+                LIMIT ?2
+                "#,
+            )?;
+            let rows = statement.query_map(
+                params![workflow_id, limit as i64],
+                agent_invocation_record_from_row,
+            )?;
+            let mut records = Vec::new();
+            for row in rows {
+                records.push(row?);
+            }
+            Ok(records)
+        }
+
+        pub fn recent_harness_events(
+            &self,
+            workflow_id: &str,
+            limit: usize,
+        ) -> Result<Vec<HarnessEventRecord>, StorageError> {
+            let mut statement = self.connection.prepare(
+                r#"
+                SELECT workflow_id, event_id, invocation_id, kind, payload_json, created_at
+                FROM harness_events
+                WHERE workflow_id = ?1
+                ORDER BY seq DESC
+                LIMIT ?2
+                "#,
+            )?;
+            let rows = statement.query_map(params![workflow_id, limit as i64], |row| {
+                let payload_json: String = row.get(4)?;
+                Ok(HarnessEventRecord {
+                    workflow_id: row.get(0)?,
+                    event_id: row.get(1)?,
+                    invocation_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    payload: serde_json::from_str(&payload_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            payload_json.len(),
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    created_at: row.get(5)?,
+                })
+            })?;
+            let mut records = Vec::new();
+            for row in rows {
+                records.push(row?);
+            }
+            Ok(records)
+        }
+
+        pub fn recent_agent_completions(
+            &self,
+            workflow_id: &str,
+            limit: usize,
+        ) -> Result<Vec<AgentCompletionRecord>, StorageError> {
+            let mut statement = self.connection.prepare(
+                r#"
+                SELECT
+                  workflow_id, completion_id, invocation_id, agent, status,
+                  summary, exit_code, event_id, payload_json, created_at
+                FROM agent_completions
+                WHERE workflow_id = ?1
+                ORDER BY seq DESC
+                LIMIT ?2
+                "#,
+            )?;
+            let rows = statement.query_map(params![workflow_id, limit as i64], |row| {
+                let payload_json: String = row.get(8)?;
+                Ok(AgentCompletionRecord {
+                    workflow_id: row.get(0)?,
+                    completion_id: row.get(1)?,
+                    invocation_id: row.get(2)?,
+                    agent: row.get(3)?,
+                    status: row.get(4)?,
+                    summary: row.get(5)?,
+                    exit_code: row.get(6)?,
+                    event_id: row.get(7)?,
+                    payload: serde_json::from_str(&payload_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            payload_json.len(),
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    created_at: row.get(9)?,
+                })
+            })?;
+            let mut records = Vec::new();
+            for row in rows {
+                records.push(row?);
+            }
+            Ok(records)
+        }
+
+        pub fn recover_expired_agent_leases(
+            &self,
+            workflow_id: &str,
+            now: &str,
+        ) -> Result<Vec<AgentInvocationRecord>, StorageError> {
+            let transaction = self.connection.unchecked_transaction()?;
+            let mut statement = transaction.prepare(
+                r#"
+                SELECT
+                  workflow_id, invocation_id, agent, effect_id, transition_id,
+                  event_id, idempotency_key, input_json, requested_profile,
+                  resolved_profile, profile_enforcement, status, claimed_by,
+                  claim_expires_at, provider, provider_run_id, run_dir,
+                  stdout_path, stderr_path, exit_code, error, created_at, updated_at
+                FROM agent_invocations
+                WHERE workflow_id = ?1
+                  AND status IN ('claimed', 'running')
+                  AND claim_expires_at IS NOT NULL
+                  AND claim_expires_at <= ?2
+                ORDER BY seq
+                "#,
+            )?;
+            let rows =
+                statement.query_map(params![workflow_id, now], agent_invocation_record_from_row)?;
+            let mut recovered = Vec::new();
+            for row in rows {
+                recovered.push(row?);
+            }
+            drop(statement);
+
+            if !recovered.is_empty() {
+                transaction.execute(
+                    r#"
+                    UPDATE agent_invocations
+                    SET status = 'queued',
+                        claimed_by = NULL,
+                        claim_expires_at = NULL,
+                        error = NULL,
+                        updated_at = ?3
+                    WHERE workflow_id = ?1
+                      AND status IN ('claimed', 'running')
+                      AND claim_expires_at IS NOT NULL
+                      AND claim_expires_at <= ?2
+                    "#,
+                    params![workflow_id, now, crate::current_unix_millis().to_string()],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(recovered)
+        }
+
+        pub fn claim_agent_invocation(
+            &self,
+            invocation_id: &str,
+            worker_id: &str,
+            lease_until: &str,
+        ) -> Result<Option<AgentInvocationRecord>, StorageError> {
+            let transaction = self.connection.unchecked_transaction()?;
+            let updated_at = crate::current_unix_millis().to_string();
+            let rows = transaction.execute(
+                r#"
+                UPDATE agent_invocations
+                SET status = 'claimed',
+                    claimed_by = ?2,
+                    claim_expires_at = ?3,
+                    updated_at = ?4
+                WHERE invocation_id = ?1
+                  AND status = 'queued'
+                "#,
+                params![invocation_id, worker_id, lease_until, updated_at],
+            )?;
+            if rows == 0 {
+                transaction.commit()?;
+                return Ok(None);
+            }
+            let record = select_agent_invocation_by_id_in(&transaction, invocation_id)?;
+            transaction.commit()?;
+            Ok(record)
+        }
+
+        pub fn mark_agent_invocation_started(
+            &self,
+            update: AgentInvocationStartedUpdate<'_>,
+        ) -> Result<(), StorageError> {
+            self.connection.execute(
+                r#"
+                UPDATE agent_invocations
+                SET status = 'running',
+                    provider = ?2,
+                    provider_run_id = ?3,
+                    resolved_profile = ?4,
+                    profile_enforcement = ?5,
+                    run_dir = ?6,
+                    stdout_path = ?7,
+                    stderr_path = ?8,
+                    updated_at = ?9
+                WHERE invocation_id = ?1
+                "#,
+                params![
+                    update.invocation_id,
+                    update.provider,
+                    update.provider_run_id,
+                    update.resolved_profile,
+                    update.profile_enforcement,
+                    update.run_dir,
+                    update.stdout_path,
+                    update.stderr_path,
+                    crate::current_unix_millis().to_string(),
+                ],
+            )?;
+            Ok(())
+        }
+
+        pub fn mark_agent_invocation_exited(
+            &self,
+            invocation_id: &str,
+            status: AgentInvocationStatus,
+            exit_code: Option<i32>,
+            error: Option<&str>,
+        ) -> Result<(), StorageError> {
+            self.connection.execute(
+                r#"
+                UPDATE agent_invocations
+                SET status = ?2,
+                    exit_code = ?3,
+                    error = ?4,
+                    updated_at = ?5
+                WHERE invocation_id = ?1
+                "#,
+                params![
+                    invocation_id,
+                    agent_invocation_status_name(&status),
+                    exit_code.map(i64::from),
+                    error,
+                    crate::current_unix_millis().to_string(),
+                ],
+            )?;
+            Ok(())
+        }
+
+        pub fn record_agent_completion(
+            &self,
+            completion: &AgentCompletionRecord,
+            event: &WorkflowEvent,
+        ) -> Result<bool, StorageError> {
+            let transaction = self.connection.unchecked_transaction()?;
+            let existing: Option<String> = transaction
+                .query_row(
+                    r#"
+                    SELECT completion_id
+                    FROM agent_completions
+                    WHERE workflow_id = ?1 AND invocation_id = ?2
+                    "#,
+                    params![&completion.workflow_id, &completion.invocation_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing.is_some() {
+                transaction.commit()?;
+                return Ok(false);
+            }
+            let inserted = insert_agent_completion_in(&transaction, completion)?;
+            if inserted {
+                insert_workflow_event_in(&transaction, event)?;
+            }
+            transaction.commit()?;
+            Ok(inserted)
+        }
+
+        pub fn append_harness_event(
+            &self,
+            record: &HarnessEventRecord,
+        ) -> Result<(), StorageError> {
+            self.connection.execute(
+                r#"
+                INSERT INTO harness_events (
+                  workflow_id, event_id, invocation_id, kind, payload_json, created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![
+                    &record.workflow_id,
+                    &record.event_id,
+                    &record.invocation_id,
+                    &record.kind,
+                    serde_json::to_string(&record.payload)?,
+                    &record.created_at,
+                ],
+            )?;
+            Ok(())
+        }
+
+        pub fn active_agent_invocation_counts(
+            &self,
+            workflow_id: &str,
+        ) -> Result<BTreeMap<String, u32>, StorageError> {
+            let mut statement = self.connection.prepare(
+                r#"
+                SELECT agent, COUNT(*)
+                FROM agent_invocations
+                WHERE workflow_id = ?1
+                  AND status IN ('queued', 'claimed', 'running')
+                GROUP BY agent
+                "#,
+            )?;
+            let rows = statement.query_map(params![workflow_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
+            })?;
+            let mut counts = BTreeMap::new();
+            for row in rows {
+                let (agent, count) = row?;
+                counts.insert(agent, count);
+            }
+            Ok(counts)
         }
 
         pub fn append_coerce_call_attempt(
@@ -1739,6 +2343,225 @@ pub mod storage {
         }
     }
 
+    fn agent_invocation_status_name(status: &AgentInvocationStatus) -> &'static str {
+        match status {
+            AgentInvocationStatus::Queued => "queued",
+            AgentInvocationStatus::Claimed => "claimed",
+            AgentInvocationStatus::Running => "running",
+            AgentInvocationStatus::Succeeded => "succeeded",
+            AgentInvocationStatus::Failed => "failed",
+            AgentInvocationStatus::Cancelled => "cancelled",
+            AgentInvocationStatus::TimedOut => "timed_out",
+            AgentInvocationStatus::CompletionRejected => "completion_rejected",
+        }
+    }
+
+    fn agent_invocation_status_from_name(status: &str) -> AgentInvocationStatus {
+        match status {
+            "queued" => AgentInvocationStatus::Queued,
+            "claimed" => AgentInvocationStatus::Claimed,
+            "running" => AgentInvocationStatus::Running,
+            "succeeded" => AgentInvocationStatus::Succeeded,
+            "failed" => AgentInvocationStatus::Failed,
+            "cancelled" => AgentInvocationStatus::Cancelled,
+            "timed_out" => AgentInvocationStatus::TimedOut,
+            "completion_rejected" => AgentInvocationStatus::CompletionRejected,
+            _ => AgentInvocationStatus::Failed,
+        }
+    }
+
+    fn insert_workflow_event_in(
+        connection: &rusqlite::Connection,
+        event: &WorkflowEvent,
+    ) -> Result<(), StorageError> {
+        connection.execute(
+            r#"
+            INSERT INTO workflow_events (
+              workflow_id,
+              event_id,
+              status,
+              event_json
+            )
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+            params![
+                event.workflow_id,
+                event.event_id,
+                event_status_name(event.status),
+                serde_json::to_string(event)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_agent_invocation_in(
+        connection: &rusqlite::Connection,
+        record: &AgentInvocationRecord,
+    ) -> Result<(), StorageError> {
+        connection.execute(
+            r#"
+            INSERT INTO agent_invocations (
+              workflow_id, invocation_id, agent, effect_id, transition_id,
+              event_id, idempotency_key, input_json, requested_profile,
+                  resolved_profile, profile_enforcement, status, claimed_by,
+              claim_expires_at, provider, provider_run_id, run_dir,
+              stdout_path, stderr_path, exit_code, error, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+            ON CONFLICT(workflow_id, idempotency_key) DO NOTHING
+            "#,
+            params![
+                &record.workflow_id,
+                &record.invocation_id,
+                &record.agent,
+                &record.effect_id,
+                &record.transition_id,
+                &record.event_id,
+                &record.idempotency_key,
+                serde_json::to_string(&record.input)?,
+                &record.requested_profile,
+                &record.resolved_profile,
+                &record.profile_enforcement,
+                agent_invocation_status_name(&record.status),
+                &record.claimed_by,
+                &record.claim_expires_at,
+                &record.provider,
+                &record.provider_run_id,
+                &record.run_dir,
+                &record.stdout_path,
+                &record.stderr_path,
+                record.exit_code.map(i64::from),
+                &record.error,
+                &record.created_at,
+                &record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_agent_message_in(
+        connection: &rusqlite::Connection,
+        record: &AgentMessageRecord,
+    ) -> Result<(), StorageError> {
+        connection.execute(
+            r#"
+            INSERT INTO agent_messages (
+              workflow_id, message_id, agent, invocation_id, effect_id,
+              transition_id, event_id, idempotency_key, message_json, status,
+              created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(workflow_id, idempotency_key) DO NOTHING
+            "#,
+            params![
+                &record.workflow_id,
+                &record.message_id,
+                &record.agent,
+                &record.invocation_id,
+                &record.effect_id,
+                &record.transition_id,
+                &record.event_id,
+                &record.idempotency_key,
+                serde_json::to_string(&record.message)?,
+                &record.status,
+                &record.created_at,
+                &record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_agent_completion_in(
+        connection: &rusqlite::Connection,
+        record: &AgentCompletionRecord,
+    ) -> Result<bool, StorageError> {
+        let rows = connection.execute(
+            r#"
+            INSERT INTO agent_completions (
+              workflow_id, completion_id, invocation_id, agent, status, summary,
+              exit_code, event_id, payload_json, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(workflow_id, invocation_id) DO NOTHING
+            "#,
+            params![
+                &record.workflow_id,
+                &record.completion_id,
+                &record.invocation_id,
+                &record.agent,
+                &record.status,
+                &record.summary,
+                record.exit_code.map(i64::from),
+                &record.event_id,
+                serde_json::to_string(&record.payload)?,
+                &record.created_at,
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
+    fn select_agent_invocation_by_id_in(
+        connection: &rusqlite::Connection,
+        invocation_id: &str,
+    ) -> Result<Option<AgentInvocationRecord>, StorageError> {
+        connection
+            .query_row(
+                r#"
+                SELECT
+                  workflow_id, invocation_id, agent, effect_id, transition_id,
+                  event_id, idempotency_key, input_json, requested_profile,
+                  resolved_profile, profile_enforcement, status, claimed_by,
+                  claim_expires_at, provider, provider_run_id, run_dir,
+                  stdout_path, stderr_path, exit_code, error, created_at, updated_at
+                FROM agent_invocations
+                WHERE invocation_id = ?1
+                "#,
+                params![invocation_id],
+                agent_invocation_record_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn agent_invocation_record_from_row(
+        row: &rusqlite::Row<'_>,
+    ) -> Result<AgentInvocationRecord, rusqlite::Error> {
+        let input_json: String = row.get(7)?;
+        let status: String = row.get(11)?;
+        let exit_code: Option<i64> = row.get(19)?;
+        Ok(AgentInvocationRecord {
+            workflow_id: row.get(0)?,
+            invocation_id: row.get(1)?,
+            agent: row.get(2)?,
+            effect_id: row.get(3)?,
+            transition_id: row.get(4)?,
+            event_id: row.get(5)?,
+            idempotency_key: row.get(6)?,
+            input: serde_json::from_str(&input_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    input_json.len(),
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+            requested_profile: row.get(8)?,
+            resolved_profile: row.get(9)?,
+            profile_enforcement: row.get(10)?,
+            status: agent_invocation_status_from_name(&status),
+            claimed_by: row.get(12)?,
+            claim_expires_at: row.get(13)?,
+            provider: row.get(14)?,
+            provider_run_id: row.get(15)?,
+            run_dir: row.get(16)?,
+            stdout_path: row.get(17)?,
+            stderr_path: row.get(18)?,
+            exit_code: exit_code.map(|value| value as i32),
+            error: row.get(20)?,
+            created_at: row.get(21)?,
+            updated_at: row.get(22)?,
+        })
+    }
+
     fn save_state_in(
         connection: &rusqlite::Connection,
         state: &WorkflowState,
@@ -1941,18 +2764,63 @@ impl WorkflowRuntime {
                                 outcome: None,
                             }
                         }));
+                        let mut start_capacity_errors = BTreeMap::new();
+                        for effect in &outcome.effects {
+                            if let Some(error) = self.start_capacity_error(&workflow_id, effect)? {
+                                start_capacity_errors.insert(effect.effect_id.clone(), error);
+                            }
+                        }
+                        let native_agent_invocations = outcome
+                            .effects
+                            .iter()
+                            .filter(|effect| !start_capacity_errors.contains_key(&effect.effect_id))
+                            .filter_map(|effect| {
+                                native_agent_invocation_from_effect(
+                                    self.interpreter.workflow(),
+                                    effect,
+                                    &event,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let native_agent_messages = outcome
+                            .effects
+                            .iter()
+                            .filter_map(|effect| {
+                                native_agent_message_from_effect(
+                                    self.interpreter.workflow(),
+                                    effect,
+                                    &event,
+                                )
+                            })
+                            .collect::<Vec<_>>();
                         self.store.commit_event_processing(
                             &event,
                             event_status,
                             &self.interpreter.state,
                             &commit_records,
+                            &native_agent_invocations,
+                            &native_agent_messages,
                         )?;
 
                         for effect in &outcome.effects {
                             let mut dispatch_result =
-                                match self.start_capacity_error(&workflow_id, effect)? {
-                                    Some(error) => Err(effects::EffectError::Unsupported(error)),
-                                    None => self.dispatcher.borrow_mut().dispatch(effect.clone()),
+                                if is_native_agent_effect(self.interpreter.workflow(), effect) {
+                                    if let Some(error) =
+                                        start_capacity_errors.get(&effect.effect_id)
+                                    {
+                                        Err(effects::EffectError::RuntimeRejected(error.clone()))
+                                    } else {
+                                        Ok(native_agent_effect_outcome(effect))
+                                    }
+                                } else {
+                                    match start_capacity_errors.get(&effect.effect_id) {
+                                        Some(error) => Err(effects::EffectError::RuntimeRejected(
+                                            error.clone(),
+                                        )),
+                                        None => {
+                                            self.dispatcher.borrow_mut().dispatch(effect.clone())
+                                        }
+                                    }
                                 };
                             if dispatch_result.is_ok() && effect.effect == "raise" {
                                 match raised_event_from_effect(effect, &event) {
@@ -2027,6 +2895,8 @@ impl WorkflowRuntime {
                             event_status,
                             &self.interpreter.state,
                             &records,
+                            &[],
+                            &[],
                         )?;
                     }
                 }
@@ -2084,10 +2954,15 @@ impl WorkflowRuntime {
 
         let records = self.store.log_records(workflow_id)?;
         let events = self.store.events(workflow_id, 10_000)?;
-        let active = active_invocation_counts(&records, &events)
-            .get(agent)
-            .copied()
-            .unwrap_or_default();
+        let native_active = self.store.active_agent_invocation_counts(workflow_id)?;
+        let active = if native_active.is_empty() {
+            active_invocation_counts(&records, &events)
+                .get(agent)
+                .copied()
+                .unwrap_or_default()
+        } else {
+            native_active.get(agent).copied().unwrap_or_default()
+        };
 
         Ok((active >= max_active).then(|| {
             format!("agent `{agent}` is at maxActive {max_active}; active invocations: {active}")
@@ -2101,6 +2976,105 @@ impl WorkflowRuntime {
     pub fn interpreter(&self) -> &Interpreter {
         &self.interpreter
     }
+}
+
+fn is_native_agent_effect(ir: &WorkflowIr, effect: &EffectRequest) -> bool {
+    matches!(effect.effect.as_str(), "start" | "send")
+        && effect
+            .target
+            .as_deref()
+            .and_then(|target| ir.agents.get(target))
+            .is_some_and(|agent| !matches!(agent.target, AgentTarget::Adapter { .. }))
+}
+
+fn native_agent_effect_outcome(effect: &EffectRequest) -> effects::EffectOutcome {
+    effects::EffectOutcome {
+        effect_id: effect.effect_id.clone(),
+        status: effects::EffectOutcomeStatus::Accepted,
+        accepted: true,
+        invocation_id: (effect.effect == "start").then(|| effect.idempotency_key.clone()),
+        required_capabilities: effect.required_capabilities.clone(),
+        output: None,
+        error: None,
+        completed_at: Some(current_unix_millis().to_string()),
+    }
+}
+
+fn native_agent_invocation_from_effect(
+    ir: &WorkflowIr,
+    effect: &EffectRequest,
+    event: &queue::WorkflowEvent,
+) -> Option<storage::AgentInvocationRecord> {
+    if effect.effect != "start" || !is_native_agent_effect(ir, effect) {
+        return None;
+    }
+    let agent = effect.target.clone()?;
+    let requested_profile = ir
+        .agents
+        .get(&agent)
+        .and_then(|agent| agent.profile.clone());
+    let input = effect
+        .args
+        .get("input")
+        .cloned()
+        .unwrap_or_else(|| effect.args.clone());
+    let now = current_unix_millis().to_string();
+    Some(storage::AgentInvocationRecord {
+        workflow_id: effect.workflow_id.clone(),
+        invocation_id: effect.idempotency_key.clone(),
+        agent,
+        effect_id: effect.effect_id.clone(),
+        transition_id: effect.transition_id.clone(),
+        event_id: Some(event.event_id.clone()),
+        idempotency_key: effect.idempotency_key.clone(),
+        input,
+        requested_profile,
+        resolved_profile: None,
+        profile_enforcement: None,
+        status: storage::AgentInvocationStatus::Queued,
+        claimed_by: None,
+        claim_expires_at: None,
+        provider: None,
+        provider_run_id: None,
+        run_dir: None,
+        stdout_path: None,
+        stderr_path: None,
+        exit_code: None,
+        error: None,
+        created_at: now.clone(),
+        updated_at: now,
+    })
+}
+
+fn native_agent_message_from_effect(
+    ir: &WorkflowIr,
+    effect: &EffectRequest,
+    event: &queue::WorkflowEvent,
+) -> Option<storage::AgentMessageRecord> {
+    if effect.effect != "send" || !is_native_agent_effect(ir, effect) {
+        return None;
+    }
+    let agent = effect.target.clone()?;
+    let message = effect
+        .args
+        .get("message")
+        .cloned()
+        .unwrap_or_else(|| effect.args.clone());
+    let now = current_unix_millis().to_string();
+    Some(storage::AgentMessageRecord {
+        workflow_id: effect.workflow_id.clone(),
+        message_id: effect.idempotency_key.clone(),
+        agent,
+        invocation_id: None,
+        effect_id: effect.effect_id.clone(),
+        transition_id: effect.transition_id.clone(),
+        event_id: Some(event.event_id.clone()),
+        idempotency_key: effect.idempotency_key.clone(),
+        message,
+        status: "queued".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    })
 }
 
 pub fn project_status(
@@ -2199,6 +3173,17 @@ pub fn project_status(
         })
         .take(10)
         .collect::<Vec<_>>();
+    let current_effect_failures = recent_effects
+        .iter()
+        .filter(|effect| effect.status == log::EffectStatus::Failed)
+        .map(|effect| {
+            effect
+                .error
+                .as_deref()
+                .map(|error| format!("{} failed: {error}", effect.effect))
+                .unwrap_or_else(|| format!("{} failed", effect.effect))
+        })
+        .collect::<Vec<_>>();
     let policy_blockers = records
         .iter()
         .rev()
@@ -2232,17 +3217,58 @@ pub fn project_status(
         })
         .take(10)
         .collect::<Vec<_>>();
-    let active_invocations = project_active_invocations(ir, &records, &events);
-    let latest_coerce_calls = store
-        .latest_coerce_calls(workflow_id, 10)?
-        .into_iter()
+    let native_active_invocations = store.active_agent_invocation_counts(workflow_id)?;
+    let active_invocations =
+        project_active_invocations(ir, &records, &events, native_active_invocations);
+    let latest_coerce_records = store.latest_coerce_calls(workflow_id, 10)?;
+    let latest_coerce_calls = latest_coerce_records
+        .iter()
+        .cloned()
         .map(coerce_call_summary)
-        .collect();
+        .collect::<Vec<_>>();
     let latest_coerce_failures = store
         .latest_coerce_failures(workflow_id, 10)?
         .into_iter()
         .map(coerce_call_summary)
-        .collect();
+        .collect::<Vec<_>>();
+    let unresolved_event_ids = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.status,
+                queue::EventStatus::Failed | queue::EventStatus::DeadLettered
+            )
+        })
+        .map(|event| event.event_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let current_coerce_failure = latest_coerce_records
+        .first()
+        .filter(|call| call.status == coerce::CoerceStatus::Failed)
+        .filter(|call| {
+            call.event_id
+                .as_deref()
+                .is_none_or(|event_id| unresolved_event_ids.contains(event_id))
+        })
+        .cloned()
+        .map(coerce_call_summary);
+    let mut current_blockers = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.status,
+                queue::EventStatus::Failed | queue::EventStatus::DeadLettered
+            )
+        })
+        .filter_map(|event| {
+            event
+                .last_error
+                .as_deref()
+                .map(|error| format!("{} {}: {error}", event.event_id, event.event_type))
+        })
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>();
+    current_blockers.extend(policy_blockers.iter().cloned());
 
     Ok(status::WorkflowStatus {
         workflow_id: workflow_id.to_string(),
@@ -2258,7 +3284,10 @@ pub fn project_status(
         recent_effects,
         latest_coerce_calls,
         latest_coerce_failures,
+        current_coerce_failure,
+        current_effect_failures,
         policy_blockers,
+        current_blockers,
         recent_failures,
     })
 }
@@ -2299,8 +3328,13 @@ fn project_active_invocations(
     ir: &WorkflowIr,
     records: &[log::WorkflowLogRecord],
     events: &[queue::WorkflowEvent],
+    native_active_by_agent: BTreeMap<String, u32>,
 ) -> Vec<status::ActiveInvocation> {
-    let active_by_agent = active_invocation_counts(records, events);
+    let active_by_agent = if native_active_by_agent.is_empty() {
+        active_invocation_counts(records, events)
+    } else {
+        subtract_finished_events(native_active_by_agent, events)
+    };
 
     active_by_agent
         .into_iter()
@@ -2311,6 +3345,32 @@ fn project_active_invocations(
                 count: active,
                 max,
             })
+        })
+        .collect()
+}
+
+fn subtract_finished_events(
+    started_by_agent: BTreeMap<String, u32>,
+    events: &[queue::WorkflowEvent],
+) -> BTreeMap<String, u32> {
+    let mut completed_by_agent: BTreeMap<String, u32> = BTreeMap::new();
+    for event in events {
+        if event.event_type != "finished" || event.status != queue::EventStatus::Processed {
+            continue;
+        }
+        let Some(name) = event.payload.get("name").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if let Some(agent) = matching_finished_agent(name, started_by_agent.keys()) {
+            *completed_by_agent.entry(agent.to_string()).or_default() += 1;
+        }
+    }
+
+    started_by_agent
+        .into_iter()
+        .map(|(agent, started)| {
+            let completed = completed_by_agent.get(&agent).copied().unwrap_or_default();
+            (agent, started.saturating_sub(completed))
         })
         .collect()
 }
@@ -2480,20 +3540,24 @@ struct StepExecutionOutcome {
 pub enum InterpreterError {
     #[error("current state `{0}` is not declared")]
     UnknownCurrentState(String),
-    #[error("event `{event_type}` payload does not match declared schema")]
-    InvalidEventPayload { event_type: String },
+    #[error("event `{event_type}` payload does not match declared schema: {reason}")]
+    InvalidEventPayload { event_type: String, reason: String },
     #[error("assign target `{0}` is not a workflow data path")]
     InvalidAssignTarget(String),
     #[error("assign target `{0}` is not declared in workflow data")]
     UndeclaredDataField(String),
     #[error("unsupported expression in runtime slice")]
     UnsupportedExpression,
-    #[error("coerce `{function_name}` output does not match declared schema")]
-    InvalidCoerceOutput { function_name: String },
-    #[error("coerce `{function_name}` parameter `{param_name}` does not match declared schema")]
+    #[error("coerce `{function_name}` output does not match declared schema: {reason}")]
+    InvalidCoerceOutput {
+        function_name: String,
+        reason: String,
+    },
+    #[error("coerce `{function_name}` parameter `{param_name}` does not match declared schema: {reason}")]
     InvalidCoerceInput {
         function_name: String,
         param_name: String,
+        reason: String,
     },
     #[error("coerce `{function_name}` expected {expected} arguments but received {actual}")]
     InvalidCoerceArity {
@@ -2598,7 +3662,10 @@ impl Interpreter {
             recent_effects: Vec::new(),
             latest_coerce_calls: Vec::new(),
             latest_coerce_failures: Vec::new(),
+            current_coerce_failure: None,
+            current_effect_failures: Vec::new(),
             policy_blockers: Vec::new(),
+            current_blockers: Vec::new(),
             recent_failures: self.recent_failures.clone(),
         }
     }
@@ -2639,9 +3706,10 @@ impl Interpreter {
             .get(&event.event_type)
             .map(|event| &event.payload)
         {
-            if !schema.accepts_json_with_types(&event.payload, &self.ir.types) {
+            if let Some(reason) = schema.explain_json_mismatch(&event.payload, &self.ir.types) {
                 return Err(InterpreterError::InvalidEventPayload {
                     event_type: event.event_type.clone(),
+                    reason,
                 });
             }
         }
@@ -3685,10 +4753,11 @@ impl Interpreter {
                 .params
                 .get(index)
                 .ok_or(InterpreterError::UnsupportedExpression)?;
-            if !param.schema.accepts_json_with_types(&value, &self.ir.types) {
+            if let Some(reason) = param.schema.explain_json_mismatch(&value, &self.ir.types) {
                 return Err(InterpreterError::InvalidCoerceInput {
                     function_name: function_name.to_string(),
                     param_name: param.name.clone(),
+                    reason,
                 });
             }
             named_args.insert(param.name.clone(), value);
@@ -3720,12 +4789,13 @@ impl Interpreter {
                 message: "coerce executor returned no value".to_string(),
             })?;
 
-        if !function
+        if let Some(reason) = function
             .output
-            .accepts_json_with_types(&output, &self.ir.types)
+            .explain_json_mismatch(&output, &self.ir.types)
         {
             return Err(InterpreterError::InvalidCoerceOutput {
                 function_name: function_name.to_string(),
+                reason,
             });
         }
 
@@ -4163,7 +5233,10 @@ mod tests {
     use super::log::{EffectStatus, WorkflowLogRecord};
     use super::queue::{EventStatus, WorkflowEvent};
     use super::state::WorkflowState;
-    use super::storage::{StorageError, WorkflowStore};
+    use super::storage::{
+        AgentCompletionRecord, AgentInvocationRecord, AgentInvocationStatus, StorageError,
+        WorkflowStore,
+    };
     use super::{EventProcessingStatus, Interpreter, InterpreterError, WorkflowRuntime};
     use serde_json::json;
     use std::cell::Cell;
@@ -4373,7 +5446,8 @@ state waiting {
 
         assert!(matches!(
             error,
-            InterpreterError::InvalidEventPayload { event_type } if event_type == "start"
+            InterpreterError::InvalidEventPayload { event_type, reason }
+                if event_type == "start" && reason.contains("$.message expected string, got int")
         ));
     }
 
@@ -4389,7 +5463,8 @@ state waiting {
 
         assert!(matches!(
             error,
-            InterpreterError::InvalidEventPayload { event_type } if event_type == "start"
+            InterpreterError::InvalidEventPayload { event_type, reason }
+                if event_type == "start" && reason.contains("$.misspelled is not declared")
         ));
     }
 
@@ -4489,7 +5564,7 @@ state done {
                 |row| row.get(0),
             )
             .expect("schema version reads");
-        assert_eq!(schema_version, "2");
+        assert_eq!(schema_version, "4");
 
         let mut context = BTreeMap::new();
         context.insert("lastMessage".to_string(), json!("persisted"));
@@ -4861,6 +5936,204 @@ state done {
     }
 
     #[test]
+    fn sqlite_records_and_claims_native_agent_invocations() {
+        let store = WorkflowStore::open_in_memory().expect("store opens");
+        let invocation = AgentInvocationRecord {
+            workflow_id: "Harness".to_string(),
+            invocation_id: "inv-1".to_string(),
+            agent: "worker".to_string(),
+            effect_id: "eff-1".to_string(),
+            transition_id: "tr-1".to_string(),
+            event_id: Some("evt-1".to_string()),
+            idempotency_key: "Harness/evt-1/tr-1/start".to_string(),
+            input: json!({"message": "ship it"}),
+            requested_profile: Some("repo-writer".to_string()),
+            resolved_profile: None,
+            profile_enforcement: None,
+            status: AgentInvocationStatus::Queued,
+            claimed_by: None,
+            claim_expires_at: None,
+            provider: None,
+            provider_run_id: None,
+            run_dir: None,
+            stdout_path: None,
+            stderr_path: None,
+            exit_code: None,
+            error: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+
+        store
+            .insert_agent_invocation(&invocation)
+            .expect("invocation inserts");
+        assert_eq!(
+            store
+                .active_agent_invocation_counts("Harness")
+                .expect("active counts load")
+                .get("worker"),
+            Some(&1)
+        );
+
+        let claimed = store
+            .claim_agent_invocation("inv-1", "worker-process", "999")
+            .expect("claim succeeds")
+            .expect("invocation claimed");
+        assert_eq!(claimed.claimed_by.as_deref(), Some("worker-process"));
+        assert_eq!(claimed.status, AgentInvocationStatus::Claimed);
+        assert!(store
+            .claim_agent_invocation("inv-1", "second-process", "999")
+            .expect("second claim is safe")
+            .is_none());
+    }
+
+    #[test]
+    fn sqlite_recovers_expired_agent_leases() {
+        let store = WorkflowStore::open_in_memory().expect("store opens");
+        let invocation = AgentInvocationRecord {
+            workflow_id: "Harness".to_string(),
+            invocation_id: "inv-expired".to_string(),
+            agent: "worker".to_string(),
+            effect_id: "eff-1".to_string(),
+            transition_id: "tr-1".to_string(),
+            event_id: Some("evt-1".to_string()),
+            idempotency_key: "Harness/evt-1/tr-1/start".to_string(),
+            input: json!({"message": "ship it"}),
+            requested_profile: Some("repo-writer".to_string()),
+            resolved_profile: None,
+            profile_enforcement: None,
+            status: AgentInvocationStatus::Queued,
+            claimed_by: None,
+            claim_expires_at: None,
+            provider: None,
+            provider_run_id: None,
+            run_dir: None,
+            stdout_path: None,
+            stderr_path: None,
+            exit_code: None,
+            error: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        store
+            .insert_agent_invocation(&invocation)
+            .expect("invocation inserts");
+        store
+            .claim_agent_invocation("inv-expired", "worker-process", "100")
+            .expect("claim succeeds")
+            .expect("invocation claimed");
+
+        let recovered = store
+            .recover_expired_agent_leases("Harness", "101")
+            .expect("lease recovers");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].status, AgentInvocationStatus::Claimed);
+        let queued = store
+            .queued_agent_invocations("Harness", 10)
+            .expect("queued invocations load");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].status, AgentInvocationStatus::Queued);
+        assert_eq!(queued[0].claimed_by, None);
+        assert_eq!(queued[0].claim_expires_at, None);
+    }
+
+    #[test]
+    fn sqlite_records_agent_completion_and_workflow_event_atomically() {
+        let store = WorkflowStore::open_in_memory().expect("store opens");
+        let completion = AgentCompletionRecord {
+            workflow_id: "Harness".to_string(),
+            completion_id: "cmp-1".to_string(),
+            invocation_id: "inv-1".to_string(),
+            agent: "worker".to_string(),
+            status: "succeeded".to_string(),
+            summary: Some("done".to_string()),
+            exit_code: Some(0),
+            event_id: Some("evt-finished".to_string()),
+            payload: json!({
+                "id": "inv-1",
+                "name": "worker",
+                "status": "succeeded",
+                "summary": "done",
+                "exitCode": 0
+            }),
+            created_at: "1".to_string(),
+        };
+        let event = workflow_event(
+            "Harness",
+            "evt-finished",
+            "finished",
+            completion.payload.clone(),
+        );
+
+        assert!(store
+            .record_agent_completion(&completion, &event)
+            .expect("completion records"));
+
+        let queued = store
+            .dequeue_next_event("Harness")
+            .expect("queue reads")
+            .expect("completion event queued");
+        assert_eq!(queued.event_type, "finished");
+        assert_eq!(queued.payload["id"], "inv-1");
+    }
+
+    #[test]
+    fn sqlite_records_duplicate_agent_completion_idempotently() {
+        let store = WorkflowStore::open_in_memory().expect("store opens");
+        let completion = AgentCompletionRecord {
+            workflow_id: "Harness".to_string(),
+            completion_id: "cmp-1".to_string(),
+            invocation_id: "inv-1".to_string(),
+            agent: "worker".to_string(),
+            status: "succeeded".to_string(),
+            summary: Some("done".to_string()),
+            exit_code: Some(0),
+            event_id: Some("evt-finished".to_string()),
+            payload: json!({
+                "id": "inv-1",
+                "name": "worker",
+                "status": "succeeded",
+                "summary": "done",
+                "exitCode": 0
+            }),
+            created_at: "1".to_string(),
+        };
+        let event = workflow_event(
+            "Harness",
+            "evt-finished",
+            "finished",
+            completion.payload.clone(),
+        );
+        let duplicate_event = workflow_event(
+            "Harness",
+            "evt-duplicate",
+            "finished",
+            completion.payload.clone(),
+        );
+
+        assert!(store
+            .record_agent_completion(&completion, &event)
+            .expect("completion records"));
+        assert!(!store
+            .record_agent_completion(&completion, &duplicate_event)
+            .expect("duplicate is ignored"));
+
+        let completions = store
+            .recent_agent_completions("Harness", 10)
+            .expect("completions load");
+        assert_eq!(completions.len(), 1);
+        assert!(store
+            .dequeue_next_event("Harness")
+            .expect("queue reads")
+            .is_some());
+        assert!(store
+            .dequeue_next_event("Harness")
+            .expect("queue reads")
+            .is_none());
+    }
+
+    #[test]
     fn sqlite_requeues_processing_events_for_recovery() {
         let store = WorkflowStore::open_in_memory().expect("store opens");
         let event = workflow_event("Recoverable", "evt_recover", "tick", json!({}));
@@ -5090,7 +6363,7 @@ state done {
             error,
             StorageError::UnsupportedSchemaVersion {
                 found: 999,
-                supported: 2
+                supported: 4
             }
         ));
         let _ = std::fs::remove_file(path);
@@ -5529,7 +6802,7 @@ machine Effects
 initial waiting
 
 agent director = thread("director")
-agent worker = codingAgent()
+agent worker = adapter("worker")
 capability plan = adapter("implementationPlan")
 
 event go {
@@ -5625,8 +6898,15 @@ state done {
                     );
                     terminal_effect_ids.insert(effect_id.clone());
                 }
-                EffectStatus::Dispatched | EffectStatus::Failed => {
-                    panic!("fake dispatcher should succeed, got {status:?}");
+                EffectStatus::Dispatched => {
+                    assert!(
+                        intended_effect_ids.contains(effect_id),
+                        "effect outcome was recorded before intended effect"
+                    );
+                    terminal_effect_ids.insert(effect_id.clone());
+                }
+                EffectStatus::Failed => {
+                    panic!("fake/native dispatcher should succeed, got {status:?}");
                 }
             }
         }
@@ -5723,7 +7003,7 @@ state done {
 machine InjectedDispatcher
 initial waiting
 
-agent worker = codingAgent()
+agent worker = adapter("worker")
 
 event go {
   message string
@@ -5788,7 +7068,7 @@ state done {
 machine FailedOutcome
 initial waiting
 
-agent director = thread("director")
+agent director = adapter("director")
 
 event go {
   message string
@@ -5908,7 +7188,7 @@ state waiting {
 machine ActiveProjectionLatest
 initial waiting
 
-agent worker = codingAgent()
+agent worker = adapter("worker")
 
 event go {}
 
@@ -6002,7 +7282,7 @@ state waiting {
 machine DispatchPolicy
 initial waiting
 
-agent worker = codingAgent()
+agent worker = adapter("worker")
 
 event go {
   message string
@@ -6272,6 +7552,11 @@ state waiting {
         assert_eq!(status.active_invocations[0].agent, "worker");
         assert_eq!(status.active_invocations[0].count, 1);
         assert_eq!(status.active_invocations[0].max, Some(1));
+        assert!(status.current_blockers.is_empty());
+        assert!(status
+            .current_effect_failures
+            .iter()
+            .any(|failure| failure.contains("start failed: agent `worker` is at maxActive 1")));
 
         let records = runtime
             .store()
@@ -6287,6 +7572,18 @@ state waiting {
                     ..
                 } if effect == "start"
                     && outcome.error.as_deref().is_some_and(|error| error.contains("maxActive 1"))
+            )
+        }));
+        assert!(records.iter().any(|record| {
+            matches!(
+                record,
+                WorkflowLogRecord::Effect {
+                    effect,
+                    status: EffectStatus::Failed,
+                    outcome: Some(outcome),
+                    ..
+                } if effect == "start"
+                    && outcome.error.as_deref().is_some_and(|error| !error.contains("not supported by this adapter"))
             )
         }));
     }
@@ -6666,7 +7963,8 @@ state waiting {
 
         assert!(matches!(
             error,
-            InterpreterError::InvalidCoerceOutput { function_name } if function_name == "classify"
+            InterpreterError::InvalidCoerceOutput { function_name, reason }
+                if function_name == "classify" && reason.contains("$.kind expected string, got int")
         ));
     }
 
@@ -6717,8 +8015,11 @@ state waiting {
             error,
             InterpreterError::InvalidCoerceInput {
                 function_name,
-                param_name
-            } if function_name == "classify" && param_name == "message"
+                param_name,
+                reason
+            } if function_name == "classify"
+                && param_name == "message"
+                && reason.contains("$ expected string, got int")
         ));
     }
 

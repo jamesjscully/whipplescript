@@ -90,6 +90,8 @@ askHuman
 baml.coerce
 resource.plan.read
 resource.plan.write
+agent.worker.start
+agent.worker.message
 adapter.untie.start
 adapter.process.start
 ```
@@ -230,7 +232,8 @@ The first implemented policy document is intentionally small JSON:
 {
   "mode": "enterprise",
   "allowed_capabilities": [
-    "adapter.agent.start",
+    "agent.worker.start",
+    "agent.worker.message",
     "baml.coerce",
     "message_agents",
     "resource.plan.read",
@@ -276,6 +279,36 @@ permanent grant of authority. Runtime policy denials return structured required
 capabilities with the failed effect outcome, allowing `status`, `overview`, and
 `log --json` to explain the authority boundary without parsing the error text.
 
+## Harness Profile Policy
+
+Native agent execution uses harness profiles as the provider-authority boundary.
+Workflow source should name the intended profile, while a harness policy
+document defines what that profile means in the current environment.
+
+The default local posture may be permissive, but safer and enterprise postures
+should separate internet/research authority from repository write authority.
+
+Built-in profile names:
+
+```text
+permissive
+research
+repo-reader
+repo-writer
+human-review
+```
+
+`research` is for external discovery and should not edit repository files.
+`repo-reader` is for repository inspection without edits. `repo-writer` is for
+implementation and should not have network access by default. `human-review` is
+for structured approval/decision work.
+
+Custom harness policy can define its own profiles, but each profile must include
+a description so coding agents can choose the right profile by intent.
+
+The full harness profile model is specified in
+[harness-profiles.md](harness-profiles.md).
+
 ## Diagnostics
 
 Policy diagnostics should answer:
@@ -295,7 +328,7 @@ contracts should live in adapter policy or a future target-policy layer.
 Future diagnostic shape:
 
 ```text
-Denied: start(worker) requires adapter.untie.start
+Denied: start(worker) requires agent.worker.start
 Workflow declared: StartWorker
 Workspace policy: allowed
 Target worker policy: denied run_tests

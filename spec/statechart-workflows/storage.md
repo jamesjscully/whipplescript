@@ -1,12 +1,13 @@
 # Workflow Storage
 
-Status: implemented compact schema plus future normalization notes
+Status: implemented compact schema plus planned native agent ledger
 
 The first implementation should use SQLite for durable workflow state.
 
 The runtime should not begin as an in-memory interpreter with persistence added
-later. Event queues, transition logs, effect logs, current state, and status
-projection data should be durable from the first executable slice.
+later. Event queues, transition logs, effect logs, current state, agent
+invocations, and status projection data should be durable from the first
+executable slice.
 
 ## Why SQLite
 
@@ -50,7 +51,7 @@ key TEXT PRIMARY KEY NOT NULL
 value TEXT NOT NULL
 ```
 
-The implemented schema version is `2`. Runtime startup rejects databases with a
+The implemented schema version is `4`. Runtime startup rejects databases with a
 newer unsupported schema version.
 
 ### `workflow_state`
@@ -123,7 +124,8 @@ record_json TEXT NOT NULL
 
 `record_json` stores typed transition and effect log records. Status and
 overview projections derive latest transitions, effects, active invocations,
-policy blockers, and recent failures from this append-only log.
+policy blockers, current effect failures, current blockers, and historical
+recent failures from this append-only log plus durable event/coerce records.
 
 ### `coerce_calls`
 
@@ -168,6 +170,183 @@ Rules:
 - status projections include latest successful coerce decisions and latest
   failures
 
+## Planned Native Agent Ledger Tables
+
+The JSON agent-file bridge is scaffolding, not the target storage model. The
+native harness should use the same SQLite workflow database as the runtime.
+Agent work is first-class durable workflow state, not an adapter side file.
+
+The first native harness migration should bump the schema version and add these
+tables.
+
+### `agent_invocations`
+
+Queued, claimed, running, and completed agent work:
+
+```text
+seq INTEGER PRIMARY KEY AUTOINCREMENT
+workflow_id TEXT NOT NULL
+invocation_id TEXT NOT NULL UNIQUE
+agent TEXT NOT NULL
+effect_id TEXT NOT NULL
+transition_id TEXT NOT NULL
+event_id TEXT
+idempotency_key TEXT NOT NULL
+input_json TEXT NOT NULL
+requested_profile TEXT
+resolved_profile TEXT
+profile_enforcement TEXT
+status TEXT NOT NULL
+claimed_by TEXT
+claim_expires_at TEXT
+provider TEXT
+provider_run_id TEXT
+run_dir TEXT
+stdout_path TEXT
+stderr_path TEXT
+exit_code INTEGER
+error TEXT
+created_at TEXT NOT NULL
+updated_at TEXT NOT NULL
+UNIQUE(workflow_id, idempotency_key)
+```
+
+Indexes:
+
+```text
+(workflow_id, status, seq)
+(workflow_id, agent, status)
+(claim_expires_at)
+(provider, provider_run_id)
+```
+
+Statuses:
+
+```text
+queued
+claimed
+running
+succeeded
+failed
+cancelled
+timed_out
+completion_rejected
+```
+
+Rules:
+
+- `start` inserts an invocation in the same transaction as the state transition
+  and effect log.
+- `idempotency_key` deduplicates replay of the same committed start step.
+- `requested_profile` records the source-level semantic profile, when present;
+  `resolved_profile` and `profile_enforcement` are filled by the harness after
+  policy resolution.
+- the harness claims `queued` or expired `claimed`/`running` work with a lease.
+- active invocation projections count `queued`, `claimed`, and `running`
+  invocations until a valid completion retires them.
+- provider stdout/stderr are referenced by path, not embedded in the row.
+
+### `agent_messages`
+
+Durable messages sent to existing agents or threads:
+
+```text
+seq INTEGER PRIMARY KEY AUTOINCREMENT
+workflow_id TEXT NOT NULL
+message_id TEXT NOT NULL UNIQUE
+agent TEXT NOT NULL
+invocation_id TEXT
+effect_id TEXT NOT NULL
+transition_id TEXT NOT NULL
+event_id TEXT
+idempotency_key TEXT NOT NULL
+message_json TEXT NOT NULL
+status TEXT NOT NULL
+created_at TEXT NOT NULL
+updated_at TEXT NOT NULL
+UNIQUE(workflow_id, idempotency_key)
+```
+
+Rules:
+
+- `send` records a durable message in the same transaction as the transition
+  that produced it.
+- if `invocation_id` is absent, the harness/provider adapter decides whether
+  the message targets a named long-lived agent, a thread, or is unsupported.
+- message delivery failures are harness events, not silent state changes.
+
+### `agent_completions`
+
+Validated provider completion records:
+
+```text
+seq INTEGER PRIMARY KEY AUTOINCREMENT
+workflow_id TEXT NOT NULL
+completion_id TEXT NOT NULL UNIQUE
+invocation_id TEXT NOT NULL
+agent TEXT NOT NULL
+status TEXT NOT NULL
+summary TEXT
+exit_code INTEGER
+event_id TEXT
+payload_json TEXT NOT NULL
+created_at TEXT NOT NULL
+UNIQUE(workflow_id, invocation_id)
+```
+
+Rules:
+
+- the harness writes the completion record and queued workflow event in one
+  transaction.
+- `payload_json` must match the workflow's declared completion event schema
+  before `workflow_events` receives the event.
+- duplicate completion attempts for the same invocation are idempotent when
+  payloads match and rejected when payloads conflict.
+
+### `harness_events`
+
+Append-only operational observations from the harness:
+
+```text
+seq INTEGER PRIMARY KEY AUTOINCREMENT
+workflow_id TEXT NOT NULL
+event_id TEXT NOT NULL UNIQUE
+invocation_id TEXT
+kind TEXT NOT NULL
+payload_json TEXT NOT NULL
+created_at TEXT NOT NULL
+```
+
+Indexes:
+
+```text
+(workflow_id, seq DESC)
+(workflow_id, kind, seq DESC)
+(invocation_id, seq)
+```
+
+Useful initial kinds:
+
+```text
+invocation_claimed
+provider_started
+provider_exited
+completion_enqueued
+completion_schema_mismatch
+provider_command_failed
+lease_expired
+idle_without_work
+desire_path_observed
+```
+
+Rules:
+
+- harness events are local operational evidence, not workflow input.
+- status may summarize recent harness events, but statechart handlers do not
+  consume them directly.
+- desire-path observations should preserve enough context to improve the UX
+  without storing unbounded raw logs in SQLite.
+
 ## Future Normalized Tables
 
 These tables remain reasonable future normalization targets once the compact
@@ -182,8 +361,9 @@ workflow_artifacts
 ```
 
 They are not required for the current runtime because `workflow_state`,
-`workflow_events`, `workflow_log`, and `coerce_calls` already provide durable
-state, queueing, audit, coerce replay, and status projection.
+`workflow_events`, `workflow_log`, `coerce_calls`, and the native agent ledger
+tables provide durable state, queueing, audit, coerce replay, agent execution
+tracking, and status projection.
 
 ## Transaction Rules
 
@@ -193,6 +373,7 @@ Event processing uses SQLite transactions around each durable phase:
 mark event processing
 evaluate transition prepare work
 append transition/effect log records
+insert native agent invocations/messages produced by start/send
 update current state and workflow data
 mark event processed or ignored
 commit
@@ -207,6 +388,11 @@ Async effect dispatch records outcomes in durable effect log records. There
 must not be a visible state where an event is marked processed but the
 state/log projection still reflects the old state, or the reverse.
 
+Native agent invocation records follow the same rule. There must not be a
+visible state where a transition has started an agent but the invocation row is
+missing, or where the invocation row exists but the transition/effect log that
+created it is absent.
+
 If the process crashes while an event is `processing`, recovery requeues it and
 preserves `attempt_count` for operator visibility.
 
@@ -217,7 +403,9 @@ On startup:
 1. Return stale `processing` events to `queued`.
 2. Preserve and increment `attempt_count` on each dequeue so repeated recovery
    is visible in status and logs.
-3. Resume normal event processing.
+3. Return expired agent claims to `queued` or mark them failed according to the
+   provider status and retry policy.
+4. Resume normal event processing and harness claiming.
 
 Durable timers are reserved for a later runtime slice; current recovery has no
 timer queue to scan.

@@ -84,6 +84,7 @@ adapter-backed targets plus optional concurrency:
       "type": "thread",
       "name": "director"
     },
+    "profile": null,
     "max_active": null,
     "capabilities": [],
     "owns": [],
@@ -93,6 +94,7 @@ adapter-backed targets plus optional concurrency:
     "target": {
       "type": "coding_agent"
     },
+    "profile": "repo-writer",
     "max_active": 4,
     "capabilities": [],
     "owns": [],
@@ -103,6 +105,7 @@ adapter-backed targets plus optional concurrency:
       "type": "adapter",
       "name": "untie"
     },
+    "profile": null,
     "max_active": null,
     "capabilities": [],
     "owns": [],
@@ -111,12 +114,15 @@ adapter-backed targets plus optional concurrency:
 }
 ```
 
-Thread agents are message targets. `start` targets must be `coding_agent` or
-adapter-backed agents. The runtime never infers additional authority from the
-target. `capabilities`, `owns`, and `contract` are reserved IR fields for
-future target-specific policy checks; the v0 source syntax does not populate
-them, and adapter manifests plus workspace policy remain the implemented
-authority boundary.
+Thread agents are message targets. Local `start` targets must be
+`coding_agent`; explicitly external starts may target adapter-backed agents.
+The runtime never infers additional authority from the target. `profile` is the
+requested semantic harness profile for native provider resolution. It does not
+grant authority by itself; the harness policy resolves it to provider,
+filesystem, network, environment, timeout, and enforcement settings.
+`capabilities`, `owns`, and `contract` are reserved IR fields for future
+target-specific policy checks; the native harness, adapter manifests, plus
+workspace policy remain the implemented authority boundary.
 
 ## Events
 
@@ -377,7 +383,7 @@ Initial effect names:
 
 ```text
 send       send a message to an existing agent or thread
-start      begin asynchronous external work
+start      begin native harness-managed agent work
 coerce     call BAML to produce typed data
 assign     update workflow-local durable data
 askHuman   create a visible human-review obligation

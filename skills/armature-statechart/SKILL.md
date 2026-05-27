@@ -54,14 +54,14 @@ Keep this boundary clear:
    armature validate path/to/workflow.armature \
      --plan-file plan.json \
      --review-file reviews.json \
-     --agent-file agents.json \
      --json
    ```
 
 6. Start inspection with `overview`, not custom status scripts:
 
    ```sh
-   armature overview path/to/workflow.armature --agent-file agents.json --json
+   armature overview path/to/workflow.armature --json
+   armature harness status path/to/workflow.armature --json
    ```
 
 ## Authoring Shape
@@ -80,8 +80,8 @@ data {
 
 agent director = thread("director")
 agent worker = codingAgent() {
+  profile "repo-writer"
   maxActive 2
-  capabilities ["edit_code", "run_tests"]
 }
 
 event finished {
@@ -340,7 +340,6 @@ Use built-in file-backed adapters for local end-to-end workflows:
 armature run workflow.armature \
   --plan-file plan.json \
   --review-file reviews.json \
-  --agent-file agents.json \
   --event idle \
   --payload '{"activeRuns":0,"unfinishedItems":1}' \
   --json
@@ -349,10 +348,14 @@ armature run workflow.armature \
 Typed adapter-originated events can be enqueued without custom manifests:
 
 ```sh
-armature emit workflow.armature \
-  --agent-file agents.json \
-  --event finished \
-  --payload '{"id":"run-1","name":"worker-1","status":"succeeded","stdoutTail":"","stderrTail":"","exitCode":0}' \
+armature harness once workflow.armature \
+  --config harness.json \
+  --json
+
+armature harness run workflow.armature \
+  --config harness.json \
+  --drive-workflow \
+  --max-iterations 10 \
   --json
 
 armature emit workflow.armature \
@@ -367,13 +370,14 @@ Inspect durable state:
 ```sh
 armature overview workflow.armature --adapter-manifest adapter.json --json
 armature overview workflow.armature --adapter-manifest adapter.json --policy policy.json --json
-armature overview workflow.armature --agent-file agents.json --json
-armature status workflow.armature --agent-file agents.json --policy policy.json --json
-armature events workflow.armature --agent-file agents.json --policy policy.json --json
+armature overview workflow.armature --json
+armature status workflow.armature --policy policy.json --json
+armature harness status workflow.armature --json
+armature events workflow.armature --policy policy.json --json
 armature events workflow.armature --status failed --json
 armature events workflow.armature --status dead_lettered --json
 armature retry-event workflow.armature --event-id evt_cli_... --json
-armature log workflow.armature --agent-file agents.json --policy policy.json --json
+armature log workflow.armature --policy policy.json --json
 ```
 
 `events --limit` and `log --limit` are bounded inspection controls; keep them
@@ -384,14 +388,47 @@ agent needs the full event payload.
 Plain `retry-event` text output confirms `status=queued` and the resulting
 `pending_events` count after an administrative retry.
 
+Harness provider config maps workflow agents to `command`, `codex`, `claude`,
+or `pi`. `command` requires an explicit command array; the presets provide
+thin command templates and may also use command overrides. `timeoutSeconds`
+kills a stuck provider and records a typed `finished` event with
+`status: "timed_out"` when the workflow declares the standard completion event.
+Use placeholders such as `{{prompt}}`, `{{inputJson}}`, `{{invocationId}}`,
+`{{agent}}`, and `{{runDir}}` inside configured command arguments.
+
+When authoring workflows for real agents, prefer semantic harness profiles in
+the `.armature` source and let the harness policy map those profiles to concrete
+providers and sandbox settings:
+
+- `research`: external documentation, package discovery, and web research.
+- `repo-reader`: repository inspection without edits.
+- `repo-writer`: implementation work after the task is clear.
+- `human-review`: approval, decision collection, or structured review.
+
+Read custom profile descriptions before assigning them. Do not combine network
+access and repository write access unless the user explicitly requests
+permissive mode or supplies a custom profile whose description allows it.
+Use provider names such as `codex`, `claude`, `pi`, or `command` in harness
+policy/config, not as workflow intent.
+
+`armature harness status --json` includes workflow status, recent invocations,
+recent completions, harness events, and recent desire-path failures such as
+`unknown_agent`, `provider_command_failed`, `provider_timed_out`,
+`completion_schema_mismatch`, `workflow_validation_failed`, and
+`lease_expired`.
+
 Use a dedicated `--store path/to/workflow.sqlite` when testing multiple runs or
 when you need repeatable fixtures.
 The human `overview` and `status` outputs include current state, queued events,
 active invocations, latest effects, required capabilities, policy blockers,
-recent failures, latest coerce calls, latest coerce failures, and summarized
-workflow data. JSON status also exposes `recent_effects[].idempotency_key` for
-adapter reconciliation and repair. Use `--json` when a coding agent needs the
-same fields in a machine-readable shape.
+current effect failures, current blockers, historical recent failures, latest
+coerce calls, the current coerce failure only while its event is unresolved,
+historical latest coerce failures, and summarized workflow data. JSON status
+also exposes `current_effect_failures`, `current_coerce_failure`,
+`current_blockers`, and
+`recent_effects[].idempotency_key` for adapter reconciliation and repair. Use
+`status --compact` for a short operator view and `--json` when a coding agent
+needs the same fields in a machine-readable shape.
 
 ## Formal Checks
 
@@ -414,7 +451,6 @@ available:
 armature check workflow.armature --target tla --json
 armature check workflow.armature --target maude --json
 armature check workflow.armature --adapter-manifest adapter.json --policy policy.json --target tla --json
-armature check workflow.armature --agent-file agents.json --target tla --json
 ```
 
 Formal models are abstractions. They are useful for lifecycle invariants such
@@ -441,18 +477,23 @@ Common repairs:
 
 - `effect ... is not declared`: add or load the right adapter manifest, or
   remove the unsupported effect. For local JSON adapters, prefer
-  `--agent-file`, `--plan-file`, or `--review-file` before inventing a custom
-  manifest.
+  `--plan-file` or `--review-file` before inventing a custom manifest. Local
+  agents use the native harness ledger, not an adapter manifest.
 - `expects category`: fix the manifest category to match the language effect.
 - `policy document validation failed`: fix duplicate, empty, or invalid policy
   entries before changing the workflow.
 - `requires denied capability` or `requires capability ... not allowed`: update
   the policy document only if that authority is intended; otherwise remove or
   replace the effect.
-- `payload does not match schema for event`: fix the emitted JSON to match the
-  workflow event or built-in adapter event. `emit --agent-file` supplies the
-  standard `finished` payload shape; `emit --review-file` supplies
-  `humanReview.responded`.
+- `payload does not match schema for event`: fix the emitted JSON path named in
+  the diagnostic, such as `$.message expected string, got int`, to match the
+  workflow event or built-in adapter event. The harness supplies the standard
+  `finished` payload shape for native agent completions; `emit --review-file`
+  supplies `humanReview.responded`.
+- Parser suggestions about `agent`, `when`, or `start worker("...")` are
+  canonical syntax hints: use `agent worker = codingAgent() { maxActive 1 }`,
+  use one or more `guard` lines before the action block, and pass start input
+  with `start worker { message "..." }`.
 - `initial state ... is not declared`: update `initial` or add the state.
 - `uses undeclared capability`: add a `capability name = adapter("...")`
   declaration or remove the call.

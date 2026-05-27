@@ -122,6 +122,7 @@ Source:
 agent director = thread("director")
 agent external = adapter("untie")
 agent worker = codingAgent() {
+  profile "repo-writer"
   maxActive 4
 }
 ```
@@ -139,6 +140,7 @@ IR:
     },
     "worker": {
       "target": {"type": "coding_agent"},
+      "profile": "repo-writer",
       "max_active": 4
     }
   }
@@ -146,9 +148,12 @@ IR:
 ```
 
 Agents are simple named targets. They do not imply wildcard group behavior.
-Pattern matching over event fields handles groups. Thread agents are message
-targets for `send`; `start` targets must be `codingAgent()` or adapter-backed
-agents.
+Pattern matching over event fields handles groups. `profile` is optional source
+metadata for native harness resolution; omitted profiles are resolved by
+harness profile policy. Thread agents are message targets for `send`; local
+`start` targets must be `codingAgent()` and are recorded in the native agent
+ledger. Explicit adapter-backed agents may also be started when their adapter
+contract is loaded and policy permits it.
 
 ## Capabilities
 
@@ -357,7 +362,10 @@ Normalization:
 - `coerce chooseNextStep(...)` and `chooseNextStep(...)` both lower to the
   `coerce` effect when the callee resolves to a `coerce` declaration.
 - `assign` lowers to a deterministic data update.
-- `send`, `start`, and `askHuman` lower to built-in adapter effects.
+- local `send` and `start` lower to native agent ledger effects; adapter-backed
+  agents lower to adapter effects.
+- `askHuman` lowers to a human-obligation effect backed by the configured
+  review adapter.
 - `plan.markDone(...)` lowers to an adapter capability operation whose schema is
   supplied by the capability registry.
 - `case` lowers to a structured `case` step. Each arm keeps its pattern, nested

@@ -164,6 +164,10 @@ Rules:
 
 ## Effect Dispatch Contract
 
+This contract applies to effects that dispatch through an external adapter.
+Native local agent `start` and `send` use the native agent harness contract
+below instead of requiring an adapter manifest.
+
 Effect request:
 
 ```json
@@ -173,10 +177,10 @@ Effect request:
   "transition_id": "tr_01H...",
   "effect": "start",
   "category": "async_invocation",
-  "target": "worker",
+  "target": "external-worker",
   "args": {},
   "idempotency_key": "wf/spec/selecting/evt_123/step_0",
-  "required_capabilities": ["adapter.untie.start"],
+  "required_capabilities": ["adapter.external.start"],
   "timeout_ms": 600000
 }
 ```
@@ -205,48 +209,98 @@ Rules:
 - async effects may return only acceptance/outcome metadata; external work
   completes through later events
 - synchronous value effects return typed output during transition prepare
-- built-in event effects are runtime-owned; adapter manifests authorize
-  adapter-backed effects such as `start`, `send`, `askHuman`, and capability
-  operations. `coerce` uses the separate coerce executor contract rather than
-  the adapter-manifest effect path. Timer and terminal effects are reserved for
+- built-in event effects are runtime-owned.
+- native local agent `start` and `send` are runtime-owned and persist through
+  the native agent ledger, not through adapter manifests.
+- adapter manifests authorize explicitly external effects such as `askHuman`,
+  plan/state adapter operations, external service calls, and adapter-backed
+  agents when a workflow deliberately targets such an adapter.
+- `coerce` uses the separate coerce executor contract rather than the
+  adapter-manifest effect path. Timer and terminal effects are reserved for
   later grammar/runtime slices.
 
-File-backed local adapter records:
+## Native Agent Harness Contract
+
+Local agent orchestration is a first-class runtime/harness boundary. A
+statechart `start` inserts an invocation into SQLite; the harness claims that
+invocation, runs a provider, records artifacts, and enqueues a typed completion
+event.
+
+Invocation record:
 
 ```json
 {
-  "invocations": [
-    {
-      "id": "implementationLoop:evt_01H:tr_01H:handler.0",
-      "status": "started",
-      "agent": "worker",
-      "workflow_id": "implementationLoop",
-      "effect_id": "tr_01H:handler.0",
-      "transition_id": "tr_01H",
-      "input": {"task": "W1", "message": "Implement W1"}
-    }
-  ],
-  "messages": [
-    {
-      "id": "implementationLoop:evt_01H:tr_01H:handler.1",
-      "status": "sent",
-      "agent": "director",
-      "workflow_id": "implementationLoop",
-      "effect_id": "tr_01H:handler.1",
-      "transition_id": "tr_01H",
-      "message": "Worker finished W1"
-    }
-  ]
+  "workflow_id": "implementationLoop",
+  "invocation_id": "inv_01H...",
+  "agent": "worker",
+  "effect_id": "eff_01H...",
+  "transition_id": "tr_01H...",
+  "event_id": "evt_01H...",
+  "idempotency_key": "implementationLoop/evt_01H/tr_01H/handler.0/start",
+  "input": {"task": "W1", "message": "Implement W1"},
+  "requested_profile": "repo-writer",
+  "resolved_profile": null,
+  "status": "queued",
+  "claimed_by": null,
+  "claim_expires_at": null,
+  "provider": null,
+  "run_dir": null,
+  "stdout_path": null,
+  "stderr_path": null
 }
 ```
 
-The JSON agent file bridge is an inspectable local adapter slice, not a real
-agent API. It must deduplicate by idempotency key, preserve authored `start`
-input without the internal request envelope, and write atomically under the
-same short-lived lock-file convention as other JSON file adapters.
-`emit --agent-file ... --event finished` also appends a `completions` record and
-marks the latest matching invocation as `finished` when the built-in completion
-payload can be matched by run id or agent-name prefix.
+Harness claim request:
+
+```json
+{
+  "worker_id": "host-123:pid-456",
+  "lease_seconds": 300,
+  "providers": ["codex", "claude", "pi", "command"]
+}
+```
+
+Harness completion:
+
+```json
+{
+  "workflow_id": "implementationLoop",
+  "completion_id": "cmp_01H...",
+  "invocation_id": "inv_01H...",
+  "agent": "worker",
+  "status": "succeeded",
+  "summary": "Implemented W1 and tests passed.",
+  "exit_code": 0,
+  "event_id": "evt_01H...",
+  "payload": {
+    "id": "inv_01H...",
+    "name": "worker",
+    "status": "succeeded",
+    "summary": "Implemented W1 and tests passed.",
+    "exitCode": 0
+  }
+}
+```
+
+Rules:
+
+- the runtime inserts invocation/message records in the same transaction as the
+  transition that produced them
+- source-level `profile` names are recorded as requested profile intent for
+  native harness resolution, but they do not grant provider authority by
+  themselves
+- the harness claims queued work through SQLite transactions and leases
+- the harness resolves requested profiles through harness profile policy before
+  launching providers; resolution records requested profile, resolved profile,
+  provider, requested authority, enforced authority, and any best-effort gaps
+- provider stdout/stderr are artifact paths, not event payloads
+- the harness validates the completion payload against the workflow event
+  schema before enqueueing the workflow event
+- completion recording and workflow-event enqueue happen in one transaction
+- harness events are operational observations; statechart handlers consume only
+  typed workflow events
+- the JSON agent-file bridge is not part of the product contract; if retained
+  temporarily, it is a fixture/debug helper with no compatibility promise
 
 The JSON plan file bridge supports a deliberately small read surface:
 `plan.snapshot()` returns the raw JSON document as text,
@@ -336,7 +390,7 @@ Adapters advertise capabilities through manifests:
   "effects": {
     "start": {
       "category": "async_invocation",
-      "required_capabilities": ["adapter.untie.start"],
+      "required_capabilities": ["adapter.external.start"],
       "input": {"type": "json"},
       "output": {"type": "json"},
       "idempotent": true,
@@ -369,10 +423,11 @@ Rules:
   outputs, and event payloads must resolve inside the same manifest, and type
   refs must not form cycles
 - effect `input` schemas describe the runtime request `args` envelope, not just
-  the user-authored expression argument. For example, `send director "hello"`
-  dispatches args shaped like `{agent: string, message: string}`, `start worker
-  input` dispatches `{agent: string, input: json}`, `askHuman reason`
-  dispatches `{reason: string}`, and statement-style capability calls dispatch
+  the user-authored expression argument. For adapter-backed effects, `send
+  director "hello"` dispatches args shaped like
+  `{agent: string, message: string}`, `start worker input` dispatches
+  `{agent: string, input: json}`, `askHuman reason` dispatches
+  `{reason: string}`, and statement-style capability calls dispatch
   `{capability: string, operation: string, call_args: json[]}`.
   Optional authored arguments are omitted from the envelope when absent.
 - workflow validation checks adapter effect categories and the static request
@@ -412,7 +467,7 @@ manifests. It also appends a `responses` record to the JSON review file and
 marks the matching open review as `responded` when `reviewId` matches a stored
 review id.
 
-Built-in JSON agent completion event:
+Native agent completion event convention:
 
 ```json
 {
@@ -422,21 +477,18 @@ Built-in JSON agent completion event:
       "id": "string",
       "name": "string",
       "status": "string",
-      "stdoutTail": "string",
-      "stderrTail": "string",
+      "summary": "string",
       "exitCode": {"type": "optional", "inner": "int"}
     }
   }
 }
 ```
 
-`emit --agent-file <json>` loads this event schema without also loading the
-`start` and `send` effects. Bounded-start workflows still declare a compatible
-`finished` event in source so active invocation accounting is statically
-visible. If a workflow declares its own narrower `finished` payload and uses
-`run --event finished`, that event is processed as workflow input only; the JSON
-agent completion bridge updates the file when the built-in `emit --agent-file`
-completion schema is used.
+Bounded-start workflows still declare a compatible `finished` event in source
+so active invocation accounting is statically visible. The native harness writes
+provider stdout/stderr as artifacts, records a durable completion row, validates
+the completion payload against the workflow event schema, and enqueues the typed
+workflow event. Raw logs do not belong in the event payload.
 
 Manifests can be checked without a workflow:
 

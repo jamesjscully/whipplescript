@@ -34,7 +34,7 @@ Keywords:
 ```text
 machine initial data event agent capability adapter enum class coerce model
 prompt state on as guard entry always final invariant let assign start send
-askHuman raise stay goto case in nil true false
+askHuman raise stay goto case in nil true false profile
 ```
 
 ## Source File
@@ -84,14 +84,22 @@ AgentOptions =
 
 AgentOption =
   "maxActive" Int
+  | "profile" String
 
 `maxActive` must be greater than zero. If a workflow starts an agent with a
 declared `maxActive` limit, v0 requires a declared `finished` event with a
 required `name string` field and at least one `finished` handler. The runtime
 uses processed `finished.name` values with agent-name prefixes such as
 `worker-01` to retire active invocations.
-Thread agents are message targets and cannot be used with `start`. Started work
-must target `codingAgent()` or an adapter-backed agent.
+`profile` names the requested harness authority profile for native agent
+execution, such as `"research"` or `"repo-writer"`. Profile names are semantic
+intent labels, not provider names; concrete commands, filesystem posture,
+network posture, timeout, and enforcement mode are resolved through harness
+profile policy.
+Thread agents are message targets and cannot be used with `start`. Native
+started work must target `codingAgent()`. Explicitly external starts may target
+an adapter-backed agent when the adapter contract is loaded and policy permits
+it.
 
 CapabilityDecl =
   "capability" Ident "=" "adapter" "(" String ")"

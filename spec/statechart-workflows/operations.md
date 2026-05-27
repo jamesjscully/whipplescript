@@ -20,14 +20,19 @@ armature status workflow.armature \
   --json
 ```
 
-For built-in JSON file-backed adapters:
+For built-in JSON file-backed plan/review adapters:
 
 ```sh
 armature overview workflow.armature \
   --plan-file plan.json \
   --review-file reviews.json \
-  --agent-file agents.json \
   --json
+```
+
+For native local agent work:
+
+```sh
+armature harness status workflow.armature --json
 ```
 
 Then inspect durable queue and log records:
@@ -38,11 +43,14 @@ armature log workflow.armature --json
 ```
 
 `status` and `overview` read only durable Armature state. They must not call
-adapters, BAML, agents, or backing JSON files.
+adapters, BAML, providers, agents, or backing JSON files.
 The human `status` and `overview` outputs include a `waiting:` line that
 summarizes the highest-priority visible reason: validation failure for
-`overview`, blocked reason, policy blocker, recent failure, queued events,
+`overview`, blocked reason, policy blocker, current blocker, queued events,
 active invocations, or idle/no work.
+Failed effects that do not make the workflow stuck, such as an attempted
+`start` rejected by `maxActive` while another invocation is already active, are
+shown as current effect failures and retained in recent failure history.
 
 ## Common Stuck States
 
@@ -105,14 +113,19 @@ Symptoms:
 
 Checks:
 
-- confirm started agents emit a `finished` event
+- inspect `armature harness status workflow.armature --json`
+- confirm started agents have native invocation records
+- confirm the harness claimed and completed the invocation
+- confirm successful harness completion enqueued a `finished` event
 - confirm `finished.name` starts with the declared agent name, for example
   `worker-17` for agent `worker`
 - confirm a reachable `on finished` handler processes the event
 
 Likely repairs:
 
-- emit a typed completion with `armature emit --agent-file ... --event finished`
+- restart or run `armature harness run workflow.armature --config harness.json`
+- fix provider command/configuration errors shown in harness events
+- retry or repair failed/dead-lettered completion events
 - align the completion event schema with the workflow's declared event
 - avoid overlapping agent names unless the longest-prefix behavior is intended
 

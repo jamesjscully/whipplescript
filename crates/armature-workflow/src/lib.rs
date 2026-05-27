@@ -96,6 +96,14 @@ pub mod schema {
             self.accepts_json_inner(value, types, 0)
         }
 
+        pub fn explain_json_mismatch(
+            &self,
+            value: &serde_json::Value,
+            types: &BTreeMap<String, Schema>,
+        ) -> Option<String> {
+            self.explain_json_mismatch_inner(value, types, "$", 0)
+        }
+
         fn accepts_json_inner(
             &self,
             value: &serde_json::Value,
@@ -157,6 +165,174 @@ pub mod schema {
                     .is_some_and(|schema| schema.accepts_json_inner(value, types, depth + 1)),
                 Schema::Json => true,
             }
+        }
+
+        fn explain_json_mismatch_inner(
+            &self,
+            value: &serde_json::Value,
+            types: &BTreeMap<String, Schema>,
+            path: &str,
+            depth: usize,
+        ) -> Option<String> {
+            if self.accepts_json_inner(value, types, depth) {
+                return None;
+            }
+            if depth > 16 {
+                return Some(format!("{path} exceeds maximum schema nesting depth"));
+            }
+
+            match self {
+                Schema::Record { fields } => {
+                    let Some(object) = value.as_object() else {
+                        return Some(format!(
+                            "{path} expected record/object, got {}",
+                            json_kind(value)
+                        ));
+                    };
+                    for key in object.keys() {
+                        if !fields.iter().any(|field| field.name == *key) {
+                            return Some(format!("{path}.{key} is not declared in schema"));
+                        }
+                    }
+                    for field in fields {
+                        let field_path = format!("{path}.{}", field.name);
+                        match object.get(&field.name) {
+                            Some(value) => {
+                                if let Some(reason) = field.schema.explain_json_mismatch_inner(
+                                    value,
+                                    types,
+                                    &field_path,
+                                    depth + 1,
+                                ) {
+                                    return Some(reason);
+                                }
+                            }
+                            None if !matches!(field.schema, Schema::Optional { .. }) => {
+                                return Some(format!("{field_path} is required"));
+                            }
+                            None => {}
+                        }
+                    }
+                    Some(format!(
+                        "{path} does not match record schema; got {}",
+                        json_kind(value)
+                    ))
+                }
+                Schema::List { inner } | Schema::Set { inner } => {
+                    let Some(items) = value.as_array() else {
+                        return Some(format!(
+                            "{path} expected list/array, got {}",
+                            json_kind(value)
+                        ));
+                    };
+                    for (index, item) in items.iter().enumerate() {
+                        let item_path = format!("{path}[{index}]");
+                        if let Some(reason) =
+                            inner.explain_json_mismatch_inner(item, types, &item_path, depth + 1)
+                        {
+                            return Some(reason);
+                        }
+                    }
+                    Some(format!("{path} does not match list schema"))
+                }
+                Schema::Map {
+                    key,
+                    value: value_schema,
+                } => {
+                    let Some(entries) = value.as_object() else {
+                        return Some(format!(
+                            "{path} expected map/object, got {}",
+                            json_kind(value)
+                        ));
+                    };
+                    for (entry_key, entry_value) in entries {
+                        let key_value = serde_json::Value::String(entry_key.clone());
+                        if let Some(reason) = key.explain_json_mismatch_inner(
+                            &key_value,
+                            types,
+                            &format!("{path}.<key:{entry_key}>"),
+                            depth + 1,
+                        ) {
+                            return Some(reason);
+                        }
+                        if let Some(reason) = value_schema.explain_json_mismatch_inner(
+                            entry_value,
+                            types,
+                            &format!("{path}.{entry_key}"),
+                            depth + 1,
+                        ) {
+                            return Some(reason);
+                        }
+                    }
+                    Some(format!("{path} does not match map schema"))
+                }
+                Schema::Optional { inner } => {
+                    if value.is_null() {
+                        None
+                    } else {
+                        inner.explain_json_mismatch_inner(value, types, path, depth + 1)
+                    }
+                }
+                Schema::Union { variants } => Some(format!(
+                    "{path} expected one of {}, got {}",
+                    variants
+                        .iter()
+                        .map(schema_name)
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                    json_kind(value)
+                )),
+                Schema::Ref { name } => types
+                    .get(name)
+                    .map(|schema| schema.explain_json_mismatch_inner(value, types, path, depth + 1))
+                    .unwrap_or_else(|| Some(format!("{path} references unknown schema `{name}`"))),
+                _ => Some(format!(
+                    "{path} expected {}, got {}",
+                    schema_name(self),
+                    json_kind(value)
+                )),
+            }
+        }
+    }
+
+    fn json_kind(value: &serde_json::Value) -> &'static str {
+        match value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => "int",
+            serde_json::Value::Number(_) => "float",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        }
+    }
+
+    fn schema_name(schema: &Schema) -> String {
+        match schema {
+            Schema::String => "string".to_string(),
+            Schema::Int => "int".to_string(),
+            Schema::Float => "float".to_string(),
+            Schema::Boolean => "bool".to_string(),
+            Schema::Null => "null".to_string(),
+            Schema::Time => "time".to_string(),
+            Schema::Duration => "duration".to_string(),
+            Schema::Agent => "agent".to_string(),
+            Schema::Literal { value } => format!("literal {value}"),
+            Schema::Enum { values } => values.join(" | "),
+            Schema::Optional { inner } => format!("{}?", schema_name(inner)),
+            Schema::List { inner } => format!("{}[]", schema_name(inner)),
+            Schema::Set { inner } => format!("set<{}>", schema_name(inner)),
+            Schema::Map { key, value } => {
+                format!("map<{}, {}>", schema_name(key), schema_name(value))
+            }
+            Schema::Union { variants } => variants
+                .iter()
+                .map(schema_name)
+                .collect::<Vec<_>>()
+                .join(" | "),
+            Schema::Record { .. } => "record/object".to_string(),
+            Schema::Ref { name } => name.clone(),
+            Schema::Json => "json".to_string(),
         }
     }
 }
@@ -232,6 +408,8 @@ pub mod ir {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Agent {
         pub target: AgentTarget,
+        #[serde(default)]
+        pub profile: Option<String>,
         pub max_active: Option<u32>,
         #[serde(default)]
         pub capabilities: Vec<String>,
@@ -951,6 +1129,12 @@ pub mod source {
         source_name: String,
     }
 
+    #[derive(Default)]
+    struct AgentOptions {
+        profile: Option<String>,
+        max_active: Option<u32>,
+    }
+
     impl Parser {
         fn new(source: &str, source_name: String) -> Self {
             Self {
@@ -1132,16 +1316,25 @@ pub mod source {
             let decl_span = self.current_span();
             self.expect(SyntaxKind::AgentKw);
             let name = self.expect_ident("agent name");
+            if self.syntax.peek() != Some(SyntaxKind::Equals) {
+                self.diagnostics.push(self.error_at_current(
+                    "agent declarations use `=` and a constructor, for example `agent worker = codingAgent() { maxActive 1 }` or `agent director = thread(\"director\")`",
+                ));
+                self.skip_until_top_level_decl();
+                self.syntax.finish_node();
+                return;
+            }
             self.expect(SyntaxKind::Equals);
             let target = self.parse_agent_ctor();
-            let max_active = self.parse_agent_options();
+            let options = self.parse_agent_options();
 
             if let (Some(name), Some(target)) = (name, target) {
                 match self.agents.entry(name) {
                     Entry::Vacant(entry) => {
                         entry.insert(Agent {
                             target,
-                            max_active,
+                            profile: options.profile,
+                            max_active: options.max_active,
                             capabilities: Vec::new(),
                             owns: Vec::new(),
                             contract: None,
@@ -1194,10 +1387,10 @@ pub mod source {
             }
         }
 
-        fn parse_agent_options(&mut self) -> Option<u32> {
-            let mut max_active = None;
+        fn parse_agent_options(&mut self) -> AgentOptions {
+            let mut options = AgentOptions::default();
             if self.syntax.eat(SyntaxKind::LBrace).is_none() {
-                return max_active;
+                return options;
             }
 
             while !self.syntax.at_end() && self.syntax.peek() != Some(SyntaxKind::RBrace) {
@@ -1208,13 +1401,24 @@ pub mod source {
 
                 match option.as_str() {
                     "maxActive" => {
-                        max_active = self
+                        options.max_active = self
                             .syntax
                             .eat(SyntaxKind::Int)
                             .and_then(|token| token.text.parse::<u32>().ok());
-                        if max_active.is_none() {
+                        if options.max_active.is_none() {
                             self.diagnostics.push(self.error_at_current(
                                 "agent option `maxActive` must be followed by an integer",
+                            ));
+                        }
+                    }
+                    "profile" => {
+                        options.profile = self
+                            .syntax
+                            .eat(SyntaxKind::String)
+                            .map(|token| decode_string_literal(&token.text));
+                        if options.profile.is_none() {
+                            self.diagnostics.push(self.error_at_current(
+                                "agent option `profile` must be followed by a string",
                             ));
                         }
                     }
@@ -1230,7 +1434,7 @@ pub mod source {
             }
 
             self.expect(SyntaxKind::RBrace);
-            max_active
+            options
         }
 
         fn parse_capability_decl(&mut self) {
@@ -1609,6 +1813,15 @@ pub mod source {
                 None
             };
 
+            if self.current_token_text_is("when") {
+                self.diagnostics.push(self.error_at_current(
+                    "event handlers use `guard`, not `when`; write `guard condition` before the action block",
+                ));
+                while !self.syntax.at_end() && self.syntax.peek() != Some(SyntaxKind::LBrace) {
+                    self.syntax.bump();
+                }
+            }
+
             let guard = self.parse_guard_list();
             let (steps, transition) = self.parse_action_block();
             self.syntax.finish_node();
@@ -1762,6 +1975,12 @@ pub mod source {
             let step_span = self.current_span();
             self.expect(SyntaxKind::StartKw);
             let agent = self.expect_ident("agent name");
+            if self.syntax.peek() == Some(SyntaxKind::LParen) {
+                self.diagnostics.push(self.error_at_current(
+                    "start uses a block input, not call syntax; write `start worker { message \"...\" }`",
+                ));
+                self.skip_balanced_parens();
+            }
             let input = if self.syntax.peek() == Some(SyntaxKind::LBrace) {
                 Some(Expr::Object {
                     fields: self.parse_object_block_fields(),
@@ -2558,6 +2777,12 @@ pub mod source {
             self.syntax.peek_nth(1) == Some(kind)
         }
 
+        fn current_token_text_is(&self, text: &str) -> bool {
+            self.syntax
+                .peek_token()
+                .is_some_and(|token| token.text == text)
+        }
+
         fn expect_ident(&mut self, label: &str) -> Option<String> {
             if self.syntax.peek().is_some_and(is_name_token) {
                 self.syntax.bump().map(|token| token.text)
@@ -2688,6 +2913,32 @@ pub mod source {
                         | SyntaxKind::SendKw
                         | SyntaxKind::AskHumanKw
                         | SyntaxKind::RBrace,
+                    ) => break,
+                    Some(SyntaxKind::LBrace) => self.skip_balanced_braces(),
+                    Some(SyntaxKind::LParen) => self.skip_balanced_parens(),
+                    Some(_) => {
+                        self.syntax.bump();
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        fn skip_until_top_level_decl(&mut self) {
+            while !self.syntax.at_end() {
+                match self.syntax.peek() {
+                    Some(
+                        SyntaxKind::MachineKw
+                        | SyntaxKind::InitialKw
+                        | SyntaxKind::DataKw
+                        | SyntaxKind::AgentKw
+                        | SyntaxKind::CapabilityKw
+                        | SyntaxKind::EnumKw
+                        | SyntaxKind::ClassKw
+                        | SyntaxKind::CoerceKw
+                        | SyntaxKind::EventKw
+                        | SyntaxKind::StateKw
+                        | SyntaxKind::InvariantKw,
                     ) => break,
                     Some(SyntaxKind::LBrace) => self.skip_balanced_braces(),
                     Some(SyntaxKind::LParen) => self.skip_balanced_parens(),
@@ -3032,6 +3283,16 @@ pub mod validate {
                     format!("agent `{agent_name}` maxActive must be greater than 0"),
                     &agent.span,
                 ));
+            }
+            if let Some(profile) = &agent.profile {
+                if profile.trim().is_empty()
+                    || profile.chars().any(|character| character.is_control())
+                {
+                    diagnostics.push(error_at(
+                        format!("agent `{agent_name}` profile must be non-empty and contain no control characters"),
+                        &agent.span,
+                    ));
+                }
             }
         }
 
@@ -5832,6 +6093,7 @@ initial done
 agent director = thread("director")
 agent external = adapter("untie")
 agent worker = codingAgent() {
+  profile "repo-writer"
   maxActive 4
 }
 
@@ -5892,6 +6154,7 @@ state done {
             "implementationPlan".to_string()
         );
         assert_eq!(ir.agents["worker"].max_active, Some(4));
+        assert_eq!(ir.agents["worker"].profile.as_deref(), Some("repo-writer"));
         assert!(matches!(
             &ir.types["RunKind"],
             crate::schema::Schema::Enum { values } if values == &vec![
@@ -6175,6 +6438,83 @@ state done {
         assert!(parsed.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("explicit outcome must be the last statement")));
+    }
+
+    #[test]
+    fn parser_suggests_canonical_agent_declaration_for_natural_agent_syntax() {
+        let source = r#"
+machine BadAgent
+initial done
+
+agent worker thread maxActive 1
+
+state done {
+  final
+}
+"#;
+
+        let parsed = crate::parse_syntax(source);
+
+        assert!(parsed.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("agent declarations use `=` and a constructor")));
+        assert!(!parsed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unexpected top-level token")));
+    }
+
+    #[test]
+    fn parser_suggests_guard_instead_of_when() {
+        let source = r#"
+machine BadWhen
+initial waiting
+
+event go {
+  ready bool
+}
+
+state waiting {
+  on go as evt when evt.ready {
+    stay
+  }
+}
+"#;
+
+        let parsed = crate::parse_syntax(source);
+
+        assert!(parsed.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("event handlers use `guard`, not `when`")));
+        assert!(!parsed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unexpected state member")));
+    }
+
+    #[test]
+    fn parser_suggests_start_block_instead_of_call_syntax() {
+        let source = r#"
+machine BadStart
+initial waiting
+
+agent worker = codingAgent()
+
+event go {}
+
+state waiting {
+  on go {
+    start worker("hello")
+    stay
+  }
+}
+"#;
+
+        let parsed = crate::parse_syntax(source);
+
+        assert!(parsed.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("start uses a block input, not call syntax")));
     }
 
     #[test]
