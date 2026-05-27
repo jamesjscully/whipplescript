@@ -1,8 +1,11 @@
 # Harness Profiles
 
-Status: design proposal for the next implementation slice
+Status: implemented first slice; target semantics clarified in
+[provider-adapters.md](provider-adapters.md)
 
-Harness profiles are the authority boundary for native agent execution.
+Harness profiles are the authority boundary for native agent execution. They
+bind semantic workflow roles to provider adapters such as Codex, Claude Code,
+Pi, or deterministic command fixtures.
 
 Armature workflows should describe agent intent. Harness policy should decide
 what that intent is allowed to do in the current environment. This keeps
@@ -12,9 +15,12 @@ enterprise teams enforce stricter provider behavior.
 ## Problem
 
 Native `start` and `send` effects are intentionally constrained inside the
-workflow language. The current harness can still run arbitrary provider
-commands through `provider: "command"`. That is useful for local experiments,
-but it is not the right product boundary for nontechnical or enterprise users.
+workflow language. `codingAgent` declares a workflow role, not a concrete
+runner. The provider adapter is selected by harness policy.
+
+The current harness can still run arbitrary provider commands through
+`provider: "command"`. That is useful for local deterministic fixtures, but it
+is not the right product boundary for nontechnical or enterprise users.
 
 The design separates three authorities:
 
@@ -130,7 +136,7 @@ to choose them without memorizing provider internals.
       "provider": "command",
       "filesystem": "none",
       "network": "denied",
-      "enforcement": "native"
+      "enforcement": "external"
     }
   }
 }
@@ -187,7 +193,7 @@ allowCommandProvider
                   whether raw command profiles are allowed
 profiles          map of profile name to profile definition
 description       human/agent-facing guidance for when to use the profile
-provider          command | codex | claude | pi
+provider          command | codex | claude-code | pi
 command           optional command template override
 args              optional extra command args
 cwd               working directory
@@ -204,16 +210,21 @@ enforcement       native | best_effort | external | native_or_best_effort
 Workflow authors should select profiles by intent:
 
 ```armature
-agent researcher = codingAgent() {
+agent researcher = codingAgent {
   profile "research"
   maxActive 2
 }
 
-agent worker = codingAgent() {
+agent worker = codingAgent {
   profile "repo-writer"
   maxActive 3
 }
 ```
+
+The parser may accept `codingAgent()` as a compatibility alias while examples
+and diagnostics migrate to the declaration-style `codingAgent` form. The
+parentheses form should not be used to imply a function call or concrete
+provider.
 
 If omitted, the profile is resolved from harness policy:
 
@@ -223,7 +234,7 @@ permissive mode        use permissive
 ```
 
 Profile names are not provider names. A team may map `repo-writer` to Codex
-locally, Claude in CI, or an external sandbox in enterprise.
+locally, Claude Code in CI, or an external sandbox in enterprise.
 
 ## Resolution
 
@@ -272,6 +283,29 @@ Providers advertise enforcement support:
 Armature should not silently claim enforcement it cannot provide. When a
 restriction is best-effort, the harness event should say so.
 
+Implemented provider mappings:
+
+```text
+codex   filesystem read_only/workspace_write -> --sandbox
+codex   network allowed/provider_default -> --search
+codex   network denied -> do not enable --search, report limited denial
+claude-code filesystem read_only/none -> --permission-mode plan
+claude-code filesystem workspace_write -> --permission-mode acceptEdits
+claude-code allowedTools -> --allowedTools
+claude-code network denied -> best-effort warning; no stable native flag mapped
+command requires explicit command-provider approval outside permissive mode
+pi      best-effort only until stable sandbox flags are documented and tested
+```
+
+Provider preset commands apply the mapped native flags directly. If a profile
+overrides the command for `codex`, `claude-code`, or `pi`, Armature records
+that the custom command is responsible for applying equivalent provider flags
+and marks the launch evidence as best-effort for that command shape.
+
+When a profile supplies `allowedEnv`, provider processes inherit only that
+allowlist plus minimal runtime keys needed to execute (`PATH`, `HOME`,
+`TMPDIR`) and Armature's own invocation environment variables.
+
 ## CLI Surface
 
 Harness commands should accept:
@@ -288,12 +322,16 @@ armature harness run workflow.armature \
 
 armature validate workflow.armature \
   --profile-policy .armature/harness-policy.json
+
+armature validate-profile-policy .armature/harness-policy.json \
+  --workflow workflow.armature
 ```
 
-`--config` remains the concrete provider runner config for local experiments.
-`--profile-policy` is the product path for governed environments. A future
-implementation may merge them into a single harness policy file, but the
-concepts should stay distinct: profile intent versus concrete runner details.
+`--profile-policy` is the product path for governed environments and should be
+sufficient by itself once provider adapters are complete. `--config` remains a
+concrete provider runner override for deterministic local experiments and tests.
+The concepts should stay distinct: profile intent versus concrete runner
+details.
 
 ## Skill Guidance
 
@@ -312,9 +350,9 @@ agents should read them before assigning profiles.
 
 ## Open Implementation Questions
 
-- whether `profile` becomes an IR field on `Agent` immediately or remains
-  harness-only metadata until enforcement lands
-- whether default built-in profiles should be generated by `armature init`
-- exact provider flag mapping for Codex, Claude Code, and Pi
 - whether external sandbox wrappers should be modeled as providers or
   enforcement backends
+- stable Pi sandbox flag mapping
+- whether the runtime should retire the completed invocation before evaluating
+  `start` effects in the same `finished` transition, or whether users should
+  model that sequencing through an internal event

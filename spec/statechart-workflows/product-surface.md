@@ -62,6 +62,7 @@ workflow.armature
       stdout.log
       stderr.log
   policy.json
+  harness-policy.json
 ```
 
 Larger projects may use multiple workflows:
@@ -104,12 +105,15 @@ valid `.armature` identifier.
 ```text
 workflow.armature
 .armature/policy.json
+.armature/harness-policy.json
 .armature/state/
 .armature/workflows/
 ```
 
-It should ask as few questions as possible. Defaults are permissive for local
-use.
+It should ask as few questions as possible. The capability policy defaults are
+local and conservative. The harness profile policy defaults to separated
+semantic profiles (`research`, `repo-reader`, `repo-writer`, `human-review`) so
+new workflows have the intended profile vocabulary immediately.
 
 ### `armature validate [file]`
 
@@ -147,6 +151,12 @@ requirements, and model abstractions.
 Validates capability policy documents independently from a workflow. This checks
 policy document shape, duplicate capability entries, empty capability names, and
 direct allow/deny conflicts.
+
+### `armature validate-profile-policy [policy...] [--workflow <file>]`
+
+Validates harness profile policy files independently from a harness run. When a
+workflow file is supplied, it also checks that source-level agent `profile`
+references resolve under the supplied policy.
 
 ### `armature check [file]`
 
@@ -189,13 +199,19 @@ The command:
 - initializes durable state if needed
 - starts the Rust interpreter
 - connects declared adapters
-- connects a BAML HTTP server when real `coerce` calls are enabled
+- connects the selected BAML backend when real `coerce` calls are enabled
 - records native local agent invocations in SQLite
 - begins processing durable events
 
 It does not execute arbitrary TypeScript or shell workflow logic.
 
-Real BAML-backed `coerce` execution uses:
+Real BAML-backed `coerce` execution is managed by Armature by default. If a
+workflow contains `coerce`, `armature run workflow.armature` should generate the
+BAML source, run a generated BAML client over stdin/stdout, call it through the
+durable coerce executor, and record runtime evidence. The default path should
+work in agent sandboxes that do not permit local TCP listeners.
+
+External BAML endpoints remain an explicit override:
 
 ```text
 --baml-url http://127.0.0.1:2024
@@ -225,8 +241,8 @@ explicit adapter manifests.
 `status` and `overview` accept the same file-backed flags for validation
 context, but they must not call adapters or read those JSON files.
 
-Managed `baml-cli serve` process mode may be added later, but the first real
-execution path should use an explicitly supplied BAML HTTP URL.
+See [managed-baml-runtime.md](managed-baml-runtime.md) for the target BAML
+runtime contract.
 
 ### `armature harness once [file] --config <config> [--profile-policy <policy>]`
 

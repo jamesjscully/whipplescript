@@ -19,6 +19,7 @@ durable event queues
 append-only transition/effect logs
 trusted Rust interpreter
 typed effects
+provider adapters for native harness-managed agents
 runtime status
 optional formal verification
 ```
@@ -96,7 +97,14 @@ and policy-checked adapters.
   data programming.
 - [baml-integration.md](baml-integration.md) defines how Armature `class`,
   `enum`, and `coerce` declarations lower to BAML artifacts and execute through
-  BAML HTTP.
+  generated stdio, explicit HTTP, or brokered BAML backends.
+- [managed-baml-runtime.md](managed-baml-runtime.md) defines the target default
+  BAML lifecycle for real `coerce` execution, including the sandbox-safe
+  generated stdio path, the external `--baml-url` override, and brokered mode.
+- [harness-profiles.md](harness-profiles.md) defines semantic agent profiles
+  and profile policy.
+- [provider-adapters.md](provider-adapters.md) defines the language boundary and
+  concrete adapter contracts for Codex, Claude Code, Pi, and command fixtures.
 - [workflow-ir.md](workflow-ir.md) defines the normalized representation shared
   by parser, validator, runtime, adapters, and model generators.
 - [component-contracts.md](component-contracts.md) defines typed interfaces

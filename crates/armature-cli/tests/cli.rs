@@ -6,6 +6,9 @@ fn armature() -> Command {
 }
 
 fn formal_checks_available() -> bool {
+    if std::env::var_os("ARMATURE_RUN_FORMAL_TESTS").is_none() {
+        return false;
+    }
     Command::new("sh")
         .arg("-c")
         .arg(
@@ -14,6 +17,10 @@ fn formal_checks_available() -> bool {
         .status()
         .expect("tool probe runs")
         .success()
+}
+
+fn loopback_tests_enabled() -> bool {
+    std::env::var_os("ARMATURE_RUN_LOOPBACK_TESTS").is_some()
 }
 
 fn workflow_source() -> &'static str {
@@ -87,6 +94,343 @@ fn run_json(command: &mut Command) -> Value {
     serde_json::from_slice(&output.stdout).expect("stdout is json")
 }
 
+fn baml_coerce_workflow_source() -> &'static str {
+    r#"
+machine BamlHttpWorkflow
+initial waiting
+
+data {
+  result string = ""
+}
+
+event go {
+  message string
+}
+
+coerce classify(message string) -> string {
+  model "gpt-5-codex"
+  prompt """
+Classify this message.
+
+{{ message }}
+  """
+}
+
+state waiting {
+  on go as evt {
+    let classification = coerce classify(evt.message)
+    assign data.result = classification
+    goto done
+  }
+}
+
+state done {
+  final
+}
+"#
+}
+
+fn write_baml_coerce_workflow(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    let file = dir.path().join(name);
+    std::fs::write(&file, baml_coerce_workflow_source()).expect("workflow writes");
+    file
+}
+
+fn write_fake_baml_cli(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("fake bin dir writes");
+    let bin = bin_dir.join("baml-cli");
+    let log = dir.path().join("fake-baml-cli.log");
+    std::fs::write(
+        &bin,
+        r#"#!/bin/sh
+python3 - "$@" <<'PY'
+import http.server
+import json
+import os
+import signal
+import socketserver
+import sys
+
+log_path = os.environ["ARMATURE_FAKE_BAML_LOG"]
+args = sys.argv[1:]
+
+def log(record):
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
+if not args or args[0] != "serve":
+    log({"error": "unexpected command", "args": args})
+    sys.exit(2)
+
+from_dir = None
+port = None
+index = 1
+while index < len(args):
+    arg = args[index]
+    if arg == "--from" and index + 1 < len(args):
+        from_dir = args[index + 1]
+        index += 2
+    elif arg.startswith("--from="):
+        from_dir = arg.split("=", 1)[1]
+        index += 1
+    elif arg == "--port" and index + 1 < len(args):
+        port = int(args[index + 1])
+        index += 2
+    elif arg.startswith("--port="):
+        port = int(arg.split("=", 1)[1])
+        index += 1
+    else:
+        index += 1
+
+if from_dir is None:
+    log({"error": "missing --from", "args": args})
+    sys.exit(2)
+if port is None:
+    port = 2024
+
+baml_path = os.path.join(from_dir, "workflow.baml")
+with open(baml_path, "r", encoding="utf-8") as handle:
+    baml_source = handle.read()
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"ok":true}')
+
+    def do_POST(self):
+        size = int(self.headers.get("content-length", "0"))
+        body = self.rfile.read(size).decode("utf-8")
+        log({"request_path": self.path, "request_body": body})
+        response = b'"managed"'
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
+    def log_message(self, format, *args):
+        return
+
+socketserver.TCPServer.allow_reuse_address = True
+server = socketserver.TCPServer(("127.0.0.1", port), Handler)
+actual_port = server.server_address[1]
+log({
+    "args": args,
+    "from": from_dir,
+    "port": actual_port,
+    "baml_contains_classify": "function Classify" in baml_source,
+})
+print(f"http://127.0.0.1:{actual_port}", flush=True)
+
+def stop(_signum, _frame):
+    server.server_close()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, stop)
+server.serve_forever()
+PY
+"#,
+    )
+    .expect("fake baml-cli writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&bin)
+            .expect("fake baml-cli metadata reads")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&bin, permissions).expect("fake baml-cli is executable");
+    }
+    (bin_dir, log)
+}
+
+fn command_with_fake_baml_cli(
+    command: &mut Command,
+    bin_dir: &std::path::Path,
+    log: &std::path::Path,
+) {
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(bin_dir.to_path_buf()).chain(std::env::split_paths(&existing_path));
+    let path = std::env::join_paths(paths).expect("fake PATH builds");
+    command.env("PATH", path).env("ARMATURE_FAKE_BAML_LOG", log);
+}
+
+fn write_fake_generated_stdio_runner(
+    dir: &tempfile::TempDir,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let bin = dir.path().join("fake-generated-baml-runner");
+    let log = dir.path().join("fake-generated-baml-runner.log");
+    std::fs::write(
+        &bin,
+        r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+log_path = os.environ["ARMATURE_FAKE_BAML_GENERATED_STDIO_LOG"]
+stdin = sys.stdin.read()
+payload = None
+for candidate in [line for line in stdin.splitlines() if line.strip()] or [stdin]:
+    if candidate.strip():
+        payload = json.loads(candidate)
+        break
+if payload is None and len(sys.argv) > 1:
+    payload = json.loads(sys.argv[1])
+if payload is None:
+    payload = {}
+
+with open(log_path, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({
+        "argv": sys.argv[1:],
+        "codex_oauth_token_present": bool(os.environ.get("ARMATURE_CODEX_OAUTH_ACCESS_TOKEN")),
+        "codex_oauth_base_url": os.environ.get("ARMATURE_CODEX_OAUTH_BASE_URL"),
+        "request": payload,
+    }, sort_keys=True, separators=(",", ":")) + "\n")
+
+request_id = payload.get("id") or payload.get("coerce_call_id") or "coerce_fake"
+function = payload.get("function") or payload.get("function_name")
+args = payload.get("args") or {}
+if function != "classify":
+    print(json.dumps({
+        "id": request_id,
+        "ok": False,
+        "error": f"unexpected function {function!r}",
+    }, separators=(",", ":")), flush=True)
+    sys.exit(0)
+
+print(json.dumps({
+    "id": request_id,
+    "coerce_call_id": request_id,
+    "ok": True,
+    "status": "succeeded",
+    "http_status": None,
+    "value": "generated-stdio",
+    "parsed_output": "generated-stdio",
+    "raw": {
+        "fakeGeneratedRunner": True,
+        "message": args.get("message"),
+    },
+    "raw_response": {
+        "fakeGeneratedRunner": True,
+        "message": args.get("message"),
+    },
+    "error": None,
+}, separators=(",", ":")), flush=True)
+"#,
+    )
+    .expect("fake generated stdio runner writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&bin)
+            .expect("fake generated stdio runner metadata reads")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&bin, permissions)
+            .expect("fake generated stdio runner is executable");
+    }
+    (bin, log)
+}
+
+fn command_with_fake_generated_stdio_runner(
+    command: &mut Command,
+    runner: &std::path::Path,
+    log: &std::path::Path,
+) {
+    command
+        .env("ARMATURE_BAML_GENERATED_STDIO_RUNNER", runner)
+        .env("ARMATURE_FAKE_BAML_GENERATED_STDIO_LOG", log);
+}
+
+fn write_fake_baml_generate_cli(
+    dir: &tempfile::TempDir,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let bin_dir = dir.path().join("generate-bin");
+    std::fs::create_dir_all(&bin_dir).expect("fake generate bin dir writes");
+    let bin = bin_dir.join("baml-cli");
+    let log = dir.path().join("fake-baml-generate.log");
+    std::fs::write(
+        &bin,
+        r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+log_path = os.environ["ARMATURE_FAKE_BAML_GENERATE_LOG"]
+args = sys.argv[1:]
+from_dir = None
+for index, arg in enumerate(args):
+    if arg == "--from" and index + 1 < len(args):
+        from_dir = args[index + 1]
+    elif arg.startswith("--from="):
+        from_dir = arg.split("=", 1)[1]
+if not args or args[0] != "generate" or from_dir is None:
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"error":"unexpected args","args":args}, sort_keys=True) + "\n")
+    sys.exit(2)
+
+with open(os.path.join(from_dir, "workflow.baml"), "r", encoding="utf-8") as handle:
+    workflow_source = handle.read()
+with open(os.path.join(from_dir, "generators.baml"), "r", encoding="utf-8") as handle:
+    generator_source = handle.read()
+
+runner_dir = os.path.abspath(os.path.join(from_dir, "..", "baml_runner"))
+client_dir = os.path.join(runner_dir, "baml_client")
+os.makedirs(client_dir, exist_ok=True)
+with open(os.path.join(client_dir, "index.ts"), "w", encoding="utf-8") as handle:
+    handle.write("""
+export const b = {
+  Classify: async function(message: string) {
+    return "generated-client:" + message;
+  }
+};
+""")
+
+with open(log_path, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({
+        "args": args,
+        "from": from_dir,
+        "workflow_contains_classify": "function Classify" in workflow_source,
+        "generator_contains_typescript": "output_type \"typescript\"" in generator_source,
+        "client": os.path.join(client_dir, "index.ts"),
+    }, sort_keys=True, separators=(",", ":")) + "\n")
+"#,
+    )
+    .expect("fake baml generate writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&bin)
+            .expect("fake baml generate metadata reads")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&bin, permissions).expect("fake baml generate is executable");
+    }
+    (bin_dir, log)
+}
+
+fn command_with_fake_baml_generate(
+    command: &mut Command,
+    bin_dir: &std::path::Path,
+    log: &std::path::Path,
+) {
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(bin_dir.to_path_buf()).chain(std::env::split_paths(&existing_path));
+    let path = std::env::join_paths(paths).expect("fake generate PATH builds");
+    let tsc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root")
+        .join("node_modules/.bin/tsc");
+    command
+        .env("PATH", path)
+        .env("ARMATURE_TSC", tsc)
+        .env("ARMATURE_FAKE_BAML_GENERATE_LOG", log);
+}
+
 #[test]
 fn validate_accepts_workflow() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -113,6 +457,7 @@ fn init_scaffolds_valid_local_project_and_refuses_overwrite() {
 
     let workflow = dir.path().join("workflow.armature");
     let policy = dir.path().join(".armature/policy.json");
+    let harness_policy = dir.path().join(".armature/harness-policy.json");
     let state_dir = dir.path().join(".armature/state");
     let workflow_store_dir = dir.path().join(".armature/workflows");
     assert_eq!(output["workflow_name"], "DemoWorkflow");
@@ -123,6 +468,10 @@ fn init_scaffolds_valid_local_project_and_refuses_overwrite() {
     assert_eq!(
         output["policy"].as_str(),
         Some(policy.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        output["harness_policy"].as_str(),
+        Some(harness_policy.to_string_lossy().as_ref())
     );
     assert_eq!(
         output["state_dir"].as_str(),
@@ -136,9 +485,23 @@ fn init_scaffolds_valid_local_project_and_refuses_overwrite() {
     assert!(workflow_store_dir.is_dir());
     let workflow_source = std::fs::read_to_string(&workflow).expect("workflow reads");
     assert!(workflow_source.contains("machine DemoWorkflow"));
+    let harness_policy_source =
+        std::fs::read_to_string(&harness_policy).expect("harness policy reads");
+    assert!(harness_policy_source.contains(r#""mode": "separated""#));
+    assert!(harness_policy_source.contains(r#""repo-writer""#));
 
     let validation = run_json(armature().arg("validate").arg(&workflow).arg("--json"));
     assert_eq!(validation["ok"], true);
+
+    let profile_validation = run_json(
+        armature()
+            .arg("validate-profile-policy")
+            .arg(&harness_policy)
+            .arg("--workflow")
+            .arg(&workflow)
+            .arg("--json"),
+    );
+    assert_eq!(profile_validation["ok"], true);
 
     let policy_validation = run_json(armature().arg("validate-policy").arg(&policy).arg("--json"));
     assert_eq!(policy_validation["ok"], true);
@@ -438,7 +801,7 @@ fn emit_run_status_events_and_log_share_the_same_store() {
             .arg(&file)
             .arg("--store")
             .arg(&store)
-            .arg("--agent-file")
+            .arg("--fixture-agent-file")
             .arg(&agent_file)
             .arg("--json"),
     );
@@ -457,7 +820,7 @@ fn emit_run_status_events_and_log_share_the_same_store() {
         .arg(&file)
         .arg("--store")
         .arg(&store)
-        .arg("--agent-file")
+        .arg("--fixture-agent-file")
         .arg(&agent_file)
         .output()
         .expect("command runs");
@@ -477,7 +840,7 @@ fn emit_run_status_events_and_log_share_the_same_store() {
             .arg(&file)
             .arg("--store")
             .arg(&store)
-            .arg("--agent-file")
+            .arg("--fixture-agent-file")
             .arg(&agent_file)
             .arg("--json"),
     );
@@ -493,7 +856,7 @@ fn emit_run_status_events_and_log_share_the_same_store() {
         .arg(&file)
         .arg("--store")
         .arg(&store)
-        .arg("--agent-file")
+        .arg("--fixture-agent-file")
         .arg(&agent_file)
         .output()
         .expect("command runs");
@@ -783,6 +1146,10 @@ state done {
 
 #[test]
 fn run_can_use_baml_http_coerce_without_fake_outputs() {
+    if !loopback_tests_enabled() {
+        eprintln!("skipping explicit BAML HTTP test; set ARMATURE_RUN_LOOPBACK_TESTS=1 to run it");
+        return;
+    }
     let dir = tempfile::tempdir().expect("tempdir");
     let file = dir.path().join("baml-http.armature");
     std::fs::write(
@@ -870,6 +1237,16 @@ state done {
         output["status"]["latest_coerce_calls"][0]["backend"]["kind"],
         "baml_http"
     );
+    assert_eq!(
+        output["status"]["latest_coerce_calls"][0]["backend"]["runtime_mode"],
+        Value::Null
+    );
+    assert_eq!(output["status"]["baml_runtime"]["mode"], "external_http");
+    assert_eq!(output["status"]["baml_runtime"]["status"], "observed");
+    assert_eq!(
+        output["status"]["baml_runtime"]["url"],
+        format!("http://{address}")
+    );
     assert!(
         output["status"]["latest_coerce_calls"][0]["backend"]["baml_src_hash"]
             .as_str()
@@ -893,6 +1270,275 @@ state done {
         )
         .expect("coerce raw response reads");
     assert_eq!(stored_raw_response, r#""done""#);
+    handle.join().expect("test server joins");
+}
+
+#[test]
+fn run_uses_generated_stdio_baml_by_default_when_coerce_exists() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_baml_coerce_workflow(&dir, "generated-stdio-baml.armature");
+    let store = dir.path().join("workflow.sqlite");
+    let (fake_runner, fake_runner_log) = write_fake_generated_stdio_runner(&dir);
+
+    let mut command = armature();
+    command_with_fake_generated_stdio_runner(&mut command, &fake_runner, &fake_runner_log);
+    let output = run_json(
+        command
+            .arg("run")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"hello"}"#)
+            .arg("--json"),
+    );
+
+    assert_eq!(output["outcome"]["status"], "processed");
+    assert_eq!(output["status"]["current_state"], "done");
+    assert_eq!(output["status"]["data"]["result"], "generated-stdio");
+    assert_eq!(
+        output["status"]["latest_coerce_calls"][0]["function_name"],
+        "classify"
+    );
+    assert_eq!(
+        output["status"]["latest_coerce_calls"][0]["parsed_output"],
+        "generated-stdio"
+    );
+    assert_eq!(
+        output["status"]["latest_coerce_calls"][0]["backend"]["kind"],
+        "baml_generated_stdio"
+    );
+    assert_eq!(
+        output["status"]["latest_coerce_calls"][0]["backend"]["runtime_mode"],
+        "generated_stdio"
+    );
+    assert_eq!(output["status"]["baml_runtime"]["mode"], "generated_stdio");
+    assert_eq!(output["status"]["baml_runtime"]["status"], "observed");
+    assert!(output["status"]["baml_runtime"]["baml_src_hash"]
+        .as_str()
+        .is_some_and(|hash| hash.starts_with("sha256:")));
+    assert!(
+        output["status"]["latest_coerce_calls"][0]["backend"]["baml_src_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("sha256:"))
+    );
+    assert!(
+        output["status"]["latest_coerce_calls"][0]["backend"]["runner_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("sha256:"))
+    );
+
+    let fake_log =
+        std::fs::read_to_string(&fake_runner_log).expect("fake generated stdio log reads");
+    assert!(
+        fake_log.contains(r#""function_name":"classify""#)
+            || fake_log.contains(r#""function":"classify""#)
+    );
+    assert!(fake_log.contains(r#""message":"hello""#));
+    assert!(fake_log.contains(r#""arg_order":["message"]"#));
+
+    let baml_source = std::fs::read_to_string(
+        dir.path()
+            .join(".armature/build/workflows/BamlHttpWorkflow/baml_src/workflow.baml"),
+    )
+    .expect("managed BAML source artifact reads");
+    assert!(baml_source.contains("function Classify"));
+    assert!(baml_source.contains("message: string"));
+
+    let managed_runner =
+        std::fs::read_to_string(dir.path().join(
+            ".armature/build/workflows/BamlHttpWorkflow/baml_runner/armature-baml-runner.mjs",
+        ))
+        .expect("managed BAML stdio runner artifact reads");
+    assert!(managed_runner.contains("ARMATURE_BAML_STDIO_PROTOCOL_VERSION"));
+    assert!(managed_runner.contains("importGeneratedClient"));
+
+    let (backend_json, parsed_output): (String, String) = rusqlite::Connection::open(&store)
+        .expect("store opens")
+        .query_row(
+            "SELECT backend_json, parsed_output_json FROM coerce_calls WHERE workflow_id = 'BamlHttpWorkflow'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("coerce backend and parsed output read");
+    assert!(backend_json.contains(r#""kind":"baml_generated_stdio""#));
+    assert!(backend_json.contains(r#""runtime_mode":"generated_stdio""#));
+    assert!(!backend_json.contains(r#""kind":"fake""#));
+    assert_eq!(parsed_output, r#""generated-stdio""#);
+}
+
+#[test]
+fn run_managed_generated_stdio_runs_baml_generate_and_generated_client() {
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("skipping managed generated stdio test; node is unavailable");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_baml_coerce_workflow(&dir, "managed-generated-stdio-baml.armature");
+    let store = dir.path().join("workflow.sqlite");
+    let (fake_baml_cli_dir, fake_baml_generate_log) = write_fake_baml_generate_cli(&dir);
+
+    let mut command = armature();
+    command_with_fake_baml_generate(&mut command, &fake_baml_cli_dir, &fake_baml_generate_log);
+    let output = run_json(
+        command
+            .arg("run")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"hello"}"#)
+            .arg("--json"),
+    );
+
+    assert_eq!(output["outcome"]["status"], "processed");
+    assert_eq!(output["status"]["current_state"], "done");
+    assert_eq!(output["status"]["data"]["result"], "generated-client:hello");
+    assert_eq!(
+        output["status"]["latest_coerce_calls"][0]["backend"]["kind"],
+        "baml_generated_stdio"
+    );
+
+    let generate_log =
+        std::fs::read_to_string(&fake_baml_generate_log).expect("fake baml generate log reads");
+    assert!(generate_log.contains(r#""args":["generate","--from""#));
+    assert!(generate_log.contains(r#""generator_contains_typescript":true"#));
+    assert!(generate_log.contains(r#""workflow_contains_classify":true"#));
+
+    let generator_source = std::fs::read_to_string(
+        dir.path()
+            .join(".armature/build/workflows/BamlHttpWorkflow/baml_src/generators.baml"),
+    )
+    .expect("managed BAML generator source artifact reads");
+    assert!(generator_source.contains(r#"output_dir "../baml_runner""#));
+}
+
+#[test]
+fn run_generated_stdio_can_use_codex_oauth_auth_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_baml_coerce_workflow(&dir, "generated-stdio-codex-oauth.armature");
+    let store = dir.path().join("workflow.sqlite");
+    let (fake_runner, fake_runner_log) = write_fake_generated_stdio_runner(&dir);
+    let codex_home = dir.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home).expect("codex home writes");
+    std::fs::write(
+        codex_home.join("auth.json"),
+        r#"{"tokens":{"access_token":"codex-oauth-test-token"}}"#,
+    )
+    .expect("codex auth writes");
+
+    let mut command = armature();
+    command_with_fake_generated_stdio_runner(&mut command, &fake_runner, &fake_runner_log);
+    let output = run_json(
+        command
+            .env("CODEX_HOME", &codex_home)
+            .arg("run")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"hello"}"#)
+            .arg("--baml-auth")
+            .arg("codex-oauth")
+            .arg("--json"),
+    );
+
+    assert_eq!(output["outcome"]["status"], "processed");
+    assert_eq!(output["status"]["data"]["result"], "generated-stdio");
+
+    let fake_log =
+        std::fs::read_to_string(&fake_runner_log).expect("fake generated stdio log reads");
+    assert!(fake_log.contains(r#""codex_oauth_token_present":true"#));
+    assert!(fake_log.contains(r#""codex_oauth_base_url":"https://chatgpt.com/backend-api/codex""#));
+
+    let baml_source = std::fs::read_to_string(
+        dir.path()
+            .join(".armature/build/workflows/BamlHttpWorkflow/baml_src/workflow.baml"),
+    )
+    .expect("managed BAML source artifact reads");
+    assert!(baml_source.contains(r#"provider "openai-responses""#));
+    assert!(baml_source.contains("api_key env.ARMATURE_CODEX_OAUTH_ACCESS_TOKEN"));
+    assert!(baml_source.contains("base_url env.ARMATURE_CODEX_OAUTH_BASE_URL"));
+    assert!(baml_source.contains("store false"));
+    assert!(baml_source.contains("stream true"));
+    assert!(baml_source.contains("instructions "));
+}
+
+#[test]
+fn run_baml_url_bypasses_managed_baml_cli_even_when_fake_is_on_path() {
+    if !loopback_tests_enabled() {
+        eprintln!("skipping explicit BAML HTTP test; set ARMATURE_RUN_LOOPBACK_TESTS=1 to run it");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_baml_coerce_workflow(&dir, "external-baml.armature");
+    let store = dir.path().join("workflow.sqlite");
+    let (fake_baml_bin_dir, fake_baml_log) = write_fake_baml_cli(&dir);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server binds");
+    let address = listener.local_addr().expect("test server address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request accepted");
+        let mut request = [0_u8; 4096];
+        let bytes_read = std::io::Read::read(&mut stream, &mut request).expect("request reads");
+        let request = String::from_utf8_lossy(&request[..bytes_read]);
+        assert!(request.starts_with("POST /call/classify "));
+        assert!(request.contains(r#""message":"hello""#));
+        let body = r#""external""#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        std::io::Write::write_all(&mut stream, response.as_bytes()).expect("response writes");
+    });
+
+    let mut command = armature();
+    command_with_fake_baml_cli(&mut command, &fake_baml_bin_dir, &fake_baml_log);
+    let output = run_json(
+        command
+            .arg("run")
+            .arg(&file)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"hello"}"#)
+            .arg("--baml-url")
+            .arg(format!("http://{address}"))
+            .arg("--json"),
+    );
+
+    assert_eq!(output["outcome"]["status"], "processed");
+    assert_eq!(output["status"]["current_state"], "done");
+    assert_eq!(output["status"]["data"]["result"], "external");
+    assert_eq!(
+        output["status"]["latest_coerce_calls"][0]["backend"]["kind"],
+        "baml_http"
+    );
+    assert_eq!(
+        output["status"]["latest_coerce_calls"][0]["backend"]["runtime_mode"],
+        Value::Null
+    );
+    assert_eq!(output["status"]["baml_runtime"]["mode"], "external_http");
+    assert_eq!(output["status"]["baml_runtime"]["status"], "observed");
+    assert_eq!(
+        output["status"]["baml_runtime"]["url"],
+        format!("http://{address}")
+    );
+    assert!(
+        !fake_baml_log.exists()
+            || std::fs::read_to_string(&fake_baml_log)
+                .expect("fake baml log reads")
+                .is_empty()
+    );
     handle.join().expect("test server joins");
 }
 
@@ -982,6 +1628,10 @@ state waiting {
 
 #[test]
 fn run_redacts_baml_http_raw_response_by_enterprise_policy_default() {
+    if !loopback_tests_enabled() {
+        eprintln!("skipping explicit BAML HTTP test; set ARMATURE_RUN_LOOPBACK_TESTS=1 to run it");
+        return;
+    }
     let dir = tempfile::tempdir().expect("tempdir");
     let file = dir.path().join("baml-http.armature");
     std::fs::write(
@@ -1086,6 +1736,10 @@ state done {
 
 #[test]
 fn status_text_surfaces_latest_coerce_failures() {
+    if !loopback_tests_enabled() {
+        eprintln!("skipping explicit BAML HTTP test; set ARMATURE_RUN_LOOPBACK_TESTS=1 to run it");
+        return;
+    }
     let dir = tempfile::tempdir().expect("tempdir");
     let file = dir.path().join("baml-http-failure.armature");
     std::fs::write(
@@ -1196,6 +1850,10 @@ state done {
 
 #[test]
 fn retry_success_clears_current_coerce_failure_but_keeps_history() {
+    if !loopback_tests_enabled() {
+        eprintln!("skipping explicit BAML HTTP test; set ARMATURE_RUN_LOOPBACK_TESTS=1 to run it");
+        return;
+    }
     let dir = tempfile::tempdir().expect("tempdir");
     let file = dir.path().join("coerce-retry.armature");
     std::fs::write(
@@ -1228,6 +1886,20 @@ state done {
     )
     .expect("workflow writes");
     let store = dir.path().join("workflow.sqlite");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server binds");
+    let address = listener.local_addr().expect("test server address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request accepted");
+        let mut request = [0_u8; 4096];
+        let _ = std::io::Read::read(&mut stream, &mut request).expect("request reads");
+        let body = "model unavailable";
+        let response = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        std::io::Write::write_all(&mut stream, response.as_bytes()).expect("response writes");
+    });
 
     let failed = armature()
         .arg("run")
@@ -1238,10 +1910,13 @@ state done {
         .arg("go")
         .arg("--payload")
         .arg(r#"{"message":"hello"}"#)
+        .arg("--baml-url")
+        .arg(format!("http://{address}"))
         .arg("--json")
         .output()
         .expect("command runs");
     assert!(!failed.status.success());
+    handle.join().expect("test server joins");
 
     let failed_events = run_json(
         armature()
@@ -1524,7 +2199,7 @@ fn events_and_log_accept_validation_context_flags() {
             .arg(&file)
             .arg("--store")
             .arg(&store)
-            .arg("--agent-file")
+            .arg("--fixture-agent-file")
             .arg(&agent_file)
             .arg("--policy")
             .arg(&policy)
@@ -1538,7 +2213,7 @@ fn events_and_log_accept_validation_context_flags() {
             .arg(&file)
             .arg("--store")
             .arg(&store)
-            .arg("--agent-file")
+            .arg("--fixture-agent-file")
             .arg(&agent_file)
             .arg("--policy")
             .arg(&policy)
@@ -1832,7 +2507,7 @@ fn validate_accepts_file_backed_adapter_flags_for_static_effect_checks() {
         armature()
             .arg("validate")
             .arg(&file)
-            .arg("--agent-file")
+            .arg("--fixture-agent-file")
             .arg(&agents)
             .arg("--json"),
     );
@@ -2274,7 +2949,7 @@ fn validate_accepts_template_with_local_file_backed_policy() {
         armature()
             .arg("validate")
             .arg(&workflow)
-            .arg("--agent-file")
+            .arg("--fixture-agent-file")
             .arg(&agents)
             .arg("--policy")
             .arg(&policy)
@@ -3061,7 +3736,7 @@ fn build_accepts_and_bundles_file_backed_adapter_flags() {
             .arg(&file)
             .arg("--out")
             .arg(&out)
-            .arg("--agent-file")
+            .arg("--fixture-agent-file")
             .arg(&agents)
             .arg("--json"),
     );
@@ -3197,7 +3872,7 @@ state done {
     assert!(baml.contains("enum Action"));
     assert!(baml.contains("class Decision"));
     assert!(!baml.contains("class WorkflowOnly"));
-    assert!(baml.contains("function choose(planText: string) -> Decision"));
+    assert!(baml.contains("function Choose(planText: string) -> Decision"));
     assert!(baml.contains("counts map<string, int>"));
     assert!(baml.contains("mode \"auto\" | \"manual\""));
     assert!(baml.contains("enabled true"));

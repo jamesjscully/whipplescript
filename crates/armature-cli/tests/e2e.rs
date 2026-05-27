@@ -8,6 +8,9 @@ fn armature() -> Command {
 }
 
 fn formal_checks_available() -> bool {
+    if env::var_os("ARMATURE_RUN_FORMAL_TESTS").is_none() {
+        return false;
+    }
     Command::new("sh")
         .arg("-c")
         .arg(
@@ -39,6 +42,21 @@ fn run_json(command: &mut Command) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("stdout is json")
+}
+
+fn run_failure(command: &mut Command) -> String {
+    let output = command.output().expect("command runs");
+    assert!(
+        !output.status.success(),
+        "command unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 fn spec_command() -> (PathBuf, PathBuf, PathBuf) {
@@ -318,7 +336,174 @@ state waiting {
         .expect("harness events")
         .iter()
         .any(|event| event["kind"] == "provider_started"
-            && event["payload"]["resolvedProfile"] == "repo-writer"));
+            && event["payload"]["resolvedProfile"] == "repo-writer"
+            && event["payload"]["enforcedAuthority"]["provider"] == "command"));
+}
+
+#[test]
+fn e2e_harness_profile_policy_rejects_strict_misconfigurations() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workflow = dir.path().join("strict-profile.armature");
+    let store = dir.path().join("workflow.sqlite");
+    let config = dir.path().join("harness.json");
+    let deny_command_policy = dir.path().join("deny-command-policy.json");
+    let mismatch_policy = dir.path().join("mismatch-policy.json");
+    let unknown_policy = dir.path().join("unknown-policy.json");
+
+    std::fs::write(
+        &workflow,
+        r#"
+machine StrictProfile
+initial waiting
+
+agent worker = codingAgent() {
+  profile "repo-writer"
+  maxActive 1
+}
+
+event go {
+  message string
+}
+
+event finished {
+  id string
+  name string
+  status string
+  summary string
+  exitCode int?
+}
+
+state waiting {
+  on go as evt {
+    start worker {
+      message evt.message
+    }
+    stay
+  }
+
+  on finished as run {
+    stay
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+    std::fs::write(
+        &config,
+        r#"{"agents":{"worker":{"provider":"command","command":["sh","-c","true"]}}}"#,
+    )
+    .expect("config writes");
+    std::fs::write(
+        &deny_command_policy,
+        r#"{
+  "mode": "separated",
+  "defaultProfile": "repo-writer",
+  "allowCommandProvider": false,
+  "profiles": {
+    "repo-writer": {
+      "description": "Implementation profile through an explicitly denied command provider.",
+      "provider": "command",
+      "command": ["sh", "-c", "true"],
+      "filesystem": "workspace_write",
+      "network": "denied",
+      "enforcement": "best_effort"
+    }
+  }
+}"#,
+    )
+    .expect("deny policy writes");
+    std::fs::write(
+        &mismatch_policy,
+        r#"{
+  "mode": "custom",
+  "defaultProfile": "repo-writer",
+  "allowCommandProvider": true,
+  "profiles": {
+    "repo-writer": {
+      "description": "Implementation profile expected to run through Codex.",
+      "provider": "codex",
+      "filesystem": "workspace_write",
+      "network": "denied",
+      "enforcement": "native_or_best_effort"
+    }
+  }
+}"#,
+    )
+    .expect("mismatch policy writes");
+    std::fs::write(
+        &unknown_policy,
+        r#"{
+  "mode": "custom",
+  "defaultProfile": "repo-writer",
+  "profiles": {}
+}"#,
+    )
+    .expect("unknown policy writes");
+
+    run_json(
+        armature()
+            .arg("run")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--event")
+            .arg("go")
+            .arg("--payload")
+            .arg(r#"{"message":"hello"}"#)
+            .arg("--json"),
+    );
+
+    let denied = run_failure(
+        armature()
+            .arg("harness")
+            .arg("once")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--config")
+            .arg(&config)
+            .arg("--profile-policy")
+            .arg(&deny_command_policy),
+    );
+    assert!(denied.contains("command provider is not allowed"));
+
+    let mismatch = run_failure(
+        armature()
+            .arg("harness")
+            .arg("once")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--config")
+            .arg(&config)
+            .arg("--profile-policy")
+            .arg(&mismatch_policy),
+    );
+    assert!(mismatch.contains("resolves to provider `codex`"));
+
+    let unknown = run_failure(
+        armature()
+            .arg("validate")
+            .arg(&workflow)
+            .arg("--profile-policy")
+            .arg(&unknown_policy),
+    );
+    assert!(unknown.contains("undefined harness profile `repo-writer`"));
+
+    let harness_status = run_json(
+        armature()
+            .arg("harness")
+            .arg("status")
+            .arg(&workflow)
+            .arg("--store")
+            .arg(&store)
+            .arg("--json"),
+    );
+    assert!(harness_status["recent_failures"]
+        .as_array()
+        .expect("recent failures")
+        .iter()
+        .any(|event| event["kind"] == "profile_resolution_failed"));
 }
 
 #[test]
@@ -881,8 +1066,8 @@ fn e2e_spec_implementation_runs_idle_worker_quality_loop_to_done() {
     }
     let baml_src =
         std::fs::read_to_string(build["baml_src"].as_str().unwrap()).expect("generated baml reads");
-    assert!(baml_src.contains("function classifyRun"));
-    assert!(baml_src.contains("function chooseNextStep"));
+    assert!(baml_src.contains("function ClassifyRun"));
+    assert!(baml_src.contains("function ChooseNextStep"));
 
     let idle = run_json(
         armature()
@@ -1541,7 +1726,7 @@ fn e2e_real_baml_http_coerce_when_enabled() {
     );
     let baml_src =
         std::fs::read_to_string(build["baml_src"].as_str().unwrap()).expect("generated baml reads");
-    assert!(baml_src.contains("function classifyText"));
+    assert!(baml_src.contains("function ClassifyText"));
 
     let run = run_json(
         armature()

@@ -121,7 +121,7 @@ Source:
 ```armature
 agent director = thread("director")
 agent external = adapter("untie")
-agent worker = codingAgent() {
+agent worker = codingAgent {
   profile "repo-writer"
   maxActive 4
 }
@@ -151,8 +151,10 @@ Agents are simple named targets. They do not imply wildcard group behavior.
 Pattern matching over event fields handles groups. `profile` is optional source
 metadata for native harness resolution; omitted profiles are resolved by
 harness profile policy. Thread agents are message targets for `send`; local
-`start` targets must be `codingAgent()` and are recorded in the native agent
-ledger. Explicit adapter-backed agents may also be started when their adapter
+`start` targets must be `codingAgent` roles and are recorded in the native
+agent ledger. The `codingAgent()` spelling is accepted only as compatibility
+syntax. Concrete providers are resolved later by harness policy and provider
+adapters. Explicit adapter-backed agents may also be started when their adapter
 contract is loaded and policy permits it.
 
 ## Capabilities

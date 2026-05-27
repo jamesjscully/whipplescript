@@ -31,8 +31,13 @@ target/debug/armature init "$init_dir" --name DocsSmoke --json >/dev/null
 grep -q 'machine DocsSmoke' "$init_dir/workflow.armature"
 target/debug/armature validate "$init_dir/workflow.armature" --json >/dev/null
 target/debug/armature validate-policy "$init_dir/.armature/policy.json" --json >/dev/null
+target/debug/armature validate \
+  "$init_dir/workflow.armature" \
+  --profile-policy "$init_dir/.armature/harness-policy.json" \
+  --json >/dev/null
 test -d "$init_dir/.armature/state"
 test -d "$init_dir/.armature/workflows"
+test -s "$init_dir/.armature/harness-policy.json"
 
 target/debug/armature validate \
   "$template" \
@@ -197,6 +202,11 @@ target/debug/armature validate-policy \
   examples/policies/local-file-backed.policy.json \
   examples/policies/enterprise-baml-http.policy.json \
   examples/policies/spec-implementation.enterprise-policy.json \
+  --json >/dev/null
+
+target/debug/armature validate-profile-policy \
+  "$init_dir/.armature/harness-policy.json" \
+  --workflow "$init_dir/workflow.armature" \
   --json >/dev/null
 
 for path in \

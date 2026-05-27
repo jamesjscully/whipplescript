@@ -60,7 +60,7 @@ class NextAction {
 }
 
 client<llm> ArmatureDefaultLLM {
-  provider "openai"
+  provider "openai-responses"
   options {
     model "gpt-4o-mini"
     api_key env.OPENAI_API_KEY
@@ -78,6 +78,30 @@ function selectNextAction(planText: string) -> NextAction {
   "#
 }
 ```
+
+When generated stdio is run with `--baml-auth codex-oauth`, the emitted client
+still uses `openai-responses`. Codex-specific request requirements must be
+expressed as BAML provider options wherever BAML supports them, not by
+rewriting the rendered prompt or request body in Armature:
+
+```baml
+api_key env.ARMATURE_CODEX_OAUTH_ACCESS_TOKEN
+base_url env.ARMATURE_CODEX_OAUTH_BASE_URL
+store false
+stream true
+instructions "Follow the BAML-generated prompt and return only the requested structured output."
+```
+
+Armature supplies those environment variables from an existing Codex login or
+an explicit `ARMATURE_CODEX_OAUTH_ACCESS_TOKEN`. The generated stdio runner may
+keep a narrow Codex SSE compatibility parser until BAML accepts the exact Codex
+stream event shape directly; it must not perform broad provider request
+mutation.
+
+For managed generated stdio, Armature writes a sibling `generators.baml` with a
+TypeScript ESM target, runs `baml-cli generate --from <baml_src>
+--no-version-check --no-tests`, and then executes the generated Node stdio
+runner. `ARMATURE_BAML_CLI` may point at a specific `baml-cli` executable.
 
 Do not require this as the normal user-authored shape:
 
@@ -106,22 +130,25 @@ function inputs and outputs. Workflow-only `class` or `enum` declarations that
 are used only for events, data, or adapter schemas remain in WorkflowIR but are
 not emitted into `workflow.baml`.
 
-The v1 runtime uses BAML HTTP as the selected execution path. Armature either
-connects to an existing BAML server or, in a later managed mode, starts:
+The v1 target runtime uses generated BAML client execution over stdin/stdout as
+the default path. This avoids requiring a local listening socket inside coding
+agent sandboxes.
 
-```sh
-baml-cli serve --from <build-dir>/baml_src
-```
-
-The Rust runtime then calls:
+`--baml-url` remains an override for an externally managed BAML HTTP endpoint.
+In that mode the Rust runtime calls:
 
 ```text
 POST /call/<function_name>
 ```
 
-with named JSON arguments. Generated TypeScript clients and the BAML Rust SDK
-are not part of the v1 `coerce` execution plan. They may be revisited later if
-the HTTP path proves insufficient.
+with named JSON arguments. `baml-cli serve` is useful for this explicit service
+mode, but it is not the normal local/sandbox UX.
+
+Generated client code is part of the default execution plan, but it is an
+implementation artifact owned by Armature, not workflow-authored TypeScript.
+
+See [managed-baml-runtime.md](managed-baml-runtime.md) for the default managed
+runtime target.
 
 ## Coerce Execution Contract
 
@@ -137,7 +164,7 @@ validate each argument against the declared parameter schema
 build named JSON argument object
 check durable coerce call log for an existing successful idempotency key
 if present, reuse the recorded parsed output
-otherwise call BAML HTTP
+otherwise call the selected BAML backend
 validate returned JSON against the declared output schema
 record input, backend, raw metadata, parsed output, validation result, and error
 continue transition with the parsed value
@@ -173,42 +200,53 @@ calling BAML.
 
 ## Backend Modes
 
+### Generated Stdio Backend
+
+Default product path:
+
+```sh
+armature run workflow.armature
+```
+
+When the workflow contains `coerce` and no fake coerce output is supplied,
+Armature generates BAML source, generates or loads a small BAML client runner,
+passes named JSON requests over stdin/stdout, records runtime metadata, and
+stops the process when the owning Armature command exits.
+
+Advantages:
+
+- users and agents run one workflow command
+- BAML source generation, source hash, logs, readiness, and failures are
+  recorded by the same product that owns `coerce`
+- no hidden sidecar setup is required for normal local runs
+- no local TCP listener is required inside the agent sandbox
+- policy can centrally decide whether local generated-client model execution is
+  allowed
+
 ### External BAML Server
 
-The first implementation should support an external server:
+External mode remains an override:
 
 ```sh
 armature run workflow.armature --baml-url http://127.0.0.1:2024
 ```
 
 The user or hosting environment is responsible for starting `baml-cli serve`
-against the generated `baml_src` directory.
+or another compatible BAML HTTP endpoint against approved source. This is useful
+for hosted model gateways, CI, debugging, and enterprise-managed services.
 
-Advantages:
+### Brokered BAML
 
-- smallest Armature implementation slice
-- clearer enterprise deployment boundary
-- no process supervision required for the first real `coerce` path
-- simple integration testing when `baml-cli` and provider credentials exist
+Brokered mode is the enterprise split-authority path. The sandboxed Armature
+runtime records a durable coerce request; a trusted out-of-sandbox broker
+performs the BAML/model call and writes back a typed result. The broker may use
+generated stdio, BAML HTTP, or a hosted provider behind the workflow boundary.
 
-### Managed BAML Server
+All modes must record:
 
-Managed mode is a later convenience:
-
-```sh
-armature run workflow.armature --manage-baml
-```
-
-Armature starts `baml-cli serve --from <build-dir>/baml_src`, captures logs, and
-stops the server when the workflow host stops. This mode may reuse process and
-log-capture lessons from the legacy runtime, but the legacy runtime should not
-own the `coerce` semantics.
-
-Managed mode must record:
-
-- server command and version
+- backend mode and command/service identity
 - generated `baml_src` hash
-- selected port or socket
+- runner hash, external URL, or broker request id
 - stdout/stderr paths or captured log records
 - startup and health-check failures
 
@@ -247,8 +285,7 @@ The storage layer should persist a `coerce_calls` record with:
   "function_name": "chooseNextStep",
   "idempotency_key": "implementationLoop/statechart-workflow-ir/v0/evt_01H/state:choosing/entry/0/chooseNextStep/{\"planText\":\"W1 ready\"}",
   "backend": {
-    "kind": "baml_http",
-    "url": "http://127.0.0.1:2024",
+    "kind": "baml_generated_stdio",
     "baml_src_hash": "sha256:..."
   },
   "args": {
@@ -280,7 +317,10 @@ remain visible enough for replay and status.
 Failure categories:
 
 ```text
-baml_server_unavailable
+baml_runner_unavailable
+baml_runner_protocol_error
+baml_broker_unavailable
+baml_http_unavailable
 baml_http_error
 baml_timeout
 baml_parse_failure
@@ -359,7 +399,7 @@ BAML-compatible representation.
 
 Multimodal BAML types such as `image`, `audio`, `pdf`, and `video` are reserved
 for future opaque media schema support. The current runtime must reject them
-unless the schema layer, policy layer, and BAML HTTP executor all explicitly
+unless the schema layer, policy layer, and BAML executor all explicitly
 support the media representation being passed.
 
 BAML does not support `set` or `tuple`. If Armature supports set-like durable
@@ -437,7 +477,8 @@ allowed environment variables
 whether network/model calls are allowed
 whether BAML tools are allowed
 allowed BAML HTTP URLs
-whether Armature may manage a local baml-cli serve process
+whether Armature may run a generated local BAML client
+whether Armature may enqueue brokered BAML requests
 ```
 
 Advanced explicit client declarations may be added later, but they should stay

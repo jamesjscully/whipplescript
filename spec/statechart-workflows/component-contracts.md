@@ -312,7 +312,9 @@ item id.
 
 ## Coerce Executor Contract
 
-`coerce` is a synchronous value effect backed by BAML HTTP in v1.
+`coerce` is a synchronous value effect backed by the selected BAML backend in
+v1. The target default backend is generated BAML client execution over
+stdin/stdout; external HTTP and brokered execution are explicit modes.
 
 Request:
 
@@ -331,8 +333,7 @@ Request:
   },
   "output_schema": {"type": "ref", "name": "NextStep"},
   "backend": {
-    "kind": "baml_http",
-    "url": "http://127.0.0.1:2024",
+    "kind": "baml_generated_stdio",
     "baml_src_hash": "sha256:..."
   },
   "timeout_ms": 60000
@@ -362,13 +363,13 @@ Rules:
 
 - arguments are named by `coerce` parameter names, even if the source call uses
   positional syntax
-- argument values are schema-validated before the HTTP call
-- parsed output is schema-validated after the HTTP call
+- argument values are schema-validated before the BAML backend call
+- parsed output is schema-validated after the BAML backend call
 - successful outputs are reused by idempotency key during replay
 - failed attempts are durable records and may be retried only through explicit
   runtime retry policy
 - the executor cannot dispatch workflow effects or mutate workflow data
-- BAML HTTP internals are not modeled by formal backends
+- BAML backend internals are not modeled by formal backends
 
 ## Adapter Manifest Contract
 

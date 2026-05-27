@@ -291,6 +291,18 @@ pub mod coerce {
         BamlHttp {
             url: String,
             baml_src_hash: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            runtime_mode: Option<String>,
+        },
+        BamlGeneratedStdio {
+            baml_src_hash: Option<String>,
+            runner_hash: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            runtime_mode: Option<String>,
+        },
+        BamlBrokered {
+            request_id: String,
+            baml_src_hash: Option<String>,
         },
     }
 
@@ -307,6 +319,9 @@ pub mod coerce {
         MissingExecutor,
         MissingFakeOutput,
         BamlServerUnavailable,
+        BamlRunnerUnavailable,
+        BamlRunnerProtocolError,
+        BamlBrokerUnavailable,
         BamlHttpError,
         BamlTimeout,
         BamlParseFailure,
@@ -398,6 +413,7 @@ pub mod coerce {
     pub struct BamlHttpCoerceExecutor {
         base_url: String,
         baml_src_hash: Option<String>,
+        runtime_mode: Option<String>,
         timeout_ms: Option<u64>,
         api_key: Option<String>,
         store_raw_response: bool,
@@ -408,6 +424,7 @@ pub mod coerce {
             Self {
                 base_url: base_url.into(),
                 baml_src_hash: None,
+                runtime_mode: None,
                 timeout_ms: None,
                 api_key: None,
                 store_raw_response: true,
@@ -416,6 +433,11 @@ pub mod coerce {
 
         pub fn with_baml_src_hash(mut self, baml_src_hash: Option<String>) -> Self {
             self.baml_src_hash = baml_src_hash;
+            self
+        }
+
+        pub fn with_runtime_mode(mut self, runtime_mode: Option<String>) -> Self {
+            self.runtime_mode = runtime_mode;
             self
         }
 
@@ -446,6 +468,7 @@ pub mod coerce {
             CoerceBackend::BamlHttp {
                 url: self.base_url.clone(),
                 baml_src_hash: self.baml_src_hash.clone(),
+                runtime_mode: self.runtime_mode.clone(),
             }
         }
     }
@@ -729,6 +752,8 @@ pub mod status {
         #[serde(default)]
         pub current_coerce_failure: Option<CoerceCallSummary>,
         #[serde(default)]
+        pub baml_runtime: Option<BamlRuntimeSummary>,
+        #[serde(default)]
         pub current_effect_failures: Vec<String>,
         #[serde(default)]
         pub policy_blockers: Vec<String>,
@@ -767,6 +792,16 @@ pub mod status {
         pub error: Option<String>,
         pub duration_ms: Option<u64>,
         pub created_at: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct BamlRuntimeSummary {
+        pub mode: String,
+        pub status: String,
+        pub url: String,
+        pub baml_src_hash: Option<String>,
+        pub last_error: Option<String>,
+        pub last_call_at: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3226,6 +3261,7 @@ pub fn project_status(
         .cloned()
         .map(coerce_call_summary)
         .collect::<Vec<_>>();
+    let baml_runtime = baml_runtime_summary(&latest_coerce_records);
     let latest_coerce_failures = store
         .latest_coerce_failures(workflow_id, 10)?
         .into_iter()
@@ -3285,6 +3321,7 @@ pub fn project_status(
         latest_coerce_calls,
         latest_coerce_failures,
         current_coerce_failure,
+        baml_runtime,
         current_effect_failures,
         policy_blockers,
         current_blockers,
@@ -3322,6 +3359,59 @@ fn coerce_call_summary(record: coerce::CoerceCallRecord) -> status::CoerceCallSu
         duration_ms: record.duration_ms,
         created_at: record.created_at,
     }
+}
+
+fn baml_runtime_summary(
+    records: &[coerce::CoerceCallRecord],
+) -> Option<status::BamlRuntimeSummary> {
+    records.iter().find_map(|record| {
+        let (mode, url, baml_src_hash) = match &record.backend {
+            coerce::CoerceBackend::BamlHttp {
+                url,
+                baml_src_hash,
+                runtime_mode,
+            } => (
+                runtime_mode
+                    .clone()
+                    .unwrap_or_else(|| "external_http".to_string()),
+                url.clone(),
+                baml_src_hash.clone(),
+            ),
+            coerce::CoerceBackend::BamlGeneratedStdio {
+                baml_src_hash,
+                runtime_mode,
+                ..
+            } => (
+                runtime_mode
+                    .clone()
+                    .unwrap_or_else(|| "generated_stdio".to_string()),
+                "stdio".to_string(),
+                baml_src_hash.clone(),
+            ),
+            coerce::CoerceBackend::BamlBrokered {
+                request_id,
+                baml_src_hash,
+            } => (
+                "brokered".to_string(),
+                format!("brokered:{request_id}"),
+                baml_src_hash.clone(),
+            ),
+            _ => return None,
+        };
+        let status = match record.status {
+            coerce::CoerceStatus::Succeeded => "observed",
+            coerce::CoerceStatus::Failed => "failed",
+        }
+        .to_string();
+        Some(status::BamlRuntimeSummary {
+            mode,
+            status,
+            url,
+            baml_src_hash,
+            last_error: record.error.clone(),
+            last_call_at: record.created_at.clone(),
+        })
+    })
 }
 
 fn project_active_invocations(
@@ -3663,6 +3753,7 @@ impl Interpreter {
             latest_coerce_calls: Vec::new(),
             latest_coerce_failures: Vec::new(),
             current_coerce_failure: None,
+            baml_runtime: None,
             current_effect_failures: Vec::new(),
             policy_blockers: Vec::new(),
             current_blockers: Vec::new(),
@@ -5237,11 +5328,17 @@ mod tests {
         AgentCompletionRecord, AgentInvocationRecord, AgentInvocationStatus, StorageError,
         WorkflowStore,
     };
-    use super::{EventProcessingStatus, Interpreter, InterpreterError, WorkflowRuntime};
+    use super::{
+        baml_runtime_summary, EventProcessingStatus, Interpreter, InterpreterError, WorkflowRuntime,
+    };
     use serde_json::json;
     use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
+
+    fn loopback_tests_enabled() -> bool {
+        std::env::var_os("ARMATURE_RUN_LOOPBACK_TESTS").is_some()
+    }
 
     fn minimal_interpreter() -> Interpreter {
         let source = include_str!("../../../examples/workflows/minimal.armature");
@@ -5660,6 +5757,7 @@ state done {
             backend: CoerceBackend::BamlHttp {
                 url: "http://127.0.0.1:2024".to_string(),
                 baml_src_hash: Some("sha256:test".to_string()),
+                runtime_mode: None,
             },
             args,
             status: CoerceStatus::Succeeded,
@@ -5743,7 +5841,84 @@ state done {
     }
 
     #[test]
+    fn baml_runtime_summary_projects_generated_stdio_records() {
+        let record = CoerceCallRecord {
+            coerce_call_id: "coerce_1".to_string(),
+            workflow_id: "Supervisor".to_string(),
+            workflow_version: "version_1".to_string(),
+            transition_id: None,
+            event_id: None,
+            step_path: "watching.entry[0]".to_string(),
+            function_name: "ChooseNextStep".to_string(),
+            idempotency_key: "Supervisor:tick:ChooseNextStep".to_string(),
+            backend: CoerceBackend::BamlGeneratedStdio {
+                baml_src_hash: Some("sha256:baml".to_string()),
+                runner_hash: Some("sha256:runner".to_string()),
+                runtime_mode: None,
+            },
+            args: BTreeMap::new(),
+            status: CoerceStatus::Succeeded,
+            http_status: None,
+            raw_response: None,
+            parsed_output: Some(json!({"kind": "idle"})),
+            error: None,
+            duration_ms: Some(13),
+            created_at: "2026-05-23T00:00:00Z".to_string(),
+        };
+
+        let summary = baml_runtime_summary(&[record]).expect("summary projects");
+
+        assert_eq!(summary.mode, "generated_stdio");
+        assert_eq!(summary.status, "observed");
+        assert_eq!(summary.url, "stdio");
+        assert_eq!(summary.baml_src_hash, Some("sha256:baml".to_string()));
+        assert_eq!(summary.last_error, None);
+        assert_eq!(summary.last_call_at, "2026-05-23T00:00:00Z");
+    }
+
+    #[test]
+    fn baml_runtime_summary_projects_brokered_records() {
+        let record = CoerceCallRecord {
+            coerce_call_id: "coerce_1".to_string(),
+            workflow_id: "Supervisor".to_string(),
+            workflow_version: "version_1".to_string(),
+            transition_id: None,
+            event_id: None,
+            step_path: "watching.entry[0]".to_string(),
+            function_name: "ChooseNextStep".to_string(),
+            idempotency_key: "Supervisor:tick:ChooseNextStep".to_string(),
+            backend: CoerceBackend::BamlBrokered {
+                request_id: "coerce_req_1".to_string(),
+                baml_src_hash: Some("sha256:baml".to_string()),
+            },
+            args: BTreeMap::new(),
+            status: CoerceStatus::Failed,
+            http_status: None,
+            raw_response: None,
+            parsed_output: None,
+            error: Some("broker unavailable".to_string()),
+            duration_ms: Some(13),
+            created_at: "2026-05-23T00:00:00Z".to_string(),
+        };
+
+        let summary = baml_runtime_summary(&[record]).expect("summary projects");
+
+        assert_eq!(summary.mode, "brokered");
+        assert_eq!(summary.status, "failed");
+        assert_eq!(summary.url, "brokered:coerce_req_1");
+        assert_eq!(summary.baml_src_hash, Some("sha256:baml".to_string()));
+        assert_eq!(summary.last_error, Some("broker unavailable".to_string()));
+        assert_eq!(summary.last_call_at, "2026-05-23T00:00:00Z");
+    }
+
+    #[test]
     fn baml_http_coerce_executor_posts_named_args_and_reads_json_output() {
+        if !loopback_tests_enabled() {
+            eprintln!(
+                "skipping explicit BAML HTTP test; set ARMATURE_RUN_LOOPBACK_TESTS=1 to run it"
+            );
+            return;
+        }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server binds");
         let address = listener.local_addr().expect("test server address");
         let handle = std::thread::spawn(move || {
@@ -5793,6 +5968,7 @@ state done {
             CoerceBackend::BamlHttp {
                 url: format!("http://{address}"),
                 baml_src_hash: Some("sha256:test".to_string()),
+                runtime_mode: None,
             }
         );
         handle.join().expect("test server joins");
@@ -5800,6 +5976,12 @@ state done {
 
     #[test]
     fn baml_http_coerce_executor_classifies_http_errors() {
+        if !loopback_tests_enabled() {
+            eprintln!(
+                "skipping explicit BAML HTTP test; set ARMATURE_RUN_LOOPBACK_TESTS=1 to run it"
+            );
+            return;
+        }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server binds");
         let address = listener.local_addr().expect("test server address");
         let handle = std::thread::spawn(move || {

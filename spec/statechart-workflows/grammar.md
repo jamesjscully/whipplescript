@@ -76,7 +76,7 @@ AgentDecl =
 
 AgentCtor =
     "thread" "(" String ")"
-  | "codingAgent" "(" ")"
+  | "codingAgent" ("(" ")")?
   | "adapter" "(" String ")"
 
 AgentOptions =
@@ -97,7 +97,9 @@ intent labels, not provider names; concrete commands, filesystem posture,
 network posture, timeout, and enforcement mode are resolved through harness
 profile policy.
 Thread agents are message targets and cannot be used with `start`. Native
-started work must target `codingAgent()`. Explicitly external starts may target
+started work must target `codingAgent`. The `codingAgent()` spelling is a
+compatibility alias, but canonical source should omit parentheses because this
+is a role declaration, not a concrete provider constructor. Explicitly external starts may target
 an adapter-backed agent when the adapter contract is loaded and policy permits
 it.
 

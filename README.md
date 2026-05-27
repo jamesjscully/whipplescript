@@ -5,9 +5,11 @@ orchestrating coding agents.
 
 The current product surface is native `.armature` workflow files, validated
 workflow IR, durable event queues, append-only transition/effect logs, trusted
-Rust adapters, and an initial `init` / `validate` / `emit` / `run` / `status` /
-`overview` / `events` / `log` / `build` / `check` / `emit-model` /
-`emit-config` / `prove` / `validate-adapter` / `validate-policy` CLI.
+Rust adapters, native harness execution, and an initial `init` / `validate` /
+`emit` / `run` / `status` / `overview` / `events` / `retry-event` / `log` /
+`build` / `check` / `emit-model` / `emit-config` / `prove` /
+`validate-adapter` / `validate-policy` / `validate-profile-policy` /
+`harness` CLI.
 Workflow files do not execute arbitrary TypeScript, shell, or host-language
 code.
 
@@ -18,9 +20,9 @@ New implementation work lives in these crates:
 ```text
 crates/armature-workflow   native DSL parser, IR, schemas, diagnostics, validation
 crates/armature-engine     durable queue/log/state and interpreter skeleton
-crates/armature-adapters   trusted adapter manifests and dispatchers for BAML, humans, agents, legacy bridges
+crates/armature-adapters   trusted adapter manifests and dispatchers for BAML, plan files, humans, legacy bridges
 crates/armature-modelgen   TLA+/Apalache/Maude/Veil model generation
-crates/armature-cli        small workflow CLI for validate/emit/run/status/overview/events/log/build/check/model iteration
+crates/armature-cli        small workflow CLI for validate/emit/run/status/overview/events/log/build/check/harness/model iteration
 ```
 
 Specs live in [`spec/statechart-workflows`](spec/statechart-workflows).
@@ -99,14 +101,18 @@ provider completions back through the workflow. The next governed execution
 surface is harness profile policy: workflows request semantic profiles such as
 `research`, `repo-reader`, `repo-writer`, or `human-review`, and policy maps
 those profiles to concrete providers, filesystem/network posture, environment
-allowlists, timeout, and enforcement mode. The e2e suite covers the
+allowlists, timeout, and enforcement mode. Codex profiles map filesystem
+posture to `--sandbox` and web access to `--search`; Claude profiles map
+filesystem posture to `--permission-mode` and tools to `--allowedTools`; Pi is
+reported as best-effort until its sandbox flags are mapped. The e2e suite covers the
 runtime boundary using fake manifests, explicit fake outputs, the JSON plan
 file adapter, the JSON review file bridge, and the native command harness. The
 current runtime evaluates the
 supported expression kernel, executes supported `case` branches, executes
 `always` transitions with loop protection, and supports
-hierarchical initial-state descent plus parent event fallback. It also persists
-adapter effect dispatch records for `start`, `send`, `askHuman`, `raise`, and
+hierarchical initial-state descent plus parent event fallback. It persists
+native ledger records for local `start`/`send`, and adapter effect dispatch
+records for `askHuman`, adapter-backed starts/messages, `raise`, and
 capability-call steps, including evaluated payload arguments for the supported
 expression subset. Expression-style capability value calls such as
 `plan.snapshot()` dispatch through the same adapter boundary. `raise` enqueues
@@ -134,17 +140,27 @@ adapter-backed effect checks. Commands that validate or dispatch adapter-backed
 effects also accept `--policy <json>` capability documents.
 Policy documents currently support exact `allowed_capabilities`,
 `denied_capabilities`, `local` / `team` / `enterprise` modes, and initial BAML
-HTTP execution controls. `run --baml-url` checks `baml.coerce`,
-`allow_baml_network`, and exact `allowed_baml_urls` entries before any network
-call. `store_baml_raw_responses` controls whether BAML HTTP raw responses are
-stored or replaced with a redaction marker; enterprise mode redacts by default
-while parsed output remains durable. Unknown capabilities warn in local mode and
-become errors under stricter modes according to effect category and write-like
-capability names. The manifest dispatcher enforces the same supplied policy at
-runtime before dispatching each adapter-backed effect. `emit` and `run --event`
-can also use manifest event schemas for adapter-originated events that are not
-declared directly in the workflow. `emit --policy` validates policy document
-shape but does not require event-only manifests to declare workflow effects.
+execution controls. The target default for real `coerce` is generated BAML
+client execution over stdin/stdout, so coding-agent sandboxes do not need local
+TCP listener authority. `--baml-url` remains an external BAML HTTP endpoint
+override, `--baml-auth codex-oauth` can use an existing Codex/ChatGPT OAuth
+login for generated stdio execution, and brokered mode is the planned
+enterprise split-authority path.
+External mode checks `baml.coerce`, BAML HTTP permission, network permission,
+and exact `allowed_baml_urls`; generated stdio mode checks `baml.coerce`, local
+runner permission, model/network/env/model policy, and Codex OAuth permission
+when selected; brokered mode checks `baml.coerce` and broker permission.
+`store_baml_raw_responses` controls whether
+BAML raw responses are stored or replaced with a redaction marker; enterprise
+mode redacts by default while parsed output remains durable. Unknown
+capabilities warn in local mode and become errors under stricter modes
+according to effect category and write-like capability names. The manifest
+dispatcher enforces the
+same supplied policy at runtime before dispatching each adapter-backed effect.
+`emit` and `run --event` can also use manifest event schemas for
+adapter-originated events that are not declared directly in the workflow. `emit
+--policy` validates policy document shape but does not require event-only
+manifests to declare workflow effects.
 Runtime string interpolation supports path
 expressions such as `{{ classification.reason }}`. Static validation checks
 nested expression calls and dotted paths against declared data fields, event

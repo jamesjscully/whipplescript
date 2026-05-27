@@ -22,6 +22,14 @@ pub struct CapabilityPolicyDocument {
     #[serde(default)]
     pub allowed_baml_urls: Vec<String>,
     #[serde(default)]
+    pub allow_baml_stdio_runner: Option<bool>,
+    #[serde(default)]
+    pub allow_baml_http: Option<bool>,
+    #[serde(default)]
+    pub allow_baml_broker: Option<bool>,
+    #[serde(default)]
+    pub allow_baml_codex_oauth: Option<bool>,
+    #[serde(default)]
     pub allow_managed_baml_server: Option<bool>,
     #[serde(default)]
     pub allowed_models: Vec<String>,
@@ -43,6 +51,10 @@ impl Default for CapabilityPolicyDocument {
             denied_capabilities: Vec::new(),
             allow_baml_network: None,
             allowed_baml_urls: Vec::new(),
+            allow_baml_stdio_runner: None,
+            allow_baml_http: None,
+            allow_baml_broker: None,
+            allow_baml_codex_oauth: None,
             allow_managed_baml_server: None,
             allowed_models: Vec::new(),
             allowed_env_vars: Vec::new(),
@@ -786,6 +798,206 @@ pub fn validate_baml_http_policy(
         diagnostics.push(error(format!(
             "BAML HTTP URL `{url}` requires an exact `allowed_baml_urls` entry in enterprise policy. Fix: add the exact URL to allowed_baml_urls only if this endpoint is approved."
         )));
+    }
+
+    diagnostics
+}
+
+pub fn validate_managed_baml_policy(
+    policies: &[CapabilityPolicyDocument],
+) -> Vec<armature_workflow::Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let strictest_mode = policies
+        .iter()
+        .map(|policy| policy.mode)
+        .max_by_key(policy_mode_rank)
+        .unwrap_or(armature_workflow::policy::PolicyMode::Local);
+
+    if policies.iter().any(|policy| {
+        policy
+            .denied_capabilities
+            .iter()
+            .any(|denied| denied == "baml.coerce")
+    }) {
+        diagnostics.push(error(
+            "Managed BAML coerce requires denied capability `baml.coerce`. Fix: remove `baml.coerce` from denied_capabilities only if model access is intended."
+                .to_string(),
+        ));
+    } else if !policies.iter().any(|policy| {
+        policy
+            .allowed_capabilities
+            .iter()
+            .any(|allowed| allowed == "baml.coerce")
+    }) {
+        let severity = if unknown_capability_is_error(
+            strictest_mode,
+            armature_engine::effects::EffectCategory::SyncValue,
+            "baml.coerce",
+        ) {
+            armature_workflow::Severity::Error
+        } else {
+            armature_workflow::Severity::Warning
+        };
+        diagnostics.push(diagnostic_at(
+            severity,
+            "Managed BAML coerce requires capability `baml.coerce` that is not allowed by supplied policy. Fix: add `baml.coerce` to allowed_capabilities only if model access is intended."
+                .to_string(),
+            None,
+        ));
+    }
+
+    if policies
+        .iter()
+        .any(|policy| policy.allow_baml_network == Some(false))
+    {
+        diagnostics.push(error(
+            "Managed BAML network execution is denied by supplied policy. Fix: set `allow_baml_network: true` only if network model access is intended."
+                .to_string(),
+        ));
+    } else if !policies
+        .iter()
+        .any(|policy| policy.allow_baml_network == Some(true))
+        && strictest_mode == armature_workflow::policy::PolicyMode::Enterprise
+    {
+        diagnostics.push(error(
+            "Managed BAML network execution requires `allow_baml_network: true` in enterprise policy. Fix: set `allow_baml_network: true` only for approved managed BAML execution."
+                .to_string(),
+        ));
+    }
+
+    if policies
+        .iter()
+        .any(|policy| policy.allow_managed_baml_server == Some(false))
+    {
+        diagnostics.push(error(
+            "Managed BAML server execution is denied by supplied policy. Fix: set `allow_managed_baml_server: true` for local managed execution, or pass --baml-url with an endpoint listed in allowed_baml_urls."
+                .to_string(),
+        ));
+    } else if !policies
+        .iter()
+        .any(|policy| policy.allow_managed_baml_server == Some(true))
+        && strictest_mode == armature_workflow::policy::PolicyMode::Enterprise
+    {
+        diagnostics.push(error(
+            "Managed BAML server execution requires `allow_managed_baml_server: true` in enterprise policy. Fix: set `allow_managed_baml_server: true` for local managed execution, or pass --baml-url with an endpoint listed in allowed_baml_urls."
+                .to_string(),
+        ));
+    }
+
+    diagnostics
+}
+
+pub fn validate_generated_baml_stdio_policy(
+    policies: &[CapabilityPolicyDocument],
+) -> Vec<armature_workflow::Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let strictest_mode = policies
+        .iter()
+        .map(|policy| policy.mode)
+        .max_by_key(policy_mode_rank)
+        .unwrap_or(armature_workflow::policy::PolicyMode::Local);
+
+    if policies.iter().any(|policy| {
+        policy
+            .denied_capabilities
+            .iter()
+            .any(|denied| denied == "baml.coerce")
+    }) {
+        diagnostics.push(error(
+            "Generated BAML stdio coerce requires denied capability `baml.coerce`. Fix: remove `baml.coerce` from denied_capabilities only if model access is intended."
+                .to_string(),
+        ));
+    } else if !policies.iter().any(|policy| {
+        policy
+            .allowed_capabilities
+            .iter()
+            .any(|allowed| allowed == "baml.coerce")
+    }) {
+        let severity = if unknown_capability_is_error(
+            strictest_mode,
+            armature_engine::effects::EffectCategory::SyncValue,
+            "baml.coerce",
+        ) {
+            armature_workflow::Severity::Error
+        } else {
+            armature_workflow::Severity::Warning
+        };
+        diagnostics.push(diagnostic_at(
+            severity,
+            "Generated BAML stdio coerce requires capability `baml.coerce` that is not allowed by supplied policy. Fix: add `baml.coerce` to allowed_capabilities only if model access is intended."
+                .to_string(),
+            None,
+        ));
+    }
+
+    if policies
+        .iter()
+        .any(|policy| policy.allow_baml_stdio_runner == Some(false))
+    {
+        diagnostics.push(error(
+            "Generated BAML stdio execution is denied by supplied policy. Fix: set `allow_baml_stdio_runner: true` only if local generated BAML execution is intended."
+                .to_string(),
+        ));
+    } else if !policies
+        .iter()
+        .any(|policy| policy.allow_baml_stdio_runner == Some(true))
+        && strictest_mode == armature_workflow::policy::PolicyMode::Enterprise
+    {
+        diagnostics.push(error(
+            "Generated BAML stdio execution requires `allow_baml_stdio_runner: true` in enterprise policy. Fix: enable it only for approved local generated BAML execution."
+                .to_string(),
+        ));
+    }
+
+    if policies
+        .iter()
+        .any(|policy| policy.allow_baml_network == Some(false))
+    {
+        diagnostics.push(error(
+            "Generated BAML stdio network execution is denied by supplied policy. Fix: set `allow_baml_network: true` only if direct model access from this process is intended."
+                .to_string(),
+        ));
+    } else if !policies
+        .iter()
+        .any(|policy| policy.allow_baml_network == Some(true))
+        && strictest_mode == armature_workflow::policy::PolicyMode::Enterprise
+    {
+        diagnostics.push(error(
+            "Generated BAML stdio execution requires `allow_baml_network: true` in enterprise policy unless brokered coerce is selected."
+                .to_string(),
+        ));
+    }
+
+    diagnostics
+}
+
+pub fn validate_baml_codex_oauth_policy(
+    policies: &[CapabilityPolicyDocument],
+) -> Vec<armature_workflow::Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let strictest_mode = policies
+        .iter()
+        .map(|policy| policy.mode)
+        .max_by_key(policy_mode_rank)
+        .unwrap_or(armature_workflow::policy::PolicyMode::Local);
+
+    if policies
+        .iter()
+        .any(|policy| policy.allow_baml_codex_oauth == Some(false))
+    {
+        diagnostics.push(error(
+            "BAML Codex OAuth execution is denied by supplied policy. Fix: set `allow_baml_codex_oauth: true` only if ChatGPT/Codex account auth is intended."
+                .to_string(),
+        ));
+    } else if !policies
+        .iter()
+        .any(|policy| policy.allow_baml_codex_oauth == Some(true))
+        && strictest_mode == armature_workflow::policy::PolicyMode::Enterprise
+    {
+        diagnostics.push(error(
+            "BAML Codex OAuth execution requires `allow_baml_codex_oauth: true` in enterprise policy. Fix: enable it only for approved ChatGPT/Codex account auth."
+                .to_string(),
+        ));
     }
 
     diagnostics
@@ -4719,6 +4931,105 @@ mod tests {
         assert!(diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("Fix: set `allow_baml_network: true`")));
+    }
+
+    #[test]
+    fn managed_baml_policy_allows_explicit_enterprise_authority() {
+        let policy = CapabilityPolicyDocument {
+            mode: armature_workflow::policy::PolicyMode::Enterprise,
+            allowed_capabilities: vec!["baml.coerce".to_string()],
+            allow_baml_network: Some(true),
+            allow_managed_baml_server: Some(true),
+            ..Default::default()
+        };
+
+        assert!(crate::validate_managed_baml_policy(&[policy]).is_empty());
+    }
+
+    #[test]
+    fn managed_baml_policy_requires_enterprise_explicit_authority() {
+        let policy = CapabilityPolicyDocument {
+            mode: armature_workflow::policy::PolicyMode::Enterprise,
+            ..Default::default()
+        };
+
+        let diagnostics = crate::validate_managed_baml_policy(&[policy]);
+        assert_eq!(diagnostics.len(), 3);
+        assert!(diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity == armature_workflow::Severity::Error));
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("requires capability `baml.coerce`")));
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("requires `allow_baml_network: true`")));
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("requires `allow_managed_baml_server: true`")));
+    }
+
+    #[test]
+    fn managed_baml_policy_warns_for_unknown_local_capability() {
+        let policy = CapabilityPolicyDocument {
+            mode: armature_workflow::policy::PolicyMode::Local,
+            ..Default::default()
+        };
+
+        let diagnostics = crate::validate_managed_baml_policy(&[policy]);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].severity,
+            armature_workflow::Severity::Warning
+        );
+        assert!(diagnostics[0]
+            .message
+            .contains("requires capability `baml.coerce`"));
+    }
+
+    #[test]
+    fn managed_baml_policy_rejects_explicit_denials_in_team_mode() {
+        let policy = CapabilityPolicyDocument {
+            mode: armature_workflow::policy::PolicyMode::Team,
+            denied_capabilities: vec!["baml.coerce".to_string()],
+            allow_baml_network: Some(false),
+            allow_managed_baml_server: Some(false),
+            ..Default::default()
+        };
+
+        let diagnostics = crate::validate_managed_baml_policy(&[policy]);
+        assert_eq!(diagnostics.len(), 3);
+        assert!(diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity == armature_workflow::Severity::Error));
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("denied capability `baml.coerce`")));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("network execution is denied")));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("server execution is denied")));
+    }
+
+    #[test]
+    fn baml_codex_oauth_policy_requires_enterprise_explicit_authority() {
+        let missing = CapabilityPolicyDocument {
+            mode: armature_workflow::policy::PolicyMode::Enterprise,
+            ..Default::default()
+        };
+        let diagnostics = crate::validate_baml_codex_oauth_policy(&[missing]);
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("requires `allow_baml_codex_oauth: true`")));
+
+        let allowed = CapabilityPolicyDocument {
+            mode: armature_workflow::policy::PolicyMode::Enterprise,
+            allow_baml_codex_oauth: Some(true),
+            ..Default::default()
+        };
+        assert!(crate::validate_baml_codex_oauth_policy(&[allowed]).is_empty());
     }
 
     #[test]

@@ -79,8 +79,10 @@ state changes, writes durable diagnostics, and surfaces the failure through
 failures. Explicit failure transitions are future workflow syntax; there is no
 hidden built-in blocked state in v0.
 
-`coerce` is backed by BAML HTTP over generated `baml_src` artifacts. Adapter
-value calls are backed by declared capabilities.
+`coerce` is backed by the selected BAML backend over generated `baml_src`
+artifacts. The target default backend is generated stdio; explicit HTTP and
+brokered backends remain available modes. Adapter value calls are backed by
+declared capabilities.
 
 ### 3. Native Agent Invocation Effects
 
@@ -199,8 +201,8 @@ workflow may use them only when an adapter declares support and policy permits
 the requested capability.
 
 Executor-backed `coerce` has the same schema, policy, idempotency, and logging
-requirements, but it is executed through the BAML HTTP coerce executor rather
-than an adapter manifest effect.
+requirements, but it is executed through the selected BAML coerce executor
+rather than an adapter manifest effect.
 
 ## Effect Schema Shape
 

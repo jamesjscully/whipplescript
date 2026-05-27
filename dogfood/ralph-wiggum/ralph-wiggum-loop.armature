@@ -1,0 +1,98 @@
+machine RalphWiggumLoop
+initial waiting
+
+data {
+  seenRuns string[] = []
+  project string? = nil
+}
+
+agent ralph = codingAgent() {
+  profile "repo-writer"
+  maxActive 1
+}
+
+event begin {
+  project string
+}
+
+event next {
+  step string
+}
+
+event finished {
+  id string
+  name string
+  status string
+  summary string
+  exitCode int?
+}
+
+state waiting {
+  on begin as request {
+    assign data.project = request.project
+    start ralph {
+      message "Ralph: I made a folder."
+    }
+    goto firstLine
+  }
+}
+
+state firstLine {
+  on finished as run
+    guard !(run.id in data.seenRuns)
+  {
+    assign data.seenRuns = data.seenRuns.append(run.id)
+    raise next {
+      step "second"
+    }
+    goto readyForSecondLine
+  }
+}
+
+state readyForSecondLine {
+  on next {
+    start ralph {
+      message "Ralph: I wrote the important sentence."
+    }
+    goto secondLine
+  }
+}
+
+state secondLine {
+  on finished as run
+    guard !(run.id in data.seenRuns)
+  {
+    assign data.seenRuns = data.seenRuns.append(run.id)
+    raise next {
+      step "third"
+    }
+    goto readyForThirdLine
+  }
+}
+
+state readyForThirdLine {
+  on next {
+    start ralph {
+      message "Ralph: I checked my work and it is cromulent."
+    }
+    goto thirdLine
+  }
+}
+
+state thirdLine {
+  on finished as run
+    guard !(run.id in data.seenRuns)
+  {
+    assign data.seenRuns = data.seenRuns.append(run.id)
+    goto done
+  }
+}
+
+state done {
+  final
+}
+
+invariant declaredAgentsOnly
+invariant declaredEffectsOnly
+invariant maxActiveRespected
+invariant terminalInvocationsObserved

@@ -132,8 +132,10 @@ which BAML providers may be used
 which model environment variables may be read
 whether network/model access is allowed
 which BAML tools, if any, may be exposed
-which BAML HTTP server URLs may be called
-whether Armature may launch a managed `baml-cli serve` process
+which external BAML HTTP server URLs may be called
+whether Armature may run a generated local BAML client
+whether Armature may use Codex/ChatGPT OAuth credentials for BAML calls
+whether Armature may enqueue brokered BAML requests
 ```
 
 The first implementation should treat BAML as structured model output only. BAML
@@ -141,9 +143,12 @@ tools that perform side effects should be disabled unless explicitly enabled by
 adapter policy and represented as ordinary workflow effects.
 
 BAML source is generated from Armature `coerce` declarations and workspace
-defaults in the first implementation. Runtime `coerce` execution uses BAML HTTP.
-Policy validates whether the selected providers, models, environment variables,
-server URLs, and managed-process mode are allowed.
+defaults. Runtime `coerce` execution uses generated stdio by default so coding
+agent sandboxes do not need local TCP listener authority. `--baml-url` selects
+an externally managed BAML HTTP endpoint, and brokered mode delegates model
+execution to a trusted out-of-sandbox service. Policy validates whether the
+selected providers, models, environment variables, external server URLs, local
+runner mode, and broker mode are allowed.
 
 Implemented BAML policy fields:
 
@@ -152,23 +157,40 @@ Implemented BAML policy fields:
   "allowed_capabilities": ["baml.coerce"],
   "allow_baml_network": true,
   "allowed_baml_urls": ["http://127.0.0.1:2024"],
-  "allow_managed_baml_server": false,
+  "allow_baml_stdio_runner": true,
+  "allow_baml_codex_oauth": false,
+  "allow_baml_http": false,
+  "allow_baml_broker": false,
   "allowed_models": ["gpt-4o-mini"],
   "allowed_env_vars": ["OPENAI_API_KEY"],
   "store_baml_raw_responses": false
 }
 ```
 
-`run --baml-url` enforces `baml.coerce`, `allow_baml_network`, and exact
-`allowed_baml_urls` before making any HTTP request. `allow_managed_baml_server`,
-`allowed_models`, and `allowed_env_vars` are parsed and validated now, but they
-become enforceable only when Armature owns managed BAML process launch or
-provider/model selection. `baml.coerce` remains the capability name for
-BAML-backed structured model output. Raw BAML HTTP response storage is
+External `run --baml-url` enforces `baml.coerce`, `allow_baml_network`, and
+exact `allowed_baml_urls` before making any HTTP request. Generated stdio mode
+should enforce `baml.coerce`, `allow_baml_stdio_runner`, direct model/network
+policy when the runner makes provider calls, `allowed_env_vars`, and, once
+model/client selection is inspectable, `allowed_models`. Brokered mode should
+enforce `baml.coerce` and `allow_baml_broker`; provider network and credential
+policy then belongs to the broker. Local/default mode may allow generated stdio
+with warnings. Enterprise mode should require explicit `baml.coerce` plus one
+approved backend: generated stdio with network/env/model approval, external
+HTTP with exact URL approval, or brokered coerce. Raw BAML response storage is
 controlled by `store_baml_raw_responses`: explicit `false` always redacts,
 explicit `true` stores raw responses, enterprise mode redacts by default, and
 local/team modes store by default unless policy says otherwise. Parsed output
 remains durable for replay and status either way.
+
+`--baml-auth codex-oauth` is an explicit generated-stdio credential mode. It
+does not reinterpret `OPENAI_API_KEY`; Armature reads Codex OAuth credentials
+from `CODEX_HOME/auth.json`, `~/.codex/auth.json`, or
+`ARMATURE_CODEX_OAUTH_ACCESS_TOKEN`, then injects only
+`ARMATURE_CODEX_OAUTH_ACCESS_TOKEN` and `ARMATURE_CODEX_OAUTH_BASE_URL` into the
+generated runner process. Enterprise policy must set
+`allow_baml_codex_oauth: true` before this mode is allowed. This mirrors the
+agent ecosystem's Codex OAuth desire path while keeping it visible as account
+credential authority.
 
 ## Resource Policy
 
@@ -242,7 +264,9 @@ The first implemented policy document is intentionally small JSON:
   "denied_capabilities": [],
   "allow_baml_network": true,
   "allowed_baml_urls": ["http://127.0.0.1:2024"],
-  "allow_managed_baml_server": false,
+  "allow_baml_stdio_runner": true,
+  "allow_baml_http": false,
+  "allow_baml_broker": false,
   "allowed_models": [],
   "allowed_env_vars": [],
   "store_baml_raw_responses": false
@@ -260,12 +284,20 @@ Rules:
 - unknown capabilities are errors in `enterprise`
 - unknown capabilities are errors in `team` for starts, messages, human
   obligations, `adapter.*`, and write-like capability names containing `.write`
-- denied `baml.coerce` blocks `run --baml-url`
-- enterprise `run --baml-url` requires `baml.coerce`,
-  `allow_baml_network: true`, and an exact matching `allowed_baml_urls` entry
-- local mode remains permissive for BAML HTTP unless a supplied policy denies
-  `baml.coerce`, denies BAML network, or provides an allowlist that does not
-  include the requested URL
+- denied `baml.coerce` blocks real BAML execution in every backend mode
+- enterprise generated stdio requires `baml.coerce`,
+  `allow_baml_stdio_runner: true`, and direct model/network/env/model approval
+  when the runner calls providers itself
+- enterprise external `run --baml-url` requires `baml.coerce`,
+  `allow_baml_http: true`, `allow_baml_network: true`, and an exact matching
+  `allowed_baml_urls` entry
+- enterprise brokered coerce requires `baml.coerce` and
+  `allow_baml_broker: true`; provider network and credential policy are
+  enforced by the broker
+- local mode remains permissive for BAML unless a supplied policy denies
+  `baml.coerce`, denies the selected backend, denies required model/network
+  access, or provides an external URL allowlist that does not include the
+  requested URL
 - BAML raw responses are redacted before storage when
   `store_baml_raw_responses` is false or when enterprise policy omits an
   explicit raw-response storage decision

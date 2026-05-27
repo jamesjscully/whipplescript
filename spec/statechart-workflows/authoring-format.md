@@ -45,12 +45,12 @@ data {
 }
 
 agent director = thread("director")
-agent worker = codingAgent() {
+agent worker = codingAgent {
   profile "repo-writer"
   maxActive 2
 }
 
-agent quality = codingAgent() {
+agent quality = codingAgent {
   profile "repo-reader"
   maxActive 1
 }
@@ -351,14 +351,27 @@ Agents are named targets. They are not pattern groups.
 
 ```armature
 agent director = thread("director")
-agent worker = codingAgent() {
+agent worker = codingAgent {
+  profile "repo-writer"
   maxActive 2
 }
 
-agent quality = codingAgent() {
+agent quality = codingAgent {
+  profile "repo-reader"
   maxActive 1
 }
 ```
+
+`codingAgent` declares an abstract native harness role. It does not select a
+provider. A harness profile policy maps `profile "repo-writer"` or
+`profile "repo-reader"` to a concrete provider adapter such as Codex, Claude
+Code, Pi, or a deterministic command fixture. See
+[provider-adapters.md](provider-adapters.md) and
+[harness-profiles.md](harness-profiles.md).
+
+The parser may accept `codingAgent()` as a compatibility alias, but examples
+should prefer `codingAgent` without parentheses so the declaration does not read
+like a function call or mock constructor.
 
 When an agent with `maxActive` is started, the workflow must also declare and
 process the v0 completion convention:
@@ -379,6 +392,12 @@ The runtime projects active invocations from native `agent_invocations` rows
 and processed `finished.name` values. Completion names should be prefixed with
 the agent name, such as `worker-01` or `quality-review-01`. When agent names
 overlap, the longest matching started-agent prefix wins.
+
+Active invocation retirement is visible after the completion event is processed.
+Starting a new `maxActive 1` invocation inside the same `finished` transition
+can still trip the active-count guard. Until runtime semantics change, use a
+small internal event between the completion transition and the next `start`
+when strict sequential execution matters.
 
 Group-like behavior is expressed in guards or pattern matching over event data:
 
@@ -477,8 +496,8 @@ coerce classifyRun(run RunSummary) -> RunClassification {
 ```
 
 `coerce` declarations lower to generated BAML source. Runtime `coerce`
-execution uses BAML HTTP against that generated source, so input and output
-types must be BAML-compatible.
+execution uses the selected BAML backend against that generated source, so
+input and output types must be BAML-compatible.
 
 Both call forms are accepted:
 

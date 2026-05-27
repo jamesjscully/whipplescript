@@ -1,0 +1,15 @@
+{
+  "agents": {
+    "ralph": {
+      "provider": "command",
+      "command": [
+        "sh",
+        "-c",
+        "printf '%s\n' \"$ARMATURE_PROMPT\" >> project/ralph-output.txt && printf 'I am helping: %s\n' \"$ARMATURE_PROMPT\""
+      ],
+      "cwd": "dogfood/ralph-wiggum",
+      "timeoutSeconds": 30
+    }
+  }
+}
+

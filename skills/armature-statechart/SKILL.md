@@ -33,6 +33,18 @@ Keep this boundary clear:
    armature init path/to/project --name MyWorkflow --json
    ```
 
+   This creates `.armature/policy.json` and
+   `.armature/harness-policy.json`. Use the harness policy as the default
+   profile vocabulary for new agent workflows.
+
+   Validate the generated harness policy directly when editing profiles:
+
+   ```sh
+   armature validate-profile-policy .armature/harness-policy.json \
+     --workflow workflow.armature \
+     --json
+   ```
+
 4. Validate before running:
 
    ```sh
@@ -209,9 +221,11 @@ explicit `coerce` form when teaching or reviewing a workflow.
 
 ## Adapter Manifests
 
-Use adapter manifests to declare what trusted runtime code can do. A workflow
-may request `start`, `send`, `askHuman`, or capability calls only when loaded
-manifests declare the effect and category.
+Use adapter manifests to declare what trusted external adapter code can do.
+Native local agent `start` and `send` use the SQLite harness ledger and do not
+need an adapter manifest. Adapter manifests are still required for explicitly
+adapter-backed agents, `askHuman`, plan/state calls, and other external
+capability calls unless a built-in file-backed shortcut supplies the manifest.
 Manifest `input` schemas describe the runtime request `args` envelope. Include
 language routing fields such as `agent`, `capability`, and `operation` when the
 effect dispatches them; otherwise static validation may pass less authority
@@ -345,7 +359,7 @@ armature run workflow.armature \
   --json
 ```
 
-Typed adapter-originated events can be enqueued without custom manifests:
+Run native local agents through the harness:
 
 ```sh
 armature harness once workflow.armature \
@@ -410,6 +424,11 @@ access and repository write access unless the user explicitly requests
 permissive mode or supplies a custom profile whose description allows it.
 Use provider names such as `codex`, `claude`, `pi`, or `command` in harness
 policy/config, not as workflow intent.
+For governed runs, prefer Codex or Claude profiles when sandbox posture matters:
+Codex maps filesystem authority to `--sandbox`; Claude maps filesystem posture
+to `--permission-mode` and semantic tools to `--allowedTools`. Treat Pi and
+raw `command` profiles as best-effort or externally sandboxed unless the policy
+description says otherwise.
 
 `armature harness status --json` includes workflow status, recent invocations,
 recent completions, harness events, and recent desire-path failures such as

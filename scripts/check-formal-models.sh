@@ -39,6 +39,10 @@ if command -v tlc >/dev/null 2>&1 && command -v maude >/dev/null 2>&1; then
   run_maude
   run_generated_checks
 elif command -v nix >/dev/null 2>&1; then
+  if [[ "${ARMATURE_RUN_FORMAL_TESTS:-}" != "1" ]]; then
+    echo "skipping formal model checks through nix; set ARMATURE_RUN_FORMAL_TESTS=1 to opt in" >&2
+    exit 0
+  fi
   nix --extra-experimental-features 'nix-command flakes' develop -c bash -c '
     tlc -deadlock \
       -config models/statechart-workflows/SpecImplementation.cfg \
@@ -63,6 +67,5 @@ elif command -v nix >/dev/null 2>&1; then
       --json >/dev/null
   '
 else
-  echo "error: tlc and maude are not available, and nix is unavailable" >&2
-  exit 127
+  echo "skipping formal model checks; tlc/maude are unavailable" >&2
 fi

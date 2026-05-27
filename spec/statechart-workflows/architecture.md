@@ -31,6 +31,7 @@ statechart validation
 durable workflow execution
 capability-aware effects
 generated BAML artifacts for coerce declarations
+provider adapters for native harness-managed agents
 workflow status/debugging
 formal model generation
 optional verification gates
@@ -195,13 +196,14 @@ Responsibilities:
 - validate that workflow calls reference declared coerce functions
 - expose coerce input/output schemas to the workflow validator
 - make coerce outputs available as typed values in the IR
-- write generated `baml_src` artifacts that can be served by `baml-cli serve`
+- write generated `baml_src` artifacts that can be consumed by generated BAML
+  clients or served by explicit BAML HTTP services
 
 Non-responsibilities:
 
 - using BAML as a control-flow runtime
 - allowing BAML to return arbitrary executable plans
-- requiring generated TypeScript clients for normal `coerce` execution
+- allowing generated client code to become workflow-authored arbitrary code
 
 ### 3. Workflow IR
 
@@ -293,8 +295,9 @@ branch on. Any resulting `start`, `send`, `askHuman`, `raise`, or adapter write
 is still an explicit Armature effect with its own schema and capability checks.
 For local agents, `start`/`send` are native ledger writes rather than adapter
 dispatch.
-The v1 `coerce` backend is BAML HTTP via `baml-cli serve`; TypeScript codegen is
-not part of the selected execution path.
+The v1 target `coerce` backend is generated BAML client execution over
+stdin/stdout. BAML HTTP via `baml-cli serve` remains an explicit service mode,
+not the default agent-sandbox execution path.
 
 Each effect has:
 
@@ -329,10 +332,18 @@ The resolution algorithm and local/team/enterprise modes are defined in
 The native harness connects local agent effects to provider processes. Adapters
 connect explicitly external effects and observations to real systems.
 
-Likely adapters:
+Provider adapters for native harness work:
 
 ```text
-native command/Codex/Claude/Pi harness providers
+command       deterministic fixtures and externally sandboxed commands
+codex         Codex CLI execution
+claude-code   Claude Code CLI execution
+pi            Pi execution, best-effort until sandbox flags are validated
+```
+
+External capability adapters:
+
+```text
 un-tie thread/session adapter
 human review adapter
 filesystem state adapter, scoped to declared files
@@ -348,6 +359,8 @@ in workflow logic. A workflow agent may request a semantic profile such as
 `research` or `repo-writer`; the harness policy maps that profile to concrete
 provider commands, filesystem/network posture, environment allowlists, timeout,
 and enforcement mode. See [harness-profiles.md](harness-profiles.md).
+The concrete provider adapter contract is defined in
+[provider-adapters.md](provider-adapters.md).
 
 ### 8a. Coerce Execution Layer
 
@@ -356,13 +369,14 @@ The coerce execution layer evaluates BAML-backed synchronous value calls.
 Supported backend modes:
 
 ```text
+generated BAML client runner over stdin/stdout
 external BAML HTTP server supplied with --baml-url
-managed local BAML HTTP server launched with baml-cli serve --from <baml_src>
+brokered BAML request completed by a trusted service
 ```
 
-The first implementation should support the external server mode before managed
-process supervision. Managed mode can reuse process/logging lessons from the
-legacy runtime, but the legacy runtime should not own `coerce` semantics.
+The product target is generated stdio by default, with `--baml-url` as an
+explicit external endpoint override and brokered mode as the enterprise
+split-authority path. See [managed-baml-runtime.md](managed-baml-runtime.md).
 
 The coerce layer is intentionally below the language boundary:
 

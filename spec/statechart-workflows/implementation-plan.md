@@ -10,7 +10,7 @@ native .armature statechart DSL
 small orchestration expression kernel
 Rust parser, validator, interpreter, modelgen, and CLI
 SQLite durable queue/log/state/coerce/agent-invocation storage
-BAML HTTP for real coerce execution
+BAML generated stdio by default for real coerce execution
 native local harness for agent execution
 adapter manifests only for explicitly external non-native effects
 TLA+/Maude generated checks, with Veil later
@@ -37,7 +37,7 @@ The active implementation already has these pieces:
   version metadata
 - interpreter support for synthetic events, parent-state event fallback,
   entry/always loop protection, fake adapter dispatch, fake coerce executor
-  outputs, BAML HTTP coerce execution, fake capability value outputs, and
+  outputs, transitional BAML HTTP coerce execution, fake capability value outputs, and
   adapter-backed capability value calls
 - adapter manifest validation and runtime policy enforcement for adapter-backed
   effects
@@ -48,12 +48,22 @@ The active implementation already has these pieces:
 - `prove` validates contracts and runs the current generated verification
   bundle, TLA+ plus Maude
 - deterministic e2e coverage around the CLI/runtime boundary using fake outputs
-- CLI `run --baml-url` support for calling an already-running `baml-cli serve`
-  endpoint
+- CLI `run --baml-url` support for calling an already-running external BAML
+  HTTP endpoint as an override
 - `run --baml-url` policy enforcement for `baml.coerce`, BAML network access,
   and exact URL allowlists
+- current managed BAML implementation starts `baml-cli serve` and records
+  `runtime_mode: managed_http`; this is now considered a transitional
+  implementation because it requires local TCP listener authority that coding
+  agent sandboxes may deny
+- target managed BAML mode is generated stdio: write generated BAML source,
+  generate/load a BAML client runner, pass named JSON over stdin/stdout, capture
+  artifacts, and record `runtime_mode: generated_stdio`
+- generated stdio supports `--baml-auth api-key` and explicit
+  `--baml-auth codex-oauth`; Codex OAuth reads existing Codex credentials and
+  injects only runner-scoped `ARMATURE_CODEX_OAUTH_*` environment variables
 - runtime `coerce` persistence/replay through durable coerce records
-- runtime BAML HTTP records include generated BAML source hashes and stable
+- runtime BAML backend records include generated BAML source hashes and stable
   interpreter step locators such as `handler.0`, `entry.0.0`, and
   `always.guard`
 - expression validation/runtime support for the v1 primitive helpers in
@@ -71,10 +81,10 @@ The active implementation already has these pieces:
 - first human-review bridge through `run --review-file`, covering durable JSON
   review obligation creation for `askHuman`, plus typed response event intake
   through `emit --review-file`
-- first local agent/thread bridge through `run --agent-file`, covering JSON
-  invocation records for `start` and message records for `send`, plus typed
-  completion event intake through `emit --agent-file`; this is now considered
-  scaffolding, not the target product architecture
+- native local agent/thread bridge through the SQLite agent ledger and harness,
+  covering durable `start` invocations, provider claims, stdout/stderr
+  artifacts, completion records, typed `finished` event enqueue, and harness
+  status; the old JSON agent-file bridge is hidden fixture scaffolding only
 
 Known major gaps:
 
@@ -88,15 +98,20 @@ Known major gaps:
 - native durable agent invocation storage and harness execution are implemented
   through the SQLite ledger; any remaining JSON agent bridge should be treated
   as fixture/debug scaffolding rather than product surface
-- provider command execution still needs harness profile policy so workflow
+- provider command execution supports harness profile policy so workflow
   authors choose semantic profiles such as `research` and `repo-writer` while
   operators control concrete commands, filesystem/network posture, environment
   allowlists, timeout, and enforcement mode
-- Codex, Claude Code, and Pi provider presets are thin command templates; exact
-  sandbox flag mapping and enforcement reporting remain future work
+- Codex and Claude Code provider presets map selected profile authority into
+  native CLI flags where available; Pi remains best-effort until its stable
+  sandbox flags are documented and tested
+- the provider-adapter target is now specified as a language/runtime boundary:
+  `codingAgent` declares an abstract role, harness profile policy binds that
+  role to a provider, and provider adapters implement concrete Codex, Claude
+  Code, Pi, or command launches
 - fuller plan/state adapters remain future work
-- managed `baml-cli serve` process mode is not part of the first real coerce
-  slice
+- BAML runtime status projection exists as a derived coerce-ledger projection;
+  dedicated runtime records remain future work
 
 ## Immediate Track: Native Agent Ledger And Harness
 
@@ -105,11 +120,11 @@ foundation. Backwards compatibility is not an objective. The implementation
 should optimize for the right architecture before other features depend on the
 old bridge.
 
-Current shape to replace:
+Former shape, now quarantined as hidden fixture scaffolding:
 
 ```text
 workflow runtime -> adapter dispatcher -> agents.json
-harness/script -> armature emit --agent-file -> workflow_events
+harness/script -> armature emit --fixture-agent-file -> workflow_events
 ```
 
 Target shape:
@@ -203,7 +218,7 @@ Work in `crates/armature-engine`:
 - make event processing transactionally persist state, logs, and invocation
   records together
 - project `active_invocations` from native invocation/completion rows instead
-  of from JSON agent-file effects
+  of JSON agent-file effects
 - keep adapter-backed agents possible only when a workflow explicitly targets an
   adapter-backed capability
 
@@ -287,8 +302,8 @@ ARMATURE_RUN_DIR
 ```
 
 Presets compile to the same internal command-runner contract. `command`
-requires an explicit command array; `codex`, `claude`, and `pi` supply default
-command templates and also accept command overrides plus extra args.
+requires an explicit command array; `codex`, `claude-code`, and `pi` supply
+default command templates and also accept command overrides plus extra args.
 `timeoutSeconds` is enforced by the harness and records `provider_timed_out`
 plus a typed `finished` event with `status: "timed_out"`. Desire-path logging
 should record provider command errors so we can pave better presets from actual
@@ -383,26 +398,31 @@ Design commitments:
 - The Armature skill should teach coding agents to read profile descriptions
   before assigning profiles.
 
-Implementation slices:
+Implementation status:
 
-1. Add parser/lowering support for `profile "name"` inside agent option blocks.
-2. Add `profile: Option<String>` to WorkflowIR agents and snapshot tests.
-3. Define harness profile policy structs and validation:
+1. Parser/lowering support for `profile "name"` inside agent option blocks:
+   implemented.
+2. `profile: Option<String>` on WorkflowIR agents and tests: implemented.
+3. Harness profile policy structs and validation: implemented for:
    - mode: `permissive | separated | custom`
    - default profile resolution
    - built-in separated profile set
    - profile names/descriptions
    - provider, command, args, cwd, timeoutSeconds
    - filesystem/network/env/tool/enforcement settings
-4. Add `--profile-policy` to `validate`, `harness once`, `harness run`, and
-   `harness status`.
-5. Resolve queued invocations through profile policy before provider launch.
-6. Add provider capability declarations for `command`, `codex`, `claude`, and
-   `pi`; report unsupported restrictions as warnings or denials according to
-   mode/enforcement.
-7. Extend harness events/status JSON with profile resolution and enforcement
+4. `--profile-policy` on `validate`, `harness once`, `harness run`, and
+   `harness status`: implemented.
+5. Queued invocation profile resolution before provider launch: implemented.
+6. Provider authority mapping:
+   - `codex`: maps filesystem to `--sandbox` and allowed network to `--search`
+   - `claude-code`/temporary `claude` alias: maps filesystem to `--permission-mode` and tools to
+     `--allowedTools`
+   - `command`: requires explicit approval and reports external-process
+     authority
+   - `pi`: reports best-effort until stable sandbox flags are mapped
+7. Harness events/status JSON include profile resolution and enforcement
    evidence.
-8. Add e2e coverage:
+8. E2e/unit coverage:
    - permissive default still runs a simple command fixture
    - separated mode denies unknown profile
    - separated mode denies raw command unless explicitly approved
@@ -412,11 +432,12 @@ Implementation slices:
 
 Exit criteria:
 
-- users can write `.armature` files with semantic agent profiles
+- users can write `.armature` files with semantic agent profiles: done
 - operators can govern provider launch authority without editing workflow
-  source
-- coding agents receive clear diagnostics when they choose the wrong profile
-- no docs recommend raw provider names as workflow intent
+  source: done for harness launch policy, provider-dependent for deep sandboxing
+- coding agents receive clear diagnostics when they choose the wrong profile:
+  done for validation and launch-time profile resolution failures
+- no docs recommend raw provider names as workflow intent: done
 
 ### 0.8 Desire-Path Apparatus
 
@@ -441,6 +462,315 @@ Exit criteria:
 
 - a failed fake provider run leaves enough evidence to improve the UX
 - status can distinguish workflow bugs from provider/harness bugs
+
+## Next Track: Real Provider Adapters
+
+Goal: turn `codingAgent` from a confusing pseudo-constructor into a clear
+language-level role declaration backed by concrete provider adapters.
+
+Target shape:
+
+```text
+.armature source declares agent role + profile intent
+harness profile policy resolves profile to provider + authority
+provider adapter builds and runs the concrete launch
+SQLite harness ledger records evidence and completion
+workflow processes typed finished events
+```
+
+Design commitments:
+
+- `codingAgent` is abstract. It never means Codex, Claude Code, Pi, or shell by
+  itself.
+- workflow source should prefer `agent worker = codingAgent { ... }`; the
+  existing `codingAgent()` syntax may remain as a compatibility alias during
+  migration.
+- provider names belong in harness policy, not ordinary workflow control flow.
+- `command` provider is a deterministic fixture or externally sandboxed escape
+  hatch, not proof that real coding agents are wired correctly.
+- `--profile-policy` should be sufficient for governed provider launches once
+  adapters are complete; `--config` should be a local override/test fixture.
+- every launch must record requested authority, enforced authority, warnings,
+  command evidence, stdout/stderr paths, and completion event ids.
+
+### 1.1 Respec And Rename The Language Surface
+
+Spec changes:
+
+- [authoring-format.md](authoring-format.md): make `codingAgent` an abstract
+  role declaration and document `codingAgent()` as compatibility syntax only.
+- [grammar.md](grammar.md): allow constructor-like agent declarations without
+  parentheses.
+- [source-to-ir.md](source-to-ir.md): preserve agent kind, profile, maxActive,
+  and source spans independent of provider binding.
+- [provider-adapters.md](provider-adapters.md): keep the concrete provider
+  contract and launch evidence shapes.
+- [harness-profiles.md](harness-profiles.md): specify that profiles are semantic
+  intent and provider bindings are deployment/runtime policy.
+
+Implementation:
+
+- update the parser to accept:
+
+  ```armature
+  agent worker = codingAgent {
+    profile "repo-writer"
+    maxActive 1
+  }
+  ```
+
+- keep `codingAgent()` accepted for now
+- update parser suggestions to prefer the no-parentheses form
+- update examples, templates, skill docs, and dogfood fixtures to use the
+  no-parentheses form
+
+Exit criteria:
+
+- old and new syntax both parse
+- canonical diagnostics/examples use `codingAgent { ... }`
+- docs no longer imply `codingAgent()` is a concrete runner or mock constructor
+
+### 1.2 Make Harness Policy A Complete Provider Binding
+
+Current harness execution still leans on `--config` for concrete command
+details. The product path should be:
+
+```sh
+armature harness run workflow.armature \
+  --store workflow.sqlite \
+  --profile-policy .armature/harness-policy.json \
+  --drive-workflow
+```
+
+Implementation:
+
+- allow `harness once/run/status` to omit `--config` when `--profile-policy`
+  supplies complete provider information or a provider adapter has a default
+  launch template
+- keep `--config` as an override for deterministic fixtures
+- define config/profile merge rules:
+  - profile policy supplies provider, authority, timeout, cwd, env, tools
+  - provider adapter supplies default command template when profile does not
+    override command
+  - local config may override command/cwd/timeout only when policy permits that
+    override mode
+  - if config and policy both specify provider, they must match
+- expose profile-policy-only execution in `armature init` scaffolding
+
+Exit criteria:
+
+- a Codex profile can run with no `harness.json`
+- deterministic command fixtures still work with explicit `--config`
+- profile/provider mismatch errors include the agent, profile, configured
+  provider, expected provider, and fix
+
+### 1.3 Extract Provider Adapter Trait
+
+Refactor the current inline command-building logic into provider adapters.
+
+Internal target:
+
+```rust
+trait ProviderAdapter {
+    fn name(&self) -> &'static str;
+    fn capabilities(&self) -> ProviderCapabilities;
+    fn build_launch(&self, invocation: &AgentInvocation, profile: &ResolvedProfile)
+        -> Result<LaunchPlan, AdapterError>;
+    fn run(&self, launch: LaunchPlan) -> Result<ProviderRunResult, AdapterError>;
+}
+```
+
+Concrete structs:
+
+```text
+CommandAdapter
+CodexAdapter
+ClaudeCodeAdapter
+PiAdapter
+```
+
+Implementation notes:
+
+- keep synchronous process execution for MVP
+- keep timeout enforcement in the harness
+- keep stdout/stderr capture in the common runner
+- provider-specific code should only build launch plans and enforcement
+  evidence
+- all adapters produce the same completion payload shape
+
+Exit criteria:
+
+- unit tests cover launch plan generation for command, Codex, Claude Code, and
+  Pi
+- harness e2e still passes through the adapter registry
+- provider warnings are stable and visible in `harness status --json`
+
+### 1.4 Codex Adapter
+
+Default launch:
+
+```text
+codex <authority flags> exec {{prompt}}
+```
+
+Implement:
+
+- filesystem mapping:
+  - `read_only` and `none` -> `--sandbox read-only`
+  - `workspace_write` -> `--sandbox workspace-write`
+  - `provider_default` -> no sandbox flag
+- network mapping:
+  - `allowed` or `provider_default` -> `--search`
+  - `denied` -> omit `--search` and record limited-denial evidence
+- env allowlist through common runner
+- cwd and timeout through common runner
+- custom command override evidence:
+  - `providerCliFlagsApplied: false`
+  - warning that custom command owns equivalent flags
+
+Exit criteria:
+
+- command plan tests for read-only research and workspace-write repo-writer
+- opt-in dogfood fixture launches a real Codex run when `codex` is installed
+- skipped gracefully with clear diagnostics when `codex` is unavailable
+
+### 1.5 Claude Code Adapter
+
+Provider name target: `claude-code`
+
+Temporary compatibility: accept `claude` as an alias in policy/config.
+
+Default launch:
+
+```text
+claude <authority flags> -p {{prompt}}
+```
+
+Implement:
+
+- filesystem mapping:
+  - `read_only` and `none` -> `--permission-mode plan`
+  - `workspace_write` -> `--permission-mode acceptEdits`
+  - `provider_default` -> no permission-mode flag
+- allowedTools mapping -> `--allowedTools <comma-list>`
+- network denied -> warning until a stable native flag is validated
+- custom command override evidence as with Codex
+
+Exit criteria:
+
+- command plan tests for plan-mode and acceptEdits-mode
+- opt-in dogfood fixture launches a real Claude Code run when `claude` is
+  installed
+- docs consistently say Claude Code, not just Claude, for the provider concept
+
+### 1.6 Pi Adapter
+
+Default launch:
+
+```text
+pi run {{prompt}}
+```
+
+Implement:
+
+- provider adapter exists and produces launch evidence
+- enforcement evidence is best-effort by default
+- no claim of filesystem/network sandbox enforcement until stable Pi flags are
+  documented and tested
+
+Exit criteria:
+
+- command plan test covers warning/evidence shape
+- opt-in dogfood fixture can launch Pi when available
+- docs are explicit that Pi is not enterprise-safe until enforcement support is
+  validated
+
+### 1.7 Real Provider Dogfood
+
+Maintain dogfood fixtures in two categories:
+
+```text
+deterministic command-provider fixtures
+real provider fixtures
+```
+
+Deterministic:
+
+- Ralph Wiggum fixture remains command-provider and CI-friendly
+- README labels it as deterministic and not a real coding-agent launch
+
+Real provider:
+
+- add `dogfood/codex-repo-writer`
+- add `dogfood/claude-code-repo-writer`
+- add `dogfood/pi-repo-writer` once Pi flags are validated enough for dogfood
+- each fixture should:
+  - use `codingAgent { profile "repo-writer" }`
+  - run through `--profile-policy`
+  - create or edit a tiny project artifact
+  - record harness status and provider evidence
+  - be opt-in, not normal CI
+
+Exit criteria:
+
+- at least one real provider dogfood run has been executed locally and its UX
+  notes are captured
+- deterministic fixture remains runnable without external credentials
+
+### 1.8 Fix Sequential `maxActive` Ergonomics
+
+Dogfooding exposed a sharp edge: if a `finished` transition immediately starts
+the next `maxActive 1` invocation, active invocation retirement may not be
+visible until after the completion event is processed, so the next `start` can
+fail.
+
+Candidate fixes:
+
+1. Runtime semantic change: when processing a `finished` event, retire the
+   matching invocation before evaluating `start` capacity checks in that same
+   transition.
+2. Language pattern: require users to raise an internal event before the next
+   `start`.
+3. Sugar: add a dedicated sequencing helper later, such as `after finished`
+   semantics, if the pattern repeats.
+
+Preferred next step:
+
+- implement a runtime semantic test for the desired behavior before changing
+  code
+- decide whether the formal active-invocation model should match option 1
+- if option 1 is coherent, implement it so ordinary sequential loops do not
+  need boilerplate internal events
+
+Exit criteria:
+
+- Ralph-style sequential workflow can be written without the internal `next`
+  event, or docs clearly justify why that event is required
+- maxActive invariants still hold under replay and duplicate completion events
+
+### 1.9 Documentation And Skill Updates
+
+Update:
+
+- `skills/armature-statechart/SKILL.md`
+- `examples/templates/simple-agent-supervisor.armature`
+- dogfood READMEs
+- CLI help for `harness run`
+- `armature init` scaffold comments
+
+Messaging:
+
+- `codingAgent` is an abstract role
+- `profile` is semantic intent
+- provider adapter is selected by harness policy
+- command provider is deterministic/local, not a real coding agent unless the
+  command itself launches one
+
+Exit criteria:
+
+- an agent reading only the skill file can correctly distinguish command
+  fixtures from real provider adapters
+- examples show both deterministic and real-provider paths
 - desire-path records are local, explicit, and easy to delete with the store
 
 ## Phase 0: Remodeling Checkpoint
@@ -470,7 +800,7 @@ Recommended work:
    `SpecImplementation.maude` against the selected semantics.
 2. Add comments or small state variables only if they clarify the selected
    `coerce` abstraction.
-3. Keep BAML HTTP, provider behavior, prompts, raw responses, and network
+3. Keep BAML backend internals, provider behavior, prompts, raw responses, and network
    failures out of the formal model.
 4. Model `coerce` as nondeterministic schema-valid output. Runtime handles
    idempotency and durable replay.
@@ -498,7 +828,7 @@ Work in `crates/armature-workflow`:
 - keep `class`, `enum`, and `coerce` declarations as the source of truth
 - keep generated BAML source as a derived artifact
 - add schema variants or reserved-type diagnostics for media types only when
-  the parser, validator, runtime, policy, and BAML HTTP executor all support
+  the parser, validator, runtime, policy, and BAML executor all support
   the representation
 - tighten static expression validation toward
   [expression-primitives.md](expression-primitives.md)
@@ -542,7 +872,7 @@ Exit criteria:
 
 - fake and real coerce can share one request/outcome boundary
 - interpreter code can evaluate `coerce` without knowing whether the backend is
-  fake or BAML HTTP
+  fake, generated stdio, external HTTP, or brokered
 - failures carry categories useful for status and retry policy
 
 ### 1.3 Adapter Crate
@@ -563,7 +893,7 @@ Exit criteria:
 
 - adapter-backed effects and executor-backed coerce have separate, clear
   boundaries
-- no adapter manifest is required just to call BAML HTTP `coerce`
+- no adapter manifest is required just to call BAML-backed `coerce`
 
 ## Phase 2: Durable Coerce Storage
 
@@ -602,29 +932,42 @@ Exit criteria:
 - tests cover insert, lookup, duplicate success behavior, latest calls, and
   latest failures
 
-## Phase 3: BAML HTTP Executor
+## Phase 3: BAML Execution Backends
 
-Goal: implement real `coerce` through BAML HTTP with external server mode first.
+Goal: implement real `coerce` through a sandbox-friendly generated stdio
+backend by default, while keeping external BAML HTTP and brokered BAML as
+explicit modes.
 
 Work in engine and CLI:
 
-- implement `BamlHttpCoerceExecutor`
-- add CLI flag:
+- keep `BamlHttpCoerceExecutor` for explicit `--baml-url`
+- add `BamlGeneratedStdioCoerceExecutor` for default managed execution
+- keep CLI override:
 
 ```text
 --baml-url http://127.0.0.1:2024
 ```
 
-- call:
+- when no fake coerce output and no `--baml-url` is supplied, workflows with
+  `coerce` should use generated stdio by default
+- external HTTP mode calls:
 
 ```text
 POST /call/<function_name>
 ```
 
 with named JSON arguments derived from the `coerce` declaration parameter names
+- generated stdio mode sends the same named JSON arguments through a framed
+  stdin/stdout protocol to a generated BAML client runner
 - support request timeouts
+- support generated runner startup timeout and protocol validation
 - classify backend errors:
-  - `baml_server_unavailable`
+  - `baml_cli_not_found`
+  - `baml_generation_failed`
+  - `baml_runner_start_failed`
+  - `baml_runner_protocol_error`
+  - `baml_broker_unavailable`
+  - `baml_http_unavailable`
   - `baml_http_error`
   - `baml_timeout`
   - `baml_parse_failure`
@@ -636,31 +979,59 @@ with named JSON arguments derived from the `coerce` declaration parameter names
 
 Implementation sequence:
 
+Implemented so far:
+
 1. Add HTTP client dependency in the smallest crate that needs it.
 2. Add executor construction in CLI when `--baml-url` is provided.
-3. Build generated `baml_src` before real coerce execution.
-4. Compute and record generated BAML artifact hash.
-5. Validate arguments before calling HTTP.
-6. Validate parsed output after HTTP.
-7. Reuse successful output before HTTP.
-8. Append failure records on all backend and schema errors.
+3. Compute and record generated BAML artifact hash.
+4. Validate arguments before calling HTTP.
+5. Validate parsed output after HTTP.
+6. Reuse successful output before HTTP.
+7. Append failure records on all backend and schema errors.
+
+Backend migration sequence:
+
+1. Add lazy mode resolution at `coerce` evaluation time: fake outputs,
+   external URL, brokered mode, no coerce call, generated stdio default.
+2. Keep existing `managed_http` code only as an explicit debug/compatibility
+   backend while generated stdio is implemented.
+3. Add policy diagnostics for generated stdio, external HTTP, and brokered
+   modes.
+4. Add `GeneratedBamlRunner` helper:
+   - write generated `baml_src`: implemented
+   - write TypeScript `generators.baml`: implemented
+   - run `baml-cli generate`: implemented for the managed runner path
+   - generate or locate a tiny runner entrypoint: implemented
+   - send one named JSON request over stdin/stdout: implemented
+   - capture stdout/stderr artifacts: failure details are captured in errors;
+     dedicated artifact files remain future hardening
+   - validate protocol responses: implemented
+5. Use generated stdio in `run` and `harness run --drive-workflow` when real
+   coerce is needed and no explicit backend override is supplied.
+6. Record runtime metadata in coerce backend records and status projection.
+7. Add brokered storage/protocol after generated stdio is working.
 
 Testing:
 
 - unit test request construction and output validation
-- unit test error classification with a local tiny HTTP test server if useful
+- unit test generated runner protocol success/failure without TCP listeners
 - deterministic e2e should continue using `FakeCoerceExecutor`
-- add opt-in real BAML integration test gated by:
+- add generated-runner tests with a fake runner executable
+- keep local HTTP tests limited to explicit HTTP mode
+- keep opt-in real BAML integration test gated by:
 
 ```text
 ARMATURE_RUN_BAML_E2E=1
-BAML server URL or managed test setup
+BAML CLI or external URL
 provider credentials or compatible local provider
 ```
 
 Exit criteria:
 
-- an external BAML server can satisfy a real workflow `coerce`
+- Armature-managed BAML can satisfy a real workflow `coerce` without requiring
+  a separately started sidecar or a local listening socket
+- an external BAML server can satisfy a real workflow `coerce` when `--baml-url`
+  is supplied
 - replay of the same committed transition does not call BAML again
 - coerce failure is visible through failed events, durable diagnostics, and
   current coerce failure status while the event is unresolved; latest coerce
@@ -776,7 +1147,7 @@ Goal: keep verification useful as runtime semantics become more complete.
 
 Work in `crates/armature-modelgen` and `models/statechart-workflows`:
 
-- keep BAML HTTP internals out of generated and hand-written models
+- keep BAML backend internals out of generated and hand-written models
 - model coerce as nondeterministic schema-valid output
 - model bounded outputs for enums, literals, bools, nulls, unions, and record
   discriminants
@@ -836,21 +1207,21 @@ Implement in this order:
      records
 
 3. **Native agent ledger and harness**
-   - start declared local agent work: planned through native
-     `agent_invocations`
-   - send messages to declared local targets: planned through native
-     `agent_messages`
-   - claim queued work: planned through harness leases in SQLite
-   - run providers: planned through command-provider MVP plus Codex, Claude
-     Code, and Pi presets
-   - observe typed completion events: planned through harness completion
-     records and direct `workflow_events` enqueue
-   - record stdout/stderr artifacts: planned through durable run directories
-     referenced from invocation rows
-   - enforce target compatibility: partially implemented through declared
-     `thread`/`codingAgent`/adapter targets and static rejection for starting
-     thread-only agents; native ledger semantics and provider contract checks
-     remain implementation work
+  - start declared local agent work: implemented through native
+    `agent_invocations`
+  - send messages to declared local targets: implemented through native
+    `agent_messages`
+  - claim queued work: implemented through harness leases in SQLite
+  - run providers: implemented through command-provider MVP plus Codex, Claude
+    Code, and Pi preset command construction; provider adapters are not yet
+    extracted as first-class structs
+  - observe typed completion events: implemented through harness completion
+    records and direct `workflow_events` enqueue
+  - record stdout/stderr artifacts: implemented through durable run directories
+    referenced from invocation rows
+  - enforce target compatibility: implemented through declared
+    `thread`/`codingAgent`/adapter targets, static rejection for starting
+    thread-only agents, and launch-time profile/provider policy checks
 
 4. **Legacy compatibility adapter**
    - not a product objective
@@ -890,12 +1261,14 @@ CLI work:
 - support administrative retry of failed queue records: implemented for
   `retry-event --event-id`, limited to `failed` and `dead_lettered` events,
   preserving attempt counts and clearing `last_error`
-- add `--baml-url` to commands that may execute real coerce
+- make generated stdio the default real `coerce` runtime when a workflow
+  contains `coerce`, no fake coerce output is supplied, and no explicit backend
+  override is supplied
+- keep `--baml-url` as an explicit external endpoint override
 - keep `--fake-coerce-output` as testing/development-only
   - duplicate fake output names are rejected to avoid silent test fixture
     overrides
   - fake output names containing whitespace or control characters are rejected
-- add `--manage-baml` only after external URL mode is reliable
 - keep `build` producing:
   - `workflow-ir.json`: implemented
   - `baml_src/workflow.baml`: implemented
@@ -911,12 +1284,17 @@ Policy work:
 - BAML-specific policy knobs:
   - `allow_baml_network`: implemented for `run --baml-url`
   - `allowed_baml_urls`: implemented as exact URL allowlist for `run --baml-url`
-  - `allow_managed_baml_server`: schema field reserved until managed process
-    mode exists
+  - `allow_baml_stdio_runner`: target policy field for generated stdio
+  - `allow_baml_codex_oauth`: implemented for explicit Codex/ChatGPT OAuth
+    credential authority in generated stdio mode
+  - `allow_baml_http`: target policy field for explicit HTTP mode
+  - `allow_baml_broker`: target policy field for brokered mode
+  - `allow_managed_baml_server`: transitional field for current managed HTTP
+    implementation; replace during generated stdio migration
   - `allowed_models`: schema field validated and reserved until Armature owns
     provider/model selection
-  - `allowed_env_vars`: schema field validated and reserved until managed
-    process mode owns environment projection
+  - `allowed_env_vars`: used to project the managed BAML process environment
+    when supplied; model-specific enforcement remains future work
 - make raw response redaction policy explicit: implemented through
   `store_baml_raw_responses`; enterprise redacts by default, explicit false
   always redacts, and parsed output remains durable for replay/status
@@ -956,10 +1334,11 @@ Required e2e layers:
    - run `check` with TLA/Maude when tools are installed
    - skip clearly when tools are absent
 
-4. **Real BAML HTTP e2e**
+4. **Real BAML e2e**
    - opt-in only
    - generated `baml_src`
-   - external `--baml-url` or managed test server
+   - generated stdio runner by default
+   - external `--baml-url` only for explicit HTTP coverage
    - provider/local-model credentials supplied by environment
    - assert durable `coerce_calls` records and status projection
 
@@ -985,13 +1364,13 @@ scripts/check-formal-models.sh
 ```
 
 `scripts/check-docs.sh` is intentionally more than a smoke test. It validates
-and builds the documented supervisor template, runs it with the local
-file-backed agent adapter, checks that `overview` reports the active worker,
-checks that `overview` reports summarized workflow data in both active and
-settled states,
-emits a typed completion event, processes the queued event, and checks that
-`overview` reports an idle settled workflow. It also exercises the local
-human-review bridge by creating an `askHuman` obligation, emitting a typed
+and builds the documented supervisor template, runs it through the native
+harness with the generated harness policy, checks that `overview` reports the
+active worker, checks that `overview` reports summarized workflow data in both
+active and settled states, processes the queued completion event, and checks
+that `overview` reports an idle settled workflow. It also validates the
+generated `.armature/harness-policy.json` and exercises the local human-review
+bridge by creating an `askHuman` obligation, emitting a typed
 `humanReview.responded` event, and checking that the review JSON file records
 the response.
 
@@ -1052,7 +1431,7 @@ The v1 track is complete when:
 - `.armature` source is the primary product surface
 - the implemented expression kernel matches
   [expression-primitives.md](expression-primitives.md)
-- real `coerce` uses BAML HTTP with durable replay-safe records
+- real `coerce` uses the selected BAML backend with durable replay-safe records
 - SQLite state, queue, transitions, effects, and coerce calls are durable and
   recoverable
 - status and overview explain current state, workflow data summary, pending
@@ -1060,7 +1439,7 @@ The v1 track is complete when:
   policy blockers
 - generated formal models cover the implemented control-state and
   active-invocation semantics and fail closed for unsupported data invariants
-- fake e2e, recovery e2e, formal command e2e, and opt-in real BAML HTTP e2e
+- fake e2e, recovery e2e, formal command e2e, and opt-in real BAML e2e
   exist
 - at least one real adapter path can start agent work and process completion
   events

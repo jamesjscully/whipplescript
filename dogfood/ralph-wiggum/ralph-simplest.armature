@@ -1,0 +1,54 @@
+machine RalphSimplest
+initial waiting
+
+agent ralph = codingAgent()
+
+event begin {
+  message string
+}
+
+event finished {
+  id string
+  name string
+  status string
+  summary string
+  exitCode int?
+}
+
+state waiting {
+  on begin {
+    start ralph {
+      message "Ralph: I made a folder."
+    }
+    goto lineTwo
+  }
+}
+
+state lineTwo {
+  on finished {
+    start ralph {
+      message "Ralph: I wrote the important sentence."
+    }
+    goto lineThree
+  }
+}
+
+state lineThree {
+  on finished {
+    start ralph {
+      message "Ralph: I checked my work."
+    }
+    goto finishing
+  }
+}
+
+state finishing {
+  on finished {
+    goto done
+  }
+}
+
+state done {
+  final
+}
+

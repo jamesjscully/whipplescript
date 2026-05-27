@@ -1,6 +1,6 @@
 # Workflow Storage
 
-Status: implemented compact schema plus planned native agent ledger
+Status: implemented compact schema plus native agent ledger
 
 The first implementation should use SQLite for durable workflow state.
 
@@ -170,14 +170,13 @@ Rules:
 - status projections include latest successful coerce decisions and latest
   failures
 
-## Planned Native Agent Ledger Tables
+## Implemented Native Agent Ledger Tables
 
 The JSON agent-file bridge is scaffolding, not the target storage model. The
 native harness should use the same SQLite workflow database as the runtime.
 Agent work is first-class durable workflow state, not an adapter side file.
 
-The first native harness migration should bump the schema version and add these
-tables.
+The native harness migration bumps the schema version and adds these tables.
 
 ### `agent_invocations`
 

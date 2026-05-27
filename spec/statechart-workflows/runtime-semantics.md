@@ -13,7 +13,7 @@ and allowed by the active contracts.
 It may call:
 
 - the native local agent harness ledger
-- BAML HTTP functions for `coerce`
+- selected BAML backends for `coerce`
 - allowlisted adapter actions
 - legacy Armature APIs only through explicit compatibility adapters, if used
 
@@ -164,10 +164,13 @@ preferred in examples where model-dependent control flow should be obvious.
 `coerce` calls are deterministic from the workflow runtime's point of view once
 the model response is recorded.
 
-The selected v1 backend is BAML HTTP. The runtime either connects to a supplied
-`--baml-url` or, in later managed mode, launches `baml-cli serve --from
-<baml_src>`. The call uses named JSON arguments derived from the `coerce`
-declaration's parameter names.
+The selected v1 target backend is generated BAML client execution over
+stdin/stdout. This is the default when real `coerce` execution is needed because
+it does not require the coding agent sandbox to open a local listening socket. A
+supplied `--baml-url` tells Armature to use an externally managed BAML HTTP
+endpoint instead. Brokered mode records durable coerce requests for a trusted
+out-of-sandbox service to complete. Every backend uses named JSON arguments
+derived from the `coerce` declaration's parameter names.
 
 The runtime records:
 
@@ -175,7 +178,7 @@ The runtime records:
 coerce function name
 named input payload
 idempotency key
-BAML HTTP backend URL or managed process metadata
+BAML backend mode and runner/service metadata
 BAML source artifact hash
 model/provider metadata
 raw response

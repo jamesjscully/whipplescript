@@ -156,18 +156,22 @@ Symptoms:
 
 - `latest_coerce_failures` is non-empty
 - workflow state did not advance after a `coerce`
-- BAML HTTP errors are visible in status/log output
+- BAML backend errors are visible in status/log output
 
 Checks:
 
-- ensure `--baml-url` is reachable
-- ensure policy allows `baml.coerce`, `allow_baml_network`, and the exact URL
+- for generated stdio BAML, inspect runner startup/protocol diagnostics and
+  stdout/stderr artifact paths
+- for external `--baml-url`, ensure the supplied endpoint is reachable
+- ensure policy allows `baml.coerce` and the selected backend:
+  generated stdio, exact external URL, or brokered coerce
 - inspect the generated `baml_src/workflow.baml` from `build`
 - confirm the BAML output matches the declared class/enum schema
 
 Likely repairs:
 
-- fix policy or URL configuration
+- fix policy, generated runner startup/protocol errors, broker state, or
+  external URL configuration
 - tighten the prompt or output type
 - rerun after the failure is corrected; successful coerce outputs are replayed
   by idempotency key

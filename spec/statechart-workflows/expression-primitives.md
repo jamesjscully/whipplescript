@@ -365,7 +365,7 @@ Rules:
 
 - no user-defined arbitrary functions in v1
 - direct calls to undeclared names are validation errors
-- coerce calls are synchronous value effects backed by BAML HTTP
+- coerce calls are synchronous value effects backed by the selected BAML backend
 - capability value calls are synchronous value effects backed by adapters
 - statement-style capability calls are adapter effects
 

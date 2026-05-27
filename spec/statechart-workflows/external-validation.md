@@ -79,9 +79,10 @@ Confirmed:
 - `prompt #"... "#` with `{{ ctx.output_format }}` is valid.
 - BAML enums require values that start with an uppercase letter.
 - Generated TypeScript client code is produced by `baml-cli generate`.
-- `baml-cli serve --from <PATH>` is the selected v1 execution path for
-  Armature `coerce`, using BAML HTTP instead of generated TypeScript or the Rust
-  SDK.
+- `baml-cli serve --from <PATH>` exposes the BAML HTTP execution path for
+  explicit service mode.
+- The revised v1 target default is generated BAML client execution over
+  stdin/stdout, because coding-agent sandboxes may deny local TCP listeners.
 - The Rust crate exposes a lower-level runtime surface including in-memory
   source loading, dynamic values, parsing, calls, and type builder APIs.
 
@@ -104,9 +105,10 @@ Corrections found:
 - Direct Rust SDK use currently requires `protoc` in this local environment; the
   probe failed before runtime execution because `protobuf-compiler` is not
   installed.
-- Because BAML HTTP is now selected for v1, generated TypeScript and direct Rust
-  SDK probes are retained as historical validation notes rather than current
-  implementation direction.
+- Because generated stdio is now selected for the default v1 path, generated
+  TypeScript or another generated-client runner should be revalidated before
+  implementation. BAML HTTP probes remain relevant for explicit `--baml-url`
+  service mode.
 
 ## TLA+ / Apalache
 

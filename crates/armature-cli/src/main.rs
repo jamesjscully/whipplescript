@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::process::Output;
@@ -34,6 +34,14 @@ enum CliEventStatus {
     Failed,
     #[value(name = "dead_lettered", alias = "dead-lettered")]
     DeadLettered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliBamlAuthMode {
+    #[value(name = "api-key", alias = "apikey")]
+    ApiKey,
+    #[value(name = "codex-oauth", alias = "codex")]
+    CodexOauth,
 }
 
 impl From<CliEventStatus> for EventStatus {
@@ -93,8 +101,8 @@ enum Command {
         /// Include the built-in JSON human-review adapter manifest for validation.
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
-        /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file", hide = true)]
+        /// Include the hidden JSON agent fixture manifest for validation.
+        #[arg(long = "fixture-agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -108,6 +116,15 @@ enum Command {
     /// Parse and statically validate capability policy document files.
     ValidatePolicy {
         policies: Vec<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Parse and statically validate harness profile policy files.
+    ValidateProfilePolicy {
+        policies: Vec<PathBuf>,
+        /// Optional workflow file whose agent profile references should be checked too.
+        #[arg(long = "workflow")]
+        workflow: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -132,8 +149,8 @@ enum Command {
         /// Supply built-in human-review response event schema for emit intake.
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
-        /// Supply built-in agent completion event schema for emit intake.
-        #[arg(long = "agent-file", hide = true)]
+        /// Supply hidden fixture agent completion event schema for emit intake.
+        #[arg(long = "fixture-agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -168,12 +185,15 @@ enum Command {
         /// Use a JSON file as the built-in human-review obligation store.
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
-        /// Use a JSON file as the built-in agent invocation/message store.
-        #[arg(long = "agent-file", hide = true)]
+        /// Use a hidden fixture JSON file as the legacy agent invocation/message store.
+        #[arg(long = "fixture-agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         /// Call real BAML functions through an already-running baml-cli serve endpoint.
         #[arg(long = "baml-url")]
         baml_url: Option<String>,
+        /// Credential source for generated-stdio BAML execution.
+        #[arg(long = "baml-auth", value_enum, default_value_t = CliBamlAuthMode::ApiKey)]
+        baml_auth: CliBamlAuthMode,
         #[arg(long = "baml-timeout-ms", default_value_t = 30_000)]
         baml_timeout_ms: u64,
         #[arg(long)]
@@ -197,8 +217,8 @@ enum Command {
         /// Include the built-in JSON human-review adapter manifest for validation.
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
-        /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file", hide = true)]
+        /// Include the hidden JSON agent fixture manifest for validation.
+        #[arg(long = "fixture-agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         /// Print a compact operator-oriented status summary.
         #[arg(long)]
@@ -224,8 +244,8 @@ enum Command {
         /// Include the built-in JSON human-review adapter manifest for validation.
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
-        /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file", hide = true)]
+        /// Include the hidden JSON agent fixture manifest for validation.
+        #[arg(long = "fixture-agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -248,8 +268,8 @@ enum Command {
         /// Include the built-in JSON human-review adapter manifest for validation.
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
-        /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file", hide = true)]
+        /// Include the hidden JSON agent fixture manifest for validation.
+        #[arg(long = "fixture-agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         /// Durable event status to filter by.
         #[arg(long, value_enum)]
@@ -281,8 +301,8 @@ enum Command {
         /// Include the built-in JSON human-review adapter manifest for validation.
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
-        /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file", hide = true)]
+        /// Include the hidden JSON agent fixture manifest for validation.
+        #[arg(long = "fixture-agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -305,8 +325,8 @@ enum Command {
         /// Include the built-in JSON human-review adapter manifest for validation.
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
-        /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file", hide = true)]
+        /// Include the hidden JSON agent fixture manifest for validation.
+        #[arg(long = "fixture-agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         /// Maximum number of log records to print.
         #[arg(long, default_value_t = 50)]
@@ -332,8 +352,8 @@ enum Command {
         /// Include the built-in JSON human-review adapter manifest for validation.
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
-        /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file", hide = true)]
+        /// Include the hidden JSON agent fixture manifest for validation.
+        #[arg(long = "fixture-agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -358,8 +378,8 @@ enum Command {
         /// Include the built-in JSON human-review adapter manifest for validation.
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
-        /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file", hide = true)]
+        /// Include the hidden JSON agent fixture manifest for validation.
+        #[arg(long = "fixture-agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -382,8 +402,8 @@ enum Command {
         /// Include the built-in JSON human-review adapter manifest in validation/build metadata.
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
-        /// Include the built-in JSON agent adapter manifest in validation/build metadata.
-        #[arg(long = "agent-file", hide = true)]
+        /// Include the hidden JSON agent fixture manifest in validation/build metadata.
+        #[arg(long = "fixture-agent-file", hide = true)]
         agent_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -406,8 +426,8 @@ enum Command {
         /// Include the built-in JSON human-review adapter manifest for validation.
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
-        /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file", hide = true)]
+        /// Include the hidden JSON agent fixture manifest for validation.
+        #[arg(long = "fixture-agent-file", hide = true)]
         agent_file: Option<PathBuf>,
     },
     /// Emit a checker config for a generated formal model.
@@ -428,8 +448,8 @@ enum Command {
         /// Include the built-in JSON human-review adapter manifest for validation.
         #[arg(long = "review-file")]
         review_file: Option<PathBuf>,
-        /// Include the built-in JSON agent adapter manifest for validation.
-        #[arg(long = "agent-file", hide = true)]
+        /// Include the hidden JSON agent fixture manifest for validation.
+        #[arg(long = "fixture-agent-file", hide = true)]
         agent_file: Option<PathBuf>,
     },
 }
@@ -487,6 +507,9 @@ enum HarnessCommand {
         /// Call real BAML functions through an already-running baml-cli serve endpoint.
         #[arg(long = "baml-url")]
         baml_url: Option<String>,
+        /// Credential source for generated-stdio BAML execution.
+        #[arg(long = "baml-auth", value_enum, default_value_t = CliBamlAuthMode::ApiKey)]
+        baml_auth: CliBamlAuthMode,
         #[arg(long = "baml-timeout-ms", default_value_t = 30_000)]
         baml_timeout_ms: u64,
         /// Maximum loop iterations; omit for continuous operation.
@@ -556,6 +579,8 @@ enum CliError {
     InvalidAdapterManifestInput(String),
     #[error("invalid policy document input: {0}")]
     InvalidPolicyDocumentInput(String),
+    #[error("invalid harness profile policy input: {0}")]
+    InvalidHarnessProfilePolicyInput(String),
     #[error("invalid fake output `{0}`; expected NAME=JSON")]
     InvalidFakeOutput(String),
     #[error("duplicate fake output `{0}`")]
@@ -684,6 +709,7 @@ struct InitOutput {
     workflow_name: String,
     workflow: PathBuf,
     policy: PathBuf,
+    harness_policy: PathBuf,
     state_dir: PathBuf,
     workflow_store_dir: PathBuf,
 }
@@ -767,6 +793,8 @@ struct HarnessAgentConfig {
     args: Vec<String>,
     cwd: Option<PathBuf>,
     timeout_seconds: Option<u64>,
+    #[serde(skip)]
+    authority: Option<HarnessAuthorityConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -813,12 +841,28 @@ struct HarnessProfileDefinition {
 }
 
 #[derive(Debug, Clone)]
+struct HarnessAuthorityConfig {
+    filesystem: String,
+    network: String,
+    allowed_env: Vec<String>,
+    allowed_tools: Vec<String>,
+    enforcement: String,
+}
+
+#[derive(Debug, Clone)]
 struct ResolvedHarnessProvider {
     profile: Option<String>,
     config: HarnessAgentConfig,
     requested_authority: serde_json::Value,
-    enforced_authority: serde_json::Value,
     enforcement: String,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ProviderAuthorityPlan {
+    args: Vec<String>,
+    env_allowlist: Option<Vec<String>>,
+    enforced: serde_json::Value,
     warnings: Vec<String>,
 }
 
@@ -876,6 +920,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             } else {
                 println!("created {}", output.workflow.display());
                 println!("created {}", output.policy.display());
+                println!("created {}", output.harness_policy.display());
                 println!("created {}", output.state_dir.display());
                 println!("created {}", output.workflow_store_dir.display());
             }
@@ -899,7 +944,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 diagnostics.extend(armature_workflow::validate_ir(&ir).diagnostics);
                 if let Some(path) = &profile_policy {
                     let policy = load_harness_profile_policy(path)?;
-                    diagnostics.extend(validate_harness_profile_policy(&ir, &policy));
+                    diagnostics.extend(validate_harness_profile_policy(Some(&ir), &policy));
                 }
                 let policies = load_policy_documents(&policy_documents)?;
                 if !adapter_manifests.is_empty()
@@ -999,6 +1044,44 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 })
             }
         }
+        Command::ValidateProfilePolicy {
+            policies,
+            workflow,
+            json,
+        } => {
+            if policies.is_empty() {
+                return Err(CliError::InvalidHarnessProfilePolicyInput(
+                    "validate-profile-policy requires at least one policy path".to_string(),
+                ));
+            }
+            let workflow_ir = workflow.as_ref().map(load_valid_ir).transpose()?;
+            let mut diagnostics = Vec::new();
+            for policy in &policies {
+                let parsed = load_harness_profile_policy(policy)?;
+                diagnostics.extend(validate_harness_profile_policy(
+                    workflow_ir.as_ref(),
+                    &parsed,
+                ));
+            }
+            let ok = !diagnostics_have_errors(&diagnostics);
+
+            if json {
+                print_json(&ValidateOutput {
+                    ok,
+                    diagnostics: diagnostics.clone(),
+                })?;
+            } else if ok {
+                println!("ok");
+            }
+
+            if ok {
+                Ok(())
+            } else {
+                Err(CliError::Validation {
+                    diagnostics: if json { Vec::new() } else { diagnostics },
+                })
+            }
+        }
         Command::Emit {
             file,
             event,
@@ -1058,6 +1141,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             review_file,
             agent_file,
             baml_url,
+            baml_auth,
             baml_timeout_ms,
             json,
         } => {
@@ -1073,15 +1157,14 @@ fn run(cli: Cli) -> Result<(), CliError> {
             }
             let policies = load_valid_policy_documents(&policy_documents)?;
             let fake_coerce_outputs = parse_fake_outputs(&fake_coerce_outputs)?;
-            if fake_coerce_outputs.is_empty() {
-                if let Some(url) = &baml_url {
-                    let diagnostics = armature_adapters::validate_baml_http_policy(&policies, url);
-                    if diagnostics_have_errors(&diagnostics) {
-                        return Err(policy_document_validation_error(diagnostics));
-                    }
-                }
-            }
             let ir = load_valid_ir_with_contracts(&file, &manifests, &policies)?;
+            validate_baml_runtime_policy(
+                &ir,
+                fake_coerce_outputs.is_empty(),
+                baml_url.as_deref(),
+                baml_auth,
+                &policies,
+            )?;
             let store_baml_raw_response =
                 armature_adapters::should_store_baml_raw_response(&policies);
             let workflow_id = ir.workflow.name.clone();
@@ -1090,7 +1173,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             let store = WorkflowStore::open(&store_path)?;
             let dispatcher = adapter_dispatcher_from_manifests(
                 manifests.clone(),
-                policies,
+                policies.clone(),
                 plan_file.clone(),
                 review_file.clone(),
                 agent_file.clone(),
@@ -1099,10 +1182,13 @@ fn run(cli: Cli) -> Result<(), CliError> {
             let coerce_executor = coerce_executor_for_run(
                 fake_coerce_outputs,
                 baml_url,
+                baml_auth,
                 Some(baml_timeout_ms),
                 &ir,
+                &file,
+                &policies,
                 store_baml_raw_response,
-            );
+            )?;
             let mut runtime = WorkflowRuntime::with_dispatcher_and_coerce_executor(
                 ir,
                 store,
@@ -1407,6 +1493,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 plan_file,
                 review_file,
                 baml_url,
+                baml_auth,
                 baml_timeout_ms,
                 max_iterations,
                 json,
@@ -1426,6 +1513,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                             plan_file.clone(),
                             review_file.clone(),
                             baml_url.clone(),
+                            baml_auth,
                             baml_timeout_ms,
                         ) {
                             Ok(processed) => processed,
@@ -1711,6 +1799,7 @@ fn load_status_for_file(
             latest_coerce_calls: Vec::new(),
             latest_coerce_failures: Vec::new(),
             current_coerce_failure: None,
+            baml_runtime: None,
             current_effect_failures: Vec::new(),
             policy_blockers: Vec::new(),
             current_blockers: Vec::new(),
@@ -1778,6 +1867,7 @@ fn load_overview_for_file(
                 latest_coerce_calls: Vec::new(),
                 latest_coerce_failures: Vec::new(),
                 current_coerce_failure: None,
+                baml_runtime: None,
                 current_effect_failures: Vec::new(),
                 policy_blockers: Vec::new(),
                 current_blockers: Vec::new(),
@@ -1825,10 +1915,61 @@ const INIT_POLICY_SOURCE: &str = r#"{
   "denied_capabilities": [],
   "allow_baml_network": false,
   "allowed_baml_urls": [],
+  "allow_baml_stdio_runner": false,
+  "allow_baml_codex_oauth": false,
   "allow_managed_baml_server": false,
   "allowed_models": [],
   "allowed_env_vars": [],
   "store_baml_raw_responses": false
+}
+"#;
+
+const INIT_HARNESS_POLICY_SOURCE: &str = r#"{
+  "mode": "separated",
+  "defaultProfile": "repo-writer",
+  "allowCommandProvider": false,
+  "profiles": {
+    "research": {
+      "description": "Use for external documentation, package discovery, and web research. Do not edit repository files.",
+      "provider": "codex",
+      "timeoutSeconds": 1200,
+      "filesystem": "read_only",
+      "network": "allowed",
+      "allowedEnv": ["OPENAI_API_KEY"],
+      "allowedTools": ["read", "web"],
+      "enforcement": "native_or_best_effort"
+    },
+    "repo-reader": {
+      "description": "Use for inspecting repository files, architecture, tests, and logs without making changes.",
+      "provider": "codex",
+      "timeoutSeconds": 1200,
+      "filesystem": "read_only",
+      "network": "denied",
+      "allowedEnv": ["OPENAI_API_KEY"],
+      "allowedTools": ["read"],
+      "enforcement": "native_or_best_effort"
+    },
+    "repo-writer": {
+      "description": "Use for implementation work after the task is clear. This profile may edit the repository but should not perform internet research.",
+      "provider": "codex",
+      "timeoutSeconds": 1800,
+      "filesystem": "workspace_write",
+      "network": "denied",
+      "allowedEnv": ["OPENAI_API_KEY"],
+      "allowedTools": ["read", "edit", "test"],
+      "enforcement": "native_or_best_effort"
+    },
+    "human-review": {
+      "description": "Use for structured review, approval, or decision collection. Do not use for autonomous code changes.",
+      "provider": "command",
+      "timeoutSeconds": 300,
+      "filesystem": "none",
+      "network": "denied",
+      "allowedEnv": [],
+      "allowedTools": [],
+      "enforcement": "external"
+    }
+  }
 }
 "#;
 
@@ -1858,15 +1999,18 @@ fn init_project(dir: &Path, name: &str, force: bool) -> Result<InitOutput, CliEr
 
     let workflow = dir.join("workflow.armature");
     let policy = armature_dir.join("policy.json");
+    let harness_policy = armature_dir.join("harness-policy.json");
     let workflow_source = INIT_WORKFLOW_TEMPLATE.replace("{name}", name);
     write_init_file(&workflow, &workflow_source, force)?;
     write_init_file(&policy, INIT_POLICY_SOURCE, force)?;
+    write_init_file(&harness_policy, INIT_HARNESS_POLICY_SOURCE, force)?;
 
     Ok(InitOutput {
         root: dir.to_path_buf(),
         workflow_name: name.to_string(),
         workflow,
         policy,
+        harness_policy,
         state_dir,
         workflow_store_dir,
     })
@@ -2019,44 +2163,993 @@ fn add_json_agent_finished_event_manifest_if_needed(
     }
 }
 
+#[derive(Debug)]
+struct GeneratedBamlStdioCoerceExecutor {
+    workflow_file: PathBuf,
+    ir: armature_workflow::WorkflowIr,
+    timeout_ms: Option<u64>,
+    policies: Vec<armature_adapters::CapabilityPolicyDocument>,
+    store_baml_raw_response: bool,
+    runner: Option<PathBuf>,
+    auth_mode: CliBamlAuthMode,
+}
+
+impl GeneratedBamlStdioCoerceExecutor {
+    fn new(
+        workflow_file: &Path,
+        ir: &armature_workflow::WorkflowIr,
+        timeout_ms: Option<u64>,
+        policies: &[armature_adapters::CapabilityPolicyDocument],
+        store_baml_raw_response: bool,
+        auth_mode: CliBamlAuthMode,
+    ) -> Self {
+        Self {
+            workflow_file: workflow_file.to_path_buf(),
+            ir: ir.clone(),
+            timeout_ms,
+            policies: policies.to_vec(),
+            store_baml_raw_response,
+            runner: std::env::var_os("ARMATURE_BAML_GENERATED_STDIO_RUNNER")
+                .or_else(|| std::env::var_os("ARMATURE_BAML_STDIO_RUNNER"))
+                .map(PathBuf::from),
+            auth_mode,
+        }
+    }
+
+    fn runner_path(&self) -> PathBuf {
+        self.runner
+            .clone()
+            .unwrap_or_else(|| managed_baml_runner_path(&self.workflow_file, &self.ir))
+    }
+
+    fn prepare_artifacts(&self) -> Result<PathBuf, armature_engine::coerce::CoerceError> {
+        let baml_dir = managed_baml_src_dir(&self.workflow_file, &self.ir);
+        fs::create_dir_all(&baml_dir).map_err(|source| {
+            armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+                format!(
+                    "failed to create generated BAML source directory `{}`: {source}",
+                    baml_dir.display()
+                ),
+            )
+        })?;
+        let baml_src = baml_dir.join("workflow.baml");
+        fs::write(
+            &baml_src,
+            emit_baml_source_for_auth(&self.ir, self.auth_mode),
+        )
+        .map_err(|source| {
+            armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+                format!(
+                    "failed to write generated BAML source `{}`: {source}",
+                    baml_src.display()
+                ),
+            )
+        })?;
+        let generator_src = baml_dir.join("generators.baml");
+        fs::write(&generator_src, generated_baml_typescript_generator_source()).map_err(
+            |source| {
+                armature_engine::coerce::CoerceError::new(
+                    armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+                    format!(
+                        "failed to write generated BAML generator config `{}`: {source}",
+                        generator_src.display()
+                    ),
+                )
+            },
+        )?;
+
+        let runner_path = managed_baml_runner_path(&self.workflow_file, &self.ir);
+        let runner_dir = runner_path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(runner_dir).map_err(|source| {
+            armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+                format!(
+                    "failed to create generated BAML runner directory `{}`: {source}",
+                    runner_dir.display()
+                ),
+            )
+        })?;
+        fs::write(&runner_path, generated_baml_stdio_runner_source()).map_err(|source| {
+            armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+                format!(
+                    "failed to write generated BAML stdio runner `{}`: {source}",
+                    runner_path.display()
+                ),
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&runner_path)
+                .map_err(|source| {
+                    armature_engine::coerce::CoerceError::new(
+                        armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+                        format!(
+                            "failed to read generated BAML stdio runner metadata `{}`: {source}",
+                            runner_path.display()
+                        ),
+                    )
+                })?
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&runner_path, permissions).map_err(|source| {
+                armature_engine::coerce::CoerceError::new(
+                    armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+                    format!(
+                        "failed to mark generated BAML stdio runner executable `{}`: {source}",
+                        runner_path.display()
+                    ),
+                )
+            })?;
+        }
+
+        if self.runner.is_none() {
+            clean_generated_baml_client_dir(runner_dir)?;
+            run_baml_generate(&baml_dir)?;
+        }
+
+        Ok(baml_dir)
+    }
+}
+
+fn clean_generated_baml_client_dir(
+    runner_dir: &Path,
+) -> Result<(), armature_engine::coerce::CoerceError> {
+    let baml_client_dir = runner_dir.join("baml_client");
+    if !baml_client_dir.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(&baml_client_dir).map_err(|source| {
+        armature_engine::coerce::CoerceError::new(
+            armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+            format!(
+                "failed to clean generated BAML client directory `{}` before regeneration: {source}",
+                baml_client_dir.display()
+            ),
+        )
+    })
+}
+
+impl armature_engine::coerce::CoerceExecutor for GeneratedBamlStdioCoerceExecutor {
+    fn coerce(
+        &self,
+        request: armature_engine::coerce::CoerceRequest,
+    ) -> Result<armature_engine::coerce::CoerceOutcome, armature_engine::coerce::CoerceError> {
+        let diagnostics = armature_adapters::validate_generated_baml_stdio_policy(&self.policies);
+        let codex_oauth_diagnostics = if self.auth_mode == CliBamlAuthMode::CodexOauth {
+            armature_adapters::validate_baml_codex_oauth_policy(&self.policies)
+        } else {
+            Vec::new()
+        };
+        let diagnostics = diagnostics
+            .into_iter()
+            .chain(codex_oauth_diagnostics)
+            .collect::<Vec<_>>();
+        if diagnostics_have_errors(&diagnostics) {
+            let message = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == armature_workflow::Severity::Error)
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::BamlPolicyDenied,
+                message,
+            ));
+        }
+
+        let baml_dir = self.prepare_artifacts()?;
+        let runner_path = self.runner_path();
+        let runner_hash = file_sha256(&runner_path);
+        let baml_src_hash = baml_source_hash(&self.ir);
+        let arg_order = self
+            .ir
+            .coerce_functions
+            .get(&request.function_name)
+            .map(|function| {
+                function
+                    .params
+                    .iter()
+                    .map(|param| param.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let input = serde_json::json!({
+            "id": request.idempotency_key.as_deref().unwrap_or(&request.function_name),
+            "function": request.function_name.clone(),
+            "baml_function": baml_function_name(&request.function_name),
+            "args": request.args.clone(),
+            "arg_order": arg_order,
+            "baml_src_dir": baml_dir,
+            "baml_src_hash": baml_src_hash.clone(),
+        });
+        let mut command = if self.runner.is_some() {
+            ProcessCommand::new(&runner_path)
+        } else {
+            let mut command = ProcessCommand::new("node");
+            command.arg(&runner_path);
+            command
+        };
+        command
+            .arg("--baml-src")
+            .arg(&baml_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(timeout_ms) = request.timeout_ms.or(self.timeout_ms) {
+            command.env("ARMATURE_BAML_TIMEOUT_MS", timeout_ms.to_string());
+        }
+        apply_managed_baml_environment(&mut command, &self.policies);
+        if self.auth_mode == CliBamlAuthMode::CodexOauth {
+            let codex_auth = load_codex_oauth_for_baml().map_err(|message| {
+                armature_engine::coerce::CoerceError::new(
+                    armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+                    message,
+                )
+            })?;
+            command.env("ARMATURE_CODEX_OAUTH_ACCESS_TOKEN", codex_auth.access_token);
+            command.env("ARMATURE_CODEX_OAUTH_BASE_URL", codex_auth.base_url);
+            command.env("ARMATURE_BAML_AUTH_MODE", "codex_oauth");
+        }
+
+        let mut child = command.spawn().map_err(|source| {
+            armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+                format!(
+                    "failed to start generated BAML stdio runner `{}`: {source}. Fix: install Node.js and run BAML code generation for this workflow, configure ARMATURE_BAML_GENERATED_STDIO_RUNNER, or pass --baml-url for an approved external endpoint.",
+                    runner_path.display()
+                ),
+            )
+        })?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::InternalError,
+                "generated BAML stdio runner stdin was unavailable",
+            )
+        })?;
+        serde_json::to_writer(&mut stdin, &input).map_err(|source| {
+            armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::InternalError,
+                format!("failed to encode generated BAML stdio request: {source}"),
+            )
+        })?;
+        stdin.write_all(b"\n").map_err(|source| {
+            armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::InternalError,
+                format!("failed to write generated BAML stdio request: {source}"),
+            )
+        })?;
+        drop(stdin);
+
+        let output = child.wait_with_output().map_err(|source| {
+            armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+                format!("failed waiting for generated BAML stdio runner: {source}"),
+            )
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::BamlRunnerProtocolError,
+                format!(
+                    "generated BAML stdio runner exited with status {}: {}",
+                    output.status,
+                    stderr.trim()
+                ),
+            ));
+        }
+
+        let response = parse_generated_baml_stdio_response(&output.stdout)?;
+        let ok = response
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        if !ok {
+            let message = response
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("generated BAML stdio runner reported failure");
+            return Err(armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::BamlRunnerProtocolError,
+                message,
+            ));
+        }
+        let value = response
+            .get("value")
+            .cloned()
+            .unwrap_or_else(|| response.clone());
+        let raw_response = response.get("raw").cloned().map(|raw| {
+            if self.store_baml_raw_response {
+                raw
+            } else {
+                serde_json::json!({"redacted": true, "reason": "policy"})
+            }
+        });
+
+        Ok(armature_engine::coerce::CoerceOutcome {
+            function_name: request.function_name,
+            status: armature_engine::coerce::CoerceStatus::Succeeded,
+            value: Some(value),
+            backend: armature_engine::coerce::CoerceBackend::BamlGeneratedStdio {
+                baml_src_hash,
+                runner_hash,
+                runtime_mode: Some("generated_stdio".to_string()),
+            },
+            http_status: None,
+            raw_response,
+            error: None,
+            duration_ms: None,
+        })
+    }
+}
+
+fn managed_baml_src_dir(workflow_file: &Path, ir: &armature_workflow::WorkflowIr) -> PathBuf {
+    workflow_file
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".armature")
+        .join("build")
+        .join("workflows")
+        .join(&ir.workflow.name)
+        .join("baml_src")
+}
+
+fn managed_baml_runner_path(workflow_file: &Path, ir: &armature_workflow::WorkflowIr) -> PathBuf {
+    workflow_file
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".armature")
+        .join("build")
+        .join("workflows")
+        .join(&ir.workflow.name)
+        .join("baml_runner")
+        .join("armature-baml-runner.mjs")
+}
+
+fn generated_baml_typescript_generator_source() -> &'static str {
+    r#"generator typescript {
+  output_type "typescript"
+  output_dir "../baml_runner"
+  default_client_mode "async"
+  module_format "esm"
+}
+"#
+}
+
+fn generated_baml_stdio_runner_source() -> &'static str {
+    r#"#!/usr/bin/env node
+const ARMATURE_BAML_STDIO_PROTOCOL_VERSION = 1;
+
+async function readStdin() {
+  let input = "";
+  process.stdin.setEncoding("utf8");
+  for await (const chunk of process.stdin) {
+    input += chunk;
+  }
+  return input.trim();
+}
+
+async function importGeneratedClient() {
+  const candidates = [
+    "./baml_client/index.js",
+    "./baml_client/client.js",
+    "./baml_client/async_client.js",
+    "../baml_client/index.js",
+    "../baml_client/client.js",
+    "../baml_client/async_client.js",
+  ];
+
+  const errors = [];
+  for (const candidate of candidates) {
+    try {
+      return await import(new URL(candidate, import.meta.url));
+    } catch (error) {
+      if (error && error.code !== "ERR_MODULE_NOT_FOUND" && error.code !== "MODULE_NOT_FOUND") {
+        errors.push(`${candidate}: ${error.message}`);
+      }
+    }
+  }
+
+  const detail = errors.length > 0 ? ` Tried candidates with errors: ${errors.join("; ")}` : "";
+  throw new Error(
+    "Could not import generated BAML client. Expected baml-cli generate to create baml_client next to this runner." +
+      detail,
+  );
+}
+
+function resolveFunction(clientModule, functionName) {
+  const candidates = [
+    clientModule.b,
+    clientModule.default,
+    clientModule.default && clientModule.default.b,
+    clientModule,
+  ];
+  for (const candidate of candidates) {
+    if (candidate && typeof candidate[functionName] === "function") {
+      return candidate[functionName].bind(candidate);
+    }
+  }
+  throw new Error(`Generated BAML client does not expose function ${functionName}`);
+}
+
+function resolveNestedFunction(clientModule, propertyName, functionName) {
+  const candidates = [
+    clientModule.b,
+    clientModule.default,
+    clientModule.default && clientModule.default.b,
+    clientModule,
+  ];
+  for (const candidate of candidates) {
+    if (
+      candidate &&
+      candidate[propertyName] &&
+      typeof candidate[propertyName][functionName] === "function"
+    ) {
+      return candidate[propertyName][functionName].bind(candidate[propertyName]);
+    }
+  }
+  throw new Error(`Generated BAML client does not expose ${propertyName}.${functionName}`);
+}
+
+function textFromCodexResponse(response) {
+  if (typeof response.output_text === "string") {
+    return response.output_text;
+  }
+  const chunks = [];
+  if (Array.isArray(response.output)) {
+    for (const item of response.output) {
+      if (Array.isArray(item.content)) {
+        for (const content of item.content) {
+          if (typeof content.text === "string") {
+            chunks.push(content.text);
+          } else if (typeof content.output_text === "string") {
+            chunks.push(content.output_text);
+          }
+        }
+      }
+    }
+  }
+  const text = chunks.join("\n").trim();
+  if (!text) {
+    throw new Error(`Codex OAuth response did not contain output text: ${JSON.stringify(response)}`);
+  }
+  return text;
+}
+
+function textFromCodexSse(responseText) {
+  const deltas = [];
+  let completedText = "";
+  for (const line of responseText.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) {
+      continue;
+    }
+    const data = trimmed.slice("data:".length).trim();
+    if (!data || data === "[DONE]") {
+      continue;
+    }
+    let event;
+    try {
+      event = JSON.parse(data);
+    } catch (_error) {
+      continue;
+    }
+    if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
+      deltas.push(event.delta);
+    } else if (typeof event.delta === "string") {
+      deltas.push(event.delta);
+    }
+    if (event.type === "response.completed" && event.response) {
+      try {
+        completedText = textFromCodexResponse(event.response);
+      } catch (_error) {
+        // Keep collecting deltas.
+      }
+    }
+  }
+  const deltaText = deltas.join("").trim();
+  if (deltaText) {
+    return deltaText;
+  }
+  if (completedText) {
+    return completedText;
+  }
+  throw new Error(`Codex OAuth stream did not contain output text: ${responseText}`);
+}
+
+async function callCodexOauth(clientModule, functionName, positionalArgs) {
+  const requestFn = resolveNestedFunction(clientModule, "request", functionName);
+  const parseFn = resolveNestedFunction(clientModule, "parse", functionName);
+  const httpRequest = await requestFn(...positionalArgs);
+  const requestBody = httpRequest.body && typeof httpRequest.body.json === "function"
+    ? httpRequest.body.json()
+    : {};
+  const headers = { ...(httpRequest.headers || {}) };
+  delete headers["baml-original-url"];
+  headers["authorization"] = `Bearer ${process.env.ARMATURE_CODEX_OAUTH_ACCESS_TOKEN || ""}`;
+  headers["content-type"] = "application/json";
+  const baseUrl = process.env.ARMATURE_CODEX_OAUTH_BASE_URL || "https://chatgpt.com/backend-api/codex";
+  const url = httpRequest.url || `${baseUrl.replace(/\/$/, "")}/responses`;
+  const response = await fetch(url, {
+    method: httpRequest.method || "POST",
+    headers,
+    body: JSON.stringify(requestBody),
+  });
+  const responseText = await response.text();
+  let responseJson;
+  try {
+    responseJson = JSON.parse(responseText);
+  } catch (_error) {
+    responseJson = { raw: responseText };
+  }
+  if (!response.ok) {
+    throw new Error(`Codex OAuth request failed with status ${response.status}: ${responseText}`);
+  }
+  const outputText = typeof responseJson.raw === "string"
+    ? textFromCodexSse(responseJson.raw)
+    : textFromCodexResponse(responseJson);
+  return parseFn(outputText);
+}
+
+async function main() {
+  const rawInput = await readStdin();
+  const request = rawInput.length === 0 ? {} : JSON.parse(rawInput);
+  const requestId = request.id ?? request.coerce_call_id ?? request.function ?? "coerce";
+  const functionName = request.baml_function ?? request.function ?? request.function_name;
+  if (typeof functionName !== "string" || functionName.length === 0) {
+    throw new Error("Generated BAML stdio request is missing string field `function`");
+  }
+
+  const clientModule = await importGeneratedClient();
+  const fn = resolveFunction(clientModule, functionName);
+  const args = request.args ?? {};
+  const argOrder = Array.isArray(request.arg_order) ? request.arg_order : [];
+  const positionalArgs = Array.isArray(args)
+    ? args
+    : argOrder.length > 0
+      ? argOrder.map((name) => args[name])
+      : Object.values(args);
+  const value = process.env.ARMATURE_BAML_AUTH_MODE === "codex_oauth"
+    ? await callCodexOauth(clientModule, functionName, positionalArgs)
+    : await fn(...positionalArgs);
+
+  process.stdout.write(
+    JSON.stringify({
+      id: requestId,
+      ok: true,
+      protocol_version: ARMATURE_BAML_STDIO_PROTOCOL_VERSION,
+      value,
+      raw: value,
+    }) + "\n",
+  );
+}
+
+main().catch((error) => {
+  process.stdout.write(
+    JSON.stringify({
+      ok: false,
+      protocol_version: ARMATURE_BAML_STDIO_PROTOCOL_VERSION,
+      error: error && error.stack ? error.stack : String(error),
+    }) + "\n",
+  );
+});
+"#
+}
+
+fn parse_generated_baml_stdio_response(
+    stdout: &[u8],
+) -> Result<serde_json::Value, armature_engine::coerce::CoerceError> {
+    let stdout = String::from_utf8_lossy(stdout);
+    for line in stdout.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            return Ok(value);
+        }
+    }
+    Err(armature_engine::coerce::CoerceError::new(
+        armature_engine::coerce::CoerceErrorCategory::BamlRunnerProtocolError,
+        format!(
+            "generated BAML stdio runner did not write a JSON protocol response to stdout. stdout:\n{}",
+            stdout.trim()
+        ),
+    ))
+}
+
+fn run_baml_generate(baml_dir: &Path) -> Result<(), armature_engine::coerce::CoerceError> {
+    let baml_cli = std::env::var_os("ARMATURE_BAML_CLI")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("baml-cli"));
+    let output = ProcessCommand::new(&baml_cli)
+        .arg("generate")
+        .arg("--from")
+        .arg(baml_dir)
+        .arg("--no-version-check")
+        .arg("--no-tests")
+        .output()
+        .map_err(|source| {
+            armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+                format!(
+                    "failed to run BAML code generation with `{}`: {source}. Fix: install @boundaryml/baml/baml-cli, set ARMATURE_BAML_CLI, or configure ARMATURE_BAML_GENERATED_STDIO_RUNNER.",
+                    baml_cli.display()
+                ),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(armature_engine::coerce::CoerceError::new(
+            armature_engine::coerce::CoerceErrorCategory::BamlRunnerProtocolError,
+            format!(
+                "BAML code generation failed with status {}.\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    prepare_generated_baml_typescript_runtime(baml_dir, &baml_cli)?;
+    Ok(())
+}
+
+fn prepare_generated_baml_typescript_runtime(
+    baml_dir: &Path,
+    baml_cli: &Path,
+) -> Result<(), armature_engine::coerce::CoerceError> {
+    let runner_dir = baml_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("baml_runner");
+    link_baml_node_modules(&runner_dir, baml_cli)?;
+    compile_generated_baml_typescript(&runner_dir)
+}
+
+fn link_baml_node_modules(
+    runner_dir: &Path,
+    baml_cli: &Path,
+) -> Result<(), armature_engine::coerce::CoerceError> {
+    let Some(node_modules) = baml_cli_node_modules_dir(baml_cli) else {
+        return Ok(());
+    };
+    let target = runner_dir.join("node_modules");
+    if target.exists() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&node_modules, &target).map_err(|source| {
+            armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+                format!(
+                    "failed to link generated BAML runner node_modules `{}` -> `{}`: {source}",
+                    target.display(),
+                    node_modules.display()
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn baml_cli_node_modules_dir(baml_cli: &Path) -> Option<PathBuf> {
+    let canonical = if baml_cli.components().count() == 1 {
+        resolve_executable_on_path(baml_cli).and_then(|path| fs::canonicalize(path).ok())
+    } else {
+        fs::canonicalize(baml_cli).ok()
+    }?;
+    for ancestor in canonical.ancestors() {
+        if ancestor.file_name().and_then(|name| name.to_str()) == Some("node_modules") {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+fn resolve_executable_on_path(executable: &Path) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(executable);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn compile_generated_baml_typescript(
+    runner_dir: &Path,
+) -> Result<(), armature_engine::coerce::CoerceError> {
+    let ts_files =
+        generated_baml_typescript_files(&runner_dir.join("baml_client")).map_err(|source| {
+            armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+                format!("failed to list generated BAML TypeScript files: {source}"),
+            )
+        })?;
+    if ts_files.is_empty() {
+        return Err(armature_engine::coerce::CoerceError::new(
+            armature_engine::coerce::CoerceErrorCategory::BamlRunnerProtocolError,
+            format!(
+                "BAML code generation did not create TypeScript files under `{}`",
+                runner_dir.join("baml_client").display()
+            ),
+        ));
+    }
+
+    let tsc = std::env::var_os("ARMATURE_TSC")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let local = PathBuf::from("node_modules").join(".bin").join("tsc");
+            local.exists().then_some(local)
+        })
+        .unwrap_or_else(|| PathBuf::from("tsc"));
+    let output = ProcessCommand::new(&tsc)
+        .args([
+            "--target",
+            "ES2022",
+            "--module",
+            "NodeNext",
+            "--moduleResolution",
+            "NodeNext",
+            "--skipLibCheck",
+            "--rootDir",
+        ])
+        .arg(runner_dir)
+        .arg("--outDir")
+        .arg(runner_dir)
+        .args(&ts_files)
+        .output()
+        .map_err(|source| {
+            armature_engine::coerce::CoerceError::new(
+                armature_engine::coerce::CoerceErrorCategory::BamlRunnerUnavailable,
+                format!(
+                    "failed to compile generated BAML TypeScript with `{}`: {source}. Fix: install TypeScript, set ARMATURE_TSC, or configure ARMATURE_BAML_GENERATED_STDIO_RUNNER.",
+                    tsc.display()
+                ),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(armature_engine::coerce::CoerceError::new(
+            armature_engine::coerce::CoerceErrorCategory::BamlRunnerProtocolError,
+            format!(
+                "generated BAML TypeScript compilation failed with status {}.\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn generated_baml_typescript_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !dir.exists() {
+        return Ok(files);
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(generated_baml_typescript_files(&path)?);
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("ts") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+#[derive(Debug)]
+struct CodexOauthBamlAuth {
+    access_token: String,
+    base_url: String,
+}
+
+fn load_codex_oauth_for_baml() -> Result<CodexOauthBamlAuth, String> {
+    if let Ok(access_token) = std::env::var("ARMATURE_CODEX_OAUTH_ACCESS_TOKEN") {
+        if !access_token.trim().is_empty() {
+            return Ok(CodexOauthBamlAuth {
+                access_token,
+                base_url: codex_oauth_base_url(),
+            });
+        }
+    }
+
+    let auth_path = codex_auth_json_path();
+    let auth_json = fs::read_to_string(&auth_path).map_err(|source| {
+        format!(
+            "failed to read Codex OAuth credentials from `{}`: {source}. Fix: run `codex login` or set ARMATURE_CODEX_OAUTH_ACCESS_TOKEN for this process.",
+            auth_path.display()
+        )
+    })?;
+    let value = serde_json::from_str::<serde_json::Value>(&auth_json).map_err(|source| {
+        format!(
+            "failed to parse Codex OAuth credentials from `{}`: {source}",
+            auth_path.display()
+        )
+    })?;
+    let access_token = find_json_string_key(&value, "access_token")
+        .or_else(|| find_json_string_key(&value, "accessToken"))
+        .ok_or_else(|| {
+            format!(
+                "Codex OAuth credentials at `{}` do not contain an access token. Fix: refresh `codex login` or set ARMATURE_CODEX_OAUTH_ACCESS_TOKEN.",
+                auth_path.display()
+            )
+        })?;
+    Ok(CodexOauthBamlAuth {
+        access_token,
+        base_url: codex_oauth_base_url(),
+    })
+}
+
+fn codex_oauth_base_url() -> String {
+    std::env::var("ARMATURE_CODEX_OAUTH_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "https://chatgpt.com/backend-api/codex".to_string())
+}
+
+fn codex_auth_json_path() -> PathBuf {
+    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+        if !codex_home.trim().is_empty() {
+            return PathBuf::from(codex_home).join("auth.json");
+        }
+    }
+    PathBuf::from(
+        std::env::var("HOME")
+            .ok()
+            .filter(|home| !home.trim().is_empty())
+            .unwrap_or_else(|| ".".to_string()),
+    )
+    .join(".codex")
+    .join("auth.json")
+}
+
+fn find_json_string_key(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(found) = object.get(key).and_then(serde_json::Value::as_str) {
+                if !found.trim().is_empty() {
+                    return Some(found.to_string());
+                }
+            }
+            object
+                .values()
+                .find_map(|nested| find_json_string_key(nested, key))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|nested| find_json_string_key(nested, key)),
+        _ => None,
+    }
+}
+
+fn apply_managed_baml_environment(
+    command: &mut ProcessCommand,
+    policies: &[armature_adapters::CapabilityPolicyDocument],
+) {
+    let allowed = policies
+        .iter()
+        .flat_map(|policy| policy.allowed_env_vars.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if allowed.is_empty() {
+        return;
+    }
+
+    command.env_clear();
+    for key in provider_runtime_env_keys(&allowed.into_iter().collect::<Vec<_>>()) {
+        if let Ok(value) = std::env::var(&key) {
+            command.env(key, value);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn coerce_executor_for_run(
     fake_coerce_outputs: BTreeMap<String, serde_json::Value>,
     baml_url: Option<String>,
+    baml_auth: CliBamlAuthMode,
+    baml_timeout_ms: Option<u64>,
+    ir: &armature_workflow::WorkflowIr,
+    workflow_file: &Path,
+    policies: &[armature_adapters::CapabilityPolicyDocument],
+    store_baml_raw_response: bool,
+) -> Result<Box<dyn armature_engine::coerce::CoerceExecutor>, CliError> {
+    if !fake_coerce_outputs.is_empty() {
+        Ok(Box::new(armature_engine::coerce::FakeCoerceExecutor::new(
+            fake_coerce_outputs,
+        )))
+    } else if let Some(url) = baml_url {
+        Ok(Box::new(baml_http_executor(
+            url,
+            baml_timeout_ms,
+            ir,
+            store_baml_raw_response,
+            None,
+        )))
+    } else if !ir.coerce_functions.is_empty() {
+        let executor = GeneratedBamlStdioCoerceExecutor::new(
+            workflow_file,
+            ir,
+            baml_timeout_ms,
+            policies,
+            store_baml_raw_response,
+            baml_auth,
+        );
+        Ok(Box::new(executor))
+    } else {
+        Ok(Box::new(armature_engine::coerce::NoopCoerceExecutor))
+    }
+}
+
+fn baml_http_executor(
+    url: String,
     baml_timeout_ms: Option<u64>,
     ir: &armature_workflow::WorkflowIr,
     store_baml_raw_response: bool,
-) -> Box<dyn armature_engine::coerce::CoerceExecutor> {
-    if !fake_coerce_outputs.is_empty() {
-        Box::new(armature_engine::coerce::FakeCoerceExecutor::new(
-            fake_coerce_outputs,
-        ))
-    } else if let Some(url) = baml_url {
-        Box::new(
-            armature_engine::coerce::BamlHttpCoerceExecutor::new(url)
-                .with_timeout_ms(baml_timeout_ms)
-                .with_baml_src_hash(baml_source_hash(ir))
-                .with_store_raw_response(store_baml_raw_response),
-        )
-    } else {
-        Box::new(armature_engine::coerce::NoopCoerceExecutor)
+    runtime_mode: Option<String>,
+) -> armature_engine::coerce::BamlHttpCoerceExecutor {
+    armature_engine::coerce::BamlHttpCoerceExecutor::new(url)
+        .with_timeout_ms(baml_timeout_ms)
+        .with_baml_src_hash(baml_source_hash(ir))
+        .with_runtime_mode(runtime_mode)
+        .with_store_raw_response(store_baml_raw_response)
+}
+
+fn validate_baml_runtime_policy(
+    ir: &armature_workflow::WorkflowIr,
+    real_coerce_enabled: bool,
+    baml_url: Option<&str>,
+    baml_auth: CliBamlAuthMode,
+    policies: &[armature_adapters::CapabilityPolicyDocument],
+) -> Result<(), CliError> {
+    if !real_coerce_enabled || ir.coerce_functions.is_empty() {
+        return Ok(());
     }
+
+    if let Some(url) = baml_url {
+        let diagnostics = armature_adapters::validate_baml_http_policy(policies, url);
+        if diagnostics_have_errors(&diagnostics) {
+            return Err(policy_document_validation_error(diagnostics));
+        }
+    } else if baml_auth == CliBamlAuthMode::CodexOauth {
+        let diagnostics = armature_adapters::validate_baml_codex_oauth_policy(policies);
+        if diagnostics_have_errors(&diagnostics) {
+            return Err(policy_document_validation_error(diagnostics));
+        }
+    }
+    Ok(())
 }
 
 fn baml_source_hash(ir: &armature_workflow::WorkflowIr) -> Option<String> {
     if ir.coerce_functions.is_empty() {
         return None;
     }
+    Some(sha256_hex(emit_baml_source(ir).as_bytes()))
+}
+
+fn file_sha256(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(sha256_hex(&bytes))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
-    hasher.update(emit_baml_source(ir).as_bytes());
+    hasher.update(bytes);
     let digest = hasher.finalize();
-    Some(format!(
+    format!(
         "sha256:{}",
         digest
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
-    ))
+    )
 }
 
 fn adapter_manifest_validation_error(diagnostics: Vec<armature_workflow::Diagnostic>) -> CliError {
@@ -2359,6 +3452,8 @@ fn print_overview(overview: &OverviewOutput) {
         }
     }
 
+    print_baml_runtime(status);
+
     if status.latest_coerce_calls.is_empty() {
         println!("latest coerce: none");
     } else {
@@ -2405,6 +3500,23 @@ fn print_overview(overview: &OverviewOutput) {
                 call.function_name, call.status, call.http_status, error
             );
         }
+    }
+}
+
+fn print_baml_runtime(status: &armature_engine::status::WorkflowStatus) {
+    if let Some(runtime) = &status.baml_runtime {
+        let hash = runtime.baml_src_hash.as_deref().unwrap_or("none");
+        let error = runtime
+            .last_error
+            .as_deref()
+            .map(|error| format!(" error={error}"))
+            .unwrap_or_default();
+        println!(
+            "baml runtime: {} {} url={} hash={} last_call_at={}{}",
+            runtime.mode, runtime.status, runtime.url, hash, runtime.last_call_at, error
+        );
+    } else {
+        println!("baml runtime: none");
     }
 }
 
@@ -2523,6 +3635,8 @@ fn print_status(status: &armature_engine::status::WorkflowStatus) {
             println!("  {blocker}");
         }
     }
+
+    print_baml_runtime(status);
 
     if status.latest_coerce_calls.is_empty() {
         println!("latest coerce: none");
@@ -2659,6 +3773,7 @@ fn process_workflow_once(
     plan_file: Option<PathBuf>,
     review_file: Option<PathBuf>,
     baml_url: Option<String>,
+    baml_auth: CliBamlAuthMode,
     baml_timeout_ms: u64,
 ) -> Result<bool, CliError> {
     let mut manifests = load_valid_adapter_manifests(adapter_manifests)?;
@@ -2670,29 +3785,36 @@ fn process_workflow_once(
     }
     let policies = load_valid_policy_documents(policy_documents)?;
     let parsed_fake_coerce_outputs = parse_fake_outputs(fake_coerce_outputs)?;
-    if parsed_fake_coerce_outputs.is_empty() {
-        if let Some(url) = &baml_url {
-            let diagnostics = armature_adapters::validate_baml_http_policy(&policies, url);
-            if diagnostics_have_errors(&diagnostics) {
-                return Err(policy_document_validation_error(diagnostics));
-            }
-        }
-    }
     let ir = load_valid_ir_with_contracts(file, &manifests, &policies)?;
+    validate_baml_runtime_policy(
+        &ir,
+        parsed_fake_coerce_outputs.is_empty(),
+        baml_url.as_deref(),
+        baml_auth,
+        &policies,
+    )?;
     let workflow_id = ir.workflow.name.clone();
     let store_baml_raw_response = armature_adapters::should_store_baml_raw_response(&policies);
     let store_path = store_path.unwrap_or_else(|| default_store_path(file, &workflow_id));
     ensure_parent_dir(&store_path)?;
     let store = WorkflowStore::open(&store_path)?;
-    let dispatcher =
-        adapter_dispatcher_from_manifests(manifests, policies, plan_file, review_file, None);
+    let dispatcher = adapter_dispatcher_from_manifests(
+        manifests,
+        policies.clone(),
+        plan_file,
+        review_file,
+        None,
+    );
     let coerce_executor = coerce_executor_for_run(
         parsed_fake_coerce_outputs,
         baml_url,
+        baml_auth,
         Some(baml_timeout_ms),
         &ir,
+        file,
+        &policies,
         store_baml_raw_response,
-    );
+    )?;
     let fake_call_outputs = parse_fake_outputs(fake_call_outputs)?;
     let mut runtime = WorkflowRuntime::with_dispatcher_and_coerce_executor(
         ir,
@@ -2723,7 +3845,7 @@ fn run_harness_once(
         .map(load_harness_profile_policy)
         .transpose()?;
     if let Some(policy) = &profile_policy {
-        let diagnostics = validate_harness_profile_policy(&ir, policy);
+        let diagnostics = validate_harness_profile_policy(Some(&ir), policy);
         if diagnostics_have_errors(&diagnostics) {
             return Err(harness_profile_policy_validation_error(diagnostics));
         }
@@ -2766,7 +3888,8 @@ fn run_harness_once(
             },
         )?;
     let agent_config = &resolved_provider.config;
-    let provider_command = resolve_harness_provider_command(agent_config, &invocation)?;
+    let (provider_command, authority_plan) =
+        resolve_harness_provider_command(agent_config, &invocation)?;
 
     let worker_id = format!("armature-cli-{}", std::process::id());
     let lease_ms = agent_config
@@ -2825,15 +3948,16 @@ fn run_harness_once(
             "provider": agent_config.provider,
             "command": provider_command,
             "requestedAuthority": &resolved_provider.requested_authority,
-            "enforcedAuthority": &resolved_provider.enforced_authority,
+            "enforcedAuthority": &authority_plan.enforced,
             "enforcement": &resolved_provider.enforcement,
-            "warnings": &resolved_provider.warnings,
+            "warnings": provider_warnings(&resolved_provider, &authority_plan),
         }),
     )?;
 
     let output = run_harness_command(
         agent_config,
         &provider_command,
+        &authority_plan,
         &claimed,
         &workflow_id,
         &run_dir,
@@ -2998,7 +4122,7 @@ fn harness_status(
     let ir = load_valid_ir(file)?;
     if let Some(path) = profile_policy_path {
         let policy = load_harness_profile_policy(path)?;
-        let diagnostics = validate_harness_profile_policy(&ir, &policy);
+        let diagnostics = validate_harness_profile_policy(Some(&ir), &policy);
         if diagnostics_have_errors(&diagnostics) {
             return Err(harness_profile_policy_validation_error(diagnostics));
         }
@@ -3121,7 +4245,7 @@ fn load_harness_profile_policy(path: &Path) -> Result<HarnessProfilePolicy, CliE
 }
 
 fn validate_harness_profile_policy(
-    ir: &armature_workflow::WorkflowIr,
+    ir: Option<&armature_workflow::WorkflowIr>,
     policy: &HarnessProfilePolicy,
 ) -> Vec<armature_workflow::Diagnostic> {
     let mut diagnostics = Vec::new();
@@ -3185,18 +4309,20 @@ fn validate_harness_profile_policy(
         }
     }
 
-    for (agent_name, agent) in &ir.agents {
-        let Some(profile) = agent.profile.as_ref() else {
-            continue;
-        };
-        if !valid_profile_name(profile) {
-            diagnostics.push(profile_policy_error(format!(
-                "agent `{agent_name}` references invalid harness profile `{profile}`"
-            )));
-        } else if !profile_exists(policy, profile) {
-            diagnostics.push(profile_policy_error(format!(
-                "agent `{agent_name}` references undefined harness profile `{profile}`"
-            )));
+    if let Some(ir) = ir {
+        for (agent_name, agent) in &ir.agents {
+            let Some(profile) = agent.profile.as_ref() else {
+                continue;
+            };
+            if !valid_profile_name(profile) {
+                diagnostics.push(profile_policy_error(format!(
+                    "agent `{agent_name}` references invalid harness profile `{profile}`"
+                )));
+            } else if !profile_exists(policy, profile) {
+                diagnostics.push(profile_policy_error(format!(
+                    "agent `{agent_name}` references undefined harness profile `{profile}`"
+                )));
+            }
         }
     }
 
@@ -3317,7 +4443,7 @@ fn builtin_harness_profile(profile: &str) -> Option<HarnessProfileDefinition> {
 fn resolve_harness_provider_command(
     config: &HarnessAgentConfig,
     invocation: &armature_engine::storage::AgentInvocationRecord,
-) -> Result<Vec<String>, CliError> {
+) -> Result<(Vec<String>, ProviderAuthorityPlan), CliError> {
     if !matches!(
         config.provider.as_str(),
         "command" | "codex" | "claude" | "pi"
@@ -3327,7 +4453,21 @@ fn resolve_harness_provider_command(
             provider: config.provider.clone(),
         });
     }
+    let mut authority_plan = provider_authority_plan(config);
     let mut command = if !config.command.is_empty() {
+        if config.provider != "command" && !authority_plan.args.is_empty() {
+            authority_plan.warnings.push(format!(
+                "custom `{}` provider command is responsible for applying provider authority flags",
+                config.provider
+            ));
+            if let Some(enforced) = authority_plan.enforced.as_object_mut() {
+                enforced.insert("customCommand".to_string(), serde_json::json!(true));
+                enforced.insert(
+                    "providerCliFlagsApplied".to_string(),
+                    serde_json::json!(false),
+                );
+            }
+        }
         config.command.clone()
     } else {
         match config.provider.as_str() {
@@ -3336,16 +4476,18 @@ fn resolve_harness_provider_command(
                     agent: invocation.agent.clone(),
                 });
             }
-            "codex" => vec![
-                "codex".to_string(),
-                "exec".to_string(),
-                "{{prompt}}".to_string(),
-            ],
-            "claude" => vec![
-                "claude".to_string(),
-                "-p".to_string(),
-                "{{prompt}}".to_string(),
-            ],
+            "codex" => {
+                let mut command = vec!["codex".to_string()];
+                command.extend(authority_plan.args.clone());
+                command.extend(["exec".to_string(), "{{prompt}}".to_string()]);
+                command
+            }
+            "claude" => {
+                let mut command = vec!["claude".to_string()];
+                command.extend(authority_plan.args.clone());
+                command.extend(["-p".to_string(), "{{prompt}}".to_string()]);
+                command
+            }
             "pi" => vec![
                 "pi".to_string(),
                 "run".to_string(),
@@ -3365,7 +4507,169 @@ fn resolve_harness_provider_command(
             agent: invocation.agent.clone(),
         });
     }
-    Ok(command)
+    Ok((command, authority_plan))
+}
+
+fn provider_authority_plan(config: &HarnessAgentConfig) -> ProviderAuthorityPlan {
+    let Some(authority) = &config.authority else {
+        return ProviderAuthorityPlan {
+            args: Vec::new(),
+            env_allowlist: None,
+            enforced: serde_json::json!({"provider": config.provider, "mode": "legacy_config"}),
+            warnings: Vec::new(),
+        };
+    };
+
+    let mut args = Vec::new();
+    let mut enforced = serde_json::Map::new();
+    let mut warnings = Vec::new();
+    enforced.insert("provider".to_string(), serde_json::json!(config.provider));
+    enforced.insert(
+        "enforcement".to_string(),
+        serde_json::json!(authority.enforcement),
+    );
+
+    match config.provider.as_str() {
+        "codex" => {
+            match authority.filesystem.as_str() {
+                "read_only" | "none" => {
+                    args.extend(["--sandbox".to_string(), "read-only".to_string()]);
+                    enforced.insert("filesystem".to_string(), serde_json::json!("read_only"));
+                }
+                "workspace_write" => {
+                    args.extend(["--sandbox".to_string(), "workspace-write".to_string()]);
+                    enforced.insert(
+                        "filesystem".to_string(),
+                        serde_json::json!("workspace_write"),
+                    );
+                }
+                "provider_default" => {
+                    enforced.insert(
+                        "filesystem".to_string(),
+                        serde_json::json!("provider_default"),
+                    );
+                }
+                value => {
+                    warnings.push(format!(
+                        "codex filesystem posture `{value}` is not mapped to a CLI flag"
+                    ));
+                    enforced.insert("filesystem".to_string(), serde_json::json!("best_effort"));
+                }
+            }
+
+            match authority.network.as_str() {
+                "allowed" | "provider_default" => {
+                    args.push("--search".to_string());
+                    enforced.insert(
+                        "network".to_string(),
+                        serde_json::json!("web_search_allowed"),
+                    );
+                }
+                "denied" => {
+                    enforced.insert(
+                        "network".to_string(),
+                        serde_json::json!("web_search_not_enabled"),
+                    );
+                    warnings.push(
+                        "codex network denial is limited to not enabling the web search flag"
+                            .to_string(),
+                    );
+                }
+                value => {
+                    warnings.push(format!("codex network posture `{value}` is not mapped"));
+                    enforced.insert("network".to_string(), serde_json::json!("best_effort"));
+                }
+            }
+        }
+        "claude" => {
+            match authority.filesystem.as_str() {
+                "read_only" | "none" => {
+                    args.extend(["--permission-mode".to_string(), "plan".to_string()]);
+                    enforced.insert(
+                        "filesystem".to_string(),
+                        serde_json::json!("plan_permission_mode"),
+                    );
+                }
+                "workspace_write" => {
+                    args.extend(["--permission-mode".to_string(), "acceptEdits".to_string()]);
+                    enforced.insert(
+                        "filesystem".to_string(),
+                        serde_json::json!("accept_edits_permission_mode"),
+                    );
+                }
+                "provider_default" => {
+                    enforced.insert(
+                        "filesystem".to_string(),
+                        serde_json::json!("provider_default"),
+                    );
+                }
+                value => {
+                    warnings.push(format!(
+                        "claude filesystem posture `{value}` is not mapped to a permission mode"
+                    ));
+                    enforced.insert("filesystem".to_string(), serde_json::json!("best_effort"));
+                }
+            }
+            if !authority.allowed_tools.is_empty() {
+                args.extend([
+                    "--allowedTools".to_string(),
+                    authority.allowed_tools.join(","),
+                ]);
+                enforced.insert(
+                    "allowedTools".to_string(),
+                    serde_json::json!(authority.allowed_tools),
+                );
+            }
+            match authority.network.as_str() {
+                "denied" => {
+                    warnings.push(
+                        "claude network denial is not currently exposed as a native CLI flag"
+                            .to_string(),
+                    );
+                    enforced.insert("network".to_string(), serde_json::json!("best_effort"));
+                }
+                value => {
+                    enforced.insert("network".to_string(), serde_json::json!(value));
+                }
+            }
+        }
+        "command" => {
+            enforced.insert(
+                "filesystem".to_string(),
+                serde_json::json!("external_process"),
+            );
+            enforced.insert("network".to_string(), serde_json::json!("external_process"));
+            warnings.push(
+                "command provider authority must be enforced by the configured command or an external sandbox"
+                    .to_string(),
+            );
+        }
+        "pi" => {
+            enforced.insert("filesystem".to_string(), serde_json::json!("best_effort"));
+            enforced.insert("network".to_string(), serde_json::json!("best_effort"));
+            warnings.push(
+                "pi provider sandbox flags are not mapped yet; profile restrictions are recorded as best-effort"
+                    .to_string(),
+            );
+        }
+        provider => {
+            warnings.push(format!("provider `{provider}` has no authority mapping"));
+            enforced.insert("filesystem".to_string(), serde_json::json!("best_effort"));
+            enforced.insert("network".to_string(), serde_json::json!("best_effort"));
+        }
+    }
+
+    let env_allowlist = Some(authority.allowed_env.clone());
+    enforced.insert(
+        "allowedEnv".to_string(),
+        serde_json::json!(authority.allowed_env),
+    );
+    ProviderAuthorityPlan {
+        args,
+        env_allowlist,
+        enforced: serde_json::Value::Object(enforced),
+        warnings,
+    }
 }
 
 fn resolve_harness_provider(
@@ -3383,7 +4687,6 @@ fn resolve_harness_provider(
             profile: None,
             config: config.clone(),
             requested_authority: serde_json::json!({"mode": "legacy_config"}),
-            enforced_authority: serde_json::json!({"mode": "legacy_config"}),
             enforcement: "legacy_config".to_string(),
             warnings: Vec::new(),
         });
@@ -3413,10 +4716,6 @@ fn resolve_harness_provider(
             profile: Some(profile_name),
             config: config.clone(),
             requested_authority: serde_json::json!({
-                "filesystem": "provider_default",
-                "network": "provider_default"
-            }),
-            enforced_authority: serde_json::json!({
                 "filesystem": "provider_default",
                 "network": "provider_default"
             }),
@@ -3469,6 +4768,7 @@ fn resolve_harness_provider(
         args: Vec::new(),
         cwd: None,
         timeout_seconds: None,
+        authority: None,
     });
     resolved_config.provider = profile.provider.clone();
     if !profile.command.is_empty() {
@@ -3483,6 +4783,22 @@ fn resolve_harness_provider(
     if profile.timeout_seconds.is_some() {
         resolved_config.timeout_seconds = profile.timeout_seconds;
     }
+    resolved_config.authority = Some(HarnessAuthorityConfig {
+        filesystem: profile
+            .filesystem
+            .clone()
+            .unwrap_or_else(|| "provider_default".to_string()),
+        network: profile
+            .network
+            .clone()
+            .unwrap_or_else(|| "provider_default".to_string()),
+        allowed_env: profile.allowed_env.clone(),
+        allowed_tools: profile.allowed_tools.clone(),
+        enforcement: profile
+            .enforcement
+            .clone()
+            .unwrap_or_else(|| "best_effort".to_string()),
+    });
 
     let requested_authority = serde_json::json!({
         "filesystem": profile.filesystem.as_deref().unwrap_or("provider_default"),
@@ -3494,28 +4810,11 @@ fn resolve_harness_provider(
         .enforcement
         .clone()
         .unwrap_or_else(|| "best_effort".to_string());
-    let mut warnings = Vec::new();
-    if matches!(
-        enforcement.as_str(),
-        "best_effort" | "native_or_best_effort"
-    ) {
-        warnings.push(format!(
-            "provider `{}` restrictions are recorded as `{}` until provider-specific sandbox flags are mapped",
-            resolved_config.provider, enforcement
-        ));
-    }
-    let enforced_authority = serde_json::json!({
-        "provider": resolved_config.provider,
-        "enforcement": enforcement,
-        "filesystem": profile.filesystem.as_deref().unwrap_or("provider_default"),
-        "network": profile.network.as_deref().unwrap_or("provider_default"),
-    });
-
+    let warnings = Vec::new();
     Ok(ResolvedHarnessProvider {
         profile: Some(profile_name),
         config: resolved_config,
         requested_authority,
-        enforced_authority,
         enforcement,
         warnings,
     })
@@ -3541,9 +4840,32 @@ fn expand_harness_arg(
         .replace("{{runDir}}", &run_dir.display().to_string()))
 }
 
+fn provider_warnings(
+    resolved: &ResolvedHarnessProvider,
+    authority_plan: &ProviderAuthorityPlan,
+) -> Vec<String> {
+    let mut warnings = resolved.warnings.clone();
+    warnings.extend(authority_plan.warnings.clone());
+    warnings.sort();
+    warnings.dedup();
+    warnings
+}
+
+fn provider_runtime_env_keys(allowlist: &[String]) -> Vec<String> {
+    let mut keys = BTreeSet::new();
+    keys.insert("PATH".to_string());
+    keys.insert("HOME".to_string());
+    keys.insert("TMPDIR".to_string());
+    for key in allowlist {
+        keys.insert(key.clone());
+    }
+    keys.into_iter().collect()
+}
+
 fn run_harness_command(
     config: &HarnessAgentConfig,
     provider_command: &[String],
+    authority_plan: &ProviderAuthorityPlan,
     invocation: &armature_engine::storage::AgentInvocationRecord,
     workflow_id: &str,
     run_dir: &Path,
@@ -3559,6 +4881,14 @@ fn run_harness_command(
     };
     let mut command = ProcessCommand::new(program);
     command.args(args);
+    if let Some(allowlist) = &authority_plan.env_allowlist {
+        command.env_clear();
+        for key in provider_runtime_env_keys(allowlist) {
+            if let Ok(value) = std::env::var(&key) {
+                command.env(key, value);
+            }
+        }
+    }
     if let Some(cwd) = &config.cwd {
         command.current_dir(cwd);
     }
@@ -4112,6 +5442,13 @@ fn ir_with_build_artifacts(
 }
 
 fn emit_baml_source(ir: &armature_workflow::WorkflowIr) -> String {
+    emit_baml_source_for_auth(ir, CliBamlAuthMode::ApiKey)
+}
+
+fn emit_baml_source_for_auth(
+    ir: &armature_workflow::WorkflowIr,
+    auth_mode: CliBamlAuthMode,
+) -> String {
     let mut output = String::new();
     let emitted_types = baml_reachable_types(ir);
 
@@ -4149,13 +5486,24 @@ fn emit_baml_source(ir: &armature_workflow::WorkflowIr) -> String {
     }
 
     for (model, client_name) in &model_clients {
-        output.push_str(&format!(
-            "client<llm> {client_name} {{\n  provider \"openai\"\n  options {{\n    model \"{}\"\n    api_key env.OPENAI_API_KEY\n  }}\n}}\n\n",
-            escape_baml_string(model)
-        ));
+        match auth_mode {
+            CliBamlAuthMode::ApiKey => {
+                output.push_str(&format!(
+                    "client<llm> {client_name} {{\n  provider \"openai-responses\"\n  options {{\n    model \"{}\"\n    api_key env.OPENAI_API_KEY\n  }}\n}}\n\n",
+                    escape_baml_string(model)
+                ));
+            }
+            CliBamlAuthMode::CodexOauth => {
+                output.push_str(&format!(
+                    "client<llm> {client_name} {{\n  provider \"openai-responses\"\n  options {{\n    model \"{}\"\n    api_key env.ARMATURE_CODEX_OAUTH_ACCESS_TOKEN\n    base_url env.ARMATURE_CODEX_OAUTH_BASE_URL\n    store false\n    stream true\n    instructions \"Follow the BAML-generated prompt and return only the requested structured output.\"\n  }}\n}}\n\n",
+                    escape_baml_string(model)
+                ));
+            }
+        }
     }
 
     for (name, function) in &ir.coerce_functions {
+        let baml_name = baml_function_name(name);
         let params = function
             .params
             .iter()
@@ -4163,7 +5511,7 @@ fn emit_baml_source(ir: &armature_workflow::WorkflowIr) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         output.push_str(&format!(
-            "function {name}({params}) -> {} {{\n",
+            "function {baml_name}({params}) -> {} {{\n",
             baml_type(&function.output)
         ));
         if let Some(model) = &function.model {
@@ -4179,6 +5527,16 @@ fn emit_baml_source(ir: &armature_workflow::WorkflowIr) -> String {
         output.push_str("}\n\n");
     }
 
+    output
+}
+
+fn baml_function_name(name: &str) -> String {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return "Coerce".to_string();
+    };
+    let mut output = first.to_uppercase().collect::<String>();
+    output.push_str(chars.as_str());
     output
 }
 
@@ -4321,4 +5679,163 @@ fn ensure_parent_dir(path: &Path) -> Result<(), CliError> {
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn invocation() -> armature_engine::storage::AgentInvocationRecord {
+        armature_engine::storage::AgentInvocationRecord {
+            workflow_id: "Test".to_string(),
+            invocation_id: "inv-1".to_string(),
+            agent: "worker".to_string(),
+            effect_id: "eff-1".to_string(),
+            transition_id: "tr-1".to_string(),
+            event_id: None,
+            idempotency_key: "Test/inv-1".to_string(),
+            input: serde_json::json!({"message": "hello"}),
+            requested_profile: Some("repo-writer".to_string()),
+            resolved_profile: None,
+            profile_enforcement: None,
+            status: armature_engine::storage::AgentInvocationStatus::Queued,
+            claimed_by: None,
+            claim_expires_at: None,
+            provider: None,
+            provider_run_id: None,
+            run_dir: None,
+            stdout_path: None,
+            stderr_path: None,
+            exit_code: None,
+            error: None,
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+        }
+    }
+
+    #[test]
+    fn codex_profile_authority_maps_to_sandbox_and_search_flags() {
+        let config = HarnessAgentConfig {
+            provider: "codex".to_string(),
+            command: Vec::new(),
+            args: Vec::new(),
+            cwd: None,
+            timeout_seconds: None,
+            authority: Some(HarnessAuthorityConfig {
+                filesystem: "workspace_write".to_string(),
+                network: "allowed".to_string(),
+                allowed_env: vec!["OPENAI_API_KEY".to_string()],
+                allowed_tools: Vec::new(),
+                enforcement: "native_or_best_effort".to_string(),
+            }),
+        };
+
+        let (command, plan) =
+            resolve_harness_provider_command(&config, &invocation()).expect("command resolves");
+
+        assert_eq!(
+            command,
+            vec![
+                "codex",
+                "--sandbox",
+                "workspace-write",
+                "--search",
+                "exec",
+                "{{prompt}}"
+            ]
+        );
+        assert_eq!(
+            plan.enforced["filesystem"],
+            serde_json::json!("workspace_write")
+        );
+        assert_eq!(
+            plan.enforced["network"],
+            serde_json::json!("web_search_allowed")
+        );
+        assert_eq!(plan.env_allowlist, Some(vec!["OPENAI_API_KEY".to_string()]));
+    }
+
+    #[test]
+    fn generated_baml_stdio_response_parser_uses_last_json_line() {
+        let response = parse_generated_baml_stdio_response(
+            b"2026-05-27T00:00:00 [BAML INFO] calling model\n{\"ok\":true,\"value\":\"done\"}\n",
+        )
+        .expect("response parses");
+
+        assert_eq!(response["value"], "done");
+    }
+
+    #[test]
+    fn claude_profile_authority_maps_to_permission_and_tool_flags() {
+        let config = HarnessAgentConfig {
+            provider: "claude".to_string(),
+            command: Vec::new(),
+            args: Vec::new(),
+            cwd: None,
+            timeout_seconds: None,
+            authority: Some(HarnessAuthorityConfig {
+                filesystem: "read_only".to_string(),
+                network: "denied".to_string(),
+                allowed_env: vec!["ANTHROPIC_API_KEY".to_string()],
+                allowed_tools: vec!["Read".to_string()],
+                enforcement: "native_or_best_effort".to_string(),
+            }),
+        };
+
+        let (command, plan) =
+            resolve_harness_provider_command(&config, &invocation()).expect("command resolves");
+
+        assert_eq!(
+            command,
+            vec![
+                "claude",
+                "--permission-mode",
+                "plan",
+                "--allowedTools",
+                "Read",
+                "-p",
+                "{{prompt}}"
+            ]
+        );
+        assert_eq!(
+            plan.enforced["filesystem"],
+            serde_json::json!("plan_permission_mode")
+        );
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("network denial")));
+    }
+
+    #[test]
+    fn custom_provider_command_does_not_claim_preset_flags_were_applied() {
+        let config = HarnessAgentConfig {
+            provider: "codex".to_string(),
+            command: vec!["codex-wrapper".to_string(), "{{prompt}}".to_string()],
+            args: Vec::new(),
+            cwd: None,
+            timeout_seconds: None,
+            authority: Some(HarnessAuthorityConfig {
+                filesystem: "workspace_write".to_string(),
+                network: "allowed".to_string(),
+                allowed_env: Vec::new(),
+                allowed_tools: Vec::new(),
+                enforcement: "native_or_best_effort".to_string(),
+            }),
+        };
+
+        let (command, plan) =
+            resolve_harness_provider_command(&config, &invocation()).expect("command resolves");
+
+        assert_eq!(command, vec!["codex-wrapper", "{{prompt}}"]);
+        assert_eq!(plan.enforced["customCommand"], serde_json::json!(true));
+        assert_eq!(
+            plan.enforced["providerCliFlagsApplied"],
+            serde_json::json!(false)
+        );
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("responsible for applying")));
+    }
 }
