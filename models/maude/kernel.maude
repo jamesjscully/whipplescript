@@ -1,15 +1,36 @@
 mod ARMATURE-KERNEL is
-  sorts EffectId FactId RunId EventId Predicate EffectStatus Cfg .
+  sorts
+    EffectId FactId RunId EventId RuleId GraphId
+    Predicate EffectStatus ProjectionStatus LeaseStatus Cfg .
 
   --- Sample identifiers used by hand-written model tests.
   ops e1 e2 e3 : -> EffectId .
   ops claimEff tellEff askEff coerceEff recordEff : -> EffectId .
   ops issueFact workerFact claimFact turnFact : -> FactId .
+  ops coerceOkFact coerceBadFact : -> FactId .
   ops run1 : -> RunId .
-  ops event1 : -> EventId .
+  ops event1 initEvt turnCompletedEvt coerceCompletedEvt coerceFailedEvt : -> EventId .
+  ops ruleCommitEvt leaseExpiredEvt : -> EventId .
+  ops ralphRule coerceRule : -> RuleId .
+  ops g1 g2 g3 : -> GraphId .
 
   --- Effect lifecycle states.
-  ops queued blocked claimed running completed failed timedOut cancelled : -> EffectStatus .
+  ops
+    queued
+    blocked
+    blockedByPolicy
+    blockedByCapacity
+    claimed
+    running
+    completed
+    failed
+    timedOut
+    cancelled
+    : -> EffectStatus .
+
+  --- Projection and lease states.
+  ops pending projected : -> ProjectionStatus .
+  ops leaseActive leaseExpired : -> LeaseStatus .
 
   --- Dependency predicates. These correspond to source-level
   --- `after effect succeeds|fails|completes` edges.
@@ -26,8 +47,53 @@ mod ARMATURE-KERNEL is
   op event : EventId -> Cfg .
   op run : RunId EffectId -> Cfg .
   op correlates : EffectId FactId -> Cfg .
+  op projection : EventId FactId ProjectionStatus -> Cfg .
+  op completionProjection : EffectId EffectStatus FactId ProjectionStatus -> Cfg .
+  op rule : RuleId FactId GraphId -> Cfg .
+  op ruleReady : RuleId FactId GraphId -> Cfg .
+  op ruleFired : RuleId FactId GraphId -> Cfg .
+  op graph : GraphId EffectId -> Cfg .
+  op graph2 : GraphId EffectId Predicate EffectId -> Cfg .
+  op graphReady : GraphId -> Cfg .
+  op graphCommitted : GraphId -> Cfg .
+  op policyAllows : EffectId -> Cfg .
+  op capacityAvailable : EffectId -> Cfg .
+  op lease : EffectId LeaseStatus -> Cfg .
+  op retryAllowed : EffectId -> Cfg .
+  op retryUsed : EffectId -> Cfg .
 
   vars U D E : EffectId .
+  vars F : FactId .
+  vars Ev : EventId .
+  vars R : RuleId .
+  vars G : GraphId .
+  vars P : Predicate .
+  vars S : EffectStatus .
+
+  --- Event-log projection into typed facts.
+  rl [derive-fact] :
+    event(Ev) projection(Ev, F, pending)
+    => event(Ev) projection(Ev, F, projected) fact(F) .
+
+  --- Effect completion projection into typed lifecycle/domain facts.
+  rl [derive-completion-fact] :
+    effect(E, S) completionProjection(E, S, F, pending)
+    => effect(E, S) completionProjection(E, S, F, projected) fact(F) .
+
+  --- Rules are one-shot rewrites over facts. The graph is committed later by
+  --- the kernel; provider execution never happens during rule firing.
+  rl [fire-rule] :
+    fact(F) rule(R, F, G) ruleReady(R, F, G)
+    => fact(F) rule(R, F, G) ruleFired(R, F, G) graphReady(G) event(ruleCommitEvt) .
+
+  --- Effect graph commits create durable outbox nodes and dependency edges.
+  rl [commit-single-effect-graph] :
+    graph(G, U) graphReady(G)
+    => graphCommitted(G) effect(U, queued) .
+
+  rl [commit-dependent-effect-graph] :
+    graph2(G, U, P, D) graphReady(G)
+    => graphCommitted(G) effect(U, queued) dep(U, P, D) effect(D, blocked) .
 
   --- A queued effect can be claimed and then started by an external worker.
   rl [claim-effect] : effect(E, queued) => effect(E, claimed) .
@@ -42,6 +108,29 @@ mod ARMATURE-KERNEL is
   rl [cancel-queued] : effect(E, queued) => effect(E, cancelled) .
   rl [cancel-blocked] : effect(E, blocked) => effect(E, cancelled) .
   rl [cancel-claimed] : effect(E, claimed) => effect(E, cancelled) .
+
+  --- Policy and capacity are modeled separately from dependency blocking so
+  --- status and diagnostics can explain why work did not start.
+  rl [policy-release] :
+    effect(E, blockedByPolicy) policyAllows(E)
+    => effect(E, queued) policyAllows(E) .
+
+  rl [capacity-release] :
+    effect(E, blockedByCapacity) capacityAvailable(E)
+    => effect(E, queued) capacityAvailable(E) .
+
+  --- Lease expiry and retry reuse effect identity in this abstract model.
+  rl [expire-lease] :
+    effect(E, running) lease(E, leaseActive)
+    => effect(E, queued) lease(E, leaseExpired) event(leaseExpiredEvt) .
+
+  rl [retry-failed] :
+    effect(E, failed) retryAllowed(E)
+    => effect(E, queued) retryUsed(E) .
+
+  rl [retry-timeout] :
+    effect(E, timedOut) retryAllowed(E)
+    => effect(E, queued) retryUsed(E) .
 
   --- Dependency release rules. Source order never releases an effect; only
   --- terminal upstream outcomes do.

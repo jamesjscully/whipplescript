@@ -34,8 +34,11 @@ scripts/check-formal-models.sh
 Current test suites:
 
 ```text
-effect-dependencies.maude  success/failure/completes dependency release
-docket-claim-turn.maude    claim-gated coding-agent turn lifecycle
+coerce-branches.maude       BAML-style coerce success/failure branches
+docket-claim-turn.maude     claim-gated coding-agent turn lifecycle
+effect-dependencies.maude   success/failure/completes dependency release
+policy-capacity-retry.maude policy/capacity blocks, lease expiry, retry
+ralph-loop.maude            external-event-bounded Ralph loop
 ```
 
 The shell script runs every Maude test file and checks the expected number of

@@ -1,5 +1,7 @@
 //! Deterministic runtime kernel scaffold.
 
+pub mod trace;
+
 /// Placeholder kernel entry point.
 ///
 /// The real kernel will own rule commits, effect graph enqueueing, dependency

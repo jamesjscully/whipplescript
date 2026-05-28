@@ -58,9 +58,28 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 scripts/check-formal-models.sh
+scripts/check-tla-models.sh
 scripts/check-e2e.sh
 ```
 
-`scripts/check-formal-models.sh` currently requires Maude. The e2e script is a
-Stage 0 smoke test that proves the new CLI workspace is executable; later stages
-will replace it with real workflow execution tests.
+`scripts/check-formal-models.sh` requires Maude. `scripts/check-tla-models.sh`
+requires Apalache and Java; if they are not already on `PATH`, it uses the repo
+Nix flake to provide them. The e2e script is a Stage 0 smoke test that proves
+the new CLI workspace is executable; later stages will replace it with real
+workflow execution tests.
+
+## Development Shell
+
+The repo includes a Nix dev shell for formal tooling:
+
+```sh
+nix develop
+```
+
+It provides:
+
+```text
+OpenJDK 21
+Maude
+Apalache 0.57.1
+```

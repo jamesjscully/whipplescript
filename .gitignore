@@ -1,5 +1,6 @@
 target/
 dist/
 node_modules/
+_apalache-out/
 .DS_Store
 **/.armature/workflows/*.sqlite

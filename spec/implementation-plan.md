@@ -76,36 +76,41 @@ Goal: validate the core execution model before and during implementation.
 - [x] Add a Docket-claim-gated agent-turn model test.
 - [x] Make `scripts/check-formal-models.sh` assert expected Maude search
   outcomes.
-- [ ] Extend the Maude model with durable event log, fact projection, effect
+- [x] Extend the Maude model with durable event log, fact projection, effect
   graph commit, and rule firing.
-- [ ] Model blocked-by-policy and blocked-by-capacity separately from
+- [x] Model blocked-by-policy and blocked-by-capacity separately from
   blocked-by-dependency.
-- [ ] Model retry, timeout, cancellation, and lease expiry outcomes.
-- [ ] Add a Ralph loop model with an explicit external-event boundary.
-- [ ] Add a coerce classification model with success/failure branches.
+- [x] Model retry, timeout, cancellation, and lease expiry outcomes.
+- [x] Add a Ralph loop model with an explicit external-event boundary.
+- [x] Add a coerce classification model with success/failure branches.
 - [ ] Add generated Maude checks from typed IR once the compiler exists.
 
 ### TLA+/Apalache Runtime Lifecycle
 
-- [ ] Finish the TLA+ lifecycle model for append, projection, claim, lease,
+- [x] Finish the TLA+ lifecycle model for append, projection, claim, lease,
   retry, completion, pause/resume, cancellation, and recovery.
-- [ ] Install or document the Apalache runner path used by CI.
+- [x] Install or document the Apalache runner path used by CI.
 - [ ] Add bounded checks for safety invariants:
-  - [ ] every run references an existing effect
-  - [ ] no effect has more than one terminal completion
-  - [ ] no provider run starts unless the effect is claimable
-  - [ ] no claimable effect has unsatisfied dependencies
-  - [ ] paused instances do not commit new effectful rewrites
+  - [x] every run references an existing effect
+  - [x] no effect has more than one terminal completion
+  - [x] no provider run starts unless the effect is claimable
+  - [x] no claimable effect has unsatisfied dependencies
+  - [x] paused instances do not commit new effectful rewrites
   - [ ] recovery does not reorder the per-instance event log
 - [ ] Add liveness/fairness checks only after safety checks stabilize.
 
 ### Trace Conformance
 
-- [ ] Define the trace event schema consumed by model checkers.
-- [ ] Implement a trace checker that validates runtime traces against kernel
+- [x] Define the trace event schema consumed by model checkers.
+- [x] Implement a trace checker that validates runtime traces against kernel
   invariants.
 - [ ] Add trace checker fixtures for success, dependency violation, duplicate
   terminal completion, stale lease completion, and pause/cancel races.
+  - [x] success
+  - [x] dependency violation
+  - [x] duplicate terminal completion
+  - [ ] stale lease completion
+  - [x] pause/cancel race basics
 
 ### Veil/Lean Recheck
 

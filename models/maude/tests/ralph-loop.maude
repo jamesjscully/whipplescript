@@ -1,0 +1,46 @@
+load ../kernel.maude
+
+--- Ralph cannot start a turn from a pending projection alone; the external
+--- completion/init event is the durable boundary.
+search [1] in ARMATURE-KERNEL :
+  projection(turnCompletedEvt, turnFact, pending)
+  rule(ralphRule, turnFact, g1)
+  ruleReady(ralphRule, turnFact, g1)
+  graph(g1, tellEff)
+  =>*
+  effect(tellEff, running) .
+
+--- Once the event is in the log, projection can derive the fact, the rule can
+--- commit an effect graph, and the agent turn can run.
+search [1] in ARMATURE-KERNEL :
+  event(turnCompletedEvt)
+  projection(turnCompletedEvt, turnFact, pending)
+  rule(ralphRule, turnFact, g1)
+  ruleReady(ralphRule, turnFact, g1)
+  graph(g1, tellEff)
+  =>*
+  event(turnCompletedEvt)
+  projection(turnCompletedEvt, turnFact, projected)
+  fact(turnFact)
+  rule(ralphRule, turnFact, g1)
+  ruleFired(ralphRule, turnFact, g1)
+  event(ruleCommitEvt)
+  graphCommitted(g1)
+  effect(tellEff, running) .
+
+--- Rule firing commits an outbox effect; it does not run the provider inline.
+search [1] in ARMATURE-KERNEL :
+  event(initEvt)
+  projection(initEvt, turnFact, pending)
+  rule(ralphRule, turnFact, g1)
+  ruleReady(ralphRule, turnFact, g1)
+  graph(g1, tellEff)
+  =>*
+  event(initEvt)
+  projection(initEvt, turnFact, projected)
+  fact(turnFact)
+  rule(ralphRule, turnFact, g1)
+  ruleFired(ralphRule, turnFact, g1)
+  event(ruleCommitEvt)
+  graphCommitted(g1)
+  effect(tellEff, queued) .
