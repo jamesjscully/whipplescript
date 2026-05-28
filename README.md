@@ -99,8 +99,22 @@ scripts/check-real-providers.sh
 ```
 
 Set `WHIPPLETREE_REAL_PROVIDERS=loft`, `WHIPPLETREE_REAL_PROVIDERS=baml`, or
-`WHIPPLETREE_REAL_PROVIDERS=loft,baml` to run only the provider smoke tests that
-are configured. The default is both providers.
+`WHIPPLETREE_REAL_PROVIDERS=codex` to run only the provider smoke tests that are
+configured. Comma-separated subsets such as `loft,baml,codex` are accepted. The
+default is `loft,baml`.
+
+For the smallest real Codex dogfood test, run:
+
+```sh
+scripts/check-codex-message.sh
+```
+
+It sends one non-interactive `codex exec` prompt, requires the final message to
+match `WHIPPLETREE_CODEX_SMOKE_EXPECTED`, and writes
+`target/codex-message-smoke-report.md`. Override the prompt, expected response,
+model, or profile with `WHIPPLETREE_CODEX_SMOKE_PROMPT`,
+`WHIPPLETREE_CODEX_SMOKE_EXPECTED`, `WHIPPLETREE_CODEX_MODEL`, and
+`WHIPPLETREE_CODEX_PROFILE`.
 
 Set `WHIPPLETREE_LOFT_REPO` when the Loft fixture repo is not available at
 `vendor/loft`. Set `WHIPPLETREE_BAML_HEALTH_PATH` to add a non-destructive HTTP

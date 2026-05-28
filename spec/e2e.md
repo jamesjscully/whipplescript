@@ -33,8 +33,19 @@ scripts/check-real-providers.sh
 ```
 
 Set `WHIPPLETREE_REAL_PROVIDERS=loft`, `WHIPPLETREE_REAL_PROVIDERS=baml`, or
-`WHIPPLETREE_REAL_PROVIDERS=loft,baml` to run a selected subset of no-mock smoke
-tests. The default is both providers.
+`WHIPPLETREE_REAL_PROVIDERS=codex` to run a selected subset of no-mock smoke
+tests. Comma-separated subsets such as `loft,baml,codex` are accepted. The
+default is `loft,baml`.
+
+For the smallest real Codex dogfood check, run:
+
+```sh
+scripts/check-codex-message.sh
+```
+
+That sends one read-only, non-interactive `codex exec` prompt, requires the
+final message and a `turn.completed` JSONL event, and records
+`target/codex-message-smoke-report.md`.
 
 For local Loft dogfooding against a sibling checkout, run:
 
@@ -93,9 +104,9 @@ The real-provider script verifies prerequisite tools, required environment,
 Loft fixture repo readiness when Loft is selected, including tracked spec
 and fixture files, non-destructive BAML endpoint reachability when BAML is
 selected, `doctor`, example compilation, a read-only no-mock `loft.show`
-smoke call, and a no-mock `baml.coerce` smoke call against the configured
-endpoint. Provider-destructive Loft flows stay manual until isolated test
-fixtures exist for external systems.
+smoke call, a no-mock `baml.coerce` smoke call against the configured endpoint,
+and a one-message Codex smoke when `codex` is selected. Provider-destructive
+Loft flows stay manual until isolated test fixtures exist for external systems.
 
 Loft fixture shape checks are available separately:
 

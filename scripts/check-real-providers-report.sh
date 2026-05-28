@@ -47,6 +47,11 @@ mkdir -p "$(dirname "$REPORT")"
   echo "- BAML output type: $(env_state WHIPPLETREE_BAML_TEST_OUTPUT_TYPE)"
   echo "- BAML health path: $(env_state WHIPPLETREE_BAML_HEALTH_PATH)"
   echo "- BAML CLI skip: $(env_state WHIPPLETREE_BAML_SKIP_CLI)"
+  echo "- Codex smoke prompt: $(env_state WHIPPLETREE_CODEX_SMOKE_PROMPT)"
+  echo "- Codex smoke expected response: $(env_state WHIPPLETREE_CODEX_SMOKE_EXPECTED)"
+  echo "- Codex smoke model override: $(env_state WHIPPLETREE_CODEX_MODEL)"
+  echo "- Codex smoke profile override: $(env_state WHIPPLETREE_CODEX_PROFILE)"
+  echo "- Codex smoke report override: $(env_state WHIPPLETREE_CODEX_SMOKE_REPORT)"
   echo
   echo "## Output"
   echo

@@ -24,7 +24,7 @@ validate_selected_providers() {
   IFS=',' read -ra providers <<<"$SELECTED_PROVIDERS"
   for provider in "${providers[@]}"; do
     case "$provider" in
-      loft | baml)
+      loft | baml | codex)
         selected_any=1
         ;;
       "")
@@ -37,7 +37,7 @@ validate_selected_providers() {
   done
 
   if [[ "$selected_any" -ne 1 ]]; then
-    echo "WHIPPLETREE_REAL_PROVIDERS must include loft, baml, or both" >&2
+    echo "WHIPPLETREE_REAL_PROVIDERS must include loft, baml, codex, or a comma-separated subset" >&2
     missing=1
   fi
 }
@@ -157,6 +157,10 @@ if provider_enabled baml; then
   fi
 fi
 
+if provider_enabled codex; then
+  require_command codex || true
+fi
+
 if [[ "$missing" -ne 0 ]]; then
   exit 2
 fi
@@ -174,6 +178,10 @@ fi
 if provider_enabled baml; then
   cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whippletree-kernel \
     real_baml_coerce_endpoint_smoke -- --nocapture
+fi
+
+if provider_enabled codex; then
+  "$ROOT/scripts/check-codex-message.sh"
 fi
 
 echo "Real-provider readiness checks passed."
