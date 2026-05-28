@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/armature-adapters",
+    "crates/armature-cli",
+    "crates/armature-engine",
+    "crates/armature-modelgen",
+    "crates/armature-workflow",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
+clap = { version = "4.5.39", features = ["derive"] }
+cron = "0.15.0"
+glob = "0.3.3"
+logos = "0.15.1"
+rowan = "0.16.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+tempfile = "3.23.0"
+text-size = "1.1.1"
+thiserror = "2.0.17"
+toml = "0.9.8"
+ulid = "1.2.1"

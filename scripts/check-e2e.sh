@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$repo_root"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-cargo test -p armature-cli --test e2e
+cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p armature-cli -- --version >/dev/null
+cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p armature-cli -- doctor >/dev/null

@@ -2,30 +2,37 @@ name: CI
 
 on:
   push:
+    branches: ["**"]
   pull_request:
 
 jobs:
-  rust:
-    name: Rust checks and e2e
+  checks:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo test --workspace
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo build -p armature-cli
-      - run: scripts/check-docs.sh
-      - run: scripts/check-e2e.sh
-      - run: git diff --check
 
-  formal:
-    name: Formal model checks
-    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - run: scripts/check-formal-models.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install Maude
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y maude
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --workspace
+
+      - name: Formal model checks
+        run: scripts/check-formal-models.sh
+
+      - name: E2E smoke
+        run: scripts/check-e2e.sh

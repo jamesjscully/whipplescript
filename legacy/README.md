@@ -1,28 +1,25 @@
-# Legacy Armature Runtime
+# Legacy Armature Work
 
-The existing task/service/script runner is legacy for the statechart workflow
-track.
+This directory preserves prior Armature designs and implementations. They are
+reference material, not the current product model.
 
-It may still provide useful implementation material:
+## Contents
+
+- `v0.3-runtime/`: older task/service/script runner work.
+- `statechart-workflows-runtime/`: the Rust statechart workflow runtime and
+  specs that preceded the current rule-machine reset.
+
+## Reuse Policy
+
+Legacy code may still provide useful implementation material:
 
 - Rust workspace and CLI patterns
 - process/log capture code
-- event/run terminology where it remains accurate
-- tests and packaging
-- runtime inspection lessons
+- SQLite persistence code
+- event/effect terminology where it remains accurate
+- tests and packaging lessons
+- formal-model scaffolding
 
-It should not define the new product model. New implementation work should start
-from:
-
-```text
-native .armature DSL files
-validated workflow IR
-durable event queues
-append-only transition/effect logs
-trusted Rust interpreter
-typed effects
-status/check/prove UX
-```
-
-Compatibility with the old task/service model should be implemented only through
-explicit adapters or migration tools.
+It should not define the new language or runtime architecture. Current design
+work starts from the root `spec/` directory and targets an event-sourced
+relational rule machine.

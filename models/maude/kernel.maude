@@ -1,0 +1,75 @@
+mod ARMATURE-KERNEL is
+  sorts EffectId FactId RunId EventId Predicate EffectStatus Cfg .
+
+  --- Sample identifiers used by hand-written model tests.
+  ops e1 e2 e3 : -> EffectId .
+  ops claimEff tellEff askEff coerceEff recordEff : -> EffectId .
+  ops issueFact workerFact claimFact turnFact : -> FactId .
+  ops run1 : -> RunId .
+  ops event1 : -> EventId .
+
+  --- Effect lifecycle states.
+  ops queued blocked claimed running completed failed timedOut cancelled : -> EffectStatus .
+
+  --- Dependency predicates. These correspond to source-level
+  --- `after effect succeeds|fails|completes` edges.
+  ops succeeds fails completes : -> Predicate .
+
+  --- Runtime configuration as a multiset.
+  op none : -> Cfg .
+  op __ : Cfg Cfg -> Cfg [assoc comm id: none] .
+
+  --- Kernel projections.
+  op effect : EffectId EffectStatus -> Cfg .
+  op dep : EffectId Predicate EffectId -> Cfg .
+  op fact : FactId -> Cfg .
+  op event : EventId -> Cfg .
+  op run : RunId EffectId -> Cfg .
+  op correlates : EffectId FactId -> Cfg .
+
+  vars U D E : EffectId .
+
+  --- A queued effect can be claimed and then started by an external worker.
+  rl [claim-effect] : effect(E, queued) => effect(E, claimed) .
+  rl [start-run] : effect(E, claimed) => effect(E, running) .
+
+  --- Terminal outcomes are recorded by the kernel from worker completion events.
+  rl [complete-run] : effect(E, running) => effect(E, completed) .
+  rl [fail-run] : effect(E, running) => effect(E, failed) .
+  rl [timeout-run] : effect(E, running) => effect(E, timedOut) .
+
+  --- Cancellation is available before an effect starts running.
+  rl [cancel-queued] : effect(E, queued) => effect(E, cancelled) .
+  rl [cancel-blocked] : effect(E, blocked) => effect(E, cancelled) .
+  rl [cancel-claimed] : effect(E, claimed) => effect(E, cancelled) .
+
+  --- Dependency release rules. Source order never releases an effect; only
+  --- terminal upstream outcomes do.
+  rl [unblock-success] :
+    effect(U, completed) dep(U, succeeds, D) effect(D, blocked)
+    => effect(U, completed) dep(U, succeeds, D) effect(D, queued) .
+
+  rl [unblock-failure] :
+    effect(U, failed) dep(U, fails, D) effect(D, blocked)
+    => effect(U, failed) dep(U, fails, D) effect(D, queued) .
+
+  rl [unblock-timeout-as-failure] :
+    effect(U, timedOut) dep(U, fails, D) effect(D, blocked)
+    => effect(U, timedOut) dep(U, fails, D) effect(D, queued) .
+
+  rl [unblock-completes-ok] :
+    effect(U, completed) dep(U, completes, D) effect(D, blocked)
+    => effect(U, completed) dep(U, completes, D) effect(D, queued) .
+
+  rl [unblock-completes-fail] :
+    effect(U, failed) dep(U, completes, D) effect(D, blocked)
+    => effect(U, failed) dep(U, completes, D) effect(D, queued) .
+
+  rl [unblock-completes-timeout] :
+    effect(U, timedOut) dep(U, completes, D) effect(D, blocked)
+    => effect(U, timedOut) dep(U, completes, D) effect(D, queued) .
+
+  rl [unblock-completes-cancelled] :
+    effect(U, cancelled) dep(U, completes, D) effect(D, blocked)
+    => effect(U, cancelled) dep(U, completes, D) effect(D, queued) .
+endm

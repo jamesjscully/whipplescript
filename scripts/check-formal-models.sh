@@ -1,68 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$repo_root"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-run_tlc() {
-  tlc -deadlock \
-    -config models/statechart-workflows/SpecImplementation.cfg \
-    models/statechart-workflows/SpecImplementation.tla
-}
-
-run_maude() {
-  maude models/statechart-workflows/SpecImplementation.maude
-}
-
-run_generated_checks() {
-  cargo run -q -p armature-cli -- check \
-    examples/workflows/spec-implementation.armature \
-    --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
-    --policy examples/policies/spec-implementation.enterprise-policy.json \
-    --target tla \
-    --json >/dev/null
-  cargo run -q -p armature-cli -- check \
-    examples/workflows/spec-implementation.armature \
-    --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
-    --policy examples/policies/spec-implementation.enterprise-policy.json \
-    --target maude \
-    --json >/dev/null
-  cargo run -q -p armature-cli -- prove \
-    examples/workflows/spec-implementation.armature \
-    --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
-    --policy examples/policies/spec-implementation.enterprise-policy.json \
-    --json >/dev/null
-}
-
-if command -v tlc >/dev/null 2>&1 && command -v maude >/dev/null 2>&1; then
-  run_tlc
-  run_maude
-  run_generated_checks
-elif command -v nix >/dev/null 2>&1; then
-  nix --extra-experimental-features 'nix-command flakes' develop -c bash -c '
-    tlc -deadlock \
-      -config models/statechart-workflows/SpecImplementation.cfg \
-      models/statechart-workflows/SpecImplementation.tla
-    maude models/statechart-workflows/SpecImplementation.maude
-    cargo run -q -p armature-cli -- check \
-      examples/workflows/spec-implementation.armature \
-      --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
-      --policy examples/policies/spec-implementation.enterprise-policy.json \
-      --target tla \
-      --json >/dev/null
-    cargo run -q -p armature-cli -- check \
-      examples/workflows/spec-implementation.armature \
-      --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
-      --policy examples/policies/spec-implementation.enterprise-policy.json \
-      --target maude \
-      --json >/dev/null
-    cargo run -q -p armature-cli -- prove \
-      examples/workflows/spec-implementation.armature \
-      --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
-      --policy examples/policies/spec-implementation.enterprise-policy.json \
-      --json >/dev/null
-  '
-else
-  echo "error: tlc and maude are not available, and nix is unavailable" >&2
-  exit 127
+if ! command -v maude >/dev/null 2>&1; then
+  echo "maude not found; skipping Maude checks" >&2
+  exit 1
 fi
+
+declare -A EXPECTED_NO_SOLUTION=(
+  ["docket-claim-turn.maude"]=2
+  ["effect-dependencies.maude"]=2
+)
+
+declare -A EXPECTED_SOLUTION=(
+  ["docket-claim-turn.maude"]=2
+  ["effect-dependencies.maude"]=4
+)
+
+for test_file in "$ROOT"/models/maude/tests/*.maude; do
+  echo "== maude ${test_file#"$ROOT"/}"
+  output="$(maude "$test_file")"
+  printf '%s\n' "$output"
+
+  test_name="$(basename "$test_file")"
+  actual_no_solution="$(grep -c 'No solution\.' <<<"$output" || true)"
+  actual_solution="$(grep -c '^Solution 1' <<<"$output" || true)"
+
+  if [[ "${EXPECTED_NO_SOLUTION[$test_name]:-}" != "$actual_no_solution" ]]; then
+    echo "unexpected No solution count for $test_name: got $actual_no_solution, expected ${EXPECTED_NO_SOLUTION[$test_name]:-unset}" >&2
+    exit 1
+  fi
+
+  if [[ "${EXPECTED_SOLUTION[$test_name]:-}" != "$actual_solution" ]]; then
+    echo "unexpected Solution 1 count for $test_name: got $actual_solution, expected ${EXPECTED_SOLUTION[$test_name]:-unset}" >&2
+    exit 1
+  fi
+done
