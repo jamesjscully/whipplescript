@@ -33,12 +33,13 @@ Whippletree v0 should provide:
   rule rewrites.
 - [x] M3: Durable effects, dependency scheduling, leases, retries, and trace
   conformance work end to end.
-- [x] M4: Control plane and CLI manage programs and instances.
-- [x] M5: Capability registry, skills, agent harnesses, BAML coerce, Loft,
+- [ ] M4: Control plane and CLI manage programs, instances, rule stepping, and
+  worker/dev loops.
+- [ ] M5: Capability registry, skills, real agent harnesses, BAML coerce, Loft,
   human review, and observability are wired through typed effect contracts.
 - [x] M6: Static analysis and generated Maude checks protect user programs.
-- [x] M7: E2E suite covers happy paths, failure paths, recovery, and dogfood
-  workflows.
+- [ ] M7: E2E suite covers happy paths, failure paths, recovery, and dogfood
+  workflows through real provider surfaces where configured.
 - [x] M8: Companion skill and release hardening make the system usable by
   coding agents without hand-holding.
 
@@ -286,6 +287,9 @@ Goal: execute compiled programs deterministically against the store.
 - [x] Implement lease acquisition, renewal, expiry, and recovery.
 - [x] Implement retry/backoff policy.
 - [x] Implement trace emission for conformance checking.
+- [ ] Expose enough rule-lowering support for the control plane to turn typed
+  IR rule bodies into `NewFact`, `NewEffect`, and dependency records without
+  duplicating kernel semantics.
 - [x] Audit Stage 5 against the kernel API, formal lifecycle models, trace
   conformance, and scheduler behavior; record gaps for the final audit stage.
   - Kernel lifecycle operations are deterministic and transaction-scoped.
@@ -297,6 +301,8 @@ Acceptance:
 - [x] Unit tests cover every lifecycle transition.
 - [x] Kernel tests match the Maude and TLA+ lifecycle expectations.
 - [x] Trace conformance passes for all kernel integration tests.
+- [ ] A rule-lowering/step integration test can materialize `record` facts and
+  `agent.tell` effects from a compiled workflow body.
 
 ## Stage 6: Control Plane And CLI
 
@@ -318,6 +324,12 @@ Goal: expose Whippletree as an inspectable system for many concurrent scripts.
   - [x] `whip cancel`
   - [x] `whip retry`
   - [x] `whip doctor`
+- [ ] Implement `whip step`.
+- [ ] Implement `whip worker`.
+- [ ] Implement `whip dev`.
+- [ ] Implement provider configuration loading and validation.
+- [ ] Implement command-level diagnostics for idle, blocked, missing provider
+  config, missing credentials, and provider capacity exhaustion.
 - [x] Support JSON output for every inspection command.
 - [x] Add compact human-readable status views.
 - [x] Add helpful suggestions for common desire-path mistakes.
@@ -335,6 +347,13 @@ Acceptance:
 - [x] Status shows current facts, queued effects, active runs, failures, and
   recent evidence.
 - [x] CLI errors include next-step guidance.
+- [ ] `whip step` can drive `examples/minimal-noop.whip` from `external.started`
+  to a recorded `StartupSeen` fact.
+- [ ] `whip dev` can drive `examples/implementation-plan-phase-review.whip`
+  through phase request creation and provider dispatch using a fixture provider.
+- [ ] Worker failures at provider binding, credential lookup, workspace
+  preparation, adapter launch, request submission, stream/read, artifact
+  capture, and terminal-event append are visible in status and trace output.
 
 ## Stage 7: Capability Registry And Plugin Kernel
 
@@ -350,6 +369,9 @@ Goal: safely bind authority at runtime without bloating the core.
   - [x] internet-research
   - [x] human-review
 - [x] Implement custom profile loading from config.
+- [ ] Implement provider binding config for Codex, Claude, Pi, fixture, BAML,
+  Loft, and human inbox providers.
+- [ ] Implement provider health checks and explainable provider selection.
 - [x] Validate source-requested capabilities against registry bindings.
 - [x] Implement plugin package discovery and loading.
 - [x] Ensure plugins cannot mutate kernel state directly.
@@ -368,6 +390,12 @@ Acceptance:
 - [x] Profile mismatch is visible in status and trace output.
 - [x] A plugin can register an effect contract and provider without changing
   kernel code.
+- [ ] Status for blocked effects explains whether the failure is missing
+  capability, profile mismatch, missing provider config, missing credentials, or
+  insufficient enforcement.
+- [ ] Missing provider configuration, credentials, native enforcement, or healthy
+  provider binding blocks an effect before provider execution and records
+  diagnostics/evidence without leaking secrets.
 
 ## Stage 8: Core Integrations
 
@@ -383,11 +411,26 @@ Goal: wire the built-in effect families through the same contract system.
 
 - [x] Define the harness adapter trait.
 - [x] Implement mock harness for deterministic tests.
-- [x] Implement Codex adapter.
-- [x] Implement Claude Code adapter.
-- [x] Implement Pi-style adapter.
-- [x] Capture stdout/stderr, transcripts, artifacts, exit status, and usage.
-- [x] Normalize provider lifecycle into `agent.turn.*` facts/events.
+- [ ] Implement Codex adapter against the Codex App Server or Codex SDK, with
+  thread lifecycle, event-stream, approval, diff, artifact, and auth handling.
+- [ ] Implement Claude adapter against the Claude Agent SDK, with API/provider
+  auth, allowed-tool/profile mapping, streaming message handling, artifact
+  capture, and usage capture.
+- [ ] Implement Pi adapter through the Pi extension system, with Whippletree
+  effect/run correlation to Pi conversation threads, transcript/evidence export,
+  and completion detection.
+- [ ] Capture provider transcripts, artifacts, exit/status, tool calls, usage,
+  diffs, and changed files for real Codex and Claude turns.
+- [ ] Capture harness failure events and evidence for config, auth, workspace,
+  adapter, launch, request, stream, timeout, cancellation, result-validation, and
+  artifact-capture failures.
+- [ ] Normalize real provider lifecycle into `agent.turn.*` facts/events.
+- [ ] Implement a control-plane driver that materializes ready rules into facts
+  and effect outbox entries before providers try to claim effects.
+- [ ] Implement workspace records and workspace policy enforcement for shared
+  checkout, per-effect worktree, per-issue worktree, and remote sandbox modes.
+- [ ] Derive standard `agent.turn.*` completion facts and deterministic
+  relationship aliases used by examples.
 
 ### BAML Coerce
 
@@ -608,6 +651,12 @@ Acceptance:
     prerequisite tracking.
 - [x] A failed e2e run leaves artifacts useful enough to debug without
   rerunning immediately.
+- [ ] Dogfood workflow `implementation-plan-phase-review.whip` can create phase
+  review facts, enqueue Codex review effects, run configured Codex threads, and
+  update `spec/implementation-plan-phase-review-tracker.md`.
+- [ ] Real-provider dogfood can be run with Codex, Claude, and Pi provider
+  bindings independently, with skipped providers reported as unavailable rather
+  than silently passing.
 
 ## Stage 12: Companion Skill, Docs, And Release Hardening
 

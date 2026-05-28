@@ -1,0 +1,37 @@
+workflow ImplementationPlanPhaseReview
+uses
+  skill whippletree-author
+schemas
+  class PhaseReviewRequest
+    number int
+    title string
+    planPath string
+    trackerPath string
+    status literal<"queued">
+  class PhaseReviewDispatch
+    request ref<PhaseReviewRequest>
+    turn ref<AgentTurn>
+    status literal<"dispatched">
+agents
+  agent codex profile=repo-reader capacity=4 skills=[whippletree-author]
+rules
+  rule seed_phase_reviews
+    when started
+    reads
+      pattern:started
+    writes
+      schema:PhaseReviewRequest
+    body_hash 0482a45d585b4fae
+  rule dispatch_phase_review
+    when PhaseReviewRequest as phase
+    when codex is available
+    reads
+      pattern:codex is available
+      schema:PhaseReviewRequest
+    writes
+      schema:PhaseReviewDispatch
+    effects
+      turn kind=agent.tell binding=turn key=adc5c89b0182f885
+    body_hash 827b406e0b89e9ac
+rule_dependencies
+  seed_phase_reviews --schema:PhaseReviewRequest--> dispatch_phase_review

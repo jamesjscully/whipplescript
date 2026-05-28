@@ -34,6 +34,26 @@ retention_policy
 enforcement_mode
 ```
 
+Provider bindings extend capability bindings with operational configuration:
+
+```text
+provider_id
+provider_kind
+profiles
+capabilities
+credentials_ref
+workspace_policy
+adapter_config_ref
+max_parallel_runs
+native_enforcement_level
+health_check
+artifact_policy
+retention_policy
+```
+
+`credentials_ref` points to operator-managed configuration or secret storage.
+Workflow source must never contain provider credentials.
+
 ## Profiles
 
 Agent profiles are also registry objects:
@@ -106,6 +126,11 @@ enforced by provider
 
 An effect can proceed only when environment policy accepts the provider's
 enforcement level for the requested profile or capability.
+
+Provider selection must be explainable. If multiple providers can satisfy a
+profile, the registry should record which provider was selected and why. If no
+provider can satisfy the request, the blocked effect should name the missing or
+insufficient binding.
 
 ## CLI Shape
 

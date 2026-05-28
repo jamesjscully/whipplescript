@@ -94,6 +94,63 @@ rule recall_before_work
 }
 ```
 
+Fan-out with a visible tracker:
+
+```whippletree
+class ReviewRequest {
+  number int
+  title string
+  trackerPath string
+  status "queued"
+}
+
+class ReviewDispatch {
+  request ReviewRequest
+  turn AgentTurn
+  status "dispatched"
+}
+
+agent reviewer {
+  profile "repo-reader"
+  capacity 4
+}
+
+rule seed_reviews
+  when started
+=> {
+  record ReviewRequest {
+    number 0
+    title "Repository reset"
+    trackerPath "spec/review-tracker.md"
+    status "queued"
+  }
+}
+
+rule dispatch_review
+  when ReviewRequest as request
+  when reviewer is available
+=> {
+  tell reviewer as turn """
+  Review phase {{ request.number }}: {{ request.title }}.
+
+  Update {{ request.trackerPath }} with status, findings, and evidence.
+  """
+
+  after turn succeeds {
+    record ReviewDispatch {
+      request request
+      turn turn
+      status "dispatched"
+    }
+  }
+}
+```
+
+Use this when the operator needs to see progress outside the runtime store.
+The workflow records durable dispatch facts, while the agent prompt tells each
+thread exactly which tracker row or file to update. Keep the tracker path in a
+fact so the prompt, evidence, and later review are tied to the same input.
+
 ## Profiles
 
 Choose profiles by authority intent:

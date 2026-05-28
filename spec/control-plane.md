@@ -116,6 +116,135 @@ whip evidence <run-or-effect>
 `whip dev` is a convenience command for dogfooding. It should compile,
 start one instance, run local effect workers, and stream useful status.
 
+`whip run` may create and start an instance without driving it. The control
+plane still needs an explicit driving surface for local dogfooding:
+
+```sh
+whip step <instance> --program workflow.whip
+whip worker --provider codex --once
+whip dev workflow.whip --input input.json --provider codex --until idle
+```
+
+`whip step` should evaluate ready rules from the compiled IR, commit their fact
+and effect rewrites transactionally, and stop before running external effects.
+`whip worker` should claim already-materialized effects and execute configured
+providers. `whip dev` may compose those loops for an operator-facing
+single-command experience.
+
+## Driver Semantics
+
+A fully functional local runtime needs three separate loops. Keeping them
+separate makes testing and recovery tractable.
+
+```text
+starter: create instance and append external input events
+stepper: evaluate ready rules and commit fact/effect rewrites
+worker: claim effects and run providers
+```
+
+`whip step` is deterministic. Given a program version, instance id, and store
+state, it should:
+
+1. Load the compiled IR for the instance's program version.
+2. Rebuild or read the current fact projection.
+3. Derive standard facts from new external events, such as `started`.
+4. Evaluate ready rules in a deterministic order.
+5. Lower each selected rule body into:
+   - `NewFact` records for `record ...` blocks
+   - `NewEffect` records for `tell`, `coerce`, `claim`, `askHuman`, `call`,
+     and `emit`
+   - `NewEffectDependency` records for `after` blocks
+   - evidence/diagnostic records for policy decisions and lowering details
+6. Commit each rule atomically through the kernel.
+7. Stop when no additional rules are ready, the configured step limit is hit,
+   or the instance becomes paused/cancelled/terminal.
+
+`whip step` must never execute providers. It only creates durable facts and
+outbox effects.
+
+`whip worker` is nondeterministic at the provider boundary but durable at the
+kernel boundary. It should:
+
+1. Query claimable effects filtered by provider, profile, capability, and
+   optional instance id.
+2. Claim one or more effects with leases.
+3. Create run records.
+4. Resolve provider binding, credentials, native enforcement, and workspace
+   policy.
+5. Invoke the configured provider adapter.
+6. Store artifacts/evidence, including failure transcripts where available.
+7. Append terminal completion/failure/timeout/cancel events.
+8. Derive standard completion facts.
+
+Every worker boundary has to be durable:
+
+```text
+provider binding resolution
+credential lookup
+workspace preparation
+adapter/session launch
+request submission
+provider stream/read
+artifact capture
+terminal event append
+fact derivation
+```
+
+Failures before claim should leave a blocked effect with explainable status.
+Failures after claim should append `effect.failed`, `effect.timed_out`, or
+`effect.cancelled` with structured error metadata and evidence. If the store
+cannot append a terminal event, the worker must leave the lease/run recoverable
+instead of reporting success out of band.
+
+`whip dev` composes `step` and `worker` for one local dogfood session. It should
+stream status, stop at idle/blocked/terminal states, and make every provider
+decision visible in the store.
+
+## Rule Lowering Requirements
+
+The control plane needs a production lowering pass from typed IR and source spans
+to concrete store writes. This pass must not rely on ad hoc prompt parsing.
+
+For each rule body construct:
+
+```text
+record Class { ... }        -> typed fact projection
+tell agent ...              -> agent.tell effect with target/profile/skills
+coerce function(...)        -> baml.coerce effect with function and arguments
+claim issue with loft       -> loft.claim effect
+askHuman ...                -> human.ask effect
+call plugin.capability ...  -> capability.call effect
+emit event                  -> event.emit effect
+after effect succeeds       -> dependency edge
+```
+
+Lowering must resolve interpolation values from the matched facts/effect outputs
+that are in scope. If a value cannot be resolved, the rule commit fails before
+persisting any partial records.
+
+Every lowered fact/effect must include:
+
+```text
+instance id
+program version id
+rule name
+trigger event id or consumed fact keys
+source span
+normalized input JSON
+stable idempotency key
+correlation id
+```
+
+Dogfood acceptance for this layer:
+
+```text
+whip dev examples/implementation-plan-phase-review.whip --provider codex --until idle
+```
+
+must create one `PhaseReviewRequest` fact for each implementation-plan phase,
+enqueue corresponding `agent.tell` effects, run configured Codex turns, and
+leave status/evidence sufficient to explain every dispatched or blocked phase.
+
 ## Control Plane Responsibilities
 
 The control plane owns mechanical reliability:

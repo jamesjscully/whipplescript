@@ -36,6 +36,47 @@ pub struct ProviderArtifact {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderFailure {
+    pub phase: String,
+    pub error_kind: String,
+    pub message: String,
+    pub recoverable: bool,
+    pub retry_after: Option<String>,
+    pub provider_session_id: Option<String>,
+    pub provider_thread_id: Option<String>,
+    pub raw_json: Option<String>,
+}
+
+impl ProviderFailure {
+    pub fn new(
+        phase: impl Into<String>,
+        error_kind: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            phase: phase.into(),
+            error_kind: error_kind.into(),
+            message: message.into(),
+            recoverable: false,
+            retry_after: None,
+            provider_session_id: None,
+            provider_thread_id: None,
+            raw_json: None,
+        }
+    }
+
+    pub fn recoverable(mut self, recoverable: bool) -> Self {
+        self.recoverable = recoverable;
+        self
+    }
+
+    pub fn raw_json(mut self, raw_json: impl Into<String>) -> Self {
+        self.raw_json = Some(raw_json.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderRunResult {
     pub status: ProviderRunStatus,
     pub summary: String,
@@ -45,6 +86,7 @@ pub struct ProviderRunResult {
     pub exit_code: Option<i64>,
     pub usage_json: String,
     pub artifacts: Vec<ProviderArtifact>,
+    pub failure: Option<ProviderFailure>,
 }
 
 pub trait AgentHarness {
@@ -131,65 +173,53 @@ impl AgentHarness for CommandAgentHarness {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                return ProviderRunResult {
-                    status: ProviderRunStatus::Failed,
+                return command_failure_result(CommandFailure {
+                    plan: &self.plan,
+                    request: &request,
+                    payload: &payload,
+                    phase: "provider.launch.failed",
+                    error_kind: "spawn_error",
                     summary: format!("failed to launch {}: {error}", self.plan.provider),
-                    stdout: String::new(),
-                    stderr: error.to_string(),
-                    transcript: command_transcript(
-                        &self.plan,
-                        &request,
-                        &payload,
-                        "",
-                        &error.to_string(),
-                    ),
                     exit_code: None,
-                    usage_json: "{}".to_owned(),
-                    artifacts: Vec::new(),
-                };
+                    stdout: "",
+                    stderr: &error.to_string(),
+                    recoverable: true,
+                });
             }
         };
 
         if let Some(mut stdin) = child.stdin.take() {
             if let Err(error) = stdin.write_all(payload.as_bytes()) {
-                return ProviderRunResult {
-                    status: ProviderRunStatus::Failed,
+                return command_failure_result(CommandFailure {
+                    plan: &self.plan,
+                    request: &request,
+                    payload: &payload,
+                    phase: "provider.stdin.failed",
+                    error_kind: "stdin_write_error",
                     summary: format!("failed to write request to {}: {error}", self.plan.provider),
-                    stdout: String::new(),
-                    stderr: error.to_string(),
-                    transcript: command_transcript(
-                        &self.plan,
-                        &request,
-                        &payload,
-                        "",
-                        &error.to_string(),
-                    ),
                     exit_code: None,
-                    usage_json: "{}".to_owned(),
-                    artifacts: Vec::new(),
-                };
+                    stdout: "",
+                    stderr: &error.to_string(),
+                    recoverable: true,
+                });
             }
         }
 
         let output = match child.wait_with_output() {
             Ok(output) => output,
             Err(error) => {
-                return ProviderRunResult {
-                    status: ProviderRunStatus::Failed,
+                return command_failure_result(CommandFailure {
+                    plan: &self.plan,
+                    request: &request,
+                    payload: &payload,
+                    phase: "provider.stream.failed",
+                    error_kind: "wait_error",
                     summary: format!("failed to wait for {}: {error}", self.plan.provider),
-                    stdout: String::new(),
-                    stderr: error.to_string(),
-                    transcript: command_transcript(
-                        &self.plan,
-                        &request,
-                        &payload,
-                        "",
-                        &error.to_string(),
-                    ),
                     exit_code: None,
-                    usage_json: "{}".to_owned(),
-                    artifacts: Vec::new(),
-                };
+                    stdout: "",
+                    stderr: &error.to_string(),
+                    recoverable: true,
+                });
             }
         };
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -209,6 +239,10 @@ impl AgentHarness for CommandAgentHarness {
             )
         };
         let transcript = command_transcript(&self.plan, &request, &payload, &stdout, &stderr);
+        let failure = (!output.status.success()).then(|| {
+            ProviderFailure::new("provider.exit.failed", "nonzero_exit", summary.clone())
+                .recoverable(true)
+        });
 
         ProviderRunResult {
             status,
@@ -219,6 +253,7 @@ impl AgentHarness for CommandAgentHarness {
             exit_code,
             usage_json: "{}".to_owned(),
             artifacts: Vec::new(),
+            failure,
         }
     }
 }
@@ -302,21 +337,28 @@ impl MockAgentHarness {
                     content_hash: Some("mock-transcript-hash".to_owned()),
                     mime_type: Some("text/plain".to_owned()),
                 }],
+                failure: None,
             },
         }
     }
 
     pub fn failed(summary: impl Into<String>) -> Self {
+        let summary = summary.into();
         Self {
             result: ProviderRunResult {
                 status: ProviderRunStatus::Failed,
-                summary: summary.into(),
+                summary: summary.clone(),
                 stdout: String::new(),
                 stderr: "mock failure\n".to_owned(),
                 transcript: "mock failed transcript\n".to_owned(),
                 exit_code: Some(1),
                 usage_json: r#"{"input_tokens":1,"output_tokens":0}"#.to_owned(),
                 artifacts: Vec::new(),
+                failure: Some(ProviderFailure::new(
+                    "provider.fixture.failed",
+                    "fixture_failure",
+                    summary,
+                )),
             },
         }
     }
@@ -333,6 +375,42 @@ impl AgentHarness for MockAgentHarness {
             request.skill_names.join(",")
         ));
         result
+    }
+}
+
+struct CommandFailure<'a> {
+    plan: &'a CommandLaunchPlan,
+    request: &'a AgentTurnRequest,
+    payload: &'a str,
+    phase: &'a str,
+    error_kind: &'a str,
+    summary: String,
+    exit_code: Option<i64>,
+    stdout: &'a str,
+    stderr: &'a str,
+    recoverable: bool,
+}
+
+fn command_failure_result(failure: CommandFailure<'_>) -> ProviderRunResult {
+    ProviderRunResult {
+        status: ProviderRunStatus::Failed,
+        summary: failure.summary.clone(),
+        stdout: failure.stdout.to_owned(),
+        stderr: failure.stderr.to_owned(),
+        transcript: command_transcript(
+            failure.plan,
+            failure.request,
+            failure.payload,
+            failure.stdout,
+            failure.stderr,
+        ),
+        exit_code: failure.exit_code,
+        usage_json: "{}".to_owned(),
+        artifacts: Vec::new(),
+        failure: Some(
+            ProviderFailure::new(failure.phase, failure.error_kind, failure.summary)
+                .recoverable(failure.recoverable),
+        ),
     }
 }
 
@@ -384,6 +462,58 @@ mod tests {
         assert!(result.stdout.contains("\"effect_id\":\"tell\""));
         assert!(result.stderr.contains("err"));
         assert!(result.transcript.contains("provider=fixture"));
+        assert!(result.failure.is_none());
+    }
+
+    #[test]
+    fn command_harness_captures_launch_failure_as_structured_failure() {
+        let harness = CommandAgentHarness::new(CommandLaunchPlan::new(
+            "fixture",
+            "definitely-not-a-command",
+        ));
+
+        let result = harness.run(AgentTurnRequest {
+            instance_id: "instance-a".to_owned(),
+            effect_id: "tell".to_owned(),
+            run_id: "run-tell".to_owned(),
+            agent: "worker".to_owned(),
+            profile: Some("repo-writer".to_owned()),
+            input_json: r#"{"prompt":"go"}"#.to_owned(),
+            skill_names: Vec::new(),
+        });
+
+        let failure = result.failure.expect("failure is structured");
+        assert_eq!(result.status, ProviderRunStatus::Failed);
+        assert_eq!(failure.phase, "provider.launch.failed");
+        assert_eq!(failure.error_kind, "spawn_error");
+        assert!(failure.recoverable);
+        assert!(result.transcript.contains("definitely-not-a-command"));
+    }
+
+    #[test]
+    fn command_harness_captures_nonzero_exit_as_structured_failure() {
+        let harness = CommandAgentHarness::new(
+            CommandLaunchPlan::new("fixture", "sh")
+                .arg("-c")
+                .arg("cat >/dev/null; echo nope >&2; exit 42"),
+        );
+
+        let result = harness.run(AgentTurnRequest {
+            instance_id: "instance-a".to_owned(),
+            effect_id: "tell".to_owned(),
+            run_id: "run-tell".to_owned(),
+            agent: "worker".to_owned(),
+            profile: Some("repo-writer".to_owned()),
+            input_json: r#"{"prompt":"go"}"#.to_owned(),
+            skill_names: Vec::new(),
+        });
+
+        let failure = result.failure.expect("failure is structured");
+        assert_eq!(result.status, ProviderRunStatus::Failed);
+        assert_eq!(result.exit_code, Some(42));
+        assert_eq!(failure.phase, "provider.exit.failed");
+        assert_eq!(failure.error_kind, "nonzero_exit");
+        assert!(result.stderr.contains("nope"));
     }
 
     #[test]

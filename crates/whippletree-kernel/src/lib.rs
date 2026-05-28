@@ -6,7 +6,9 @@ pub mod loft;
 pub mod trace;
 
 use coerce::{BamlClient, BamlCoerceRequest, BamlCoerceResult, BamlCoerceStatus};
-use harness::{AgentHarness, AgentTurnRequest, ProviderRunResult, ProviderRunStatus};
+use harness::{
+    AgentHarness, AgentTurnRequest, ProviderFailure, ProviderRunResult, ProviderRunStatus,
+};
 use loft::{LoftAction, LoftClient, LoftEffectRequest, LoftEffectResult, LoftEffectStatus};
 use serde_json::{json, Value};
 use trace::{DependencyEdge, EffectStatus, TraceEvent, TraceRecord};
@@ -885,6 +887,7 @@ impl RuntimeKernel {
             "exit_code": result.exit_code,
             "usage": json_from_str(&result.usage_json),
             "artifact_ids": artifact_ids,
+            "failure": result.failure.as_ref().map(provider_failure_json),
         })
         .to_string();
         self.store.record_evidence(EvidenceRecord {
@@ -919,6 +922,7 @@ impl RuntimeKernel {
             "status": status,
             "summary": result.summary,
             "exit_code": result.exit_code,
+            "failure": result.failure.as_ref().map(provider_failure_json),
         })
         .to_string();
         let fact_id = idempotency_key(&[execution.instance_id, "agent-turn", execution.run_id]);
@@ -1011,8 +1015,22 @@ fn provider_metadata(result: &ProviderRunResult) -> String {
         "stderr": result.stderr,
         "transcript": result.transcript,
         "usage": json_from_str(&result.usage_json),
+        "failure": result.failure.as_ref().map(provider_failure_json),
     })
     .to_string()
+}
+
+fn provider_failure_json(failure: &ProviderFailure) -> serde_json::Value {
+    json!({
+        "phase": failure.phase,
+        "error_kind": failure.error_kind,
+        "message": failure.message,
+        "recoverable": failure.recoverable,
+        "retry_after": failure.retry_after,
+        "provider_session_id": failure.provider_session_id,
+        "provider_thread_id": failure.provider_thread_id,
+        "raw": failure.raw_json.as_deref().map(json_from_str),
+    })
 }
 
 fn baml_status(status: &BamlCoerceStatus) -> &'static str {
@@ -1130,8 +1148,12 @@ pub fn kernel_stage() -> &'static str {
 mod tests {
     use super::*;
     use coerce::{BamlCoerceRequest, FakeBamlClient};
-    use harness::MockAgentHarness;
+    use harness::{
+        ClaudeCodeAgentHarness, CodexAgentHarness, CommandLaunchPlan, MockAgentHarness,
+        PiStyleAgentHarness,
+    };
     use loft::{FakeLoftClient, LoftAction, LoftEffectRequest};
+    use std::process::Command;
     use trace::check_trace;
     use whippletree_parser::compile_program;
     use whippletree_store::{
@@ -1715,6 +1737,146 @@ rule wait
     }
 
     #[test]
+    fn failed_agent_harness_records_structured_failure_event_and_evidence() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version(ProgramVersionInput {
+                program_name: "HarnessFailure",
+                source_hash: "source",
+                ir_hash: "ir",
+                compiler_version: "test",
+            })
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        let effects = [NewEffect {
+            effect_id: "tell",
+            kind: "agent.tell",
+            target: Some("worker"),
+            input_json: r#"{"prompt":"go"}"#,
+            status: "queued",
+            idempotency_key: "rule=start;effect=tell",
+            required_capabilities_json: "[]",
+            profile: Some("repo-reader"),
+            correlation_id: None,
+        }];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                effects: &effects,
+                dependencies: &[],
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commits");
+
+        kernel
+            .run_agent_turn(
+                AgentTurnExecution {
+                    instance_id: &instance_id,
+                    effect_id: "tell",
+                    run_id: "run-tell",
+                    provider: "mock",
+                    worker_id: "worker-1",
+                    lease_id: "lease-tell",
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    agent: "worker",
+                    profile: Some("repo-reader"),
+                    input_json: r#"{"prompt":"go"}"#,
+                    skill_names: &[],
+                },
+                &MockAgentHarness::failed("fixture exploded"),
+            )
+            .expect("mock turn records failure");
+
+        let store = kernel.into_store();
+        let events = store.list_events(&instance_id).expect("events list");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "effect.terminal"
+                && event.payload_json.contains("\"status\":\"failed\"")
+                && event
+                    .payload_json
+                    .contains("\"phase\":\"provider.fixture.failed\"")));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "agent.turn.failed"
+                && event
+                    .payload_json
+                    .contains("\"error_kind\":\"fixture_failure\"")));
+
+        let evidence = store.list_evidence(&instance_id).expect("evidence lists");
+        assert!(evidence
+            .iter()
+            .any(|evidence| evidence.kind == "agent.turn.provider"
+                && evidence
+                    .metadata_json
+                    .contains("\"phase\":\"provider.fixture.failed\"")));
+
+        let facts = store.list_facts(&instance_id).expect("facts list");
+        assert!(facts.iter().any(|fact| fact.name == "agent.turn.failed"
+            && fact.value_json.contains("\"recoverable\":false")));
+    }
+
+    #[test]
+    fn real_codex_failure_reaches_event_stream() {
+        if !command_exists("codex") {
+            eprintln!("skipping real Codex failure smoke: codex not found on PATH");
+            return;
+        }
+        let harness = CodexAgentHarness::new(
+            CommandLaunchPlan::new("codex", "codex")
+                .arg("app-server")
+                .arg("--listen")
+                .arg("not-a-url://"),
+        );
+        assert_real_provider_failure_reaches_event_stream(
+            "RealCodexFailure",
+            "codex",
+            &harness,
+            "unsupported --listen URL",
+        );
+    }
+
+    #[test]
+    fn real_claude_failure_reaches_event_stream() {
+        if !command_exists("claude") {
+            eprintln!("skipping real Claude failure smoke: claude not found on PATH");
+            return;
+        }
+        let harness = ClaudeCodeAgentHarness::new(
+            CommandLaunchPlan::new("claude", "claude").arg("--definitely-not-a-real-flag"),
+        );
+        assert_real_provider_failure_reaches_event_stream(
+            "RealClaudeFailure",
+            "claude",
+            &harness,
+            "unknown option",
+        );
+    }
+
+    #[test]
+    fn real_pi_failure_reaches_event_stream() {
+        if !command_exists("pi") {
+            eprintln!("skipping real Pi failure smoke: pi not found on PATH");
+            return;
+        }
+        let harness = PiStyleAgentHarness::new(
+            CommandLaunchPlan::new("pi", "pi").arg("--definitely-not-a-real-flag"),
+        );
+        assert_real_provider_failure_reaches_event_stream(
+            "RealPiFailure",
+            "pi",
+            &harness,
+            "Unknown option",
+        );
+    }
+
+    #[test]
     fn fake_baml_coerce_records_evidence_and_success_fact() {
         let store = SqliteStore::open_in_memory().expect("store opens");
         let mut kernel = RuntimeKernel::new(store);
@@ -2206,5 +2368,111 @@ rule wait
         assert!(facts
             .iter()
             .any(|fact| fact.name == "human.ask.created" && fact.value_json.contains("inbox-ask")));
+    }
+
+    fn command_exists(binary: &str) -> bool {
+        Command::new(binary).arg("--version").output().is_ok()
+    }
+
+    fn assert_real_provider_failure_reaches_event_stream(
+        program_name: &str,
+        provider: &str,
+        harness: &dyn AgentHarness,
+        expected_stderr: &str,
+    ) {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version(ProgramVersionInput {
+                program_name,
+                source_hash: "source",
+                ir_hash: "ir",
+                compiler_version: "test",
+            })
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        let effects = [NewEffect {
+            effect_id: "tell",
+            kind: "agent.tell",
+            target: Some("worker"),
+            input_json: r#"{"prompt":"this should fail before a model turn"}"#,
+            status: "queued",
+            idempotency_key: "rule=start;effect=tell",
+            required_capabilities_json: "[]",
+            profile: Some("repo-reader"),
+            correlation_id: None,
+        }];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                effects: &effects,
+                dependencies: &[],
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commits");
+
+        kernel
+            .run_agent_turn(
+                AgentTurnExecution {
+                    instance_id: &instance_id,
+                    effect_id: "tell",
+                    run_id: "run-tell",
+                    provider,
+                    worker_id: "worker-1",
+                    lease_id: "lease-tell",
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    agent: "worker",
+                    profile: Some("repo-reader"),
+                    input_json: r#"{"prompt":"this should fail before a model turn"}"#,
+                    skill_names: &[],
+                },
+                harness,
+            )
+            .expect("real provider failure records terminal event");
+
+        let store = kernel.into_store();
+        let events = store.list_events(&instance_id).expect("events list");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "effect.terminal"
+                    && event.payload_json.contains("\"status\":\"failed\"")
+                    && event
+                        .payload_json
+                        .contains("\"phase\":\"provider.exit.failed\"")
+                    && event
+                        .payload_json
+                        .contains("\"error_kind\":\"nonzero_exit\"")
+                    && event.payload_json.contains(expected_stderr)),
+            "missing failed terminal event for {provider}: {events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "agent.turn.failed"
+                    && event
+                        .payload_json
+                        .contains("\"phase\":\"provider.exit.failed\"")
+                    && event.payload_json.contains("\"recoverable\":true")),
+            "missing failed agent turn event for {provider}: {events:#?}"
+        );
+
+        let facts = store.list_facts(&instance_id).expect("facts list");
+        assert!(facts.iter().any(|fact| fact.name == "agent.turn.failed"
+            && fact.value_json.contains("\"error_kind\":\"nonzero_exit\"")));
+
+        let evidence = store.list_evidence(&instance_id).expect("evidence lists");
+        assert!(evidence
+            .iter()
+            .any(|evidence| evidence.kind == "agent.turn.provider"
+                && evidence
+                    .metadata_json
+                    .contains("\"phase\":\"provider.exit.failed\"")
+                && evidence.metadata_json.contains(expected_stderr)));
     }
 }

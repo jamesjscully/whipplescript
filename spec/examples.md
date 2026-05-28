@@ -456,6 +456,8 @@ The checked example fixtures in `examples/` are:
 - `coerce-branch.whip`: typed model classification followed by explicit
   routing.
 - `human-review.whip`: manual review request and answer recording.
+- `implementation-plan-phase-review.whip`: fan out implementation-plan phase
+  reviews to Codex/repo-reader turns and a visible tracker.
 - `multi-agent-bounded-concurrency.whip`: two agents with explicit capacity
   bounds.
 - `openclaw-lite.whip`: planner, implementer, verifier, and human approval

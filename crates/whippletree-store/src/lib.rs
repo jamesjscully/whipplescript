@@ -370,6 +370,7 @@ pub struct ClaimableEffect {
     pub kind: String,
     pub target: Option<String>,
     pub profile: Option<String>,
+    pub input_json: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -396,6 +397,7 @@ pub struct EffectView {
     pub effect_id: String,
     pub kind: String,
     pub target: Option<String>,
+    pub input_json: String,
     pub status: String,
     pub created_by_rule: String,
     pub profile: Option<String>,
@@ -925,7 +927,7 @@ impl SqliteStore {
         }
         let mut statement = self.connection.prepare(
             r#"
-            SELECT effect_id, kind, target, profile
+            SELECT effect_id, kind, target, profile, input_json
             FROM effects AS candidate
             WHERE candidate.instance_id = ?1
               AND candidate.status IN ('queued', 'blocked_by_dependency')
@@ -953,6 +955,7 @@ impl SqliteStore {
                     kind: row.get(1)?,
                     target: row.get(2)?,
                     profile: row.get(3)?,
+                    input_json: row.get(4)?,
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()
@@ -1888,6 +1891,7 @@ impl SqliteStore {
                 effect_id,
                 kind,
                 target,
+                input_json,
                 status,
                 created_by_rule,
                 profile,
@@ -1904,11 +1908,12 @@ impl SqliteStore {
                     effect_id: row.get(0)?,
                     kind: row.get(1)?,
                     target: row.get(2)?,
-                    status: row.get(3)?,
-                    created_by_rule: row.get(4)?,
-                    profile: row.get(5)?,
-                    required_capabilities_json: row.get(6)?,
-                    policy_block_reason: row.get(7)?,
+                    input_json: row.get(3)?,
+                    status: row.get(4)?,
+                    created_by_rule: row.get(5)?,
+                    profile: row.get(6)?,
+                    required_capabilities_json: row.get(7)?,
+                    policy_block_reason: row.get(8)?,
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()?;

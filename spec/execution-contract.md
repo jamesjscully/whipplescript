@@ -230,6 +230,9 @@ Core effects may also define typed completion facts:
 
 ```text
 agent.turn.completed
+agent.turn.failed
+agent.turn.timed_out
+agent.turn.cancelled
 loft.claim.succeeded
 loft.claim.failed
 baml.coerce.succeeded
@@ -239,6 +242,43 @@ human.answer.received
 
 Domain-specific facts should be produced by rules unless a core effect contract
 explicitly defines them.
+
+Provider and harness failures are event-stream data, not side-channel logs.
+After an effect is claimed, each failed provider boundary must either append a
+terminal event or leave enough lease state for recovery to retry that append.
+This includes workspace preparation, adapter resolution, process/session launch,
+stdin/request submission, streaming, timeout, cancellation, result validation,
+and artifact capture.
+
+Failures before a provider run is created should be represented as blocked
+effect state with diagnostics and evidence. Examples include missing provider
+configuration, missing credentials, insufficient native enforcement, or no
+healthy provider binding. These are distinct from provider runtime failures
+because no provider turn was attempted.
+
+## Rule Advancement Loop
+
+Rule advancement is part of the control plane, but it is constrained by this
+contract. A driver may commit more than one ready rule in one `step`, but every
+rule commit is still atomic and individually replayable.
+
+The driver must:
+
+- use a deterministic ready-rule order
+- avoid firing the same logical rule twice for the same unchanged trigger facts
+- derive standard facts from new events before evaluating user rules
+- stop before provider execution
+- preserve idempotency across restarts
+
+The driver must not:
+
+- inspect prompt text to infer state
+- execute effects inline
+- mutate facts outside a kernel rule commit
+- skip blocked effects to synthesize fake completion facts
+
+If rule lowering fails, the instance should record diagnostics and remain
+inspectable. It should not partially commit the failed rule.
 
 ## Idempotency
 

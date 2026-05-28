@@ -1,0 +1,179 @@
+workflow ImplementationPlanPhaseReview
+
+use skill "whippletree-author"
+
+class PhaseReviewRequest {
+  number int
+  title string
+  planPath string
+  trackerPath string
+  status "queued"
+}
+
+class PhaseReviewDispatch {
+  request PhaseReviewRequest
+  turn AgentTurn
+  status "dispatched"
+}
+
+agent codex {
+  profile "repo-reader"
+  capacity 4
+  skills ["whippletree-author"]
+}
+
+rule seed_phase_reviews
+  when started
+=> {
+  record PhaseReviewRequest {
+    number 0
+    title "Repository Reset And Project Skeleton"
+    planPath "spec/implementation-plan.md"
+    trackerPath "spec/implementation-plan-phase-review-tracker.md"
+    status "queued"
+  }
+
+  record PhaseReviewRequest {
+    number 1
+    title "Formal Modeling And Verification Spine"
+    planPath "spec/implementation-plan.md"
+    trackerPath "spec/implementation-plan-phase-review-tracker.md"
+    status "queued"
+  }
+
+  record PhaseReviewRequest {
+    number 2
+    title "Source Language, Parser, And Typed IR"
+    planPath "spec/implementation-plan.md"
+    trackerPath "spec/implementation-plan-phase-review-tracker.md"
+    status "queued"
+  }
+
+  record PhaseReviewRequest {
+    number 3
+    title "Static Analysis"
+    planPath "spec/implementation-plan.md"
+    trackerPath "spec/implementation-plan-phase-review-tracker.md"
+    status "queued"
+  }
+
+  record PhaseReviewRequest {
+    number 4
+    title "Runtime Store"
+    planPath "spec/implementation-plan.md"
+    trackerPath "spec/implementation-plan-phase-review-tracker.md"
+    status "queued"
+  }
+
+  record PhaseReviewRequest {
+    number 5
+    title "Runtime Kernel"
+    planPath "spec/implementation-plan.md"
+    trackerPath "spec/implementation-plan-phase-review-tracker.md"
+    status "queued"
+  }
+
+  record PhaseReviewRequest {
+    number 6
+    title "Control Plane And CLI"
+    planPath "spec/implementation-plan.md"
+    trackerPath "spec/implementation-plan-phase-review-tracker.md"
+    status "queued"
+  }
+
+  record PhaseReviewRequest {
+    number 7
+    title "Capability Registry And Plugin Kernel"
+    planPath "spec/implementation-plan.md"
+    trackerPath "spec/implementation-plan-phase-review-tracker.md"
+    status "queued"
+  }
+
+  record PhaseReviewRequest {
+    number 8
+    title "Core Integrations"
+    planPath "spec/implementation-plan.md"
+    trackerPath "spec/implementation-plan-phase-review-tracker.md"
+    status "queued"
+  }
+
+  record PhaseReviewRequest {
+    number 9
+    title "Generated Verification And Static Tooling"
+    planPath "spec/implementation-plan.md"
+    trackerPath "spec/implementation-plan-phase-review-tracker.md"
+    status "queued"
+  }
+
+  record PhaseReviewRequest {
+    number 10
+    title "Examples And Dogfood Workflows"
+    planPath "spec/implementation-plan.md"
+    trackerPath "spec/implementation-plan-phase-review-tracker.md"
+    status "queued"
+  }
+
+  record PhaseReviewRequest {
+    number 11
+    title "E2E Test System"
+    planPath "spec/implementation-plan.md"
+    trackerPath "spec/implementation-plan-phase-review-tracker.md"
+    status "queued"
+  }
+
+  record PhaseReviewRequest {
+    number 12
+    title "Companion Skill, Docs, And Release Hardening"
+    planPath "spec/implementation-plan.md"
+    trackerPath "spec/implementation-plan-phase-review-tracker.md"
+    status "queued"
+  }
+
+  record PhaseReviewRequest {
+    number 13
+    title "Final Audit And Gap Closure"
+    planPath "spec/implementation-plan.md"
+    trackerPath "spec/implementation-plan-phase-review-tracker.md"
+    status "queued"
+  }
+}
+
+rule dispatch_phase_review
+  when PhaseReviewRequest as phase
+  when codex is available
+=> {
+  tell codex as turn """
+  Review phase {{ phase.number }} of the Whippletree implementation plan.
+
+  Phase title:
+  {{ phase.title }}
+
+  Plan path:
+  {{ phase.planPath }}
+
+  Tracker path:
+  {{ phase.trackerPath }}
+
+  Scope:
+  - Inspect only this phase and directly related code, tests, examples, and docs.
+  - Check whether the checked-off items are genuinely implemented.
+  - Prefer concrete file references and command results.
+  - Do not modify implementation files.
+  - Update the matching row in the tracker with status, reviewer, findings, evidence, and next action.
+  - If the tracker row is missing, add it.
+
+  Output:
+  - Summary of what you checked.
+  - Findings ordered by severity.
+  - Tests or commands run.
+  - Tracker update completed.
+  """
+
+  after turn succeeds {
+    record PhaseReviewDispatch {
+      request phase
+      turn turn
+      status "dispatched"
+    }
+  }
+}
