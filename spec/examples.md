@@ -5,43 +5,43 @@ Status: sketchpad
 These examples are intentionally small. The goal is to feel the authoring model
 before committing to syntax.
 
-## Simple Docket Worker
+## Simple Loft Worker
 
 This is the best current v0 candidate for the smallest useful real workflow:
 
-```armature
-workflow SimpleDocketWorker
+```whippletree
+workflow SimpleLoftWorker
 
-use skill "docket-user"
+use skill "loft-user"
 use skill "human-review-user"
 
 agent worker {
   profile "repo-writer"
   capacity 1
-  skills ["docket-user"]
+  skills ["loft-user"]
 }
 
 rule start_ready_issue
-  when docket has ready issue as issue
+  when loft has ready issue as issue
   when worker is available
 => {
-  claim issue with docket as claim
+  claim issue with loft as claim
 
   after claim succeeds {
     tell worker """
-    Implement this Docket issue:
+    Implement this Loft issue:
 
     {{ claim.issue.title }}
 
     {{ claim.issue.body }}
 
-    When finished, update the Docket issue with a concise note and evidence.
+    When finished, update the Loft issue with a concise note and evidence.
     """
   }
 
   after claim fails {
     askHuman """
-    Armature could not claim this Docket issue:
+    Whippletree could not claim this Loft issue:
 
     {{ claim.issue_id }}
 
@@ -55,11 +55,11 @@ rule start_ready_issue
 
 rule recover_idle
   when no active agent turns
-  when docket has unfinished issues
+  when loft has unfinished issues
   when no claimable effects
 => {
   askHuman """
-  There is unfinished Docket work, but Armature has no active turns or
+  There is unfinished Loft work, but Whippletree has no active turns or
   claimable effects. Inspect status and decide whether to resume, split, or
   block the work.
   """
@@ -75,15 +75,15 @@ Why this script is important:
 - The idle recovery rule reacts to facts; it does not run a hidden supervisor
   loop.
 
-## Docket Worker With BAML Review
+## Loft Worker With BAML Review
 
 This example adds a typed model decision. It uses BAML-shaped `enum`, `class`,
 and `coerce` declarations, but keeps ordinary data operations small and pure.
 
-```armature
-workflow DocketWorkerWithReview
+```whippletree
+workflow LoftWorkerWithReview
 
-use skill "docket-user"
+use skill "loft-user"
 use skill "baml-coerce-user"
 use skill "human-review-user"
 
@@ -107,7 +107,7 @@ class ReviewedWork {
 
 coerce reviewWork(issueTitle string, agentSummary string, changedFiles string[]) -> WorkReview {
   prompt """
-  Review this completed agent turn for the Docket issue.
+  Review this completed agent turn for the Loft issue.
 
   Issue:
   {{ issueTitle }}
@@ -127,18 +127,18 @@ coerce reviewWork(issueTitle string, agentSummary string, changedFiles string[])
 agent worker {
   profile "repo-writer"
   capacity 1
-  skills ["docket-user"]
+  skills ["loft-user"]
 }
 
 rule start_ready_issue
-  when docket has ready issue as issue
+  when loft has ready issue as issue
   when worker is available
 => {
-  claim issue with docket as claim
+  claim issue with loft as claim
 
   after claim succeeds {
     tell worker """
-    Implement this Docket issue:
+    Implement this Loft issue:
 
     {{ claim.issue.title }}
 
@@ -150,7 +150,7 @@ rule start_ready_issue
 }
 
 rule review_finished_turn
-  when worker completed turn for docket issue as turn
+  when worker completed turn for loft issue as turn
 => {
   coerce reviewWork(turn.issue.title, turn.summary, turn.changedFiles) as review
 
@@ -177,7 +177,7 @@ rule accept_reviewed_work
   when ReviewedWork as reviewed
   when reviewed.review.status == Accept
 => {
-  close reviewed.turn.issue with docket
+  close reviewed.turn.issue with loft
 }
 
 rule request_revision
@@ -186,7 +186,7 @@ rule request_revision
   when worker is available
 => {
   tell worker """
-  Revise this Docket issue:
+  Revise this Loft issue:
 
   {{ reviewed.turn.issue.title }}
 
@@ -228,14 +228,14 @@ What changes:
 - `after review succeeds` narrows `review` to the typed success payload.
 - `record ReviewedWork` creates a durable typed workflow fact.
 - Nontrivial data reasoning should happen in BAML or a capability, not inside
-  Armature.
+  Whippletree.
 
 ## Ralph Loop
 
 An infinite loop that waits for the agent to finish before asking for another
 small step:
 
-```armature
+```whippletree
 workflow Ralph
 
 agent ralph {
@@ -279,7 +279,7 @@ rule again enqueues the next agent.tell
 
 ## Bounded Implementation Workers
 
-```armature
+```whippletree
 workflow ImplementSpec
 
 agent worker {
@@ -332,7 +332,7 @@ is a pool. It is a runtime invariant over turn effects for that role.
 
 ## Research Fan-Out
 
-```armature
+```whippletree
 workflow Research
 
 agent researcher {
@@ -383,18 +383,18 @@ right but needs semantic discipline.
 OpenClaw-lite is an example composition, not a special mode. It combines core
 registries with a few plugins:
 
-```armature
+```whippletree
 workflow OpenClawLite
 
-use skill "armature-author"
-use skill "docket-user"
+use skill "whippletree-author"
+use skill "loft-user"
 use skill "human-review-user"
 use plugin "memory"
 
 agent worker {
   profile "repo-writer"
   capacity 3
-  skills ["docket-user", "memory-user"]
+  skills ["loft-user", "memory-user"]
 }
 
 rule heartbeat
@@ -405,17 +405,17 @@ rule heartbeat
 
 rule start_ready_issue
   when heartbeat
-  when docket has ready issue as issue
+  when loft has ready issue as issue
   when worker is available
 => {
-  claim issue with docket as claim
+  claim issue with loft as claim
 
   after claim succeeds {
     memory.query claim.issue.summary as memory
 
     after memory succeeds {
       tell worker """
-      Implement this Docket issue:
+      Implement this Loft issue:
 
       {{ claim.issue.title }}
 
@@ -430,17 +430,53 @@ rule start_ready_issue
 
 rule ask_when_idle
   when heartbeat
-  when docket has unfinished issues
+  when loft has unfinished issues
   when no active agent turns
 => {
   askHuman """
-  Armature is idle but Docket still has unfinished work.
+  Whippletree is idle but Loft still has unfinished work.
   Inspect the trace and decide whether to resume, split, or block the work.
   """
 }
 ```
 
 The important part is not the name. The important part is that skills,
-heartbeat scheduling, agent turns, Docket work claims, memory access, human
+heartbeat scheduling, agent turns, Loft work claims, memory access, human
 review, and evidence tracing are composed through the same small rule/effect
 kernel.
+
+## Current Checked Fixtures
+
+The checked example fixtures in `examples/` are:
+
+- `minimal-noop.whip`: smallest rule/fact shape with no external effect.
+- `ralph.whip`: recursive external-turn loop.
+- `loft-worker-with-review.whip`: Loft claim before agent turn, BAML
+  review, and human fallback.
+- `coerce-branch.whip`: typed model classification followed by explicit
+  routing.
+- `human-review.whip`: manual review request and answer recording.
+- `multi-agent-bounded-concurrency.whip`: two agents with explicit capacity
+  bounds.
+- `openclaw-lite.whip`: planner, implementer, verifier, and human approval
+  composition.
+- `plugin-memory.whip`: memory plugin capability call before an agent turn.
+
+Each checked source has a matching `.ir` snapshot consumed by parser tests.
+
+## Dogfood Notes
+
+First authoring pass guesses:
+
+- Equality guards such as `when reviewed.status == Accept` feel natural, but
+  the implemented grammar does not support guard expressions yet. For now this
+  is a hard diagnostic; authors should route through typed facts or a BAML
+  `coerce` result.
+- Binding an effect after a multi-line string, for example closing with
+  `""" as plan`, also feels natural. The current parser only recognizes
+  `as binding` on the effect line. This should become either a supported alias
+  or a targeted diagnostic before v0.
+- Plugin-specific shorthand such as `memory.query item as context` is
+  appealing, but the current durable surface is the generic `call` capability
+  effect. Keep shorthand out of the grammar until plugin effect registration
+  and docs can make the lowering auditable.

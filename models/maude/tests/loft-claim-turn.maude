@@ -1,0 +1,50 @@
+load ../kernel.maude
+
+--- A coding-agent turn gated by a Loft claim cannot start before the claim
+--- effect succeeds.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact)
+  effect(claimEff, queued)
+  dep(claimEff, succeeds, tellEff)
+  effect(tellEff, blocked)
+  =>*
+  fact(issueFact)
+  effect(claimEff, queued)
+  dep(claimEff, succeeds, tellEff)
+  effect(tellEff, running) .
+
+--- Once the claim succeeds, the agent turn can be released and run.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact)
+  effect(claimEff, queued)
+  dep(claimEff, succeeds, tellEff)
+  effect(tellEff, blocked)
+  =>*
+  fact(issueFact)
+  effect(claimEff, completed)
+  dep(claimEff, succeeds, tellEff)
+  effect(tellEff, running) .
+
+--- Claim failure does not release the success-gated agent turn.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact)
+  effect(claimEff, queued)
+  dep(claimEff, succeeds, tellEff)
+  effect(tellEff, blocked)
+  =>*
+  fact(issueFact)
+  effect(claimEff, failed)
+  dep(claimEff, succeeds, tellEff)
+  effect(tellEff, running) .
+
+--- Claim failure can release an explicit failure handler, such as human review.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact)
+  effect(claimEff, queued)
+  dep(claimEff, fails, askEff)
+  effect(askEff, blocked)
+  =>*
+  fact(issueFact)
+  effect(claimEff, failed)
+  dep(claimEff, fails, askEff)
+  effect(askEff, running) .

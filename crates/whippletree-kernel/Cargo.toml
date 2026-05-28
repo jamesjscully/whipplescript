@@ -1,0 +1,17 @@
+[package]
+name = "whippletree-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+whippletree-core = { path = "../whippletree-core" }
+whippletree-parser = { path = "../whippletree-parser" }
+whippletree-store = { path = "../whippletree-store" }
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

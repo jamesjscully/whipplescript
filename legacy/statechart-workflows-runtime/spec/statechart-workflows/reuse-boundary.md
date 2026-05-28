@@ -1,14 +1,14 @@
-# Existing Armature Reuse Boundary
+# Existing Whippletree Reuse Boundary
 
 Status: design guardrail
 
-This document prevents accidental baggage from the existing Armature
+This document prevents accidental baggage from the existing Whippletree
 script-runner design from shaping the new workflow system.
 
 The new product surface is:
 
 ```text
-.armature workflow files
+.whip workflow files
 native statechart DSL source
 validated IR
 durable event queue
@@ -42,7 +42,7 @@ event/run terminology where it remains accurate
 Reuse standard:
 
 ```text
-Does this make the .armature workflow runtime simpler, safer, or faster to
+Does this make the .whip workflow runtime simpler, safer, or faster to
 ship without importing old assumptions?
 ```
 
@@ -59,7 +59,7 @@ arbitrary shell/TypeScript scripts own semantics
 scripts are expected to manage durable state
 scripts implement their own polling/event loops
 process runs are the only important runtime records
-Armature is only cron + watcher + process supervisor
+Whippletree is only cron + watcher + process supervisor
 ```
 
 The workflow system may still invoke external processes through declared
@@ -140,13 +140,13 @@ narrow.
 
 ## Compatibility Posture
 
-Compatibility with old Armature configs is optional and should be treated as a
+Compatibility with old Whippletree configs is optional and should be treated as a
 separate adapter or migration tool.
 
 Examples:
 
 ```text
-armature migrate old-armature.toml --to workflow.armature
+whip migrate old-project.whip --to workflow.whip
 adapter: start an old task by name
 adapter: observe an old run completion event
 ```

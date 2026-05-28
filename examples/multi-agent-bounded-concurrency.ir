@@ -1,0 +1,23 @@
+workflow MultiAgentBoundedConcurrency
+agents
+  agent implementer profile=repo-writer capacity=2 skills=[]
+  agent reviewer profile=repo-reader capacity=1 skills=[]
+rules
+  rule implement_ready_work
+    when WorkItem as item
+    when implementer is available
+    reads
+      pattern:implementer is available
+      schema:WorkItem
+    effects
+      effect1 kind=agent.tell binding=- key=098de6615e14a6ce
+    body_hash 302daa006365ffc7
+  rule review_completed_turn
+    when worker completed turn for loft issue as turn
+    when reviewer is available
+    reads
+      pattern:reviewer is available
+      pattern:worker completed turn for loft issue as turn
+    effects
+      effect1 kind=agent.tell binding=- key=00a9ca48408507d3
+    body_hash 0e596f514e4a8e8d

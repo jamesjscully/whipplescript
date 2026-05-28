@@ -1,11 +1,11 @@
-# Armature v0.3 Implementation State
+# Whippletree v0.3 Implementation State
 
 This file is the shared implementation ledger for the sequential Paseo build loop.
 
 Agents may edit this file directly. Keep updates factual and compact. Do not use this
 file for design expansion; the authoritative design remains in:
 
-- `spec/armature-v0.3.md`
+- `spec/whippletree-v0.3.md`
 - `spec/implementation-plan-v0.3.md`
 
 ## Rules for Agents
@@ -17,20 +17,20 @@ file for design expansion; the authoritative design remains in:
 5. Commit your work atomically.
 6. Merge your work back to `main` and push `main` before marking `done`.
 7. Do not mark `done` unless tests or relevant checks have run, or you recorded why they could not run.
-8. Do not introduce workflow DAGs, durable promises, agent graphs, semantic retries, semantic dedupe, built-in adapters, capabilities, Windows support, or `armature plan`.
+8. Do not introduce workflow DAGs, durable promises, agent graphs, semantic retries, semantic dedupe, built-in adapters, capabilities, Windows support, or `whip plan`.
 
 ## Current State
 
 | Slice | Status | Branch / Worktree | Owner | Result |
 | --- | --- | --- | --- | --- |
-| foundation | done | `armature-foundation` | Codex | merged `d944f1c` to `main` as `a3daf03`; checks: `cargo test`, `npm test` |
-| config | done | `armature-config` | Codex | merged `651cd02` to `main` as `05a3cee`; checks: `cargo test`, `cargo run -q -p armature-cli -- --workspace <tmp> config check` |
-| store | done | `armature-store` | Codex | merged `2e7dd5f` to `main` as `fe7a9a9`; checks: `cargo test` |
-| daemon | done | `armature-daemon` | Codex | merged `761a878` to `main`; checks: `cargo test` |
-| triggers | done | `armature-triggers` | Codex | merged `fae27a1` to `main`; checks: `cargo test` |
-| cli | done | `armature-cli` | Codex | merged `14c99d7` to `main` as `305e7de`; checks: `cargo test`, CLI smoke (`init`, `up`, `tasks`, `run`, `runs`, `logs`, `doctor`, `lock`, `down`) |
-| sdk | done | `armature-sdk` | Codex | merged `c098d8a` to `main`; checks: `npm test --workspace @armature/sdk` |
-| recipes | done | `armature-recipes` | Codex | merged `8ce7a57` to `main`; checks: `cargo test`, recipe smoke (`init recipe` x5 + `config check`) |
+| foundation | done | `whippletree-foundation` | Codex | merged `d944f1c` to `main` as `a3daf03`; checks: `cargo test`, `npm test` |
+| config | done | `whippletree-config` | Codex | merged `651cd02` to `main` as `05a3cee`; checks: `cargo test`, `cargo run -q -p whippletree-cli -- --workspace <tmp> config check` |
+| store | done | `whippletree-store` | Codex | merged `2e7dd5f` to `main` as `fe7a9a9`; checks: `cargo test` |
+| daemon | done | `whippletree-daemon` | Codex | merged `761a878` to `main`; checks: `cargo test` |
+| triggers | done | `whippletree-triggers` | Codex | merged `fae27a1` to `main`; checks: `cargo test` |
+| cli | done | `whippletree-cli` | Codex | merged `14c99d7` to `main` as `305e7de`; checks: `cargo test`, CLI smoke (`init`, `up`, `tasks`, `run`, `runs`, `logs`, `doctor`, `lock`, `down`) |
+| sdk | done | `whippletree-sdk` | Codex | merged `c098d8a` to `main`; checks: `npm test --workspace @whippletree/sdk` |
+| recipes | done | `whippletree-recipes` | Codex | merged `8ce7a57` to `main`; checks: `cargo test`, recipe smoke (`init recipe` x5 + `config check`) |
 
 ## Integration Notes
 
@@ -46,11 +46,11 @@ Done. Added Rust workspace + SDK skeleton, shared core types/IDs/errors, and bas
 
 ### config
 
-Done. Added strict TOML parsing/validation, normalized config hashing, upward-only workspace discovery, and `armature config check`. Merged `651cd02` into `main` as `05a3cee`.
+Done. Added strict TOML parsing/validation, normalized config hashing, upward-only workspace discovery, and `whip config check`. Merged `651cd02` into `main` as `05a3cee`.
 
 ### store
 
-Done. Added XDG state-root resolution keyed by canonical workspace hash, SQLite schema/bootstrap and event/run/log persistence APIs, and isolated `.armature/runs/<run-id>` artifact layout. Merged `2e7dd5f` into `main` as `fe7a9a9`.
+Done. Added XDG state-root resolution keyed by canonical workspace hash, SQLite schema/bootstrap and event/run/log persistence APIs, and isolated `.whippletree/runs/<run-id>` artifact layout. Merged `2e7dd5f` into `main` as `fe7a9a9`.
 
 ### daemon
 
@@ -66,8 +66,8 @@ Done. Added foreground/detached daemon lifecycle, runtime inspection/task/servic
 
 ### sdk
 
-Done. Added a thin TypeScript SDK over Armature CLI/env surfaces with typed client helpers, event/env parsing, manual lock helpers, structured logging, JSON utilities, and package README examples. Merged `c098d8a` to `main`; checks: `npm test --workspace @armature/sdk`.
+Done. Added a thin TypeScript SDK over Whippletree CLI/env surfaces with typed client helpers, event/env parsing, manual lock helpers, structured logging, JSON utilities, and package README examples. Merged `c098d8a` to `main`; checks: `npm test --workspace @whippletree/sdk`.
 
 ### recipes
 
-Done. Added `armature init recipe <name>` scaffolding for file-watch tests, scheduled status, event source service, event hook task, and explicit named lock starters. Merged `8ce7a57` to `main`; checks: `cargo test`, recipe smoke for all five starters plus `config check`.
+Done. Added `whip init recipe <name>` scaffolding for file-watch tests, scheduled status, event source service, event hook task, and explicit named lock starters. Merged `8ce7a57` to `main`; checks: `cargo test`, recipe smoke for all five starters plus `config check`.

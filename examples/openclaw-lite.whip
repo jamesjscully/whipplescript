@@ -1,0 +1,57 @@
+workflow OpenClawLite
+
+use skill "human-review-user"
+
+class PlanReview {
+  subject string
+  decision string
+  reason string
+}
+
+agent planner {
+  profile "repo-reader"
+  capacity 1
+}
+
+agent implementer {
+  profile "repo-writer"
+  capacity 2
+}
+
+agent verifier {
+  profile "repo-reader"
+  capacity 1
+}
+
+rule plan_open_work
+  when WorkItem as item
+  when planner is available
+=> {
+  tell planner "Break this work into a short implementation plan for {{ item.title }}: {{ item.body }}" as plan
+
+  after plan succeeds {
+    askHuman "Review the proposed plan for {{ item.title }}. Accept, revise, or block it before implementation starts." as approval
+  }
+}
+
+rule implement_accepted_plan
+  when human answered review as approval
+  when implementer is available
+=> {
+  tell implementer """
+  Implement the accepted plan:
+
+  {{ approval.reason }}
+  """
+}
+
+rule verify_completed_work
+  when worker completed turn for loft issue as turn
+  when verifier is available
+=> {
+  tell verifier """
+  Verify correctness, tests, and scope for:
+
+  {{ turn.summary }}
+  """
+}

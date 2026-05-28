@@ -2,7 +2,7 @@
 
 Status: design proposal
 
-The intended product surface is running `.armature` workflow files.
+The intended product surface is running `.whip` workflow files.
 
 The user should not need to understand tasks, services, triggers, TypeScript
 workers, or daemon internals to use the system. Those may exist as
@@ -14,11 +14,11 @@ the primary object.
 The core loop:
 
 ```sh
-armature init
-armature validate workflow.armature
-armature check workflow.armature
-armature run workflow.armature
-armature status workflow.armature
+whip init
+whip validate workflow.whip
+whip check workflow.whip
+whip run workflow.whip
+whip status workflow.whip
 ```
 
 For a single workflow project, the common commands should be short. The user
@@ -29,15 +29,15 @@ that inspect or mutate a workflow instance.
 Verbose workflow forms may also exist for scripting and help output:
 
 ```sh
-armature workflow validate workflow.armature
-armature workflow check workflow.armature
-armature workflow run workflow.armature
-armature workflow status spec-implementation
+whip workflow validate workflow.whip
+whip workflow check workflow.whip
+whip workflow run workflow.whip
+whip workflow status spec-implementation
 ```
 
 The implemented v0 CLI exposes the short workflow forms directly, for example
-`armature validate workflow.armature` and `armature status workflow.armature`.
-Namespaced `armature workflow ...` forms are not implemented yet; if added,
+`whip validate workflow.whip` and `whip status workflow.whip`.
+Namespaced `whip workflow ...` forms are not implemented yet; if added,
 they should be aliases over the same workflow operations. This intentionally
 breaks from the legacy task/service CLI. Compatibility, if needed, should live
 under explicit legacy commands or adapters rather than preserving old short-form
@@ -48,8 +48,8 @@ meanings.
 Default project layout:
 
 ```text
-workflow.armature
-.armature/
+workflow.whip
+.whippletree/
   build/
     ir.json
     baml_src/
@@ -68,9 +68,9 @@ Larger projects may use multiple workflows:
 
 ```text
 workflows/
-  spec-implementation.armature
-  nightly-maintenance.armature
-.armature/
+  spec-implementation.whip
+  nightly-maintenance.whip
+.whippletree/
   state/
     spec-implementation/
     nightly-maintenance/
@@ -78,7 +78,7 @@ workflows/
 
 ## Source Format
 
-The source format is the native `.armature` statechart DSL described in
+The source format is the native `.whip` statechart DSL described in
 [authoring-format.md](authoring-format.md).
 
 Reasons:
@@ -89,31 +89,31 @@ Reasons:
 - avoids forcing workflow logic into manifest-shaped HJSON
 - still compiles to ordinary JSON-shaped WorkflowIR for tests and runtime work
 
-The file extension remains `.armature` because the product object is an
+The file extension remains `.whip` because the product object is an
 orchestrated workflow.
 
 ## Commands
 
-### `armature init [dir] --name [machine-name]`
+### `whip init [dir] --name [machine-name]`
 
 Creates a minimal local project. The implemented v0 command is noninteractive,
 defaults to the current directory, and refuses to overwrite existing scaffold
 files unless `--force` is passed. `--name` defaults to `Workflow` and must be a
-valid `.armature` identifier.
+valid `.whip` identifier.
 
 ```text
-workflow.armature
-.armature/policy.json
-.armature/state/
-.armature/workflows/
+workflow.whip
+.whippletree/policy.json
+.whippletree/state/
+.whippletree/workflows/
 ```
 
 It should ask as few questions as possible. Defaults are permissive for local
 use.
 
-### `armature validate [file]`
+### `whip validate [file]`
 
-Parses `.armature` source, generates BAML source artifacts for `coerce`, builds
+Parses `.whip` source, generates BAML source artifacts for `coerce`, builds
 IR, and runs static validation. `--adapter-manifest` validates adapter-backed
 effect contracts, and `--policy` validates manifest-required capabilities
 against explicit capability policy documents. `--profile-policy` validates
@@ -136,19 +136,19 @@ Checks:
 
 This command should be fast and should not require heavyweight formal tooling.
 
-### `armature validate-adapter [manifest...]`
+### `whip validate-adapter [manifest...]`
 
 Validates adapter manifest files independently from a workflow. This checks
 manifest shape, effect/event duplicates, schema references, idempotency
 requirements, and model abstractions.
 
-### `armature validate-policy [policy...]`
+### `whip validate-policy [policy...]`
 
 Validates capability policy documents independently from a workflow. This checks
 policy document shape, duplicate capability entries, empty capability names, and
 direct allow/deny conflicts.
 
-### `armature check [file]`
+### `whip check [file]`
 
 Runs validation plus bounded model checks when tooling is available. If
 `--adapter-manifest` or `--policy` is supplied, those contracts are validated
@@ -157,7 +157,7 @@ before model checking starts.
 The first target is likely TLA+/Apalache because useful counterexamples matter
 more than proof elegance early.
 
-### `armature emit-config [file] --target tla`
+### `whip emit-config [file] --target tla`
 
 Emits the checker configuration that matches the generated formal model. This is
 useful for CI, debugging, and agents that need to inspect exactly which
@@ -165,7 +165,7 @@ generated invariants `check` will run. In the current implementation this is
 only meaningful for TLA; Maude checks are embedded in the generated `.maude`
 file.
 
-### `armature prove [file]`
+### `whip prove [file]`
 
 Runs the strongest generated verification bundle currently implemented. In the
 current implementation, this command validates the workflow and supplied
@@ -177,9 +177,9 @@ once their generated model target is mature.
 This is an expert or enterprise command. It should not be required for the
 first local prototype loop.
 
-### `armature run [file]`
+### `whip run [file]`
 
-Starts or resumes a workflow instance from a `.armature` file.
+Starts or resumes a workflow instance from a `.whip` file.
 
 The command:
 
@@ -211,12 +211,12 @@ File-backed local adapter slices use:
 `--plan-file` backs `plan.snapshot()`, `plan.unfinishedItems()`,
 `plan.nextReadyItem()`, and plan status updates. `--review-file` backs
 `askHuman(...)` by appending visible open review obligations. For
-`armature emit`, `--review-file` supplies the typed
+`whip emit`, `--review-file` supplies the typed
 `humanReview.responded` adapter event schema so review responses can be
 validated before entering the durable queue.
 
 Local agent `start` and `send` do not use a JSON side file. They write native
-SQLite ledger records that are claimed by `armature harness`. Explicit
+SQLite ledger records that are claimed by `whip harness`. Explicit
 adapter-backed agents can still be supplied through adapter manifests.
 
 These file-backed flags can supply built-in JSON adapter manifests for workflows
@@ -228,21 +228,21 @@ context, but they must not call adapters or read those JSON files.
 Managed `baml-cli serve` process mode may be added later, but the first real
 execution path should use an explicitly supplied BAML HTTP URL.
 
-### `armature harness once [file] --config <config> [--profile-policy <policy>]`
+### `whip harness once [file] --config <config> [--profile-policy <policy>]`
 
 Claims one queued native agent invocation, runs the configured provider, records
 stdout/stderr artifacts, records a durable completion, and enqueues the typed
 workflow completion event. This command is the deterministic testable unit of
 the local harness.
 
-Provider config maps declared Armature agents to provider runners:
+Provider config maps declared Whippletree agents to provider runners:
 
 ```json
 {
   "agents": {
     "worker": {
       "provider": "command",
-      "command": ["sh", "-c", "printf '%s\n' \"$ARMATURE_PROMPT\""],
+      "command": ["sh", "-c", "printf '%s\n' \"$WHIPPLETREE_PROMPT\""],
       "cwd": ".",
       "timeoutSeconds": 1800
     }
@@ -257,7 +257,7 @@ also receive an explicit `command` override and extra `args`.
 Governed environments should pass `--profile-policy` and use source-level agent
 profiles instead of exposing raw command/provider choices in workflow logic:
 
-```armature
+```whippletree
 agent researcher = codingAgent() {
   profile "research"
   maxActive 2
@@ -291,7 +291,7 @@ declares a compatible completion event.
 Failed provider commands are recorded as harness events so repeated agent
 mistakes become desire-path signals.
 
-### `armature harness run [file] --config <config> [--profile-policy <policy>] [--drive-workflow]`
+### `whip harness run [file] --config <config> [--profile-policy <policy>] [--drive-workflow]`
 
 Runs the harness supervisor loop. The MVP may poll the SQLite ledger for queued
 work; polling is a wakeup strategy, not the data model. The durable truth is the
@@ -310,14 +310,14 @@ The loop:
 - enqueue typed completions
 - avoid corrupting claims on shutdown
 
-### `armature harness status [file]`
+### `whip harness status [file]`
 
 Shows native harness state: queued invocations, claimed/running invocations,
 recent completions, recent provider failures, stdout/stderr artifact paths, and
 recent desire-path observations. It includes the projected workflow `status`
 when a store exists, but it must not call providers for hidden live data.
 
-### `armature emit [file] --event <event> --payload <payload>`
+### `whip emit [file] --event <event> --payload <payload>`
 
 Adds a typed event to the durable workflow event queue.
 
@@ -332,7 +332,7 @@ execute them.
 For multiple workflows, `emit` requires a workflow selector unless routing is
 unambiguous.
 
-### `armature status [file]`
+### `whip status [file]`
 
 Shows what the workflow is doing and why.
 
@@ -367,7 +367,7 @@ current coerce failure: none
 latest coerce failures (history): none
 ```
 
-`armature status [file] --compact` prints the same durable projection in a
+`whip status [file] --compact` prints the same durable projection in a
 short operator view:
 
 ```text
@@ -380,7 +380,7 @@ current blockers: none
 latest transition: running.watching.on.finished[0]
 ```
 
-### `armature events [file]`
+### `whip events [file]`
 
 Shows queued, processing, processed, ignored, failed, and dead-lettered events.
 The status filter uses durable event status names, such as `--status failed`
@@ -388,21 +388,21 @@ and `--status dead_lettered`. Human text output includes attempt counts when
 nonzero and the durable `last_error` when present, so operators can triage
 failed events without opening SQLite.
 
-### `armature retry-event [file] --event-id [event]`
+### `whip retry-event [file] --event-id [event]`
 
 Administrative retry for failed or dead-lettered events. It requeues the event
 without hiding prior attempts, so status and event inspection still show retry
 history. Human text output confirms the requeued event id, queued status, and
 resulting pending event count.
 
-### `armature log [file]`
+### `whip log [file]`
 
 Shows the append-only transition/effect log in a human-readable form.
 
 This should be separate from process stdout/stderr logs. The workflow log is the
 semantic audit trail.
 
-### `armature build [file]`
+### `whip build [file]`
 
 Compiles a workflow file into build artifacts without running it:
 

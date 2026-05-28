@@ -1,0 +1,30 @@
+error: rule `bad_record` has invalid field path `request.missing`: schema `WorkItem` has no field `missing`
+   --> examples/invalid/bad-record.whip:18:4
+   |
+18 | => {
+   |    ^
+   = help: use a field declared on the bound schema or add it to the class declaration
+error: enum `ReviewStatus` has no variant `Maybe`
+   --> examples/invalid/bad-record.whip:18:4
+   |
+18 | => {
+   |    ^
+   = help: use one of: Accept, Blocked, Revise
+error: field `HumanDecision.confidence` expects `float`
+   --> examples/invalid/bad-record.whip:18:4
+   |
+18 | => {
+   |    ^
+   = help: record a value compatible with `float`
+error: field `HumanDecision.mode` cannot be `scripted`
+   --> examples/invalid/bad-record.whip:18:4
+   |
+18 | => {
+   |    ^
+   = help: use one of: manual, auto
+error: class `HumanDecision` has no field `extra`
+   --> examples/invalid/bad-record.whip:18:4
+   |
+18 | => {
+   |    ^
+   = help: add `extra` to `class HumanDecision` or record an existing field

@@ -1,0 +1,44 @@
+workflow LoftWorkerWithReview
+uses
+  skill loft-user
+  skill baml-coerce-user
+  skill human-review-user
+schemas
+  enum ReviewStatus { Accept, Revise, Blocked }
+  class WorkReview
+    status ref<ReviewStatus>
+    reason string
+    followups array<string>
+    confidence float
+  class ReviewedWork
+    turn ref<AgentTurn>
+    review ref<WorkReview>
+agents
+  agent worker profile=repo-writer capacity=1 skills=[loft-user]
+coerces
+  coerce reviewWork(issueTitle string, agentSummary string, changedFiles array<string>) -> ref<WorkReview>
+rules
+  rule start_ready_issue
+    when loft has ready issue as issue
+    when worker is available
+    reads
+      pattern:loft has ready issue as issue
+      pattern:worker is available
+    effects
+      claim kind=loft.claim binding=claim key=a76168697ddda53f
+      effect2 kind=agent.tell binding=- key=209ccb4b95b94bda
+    dependencies
+      claim --succeeds--> effect2
+    body_hash 3b7c46c68bd1d129
+  rule review_finished_turn
+    when worker completed turn for loft issue as turn
+    reads
+      pattern:worker completed turn for loft issue as turn
+    writes
+      schema:ReviewedWork
+    effects
+      review kind=baml.coerce binding=review key=f665dd06ed9827ec
+      effect2 kind=human.ask binding=- key=435a970270e9af6d
+    dependencies
+      review --fails--> effect2
+    body_hash ec0db5d773a42194

@@ -1,9 +1,9 @@
-# Armature Statechart Workflows
+# Whippletree Statechart Workflows
 
 Status: design track
 
-This folder specifies the proposed next Armature product surface: restricted,
-verifiable workflow orchestration for coding agents from `.armature` workflow
+This folder specifies the proposed next Whippletree product surface: restricted,
+verifiable workflow orchestration for coding agents from `.whip` workflow
 files.
 
 This design is intentionally fresh. The existing script/task runner may provide
@@ -13,7 +13,7 @@ preserve.
 The new core runtime is deliberately constrained:
 
 ```text
-.armature statechart source files
+.whip statechart source files
 validated workflow IR
 durable event queues
 append-only transition/effect logs
@@ -51,11 +51,11 @@ concurrency bounds, event replay, or capability checks themselves.
 
 ## Direction
 
-Armature should provide a restricted statechart workflow system:
+Whippletree should provide a restricted statechart workflow system:
 
 ```text
-.armature source file
-  -> Armature DSL parser
+.whip source file
+  -> Whippletree DSL parser
   -> static validator
   -> generated BAML artifacts for coerce declarations
   -> statechart IR
@@ -86,7 +86,7 @@ and policy-checked adapters.
   architectures, and selected direction.
 - [product-surface.md](product-surface.md) defines the intended UX, CLI, file
   layout, and status surfaces.
-- [authoring-format.md](authoring-format.md) describes the native `.armature`
+- [authoring-format.md](authoring-format.md) describes the native `.whip`
   statechart DSL.
 - [grammar.md](grammar.md) sketches the v0 grammar and parser architecture.
 - [source-to-ir.md](source-to-ir.md) defines parsing, expression lowering,
@@ -94,7 +94,7 @@ and policy-checked adapters.
 - [expression-primitives.md](expression-primitives.md) defines the small
   orchestration-grade expression kernel and explicitly excludes general-purpose
   data programming.
-- [baml-integration.md](baml-integration.md) defines how Armature `class`,
+- [baml-integration.md](baml-integration.md) defines how Whippletree `class`,
   `enum`, and `coerce` declarations lower to BAML artifacts and execute through
   BAML HTTP.
 - [workflow-ir.md](workflow-ir.md) defines the normalized representation shared
@@ -113,7 +113,7 @@ and policy-checked adapters.
   semantics.
 - [operations.md](operations.md) explains how to inspect and repair stuck
   workflows.
-- [migration.md](migration.md) maps legacy Armature script concepts onto the
+- [migration.md](migration.md) maps legacy Whippletree script concepts onto the
   statechart workflow surface.
 - [release-checklist.md](release-checklist.md) defines release and upgrade
   checks for this track.
@@ -123,11 +123,11 @@ and policy-checked adapters.
 - [implementation-plan.md](implementation-plan.md) sequences specification,
   formal modeling, runtime scaffolding, generated validation, and gates.
 - [reuse-boundary.md](reuse-boundary.md) defines what may be kept from the
-  existing Armature implementation and what should not constrain the new system.
+  existing Whippletree implementation and what should not constrain the new system.
 - [external-validation.md](external-validation.md) records documentation checks,
   local probes, corrections, and remaining unvalidated assumptions for external
   systems.
-- [spec-implementation-example.armature.md](spec-implementation-example.armature.md)
+- [spec-implementation-example.whip.md](spec-implementation-example.whip.md)
   sketches the workflow we wish the managed spec orchestration example could
   become.
 
@@ -141,9 +141,9 @@ action, agent, or coerce function.
 This system does not support arbitrary TypeScript or shell as workflow logic.
 External tools may still exist behind declared effects or adapters.
 
-## Relationship To Existing Armature
+## Relationship To Existing Whippletree
 
-This design supersedes the old product center for this track. The old Armature
+This design supersedes the old product center for this track. The old Whippletree
 runtime may be mined for useful ideas and code:
 
 ```text
@@ -165,5 +165,5 @@ TypeScript is an acceptable workflow runtime
 
 The new boundary is:
 
-**Users author `.armature` workflow files. Armature validates and executes them
+**Users author `.whip` workflow files. Whippletree validates and executes them
 through a constrained Rust interpreter.**

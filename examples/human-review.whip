@@ -1,0 +1,31 @@
+workflow HumanReview
+
+use skill "human-review-user"
+
+class HumanDecision {
+  subject string
+  decision string
+  reason string
+}
+
+rule request_manual_review
+  when manual review requested as request
+=> {
+  askHuman """
+  Review the pending work item:
+
+  {{ request.title }}
+
+  Decide whether to accept, revise, or block it.
+  """
+}
+
+rule record_manual_review
+  when human answered review as answer
+=> {
+  record HumanDecision {
+    subject answer.subject
+    decision answer.decision
+    reason answer.reason
+  }
+}

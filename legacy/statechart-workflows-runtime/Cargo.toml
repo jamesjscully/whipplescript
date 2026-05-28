@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "crates/armature-adapters",
-    "crates/armature-cli",
-    "crates/armature-engine",
-    "crates/armature-modelgen",
-    "crates/armature-workflow",
+    "crates/whippletree-adapters",
+    "crates/whippletree-cli",
+    "crates/whippletree-engine",
+    "crates/whippletree-modelgen",
+    "crates/whippletree-workflow",
 ]
 resolver = "2"
 

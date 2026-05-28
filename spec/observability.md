@@ -2,7 +2,7 @@
 
 Status: draft
 
-Armature must be inspectable. Agent orchestration is only useful if users can
+Whippletree must be inspectable. Agent orchestration is only useful if users can
 understand why work started, what authority it used, what it observed, and why
 it stopped.
 
@@ -54,8 +54,8 @@ model_request
 model_response
 baml_source
 baml_output
-docket_command
-docket_result
+loft_command
+loft_result
 thoth_brief
 thoth_verify
 memory_query
@@ -134,6 +134,18 @@ OpenTelemetry is a plausible export target, but the local store remains the
 source of truth for v0 because it must work offline and inside local agent
 sandboxes.
 
+Current implementation exports a local JSON trace with schema
+`whippletree.local_trace.v0` through:
+
+```sh
+whip trace <instance> --json
+whip evidence <instance> --json
+```
+
+The export includes events, facts, effects, runs, evidence records, and typed
+evidence links. This is the stable local trace shape that a later OpenTelemetry
+or hosted exporter should consume.
+
 ## Status UX
 
 The core status view should answer:
@@ -144,7 +156,7 @@ what instances are running?
 what effects are queued/running/failed?
 what agents are active?
 what human questions are pending?
-what Docket issues are claimed?
+what Loft issues are claimed?
 what recent failures/blockers exist?
 what capabilities or policies blocked work?
 what evidence changed since last view?
@@ -153,12 +165,12 @@ what evidence changed since last view?
 Target commands:
 
 ```sh
-armature ps
-armature status <instance>
-armature trace <instance>
-armature evidence <run-or-effect>
-armature failures
-armature blockers
+whip ps
+whip status <instance>
+whip trace <instance>
+whip evidence <run-or-effect>
+whip failures
+whip blockers
 ```
 
 The UX should also provide compact views for agents:
@@ -168,7 +180,7 @@ latest run per logical agent
 queued/running/failed effects
 pending inbox items
 recent capability blocks
-recent Docket claims
+recent Loft claims
 recent evidence summaries
 ```
 

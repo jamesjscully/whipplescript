@@ -1,0 +1,44 @@
+{
+  "plugin_id": "plugin-memory",
+  "name": "memory",
+  "version": "0.1.0",
+  "capabilities": [
+    {
+      "capability": "memory.query",
+      "description": "Query plugin memory.",
+      "schema": {
+        "input": {
+          "query": "string"
+        }
+      }
+    }
+  ],
+  "providers": [
+    {
+      "provider_id": "provider-memory-query",
+      "effect_kind": "memory.query",
+      "provider": "memory-plugin",
+      "capability": "memory.query",
+      "config": {}
+    }
+  ],
+  "profiles": [
+    {
+      "profile_id": "profile-memory-user",
+      "name": "memory-user",
+      "description": "Allow memory plugin queries.",
+      "enforcement_mode": "enforce",
+      "allowed_capabilities": ["memory.query"],
+      "config": {}
+    }
+  ],
+  "bindings": [
+    {
+      "binding_id": "binding-memory-query-global",
+      "program_id": null,
+      "capability": "memory.query",
+      "provider": "memory-plugin",
+      "config": {}
+    }
+  ]
+}

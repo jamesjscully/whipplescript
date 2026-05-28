@@ -42,3 +42,16 @@ jobs:
 
       - name: E2E smoke
         run: scripts/check-e2e.sh
+
+      - name: Release readiness
+        run: scripts/check-release-readiness.sh
+
+      - name: Upload readiness reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: readiness-reports
+          path: |
+            target/release-readiness-report.md
+            target/real-provider-smoke-report.md
+            target/loft-handoff-report.md

@@ -1,0 +1,25 @@
+[package]
+name = "whippletree-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "whip"
+path = "src/main.rs"
+
+[dependencies]
+whippletree-adapters = { path = "../whippletree-adapters" }
+whippletree-engine = { path = "../whippletree-engine" }
+whippletree-modelgen = { path = "../whippletree-modelgen" }
+whippletree-workflow = { path = "../whippletree-workflow" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile.workspace = true

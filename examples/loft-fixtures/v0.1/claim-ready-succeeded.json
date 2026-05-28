@@ -1,0 +1,38 @@
+{
+  "status": "succeeded",
+  "lease_id": "lea_fixture",
+  "issue": {
+    "id": "iss_fixture",
+    "title": "Fixture issue",
+    "body": "Fixture body",
+    "issue_status": "open",
+    "type": "task",
+    "priority": 2,
+    "assignee": null,
+    "owner": null,
+    "due_at": null,
+    "defer_until": null,
+    "created_at": "2030-01-01T00:00:00Z",
+    "updated_at": "2030-01-01T00:00:00Z",
+    "closed_at": null,
+    "close_reason": null,
+    "labels": [
+      "fixture"
+    ],
+    "relations": [],
+    "blocked_by": [],
+    "comments": [],
+    "evidence": [],
+    "resource_intent": {
+      "reads": [],
+      "writes": []
+    },
+    "heads": [
+      "evt_fixture"
+    ],
+    "conflicted": false,
+    "field_conflicts": {},
+    "state_token": "b3:fixture"
+  },
+  "expires_at": "2030-01-01T00:30:00Z"
+}

@@ -9,7 +9,7 @@ upgrade important workflow stores.
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo build -p armature-cli
+cargo build -p whippletree-cli
 scripts/check-docs.sh
 scripts/check-e2e.sh
 scripts/check-formal-models.sh
@@ -18,7 +18,7 @@ git diff --check
 
 ## Compatibility Checks
 
-- New `.armature` syntax is documented in `grammar.md` and `authoring-format.md`.
+- New `.whip` syntax is documented in `grammar.md` and `authoring-format.md`.
 - New expression behavior is documented in `expression-primitives.md`.
 - New adapter effects or events are documented in `component-contracts.md`.
 - New policy fields are documented in `policy.md` and have example JSON.
@@ -28,7 +28,7 @@ git diff --check
 ## Product Checks
 
 - README command examples still run or are clearly marked as illustrative.
-- `skills/armature-statechart/SKILL.md` reflects the current CLI surface.
+- `skills/whippletree-statechart/SKILL.md` reflects the current CLI surface.
 - At least one template validates, builds, runs, processes a typed completion,
   reaches settled status, and the local human-review response bridge is checked
   through `scripts/check-docs.sh`.
@@ -55,8 +55,8 @@ running a new binary:
 
 ```sh
 cp workflow.sqlite workflow.sqlite.backup
-armature status workflow.armature --store workflow.sqlite --json
+whip status workflow.whip --store workflow.sqlite --json
 ```
 
-If the binary rejects a newer schema version, use the matching newer Armature
+If the binary rejects a newer schema version, use the matching newer Whippletree
 binary. Do not edit schema metadata manually.

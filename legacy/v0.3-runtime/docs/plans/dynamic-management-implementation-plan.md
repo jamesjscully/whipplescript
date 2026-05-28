@@ -8,13 +8,13 @@ Primary design document:
 
 Supporting spec:
 
-- `spec/armature-v0.3.md`
+- `spec/whippletree-v0.3.md`
 
 The goal of this plan is to align the implementation with the dynamic-management
-interface without turning Armature into a workflow engine. The implementation
+interface without turning Whippletree into a workflow engine. The implementation
 should keep the v0.3 boundary intact:
 
-**Armature owns invocation truth. User code owns operational meaning.**
+**Whippletree owns invocation truth. User code owns operational meaning.**
 
 ## Implementation Strategy
 
@@ -50,47 +50,47 @@ top-level aliases.
 Canonical forms:
 
 ```sh
-armature task list
-armature task show <name>
-armature task run <name>
+whip task list
+whip task show <name>
+whip task run <name>
 
-armature service list
-armature service show <name>
+whip service list
+whip service show <name>
 
-armature run list
-armature run show <run-id>
-armature run logs <run-id>
-armature run cancel <run-id>
+whip run list
+whip run show <run-id>
+whip run logs <run-id>
+whip run cancel <run-id>
 
-armature event list
-armature event show <event-id>
-armature event emit <type>
+whip event list
+whip event show <event-id>
+whip event emit <type>
 
-armature trigger list
-armature trigger show <trigger-id>
+whip trigger list
+whip trigger show <trigger-id>
 
-armature log show <run-id>
-armature log tail <run-id> --lines N
-armature log follow <run-id>
+whip log show <run-id>
+whip log tail <run-id> --lines N
+whip log follow <run-id>
 ```
 
 Existing aliases should continue:
 
 ```sh
-armature tasks
-armature services
-armature runs
-armature logs <run-id>
-armature cancel <run-id>
-armature events
-armature triggers
-armature emit <type>
-armature run <task-name>
+whip tasks
+whip services
+whip runs
+whip logs <run-id>
+whip cancel <run-id>
+whip events
+whippletree triggers
+whip emit <type>
+whip run <task-name>
 ```
 
 Expected implementation work:
 
-- Add command groups in `crates/armature-cli/src/main.rs`.
+- Add command groups in `crates/whippletree-cli/src/main.rs`.
 - Reuse existing command implementations rather than duplicating logic.
 - Add CLI help tests and e2e smoke tests for canonical/alias equivalence.
 - Update README command examples to introduce the object model.
@@ -98,8 +98,8 @@ Expected implementation work:
 Acceptance checks:
 
 ```sh
-cargo test -p armature-cli --bin armature
-cargo test -p armature-cli --test e2e object_cli_aliases
+cargo test -p whippletree-cli --bin whip
+cargo test -p whippletree-cli --test e2e object_cli_aliases
 cargo test
 ```
 
@@ -110,27 +110,27 @@ Goal: make runtime state easy for agents to observe without custom polling loops
 Query requirements:
 
 ```sh
-armature event list --type TYPE --source SOURCE --correlation ID --limit N
-armature trigger list --task NAME --event EVENT --outcome OUTCOME --correlation ID --limit N
-armature run list --name NAME --origin ORIGIN --state STATE --correlation ID --limit N
-armature lock list --expired
+whip event list --type TYPE --source SOURCE --correlation ID --limit N
+whip trigger list --task NAME --event EVENT --outcome OUTCOME --correlation ID --limit N
+whip run list --name NAME --origin ORIGIN --state STATE --correlation ID --limit N
+whip lock list --expired
 ```
 
 Wait requirements:
 
 ```sh
-armature wait event <type> --correlation ID --timeout 30s
-armature wait run <run-id> --state exited --timeout 30s
-armature wait trigger --task NAME --outcome started --timeout 30s
-armature wait service <name> --state running --timeout 30s
+whip wait event <type> --correlation ID --timeout 30s
+whip wait run <run-id> --state exited --timeout 30s
+whip wait trigger --task NAME --outcome started --timeout 30s
+whip wait service <name> --state running --timeout 30s
 ```
 
 Subscribe requirements:
 
 ```sh
-armature subscribe events
-armature subscribe runs
-armature subscribe triggers
+whip subscribe events
+whip subscribe runs
+whip subscribe triggers
 ```
 
 Initial subscribe may be implemented as polling that emits newline-delimited
@@ -147,26 +147,26 @@ Expected implementation work:
 Acceptance checks:
 
 ```sh
-cargo test -p armature-cli --test e2e wait_and_subscribe_agent_flow
-cargo test -p armature-daemon
+cargo test -p whippletree-cli --test e2e wait_and_subscribe_agent_flow
+cargo test -p whippletree-daemon
 cargo test
 ```
 
 ## Slice 3: Ad Hoc Tracked Runs
 
-Goal: let agents run arbitrary finite commands under Armature tracking without
+Goal: let agents run arbitrary finite commands under Whippletree tracking without
 creating a task definition.
 
 Canonical command:
 
 ```sh
-armature run start --name NAME -- <cmd...>
+whip run start --name NAME -- <cmd...>
 ```
 
 Alias:
 
 ```sh
-armature exec --name NAME -- <cmd...>
+whip exec --name NAME -- <cmd...>
 ```
 
 Useful options:
@@ -200,8 +200,8 @@ Expected implementation work:
 Acceptance checks:
 
 ```sh
-cargo test -p armature-cli --test e2e adhoc_run_is_tracked_and_cancelable
-cargo test -p armature-daemon
+cargo test -p whippletree-cli --test e2e adhoc_run_is_tracked_and_cancelable
+cargo test -p whippletree-daemon
 cargo test
 ```
 
@@ -212,21 +212,21 @@ Goal: complete lock semantics from the dynamic interface spec.
 Required commands:
 
 ```sh
-armature lock force-release <name> --reason TEXT
-armature lock show <name>
-armature lock list --expired
-armature lock with <name> --ttl DURATION --reason TEXT -- <cmd...>
+whip lock force-release <name> --reason TEXT
+whip lock show <name>
+whip lock list --expired
+whip lock with <name> --ttl DURATION --reason TEXT -- <cmd...>
 ```
 
 Existing commands must remain safe:
 
 ```sh
-armature lock acquire <name> --ttl DURATION --reason TEXT
-armature lock renew <name> --token TOKEN --ttl DURATION
-armature lock release <name> --token TOKEN
+whip lock acquire <name> --ttl DURATION --reason TEXT
+whip lock renew <name> --token TOKEN --ttl DURATION
+whip lock release <name> --token TOKEN
 ```
 
-Tokenless release may be allowed only for the owning Armature run.
+Tokenless release may be allowed only for the owning Whippletree run.
 
 Expected implementation work:
 
@@ -238,8 +238,8 @@ Expected implementation work:
 Acceptance checks:
 
 ```sh
-cargo test -p armature-cli --test e2e lock_recovery_and_with_lock
-cargo test -p armature-daemon manual_lock
+cargo test -p whippletree-cli --test e2e lock_recovery_and_with_lock
+cargo test -p whippletree-daemon manual_lock
 cargo test
 ```
 
@@ -250,10 +250,10 @@ Goal: allow runtime-created service definitions without editing user TOML.
 Canonical commands:
 
 ```sh
-armature service add <name> -- <cmd...>
-armature service remove <name>
-armature service show <name>
-armature service list --dynamic
+whip service add <name> -- <cmd...>
+whip service remove <name>
+whip service show <name>
+whip service list --dynamic
 ```
 
 Useful options:
@@ -271,7 +271,7 @@ Initial semantics:
 - Dynamic services are ephemeral.
 - They live until removed, daemon shutdown, or workspace reset.
 - They are inspectable and marked `dynamic: true`.
-- They do not rewrite `.armature/armature.toml`.
+- They do not rewrite `.whippletree/project.whip`.
 
 Expected implementation work:
 
@@ -283,8 +283,8 @@ Expected implementation work:
 Acceptance checks:
 
 ```sh
-cargo test -p armature-cli --test e2e dynamic_service_lifecycle
-cargo test -p armature-daemon
+cargo test -p whippletree-cli --test e2e dynamic_service_lifecycle
+cargo test -p whippletree-daemon
 cargo test
 ```
 
@@ -295,12 +295,12 @@ Goal: allow runtime-created trigger handlers without editing user TOML.
 Canonical commands:
 
 ```sh
-armature task add <name> --on EVENT -- <cmd...>
-armature task add <name> --watch GLOB --settle 500ms -- <cmd...>
-armature task add <name> --schedule CRON -- <cmd...>
-armature task remove <name>
-armature task show <name>
-armature task list --dynamic
+whip task add <name> --on EVENT -- <cmd...>
+whip task add <name> --watch GLOB --settle 500ms -- <cmd...>
+whip task add <name> --schedule CRON -- <cmd...>
+whip task remove <name>
+whip task show <name>
+whip task list --dynamic
 ```
 
 Initial semantics:
@@ -320,8 +320,8 @@ Expected implementation work:
 Acceptance checks:
 
 ```sh
-cargo test -p armature-cli --test e2e dynamic_task_event_and_watch_lifecycle
-cargo test -p armature-daemon
+cargo test -p whippletree-cli --test e2e dynamic_task_event_and_watch_lifecycle
+cargo test -p whippletree-daemon
 cargo test
 ```
 
@@ -333,14 +333,14 @@ without adding a second runtime.
 Expected SDK additions:
 
 ```ts
-armature.task.list()
-armature.task.run(name)
-armature.run.start(...)
-armature.event.emit(...)
-armature.wait.event(...)
-armature.service.add(...)
-armature.task.add(...)
-armature.lock.with(...)
+whippletree.task.list()
+whippletree.task.run(name)
+whippletree.run.start(...)
+whippletree.event.emit(...)
+whippletree.wait.event(...)
+whippletree.service.add(...)
+whippletree.task.add(...)
+whippletree.lock.with(...)
 ```
 
 Rules:
@@ -361,7 +361,7 @@ Documentation updates:
 Acceptance checks:
 
 ```sh
-npm test --workspace @armature/sdk
+npm test --workspace @whippletree/sdk
 cargo test
 ```
 
@@ -374,19 +374,19 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo test --release
-cargo test -p armature-cli --test e2e -- --ignored sustained_stress_many_events_watch_changes_and_services
-npm test --workspace @armature/sdk
+cargo test -p whippletree-cli --test e2e -- --ignored sustained_stress_many_events_watch_changes_and_services
+npm test --workspace @whippletree/sdk
 ```
 
 Manual smoke:
 
 ```sh
-armature up
-armature service add github-source -- node sources/github.mjs
-armature task add planner --on agent.requested -- node planner.mjs
-armature emit agent.requested --correlation req-1 --payload-file request.json
-armature wait event work.completed --correlation req-1 --timeout 5m
-armature runs --correlation req-1
-armature lock with repo:main --ttl 1m -- echo ok
-armature down
+whip up
+whip service add github-source -- node sources/github.mjs
+whip task add planner --on agent.requested -- node planner.mjs
+whip emit agent.requested --correlation req-1 --payload-file request.json
+whip wait event work.completed --correlation req-1 --timeout 5m
+whip runs --correlation req-1
+whip lock with repo:main --ttl 1m -- echo ok
+whip down
 ```

@@ -34,7 +34,7 @@ that rule commit are persisted.
 
 Fact records and effect graph nodes produced by the same rule commit share
 correlation metadata. This lets later rules match typed relationships such as
-"worker completed turn for Docket issue" without depending on prompt text.
+"worker completed turn for Loft issue" without depending on prompt text.
 
 ## Effect Graph
 
@@ -67,18 +67,18 @@ Source order does not imply effect ordering.
 
 This is unordered:
 
-```armature
+```whippletree
 => {
-  docket.note "Starting work"
+  loft.note "Starting work"
   tell worker "Implement the issue"
 }
 ```
 
 If ordering matters, the source must express it:
 
-```armature
+```whippletree
 => {
-  claim issue with docket as claim
+  claim issue with loft as claim
 
   after claim succeeds {
     tell worker """
@@ -91,7 +91,7 @@ If ordering matters, the source must express it:
 Lowering:
 
 ```text
-effect e1 = docket.claim(issue)
+effect e1 = loft.claim(issue)
 effect e2 = agent.tell(worker, prompt)
 edge e1 --succeeds--> e2
 ```
@@ -140,8 +140,8 @@ predicate is satisfied.
 
 Allowed:
 
-```armature
-claim issue with docket as claim
+```whippletree
+claim issue with loft as claim
 after claim succeeds {
   tell worker "{{ claim.issue.title }}"
 }
@@ -149,8 +149,8 @@ after claim succeeds {
 
 Rejected:
 
-```armature
-claim issue with docket as claim
+```whippletree
+claim issue with loft as claim
 tell worker "{{ claim.issue.title }}"
 ```
 
@@ -173,17 +173,17 @@ type. Inside `after effect fails`, it has the failure output type. Inside
 
 The lifecycle predicates are generic. The payload shape is effect-specific.
 For example, `after claim succeeds` uses the generic success predicate, but the
-fields available on `claim` come from the `docket.claim` success contract.
+fields available on `claim` come from the `loft.claim` success contract.
 
 ## Branching
 
 Effect graphs may branch:
 
-```armature
+```whippletree
 coerce classifyWork(result.summary) as classification
 
 after classification succeeds {
-  docket.note "Classification: {{ classification.status }}"
+  loft.note "Classification: {{ classification.status }}"
   tell reviewer "Review this result"
 }
 ```
@@ -198,7 +198,7 @@ Effect graph joins are not part of v0.
 To wait for multiple external results, let completions produce facts/events and
 write a normal rule:
 
-```armature
+```whippletree
 rule synthesize
   when research result from alpha
   when research result from beta
@@ -230,8 +230,8 @@ Core effects may also define typed completion facts:
 
 ```text
 agent.turn.completed
-docket.claim.succeeded
-docket.claim.failed
+loft.claim.succeeded
+loft.claim.failed
 baml.coerce.succeeded
 baml.coerce.failed
 human.answer.received

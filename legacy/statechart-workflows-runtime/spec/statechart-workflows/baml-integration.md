@@ -2,10 +2,10 @@
 
 Status: design proposal
 
-Armature uses BAML's type and prompt model without making users author a
+Whippletree uses BAML's type and prompt model without making users author a
 separate embedded BAML island by default.
 
-`.armature` source owns:
+`.whip` source owns:
 
 - `enum` declarations
 - `class` declarations
@@ -20,7 +20,7 @@ artifact, not the primary authoring surface.
 
 Use this source model:
 
-```armature
+```whippletree
 enum ActionKind {
   StartWorker
   Wait
@@ -59,7 +59,7 @@ class NextAction {
   reason string
 }
 
-client<llm> ArmatureDefaultLLM {
+client<llm> WhippletreeDefaultLLM {
   provider "openai"
   options {
     model "gpt-4o-mini"
@@ -68,7 +68,7 @@ client<llm> ArmatureDefaultLLM {
 }
 
 function selectNextAction(planText: string) -> NextAction {
-  client ArmatureDefaultLLM
+  client WhippletreeDefaultLLM
   prompt #"
     Choose the next safe orchestration action.
 
@@ -81,7 +81,7 @@ function selectNextAction(planText: string) -> NextAction {
 
 Do not require this as the normal user-authored shape:
 
-```armature
+```whippletree
 baml {
   '''
   enum ActionKind { ... }
@@ -95,10 +95,10 @@ product surface.
 
 ## Source Of Truth
 
-Armature declarations are canonical. Generated BAML artifacts are derived:
+Whippletree declarations are canonical. Generated BAML artifacts are derived:
 
 ```text
-.armature/build/workflows/<machine>/baml_src/*.baml
+.whippletree/build/workflows/<machine>/baml_src/*.baml
 ```
 
 The generated BAML source includes only declarations reachable from `coerce`
@@ -106,7 +106,7 @@ function inputs and outputs. Workflow-only `class` or `enum` declarations that
 are used only for events, data, or adapter schemas remain in WorkflowIR but are
 not emitted into `workflow.baml`.
 
-The v1 runtime uses BAML HTTP as the selected execution path. Armature either
+The v1 runtime uses BAML HTTP as the selected execution path. Whippletree either
 connects to an existing BAML server or, in a later managed mode, starts:
 
 ```sh
@@ -154,7 +154,7 @@ Request shape:
 
 The source syntax can look positional:
 
-```armature
+```whippletree
 let next = coerce chooseNextStep(planText, recentRuns)
 ```
 
@@ -178,7 +178,7 @@ calling BAML.
 The first implementation should support an external server:
 
 ```sh
-armature run workflow.armature --baml-url http://127.0.0.1:2024
+whip run workflow.whip --baml-url http://127.0.0.1:2024
 ```
 
 The user or hosting environment is responsible for starting `baml-cli serve`
@@ -186,7 +186,7 @@ against the generated `baml_src` directory.
 
 Advantages:
 
-- smallest Armature implementation slice
+- smallest Whippletree implementation slice
 - clearer enterprise deployment boundary
 - no process supervision required for the first real `coerce` path
 - simple integration testing when `baml-cli` and provider credentials exist
@@ -196,10 +196,10 @@ Advantages:
 Managed mode is a later convenience:
 
 ```sh
-armature run workflow.armature --manage-baml
+whip run workflow.whip --manage-baml
 ```
 
-Armature starts `baml-cli serve --from <build-dir>/baml_src`, captures logs, and
+Whippletree starts `baml-cli serve --from <build-dir>/baml_src`, captures logs, and
 stops the server when the workflow host stops. This mode may reuse process and
 log-capture lessons from the legacy runtime, but the legacy runtime should not
 own the `coerce` semantics.
@@ -304,7 +304,7 @@ allowed.
 
 ## Supported Declaration Surface
 
-Armature-authored BAML-shaped declarations:
+Whippletree-authored BAML-shaped declarations:
 
 ```text
 enum
@@ -315,12 +315,12 @@ model shorthand
 ```
 
 The first implementation should not expose BAML tests, tools, generators, or
-advanced client routing in `.armature` source. Those can be introduced later if
+advanced client routing in `.whip` source. Those can be introduced later if
 the product needs them.
 
 ## Type Mapping
 
-BAML-compatible declarations map into Armature schema types:
+BAML-compatible declarations map into Whippletree schema types:
 
 ```text
 BAML string              -> Schema::String
@@ -338,11 +338,11 @@ BAML enum                -> Schema::Enum
 BAML class               -> Schema::Record or Schema::Ref
 ```
 
-Generated Armature records/classes are closed for validation. Values may omit
+Generated Whippletree records/classes are closed for validation. Values may omit
 optional fields but may not include undeclared fields. Use `map<string, T>` or a
 native `json` field for deliberately open object-shaped data.
 
-Armature stores and validates map values as JSON objects. The compiler therefore
+Whippletree stores and validates map values as JSON objects. The compiler therefore
 accepts only string-compatible map keys in v0: `string`, enums, string literals,
 and unions/refs composed from those. This keeps generated BAML map boundaries
 aligned with the runtime representation instead of accepting schemas that cannot
@@ -352,7 +352,7 @@ Enum values must start with an uppercase ASCII letter, matching BAML's enum
 rules. The workflow validator rejects lowercase enum values before build so
 generated `workflow.baml` does not fail later in the BAML toolchain.
 
-Armature workflow-native types such as `time`, `duration`, and `agent` may
+Whippletree workflow-native types such as `time`, `duration`, and `agent` may
 exist in `data`, event payloads, and adapter schemas, but they are not valid
 BAML boundary types unless an adapter or compiler rule maps them explicitly to a
 BAML-compatible representation.
@@ -362,15 +362,15 @@ for future opaque media schema support. The current runtime must reject them
 unless the schema layer, policy layer, and BAML HTTP executor all explicitly
 support the media representation being passed.
 
-BAML does not support `set` or `tuple`. If Armature supports set-like durable
+BAML does not support `set` or `tuple`. If Whippletree supports set-like durable
 data internally, it must not emit that type as a BAML input/output schema.
 
 BAML does not support generic `any/json` as a preferred structured boundary. If
 a workflow needs arbitrary JSON at a model boundary, it should pass a string or
 use a more specific class/map/union schema.
 
-BAML-compatible schemas do not imply full inline operations in the Armature
-expression language. Armature can store, compare where meaningful, route, and
+BAML-compatible schemas do not imply full inline operations in the Whippletree
+expression language. Whippletree can store, compare where meaningful, route, and
 pass values through typed boundaries. The supported operation set is defined in
 [expression-primitives.md](expression-primitives.md).
 
@@ -378,7 +378,7 @@ pass values through typed boundaries. The supported operation set is defined in
 
 Both call forms are accepted:
 
-```armature
+```whippletree
 let next = coerce selectNextAction(planText)
 let next = selectNextAction(planText)
 ```
@@ -401,11 +401,11 @@ function classify(input: string) -> "bug" | "feature" {
 }
 ```
 
-Armature should support these as `Schema::Literal` and `Schema::Union`.
+Whippletree should support these as `Schema::Literal` and `Schema::Union`.
 
 For workflow control branches, examples should prefer enums:
 
-```armature
+```whippletree
 enum ActionKind {
   StartWorker
   Wait
@@ -420,7 +420,7 @@ model-generation domains.
 
 The first authoring surface uses simple model shorthand:
 
-```armature
+```whippletree
 coerce choose(planText string) -> NextStep {
   model "gpt-4o-mini"
   prompt """..."""
@@ -437,7 +437,7 @@ allowed environment variables
 whether network/model calls are allowed
 whether BAML tools are allowed
 allowed BAML HTTP URLs
-whether Armature may manage a local baml-cli serve process
+whether Whippletree may manage a local baml-cli serve process
 ```
 
 Advanced explicit client declarations may be added later, but they should stay
@@ -447,13 +447,13 @@ compatible with BAML rather than inventing a parallel client language.
 
 Prompt blocks use BAML/Jinja template semantics inside generated BAML.
 
-Armature expression interpolation is not active inside prompt blocks. Prompt
+Whippletree expression interpolation is not active inside prompt blocks. Prompt
 variables are the coerce function parameters and BAML-provided context such as
 `ctx.output_format`.
 
-Outside prompt blocks, Armature strings use Armature interpolation rules:
+Outside prompt blocks, Whippletree strings use Whippletree interpolation rules:
 
-```armature
+```whippletree
 send director """
 Worker failed: {{ classification.reason }}
 """
@@ -463,12 +463,12 @@ Worker failed: {{ classification.reason }}
 
 BAML supports multimodal types such as `image`, `audio`, `pdf`, and `video`.
 
-Armature should not support multimodal coerce inputs in the first
+Whippletree should not support multimodal coerce inputs in the first
 implementation unless adapter policy explicitly enables them. URL-based media
 can create SSRF and egress risks, so multimodal values need explicit policy,
 allowlists, and audit records.
 
-When enabled, multimodal values are opaque in Armature expressions. Workflows may
+When enabled, multimodal values are opaque in Whippletree expressions. Workflows may
 store them, pass them to BAML, pass them to declared adapters, or test for
 presence. They may not inspect, transform, fetch, transcode, or parse media
 inline.

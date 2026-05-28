@@ -2,7 +2,7 @@
 
 Status: draft
 
-Armature has six conceptual layers:
+Whippletree has six conceptual layers:
 
 ```text
 source rule language
@@ -25,7 +25,7 @@ agent harness interface
 capability registry
 skill registry
 BAML-backed coerce
-Docket work kernel integration
+Loft work kernel integration
 human review inbox
 artifact/evidence store
 observability/status views
@@ -66,10 +66,10 @@ This state is persisted by the runtime store and inspected through the control
 plane. The product surface should expose both history and current projection:
 
 ```text
-armature log
-armature facts
-armature effects
-armature status
+whip log
+whip facts
+whip effects
+whip status
 ```
 
 The kernel, not the control plane or plugins, owns instance transition
@@ -160,7 +160,7 @@ The architecture depends on these supporting specs:
 - [agent-harness.md](agent-harness.md) defines provider adapters for real
   coding-agent turns.
 - [coerce.md](coerce.md) defines BAML-backed model calls as durable effects.
-- [docket-integration.md](docket-integration.md) defines the separate work
-  kernel Armature relies on for serious repo execution.
+- [loft-integration.md](loft-integration.md) defines the separate work
+  kernel Whippletree relies on for serious repo execution.
 - [human-review.md](human-review.md) defines human inbox semantics.
 - [observability.md](observability.md) defines evidence and trace UX.

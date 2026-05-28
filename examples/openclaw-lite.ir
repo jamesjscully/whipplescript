@@ -1,0 +1,43 @@
+workflow OpenClawLite
+uses
+  skill human-review-user
+schemas
+  class PlanReview
+    subject string
+    decision string
+    reason string
+agents
+  agent planner profile=repo-reader capacity=1 skills=[]
+  agent implementer profile=repo-writer capacity=2 skills=[]
+  agent verifier profile=repo-reader capacity=1 skills=[]
+rules
+  rule plan_open_work
+    when WorkItem as item
+    when planner is available
+    reads
+      pattern:planner is available
+      schema:WorkItem
+    effects
+      plan kind=agent.tell binding=plan key=67c7d5b9e93056bc
+      approval kind=human.ask binding=approval key=9229cc072119cfb4
+    dependencies
+      plan --succeeds--> approval
+    body_hash ba8232382a5a6ad8
+  rule implement_accepted_plan
+    when human answered review as approval
+    when implementer is available
+    reads
+      pattern:human answered review as approval
+      pattern:implementer is available
+    effects
+      effect1 kind=agent.tell binding=- key=ec5314efdca00a2a
+    body_hash bf87340eac610d91
+  rule verify_completed_work
+    when worker completed turn for loft issue as turn
+    when verifier is available
+    reads
+      pattern:verifier is available
+      pattern:worker completed turn for loft issue as turn
+    effects
+      effect1 kind=agent.tell binding=- key=6216c3b72ab15644
+    body_hash e2c00a0dd95edc22

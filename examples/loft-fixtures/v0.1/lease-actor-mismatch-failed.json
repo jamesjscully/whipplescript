@@ -1,0 +1,14 @@
+{
+  "status": "failed",
+  "error": {
+    "code": "lease_actor_mismatch",
+    "message": "lease actor does not match",
+    "recoverable": true,
+    "details": {
+      "lease_id": "lea_fixture",
+      "issue_id": "iss_fixture",
+      "expected_actor": "agent:owner",
+      "actual_actor": "agent:other"
+    }
+  }
+}

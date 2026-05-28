@@ -2,14 +2,14 @@
 
 Status: draft
 
-Armature's plugin model is inspired by Pi's extension and package architecture:
+Whippletree's plugin model is inspired by Pi's extension and package architecture:
 a small host API, package-level resource discovery, lifecycle hooks, and
-registered tools/resources. Armature should borrow the shape, but not Pi's full
+registered tools/resources. Whippletree should borrow the shape, but not Pi's full
 process authority model.
 
 Pi extensions run as TypeScript modules inside the agent process and can
 register hooks, tools, commands, providers, resources, and persistent session
-entries. That is excellent for hacker extensibility. Armature's target includes
+entries. That is excellent for hacker extensibility. Whippletree's target includes
 enterprise and nontechnical users, so plugins must expose authority through
 declared capabilities and durable effects.
 
@@ -17,7 +17,7 @@ declared capabilities and durable effects.
 
 ```text
 Pi extension = arbitrary code in the agent process
-Armature plugin = declared capability provider with explicit authority
+Whippletree plugin = declared capability provider with explicit authority
 ```
 
 The host remains small. Plugins extend available effects and resources, not the
@@ -25,10 +25,10 @@ rule language's execution semantics.
 
 ## Package Shape
 
-An Armature package may contain:
+An Whippletree package may contain:
 
 ```text
-armature.json
+whippletree.json
 plugins/
 skills/
 prompts/
@@ -42,9 +42,9 @@ Example manifest:
 
 ```json
 {
-  "name": "armature-memory-sqlite",
+  "name": "whippletree-memory-sqlite",
   "version": "0.1.0",
-  "armature": {
+  "whippletree": {
     "plugins": ["plugins/memory.wasm"],
     "skills": ["skills/memory/SKILL.md"],
     "effects": ["memory.query", "memory.write", "memory.consolidate"],
@@ -110,7 +110,7 @@ plugin code -> direct mutation of L, F, Q, or D
 
 ## Hooks
 
-Armature should expose lifecycle hooks, but hooks must produce durable records
+Whippletree should expose lifecycle hooks, but hooks must produce durable records
 or registered resources rather than hidden runtime mutation.
 
 Initial hook families:
@@ -155,15 +155,15 @@ status panels
 artifact renderers
 ```
 
-Discovery must be visible in `armature status` and `armature plugins`.
+Discovery must be visible in `whip status` and `whip plugins`.
 
 ## Plugin State
 
 Plugin state must be explicit:
 
-- instance-local state lives in Armature facts/effects/artifacts
+- instance-local state lives in Whippletree facts/effects/artifacts
 - plugin-local cache lives under a plugin-specific runtime store
-- committed project state belongs to external kernels such as Docket or Thoth
+- committed project state belongs to external kernels such as Loft or Thoth
 
 Plugins must declare whether state is authoritative, cache, or local runtime
 coordination.

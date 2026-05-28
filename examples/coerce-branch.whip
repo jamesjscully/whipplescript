@@ -1,0 +1,73 @@
+workflow CoerceBranch
+
+use skill "baml-coerce-user"
+use skill "human-review-user"
+
+enum Priority {
+  Low
+  Normal
+  Urgent
+}
+
+class MessageClassification {
+  priority Priority
+  summary string
+  confidence float
+}
+
+class ClassifiedMessage {
+  request WorkItem
+  classification MessageClassification
+}
+
+coerce classifyMessage(title string, body string) -> MessageClassification {
+  prompt """
+  Classify this work request.
+
+  Title:
+  {{ title }}
+
+  Body:
+  {{ body }}
+
+  Return a priority, summary, and confidence.
+
+  {{ ctx.output_format }}
+  """
+}
+
+rule classify_request
+  when WorkItem as request
+=> {
+  coerce classifyMessage(request.title, request.body) as classification
+
+  after classification succeeds {
+    record ClassifiedMessage {
+      request request
+      classification classification
+    }
+  }
+
+  after classification fails {
+    askHuman """
+    Could not classify this request:
+
+    {{ request.title }}
+
+    Please choose a priority and summarize the work.
+    """
+  }
+}
+
+rule route_classified
+  when ClassifiedMessage as message
+=> {
+  askHuman """
+  Classified request needs routing:
+
+  {{ message.request.title }}
+
+  Summary:
+  {{ message.classification.summary }}
+  """
+}

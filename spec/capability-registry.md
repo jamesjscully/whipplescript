@@ -50,7 +50,7 @@ retry_policy
 artifact_policy
 ```
 
-Descriptions matter because coding agents writing Armature scripts should be
+Descriptions matter because coding agents writing Whippletree scripts should be
 able to choose profiles by intent.
 
 ## Default Profile Sets
@@ -110,13 +110,13 @@ enforcement level for the requested profile or capability.
 ## CLI Shape
 
 ```sh
-armature capabilities list
-armature capabilities show <id>
-armature profiles list
-armature profiles show <id>
-armature plugins list
-armature plugins enable <package>
-armature plugins disable <package>
+whip capabilities list
+whip capabilities show <id>
+whip profiles list
+whip profiles show <id>
+whip plugins list
+whip plugins enable <package>
+whip plugins disable <package>
 ```
 
 The status view for a blocked effect must show which capability or profile

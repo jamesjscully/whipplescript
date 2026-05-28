@@ -6,9 +6,9 @@ import test from "node:test";
 import { PassThrough } from "node:stream";
 
 import {
-  ArmatureSdkError,
-  armature,
-  createArmature,
+  WhippletreeSdkError,
+  whippletree,
+  createWhippletree,
   emit,
   getEvent,
   getPayload,
@@ -27,10 +27,10 @@ import {
   writeJson
 } from "./index.js";
 
-async function createStubArmature() {
-  const directory = await mkdtemp(join(tmpdir(), "armature-sdk-cli-"));
+async function createStubWhippletree() {
+  const directory = await mkdtemp(join(tmpdir(), "whippletree-sdk-cli-"));
   const callsPath = join(directory, "calls.jsonl");
-  const binPath = join(directory, "armature");
+  const binPath = join(directory, "whippletree");
 
 const source = `#!/usr/bin/env node
 const fs = require("node:fs");
@@ -55,7 +55,7 @@ const command = filtered.join(" ");
 if (command === "status") {
   send({
     workspace_root: "/workspace",
-    config_path: "/workspace/.armature/armature.toml",
+    config_path: "/workspace/.whippletree/project.whip",
     config_version: "cfg_123",
     socket_path: "/state/daemon.sock",
     pid_path: "/state/daemon.pid",
@@ -66,7 +66,7 @@ if (command === "status") {
 } else if (command === "overview" || command === "overview --recent 3") {
   send({
     workspace_root: "/workspace",
-    config_path: "/workspace/.armature/armature.toml",
+    config_path: "/workspace/.whippletree/project.whip",
     config_version: "cfg_123",
     daemon_running: true,
     socket_path: "/state/daemon.sock",
@@ -392,14 +392,14 @@ if (command === "status") {
   return { binPath, callsPath };
 }
 
-test("getRunContext reads Armature runtime environment", () => {
+test("getRunContext reads Whippletree runtime environment", () => {
   const context = getRunContext({
-    ARMATURE_KIND: "task",
-    ARMATURE_NAME: "status",
-    ARMATURE_RUN_ID: "run_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-    ARMATURE_RUN_DIR: "/tmp/run",
-    ARMATURE_EVENT_TYPE: "runtime.tick",
-    ARMATURE_CORRELATION_ID: "corr-env"
+    WHIPPLETREE_KIND: "task",
+    WHIPPLETREE_NAME: "status",
+    WHIPPLETREE_RUN_ID: "run_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    WHIPPLETREE_RUN_DIR: "/tmp/run",
+    WHIPPLETREE_EVENT_TYPE: "runtime.tick",
+    WHIPPLETREE_CORRELATION_ID: "corr-env"
   });
 
   assert.equal(context.kind, "task");
@@ -410,9 +410,9 @@ test("getRunContext reads Armature runtime environment", () => {
   assert.equal(context.correlationId, "corr-env");
 });
 
-test("getEvent prefers ARMATURE_EVENT_JSON and parses payloads", () => {
+test("getEvent prefers WHIPPLETREE_EVENT_JSON and parses payloads", () => {
   const event = getEvent<{ ok: boolean }>({
-    ARMATURE_EVENT_JSON: JSON.stringify({
+    WHIPPLETREE_EVENT_JSON: JSON.stringify({
       id: "evt_123",
       event_type: "tool.run.completed",
       payload: { ok: true }
@@ -420,17 +420,17 @@ test("getEvent prefers ARMATURE_EVENT_JSON and parses payloads", () => {
   });
 
   assert.equal(event.event_type, "tool.run.completed");
-  assert.deepEqual(getPayload<{ ok: boolean }>({ ARMATURE_EVENT_JSON: JSON.stringify(event) }), {
+  assert.deepEqual(getPayload<{ ok: boolean }>({ WHIPPLETREE_EVENT_JSON: JSON.stringify(event) }), {
     ok: true
   });
 });
 
-test("getEvent falls back to ARMATURE_EVENT_PATH", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "armature-sdk-event-"));
+test("getEvent falls back to WHIPPLETREE_EVENT_PATH", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "whippletree-sdk-event-"));
   const path = join(directory, "event.json");
   await writeFile(path, JSON.stringify({ event_type: "runtime.tick", payload: { count: 1 } }));
 
-  const event = getEvent<{ count: number }>({ ARMATURE_EVENT_PATH: path });
+  const event = getEvent<{ count: number }>({ WHIPPLETREE_EVENT_PATH: path });
 
   assert.equal(event.event_type, "runtime.tick");
   assert.equal(event.payload.count, 1);
@@ -438,14 +438,14 @@ test("getEvent falls back to ARMATURE_EVENT_PATH", async () => {
 
 test("getEvent raises a typed error when event context is absent", () => {
   assert.throws(() => getEvent({}), (error: unknown) => {
-    assert.ok(error instanceof ArmatureSdkError);
+    assert.ok(error instanceof WhippletreeSdkError);
     assert.equal(error.kind, "missing_env");
     return true;
   });
 });
 
 test("readJson and writeJson round-trip formatted files", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "armature-sdk-json-"));
+  const directory = await mkdtemp(join(tmpdir(), "whippletree-sdk-json-"));
   const path = join(directory, "payload.json");
 
   await writeJson(path, { ok: true, count: 1 });
@@ -468,8 +468,8 @@ test("log writes structured JSON lines", async () => {
 });
 
 test("client wrappers call the CLI with json output and workspace options", async () => {
-  const { binPath, callsPath } = await createStubArmature();
-  const sdk = createArmature({
+  const { binPath, callsPath } = await createStubWhippletree();
+  const sdk = createWhippletree({
     bin: binPath,
     workspace: "/workspace",
     env: { ...process.env, CALLS_PATH: callsPath }
@@ -520,8 +520,8 @@ test("client wrappers call the CLI with json output and workspace options", asyn
 });
 
 test("emit options pass source and correlation through the CLI", async () => {
-  const { binPath, callsPath } = await createStubArmature();
-  const sdk = createArmature({
+  const { binPath, callsPath } = await createStubWhippletree();
+  const sdk = createWhippletree({
     bin: binPath,
     workspace: "/workspace",
     env: { ...process.env, CALLS_PATH: callsPath }
@@ -557,8 +557,8 @@ test("emit options pass source and correlation through the CLI", async () => {
 });
 
 test("dynamic-management namespaces use canonical object commands", async () => {
-  const { binPath, callsPath } = await createStubArmature();
-  const sdk = createArmature({
+  const { binPath, callsPath } = await createStubWhippletree();
+  const sdk = createWhippletree({
     bin: binPath,
     workspace: "/workspace",
     env: { ...process.env, CALLS_PATH: callsPath }
@@ -635,8 +635,8 @@ test("dynamic-management namespaces use canonical object commands", async () => 
 });
 
 test("top-level helpers use the default client", async () => {
-  const { binPath, callsPath } = await createStubArmature();
-  process.env.ARMATURE_BIN = binPath;
+  const { binPath, callsPath } = await createStubWhippletree();
+  process.env.WHIPPLETREE_BIN = binPath;
   process.env.CALLS_PATH = callsPath;
 
   try {
@@ -646,16 +646,16 @@ test("top-level helpers use the default client", async () => {
     assert.equal((await run("build")).task, "build");
     assert.equal((await emit("runtime.tick", { ok: true })).event_type, "runtime.tick");
   } finally {
-    delete process.env.ARMATURE_BIN;
+    delete process.env.WHIPPLETREE_BIN;
     delete process.env.CALLS_PATH;
   }
 
-  assert.ok(armature);
+  assert.ok(whippletree);
 });
 
 test("lock helpers include a ttl and release locks around the callback", async () => {
-  const { binPath, callsPath } = await createStubArmature();
-  const sdk = createArmature({
+  const { binPath, callsPath } = await createStubWhippletree();
+  const sdk = createWhippletree({
     bin: binPath,
     env: { ...process.env, CALLS_PATH: callsPath }
   });
@@ -713,8 +713,8 @@ test("lock helpers include a ttl and release locks around the callback", async (
 });
 
 test("top-level lock helpers use default ttl and list commands", async () => {
-  const { binPath, callsPath } = await createStubArmature();
-  process.env.ARMATURE_BIN = binPath;
+  const { binPath, callsPath } = await createStubWhippletree();
+  process.env.WHIPPLETREE_BIN = binPath;
   process.env.CALLS_PATH = callsPath;
 
   try {
@@ -724,7 +724,7 @@ test("top-level lock helpers use default ttl and list commands", async () => {
     assert.equal((await unlock("branch:main", "lock_main")).released, true);
     await withLock("branch:release", async () => undefined, { ttl: "2m", reason: "deploy" });
   } finally {
-    delete process.env.ARMATURE_BIN;
+    delete process.env.WHIPPLETREE_BIN;
     delete process.env.CALLS_PATH;
   }
 
@@ -740,8 +740,8 @@ test("top-level lock helpers use default ttl and list commands", async () => {
 });
 
 test("CLI failures surface typed details", async () => {
-  const { binPath, callsPath } = await createStubArmature();
-  const sdk = createArmature({
+  const { binPath, callsPath } = await createStubWhippletree();
+  const sdk = createWhippletree({
     bin: binPath,
     env: { ...process.env, CALLS_PATH: callsPath }
   });
@@ -749,7 +749,7 @@ test("CLI failures surface typed details", async () => {
   await assert.rejects(
     sdk.run("missing"),
     (error: unknown) => {
-      assert.ok(error instanceof ArmatureSdkError);
+      assert.ok(error instanceof WhippletreeSdkError);
       assert.equal(error.kind, "cli_failed");
       assert.equal(error.details?.code, "2");
       return true;

@@ -1,0 +1,156 @@
+{
+  "schema": "loft.whippletree.fixtures.v1",
+  "loft_spec": "v0.1",
+  "fixture_version": "whippletree/v0.1",
+  "fixtures": [
+    {
+      "file": "claim-ready-succeeded.json",
+      "command": "loft claim --ready --json",
+      "expected_status": "succeeded",
+      "covers": [
+        "json_envelope",
+        "rich_issue_shape",
+        "lease_claim"
+      ]
+    },
+    {
+      "file": "claim-already-leased-failed.json",
+      "command": "loft claim ISS --json",
+      "expected_status": "failed",
+      "expected_error_code": "issue_already_leased",
+      "covers": [
+        "retryable_error_details",
+        "lease_conflict"
+      ]
+    },
+    {
+      "file": "note-succeeded.json",
+      "command": "loft note ISS TEXT --json",
+      "expected_status": "succeeded",
+      "covers": [
+        "comment_added",
+        "mutation_envelope",
+        "rich_issue_shape"
+      ]
+    },
+    {
+      "file": "transition-succeeded.json",
+      "command": "loft set ISS status in_progress --json",
+      "expected_status": "succeeded",
+      "covers": [
+        "mutation_envelope",
+        "issue_status_domain_field",
+        "rich_issue_shape"
+      ]
+    },
+    {
+      "file": "evidence-succeeded.json",
+      "command": "loft evidence add ISS --lease-id LEASE --kind whippletree.trace --artifact REF --json",
+      "expected_status": "succeeded",
+      "covers": [
+        "structured_evidence",
+        "mutation_envelope",
+        "rich_issue_shape"
+      ]
+    },
+    {
+      "file": "resource-intent-succeeded.json",
+      "command": "loft set ISS resource_intent JSON --json",
+      "expected_status": "succeeded",
+      "covers": [
+        "resource_intent",
+        "mutation_envelope",
+        "rich_issue_shape"
+      ]
+    },
+    {
+      "file": "renew-succeeded.json",
+      "command": "loft renew LEASE --json",
+      "expected_status": "succeeded",
+      "covers": [
+        "lease_renew"
+      ]
+    },
+    {
+      "file": "release-succeeded.json",
+      "command": "loft release LEASE --json",
+      "expected_status": "succeeded",
+      "covers": [
+        "lease_release"
+      ]
+    },
+    {
+      "file": "complete-succeeded.json",
+      "command": "loft complete LEASE --reason done --json",
+      "expected_status": "succeeded",
+      "covers": [
+        "lifecycle_complete",
+        "lease_release",
+        "rich_issue_shape"
+      ]
+    },
+    {
+      "file": "fail-release-succeeded.json",
+      "command": "loft fail LEASE --note TEXT --release --json",
+      "expected_status": "succeeded",
+      "covers": [
+        "lifecycle_fail",
+        "lease_release",
+        "comment_added",
+        "rich_issue_shape"
+      ]
+    },
+    {
+      "file": "lease-not-active-failed.json",
+      "command": "loft complete LEASE --reason done --json",
+      "expected_status": "failed",
+      "expected_error_code": "lease_not_active",
+      "covers": [
+        "lease_precondition_failure",
+        "retryable_error_details"
+      ]
+    },
+    {
+      "file": "lease-wrong-issue-failed.json",
+      "command": "loft note ISS TEXT --lease-id LEASE --json",
+      "expected_status": "failed",
+      "expected_error_code": "lease_wrong_issue",
+      "covers": [
+        "lease_precondition_failure",
+        "retryable_error_details"
+      ]
+    },
+    {
+      "file": "lease-actor-mismatch-failed.json",
+      "command": "loft note ISS TEXT --lease-id LEASE --actor ACTOR --json",
+      "expected_status": "failed",
+      "expected_error_code": "lease_actor_mismatch",
+      "covers": [
+        "lease_precondition_failure",
+        "retryable_error_details"
+      ]
+    },
+    {
+      "file": "lifecycle-runtime-release-failed.json",
+      "command": "loft complete LEASE --reason done --json",
+      "expected_status": "failed",
+      "expected_error_code": "runtime_release_failed",
+      "covers": [
+        "atomic_lifecycle_recovery",
+        "partial_failure",
+        "rich_issue_shape"
+      ]
+    },
+    {
+      "file": "claim-mark-runtime-commit-failed.json",
+      "command": "loft claim --ready --actor ACTOR --mark in_progress --json",
+      "expected_status": "failed",
+      "expected_error_code": "runtime_claim_failed",
+      "covers": [
+        "atomic_lifecycle_recovery",
+        "partial_failure",
+        "rich_issue_shape"
+      ]
+    }
+  ]
+}

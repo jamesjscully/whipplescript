@@ -262,7 +262,7 @@ policy_blocked
 
 Evidence is not workflow truth. It is an observability layer over truth in the
 event log, fact projection, effect outbox, runs, artifacts, and external
-kernels such as Docket.
+kernels such as Loft.
 
 ## Transactions
 

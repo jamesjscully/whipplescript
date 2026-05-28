@@ -5,7 +5,7 @@ Status: draft
 Skills are deterministic context bundles for agents. They teach an agent how to
 use a capability, workflow, tool, or project convention.
 
-Skills are core because almost every practical Armature workflow needs to give
+Skills are core because almost every practical Whippletree workflow needs to give
 agents operational instructions without bloating every prompt.
 
 ## Skill Object
@@ -27,7 +27,7 @@ The canonical file format may follow the `SKILL.md` convention:
 
 ```text
 skills/
-  docket/
+  loft/
     SKILL.md
   thoth/
     SKILL.md
@@ -40,8 +40,8 @@ skills/
 The skill registry loads skills from:
 
 ```text
-project .armature/skills/
-installed Armature packages
+project .whippletree/skills/
+installed Whippletree packages
 first-party bundled skills
 explicit CLI/config paths
 plugin resource discovery
@@ -57,21 +57,29 @@ capability requirements
 enabled/disabled state
 ```
 
+The first runtime implementation persists that provenance in SQLite. Registering
+a skill records its name, version, source text, source path, deterministic
+content hash, required capabilities, and metadata. Attachments are explicit rows
+scoped to `program`, `agent`, or `run`, so the harness never has to infer hidden
+context. Before a provider turn starts, the harness can write `skills.injected`
+evidence for the run; that evidence includes each injected skill's exact
+version, path, and hash.
+
 ## Attachment
 
 Skills may be attached to agents:
 
-```armature
+```whippletree
 agent worker {
   profile "repo-writer"
-  skills ["repo-worker", "docket", "thoth"]
+  skills ["repo-worker", "loft", "thoth"]
 }
 ```
 
 Or to individual turns:
 
-```armature
-tell worker with skills ["docket"] """
+```whippletree
+tell worker with skills ["loft"] """
 Claim one ready issue and implement it.
 """
 ```
@@ -92,8 +100,8 @@ The harness resolves skills into context before the provider turn starts.
 First-party core skills:
 
 ```text
-armature-author
-docket-user
+whippletree-author
+loft-user
 baml-coerce-user
 human-review-user
 ```

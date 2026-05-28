@@ -1,0 +1,4 @@
+interface:
+  display_name: "Whippletree Runtime"
+  short_description: "Use Whippletree for local agent runtime coordination"
+  default_prompt: "Use $whippletree-runtime to configure, operate, or debug Whippletree tasks, services, events, runs, locks, waits, and SDK integrations."

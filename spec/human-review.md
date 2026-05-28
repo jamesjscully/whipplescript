@@ -31,11 +31,11 @@ status
 ## Inbox CLI
 
 ```sh
-armature inbox
-armature inbox show <question>
-armature inbox answer <question> --choice <choice>
-armature inbox answer <question> --text <text>
-armature inbox dismiss <question>
+whip inbox
+whip inbox show <question>
+whip inbox answer <question> --choice <choice>
+whip inbox answer <question> --text <text>
+whip inbox dismiss <question>
 ```
 
 Answers append events to the target instance. Rules consume those events like

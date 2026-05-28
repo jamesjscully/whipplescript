@@ -17,7 +17,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo build -p armature-cli
+      - run: cargo build -p whippletree-cli
       - run: scripts/check-docs.sh
       - run: scripts/check-e2e.sh
       - run: git diff --check

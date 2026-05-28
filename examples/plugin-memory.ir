@@ -1,0 +1,25 @@
+workflow PluginMemory
+uses
+  plugin memory
+agents
+  agent worker profile=repo-writer capacity=1 skills=[]
+rules
+  rule recall_before_work
+    when WorkItem as item
+    when worker is available
+    reads
+      pattern:worker is available
+      schema:WorkItem
+    effects
+      context kind=capability.call binding=context key=9696aa64918eb021
+      effect2 kind=agent.tell binding=- key=c20db07642a6d11f
+    dependencies
+      context --succeeds--> effect2
+    body_hash 58fc23921ff13dc1
+  rule save_completed_context
+    when worker completed turn for loft issue as turn
+    reads
+      pattern:worker completed turn for loft issue as turn
+    effects
+      effect1 kind=capability.call binding=- key=dfd40d56735bedd4
+    body_hash 7840fe4c22b67919

@@ -2,18 +2,18 @@
 
 Status: draft
 
-Armature needs a real type system because facts, effect payloads, Docket
+Whippletree needs a real type system because facts, effect payloads, Loft
 contracts, BAML coercions, plugin capabilities, and evidence records all cross
 typed boundaries.
 
-Armature is still not a general-purpose data language. Types are schemas for
+Whippletree is still not a general-purpose data language. Types are schemas for
 validation, routing, persistence, and external calls. Supporting a type does not
 mean supporting every operation over that type.
 
 ## Design Rule
 
 ```text
-Armature-compatible types are schemas; they do not imply a full data language.
+Whippletree-compatible types are schemas; they do not imply a full data language.
 ```
 
 For example:
@@ -23,7 +23,7 @@ For example:
 - a `string[]` can be stored, counted, checked for membership, passed to
   `coerce`, and interpolated; v0 does not provide `map`, `filter`, or `reduce`
 - an `image` can be passed to a model/capability as an opaque boundary value;
-  Armature cannot inspect pixels or transform the media inline
+  Whippletree cannot inspect pixels or transform the media inline
 
 ## Type Universe
 
@@ -63,7 +63,7 @@ video
 
 Primitive types:
 
-```armature
+```whippletree
 string
 int
 float
@@ -79,27 +79,27 @@ video
 
 Optional types:
 
-```armature
+```whippletree
 string?
 WorkReview?
 ```
 
 Arrays:
 
-```armature
+```whippletree
 string[]
 WorkItem[]
 ```
 
 Maps:
 
-```armature
+```whippletree
 map<string>
 map<int>
 map<WorkReview>
 ```
 
-Armature maps have string keys in v0. `map<T>` means:
+Whippletree maps have string keys in v0. `map<T>` means:
 
 ```text
 string -> T
@@ -107,7 +107,7 @@ string -> T
 
 Enums and classes:
 
-```armature
+```whippletree
 enum ReviewStatus {
   Accept
   Revise
@@ -124,7 +124,7 @@ class WorkReview {
 
 Literal types use BAML-style literal values where needed:
 
-```armature
+```whippletree
 class StatusEvent {
   kind "accepted" | "rejected" | "blocked"
   reason string
@@ -199,7 +199,7 @@ optional  missing field or null, depending on containing schema
 ```
 
 Closed classes reject unknown fields unless a specific adapter contract marks a
-payload as open. Armature-authored classes should be closed by default.
+payload as open. Whippletree-authored classes should be closed by default.
 
 ## Media Boundary Values
 
@@ -221,10 +221,10 @@ Rules:
 - media values are never inline bytes inside facts/effects
 - media values may be passed to `coerce` or registered capabilities when schema
   and policy allow it
-- Armature may compare media references for identity
-- Armature may inspect metadata fields only if the schema exposes them as
+- Whippletree may compare media references for identity
+- Whippletree may inspect metadata fields only if the schema exposes them as
   ordinary fields
-- Armature cannot transform media inline
+- Whippletree cannot transform media inline
 
 ## Allowed Operations
 
@@ -274,7 +274,7 @@ capabilities.
 
 Optional fields must be proven present before field access:
 
-```armature
+```whippletree
 when issue.assignee != null
 when issue.assignee.name == "Ada"
 ```
@@ -294,7 +294,7 @@ guard.
 
 ## BAML Lowering
 
-Reachable Armature declarations used by `coerce` lower to generated BAML:
+Reachable Whippletree declarations used by `coerce` lower to generated BAML:
 
 ```text
 enum       -> BAML enum
@@ -312,10 +312,10 @@ pdf        -> pdf
 video      -> video
 ```
 
-The compiler must reject any Armature type used in a `coerce` signature that
+The compiler must reject any Whippletree type used in a `coerce` signature that
 cannot be lowered to the selected BAML version.
 
-Generated BAML is a build artifact. Armature declarations remain the source of
+Generated BAML is a build artifact. Whippletree declarations remain the source of
 truth.
 
 ## Boundary Validation
@@ -340,9 +340,9 @@ successes.
 
 ## Fact Types
 
-Armature-authored durable facts use class schemas:
+Whippletree-authored durable facts use class schemas:
 
-```armature
+```whippletree
 class ReviewedWork {
   turn AgentTurn
   review WorkReview
@@ -362,7 +362,7 @@ The `record` body is checked against the class:
 - optional fields may be omitted or set to `null`
 - classes are closed by default
 
-Built-in and integration facts, such as agent turn completions and Docket ready
+Built-in and integration facts, such as agent turn completions and Loft ready
 issues, also expose class-like schemas even when their source syntax is
 conversational.
 
@@ -388,7 +388,7 @@ But strict where semantics matter:
 Good diagnostic shape:
 
 ```text
-`review.followups.map(...)` is not supported in Armature.
-Armature is an orchestration language, not a data language.
+`review.followups.map(...)` is not supported in Whippletree.
+Whippletree is an orchestration language, not a data language.
 Move this transformation into a `coerce` function or a registered capability.
 ```

@@ -2,7 +2,7 @@
 
 Status: draft
 
-Armature runs many workflow instances concurrently. A `.armature` source file is
+Whippletree runs many workflow instances concurrently. A `.whip` source file is
 not itself a process. It compiles into a versioned program, and each execution is
 a durable instance managed by the local or hosted control plane.
 
@@ -89,31 +89,31 @@ instance into a terminal control-plane state. It does not delete the log.
 Target local CLI:
 
 ```sh
-armature check workflow.armature
-armature deploy workflow.armature --name spec-impl
-armature start spec-impl --input input.json
-armature dev workflow.armature --input input.json
+whip check workflow.whip
+whip deploy workflow.whip --name spec-impl
+whip start spec-impl --input input.json
+whip dev workflow.whip --input input.json
 
-armature ps
-armature status <instance>
-armature facts <instance>
-armature log <instance>
-armature effects <instance>
-armature runs <instance>
+whip ps
+whip status <instance>
+whip facts <instance>
+whip log <instance>
+whip effects <instance>
+whip runs <instance>
 
-armature pause <instance>
-armature resume <instance>
-armature stop <instance>
-armature emit <instance> event.type --json payload.json
+whip pause <instance>
+whip resume <instance>
+whip stop <instance>
+whip emit <instance> event.type --json payload.json
 
-armature plugins
-armature skills
-armature inbox
-armature trace <instance>
-armature evidence <run-or-effect>
+whip plugins
+whip skills
+whip inbox
+whip trace <instance>
+whip evidence <run-or-effect>
 ```
 
-`armature dev` is a convenience command for dogfooding. It should compile,
+`whip dev` is a convenience command for dogfooding. It should compile,
 start one instance, run local effect workers, and stream useful status.
 
 ## Control Plane Responsibilities

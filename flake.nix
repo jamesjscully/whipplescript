@@ -1,5 +1,5 @@
 {
-  description = "Armature development environment";
+  description = "Whippletree development environment";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 

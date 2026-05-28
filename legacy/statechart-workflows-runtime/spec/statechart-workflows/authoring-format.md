@@ -2,9 +2,9 @@
 
 Status: design proposal
 
-`.armature` files use a small native statechart DSL. The language borrows BAML's
+`.whip` files use a small native statechart DSL. The language borrows BAML's
 declaration style for structured data and model coercion, but the workflow
-control model is Armature-owned and statechart-first.
+control model is Whippletree-owned and statechart-first.
 
 The source file defines exactly one machine. The top-level `machine` declaration
 names that machine; it does not wrap the file in braces.
@@ -35,7 +35,7 @@ The format must avoid:
 
 ## Example
 
-```armature
+```whippletree
 machine implementationLoop
 initial running
 
@@ -289,7 +289,7 @@ send
 assign
 ```
 
-Armature-specific orchestration terms are reserved for domain effects:
+Whippletree-specific orchestration terms are reserved for domain effects:
 
 ```text
 agent
@@ -304,7 +304,7 @@ snapshot-style adapter calls
 
 A source file defines one machine:
 
-```armature
+```whippletree
 machine simpleSupervisor
 initial watching
 ```
@@ -319,7 +319,7 @@ change runtime behavior.
 
 Workflow-local durable data is declared with `data`:
 
-```armature
+```whippletree
 data {
   seenRuns string[] = []
   lastIdleNudgeAt time? = nil
@@ -333,7 +333,7 @@ as `now()` are not valid data initializers in v0.
 
 Durable writes must use `assign`:
 
-```armature
+```whippletree
 assign data.seenRuns = data.seenRuns.append(run.id)
 assign data.lastIdleNudgeAt = now()
 ```
@@ -341,7 +341,7 @@ assign data.lastIdleNudgeAt = now()
 `let` bindings are ephemeral and exist only for the current event-processing
 turn:
 
-```armature
+```whippletree
 let planText = plan.snapshot()
 ```
 
@@ -349,7 +349,7 @@ let planText = plan.snapshot()
 
 Agents are named targets. They are not pattern groups.
 
-```armature
+```whippletree
 agent director = thread("director")
 agent worker = codingAgent() {
   maxActive 2
@@ -363,8 +363,7 @@ agent quality = codingAgent() {
 When an agent with `maxActive` is started, the workflow must also declare and
 process the v0 completion convention:
 
-```armature
-event finished {
+```whip event finished {
   name string
 }
 
@@ -382,7 +381,7 @@ overlap, the longest matching started-agent prefix wins.
 
 Group-like behavior is expressed in guards or pattern matching over event data:
 
-```armature
+```whippletree
 case run.name {
   matches "worker-*" -> { ... }
   matches "quality-*" -> { ... }
@@ -396,18 +395,18 @@ This keeps agent declarations simple and avoids hidden polymorphism.
 
 Capabilities declare adapter-backed authority:
 
-```armature
+```whippletree
 capability plan = adapter("implementationPlan")
 ```
 
 The workflow may call approved operations on the capability:
 
-```armature
+```whippletree
 let planText = plan.snapshot()
 plan.markBlocked(workItemId, reason)
 ```
 
-The `.armature` language does not gain arbitrary filesystem, database, process,
+The `.whip` language does not gain arbitrary filesystem, database, process,
 or network APIs from a capability declaration. A capability is resolved through
 the runtime's adapter registry and workspace policy. The adapter must advertise
 operation schemas, required authority, idempotency behavior, and failure modes.
@@ -419,7 +418,7 @@ updating databases, or running approved scripts.
 
 User-defined structured types are only `enum` and `class`.
 
-```armature
+```whippletree
 enum RunKind {
   WorkerComplete
   WorkerFailed
@@ -462,7 +461,7 @@ boundary intentionally accepts arbitrary keys.
 
 `coerce` declares a typed model interpretation function:
 
-```armature
+```whippletree
 coerce classifyRun(run RunSummary) -> RunClassification {
   model "gpt-4o-mini"
 
@@ -482,7 +481,7 @@ types must be BAML-compatible.
 
 Both call forms are accepted:
 
-```armature
+```whippletree
 let classification = coerce classifyRun(summary)
 let classification = classifyRun(summary)
 ```
@@ -496,7 +495,7 @@ as a coerce function.
 
 Event handlers use `on`:
 
-```armature
+```whippletree
 on finished as run
   guard !(run.id in data.seenRuns)
 {
@@ -513,7 +512,7 @@ Guards are pure expressions. Multiple `guard` lines are ANDed.
 
 States may contain child states:
 
-```armature
+```whippletree
 state running {
   initial watching
 
@@ -544,7 +543,7 @@ a validation error.
 
 Every `on`, `entry`, and `always` block may use an explicit outcome:
 
-```armature
+```whippletree
 stay
 goto someState
 ```
@@ -594,7 +593,7 @@ coerce     run typed model interpretation
 Adapter-backed capability calls are also effects, but they must be declared and
 approved:
 
-```armature
+```whippletree
 plan.markDone(workItemId)
 scripts.run("sync-plan")
 ```
@@ -605,7 +604,7 @@ Unknown effect names fail validation.
 
 The DSL avoids colons across declarations and object literals:
 
-```armature
+```whippletree
 class RunSummary {
   id string
   exitCode int?
@@ -617,5 +616,5 @@ let summary = {
 }
 ```
 
-This keeps Armature close to BAML where BAML already has good syntax, while
+This keeps Whippletree close to BAML where BAML already has good syntax, while
 statechart constructs remain explicit and standard.

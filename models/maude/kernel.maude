@@ -1,4 +1,4 @@
-mod ARMATURE-KERNEL is
+mod WHIPPLETREE-KERNEL is
   sorts
     EffectId FactId RunId EventId RuleId GraphId
     Predicate EffectStatus ProjectionStatus LeaseStatus Cfg .

@@ -2,7 +2,7 @@
 EXTENDS Naturals, Sequences, FiniteSets
 
 \* This model captures the durable control-plane lifecycle independently of
-\* any particular Armature source program. Maude models local rule/effect
+\* any particular Whippletree source program. Maude models local rule/effect
 \* rewrites; this TLA+ model tracks asynchronous runtime actions, leases,
 \* recovery, pause/resume, cancellation, and event-log ordering.
 
@@ -19,6 +19,8 @@ CONSTANTS
 VARIABLES
   \* @type: Seq(Str);
   eventLog,
+  \* @type: Seq(Str);
+  recoveryLog,
   \* @type: Str -> Str;
   effects,
   \* @type: Str -> Str;
@@ -34,11 +36,13 @@ VARIABLES
   \* @type: Bool;
   paused,
   \* @type: Bool;
-  cancelled
+  cancelled,
+  \* @type: Bool;
+  recovering
 
 vars ==
-  << eventLog, effects, runs, runEffect, leases, terminalEffects,
-     projectionCursor, paused, cancelled >>
+  << eventLog, recoveryLog, effects, runs, runEffect, leases, terminalEffects,
+     projectionCursor, paused, cancelled, recovering >>
 
 EffectStatuses ==
   {"queued", "blocked", "claimed", "running", "completed",
@@ -52,6 +56,7 @@ LeaseStatuses ==
 
 Init ==
   /\ eventLog = << >>
+  /\ recoveryLog = << >>
   /\ effects = [e \in Effects |-> "queued"]
   /\ runs = [r \in Runs |-> "none"]
   /\ runEffect = [r \in Runs |-> CHOOSE e \in Effects : TRUE]
@@ -60,12 +65,14 @@ Init ==
   /\ projectionCursor = 0
   /\ paused = FALSE
   /\ cancelled = FALSE
+  /\ recovering = FALSE
 
 AppendEvent(ev) ==
   /\ ev \in Events
+  /\ ~recovering
   /\ eventLog' = Append(eventLog, ev)
   /\ UNCHANGED << effects, runs, runEffect, leases, terminalEffects,
-                  projectionCursor, paused, cancelled >>
+                  projectionCursor, paused, cancelled, recoveryLog, recovering >>
 
 \* @type: (<<Str, Str, Str>>) => Str;
 DepUpstream(d) == d[1]
@@ -98,27 +105,30 @@ Claimable(e) ==
 ClaimEffect(e, r) ==
   /\ e \in Effects
   /\ r \in Runs
+  /\ ~recovering
   /\ Claimable(e)
   /\ runs[r] = "none"
   /\ effects' = [effects EXCEPT ![e] = "claimed"]
   /\ runs' = [runs EXCEPT ![r] = "claimed"]
   /\ runEffect' = [runEffect EXCEPT ![r] = e]
-  /\ UNCHANGED << eventLog, leases, terminalEffects, projectionCursor,
+  /\ UNCHANGED << eventLog, recoveryLog, leases, terminalEffects, projectionCursor,
                   paused, cancelled >>
 
 StartRun(r) ==
   /\ r \in Runs
+  /\ ~recovering
   /\ runs[r] = "claimed"
   /\ effects[runEffect[r]] = "claimed"
   /\ effects' = [effects EXCEPT ![runEffect[r]] = "running"]
   /\ runs' = [runs EXCEPT ![r] = "running"]
   /\ leases' = [leases EXCEPT ![runEffect[r]] = "active"]
-  /\ UNCHANGED << eventLog, runEffect, terminalEffects, projectionCursor,
+  /\ UNCHANGED << eventLog, recoveryLog, runEffect, terminalEffects, projectionCursor,
                   paused, cancelled >>
 
 CompleteRun(r, ev) ==
   /\ r \in Runs
   /\ ev \in Events
+  /\ ~recovering
   /\ runs[r] = "running"
   /\ runEffect[r] \notin terminalEffects
   /\ effects' = [effects EXCEPT ![runEffect[r]] = "completed"]
@@ -126,11 +136,12 @@ CompleteRun(r, ev) ==
   /\ leases' = [leases EXCEPT ![runEffect[r]] = "none"]
   /\ terminalEffects' = terminalEffects \cup {runEffect[r]}
   /\ eventLog' = Append(eventLog, ev)
-  /\ UNCHANGED << runEffect, projectionCursor, paused, cancelled >>
+  /\ UNCHANGED << recoveryLog, runEffect, projectionCursor, paused, cancelled, recovering >>
 
 FailRun(r, ev) ==
   /\ r \in Runs
   /\ ev \in Events
+  /\ ~recovering
   /\ runs[r] = "running"
   /\ runEffect[r] \notin terminalEffects
   /\ effects' = [effects EXCEPT ![runEffect[r]] = "failed"]
@@ -138,41 +149,46 @@ FailRun(r, ev) ==
   /\ leases' = [leases EXCEPT ![runEffect[r]] = "none"]
   /\ terminalEffects' = terminalEffects \cup {runEffect[r]}
   /\ eventLog' = Append(eventLog, ev)
-  /\ UNCHANGED << runEffect, projectionCursor, paused, cancelled >>
+  /\ UNCHANGED << recoveryLog, runEffect, projectionCursor, paused, cancelled, recovering >>
 
 ExpireLease(e, ev) ==
   /\ e \in Effects
   /\ ev \in Events
+  /\ ~recovering
   /\ effects[e] = "running"
   /\ leases[e] = "active"
   /\ e \notin terminalEffects
   /\ effects' = [effects EXCEPT ![e] = "queued"]
   /\ leases' = [leases EXCEPT ![e] = "expired"]
   /\ eventLog' = Append(eventLog, ev)
-  /\ UNCHANGED << runs, runEffect, terminalEffects, projectionCursor,
+  /\ UNCHANGED << recoveryLog, runs, runEffect, terminalEffects, projectionCursor,
                   paused, cancelled >>
 
 DeriveProjection ==
+  /\ ~recovering
   /\ projectionCursor < Len(eventLog)
   /\ projectionCursor' = projectionCursor + 1
-  /\ UNCHANGED << eventLog, effects, runs, runEffect, leases, terminalEffects,
-                  paused, cancelled >>
+  /\ UNCHANGED << eventLog, recoveryLog, effects, runs, runEffect, leases, terminalEffects,
+                  paused, cancelled, recovering >>
 
 PauseInstance ==
+  /\ ~recovering
   /\ ~paused
   /\ paused' = TRUE
-  /\ UNCHANGED << eventLog, effects, runs, runEffect, leases, terminalEffects,
-                  projectionCursor, cancelled >>
+  /\ UNCHANGED << eventLog, recoveryLog, effects, runs, runEffect, leases, terminalEffects,
+                  projectionCursor, cancelled, recovering >>
 
 ResumeInstance ==
+  /\ ~recovering
   /\ paused
   /\ ~cancelled
   /\ paused' = FALSE
-  /\ UNCHANGED << eventLog, effects, runs, runEffect, leases, terminalEffects,
-                  projectionCursor, cancelled >>
+  /\ UNCHANGED << eventLog, recoveryLog, effects, runs, runEffect, leases, terminalEffects,
+                  projectionCursor, cancelled, recovering >>
 
 CancelInstance(ev) ==
   /\ ev \in Events
+  /\ ~recovering
   /\ ~cancelled
   /\ cancelled' = TRUE
   /\ paused' = TRUE
@@ -184,7 +200,22 @@ CancelInstance(ev) ==
          ELSE effects[e]]
   /\ terminalEffects' =
        terminalEffects \cup {e \in Effects : effects[e] \in {"queued", "blocked", "claimed"}}
-  /\ UNCHANGED << runs, runEffect, leases, projectionCursor >>
+  /\ UNCHANGED << recoveryLog, runs, runEffect, leases, projectionCursor, recovering >>
+
+StartRecovery ==
+  /\ ~recovering
+  /\ recovering' = TRUE
+  /\ recoveryLog' = eventLog
+  /\ UNCHANGED << eventLog, effects, runs, runEffect, leases, terminalEffects,
+                  projectionCursor, paused, cancelled >>
+
+FinishRecovery ==
+  /\ recovering
+  /\ eventLog' = recoveryLog
+  /\ projectionCursor' = Len(recoveryLog)
+  /\ recovering' = FALSE
+  /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
+                  paused, cancelled >>
 
 Next ==
   \/ \E ev \in Events : AppendEvent(ev)
@@ -197,9 +228,35 @@ Next ==
   \/ PauseInstance
   \/ ResumeInstance
   \/ \E ev \in Events : CancelInstance(ev)
+  \/ StartRecovery
+  \/ FinishRecovery
 
 Spec ==
   Init /\ [][Next]_vars
+
+ClaimAny(e) ==
+  \E r \in Runs : ClaimEffect(e, r)
+
+StartAny(e) ==
+  \E r \in Runs :
+    /\ runEffect[r] = e
+    /\ StartRun(r)
+
+ProviderTerminalOrRecovered(e) ==
+  \E r \in Runs, ev \in Events :
+    /\ runEffect[r] = e
+    /\ \/ CompleteRun(r, ev)
+       \/ FailRun(r, ev)
+       \/ ExpireLease(e, ev)
+
+FairSpec ==
+  /\ Spec
+  /\ WF_vars(DeriveProjection)
+  /\ WF_vars(FinishRecovery)
+  /\ \A e \in Effects :
+       /\ WF_vars(ClaimAny(e))
+       /\ WF_vars(StartAny(e))
+       /\ WF_vars(ProviderTerminalOrRecovered(e))
 
 EveryRunReferencesEffect ==
   \A r \in Runs : runEffect[r] \in Effects
@@ -226,8 +283,39 @@ NoTerminalEffectLeavesTerminalSet ==
 ProjectionCursorWithinLog ==
   projectionCursor <= Len(eventLog)
 
+RecoveryDoesNotReorderEventLog ==
+  recovering => eventLog = recoveryLog
+
+EffectTerminalOrNotRunning(e) ==
+  \/ effects[e] \in {"blocked", "claimed"}
+  \/ e \in terminalEffects
+  \/ paused
+  \/ cancelled
+  \/ recovering
+
+ClaimableEffectEventuallyRunsOrStops(e) ==
+  [](Claimable(e) => <>(effects[e] = "running" \/ EffectTerminalOrNotRunning(e)))
+
+RunningEffectEventuallyTerminalsOrRecovers(e) ==
+  [](effects[e] = "running" /\ leases[e] = "active" =>
+      <>(e \in terminalEffects \/ effects[e] = "queued" \/ cancelled \/ recovering))
+
+ProjectionEventuallyCatchesUp ==
+  [](~recovering /\ projectionCursor < Len(eventLog) =>
+      <>(projectionCursor = Len(eventLog) \/ recovering))
+
+RecoveryEventuallyFinishes ==
+  [](recovering => <>~recovering)
+
+LivenessGoals ==
+  /\ \A e \in Effects : ClaimableEffectEventuallyRunsOrStops(e)
+  /\ \A e \in Effects : RunningEffectEventuallyTerminalsOrRecovers(e)
+  /\ ProjectionEventuallyCatchesUp
+  /\ RecoveryEventuallyFinishes
+
 TypeOk ==
   /\ eventLog \in Seq(Events)
+  /\ recoveryLog \in Seq(Events)
   /\ effects \in [Effects -> EffectStatuses]
   /\ runs \in [Runs -> RunStatuses]
   /\ runEffect \in [Runs -> Effects]
@@ -236,5 +324,6 @@ TypeOk ==
   /\ projectionCursor \in Nat
   /\ paused \in BOOLEAN
   /\ cancelled \in BOOLEAN
+  /\ recovering \in BOOLEAN
 
 ====

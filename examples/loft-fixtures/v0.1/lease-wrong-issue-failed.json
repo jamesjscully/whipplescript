@@ -1,0 +1,13 @@
+{
+  "status": "failed",
+  "error": {
+    "code": "lease_wrong_issue",
+    "message": "lease belongs to a different issue",
+    "recoverable": true,
+    "details": {
+      "lease_id": "lea_fixture",
+      "expected_issue_id": "iss_fixture",
+      "actual_issue_id": "iss_other"
+    }
+  }
+}

@@ -32,7 +32,7 @@ Produced by source rules using `record`.
 
 Example:
 
-```armature
+```whippletree
 record ReviewedWork {
   turn turn
   review review
@@ -49,7 +49,7 @@ Examples:
 
 ```text
 agent.turn.completed
-docket.claim.succeeded
+loft.claim.succeeded
 baml.coerce.succeeded
 human.answer.received
 ```
@@ -63,12 +63,12 @@ Projected from external kernels or systems through registered capabilities.
 Examples:
 
 ```text
-docket.readyIssue
-docket.unfinishedIssue
-docket.conflict
+loft.readyIssue
+loft.unfinishedIssue
+loft.conflict
 ```
 
-Docket remains the source of truth for Docket facts. Armature may cache or
+Loft remains the source of truth for Loft facts. Whippletree may cache or
 project them for rule matching, but the provenance must remain visible.
 
 ### Plugin Projection Facts
@@ -84,7 +84,7 @@ github.prStatus
 ```
 
 Plugins may register schemas for these facts. They may not write them directly
-into an instance. Plugin observations enter Armature through effects/events and
+into an instance. Plugin observations enter Whippletree through effects/events and
 kernel-mediated projection.
 
 ## Required Fact Metadata
@@ -135,7 +135,7 @@ User rules may not:
 
 - directly record runtime facts
 - directly record plugin projection facts
-- directly mutate Docket/Thoth/GitHub facts
+- directly mutate Loft/Thoth/GitHub facts
 - forge effect completion facts
 
 To change an external system, rules enqueue effects.

@@ -8,50 +8,50 @@ typed data contracts, not direct calls into each other's internals.
 ## Component Graph
 
 ```text
-armature-cli
-  -> armature-workflow
-  -> armature-engine
-  -> armature-adapters
-  -> armature-modelgen
+whippletree-cli
+  -> whippletree-workflow
+  -> whippletree-engine
+  -> whippletree-adapters
+  -> whippletree-modelgen
 
-armature-engine
-  -> armature-workflow
+whippletree-engine
+  -> whippletree-workflow
 
-armature-adapters
-  -> armature-engine effect contracts
-  -> armature-workflow schema types
+whippletree-adapters
+  -> whippletree-engine effect contracts
+  -> whippletree-workflow schema types
 
-armature-modelgen
-  -> armature-workflow
+whippletree-modelgen
+  -> whippletree-workflow
 ```
 
 Allowed dependencies:
 
 ```text
-armature-workflow:
+whippletree-workflow:
   no dependencies on engine, adapters, CLI, or modelgen
 
-armature-engine:
-  depends on armature-workflow IR/types
+whippletree-engine:
+  depends on whippletree-workflow IR/types
   depends on adapter traits, not adapter implementations
   owns SQLite-backed queue/log/state storage
 
-armature-adapters:
+whippletree-adapters:
   depends on engine effect contracts and workflow schema types
   does not depend on CLI
 
-armature-modelgen:
+whippletree-modelgen:
   depends on workflow IR only
   does not depend on engine runtime state
 
-armature-cli:
+whippletree-cli:
   composes parser, validator, engine, adapters, and model generation behind
   product commands
 ```
 
-If `armature-engine` and `armature-adapters` begin to pull implementation code
-from each other, shared DTOs should move into a small `armature-api` or
-`armature-contracts` crate. The important boundary is that adapters depend on
+If `whippletree-engine` and `whippletree-adapters` begin to pull implementation code
+from each other, shared DTOs should move into a small `whippletree-api` or
+`whippletree-contracts` crate. The important boundary is that adapters depend on
 effect contracts, not interpreter internals.
 
 ## Boundary Principle
@@ -493,8 +493,8 @@ workflow event. Raw logs do not belong in the event payload.
 Manifests can be checked without a workflow:
 
 ```text
-armature validate-adapter adapter.json --json
-armature validate-adapter adapter-a.json adapter-b.json --json
+whip validate-adapter adapter.json --json
+whip validate-adapter adapter-a.json adapter-b.json --json
 ```
 
 The multi-file form validates cross-manifest uniqueness for effect and event

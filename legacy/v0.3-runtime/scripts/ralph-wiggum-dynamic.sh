@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Sequential Paseo implementation loop for Armature dynamic management.
+# Sequential Paseo implementation loop for Whippletree dynamic management.
 # The shared editable plan state is docs/plans/dynamic-management-implementation-state.md.
 
 usage() {
@@ -97,7 +97,7 @@ state_file="docs/plans/dynamic-management-implementation-state.md"
 plan_file="docs/plans/dynamic-management-implementation-plan.md"
 
 if [[ ! -f "$repo_root/spec/dynamic-management-interface.md" ]]; then
-  echo "expected Armature repo root at $repo_root" >&2
+  echo "expected Whippletree repo root at $repo_root" >&2
   exit 1
 fi
 
@@ -127,13 +127,13 @@ declare -a slices=(
 )
 
 declare -A names=(
-  [object-cli]="armature-dynamic-object-cli"
-  [query-wait]="armature-dynamic-query-wait"
-  [adhoc-run]="armature-dynamic-adhoc-run"
-  [locks]="armature-dynamic-locks"
-  [dynamic-services]="armature-dynamic-services"
-  [dynamic-tasks]="armature-dynamic-tasks"
-  [sdk-docs]="armature-dynamic-sdk-docs"
+  [object-cli]="whippletree-dynamic-object-cli"
+  [query-wait]="whippletree-dynamic-query-wait"
+  [adhoc-run]="whippletree-dynamic-adhoc-run"
+  [locks]="whippletree-dynamic-locks"
+  [dynamic-services]="whippletree-dynamic-services"
+  [dynamic-tasks]="whippletree-dynamic-tasks"
+  [sdk-docs]="whippletree-dynamic-sdk-docs"
 )
 
 declare -A ownership=(
@@ -157,13 +157,13 @@ declare -A goals=(
 )
 
 declare -A checks=(
-  [object-cli]="cargo test -p armature-cli --bin armature && cargo test -p armature-cli --test e2e"
-  [query-wait]="cargo test -p armature-cli --test e2e wait_and_subscribe_agent_flow && cargo test"
-  [adhoc-run]="cargo test -p armature-cli --test e2e adhoc_run_is_tracked_and_cancelable && cargo test"
-  [locks]="cargo test -p armature-cli --test e2e lock_recovery_and_with_lock && cargo test"
-  [dynamic-services]="cargo test -p armature-cli --test e2e dynamic_service_lifecycle && cargo test"
-  [dynamic-tasks]="cargo test -p armature-cli --test e2e dynamic_task_event_and_watch_lifecycle && cargo test"
-  [sdk-docs]="npm test --workspace @armature/sdk && cargo test && cargo clippy --all-targets -- -D warnings"
+  [object-cli]="cargo test -p whippletree-cli --bin whip && cargo test -p whippletree-cli --test e2e"
+  [query-wait]="cargo test -p whippletree-cli --test e2e wait_and_subscribe_agent_flow && cargo test"
+  [adhoc-run]="cargo test -p whippletree-cli --test e2e adhoc_run_is_tracked_and_cancelable && cargo test"
+  [locks]="cargo test -p whippletree-cli --test e2e lock_recovery_and_with_lock && cargo test"
+  [dynamic-services]="cargo test -p whippletree-cli --test e2e dynamic_service_lifecycle && cargo test"
+  [dynamic-tasks]="cargo test -p whippletree-cli --test e2e dynamic_task_event_and_watch_lifecycle && cargo test"
+  [sdk-docs]="npm test --workspace @whippletree/sdk && cargo test && cargo clippy --all-targets -- -D warnings"
 )
 
 slice_exists() {
@@ -190,7 +190,7 @@ build_prompt() {
   local branch="${names[$slice]}"
 
   cat <<PROMPT
-You are implementing the Armature dynamic-management $slice slice in this repository.
+You are implementing the Whippletree dynamic-management $slice slice in this repository.
 
 Primary checkout for integration:
 $repo_root
@@ -200,7 +200,7 @@ $branch
 
 Read these first:
 - spec/dynamic-management-interface.md
-- spec/armature-v0.3.md
+- spec/whippletree-v0.3.md
 - $plan_file
 - $state_file
 
@@ -212,7 +212,7 @@ Shared state:
 - If blocked, mark blocked and record the exact blocker.
 
 Boundary:
-- Keep Armature narrow: trigger, launch, monitor, record, supervise, reconcile runtime, inspect, lock, wait.
+- Keep Whippletree narrow: trigger, launch, monitor, record, supervise, reconcile runtime, inspect, lock, wait.
 - Do not introduce workflow DAGs, durable promises, semantic retries, semantic dedupe, agent graphs, hidden workflow state, built-in domain adapters, or a second runtime.
 - Dynamic definitions are runtime definitions, not workflow state.
 - You are not alone in the codebase. Do not revert work you did not make.
@@ -253,7 +253,7 @@ for slice in "${slices[@]}"; do
   selected_slices+=("$slice")
 done
 
-echo "Armature repo: $repo_root"
+echo "Whippletree repo: $repo_root"
 echo "State file: $state_file"
 echo "Plan file: $plan_file"
 echo "Paseo command: $paseo_bin"

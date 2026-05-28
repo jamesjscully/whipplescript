@@ -1,0 +1,23 @@
+workflow HumanReview
+uses
+  skill human-review-user
+schemas
+  class HumanDecision
+    subject string
+    decision string
+    reason string
+rules
+  rule request_manual_review
+    when manual review requested as request
+    reads
+      pattern:manual review requested as request
+    effects
+      effect1 kind=human.ask binding=- key=9100aa0464a1d624
+    body_hash 08ea638b2f76e1ef
+  rule record_manual_review
+    when human answered review as answer
+    reads
+      pattern:human answered review as answer
+    writes
+      schema:HumanDecision
+    body_hash b8f9feaaf3393ee9

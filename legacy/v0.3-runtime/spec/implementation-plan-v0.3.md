@@ -1,30 +1,30 @@
-# Armature v0.3 - Implementation Plan
+# Whippletree v0.3 - Implementation Plan
 
-This plan fixes the implementation decisions for the first build of Armature v0.3.
+This plan fixes the implementation decisions for the first build of Whippletree v0.3.
 
-It is subordinate to `spec/armature-v0.3.md`. If this file appears to introduce workflow semantics, the normative specification wins.
+It is subordinate to `spec/whippletree-v0.3.md`. If this file appears to introduce workflow semantics, the normative specification wins.
 
 ## 1. Implementation Goal
 
-Armature v0.3 should produce a complete local daemon runtime:
+Whippletree v0.3 should produce a complete local daemon runtime:
 
 ```text
-armature init
-armature dev
-armature run <task>
-armature emit <event-type>
-armature status
-armature ps
-armature tasks
-armature services
-armature runs
-armature logs <run-id>
-armature cancel <run-id>
-armature config check
-armature doctor
-armature lock acquire <name>
-armature lock release <name>
-armature lock status
+whip init
+whip dev
+whip run <task>
+whip emit <event-type>
+whip status
+whip ps
+whip tasks
+whip services
+whip runs
+whip logs <run-id>
+whip cancel <run-id>
+whip config check
+whip doctor
+whip lock acquire <name>
+whip lock release <name>
+whip lock status
 ```
 
 It should support:
@@ -57,7 +57,7 @@ Windows support
 config migrations
 built-in external adapters
 capability policy
-armature plan
+whip plan
 cloud or distributed coordination
 workflow DAGs
 durable promises
@@ -71,11 +71,11 @@ daemon-owned traces
 
 v0.3 supports a normal local daemon lifecycle and an explicit foreground mode.
 
-`armature dev` starts the daemon in the foreground and owns the workspace until it exits.
+`whip dev` starts the daemon in the foreground and owns the workspace until it exits.
 
-`armature up` starts or reconciles the daemon runtime for the workspace without attaching it to the current terminal.
+`whip up` starts or reconciles the daemon runtime for the workspace without attaching it to the current terminal.
 
-Foreground operation must be explicit through `armature dev` or an explicit foreground option. `armature up` without such an option should not run in the foreground.
+Foreground operation must be explicit through `whip dev` or an explicit foreground option. `whip up` without such an option should not run in the foreground.
 
 The CLI may invoke runtime commands against the active daemon.
 
@@ -84,14 +84,14 @@ If no daemon owns the workspace, commands that require a running daemon should f
 Commands that do not require a running daemon may operate directly on the workspace:
 
 ```text
-armature init
-armature config check
-armature doctor
+whip init
+whip config check
+whip doctor
 ```
 
-`armature down` stops the daemon runtime for the workspace.
+`whip down` stops the daemon runtime for the workspace.
 
-`armature restart` performs `down` then `up`.
+`whip restart` performs `down` then `up`.
 
 The daemon should remain local to the machine and workspace. v0.3 should not install launchd or systemd services unless the user explicitly asks for that in a future version.
 
@@ -105,9 +105,9 @@ Recommended package layout:
 
 ```text
 crates/
-  armature-cli/
-  armature-daemon/
-  armature-core/
+  whippletree-cli/
+  whippletree-daemon/
+  whippletree-core/
 packages/
   sdk/
 ```
@@ -119,20 +119,20 @@ The Rust CLI and daemon may initially live in one binary if that accelerates the
 Workspace discovery walks upward from the current working directory until it finds:
 
 ```text
-.armature/armature.toml
+.whippletree/project.whip
 ```
 
-Armature must not search downward into subdirectories.
+Whippletree must not search downward into subdirectories.
 
-If a user is inside a nested project, the nearest ancestor with `.armature/armature.toml` is the workspace.
+If a user is inside a nested project, the nearest ancestor with `.whippletree/project.whip` is the workspace.
 
 An explicit workspace flag should override discovery:
 
 ```bash
-armature --workspace /path/to/workspace status
+whip --workspace /path/to/workspace status
 ```
 
-The workspace root is the directory containing `.armature/`.
+The workspace root is the directory containing `.whippletree/`.
 
 ## 5. State Location
 
@@ -140,18 +140,18 @@ SQLite is the v0.3 store.
 
 The SQLite database must not live in the working tree by default.
 
-The workspace `.armature/` directory may contain user-editable config and run artifacts, but the internal database should live under an Armature-controlled state root outside the repository checkout.
+The workspace `.whippletree/` directory may contain user-editable config and run artifacts, but the internal database should live under an Whippletree-controlled state root outside the repository checkout.
 
 Recommended default:
 
 ```text
-$XDG_STATE_HOME/armature/workspaces/<workspace-id>/armature.sqlite
+$XDG_STATE_HOME/whippletree/workspaces/<workspace-id>/whippletree.sqlite
 ```
 
 Fallback:
 
 ```text
-~/.local/state/armature/workspaces/<workspace-id>/armature.sqlite
+~/.local/state/whippletree/workspaces/<workspace-id>/whippletree.sqlite
 ```
 
 The workspace id should be a stable hash of the canonical workspace path.
@@ -198,7 +198,7 @@ Config format is TOML.
 Default path:
 
 ```text
-.armature/armature.toml
+.whippletree/project.whip
 ```
 
 The daemon validates config on startup and reload.
@@ -277,7 +277,7 @@ do not buffer while daemon is down
 do not promise exactly-once delivery
 ```
 
-If `armature emit` cannot reach the daemon, it fails clearly.
+If `whip emit` cannot reach the daemon, it fails clearly.
 
 Built-in schedules and file watchers emit mechanical events into the same event log as user-authored sources.
 
@@ -330,7 +330,7 @@ Admission is per task. It does not create cross-task workflow ordering.
 
 Services are declared long-running commands.
 
-The daemon reconciles enabled services toward running while `armature dev` is active, subject to:
+The daemon reconciles enabled services toward running while `whip dev` is active, subject to:
 
 ```text
 user stop overrides
@@ -353,11 +353,11 @@ restart/backoff state
 health state, if configured
 ```
 
-`armature service stop <name>` sets a stop override.
+`whip service stop <name>` sets a stop override.
 
-`armature service start <name>` clears the stop override and starts/reconciles the service.
+`whip service start <name>` clears the stop override and starts/reconciles the service.
 
-`armature service restart <name>` clears the stop override and restarts the service.
+`whip service restart <name>` clears the stop override and restarts the service.
 
 Config reload does not clear stop overrides.
 
@@ -453,7 +453,7 @@ Each run has a private run directory.
 Recommended default:
 
 ```text
-.armature/runs/<run-id>/
+.whippletree/runs/<run-id>/
   event.json
   meta.json
   stdout.log
@@ -476,9 +476,9 @@ Locks are raw mechanical mutexes.
 Supported commands:
 
 ```bash
-armature lock acquire <name>
-armature lock release <name>
-armature lock status
+whip lock acquire <name>
+whip lock release <name>
+whip lock status
 ```
 
 Run-owned locks are preferred.
@@ -488,7 +488,7 @@ Manual locks should require a lease or be marked as manually owned and inspectab
 Recommended manual lock syntax:
 
 ```bash
-armature lock acquire branch:main --ttl 10m
+whip lock acquire branch:main --ttl 10m
 ```
 
 Lock records include:
@@ -512,7 +512,7 @@ The TypeScript SDK is part of v0.3, not deferred.
 
 It must be optional and must not create a second runtime.
 
-It should be complete for v0.3 core functionality while remaining a thin wrapper over Armature runtime facts, environment variables, CLI commands, or daemon transport.
+It should be complete for v0.3 core functionality while remaining a thin wrapper over Whippletree runtime facts, environment variables, CLI commands, or daemon transport.
 
 It should wrap:
 
@@ -553,7 +553,7 @@ readJson()
 writeJson()
 ```
 
-SDK helpers should either use environment variables or call the Armature CLI/daemon transport.
+SDK helpers should either use environment variables or call the Whippletree CLI/daemon transport.
 
 The SDK must not expose workflow, activity, durable promise, agent graph, managed join, managed race, semantic retry, or semantic dedupe helpers.
 
@@ -566,13 +566,13 @@ Recipes generate ordinary files and do not create hidden daemon behavior.
 Recommended command:
 
 ```bash
-armature init recipe <name>
+whip init recipe <name>
 ```
 
 Recipes may create:
 
 ```text
-.armature/armature.toml
+.whippletree/project.whip
 scripts/
 sources/
 package.json
@@ -585,45 +585,45 @@ Recipe output should be plain project code that users and agents can edit.
 Required v0.3 commands:
 
 ```bash
-armature init
-armature init recipe <name>
-armature dev
-armature up
-armature down
-armature restart
-armature run <task-name>
-armature emit <event-type> --json <payload>
-armature status
-armature ps
-armature tasks
-armature services
-armature service start <name>
-armature service stop <name>
-armature service restart <name>
-armature runs
-armature logs <run-id>
-armature cancel <run-id>
-armature config check
-armature doctor
-armature lock acquire <name>
-armature lock release <name>
-armature lock status
+whip init
+whip init recipe <name>
+whip dev
+whip up
+whip down
+whip restart
+whip run <task-name>
+whip emit <event-type> --json <payload>
+whip status
+whip ps
+whip tasks
+whip services
+whip service start <name>
+whip service stop <name>
+whip service restart <name>
+whip runs
+whip logs <run-id>
+whip cancel <run-id>
+whip config check
+whip doctor
+whip lock acquire <name>
+whip lock release <name>
+whip lock status
 ```
 
 Reserved or deferred:
 
 ```bash
-armature plan
+whip plan
 ```
 
-Foreground operation must remain explicit through `armature dev` or a foreground option.
+Foreground operation must remain explicit through `whip dev` or a foreground option.
 
 ## 24. Validation Boundary
 
 The daemon validates:
 
 ```text
-Armature config schema
+Whippletree config schema
 event envelope schema
 run status transitions
 service state transitions
@@ -657,8 +657,8 @@ The TypeScript SDK may provide user-space payload validation helpers, but those 
 Build the first implementation in this order:
 
 1. Rust workspace and CLI skeleton.
-2. Workspace discovery and `armature init`.
-3. TOML config parse and `armature config check`.
+2. Workspace discovery and `whip init`.
+3. TOML config parse and `whip config check`.
 4. Daemon lifecycle with workspace lock and Unix socket.
 5. SQLite store outside the workspace.
 6. Manual task execution with per-run directory and logs.
@@ -677,6 +677,6 @@ Build the first implementation in this order:
 Each step should preserve the core boundary:
 
 ```text
-Armature records and controls mechanical runtime facts.
+Whippletree records and controls mechanical runtime facts.
 User code owns operational meaning.
 ```

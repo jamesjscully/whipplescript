@@ -133,14 +133,14 @@ which model environment variables may be read
 whether network/model access is allowed
 which BAML tools, if any, may be exposed
 which BAML HTTP server URLs may be called
-whether Armature may launch a managed `baml-cli serve` process
+whether Whippletree may launch a managed `baml-cli serve` process
 ```
 
 The first implementation should treat BAML as structured model output only. BAML
 tools that perform side effects should be disabled unless explicitly enabled by
 adapter policy and represented as ordinary workflow effects.
 
-BAML source is generated from Armature `coerce` declarations and workspace
+BAML source is generated from Whippletree `coerce` declarations and workspace
 defaults in the first implementation. Runtime `coerce` execution uses BAML HTTP.
 Policy validates whether the selected providers, models, environment variables,
 server URLs, and managed-process mode are allowed.
@@ -162,7 +162,7 @@ Implemented BAML policy fields:
 `run --baml-url` enforces `baml.coerce`, `allow_baml_network`, and exact
 `allowed_baml_urls` before making any HTTP request. `allow_managed_baml_server`,
 `allowed_models`, and `allowed_env_vars` are parsed and validated now, but they
-become enforceable only when Armature owns managed BAML process launch or
+become enforceable only when Whippletree owns managed BAML process launch or
 provider/model selection. `baml.coerce` remains the capability name for
 BAML-backed structured model output. Raw BAML HTTP response storage is
 controlled by `store_baml_raw_responses`: explicit `false` always redacts,
@@ -174,7 +174,7 @@ remains durable for replay and status either way.
 
 External authority is declared through capabilities in workflow source:
 
-```armature
+```whippletree
 capability plan = adapter("implementationPlan")
 ```
 
@@ -182,7 +182,7 @@ Adapters may expose file, database, command, or service operations, but each
 operation must have a declared schema and capability requirement. Source code may
 call only approved operations:
 
-```armature
+```whippletree
 let planText = plan.snapshot()
 plan.markBlocked(workItemId, reason)
 ```

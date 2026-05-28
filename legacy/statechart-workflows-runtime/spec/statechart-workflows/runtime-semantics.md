@@ -15,7 +15,7 @@ It may call:
 - the native local agent harness ledger
 - BAML HTTP functions for `coerce`
 - allowlisted adapter actions
-- legacy Armature APIs only through explicit compatibility adapters, if used
+- legacy Whippletree APIs only through explicit compatibility adapters, if used
 
 It must not provide ambient access to:
 
@@ -110,7 +110,7 @@ produced by those actions.
 
 For example:
 
-```armature
+```whippletree
 start worker {
   workItemId selection.workItemId
 }

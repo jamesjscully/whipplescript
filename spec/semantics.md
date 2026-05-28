@@ -15,7 +15,7 @@ Fact      = FactName(Value...)
 FactSet   = finite set or multiset of facts
 ```
 
-Armature should default to set semantics for derived facts. Runtime facts that
+Whippletree should default to set semantics for derived facts. Runtime facts that
 represent unique lifecycle records carry stable IDs. If true multiplicity is
 needed, it must be represented explicitly with IDs rather than accidental
 duplicates.

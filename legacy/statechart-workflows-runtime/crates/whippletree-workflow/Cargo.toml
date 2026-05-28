@@ -1,0 +1,13 @@
+[package]
+name = "whippletree-workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+logos.workspace = true
+rowan.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+text-size.workspace = true
+thiserror.workspace = true

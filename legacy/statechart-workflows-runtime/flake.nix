@@ -1,5 +1,5 @@
 {
-  description = "Armature development and formal verification tools";
+  description = "Whippletree development and formal verification tools";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

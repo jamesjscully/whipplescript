@@ -2,9 +2,9 @@
 
 Status: design sketch
 
-Armature workflows should be designed so their semantics can be validated both
+Whippletree workflows should be designed so their semantics can be validated both
 statically and with transition-system verification. Verification starts after
-the native `.armature` source has been parsed, lowered, and validated; formal
+the native `.whip` source has been parsed, lowered, and validated; formal
 backends consume WorkflowIR, not raw source text.
 
 The verification strategy should optimize for early bug discovery. TLA+ and
@@ -139,7 +139,7 @@ checks remain authoritative.
 
 ### 3. Generated Transition-System Checks
 
-For high-value workflows, Armature should generate a formal transition-system
+For high-value workflows, Whippletree should generate a formal transition-system
 model from the validated IR.
 
 The generated model should include:
@@ -151,7 +151,7 @@ The generated model should include:
 - capability declarations
 - bounded work item abstractions
 - coerce outputs as nondeterministic values constrained by schema
-- Armature expression primitives as pure deterministic operations over bounded
+- Whippletree expression primitives as pure deterministic operations over bounded
   typed values
 
 The generated model should not include:
@@ -191,7 +191,7 @@ Veil support should stay exploratory until the dependency/version story is
 pinned. The compiler can lower workflow IR to a Veil module:
 
 ```text
-Armature workflow state       -> Veil mutable state
+Whippletree workflow state       -> Veil mutable state
 events                        -> Veil actions
 transitions                   -> guarded action bodies
 agent/resource counters       -> mutable relations/functions
@@ -282,7 +282,7 @@ modeling external agent execution.
 
 Users may define additional invariants over workflow state:
 
-```armature
+```whippletree
 invariant retryCountWithinBound {
   assert data.retryCount <= 3
 }
@@ -312,19 +312,19 @@ This avoids hiding stuck work while leaving room for future liveness checking.
 Recommended modes:
 
 ```text
-armature validate <file>
+whip validate <file>
   Fast static validation.
 
-armature check <file> [--adapter-manifest <manifest>]
+whip check <file> [--adapter-manifest <manifest>]
   Static validation plus bounded model checking.
 
-armature prove <file>
+whip prove <file>
   Generate Veil and run stronger invariant checks.
 
-armature emit-model <file> --target veil [--adapter-manifest <manifest>]
+whip emit-model <file> --target veil [--adapter-manifest <manifest>]
   Produce the generated Veil module for inspection.
 
-armature emit-model <file> --target maude [--adapter-manifest <manifest>]
+whip emit-model <file> --target maude [--adapter-manifest <manifest>]
   Produce the generated Maude module for executable semantics inspection if
   Maude support is enabled.
 ```

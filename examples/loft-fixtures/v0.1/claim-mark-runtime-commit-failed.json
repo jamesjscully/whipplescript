@@ -1,0 +1,54 @@
+{
+  "status": "failed",
+  "tx_id": "tx_fixture_claim_mark",
+  "events": [
+    "evt_fixture_claim_mark"
+  ],
+  "issue": {
+    "id": "iss_fixture",
+    "title": "Fixture issue",
+    "body": "Fixture body",
+    "issue_status": "in_progress",
+    "type": "task",
+    "priority": 2,
+    "assignee": null,
+    "owner": null,
+    "due_at": null,
+    "defer_until": null,
+    "created_at": "2030-01-01T00:00:00Z",
+    "updated_at": "2030-01-01T00:18:00Z",
+    "closed_at": null,
+    "close_reason": null,
+    "labels": [
+      "fixture"
+    ],
+    "relations": [],
+    "blocked_by": [],
+    "comments": [],
+    "evidence": [],
+    "resource_intent": {
+      "reads": [],
+      "writes": []
+    },
+    "heads": [
+      "evt_fixture_claim_mark"
+    ],
+    "conflicted": false,
+    "field_conflicts": {},
+    "state_token": "b3:fixture-claim-mark"
+  },
+  "error": {
+    "code": "runtime_claim_failed",
+    "message": "durable issue update succeeded but runtime lease commit failed",
+    "recoverable": true,
+    "details": {
+      "issue_id": "iss_fixture",
+      "durable_committed": true,
+      "runtime_lease_committed": false,
+      "current_state_token": "b3:fixture-claim-mark",
+      "current_heads": [
+        "evt_fixture_claim_mark"
+      ]
+    }
+  }
+}

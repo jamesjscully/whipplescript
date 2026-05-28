@@ -1,12 +1,12 @@
-# Armature Dynamic Management Interface
+# Whippletree Dynamic Management Interface
 
 Status: design proposal
 
-This document describes the desired CLI/API shape for managing Armature as a
+This document describes the desired CLI/API shape for managing Whippletree as a
 runtime scaffold for agent projects. It is intentionally separate from the v0.3
 normative spec: not every command described here exists yet.
 
-The goal is to make Armature a reusable coordination layer for ordinary
+The goal is to make Whippletree a reusable coordination layer for ordinary
 long-running processes without turning it into a workflow engine, tracing
 system, or agent framework.
 
@@ -26,7 +26,7 @@ recover from crashes
 inspect what happened
 ```
 
-Armature should provide that plumbing with a clear object model and a predictable
+Whippletree should provide that plumbing with a clear object model and a predictable
 CLI. User code remains responsible for semantic meaning:
 
 ```text
@@ -42,7 +42,7 @@ domain-specific conflict handling
 
 The boundary remains:
 
-**Armature owns invocation truth. User code owns operational meaning.**
+**Whippletree owns invocation truth. User code owns operational meaning.**
 
 ## 2. Interface Principles
 
@@ -60,18 +60,18 @@ The dynamic management interface should follow these principles:
 For example:
 
 ```sh
-armature task run test
-armature run test
+whip task run test
+whip run test
 
-armature event emit plan.ready --json '{"requestId":"req-123"}'
-armature emit plan.ready --json '{"requestId":"req-123"}'
+whip event emit plan.ready --json '{"requestId":"req-123"}'
+whip emit plan.ready --json '{"requestId":"req-123"}'
 ```
 
 The first form is canonical. The second form is an alias.
 
 ## 3. Ontology
 
-Armature's interface should distinguish definitions from records.
+Whippletree's interface should distinguish definitions from records.
 
 Definitions describe desired behavior:
 
@@ -147,7 +147,7 @@ name = "github-source"
 run = "node sources/github-events.mjs"
 ```
 
-Services are definitions with reconciliation. Armature should keep enabled
+Services are definitions with reconciliation. Whippletree should keep enabled
 services running according to mechanical supervision policy.
 
 Agents use services for:
@@ -164,7 +164,7 @@ log tailers
 
 ### 3.4 Source
 
-A source is anything that emits Armature events:
+A source is anything that emits Whippletree events:
 
 ```text
 manual CLI emit
@@ -183,7 +183,7 @@ with source role metadata.
 An event is a recorded message:
 
 ```sh
-armature event emit plan.ready --correlation req-123 --json '{"ok":true}'
+whip event emit plan.ready --correlation req-123 --json '{"ok":true}'
 ```
 
 Events are coordination messages, not durable workflow promises. They may carry
@@ -191,7 +191,7 @@ mechanical provenance such as source run, parent event, and correlation id.
 
 ### 3.6 Trigger
 
-A trigger is a routing/admission record produced by Armature. If an event causes
+A trigger is a routing/admission record produced by Whippletree. If an event causes
 a task to start, the trigger records:
 
 ```text
@@ -230,7 +230,7 @@ Where are the logs?
 ### 3.8 Log
 
 A log is captured stdout/stderr plus mechanical metadata for a run. Logs should
-be good enough that Armature does not need a structured result object for v0.x.
+be good enough that Whippletree does not need a structured result object for v0.x.
 
 ### 3.9 Lock
 
@@ -284,15 +284,15 @@ The canonical CLI should map to object types.
 ### 4.1 Task Commands
 
 ```sh
-armature task list
-armature task show <name>
-armature task run <name>
-armature task add <name> --on EVENT -- <cmd...>
-armature task add <name> --watch GLOB --settle 500ms -- <cmd...>
-armature task add <name> --schedule CRON -- <cmd...>
-armature task enable <name>
-armature task disable <name>
-armature task remove <name>
+whip task list
+whip task show <name>
+whip task run <name>
+whip task add <name> --on EVENT -- <cmd...>
+whip task add <name> --watch GLOB --settle 500ms -- <cmd...>
+whip task add <name> --schedule CRON -- <cmd...>
+whip task enable <name>
+whip task disable <name>
+whip task remove <name>
 ```
 
 Task add creates a dynamic task definition. Dynamic task definitions should be
@@ -304,16 +304,16 @@ dynamic tasks should be added only after the storage model is explicit.
 ### 4.2 Service Commands
 
 ```sh
-armature service list
-armature service show <name>
-armature service add <name> -- <cmd...>
-armature service start <name>
-armature service stop <name>
-armature service restart <name>
-armature service enable <name>
-armature service disable <name>
-armature service remove <name>
-armature service health <name>
+whip service list
+whip service show <name>
+whip service add <name> -- <cmd...>
+whip service start <name>
+whip service stop <name>
+whip service restart <name>
+whip service enable <name>
+whip service disable <name>
+whip service remove <name>
+whip service health <name>
 ```
 
 Service add creates a dynamic service definition. Dynamic services should be
@@ -324,12 +324,12 @@ Initial implementations may support ephemeral dynamic services only.
 ### 4.3 Run Commands
 
 ```sh
-armature run list
-armature run show <run-id>
-armature run start --name NAME -- <cmd...>
-armature run cancel <run-id>
-armature run logs <run-id>
-armature run wait <run-id>
+whip run list
+whip run show <run-id>
+whip run start --name NAME -- <cmd...>
+whip run cancel <run-id>
+whip run logs <run-id>
+whip run wait <run-id>
 ```
 
 `run start` creates an ad hoc tracked process. It does not create a task
@@ -350,10 +350,10 @@ Useful options:
 ### 4.4 Event Commands
 
 ```sh
-armature event list
-armature event show <event-id>
-armature event emit <type> [--json JSON | --payload-file PATH | --stdin]
-armature event wait <type>
+whip event list
+whip event show <event-id>
+whip event emit <type> [--json JSON | --payload-file PATH | --stdin]
+whip event wait <type>
 ```
 
 Useful list filters:
@@ -365,15 +365,15 @@ Useful list filters:
 --limit N
 ```
 
-Armature should not add a separate `publish` command. `emit` is the canonical
+Whippletree should not add a separate `publish` command. `emit` is the canonical
 event creation verb.
 
 ### 4.5 Trigger Commands
 
 ```sh
-armature trigger list
-armature trigger show <trigger-id>
-armature trigger wait --task NAME
+whip trigger list
+whip trigger show <trigger-id>
+whip trigger wait --task NAME
 ```
 
 Useful list filters:
@@ -389,7 +389,7 @@ Useful list filters:
 Potential future command:
 
 ```sh
-armature trigger retry <trigger-id>
+whip trigger retry <trigger-id>
 ```
 
 Retry should be deferred. If added, it must be defined mechanically as "create a
@@ -398,9 +398,9 @@ new run for the same task/event context" rather than a semantic workflow retry.
 ### 4.6 Log Commands
 
 ```sh
-armature log show <run-id>
-armature log tail <run-id> --lines 100
-armature log follow <run-id>
+whip log show <run-id>
+whip log tail <run-id> --lines 100
+whip log follow <run-id>
 ```
 
 Logs should expose:
@@ -419,13 +419,13 @@ stream contents
 ### 4.7 Lock Commands
 
 ```sh
-armature lock acquire <name> --ttl 10m --reason "editing branch"
-armature lock renew <name> --token lock_... --ttl 10m
-armature lock release <name> --token lock_...
-armature lock force-release <name> --reason "holder died"
-armature lock list
-armature lock show <name>
-armature lock with <name> --ttl 10m -- <cmd...>
+whip lock acquire <name> --ttl 10m --reason "editing branch"
+whip lock renew <name> --token lock_... --ttl 10m
+whip lock release <name> --token lock_...
+whip lock force-release <name> --reason "holder died"
+whip lock list
+whip lock show <name>
+whip lock with <name> --ttl 10m -- <cmd...>
 ```
 
 Lock semantics are detailed in section 7.
@@ -433,10 +433,10 @@ Lock semantics are detailed in section 7.
 ### 4.8 Wait Commands
 
 ```sh
-armature wait event <type> --correlation req-123
-armature wait run <run-id> --state exited
-armature wait trigger --task reviewer --outcome started
-armature wait service <name> --state running
+whip wait event <type> --correlation req-123
+whip wait run <run-id> --state exited
+whip wait trigger --task reviewer --outcome started
+whip wait service <name> --state running
 ```
 
 Useful options:
@@ -452,9 +452,9 @@ timeout.
 ### 4.9 Subscribe Commands
 
 ```sh
-armature subscribe events
-armature subscribe runs
-armature subscribe triggers
+whip subscribe events
+whip subscribe runs
+whip subscribe triggers
 ```
 
 Subscribe should stream newline-delimited JSON. It should be an observation API,
@@ -465,18 +465,18 @@ not a broker protocol.
 Top-level aliases should exist for common operations:
 
 ```sh
-armature tasks                 # task list
-armature services              # service list
-armature runs                  # run list
-armature events                # event list
-armature triggers              # trigger list
+whip tasks                 # task list
+whip services              # service list
+whip runs                  # run list
+whip events                # event list
+whippletree triggers              # trigger list
 
-armature run <task>            # task run <task>
-armature exec -- <cmd...>      # run start -- <cmd...>
-armature emit <type>           # event emit <type>
-armature logs <run-id>         # run logs <run-id>
-armature cancel <run-id>       # run cancel <run-id>
-armature ps                    # active runs view
+whip run <task>            # task run <task>
+whip exec -- <cmd...>      # run start -- <cmd...>
+whip emit <type>           # event emit <type>
+whip logs <run-id>         # run logs <run-id>
+whip cancel <run-id>       # run cancel <run-id>
+whip ps                    # active runs view
 ```
 
 Canonical docs should teach the object-oriented form when explaining the model
@@ -487,8 +487,8 @@ and the alias form when showing common workflows.
 Dynamic definitions are runtime-created task/service definitions:
 
 ```sh
-armature task add reviewer --on plan.ready -- node reviewer.mjs
-armature service add github-source -- node sources/github.mjs
+whip task add reviewer --on plan.ready -- node reviewer.mjs
+whip service add github-source -- node sources/github.mjs
 ```
 
 Dynamic definitions must be inspectable:
@@ -511,8 +511,8 @@ dynamic definitions live until removed, daemon shutdown, or workspace reset
 ```
 
 Persistence should be designed separately. If added, persistent dynamic
-definitions should not rewrite the user's primary `.armature/armature.toml`
-without explicit consent. A separate Armature-managed dynamic definition file is
+definitions should not rewrite the user's primary `.whippletree/project.whip`
+without explicit consent. A separate Whippletree-managed dynamic definition file is
 preferable.
 
 ## 7. Lock Semantics
@@ -544,7 +544,7 @@ lease, not a stale lease with the same name.
 ### 7.2 Acquire
 
 ```sh
-armature lock acquire repo:main --ttl 10m --reason "review req-482"
+whip lock acquire repo:main --ttl 10m --reason "review req-482"
 ```
 
 Acquire returns the lock record, including token.
@@ -553,19 +553,19 @@ If the lock exists and is not expired, acquire fails with conflict.
 
 If the lock exists but is expired, the daemon may replace it.
 
-When acquire is called from inside an Armature-managed run, owner fields should
+When acquire is called from inside an Whippletree-managed run, owner fields should
 be inferred from environment:
 
 ```text
-ARMATURE_RUN_ID
-ARMATURE_NAME
-ARMATURE_CORRELATION_ID
+WHIPPLETREE_RUN_ID
+WHIPPLETREE_NAME
+WHIPPLETREE_CORRELATION_ID
 ```
 
 ### 7.3 Renew
 
 ```sh
-armature lock renew repo:main --token lock_... --ttl 10m
+whip lock renew repo:main --token lock_... --ttl 10m
 ```
 
 Renew requires the current fencing token.
@@ -577,22 +577,22 @@ Renew should update `renewed_at_ms` and `expires_at_ms`.
 Canonical release requires a token:
 
 ```sh
-armature lock release repo:main --token lock_...
+whip lock release repo:main --token lock_...
 ```
 
 This prevents stale holders from releasing newer locks.
 
 For ergonomics, tokenless release may be allowed only when the caller is the same
-Armature run that owns the lock:
+Whippletree run that owns the lock:
 
 ```sh
-armature lock release repo:main
+whip lock release repo:main
 ```
 
 The daemon may accept this only if:
 
 ```text
-caller ARMATURE_RUN_ID == lock.owner_run_id
+caller WHIPPLETREE_RUN_ID == lock.owner_run_id
 ```
 
 Outside the owning run context, tokenless release must fail and explain how to
@@ -603,7 +603,7 @@ use `--token` or `force-release`.
 Force release is the administrative recovery path:
 
 ```sh
-armature lock force-release repo:main --reason "holder crashed and TTL is too long"
+whip lock force-release repo:main --reason "holder crashed and TTL is too long"
 ```
 
 Force release should require a reason and should be inspectable. It should record
@@ -626,7 +626,7 @@ create unrecoverable deadlocks.
 `with-lock` is the ergonomic safe path:
 
 ```sh
-armature lock with repo:main --ttl 10m --reason "run tests" -- npm test
+whip lock with repo:main --ttl 10m --reason "run tests" -- npm test
 ```
 
 The daemon/CLI should:
@@ -647,7 +647,7 @@ automatic renewal while the command is running
 
 ## 8. Provenance and Correlation
 
-Armature should track mechanical causality, not semantic workflow traces.
+Whippletree should track mechanical causality, not semantic workflow traces.
 
 Good mechanical provenance fields:
 
@@ -661,14 +661,14 @@ event_id
 trigger_id
 ```
 
-When `event emit` is called from inside an Armature-managed run, Armature should
+When `event emit` is called from inside an Whippletree-managed run, Whippletree should
 infer:
 
 ```text
-source_run_id    from ARMATURE_RUN_ID
-parent_event_id  from ARMATURE_EVENT_ID
-correlation_id   from ARMATURE_CORRELATION_ID, unless overridden
-source           from ARMATURE_NAME, unless overridden
+source_run_id    from WHIPPLETREE_RUN_ID
+parent_event_id  from WHIPPLETREE_EVENT_ID
+correlation_id   from WHIPPLETREE_CORRELATION_ID, unless overridden
+source           from WHIPPLETREE_NAME, unless overridden
 ```
 
 These fields answer:
@@ -696,11 +696,11 @@ Every record list should support practical filters.
 Examples:
 
 ```sh
-armature event list --type plan.ready --correlation req-123
-armature trigger list --task reviewer --outcome rejected
-armature run list --name worker --state failed
-armature lock list --expired
-armature overview --json
+whip event list --type plan.ready --correlation req-123
+whip trigger list --task reviewer --outcome rejected
+whip run list --name worker --state failed
+whip lock list --expired
+whip overview --json
 ```
 
 Filtering is not a workflow query language. It is runtime inspection.
@@ -720,7 +720,7 @@ idempotency hooks where appropriate
 Recommended environment default:
 
 ```sh
-ARMATURE_FORMAT=json
+WHIPPLETREE_FORMAT=json
 ```
 
 Potential future flags:
@@ -748,7 +748,7 @@ business state machines
 semantic deduplication
 ```
 
-Armature may carry labels, names, correlation IDs, and provenance. User code
+Whippletree may carry labels, names, correlation IDs, and provenance. User code
 decides what they mean.
 
 ## 12. Suggested Implementation Order

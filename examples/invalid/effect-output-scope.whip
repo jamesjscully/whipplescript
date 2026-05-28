@@ -1,0 +1,14 @@
+workflow EffectOutputScope
+
+agent worker {
+  profile "repo-writer"
+  capacity 1
+}
+
+rule bad_scope
+  when loft has ready issue as issue
+=> {
+  claim issue with loft as claim
+
+  tell worker "{{ claim.issue.title }}"
+}

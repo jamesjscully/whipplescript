@@ -1,0 +1,10 @@
+[package]
+name = "whippletree-modelgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+whippletree-workflow = { path = "../whippletree-workflow" }
+serde_json.workspace = true
+thiserror.workspace = true

@@ -6,7 +6,7 @@ This plan starts from the current Rust statechart runtime work, not from a blank
 repository. The implementation direction is now:
 
 ```text
-native .armature statechart DSL
+native .whip statechart DSL
 small orchestration expression kernel
 Rust parser, validator, interpreter, modelgen, and CLI
 SQLite durable queue/log/state/coerce/agent-invocation storage
@@ -24,7 +24,7 @@ programming-language authority.
 
 The active implementation already has these pieces:
 
-- native `.armature` parser/lowering scaffold using `logos` and `rowan`
+- native `.whip` parser/lowering scaffold using `logos` and `rowan`
 - WorkflowIR structs, schema validation, and source diagnostics
 - support for `machine`, `initial`, `data`, `event`, `agent`, `capability`,
   `enum`, `class`, `coerce`, nested `state`, `on`, `entry`, `always`, `case`,
@@ -63,8 +63,8 @@ The active implementation already has these pieces:
   calls, current coerce failure, historical latest coerce failures,
   current effect failures, current blockers, and policy blockers from durable
   storage
-- opt-in real BAML HTTP e2e coverage gated by `ARMATURE_RUN_BAML_E2E=1` and
-  `ARMATURE_BAML_URL`
+- opt-in real BAML HTTP e2e coverage gated by `WHIPPLETREE_RUN_BAML_E2E=1` and
+  `WHIPPLETREE_BAML_URL`
 - first scoped JSON plan file adapter slice through `run --plan-file`, covering
   plan snapshot reads and task status updates for ready-for-quality, done, and
   blocked; plan-only workflows get a built-in JSON plan manifest automatically
@@ -109,7 +109,7 @@ Current shape to replace:
 
 ```text
 workflow runtime -> adapter dispatcher -> agents.json
-harness/script -> armature emit --agent-file -> workflow_events
+harness/script -> whip emit --agent-file -> workflow_events
 ```
 
 Target shape:
@@ -133,8 +133,8 @@ model.
 - Provider stdout/stderr and metadata are stored as durable run artifacts.
 - Provider completion writes both an agent completion record and a typed
   workflow event, usually `finished`.
-- `armature emit` remains useful for manual external events, but the harness
-  must not shell out to `armature emit` for normal completion.
+- `whip emit` remains useful for manual external events, but the harness
+  must not shell out to `whip emit` for normal completion.
 - `--agent-file` is removed from normal UX and documentation. If any JSON bridge
   code survives temporarily, it must be named and documented as a fixture/debug
   helper with a concrete use case.
@@ -165,7 +165,7 @@ Exit criteria:
 
 ### 0.2 Add Agent Ledger Storage
 
-Work in `crates/armature-engine` storage:
+Work in `crates/whippletree-engine` storage:
 
 - bump the SQLite schema version
 - add tables:
@@ -194,7 +194,7 @@ Exit criteria:
 
 ### 0.3 Make `start` And `send` Native
 
-Work in `crates/armature-engine`:
+Work in `crates/whippletree-engine`:
 
 - route `start` for `codingAgent`/local provider agents to the native ledger
   instead of the manifest dispatcher
@@ -216,13 +216,13 @@ Exit criteria:
 
 ### 0.4 Add Harness Commands
 
-Work in `crates/armature-cli` and, if the code gets large, a new harness module
+Work in `crates/whippletree-cli` and, if the code gets large, a new harness module
 or crate:
 
 ```text
-armature harness once <workflow.armature> --store <path> --config <path>
-armature harness run <workflow.armature> --store <path> --config <path>
-armature harness status <workflow.armature> --store <path>
+whip harness once <workflow.whip> --store <path> --config <path>
+whip harness run <workflow.whip> --store <path> --config <path>
+whip harness status <workflow.whip> --store <path>
 ```
 
 `once`:
@@ -267,7 +267,7 @@ Provider config:
   "agents": {
     "worker": {
       "provider": "command",
-      "command": ["sh", "-c", "printf '%s\n' \"$ARMATURE_PROMPT\""],
+      "command": ["sh", "-c", "printf '%s\n' \"$WHIPPLETREE_PROMPT\""],
       "cwd": ".",
       "timeoutSeconds": 1800
     }
@@ -278,12 +278,12 @@ Provider config:
 Runtime environment for providers:
 
 ```text
-ARMATURE_WORKFLOW_ID
-ARMATURE_INVOCATION_ID
-ARMATURE_AGENT
-ARMATURE_PROMPT
-ARMATURE_INPUT_JSON
-ARMATURE_RUN_DIR
+WHIPPLETREE_WORKFLOW_ID
+WHIPPLETREE_INVOCATION_ID
+WHIPPLETREE_AGENT
+WHIPPLETREE_PROMPT
+WHIPPLETREE_INPUT_JSON
+WHIPPLETREE_RUN_DIR
 ```
 
 Presets compile to the same internal command-runner contract. `command`
@@ -322,8 +322,8 @@ Default completion event:
 
 Rules:
 
-- `id` is the Armature invocation id
-- `name` is the declared Armature agent name
+- `id` is the Whippletree invocation id
+- `name` is the declared Whippletree agent name
 - `status` is `succeeded`, `failed`, `cancelled`, or `timed_out`
 - `summary` is a short harness/provider summary, not raw logs
 - raw stdout/stderr remain artifacts
@@ -362,7 +362,7 @@ commands or sandbox trivia into ordinary workflow source.
 Target shape:
 
 ```text
-.armature source -> agent profile intent
+.whip source -> agent profile intent
 harness profile policy -> concrete provider + authority posture
 harness runner -> enforced or best-effort provider execution + audit event
 ```
@@ -380,7 +380,7 @@ Design commitments:
   requested authority, enforced authority, and unsupported best-effort gaps.
 - Raw `command` providers are allowed by default only in permissive mode; in
   separated/custom mode they must be explicitly named by policy.
-- The Armature skill should teach coding agents to read profile descriptions
+- The Whippletree skill should teach coding agents to read profile descriptions
   before assigning profiles.
 
 Implementation slices:
@@ -412,7 +412,7 @@ Implementation slices:
 
 Exit criteria:
 
-- users can write `.armature` files with semantic agent profiles
+- users can write `.whip` files with semantic agent profiles
 - operators can govern provider launch authority without editing workflow
   source
 - coding agents receive clear diagnostics when they choose the wrong profile
@@ -434,7 +434,7 @@ The native harness records lightweight local observation:
 - expose recent observations through `harness status --json`
 
 This is not a telemetry system. It is a local product-development apparatus for
-watching agents use Armature and turning repeated mistakes into better language
+watching agents use Whippletree and turning repeated mistakes into better language
 and CLI ergonomics.
 
 Exit criteria:
@@ -493,7 +493,7 @@ adding new behavior.
 
 ### 1.1 Workflow Crate
 
-Work in `crates/armature-workflow`:
+Work in `crates/whippletree-workflow`:
 
 - keep `class`, `enum`, and `coerce` declarations as the source of truth
 - keep generated BAML source as a derived artifact
@@ -515,7 +515,7 @@ Exit criteria:
 
 ### 1.2 Engine Boundary
 
-Work in `crates/armature-engine`:
+Work in `crates/whippletree-engine`:
 
 - introduce `CoerceExecutor` as a runtime dependency, separate from
   `EffectDispatcher`
@@ -547,7 +547,7 @@ Exit criteria:
 
 ### 1.3 Adapter Crate
 
-Work in `crates/armature-adapters`:
+Work in `crates/whippletree-adapters`:
 
 - remove or demote the placeholder `BamlAdapter` trait if it conflicts with
   the engine-facing `CoerceExecutor`: implemented by removing the placeholder
@@ -569,7 +569,7 @@ Exit criteria:
 
 Goal: make `coerce` replay-safe and inspectable before calling any real model.
 
-Work in `crates/armature-engine` storage:
+Work in `crates/whippletree-engine` storage:
 
 - add a `coerce_calls` table matching [storage.md](storage.md)
 - add migration/version handling for the new table
@@ -653,7 +653,7 @@ Testing:
 - add opt-in real BAML integration test gated by:
 
 ```text
-ARMATURE_RUN_BAML_E2E=1
+WHIPPLETREE_RUN_BAML_E2E=1
 BAML server URL or managed test setup
 provider credentials or compatible local provider
 ```
@@ -697,8 +697,8 @@ Suggested status JSON additions:
 
 Exit criteria:
 
-- `armature status --json` exposes coerce and data summary fields
-- `armature overview` renders those fields compactly for humans
+- `whip status --json` exposes coerce and data summary fields
+- `whip overview` renders those fields compactly for humans
 - policy-denied effect dispatches are projected as first-class policy blockers
 - no status command performs hidden live adapter or BAML calls
 - e2e tests assert status includes current state, queued events, active
@@ -774,7 +774,7 @@ Exit criteria:
 
 Goal: keep verification useful as runtime semantics become more complete.
 
-Work in `crates/armature-modelgen` and `models/statechart-workflows`:
+Work in `crates/whippletree-modelgen` and `models/statechart-workflows`:
 
 - keep BAML HTTP internals out of generated and hand-written models
 - model coerce as nondeterministic schema-valid output
@@ -913,7 +913,7 @@ Policy work:
   - `allowed_baml_urls`: implemented as exact URL allowlist for `run --baml-url`
   - `allow_managed_baml_server`: schema field reserved until managed process
     mode exists
-  - `allowed_models`: schema field validated and reserved until Armature owns
+  - `allowed_models`: schema field validated and reserved until Whippletree owns
     provider/model selection
   - `allowed_env_vars`: schema field validated and reserved until managed
     process mode owns environment projection
@@ -978,7 +978,7 @@ CI expectations:
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo build -p armature-cli
+cargo build -p whippletree-cli
 scripts/check-docs.sh
 scripts/check-e2e.sh
 scripts/check-formal-models.sh
@@ -1016,9 +1016,9 @@ Goal: make the system practical for nontechnical and enterprise users.
 Deliverables:
 
 - workflow templates: started with
-  `examples/templates/simple-agent-supervisor.armature`
+  `examples/templates/simple-agent-supervisor.whip`
   - the documented local lifecycle is covered by `scripts/check-docs.sh`
-- companion skill updates: current `skills/armature-statechart` documents
+- companion skill updates: current `skills/whippletree-statechart` documents
   file-backed adapter shortcuts, typed response/completion event intake, and
   debugging flow
 - example workflows
@@ -1027,7 +1027,7 @@ Deliverables:
   [operations.md](operations.md)
 - diagnostics written for coding agents and operators: capability policy
   diagnostics include conservative `Fix:` hints naming exact policy fields
-- migration notes from legacy Armature: added [migration.md](migration.md)
+- migration notes from legacy Whippletree: added [migration.md](migration.md)
 - schema/database migration story: added
   [database-migrations.md](database-migrations.md)
 - release checklist: added [release-checklist.md](release-checklist.md)
@@ -1041,7 +1041,7 @@ Exit criteria:
 - a coding agent can repair a workflow from diagnostics without reading runtime
   internals
 - capability violations are explained in terms of contracts and targets
-- `spec-implementation.armature` works end to end against real adapters in a
+- `spec-implementation.whip` works end to end against real adapters in a
   real repo
 - the old TypeScript/script-runner mental model is clearly documented as legacy
 
@@ -1049,7 +1049,7 @@ Exit criteria:
 
 The v1 track is complete when:
 
-- `.armature` source is the primary product surface
+- `.whip` source is the primary product surface
 - the implemented expression kernel matches
   [expression-primitives.md](expression-primitives.md)
 - real `coerce` uses BAML HTTP with durable replay-safe records

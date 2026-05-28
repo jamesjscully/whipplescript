@@ -29,7 +29,7 @@ recovery, and idempotency reconciliation become awkward quickly.
 One workspace owns one workflow database by default:
 
 ```text
-.armature/state/workflows.sqlite3
+.whippletree/state/workflows.sqlite3
 ```
 
 The database may contain multiple workflow instances. Each table includes
@@ -42,7 +42,7 @@ stored as JSON records, while the fields needed for durable lookup and status
 queries are indexed as columns. This keeps the first implementation simple
 without losing typed validation at the runtime boundary.
 
-### `armature_meta`
+### `whippletree_meta`
 
 Schema metadata:
 
@@ -412,7 +412,7 @@ timer queue to scan.
 
 ## Migration
 
-The database stores a schema version in `armature_meta`.
+The database stores a schema version in `whippletree_meta`.
 Migration code may create the metadata table for older stores that predate
 version tracking, but it must fail closed when the stored version is newer than
 the runtime supports.

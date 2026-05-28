@@ -1,7 +1,7 @@
 {
-  "name": "@armature/sdk",
+  "name": "@whippletree/sdk",
   "version": "0.1.0",
-  "description": "Thin TypeScript helpers for Armature runtime interactions",
+  "description": "Thin TypeScript helpers for Whippletree runtime interactions",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

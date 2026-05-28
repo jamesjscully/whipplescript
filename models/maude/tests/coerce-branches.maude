@@ -1,7 +1,7 @@
 load ../kernel.maude
 
 --- A coerce success can release the success branch.
-search [1] in ARMATURE-KERNEL :
+search [1] in WHIPPLETREE-KERNEL :
   effect(coerceEff, queued)
   dep(coerceEff, succeeds, tellEff)
   effect(tellEff, blocked)
@@ -15,7 +15,7 @@ search [1] in ARMATURE-KERNEL :
   effect(askEff, blocked) .
 
 --- A coerce failure cannot release the success branch.
-search [1] in ARMATURE-KERNEL :
+search [1] in WHIPPLETREE-KERNEL :
   effect(coerceEff, queued)
   dep(coerceEff, succeeds, tellEff)
   effect(tellEff, blocked)
@@ -29,7 +29,7 @@ search [1] in ARMATURE-KERNEL :
   effect(askEff, blocked) .
 
 --- A coerce failure can release the failure branch.
-search [1] in ARMATURE-KERNEL :
+search [1] in WHIPPLETREE-KERNEL :
   effect(coerceEff, queued)
   dep(coerceEff, succeeds, tellEff)
   effect(tellEff, blocked)
@@ -43,7 +43,7 @@ search [1] in ARMATURE-KERNEL :
   effect(askEff, running) .
 
 --- A coerce success can project a typed success fact for later rules.
-search [1] in ARMATURE-KERNEL :
+search [1] in WHIPPLETREE-KERNEL :
   effect(coerceEff, queued)
   completionProjection(coerceEff, completed, coerceOkFact, pending)
   =>*

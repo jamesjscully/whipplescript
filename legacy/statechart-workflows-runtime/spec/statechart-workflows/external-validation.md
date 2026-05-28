@@ -8,7 +8,7 @@ documentation and, where possible, tested directly.
 ## HJSON Historical Probe
 
 HJSON was validated when it was the candidate source format. It is no longer the
-selected primary `.armature` authoring surface, but these notes remain useful if
+selected primary `.whip` authoring surface, but these notes remain useful if
 HJSON is later used for policy files, adapter manifests, fixtures, or migration
 tools.
 
@@ -36,8 +36,8 @@ deser-hjson parse of temporary candidate HJSON workflow fixtures
 ```
 
 These probes were run against the former HJSON-shaped workflow sketches, not
-against the current native `.armature` source files. Current `.armature` files
-are parsed only by Armature's native parser.
+against the current native `.whip` source files. Current `.whip` files
+are parsed only by Whippletree's native parser.
 
 Correction found:
 
@@ -80,7 +80,7 @@ Confirmed:
 - BAML enums require values that start with an uppercase letter.
 - Generated TypeScript client code is produced by `baml-cli generate`.
 - `baml-cli serve --from <PATH>` is the selected v1 execution path for
-  Armature `coerce`, using BAML HTTP instead of generated TypeScript or the Rust
+  Whippletree `coerce`, using BAML HTTP instead of generated TypeScript or the Rust
   SDK.
 - The Rust crate exposes a lower-level runtime surface including in-memory
   source loading, dynamic values, parsing, calls, and type builder APIs.
@@ -88,7 +88,7 @@ Confirmed:
 Direct probe:
 
 ```text
-construct BAML source equivalent to Armature-shaped enum/class/coerce declarations
+construct BAML source equivalent to Whippletree-shaped enum/class/coerce declarations
 write that source into baml_src/
 run npm exec --package @boundaryml/baml@0.220.0 -- baml-cli generate
 attempt a Rust SDK probe with baml = 0.221.0
@@ -148,7 +148,7 @@ Required before relying on this path:
 Implemented repeatable path:
 
 - `scripts/check-formal-models.sh` runs the source-controlled TLA+/Maude models
-  and `armature prove` against the generated fixture model.
+  and `whip prove` against the generated fixture model.
 - `.github/workflows/ci.yml` runs `scripts/check-formal-models.sh` in the
   formal CI job through the repository Nix flake.
 
@@ -191,5 +191,5 @@ Confirmed:
 
 Not directly tested in this validation pass:
 
-- no Armature workflow adapter was run against a live un-tie session because the
+- no Whippletree workflow adapter was run against a live un-tie session because the
   adapter does not exist yet.

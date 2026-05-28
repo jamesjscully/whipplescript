@@ -4,7 +4,7 @@ Status: draft
 
 The harness layer turns durable `agent.tell` effects into real agent turns.
 
-Armature must not pretend an agent turn exists until this layer can claim an
+Whippletree must not pretend an agent turn exists until this layer can claim an
 effect, run a provider, capture evidence, and append a completion event.
 
 ## Harness Player
@@ -24,7 +24,7 @@ release or renew leases
 ```
 
 The player is not a workflow engine. It does not choose new work, inspect
-Docket readiness, retry policy, or decide when the loop is done. Those decisions
+Loft readiness, retry policy, or decide when the loop is done. Those decisions
 belong to rules and external kernels.
 
 ## Responsibilities
@@ -73,6 +73,20 @@ enterprise broker
 
 `command fixture` is for deterministic tests only. It is not proof that real
 coding agents are wired.
+
+The first implementation exposes this boundary as a kernel `AgentHarness` trait
+with a deterministic `MockAgentHarness`. The kernel-owned runner claims the
+effect, records injected skill provenance, runs the adapter, stores artifacts
+and provider evidence, appends the terminal effect completion, and then emits an
+`agent.turn.*` event plus fact. Adapters return data; they do not receive store
+handles or mutate kernel state directly.
+
+Codex, Claude Code, and Pi-style providers initially use the same
+configuration-driven command adapter. Deployment config supplies the executable,
+arguments, working directory, and environment. Whippletree writes the turn request
+as JSON on stdin and captures stdout, stderr, exit status, and a transcript. The
+adapter shape is stable even while individual provider CLI flags remain
+deployment-specific.
 
 Provider adapters are replaceable. The rule language addresses logical agents
 and profiles; the registry chooses whether that means Codex, Claude Code, Pi,
@@ -127,7 +141,7 @@ base prompt
 rule-provided message
 attached skills
 plugin-provided context bundles
-Docket/Thoth/memory artifacts, if requested
+Loft/Thoth/memory artifacts, if requested
 capability instructions
 ```
 

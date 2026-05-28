@@ -2,7 +2,7 @@
 
 Status: draft
 
-Effects are the only way Armature interacts with external systems. Capabilities
+Effects are the only way Whippletree interacts with external systems. Capabilities
 define which effects a program may request and how the runtime may execute
 them.
 
@@ -26,10 +26,16 @@ Core integrations may expose namespaced effects directly when the compiler or
 runtime needs to understand their ordering:
 
 ```text
-docket.claim
-docket.release
-docket.note
-docket.close
+loft.show
+loft.claim
+loft.renew
+loft.release
+loft.note
+loft.transition
+loft.evidence
+loft.resource_intent
+loft.complete
+loft.fail
 ```
 
 Plugins may also expose namespaced effect kinds:
@@ -104,7 +110,7 @@ after x completes  x has a tagged terminal-output union
 
 The language can make effects feel direct:
 
-```armature
+```whippletree
 tell worker "Implement this work item."
 coerce classify(result.summary) as classification
 askHuman "This task is blocked. What should happen?"
@@ -149,14 +155,14 @@ network = "allowed"
 allowed_capabilities = []
 ```
 
-The same Armature program can run in different environments if all required
+The same Whippletree program can run in different environments if all required
 capabilities and profiles are satisfied.
 
 ## Script Declarations
 
 A source program should be explicit about non-built-in authority:
 
-```armature
+```whippletree
 requires capability issueTracker
 
 agent worker {
@@ -165,7 +171,7 @@ agent worker {
 }
 ```
 
-Built-in effects such as `tell`, `coerce`, `askHuman`, and Docket operations
+Built-in effects such as `tell`, `coerce`, `askHuman`, and Loft operations
 still require runtime bindings, but they do not need custom capability
 declarations unless policy requires stricter naming.
 
@@ -196,7 +202,7 @@ Provider selection belongs in environment policy. The language names intent.
 
 ## Enforcement
 
-Armature must not claim stronger enforcement than a provider can supply.
+Whippletree must not claim stronger enforcement than a provider can supply.
 
 Each provider binding reports:
 

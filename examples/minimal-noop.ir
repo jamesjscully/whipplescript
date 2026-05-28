@@ -1,0 +1,13 @@
+workflow MinimalNoop
+schemas
+  class StartupSeen
+    source string
+    state literal<"observed">
+rules
+  rule observe_start
+    when started
+    reads
+      pattern:started
+    writes
+      schema:StartupSeen
+    body_hash a9ab267aca9bad6e

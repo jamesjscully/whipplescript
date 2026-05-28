@@ -1,0 +1,37 @@
+workflow CoerceBranch
+uses
+  skill baml-coerce-user
+  skill human-review-user
+schemas
+  enum Priority { Low, Normal, Urgent }
+  class MessageClassification
+    priority ref<Priority>
+    summary string
+    confidence float
+  class ClassifiedMessage
+    request ref<WorkItem>
+    classification ref<MessageClassification>
+coerces
+  coerce classifyMessage(title string, body string) -> ref<MessageClassification>
+rules
+  rule classify_request
+    when WorkItem as request
+    reads
+      schema:WorkItem
+    writes
+      schema:ClassifiedMessage
+    effects
+      classification kind=baml.coerce binding=classification key=95520869f1dc020b
+      effect2 kind=human.ask binding=- key=9cb792d395f3f9ce
+    dependencies
+      classification --fails--> effect2
+    body_hash 06ad008130ec0589
+  rule route_classified
+    when ClassifiedMessage as message
+    reads
+      schema:ClassifiedMessage
+    effects
+      effect1 kind=human.ask binding=- key=f81bef02f1cb4990
+    body_hash b609c512cd3d7c19
+rule_dependencies
+  classify_request --schema:ClassifiedMessage--> route_classified

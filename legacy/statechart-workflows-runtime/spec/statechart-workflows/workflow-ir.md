@@ -22,7 +22,7 @@ The IR must:
 - be stable enough for snapshot tests
 
 The IR should be representable as JSON for tests and runtime work. The native
-`.armature` DSL lowers to this explicit JSON-shaped IR.
+`.whip` DSL lowers to this explicit JSON-shaped IR.
 
 ## Top-Level Shape
 
@@ -33,7 +33,7 @@ Illustrative JSON shape:
   "schema_version": "statechart-workflow-ir/v0",
   "workflow": {
     "name": "SpecImplementation",
-    "source_path": "workflow.armature",
+    "source_path": "workflow.whip",
     "repo": ".",
     "contracts": [
       "builder_only/orchestration/contracts/spec-implementation.contract.json"
@@ -64,7 +64,7 @@ Workflow metadata defines the coordination boundary:
   "contracts": [
     "builder_only/orchestration/contracts/spec-implementation.contract.json"
   ],
-  "state_scope": ".armature/workflows/spec-implementation",
+  "state_scope": ".whippletree/workflows/spec-implementation",
   "plan": "state/implementation-plan.json"
 }
 ```
@@ -214,7 +214,7 @@ The IR records coerce function schemas and the generated BAML artifact location:
     ],
     "output": {"type": "ref", "name": "RunClassification"},
     "model": "gpt-4o-mini",
-    "generated_baml_artifact": ".armature/build/workflows/SpecImplementation/baml_src/workflow.baml"
+    "generated_baml_artifact": ".whippletree/build/workflows/SpecImplementation/baml_src/workflow.baml"
   }
 }
 ```
@@ -222,7 +222,7 @@ The IR records coerce function schemas and the generated BAML artifact location:
 The model generator treats each coerce call as nondeterministic over the output
 schema. The runtime records the concrete result returned by the model provider.
 
-Armature `class`, `enum`, and `coerce` declarations are source of truth.
+Whippletree `class`, `enum`, and `coerce` declarations are source of truth.
 Generated BAML files are derived artifacts.
 
 ## Statechart
@@ -372,7 +372,7 @@ and source span:
     }
   },
   "assign": null,
-  "span": "workflow.armature:92:9"
+  "span": "workflow.whip:92:9"
 }
 ```
 
@@ -421,7 +421,7 @@ Invariants are either named built-ins or supported expressions:
 ```
 
 Invariant names must be unique across built-in and expression invariants.
-Built-in invariant names must be from Armature's supported built-in invariant
+Built-in invariant names must be from Whippletree's supported built-in invariant
 set. Unsupported invariant forms fail validation.
 
 ## Source Spans
@@ -431,7 +431,7 @@ Every major IR node should carry a source span:
 ```json
 {
   "span": {
-    "file": "workflow.armature",
+    "file": "workflow.whip",
     "start_line": 91,
     "start_column": 9,
     "end_line": 94,

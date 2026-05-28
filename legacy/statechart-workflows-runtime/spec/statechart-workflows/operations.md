@@ -9,12 +9,12 @@ Use the same contract context that was used to validate or run the workflow.
 For explicit manifests:
 
 ```sh
-armature overview workflow.armature \
+whip overview workflow.whip \
   --adapter-manifest adapter.json \
   --policy policy.json \
   --json
 
-armature status workflow.armature \
+whip status workflow.whip \
   --adapter-manifest adapter.json \
   --policy policy.json \
   --json
@@ -23,7 +23,7 @@ armature status workflow.armature \
 For built-in JSON file-backed plan/review adapters:
 
 ```sh
-armature overview workflow.armature \
+whip overview workflow.whip \
   --plan-file plan.json \
   --review-file reviews.json \
   --json
@@ -32,17 +32,17 @@ armature overview workflow.armature \
 For native local agent work:
 
 ```sh
-armature harness status workflow.armature --json
+whip harness status workflow.whip --json
 ```
 
 Then inspect durable queue and log records:
 
 ```sh
-armature events workflow.armature --json
-armature log workflow.armature --json
+whip events workflow.whip --json
+whip log workflow.whip --json
 ```
 
-`status` and `overview` read only durable Armature state. They must not call
+`status` and `overview` read only durable Whippletree state. They must not call
 adapters, BAML, providers, agents, or backing JSON files.
 The human `status` and `overview` outputs include a `waiting:` line that
 summarizes the highest-priority visible reason: validation failure for
@@ -79,15 +79,15 @@ Likely repairs:
 
 Symptoms:
 
-- `armature events workflow.armature --status failed --json` returns records
-- `armature events workflow.armature --status dead_lettered --json` returns
+- `whip events workflow.whip --status failed --json` returns records
+- `whip events workflow.whip --status dead_lettered --json` returns
   records
 - the event `last_error` explains an old payload or processing failure
 
 Checks:
 
 - inspect the failed event payload and `attempt_count`; plain
-  `armature events --status failed` also shows durable `last_error` in text
+  `whip events --status failed` also shows durable `last_error` in text
   output when present
 - validate the workflow with the same manifests and policy before retrying
 - confirm any external cause has been repaired
@@ -95,7 +95,7 @@ Checks:
 Likely repairs:
 
 - retry a specific event with
-  `armature retry-event workflow.armature --event-id <event-id> --json`
+  `whip retry-event workflow.whip --event-id <event-id> --json`
   or use text mode to confirm `status=queued` and the new `pending_events`
   count
 - if the selected store path does not exist, `retry-event` fails without
@@ -113,7 +113,7 @@ Symptoms:
 
 Checks:
 
-- inspect `armature harness status workflow.armature --json`
+- inspect `whip harness status workflow.whip --json`
 - confirm started agents have native invocation records
 - confirm the harness claimed and completed the invocation
 - confirm successful harness completion enqueued a `finished` event
@@ -123,7 +123,7 @@ Checks:
 
 Likely repairs:
 
-- restart or run `armature harness run workflow.armature --config harness.json`
+- restart or run `whip harness run workflow.whip --config harness.json`
 - fix provider command/configuration errors shown in harness events
 - retry or repair failed/dead-lettered completion events
 - align the completion event schema with the workflow's declared event
@@ -188,7 +188,7 @@ Checks:
 Example:
 
 ```sh
-armature emit workflow.armature \
+whip emit workflow.whip \
   --review-file reviews.json \
   --event humanReview.responded \
   --payload '{"reviewId":"review-1","decision":"approved","response":"continue"}' \

@@ -2,7 +2,7 @@
 
 Status: draft
 
-Thoth should be a plugin, not part of Armature core.
+Thoth should be a plugin, not part of Whippletree core.
 
 Thoth owns governed repo resource truth:
 
@@ -16,7 +16,7 @@ resource leases
 deterministic context briefs
 ```
 
-Armature owns orchestration. It should call Thoth through a capability provider
+Whippletree owns orchestration. It should call Thoth through a capability provider
 when a workflow needs resource governance.
 
 ## Capability Surface
@@ -39,18 +39,18 @@ thoth.show
 Common sequence:
 
 ```text
-Docket issue claimed
+Loft issue claimed
 Thoth resource intent loaded or inferred
 Thoth brief attached to agent turn
 agent writes code
 Thoth touch classifies changed resources
 Thoth verify runs required checks
-evidence is attached to Armature run and Docket note
+evidence is attached to Whippletree run and Loft note
 ```
 
 ## Policy
 
-Thoth severities map to Armature policy:
+Thoth severities map to Whippletree policy:
 
 ```text
 advisory    context only
@@ -58,6 +58,6 @@ gated       required checks before completion
 serialized  lease + checks before completion
 ```
 
-Armature should not reinterpret Thoth's resource model. The plugin registers
+Whippletree should not reinterpret Thoth's resource model. The plugin registers
 fact schemas and reports observations/failures through typed effects or events;
-Armature rules decide how to react to the projected facts.
+Whippletree rules decide how to react to the projected facts.

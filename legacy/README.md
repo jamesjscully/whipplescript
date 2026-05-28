@@ -1,6 +1,6 @@
-# Legacy Armature Work
+# Legacy Whippletree Work
 
-This directory preserves prior Armature designs and implementations. They are
+This directory preserves prior Whippletree designs and implementations. They are
 reference material, not the current product model.
 
 ## Contents

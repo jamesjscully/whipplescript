@@ -2,7 +2,7 @@
 
 Status: draft
 
-Armature should keep a small core in the Pi style: enough stable machinery to
+Whippletree should keep a small core in the Pi style: enough stable machinery to
 compose serious agent systems, without baking every useful integration into the
 language or daemon.
 
@@ -22,7 +22,7 @@ agent harness interface
 capability registry
 skill registry
 BAML-backed coerce
-Docket integration
+Loft integration
 human review inbox
 artifact/evidence records
 observability/status views
@@ -65,7 +65,7 @@ Everything else should begin as a plugin.
 ## OpenClaw-Lite
 
 "OpenClaw-lite" is an example capability composition, not a separate product
-mode and not a language feature. A small Armature script plus core registries
+mode and not a language feature. A small Whippletree script plus core registries
 should be able to provide:
 
 ```text
@@ -73,7 +73,7 @@ skills
 scheduled heartbeat events
 agent harness turns
 memory plugin access
-Docket work claims
+Loft work claims
 human review
 artifact/evidence tracing
 ```

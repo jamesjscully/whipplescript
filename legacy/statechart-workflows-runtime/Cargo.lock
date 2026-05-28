@@ -65,11 +65,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "armature-adapters"
+name = "whippletree-adapters"
 version = "0.1.0"
 dependencies = [
- "armature-engine",
- "armature-workflow",
+ "whippletree-engine",
+ "whippletree-workflow",
  "serde",
  "serde_json",
  "tempfile",
@@ -77,13 +77,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "armature-cli"
+name = "whippletree-cli"
 version = "0.1.0"
 dependencies = [
- "armature-adapters",
- "armature-engine",
- "armature-modelgen",
- "armature-workflow",
+ "whippletree-adapters",
+ "whippletree-engine",
+ "whippletree-modelgen",
+ "whippletree-workflow",
  "clap",
  "rusqlite",
  "serde",
@@ -95,10 +95,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "armature-engine"
+name = "whippletree-engine"
 version = "0.1.0"
 dependencies = [
- "armature-workflow",
+ "whippletree-workflow",
  "reqwest",
  "rusqlite",
  "serde",
@@ -108,16 +108,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "armature-modelgen"
+name = "whippletree-modelgen"
 version = "0.1.0"
 dependencies = [
- "armature-workflow",
+ "whippletree-workflow",
  "serde_json",
  "thiserror",
 ]
 
 [[package]]
-name = "armature-workflow"
+name = "whippletree-workflow"
 version = "0.1.0"
 dependencies = [
  "logos",

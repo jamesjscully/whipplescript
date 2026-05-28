@@ -1,0 +1,19 @@
+[package]
+name = "whippletree-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+whippletree-core = { path = "../whippletree-core" }
+whippletree-kernel = { path = "../whippletree-kernel" }
+whippletree-parser = { path = "../whippletree-parser" }
+whippletree-store = { path = "../whippletree-store" }
+serde_json = "1"
+
+[[bin]]
+name = "whip"
+path = "src/main.rs"
+
+[lints]
+workspace = true

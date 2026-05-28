@@ -1,0 +1,20 @@
+workflow BadEffectGraph
+
+agent worker {
+  profile "repo-writer"
+  capacity 1
+}
+
+rule bad_after
+  when started
+=> {
+  after claim succeeds {
+    tell worker "missing claim"
+  }
+
+  claim issue with loft as claim
+
+  after claim retries {
+    tell worker "bad predicate"
+  }
+}

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Armature Runtime"
-  short_description: "Use Armature for local agent runtime coordination"
-  default_prompt: "Use $armature-runtime to configure, operate, or debug Armature tasks, services, events, runs, locks, waits, and SDK integrations."

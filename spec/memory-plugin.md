@@ -30,7 +30,7 @@ memory.writeFailed
 ```
 
 Memory facts are plugin projection facts. The memory plugin registers their
-schemas, but observations enter an Armature instance through effects/events and
+schemas, but observations enter an Whippletree instance through effects/events and
 kernel-mediated projection.
 
 ## Scopes
@@ -81,7 +81,7 @@ why.
 
 Memory may provide context before an agent turn:
 
-```armature
+```whippletree
 recall memory for issue as context
 tell worker with context context "..."
 ```

@@ -1,6 +1,6 @@
 # Maude Models
 
-Maude is the primary formal target for the Armature rule kernel.
+Maude is the primary formal target for the Whippletree rule kernel.
 
 Use it to model:
 
@@ -35,7 +35,7 @@ Current test suites:
 
 ```text
 coerce-branches.maude       BAML-style coerce success/failure branches
-docket-claim-turn.maude     claim-gated coding-agent turn lifecycle
+loft-claim-turn.maude       claim-gated coding-agent turn lifecycle
 effect-dependencies.maude   success/failure/completes dependency release
 policy-capacity-retry.maude policy/capacity blocks, lease expiry, retry
 ralph-loop.maude            external-event-bounded Ralph loop

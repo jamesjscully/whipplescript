@@ -1,14 +1,14 @@
-# Armature Specs
+# Whippletree Specs
 
 Status: draft reset
 
-These specs define the new Armature design from first principles. The current
+These specs define the new Whippletree design from first principles. The current
 target is not a statechart language and not a general programming language. It
 is a restricted event-sourced rule system for orchestrating agent work.
 
 ## North Star
 
-Armature should let coding agents and humans write orchestration logic that is:
+Whippletree should let coding agents and humans write orchestration logic that is:
 
 - explicit about when agent work is requested
 - durable across crashes and restarts
@@ -17,7 +17,7 @@ Armature should let coding agents and humans write orchestration logic that is:
 - formally modelable with a small operational semantics
 - safe to expose in enterprise environments through capability profiles
 
-Armature should not require authors to debug arbitrary distributed systems
+Whippletree should not require authors to debug arbitrary distributed systems
 control flow. The runtime owns delivery, effect queues, leases, idempotency,
 timeouts, and replay. The language owns policy.
 
@@ -37,16 +37,24 @@ timeouts, and replay. The language owns policy.
 - [skills.md](skills.md): deterministic skill registry and attachment model
 - [agent-harness.md](agent-harness.md): provider adapters for real agent turns
 - [coerce.md](coerce.md): BAML-backed typed model-decision effects
-- [docket-integration.md](docket-integration.md): Docket as a separate core work kernel
+- [loft-integration.md](loft-integration.md): Loft as a separate core work kernel
 - [human-review.md](human-review.md): inbox and human-review effects
 - [observability.md](observability.md): artifact/evidence store and status UX
+- [quickstart.md](quickstart.md): human-facing CLI quickstart
+- [operator-guide.md](operator-guide.md): store, profile, provider, and recovery operations
+- [plugin-author-guide.md](plugin-author-guide.md): capability/provider plugin authoring
+- [troubleshooting.md](troubleshooting.md): common diagnostics and operational failures
+- [release-checklist.md](release-checklist.md): v0 release gate checklist
+- [migration-notes.md](migration-notes.md): why legacy systems moved aside
+- [final-audit.md](final-audit.md): staged audit findings and gap classification
 - [memory-plugin.md](memory-plugin.md): memory as a registered plugin capability
 - [thoth-plugin.md](thoth-plugin.md): Thoth governance as a registered plugin capability
-- [companion-skill.md](companion-skill.md): first-party skill for authoring Armature workflows
+- [companion-skill.md](companion-skill.md): first-party skill for authoring Whippletree workflows
 - [language.md](language.md): author-facing rule language sketch
 - [semantics.md](semantics.md): mathematical runtime model
 - [static-analysis.md](static-analysis.md): compiler checks and restrictions
 - [verification.md](verification.md): Maude, TLA+/Apalache, Veil, and static-analysis strategy
+- [e2e.md](e2e.md): deterministic and opt-in real-provider e2e test guidance
 - [implementation-plan.md](implementation-plan.md): staged project tracker from formal verification through e2e testing
 - [examples.md](examples.md): early syntax sketches
 
@@ -64,7 +72,7 @@ timeouts, and replay. The language owns policy.
 9. A source file compiles into a versioned program; each run is a durable
    instance managed by the control plane.
 10. The core stays small: rule runtime, registries, harnesses, skills, BAML,
-   Docket, human review, and observability.
+   Loft, human review, and observability.
 11. Memory, Thoth, external trackers, browsers, research tools, dashboards, and
    evaluators start as plugins unless the kernel must understand them.
 12. OpenClaw-lite is an example composition, not a product mode or language

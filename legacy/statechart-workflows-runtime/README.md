@@ -1,9 +1,9 @@
-# armature
+# whippletree
 
-Armature is being rebuilt as a restricted statechart workflow runtime for
+Whippletree is being rebuilt as a restricted statechart workflow runtime for
 orchestrating coding agents.
 
-The current product surface is native `.armature` workflow files, validated
+The current product surface is native `.whip` workflow files, validated
 workflow IR, durable event queues, append-only transition/effect logs, trusted
 Rust adapters, and an initial `init` / `validate` / `emit` / `run` / `status` /
 `overview` / `events` / `log` / `build` / `check` / `emit-model` /
@@ -16,11 +16,11 @@ code.
 New implementation work lives in these crates:
 
 ```text
-crates/armature-workflow   native DSL parser, IR, schemas, diagnostics, validation
-crates/armature-engine     durable queue/log/state and interpreter skeleton
-crates/armature-adapters   trusted adapter manifests and dispatchers for BAML, humans, agents, legacy bridges
-crates/armature-modelgen   TLA+/Apalache/Maude/Veil model generation
-crates/armature-cli        small workflow CLI for validate/emit/run/status/overview/events/log/build/check/model iteration
+crates/whippletree-workflow   native DSL parser, IR, schemas, diagnostics, validation
+crates/whippletree-engine     durable queue/log/state and interpreter skeleton
+crates/whippletree-adapters   trusted adapter manifests and dispatchers for BAML, humans, agents, legacy bridges
+crates/whippletree-modelgen   TLA+/Apalache/Maude/Veil model generation
+crates/whippletree-cli        small workflow CLI for validate/emit/run/status/overview/events/log/build/check/model iteration
 ```
 
 Specs live in [`spec/statechart-workflows`](spec/statechart-workflows).
@@ -29,7 +29,7 @@ Fake adapter manifests live in [`examples/adapters`](examples/adapters).
 Example capability policies live in [`examples/policies`](examples/policies).
 Formal-model work starts in [`models/statechart-workflows`](models/statechart-workflows).
 The companion coding-agent skill lives in
-[`skills/armature-statechart`](skills/armature-statechart).
+[`skills/whippletree-statechart`](skills/whippletree-statechart).
 Operational repair guidance lives in
 [`spec/statechart-workflows/operations.md`](spec/statechart-workflows/operations.md);
 legacy migration notes live in
@@ -53,7 +53,7 @@ Run the active Rust workspace checks with:
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo build -p armature-cli
+cargo build -p whippletree-cli
 scripts/check-docs.sh
 scripts/check-e2e.sh
 scripts/check-formal-models.sh
@@ -66,8 +66,8 @@ entry and `always` blocks, `case` arm bodies, `let`, object/list/call
 expressions, and basic effect statements.
 
 ```text
-examples/workflows/minimal.armature
-examples/workflows/simple-supervisor.armature
+examples/workflows/minimal.whip
+examples/workflows/simple-supervisor.whip
 ```
 
 The larger spec implementation example runs end-to-end through the CLI when
@@ -90,7 +90,7 @@ also supplies the built-in `humanReview.responded` event schema for typed
 review responses with `{reviewId, decision, response?}` payloads.
 Local agents are native runtime resources: `start` writes durable queued
 invocations to SQLite, `send` writes durable messages, and
-`armature harness once|run|status` claims invocations, runs configured
+`whip harness once|run|status` claims invocations, runs configured
 providers, records completions, and enqueues typed `finished` workflow events.
 The harness supports the generic `command` provider, thin `codex`/`claude`/`pi`
 command presets, `timeoutSeconds`, command placeholders such as `{{prompt}}`,
@@ -214,7 +214,7 @@ models, and `artifact-hashes.json` with SHA-256 hashes for reproducibility. If
 `--adapter-manifest` or `--policy` is supplied, `build` validates the workflow
 against those contracts and writes `adapter-manifests.json` and
 `policy-documents.json` bundles beside the other artifacts.
-`skills/armature-statechart` contains the companion skill for coding agents. It
+`skills/whippletree-statechart` contains the companion skill for coding agents. It
 documents the restricted workflow boundary, the statechart authoring pattern,
 coerce usage, adapter manifests, debug commands, and common repairs.
 Schema validation follows BAML-style optional fields: a `?` field may be absent
@@ -223,43 +223,43 @@ or `null`, while non-optional fields must be present.
 Useful CLI examples:
 
 ```sh
-cargo run -p armature-cli -- validate examples/workflows/minimal.armature --json
-cargo run -p armature-cli -- init target/tmp/armature-demo --name DemoWorkflow --json
-cargo run -p armature-cli -- validate examples/workflows/spec-implementation.armature --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --json
-cargo run -p armature-cli -- validate examples/workflows/spec-implementation.armature --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --json
-cargo run -p armature-cli -- validate-adapter examples/adapters/spec-implementation.fake-adapter.json --json
-cargo run -p armature-cli -- validate-policy examples/policies/spec-implementation.enterprise-policy.json --json
-cargo run -p armature-cli -- emit examples/workflows/minimal.armature --event start --payload '{"message":"hello"}' --json
-cargo run -p armature-cli -- run examples/workflows/minimal.armature --event start --payload '{"message":"hello"}' --json
-cargo run -p armature-cli -- run examples/workflows/minimal.armature --json
-cargo run -p armature-cli -- run examples/workflows/spec-implementation.armature --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --event idle --payload '{"activeRuns":0,"unfinishedItems":1}' --fake-call-output 'plan.snapshot="W1 ready"' --fake-coerce-output 'chooseNextStep={"action":"StartWorker","workItemId":"W1","reason":"ready","message":"Implement W1"}' --json
-cargo run -p armature-cli -- status examples/workflows/minimal.armature --json
-cargo run -p armature-cli -- overview examples/workflows/minimal.armature
-cargo run -p armature-cli -- harness status examples/workflows/minimal.armature --json
-cargo run -p armature-cli -- harness once examples/workflows/minimal.armature --config harness.json --json
-cargo run -p armature-cli -- harness run examples/workflows/minimal.armature --config harness.json --drive-workflow --max-iterations 10 --json
-cargo run -p armature-cli -- events examples/workflows/minimal.armature --json
-cargo run -p armature-cli -- events examples/workflows/minimal.armature --status failed --json
-cargo run -p armature-cli -- events examples/workflows/minimal.armature --status dead_lettered --json
-cargo run -p armature-cli -- retry-event examples/workflows/minimal.armature --event-id evt_cli_... --json
-cargo run -p armature-cli -- log examples/workflows/minimal.armature --json
-cargo run -p armature-cli -- build examples/workflows/minimal.armature --json
-cargo run -p armature-cli -- build examples/workflows/spec-implementation.armature --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --json
-cargo run -p armature-cli -- check examples/workflows/minimal.armature --target tla --json
-cargo run -p armature-cli -- check examples/workflows/minimal.armature --target maude --json
-cargo run -p armature-cli -- check examples/workflows/spec-implementation.armature --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --target tla --json
-cargo run -p armature-cli -- prove examples/workflows/minimal.armature --json
-cargo run -p armature-cli -- emit-model examples/workflows/minimal.armature --target tla
-cargo run -p armature-cli -- emit-config examples/workflows/minimal.armature --target tla
-cargo run -p armature-cli -- emit-model examples/workflows/minimal.armature --target maude
-cargo run -p armature-cli -- emit-model examples/workflows/spec-implementation.armature --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --target maude
+cargo run -p whippletree-cli -- validate examples/workflows/minimal.whip --json
+cargo run -p whippletree-cli -- init target/tmp/whippletree-demo --name DemoWorkflow --json
+cargo run -p whippletree-cli -- validate examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --json
+cargo run -p whippletree-cli -- validate examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --json
+cargo run -p whippletree-cli -- validate-adapter examples/adapters/spec-implementation.fake-adapter.json --json
+cargo run -p whippletree-cli -- validate-policy examples/policies/spec-implementation.enterprise-policy.json --json
+cargo run -p whippletree-cli -- emit examples/workflows/minimal.whip --event start --payload '{"message":"hello"}' --json
+cargo run -p whippletree-cli -- run examples/workflows/minimal.whip --event start --payload '{"message":"hello"}' --json
+cargo run -p whippletree-cli -- run examples/workflows/minimal.whip --json
+cargo run -p whippletree-cli -- run examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --event idle --payload '{"activeRuns":0,"unfinishedItems":1}' --fake-call-output 'plan.snapshot="W1 ready"' --fake-coerce-output 'chooseNextStep={"action":"StartWorker","workItemId":"W1","reason":"ready","message":"Implement W1"}' --json
+cargo run -p whippletree-cli -- status examples/workflows/minimal.whip --json
+cargo run -p whippletree-cli -- overview examples/workflows/minimal.whip
+cargo run -p whippletree-cli -- harness status examples/workflows/minimal.whip --json
+cargo run -p whippletree-cli -- harness once examples/workflows/minimal.whip --config harness.json --json
+cargo run -p whippletree-cli -- harness run examples/workflows/minimal.whip --config harness.json --drive-workflow --max-iterations 10 --json
+cargo run -p whippletree-cli -- events examples/workflows/minimal.whip --json
+cargo run -p whippletree-cli -- events examples/workflows/minimal.whip --status failed --json
+cargo run -p whippletree-cli -- events examples/workflows/minimal.whip --status dead_lettered --json
+cargo run -p whippletree-cli -- retry-event examples/workflows/minimal.whip --event-id evt_cli_... --json
+cargo run -p whippletree-cli -- log examples/workflows/minimal.whip --json
+cargo run -p whippletree-cli -- build examples/workflows/minimal.whip --json
+cargo run -p whippletree-cli -- build examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --json
+cargo run -p whippletree-cli -- check examples/workflows/minimal.whip --target tla --json
+cargo run -p whippletree-cli -- check examples/workflows/minimal.whip --target maude --json
+cargo run -p whippletree-cli -- check examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --target tla --json
+cargo run -p whippletree-cli -- prove examples/workflows/minimal.whip --json
+cargo run -p whippletree-cli -- emit-model examples/workflows/minimal.whip --target tla
+cargo run -p whippletree-cli -- emit-config examples/workflows/minimal.whip --target tla
+cargo run -p whippletree-cli -- emit-model examples/workflows/minimal.whip --target maude
+cargo run -p whippletree-cli -- emit-model examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --target maude
 ```
 
 The repository smoke suite runs the maintained command set through
 `scripts/check-docs.sh`, `scripts/check-e2e.sh`, and
 `scripts/check-formal-models.sh`. Commands with placeholder ids, such as
 `retry-event --event-id evt_cli_...`, are illustrative and need a real event id
-from `armature events --json`.
+from `whip events --json`.
 
 Maude checks are embedded in the generated `.maude` file, so `emit-config` is
 only meaningful for TLA in the current implementation.

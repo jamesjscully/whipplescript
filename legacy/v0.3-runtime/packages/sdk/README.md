@@ -1,18 +1,18 @@
-# `@armature/sdk`
+# `@whippletree/sdk`
 
-Thin TypeScript helpers for Armature v0.3. The SDK shells out to the Armature CLI
-and reads Armature-provided runtime environment variables; it does not add a
+Thin TypeScript helpers for Whippletree v0.3. The SDK shells out to the Whippletree CLI
+and reads Whippletree-provided runtime environment variables; it does not add a
 second runtime, workflow DSL, or orchestration layer.
 
 ## Setup
 
-Make the `armature` binary available on `PATH`, or pass a binary path:
+Make the `whip` binary available on `PATH`, or pass a binary path:
 
 ```ts
-import { createArmature } from "@armature/sdk"
+import { createWhippletree } from "@whippletree/sdk"
 
-const armature = createArmature({
-  bin: "/path/to/armature",
+const whippletree = createWhippletree({
+  bin: "/path/to/whippletree",
   workspace: "/path/to/workspace",
 })
 ```
@@ -24,17 +24,17 @@ Every CLI-backed call requests JSON output and returns typed objects.
 The client exposes the canonical dynamic-management vocabulary directly:
 
 ```ts
-await armature.task.run("test")
-await armature.event.emit("build.completed", { ok: true })
-await armature.run.start({
+await whippletree.task.run("test")
+await whippletree.event.emit("build.completed", { ok: true })
+await whippletree.run.start({
   name: "one-shot",
   command: ["node", "scripts/check.mjs"],
   correlation: "corr-123",
 })
 
-const events = await armature.event.list({ type: "build.completed", limit: 10 })
-const runs = await armature.run.list({ correlation: "corr-123" })
-const trigger = await armature.wait.trigger({
+const events = await whippletree.event.list({ type: "build.completed", limit: 10 })
+const runs = await whippletree.run.list({ correlation: "corr-123" })
+const trigger = await whippletree.wait.trigger({
   task: "reviewer",
   outcome: "started",
   timeout: "30s",
@@ -42,38 +42,38 @@ const trigger = await armature.wait.trigger({
 ```
 
 These helpers are thin wrappers over object-oriented CLI commands such as
-`armature task run`, `armature event emit`, `armature run start`, and
-`armature wait trigger`. They do not add workflow state, semantic retries, or
+`whip task run`, `whip event emit`, `whip run start`, and
+`whip wait trigger`. They do not add workflow state, semantic retries, or
 agent graph behavior.
 
 Dynamic definitions are runtime definitions:
 
 ```ts
-await armature.service.add("github-source", ["node", "sources/github.mjs"], {
+await whippletree.service.add("github-source", ["node", "sources/github.mjs"], {
   restart: "on_failure",
   reason: "bridge github events",
 })
 
-await armature.task.add("reviewer", ["node", "agents/reviewer.mjs"], {
+await whippletree.task.add("reviewer", ["node", "agents/reviewer.mjs"], {
   on: "plan.ready",
   correlation: "corr-123",
 })
 
-console.log(await armature.service.list({ dynamic: true }))
-console.log(await armature.task.list({ dynamic: true }))
-await armature.task.remove("reviewer")
-await armature.service.remove("github-source")
+console.log(await whippletree.service.list({ dynamic: true }))
+console.log(await whippletree.task.list({ dynamic: true }))
+await whippletree.task.remove("reviewer")
+await whippletree.service.remove("github-source")
 ```
 
 They live in the daemon runtime until removed, daemon shutdown, or workspace
-reset. The SDK does not rewrite `.armature/armature.toml`.
+reset. The SDK does not rewrite `.whippletree/project.whip`.
 
 ## Runtime Context
 
 Task and service processes can read their run and event context:
 
 ```ts
-import { getEvent, getPayload, getRunContext } from "@armature/sdk"
+import { getEvent, getPayload, getRunContext } from "@whippletree/sdk"
 
 const context = getRunContext()
 const event = getEvent<{ runId: string; ok: boolean }>()
@@ -82,11 +82,11 @@ const payload = getPayload<{ runId: string; ok: boolean }>()
 console.log(context.runId, context.runDirectory, event.event_type, payload.ok)
 ```
 
-`getEvent()` reads `ARMATURE_EVENT_JSON`, `ARMATURE_EVENT`, or
-`ARMATURE_EVENT_PATH`. `getRunContext()` also exposes
-`ARMATURE_CORRELATION_ID` as `correlationId`.
+`getEvent()` reads `WHIPPLETREE_EVENT_JSON`, `WHIPPLETREE_EVENT`, or
+`WHIPPLETREE_EVENT_PATH`. `getRunContext()` also exposes
+`WHIPPLETREE_CORRELATION_ID` as `correlationId`.
 
-When SDK code calls `emit()` from inside an Armature-managed task or service, the
+When SDK code calls `emit()` from inside an Whippletree-managed task or service, the
 CLI records mechanical provenance inherited from the process environment:
 `source_run_id`, `parent_event_id`, and optional `correlation_id`.
 
@@ -97,27 +97,27 @@ await emit("review.ready", { ok: true }, { correlation: "corr-123" })
 ## Daemon And Inspection
 
 ```ts
-import { armature } from "@armature/sdk"
+import { whippletree } from "@whippletree/sdk"
 
-await armature.up()
-await armature.restart()
+await whippletree.up()
+await whippletree.restart()
 
-const snapshot = await armature.status()
-const overview = await armature.overview()
-const tasks = await armature.tasks()
-const services = await armature.services()
-const runs = await armature.runs()
-const logOutput = await armature.logs(runs[0].id)
+const snapshot = await whippletree.status()
+const overview = await whippletree.overview()
+const tasks = await whippletree.tasks()
+const services = await whippletree.services()
+const runs = await whippletree.runs()
+const logOutput = await whippletree.logs(runs[0].id)
 
 console.log(snapshot, overview, tasks, services, logOutput)
 
-await armature.down()
+await whippletree.down()
 ```
 
 Equivalent named exports are available for common calls:
 
 ```ts
-import { emit, logs, overview, run, runs, services, status, tasks } from "@armature/sdk"
+import { emit, logs, overview, run, runs, services, status, tasks } from "@whippletree/sdk"
 
 const started = await run("test")
 await emit("build.completed", { runId: started.run_id, ok: true })
@@ -125,28 +125,28 @@ console.log(await status(), await overview(), await tasks(), await services(), a
 console.log(await logs(started.run_id))
 ```
 
-`overview()` wraps `armature overview` and returns the compact mechanical status
+`overview()` wraps `whip overview` and returns the compact mechanical status
 view: configured tasks/services, active runs, latest run per task/service, queued
 trigger counts, recent failures, recent events, and recent triggers.
 
 `logs(runId)` returns captured stdout/stderr plus the run record, run directory,
 log paths, byte counts, line counts, truncation flags, and missing-file flags
-exposed by `armature --format json logs`.
+exposed by `whip --format json logs`.
 
 ## Services
 
 ```ts
-import { armature } from "@armature/sdk"
+import { whippletree } from "@whippletree/sdk"
 
-await armature.startService("worker")
-await armature.restartService("worker")
-await armature.stopService("worker")
+await whippletree.startService("worker")
+await whippletree.restartService("worker")
+await whippletree.stopService("worker")
 ```
 
 ## Locks
 
 ```ts
-import { lock, locks, renewLock, unlock, withLock } from "@armature/sdk"
+import { lock, locks, renewLock, unlock, withLock } from "@whippletree/sdk"
 
 await withLock("branch:main", async () => {
   // user-space critical section
@@ -157,7 +157,7 @@ await renewLock(held.name, held.token, "10m")
 console.log(await locks())
 await unlock(held.name, held.token)
 
-await armature.lock.withCommand("repo:main", ["npm", "test"], {
+await whippletree.lock.withCommand("repo:main", ["npm", "test"], {
   ttl: "2m",
   reason: "test main branch",
 })
@@ -166,7 +166,7 @@ await armature.lock.withCommand("repo:main", ["npm", "test"], {
 ## Files And Structured Logs
 
 ```ts
-import { log, readJson, writeJson } from "@armature/sdk"
+import { log, readJson, writeJson } from "@whippletree/sdk"
 
 await writeJson("result.json", { ok: true })
 const result = await readJson<{ ok: boolean }>("result.json")
@@ -176,16 +176,16 @@ log({ level: "info", message: "result written", ok: result.ok })
 
 ## Errors
 
-CLI failures and invalid JSON are reported as `ArmatureSdkError` with a stable
+CLI failures and invalid JSON are reported as `WhippletreeSdkError` with a stable
 `kind` and optional `details` object:
 
 ```ts
-import { ArmatureSdkError, status } from "@armature/sdk"
+import { WhippletreeSdkError, status } from "@whippletree/sdk"
 
 try {
   await status()
 } catch (error) {
-  if (error instanceof ArmatureSdkError) {
+  if (error instanceof WhippletreeSdkError) {
     console.error(error.kind, error.details)
   }
 }

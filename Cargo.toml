@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "crates/armature-cli",
-    "crates/armature-core",
-    "crates/armature-kernel",
-    "crates/armature-parser",
-    "crates/armature-store",
+    "crates/whippletree-cli",
+    "crates/whippletree-core",
+    "crates/whippletree-kernel",
+    "crates/whippletree-parser",
+    "crates/whippletree-store",
 ]
 resolver = "2"
 

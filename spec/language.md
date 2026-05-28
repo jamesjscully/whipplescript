@@ -17,7 +17,7 @@ provide those facts; the language defines policy over them.
 
 ## Example Shape
 
-```armature
+```whippletree
 workflow SpecImplementation
 
 agent worker {
@@ -118,8 +118,8 @@ Core integrations also provide source-level affordances for common workflow
 boundaries:
 
 ```text
-docket has ready issue
-claim issue with docket
+loft has ready issue
+claim issue with loft
 askHuman
 coerce
 attach skill
@@ -150,10 +150,49 @@ those through ordinary durable effects and completion facts.
 Every effect has an idempotency key, required capabilities, and a completion
 contract.
 
+The runtime enforces effect authority through a durable registry:
+
+- capability schemas define the authority name and input contract
+- effect providers bind effect kinds to executable providers
+- profiles describe allowed capability sets and whether enforcement is strict
+- capability bindings grant a program access to a provider for a capability
+
+The built-in registry ships `permissive`, `repo-reader`, `repo-writer`,
+`internet-research`, and `human-review` profiles. If an effect requests a
+capability that is not registered, not bound, or not allowed by its profile, the
+effect is blocked before a provider run starts. The block reason is written to
+the event log and effect projection, so `status` and trace-conformance checks can
+explain why no worker was started.
+
+Plugins are loaded as manifests that register capability schemas, effect
+providers, optional profiles, and optional bindings. They extend the registry
+but do not receive mutable access to kernel state or control-flow semantics.
+
 All fact payloads, effect payloads, and `coerce` signatures use the type system
-defined in [type-system.md](type-system.md). Armature supports BAML-compatible
+defined in [type-system.md](type-system.md). Whippletree supports BAML-compatible
 boundary types, but only a small pure expression kernel. It should not grow
 loops, collection pipelines, numeric libraries, or media manipulation.
+
+## Parser Strategy
+
+The initial compiler uses a hand-written lexer/parser in
+`crates/whippletree-parser`. The grammar is still settling, so this keeps the
+parser easy to adjust while preserving the properties the compiler needs:
+
+```text
+byte-accurate source spans
+recoverable diagnostics
+raw rule/effect block preservation
+typed top-level syntax nodes for workflow, skills, schemas, agents, and rules
+```
+
+The parser should only become generator-backed if the grammar stabilizes enough
+that generated parse tables are easier to maintain than direct Rust code.
+
+`whip check` renders diagnostics with source excerpts, caret underlines,
+and next-step help where the compiler can identify a likely fix. The parser
+crate also exposes formatter scaffolding that canonicalizes declarations while
+preserving rule and coerce block bodies for later lowering work.
 
 ## Facts
 
@@ -166,7 +205,7 @@ projection, or plugin projection. See
 
 Typed fact declarations use classes:
 
-```armature
+```whippletree
 class ReviewedWork {
   turn AgentTurn
   review WorkReview
@@ -175,7 +214,7 @@ class ReviewedWork {
 
 Producing a fact:
 
-```armature
+```whippletree
 record ReviewedWork {
   turn turn
   review review
@@ -184,7 +223,7 @@ record ReviewedWork {
 
 Matching a fact:
 
-```armature
+```whippletree
 when ReviewedWork as reviewed
 when reviewed.review.status == Accept
 ```
@@ -200,8 +239,8 @@ set to `null`.
 
 Conversational fact sugar is allowed for core integrations:
 
-```armature
-when docket has ready issue as issue
+```whippletree
+when loft has ready issue as issue
 when worker is available
 ```
 
@@ -228,8 +267,8 @@ capability/effect kind
 
 Examples:
 
-```armature
-claim issue with docket as claim
+```whippletree
+claim issue with loft as claim
 
 after claim succeeds {
   tell worker """
@@ -238,12 +277,12 @@ after claim succeeds {
 }
 ```
 
-The downstream `agent.tell` effect is correlated with the `docket.claim` output
+The downstream `agent.tell` effect is correlated with the `loft.claim` output
 and the claimed issue. Later completion facts can therefore support patterns
 like:
 
-```armature
-when worker completed turn for docket issue as turn
+```whippletree
+when worker completed turn for loft issue as turn
 ```
 
 without asking the compiler to infer meaning from prompt text.
@@ -252,12 +291,12 @@ without asking the compiler to infer meaning from prompt text.
 
 Use `after` when one effect must wait for another:
 
-```armature
+```whippletree
 rule implement_claimed_issue
-  when docket has ready issue as issue
+  when loft has ready issue as issue
   when worker is available
 => {
-  claim issue with docket as claim
+  claim issue with loft as claim
 
   after claim succeeds {
     tell worker """
@@ -290,7 +329,7 @@ effect graph syntax.
 `coerce` should read like a typed model decision, but it is semantically
 asynchronous and durable:
 
-```armature
+```whippletree
 rule classify
   when worker completed work as item
 => {
@@ -315,13 +354,13 @@ to a small, explainable rewrite.
 
 Bad direction:
 
-```armature
+```whippletree
 manage team until done
 ```
 
 Good direction:
 
-```armature
+```whippletree
 when ready work as item
 when worker is available
 => tell worker item

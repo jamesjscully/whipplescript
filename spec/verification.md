@@ -2,10 +2,10 @@
 
 Status: draft
 
-Armature needs two related but separate verification tracks:
+Whippletree needs two related but separate verification tracks:
 
 1. Validate the architecture before and after implementation.
-2. Statically analyze user Armature programs as a product feature.
+2. Statically analyze user Whippletree programs as a product feature.
 
 The same semantics should feed both tracks, but the tools should not be forced
 into one shape.
@@ -14,9 +14,9 @@ into one shape.
 
 ### Maude: Rule Kernel And Program Semantics
 
-Maude is the primary tool for the Armature language kernel. Maude system modules
+Maude is the primary tool for the Whippletree language kernel. Maude system modules
 specify rewrite theories, and rewrite rules represent local state transitions.
-That matches Armature's core model:
+That matches Whippletree's core model:
 
 ```text
 facts + events + effect queue + dependency edges + rewrite rules
@@ -33,7 +33,7 @@ bounded searches for bad rule cycles
 generated per-program counterexample checks
 ```
 
-Maude should be the first formal target generated from typed Armature IR.
+Maude should be the first formal target generated from typed Whippletree IR.
 
 ### TLA+/Apalache: Durable Runtime Lifecycles
 
@@ -93,7 +93,7 @@ Represent runtime state as a Maude configuration:
   control : RuntimeMeta >
 ```
 
-Each Armature rule lowers to one or more Maude rewrite rules. External systems
+Each Whippletree rule lowers to one or more Maude rewrite rules. External systems
 are modeled nondeterministically:
 
 ```text
@@ -150,6 +150,12 @@ Initial liveness/fairness goals, checked only after safety stabilizes:
 - expired leases eventually recover or become terminal
 - unprocessed events eventually reach the projection cursor
 
+Current implementation names these goals in `ControlPlaneLifecycle.tla` as
+`FairSpec` and `LivenessGoals`, with per-property formulas for claimable
+effects, running leased effects, projection catch-up, and recovery completion.
+The default repository check typechecks those temporal formulas. Full temporal
+proof remains a later hardening activity rather than a v0 release blocker.
+
 ## Runtime Trace Conformance
 
 The implementation should emit enough evidence to replay its behavior against
@@ -180,7 +186,7 @@ Trace conformance should reject:
 
 This is the bridge between formal specs and the Rust implementation.
 
-## Static Analysis Of Armature Programs
+## Static Analysis Of Whippletree Programs
 
 Compiler checks should be fast, local, and explainable:
 
@@ -199,14 +205,46 @@ capacity/resource constraints
 Generated Maude checks should be optional at first:
 
 ```sh
-armature check workflow.armature --model-search
+whip check workflow.whip --model-search
 ```
 
 They should provide bounded counterexamples for unsafe orchestration patterns,
 not require authors to understand Maude.
 
+Current implementation generates a temporary Maude module from typed IR effect
+dependencies and runs dependency-release searches through:
+
+```sh
+whip check --model-search workflow.whip
+```
+
+The first generated searches verify that downstream effects cannot run while an
+upstream dependency is still queued, that satisfying terminal states release the
+downstream effect, and that non-satisfying terminal states do not release
+success/failure-specific branches.
+
+When a generated search returns an unexpected result, the CLI reports a
+source-span diagnostic at the matching `after <effect> <predicate>` dependency
+anchor and includes the expected and actual Maude result.
+
+The CLI test suite includes an expected-failure generated-check fixture: it
+compiles a real Whippletree example, injects one unsafe dependency-release rewrite
+into the generated Maude module, and asserts that Maude finds the resulting
+counterexample when `maude` is available on `PATH`.
+
 Do not generate TLA+ per user program in v0. TLA+ models the runtime/control
 plane; Maude models user program behavior.
+
+## CI Policy
+
+Run TLA+/Apalache in default CI for v0 because it checks the durable
+control-plane lifecycle rather than per-user workflows. Keep generated
+per-program Maude checks opt-in through `whip check --model-search` so
+ordinary authoring checks do not require every formal tool locally.
+
+The CI path should call `scripts/check-tla-models.sh`; that script owns the
+Apalache/Nix fallback and keeps the workflow definition independent of local
+tool installation details.
 
 ## Scope Boundary
 
@@ -216,7 +254,7 @@ Verification does not prove:
 - external agent correctness
 - filesystem correctness
 - semantic truth of model classifications
-- correctness of Docket or Thoth internals
+- correctness of Loft or Thoth internals
 
 It proves orchestration-kernel properties under typed contracts for external
 results.
@@ -243,6 +281,6 @@ The strategy is based on:
 2. Hand-write the TLA+ control-plane lifecycle model.
 3. Add a lightweight trace-conformance contract to the runtime-store and
    observability specs.
-4. Encode Ralph loop and Docket-claim-before-agent-turn examples.
+4. Encode Ralph loop and Loft-claim-before-agent-turn examples.
 5. Add generated Maude from typed rule IR once the parser/IR exists.
 6. Reevaluate Veil after the kernel semantics stop moving.

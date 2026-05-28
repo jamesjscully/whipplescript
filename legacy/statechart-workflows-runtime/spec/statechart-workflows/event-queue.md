@@ -179,12 +179,12 @@ The default during early development should be `keep_all`.
 Event commands:
 
 ```text
-armature emit workflow.armature --event <event-type> --payload <json>
-armature events workflow.armature
-armature events workflow.armature --status failed
-armature events workflow.armature --status dead_lettered
-armature events workflow.armature --json
-armature retry-event workflow.armature --event-id <event-id>
+whip emit workflow.whip --event <event-type> --payload <json>
+whip events workflow.whip
+whip events workflow.whip --status failed
+whip events workflow.whip --status dead_lettered
+whip events workflow.whip --json
+whip retry-event workflow.whip --event-id <event-id>
 ```
 
 `retry-event` is an administrative command. It should require that the event is

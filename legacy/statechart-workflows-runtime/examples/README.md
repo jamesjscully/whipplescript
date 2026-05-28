@@ -1,23 +1,23 @@
 # Examples
 
-This directory contains workflow-first examples for the new `.armature` product
+This directory contains workflow-first examples for the new `.whip` product
 surface.
 
 ## Workflows
 
-[`workflows/`](workflows/) contains native `.armature` source sketches:
+[`workflows/`](workflows/) contains native `.whip` source sketches:
 
-- `minimal.armature` is a tiny statechart shape for parser/runtime scaffolding.
-- `simple-supervisor.armature` is a compact director notification workflow for
+- `minimal.whip` is a tiny statechart shape for parser/runtime scaffolding.
+- `simple-supervisor.whip` is a compact director notification workflow for
   completion and idle observation events.
-- `baml-coerce-smoke.armature` is a small opt-in real BAML HTTP smoke workflow.
-- `spec-implementation.armature` is the target managed spec implementation
+- `baml-coerce-smoke.whip` is a small opt-in real BAML HTTP smoke workflow.
+- `spec-implementation.whip` is the target managed spec implementation
   workflow.
 
 The examples are used by parser, validation, runtime, formal-check, and e2e
 tests. Normal CI uses deterministic fake adapter/coerce outputs; the BAML smoke
-workflow runs only when a developer opts in with `ARMATURE_RUN_BAML_E2E=1` and
-`ARMATURE_BAML_URL`.
+workflow runs only when a developer opts in with `WHIPPLETREE_RUN_BAML_E2E=1` and
+`WHIPPLETREE_BAML_URL`.
 
 ## Policies
 
@@ -35,7 +35,7 @@ workflow runs only when a developer opts in with `ARMATURE_RUN_BAML_E2E=1` and
 ## Templates
 
 [`templates/`](templates/) contains copyable workflow starting points. Start
-with `simple-agent-supervisor.armature` when you need a small worker lifecycle
+with `simple-agent-supervisor.whip` when you need a small worker lifecycle
 loop that uses the built-in JSON agent-file adapter.
 
 ## Managed Spec Orchestration

@@ -52,7 +52,7 @@ workflow data expression invariants runtime enforcement now, generated model lat
 adapter capability authority        static validation, runtime policy, adapter tests
 ```
 
-The hand-written model should be written against the native `.armature` DSL and
+The hand-written model should be written against the native `.whip` DSL and
 WorkflowIR semantics. Generated models should consume validated WorkflowIR, not
 raw source text.
 
@@ -68,8 +68,8 @@ scripts/check-formal-models.sh
 
 `scripts/check-formal-models.sh` checks both tracks: the source-controlled
 hand-written TLA+/Maude models in this directory and the generated TLA+/Maude
-models produced from `examples/workflows/spec-implementation.armature` through
-`armature check`.
+models produced from `examples/workflows/spec-implementation.whip` through
+`whip check`.
 
 TLC result recorded during the initial implementation pass:
 
@@ -91,6 +91,6 @@ search found no invariant-violating solution
 Apalache is not currently pinned. Phase 1 should either add an Apalache
 installation path or continue with TLC plus Maude first.
 
-Generated models should eventually live under `.armature/build/models/` for a
+Generated models should eventually live under `.whippletree/build/models/` for a
 specific workflow build. This directory is for source-controlled design models
 and fixtures.

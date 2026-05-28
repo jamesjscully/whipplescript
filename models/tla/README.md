@@ -32,6 +32,7 @@ claim effect
 start run
 complete/fail run
 expire lease
+start/finish recovery from the durable event log
 pause/resume/cancel
 dependency-gated claimability
 ```
@@ -45,8 +46,24 @@ claimability and dependency satisfaction
 paused instances not producing new claimable work
 terminal effects staying terminal
 projection cursor bounds
+recovery preserving event-log order
 basic type correctness
 ```
+
+It also names weak-fairness and liveness goals:
+
+```text
+FairSpec
+LivenessGoals
+ClaimableEffectEventuallyRunsOrStops
+RunningEffectEventuallyTerminalsOrRecovers
+ProjectionEventuallyCatchesUp
+RecoveryEventuallyFinishes
+```
+
+The default script typechecks these formulas with Apalache. It does not treat
+full temporal liveness proof as a v0 release gate; the formulas are kept in the
+model so future TLC/Apalache temporal-checking work has a stable target.
 
 Current local workspace status:
 
@@ -63,3 +80,13 @@ scripts/check-tla-models.sh
 
 If `apalache-mc` is not already on `PATH`, the script enters the repo Nix dev
 shell and runs the check there.
+
+CI policy:
+
+```text
+run TLA+/Apalache in default CI
+keep generated per-program Maude model search opt-in from the CLI
+```
+
+This keeps durable control-plane regressions in the normal gate while avoiding a
+formal-tool requirement for ordinary local `whip check` usage.

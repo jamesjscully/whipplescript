@@ -3,4 +3,8 @@ dist/
 node_modules/
 _apalache-out/
 .DS_Store
-**/.armature/workflows/*.sqlite
+.env
+.env.local
+.env.*.local
+**/.whippletree/workflows/*.sqlite
+.whippletree/*.sqlite

@@ -1,0 +1,18 @@
+error: expected profile string, found number literal
+  --> examples/invalid/broken.whip:4:11
+  |
+4 |   profile 42
+  |           ^^
+  = help: write `profile "profile-name"`
+error: expected capacity value, found identifier `nope`
+  --> examples/invalid/broken.whip:5:12
+  |
+5 |   capacity nope
+  |            ^^^^
+  = help: write `capacity 1`
+error: expected `{`, found end of file
+   --> examples/invalid/broken.whip:11:1
+   |
+11 |
+   | ^
+   = help: add a `{ ... }` block

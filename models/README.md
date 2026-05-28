@@ -2,7 +2,7 @@
 
 Status: draft
 
-This directory holds formal and semi-formal models for the new Armature kernel.
+This directory holds formal and semi-formal models for the new Whippletree kernel.
 
 The split is intentional:
 

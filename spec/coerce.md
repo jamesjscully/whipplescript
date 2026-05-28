@@ -2,7 +2,7 @@
 
 Status: draft
 
-`coerce` is Armature's typed model-decision effect. It uses BAML's strengths:
+`coerce` is Whippletree's typed model-decision effect. It uses BAML's strengths:
 typed classes/enums, prompt functions, clients, tests, and output validation.
 
 In the rule-machine design, `coerce` is not a synchronous in-transaction call.
@@ -27,7 +27,7 @@ See [type-system.md](type-system.md) for the shared boundary type system used by
 
 Possible authoring syntax:
 
-```armature
+```whippletree
 class WorkClassification {
   status WorkStatus
   reason string
@@ -62,7 +62,7 @@ typed fact that the second rule can match.
 If another effect must use the coerce output immediately, use the execution
 contract's dependency syntax:
 
-```armature
+```whippletree
 coerce classifyWork(item.summary) as classification
 
 after classification succeeds {
@@ -76,7 +76,7 @@ This lowers to durable effect dependency edges, not an inline model call.
 
 Source syntax:
 
-```armature
+```whippletree
 coerce reviewWork(turn.issue.title, turn.summary, turn.changedFiles) as review
 ```
 
@@ -108,7 +108,7 @@ DeclaredReturnType
 
 If `reviewWork(...) -> WorkReview`, then inside:
 
-```armature
+```whippletree
 after review succeeds {
   // review : WorkReview
 }
@@ -140,7 +140,7 @@ BamlCoerceTimedOut {
 
 Typing rules:
 
-```armature
+```whippletree
 after review succeeds {
   // review : WorkReview
 }
@@ -156,11 +156,11 @@ after review completes {
 
 ## Data Operations
 
-Armature should keep the legacy expression rule, now formalized in
+Whippletree should keep the legacy expression rule, now formalized in
 [type-system.md](type-system.md):
 
 ```text
-Armature-compatible types are schemas; they do not imply a full data language.
+Whippletree-compatible types are schemas; they do not imply a full data language.
 ```
 
 The language may support BAML-compatible boundary types:
@@ -211,7 +211,7 @@ general user-defined functions
 ```
 
 If a workflow needs nontrivial reasoning over data, it should call a typed
-`coerce` function or registered capability. That keeps Armature an
+`coerce` function or registered capability. That keeps Whippletree an
 orchestration language rather than slowly growing into a brittle half-language.
 
 Multimodal values are opaque boundary values. A workflow may pass an `image`,
@@ -220,7 +220,7 @@ schema and policy allow it, but it cannot inspect or transform the media inline.
 
 ## Generated BAML
 
-Armature source may define:
+Whippletree source may define:
 
 - classes
 - enums
@@ -252,6 +252,29 @@ Allowed targets:
 3. External BAML endpoint in hosted environments.
 
 All modes must expose the same durable `baml.coerce` effect contract.
+
+Current implementation:
+
+- `ManagedBamlService` starts and owns a local BAML-compatible process, exposing
+  its configured endpoint until the service guard is dropped.
+- `HttpBamlClient` posts the durable coerce contract to `http://.../coerce` and
+  decodes JSON status, value, error, transcript, and usage fields.
+- `scripts/openai-coerce-server.mjs` is a local BAML-compatible `/coerce`
+  bridge backed by the OpenAI Responses API. It loads `OPENAI_API_KEY` from
+  `.env` or the environment, uses Structured Outputs, and defaults to
+  `gpt-5.4-mini` unless `WHIPPLETREE_OPENAI_MODEL` is set.
+- `scripts/check-openai-coerce.sh` starts that bridge and runs the no-mock
+  Coerce smoke test through the same `HttpBamlClient` path used for external
+  BAML-compatible endpoints.
+- `FakeBamlClient` provides deterministic CI coverage for success and failure
+  branches without credentials.
+- A no-mock smoke test runs when `WHIPPLETREE_BAML_TEST_ENDPOINT`,
+  `WHIPPLETREE_BAML_TEST_FUNCTION`, `WHIPPLETREE_BAML_TEST_ARGUMENTS_JSON`, and
+  `WHIPPLETREE_BAML_TEST_OUTPUT_TYPE` are set. `scripts/check-real-providers.sh`
+  requires those variables before claiming real-provider readiness.
+
+The built-in HTTP transport intentionally covers plain `http://` endpoints only.
+TLS and BAML SDK-specific transport are tracked separately.
 
 ## Completion Fact
 

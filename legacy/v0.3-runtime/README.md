@@ -1,9 +1,9 @@
-# Armature v0.3 Runtime
+# Whippletree v0.3 Runtime
 
-This directory contains the previous Armature task/service/script runner.
+This directory contains the previous Whippletree task/service/script runner.
 
 It has been moved out of the active workspace because the current project is
-being rebuilt around native `.armature` statechart workflows, validated
+being rebuilt around native `.whip` statechart workflows, validated
 WorkflowIR, typed effects, durable event queues, and trusted Rust adapters.
 
 The v0.3 runtime may still be mined for:

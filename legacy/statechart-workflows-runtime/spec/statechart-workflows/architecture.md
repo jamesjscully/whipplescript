@@ -2,14 +2,14 @@
 
 Status: design proposal
 
-Statechart workflows should be implemented as the new primary Armature product
-surface for this track. The old Armature daemon/task implementation may be
+Statechart workflows should be implemented as the new primary Whippletree product
+surface for this track. The old Whippletree daemon/task implementation may be
 reused opportunistically, but it should not define the conceptual model.
 
 The new core is:
 
 ```text
-native .armature source files
+native .whip source files
 validated workflow IR
 durable event queues
 append-only transition/effect logs
@@ -54,7 +54,7 @@ Build the workflow system directly around a custom parser, normalized IR, static
 validator, and durable interpreter.
 
 ```text
-.armature source
+.whip source
   -> logos lexer
   -> rowan lossless syntax tree
   -> typed AST / lowering
@@ -69,7 +69,7 @@ validator, and durable interpreter.
 Strengths:
 
 - fastest path to a usable workflow runtime
-- tight fit with Armature's existing runtime objects
+- tight fit with Whippletree's existing runtime objects
 - small number of moving parts
 - easy to run locally
 
@@ -112,7 +112,7 @@ Use existing statechart vocabulary or interchange formats while still executing
 with a restricted Rust interpreter.
 
 ```text
-.armature source
+.whip source
   -> statechart frontend
   -> XState/SCXML-shaped IR
   -> custom validator
@@ -140,7 +140,7 @@ The recommended architecture is:
 
 That means:
 
-- use the native `.armature` statechart DSL as the initial authoring format
+- use the native `.whip` statechart DSL as the initial authoring format
 - define a normalized IR before implementing the interpreter
 - write a hand-authored formal model before runtime behavior hardens
 - keep the runtime small and effect-based
@@ -154,7 +154,7 @@ far down a path with ambiguous semantics.
 
 ## System Components
 
-### 1. Armature Source Parser
+### 1. Whippletree Source Parser
 
 The parser reads one workflow source file and produces a lossless rowan syntax
 tree plus typed lowering diagnostics. This follows the newer BAML language
@@ -186,7 +186,7 @@ action normalization, and invariants lower according to
 
 ### 2. BAML Artifact Generator
 
-The generator turns Armature `class`, `enum`, and `coerce` declarations into
+The generator turns Whippletree `class`, `enum`, and `coerce` declarations into
 normal generated BAML artifacts.
 
 Responsibilities:
@@ -290,7 +290,7 @@ registered by adapters. They are not free-form workflow code.
 `coerce` and adapter value operations are synchronous typed value calls, not
 workflow control-flow authority. They produce values that the statechart may
 branch on. Any resulting `start`, `send`, `askHuman`, `raise`, or adapter write
-is still an explicit Armature effect with its own schema and capability checks.
+is still an explicit Whippletree effect with its own schema and capability checks.
 For local agents, `start`/`send` are native ledger writes rather than adapter
 dispatch.
 The v1 `coerce` backend is BAML HTTP via `baml-cli serve`; TypeScript codegen is
@@ -337,7 +337,7 @@ un-tie thread/session adapter
 human review adapter
 filesystem state adapter, scoped to declared files
 external process adapter, if explicitly enabled
-legacy Armature adapter, if compatibility is needed
+legacy Whippletree adapter, if compatibility is needed
 ```
 
 Harness providers and adapters should be narrow and capability-checked. They

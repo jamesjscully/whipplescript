@@ -1,12 +1,12 @@
 {
-  "name": "armature",
+  "name": "whippletree",
   "private": true,
   "workspaces": [
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspace @armature/sdk",
-    "test": "npm run test --workspace @armature/sdk"
+    "build": "npm run build --workspace @whippletree/sdk",
+    "test": "npm run test --workspace @whippletree/sdk"
   }
 }
 

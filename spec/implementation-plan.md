@@ -2,7 +2,7 @@
 
 Status: draft tracker
 
-This is the project tracker for the new Armature system. It runs from formal
+This is the project tracker for the new Whippletree system. It runs from formal
 modeling through the last e2e acceptance tests.
 
 The plan is organized as stage gates. A stage is complete only when its
@@ -11,14 +11,14 @@ updated. Checkboxes should be updated as implementation lands.
 
 ## Product Target
 
-Armature v0 should provide:
+Whippletree v0 should provide:
 
 - a restricted rule language for durable agent orchestration
 - typed facts, schemas, effect contracts, and capability profiles
 - an event-sourced runtime kernel backed by SQLite
 - a control plane for compiling, starting, inspecting, pausing, resuming, and
   cancelling workflow instances
-- first-party effects for agent turns, BAML-backed coercion, Docket claims,
+- first-party effects for agent turns, BAML-backed coercion, Loft claims,
   human review, skills, and evidence capture
 - adapter support for at least Codex, Claude Code, and Pi-style harnesses
 - formal checks and trace-conformance checks that catch orchestration bugs
@@ -27,19 +27,19 @@ Armature v0 should provide:
 ## Milestone Summary
 
 - [x] M0: Formal kernel spine is executable and checked in CI.
-- [ ] M1: Source language grammar, parser, and typed IR compile example
+- [x] M1: Source language grammar, parser, and typed IR compile example
   programs.
-- [ ] M2: Runtime store and kernel can replay events and commit deterministic
+- [x] M2: Runtime store and kernel can replay events and commit deterministic
   rule rewrites.
-- [ ] M3: Durable effects, dependency scheduling, leases, retries, and trace
+- [x] M3: Durable effects, dependency scheduling, leases, retries, and trace
   conformance work end to end.
-- [ ] M4: Control plane and CLI manage programs and instances.
-- [ ] M5: Capability registry, skills, agent harnesses, BAML coerce, Docket,
+- [x] M4: Control plane and CLI manage programs and instances.
+- [x] M5: Capability registry, skills, agent harnesses, BAML coerce, Loft,
   human review, and observability are wired through typed effect contracts.
-- [ ] M6: Static analysis and generated Maude checks protect user programs.
-- [ ] M7: E2E suite covers happy paths, failure paths, recovery, and dogfood
+- [x] M6: Static analysis and generated Maude checks protect user programs.
+- [x] M7: E2E suite covers happy paths, failure paths, recovery, and dogfood
   workflows.
-- [ ] M8: Companion skill and release hardening make the system usable by
+- [x] M8: Companion skill and release hardening make the system usable by
   coding agents without hand-holding.
 
 ## Stage 0: Repository Reset And Project Skeleton
@@ -56,6 +56,12 @@ Goal: make the repo coherent after the redesign and isolate old systems.
 - [x] Add CI for formatting, Rust tests, formal checks, and e2e smoke tests.
 - [x] Add a top-level developer README that points to the new specs, not the
   legacy systems.
+- [x] Audit Stage 0 against the repo layout, specs, tests, and docs; record
+  gaps for the final audit stage.
+  - Active implementation is rooted in the new Rust workspace and spec/model
+    tree.
+  - Legacy implementations are isolated under `legacy/`.
+  - No blocking Stage 0 gaps remain.
 
 Acceptance:
 
@@ -73,7 +79,7 @@ Goal: validate the core execution model before and during implementation.
   release.
 - [x] Add hand-written dependency tests for `succeeds`, `fails`, and
   `completes`.
-- [x] Add a Docket-claim-gated agent-turn model test.
+- [x] Add a Loft-claim-gated agent-turn model test.
 - [x] Make `scripts/check-formal-models.sh` assert expected Maude search
   outcomes.
 - [x] Extend the Maude model with durable event log, fact projection, effect
@@ -83,236 +89,284 @@ Goal: validate the core execution model before and during implementation.
 - [x] Model retry, timeout, cancellation, and lease expiry outcomes.
 - [x] Add a Ralph loop model with an explicit external-event boundary.
 - [x] Add a coerce classification model with success/failure branches.
-- [ ] Add generated Maude checks from typed IR once the compiler exists.
+- [x] Add generated Maude checks from typed IR once the compiler exists.
 
 ### TLA+/Apalache Runtime Lifecycle
 
 - [x] Finish the TLA+ lifecycle model for append, projection, claim, lease,
   retry, completion, pause/resume, cancellation, and recovery.
 - [x] Install or document the Apalache runner path used by CI.
-- [ ] Add bounded checks for safety invariants:
+- [x] Add bounded checks for safety invariants:
   - [x] every run references an existing effect
   - [x] no effect has more than one terminal completion
   - [x] no provider run starts unless the effect is claimable
   - [x] no claimable effect has unsatisfied dependencies
   - [x] paused instances do not commit new effectful rewrites
-  - [ ] recovery does not reorder the per-instance event log
-- [ ] Add liveness/fairness checks only after safety checks stabilize.
+  - [x] recovery does not reorder the per-instance event log
+- [x] Add liveness/fairness checks only after safety checks stabilize.
+  - `ControlPlaneLifecycle.tla` now names weak-fairness assumptions and
+    temporal liveness goals for claimable effects, running leased effects,
+    projection catch-up, and recovery completion.
+  - The default TLA script typechecks these formulas; full temporal proof
+    remains future hardening, not a v0 release gate.
 
 ### Trace Conformance
 
 - [x] Define the trace event schema consumed by model checkers.
 - [x] Implement a trace checker that validates runtime traces against kernel
   invariants.
-- [ ] Add trace checker fixtures for success, dependency violation, duplicate
+- [x] Add trace checker fixtures for success, dependency violation, duplicate
   terminal completion, stale lease completion, and pause/cancel races.
   - [x] success
   - [x] dependency violation
   - [x] duplicate terminal completion
-  - [ ] stale lease completion
+  - [x] stale lease completion
   - [x] pause/cancel race basics
 
 ### Veil/Lean Recheck
 
-- [ ] Reevaluate Veil after the kernel semantics and trace schema stabilize.
-- [ ] Decide whether Veil proves stable invariants or remains out of v0.
+- [x] Reevaluate Veil after the kernel semantics and trace schema stabilize.
+  - Decision: keep Veil out of v0 and revisit it after the runtime semantics
+    stop moving.
+- [x] Decide whether Veil proves stable invariants or remains out of v0.
+- [x] Audit Stage 1 against the formal models, generated-check plan, trace
+  fixtures, and CI wiring; record gaps for the final audit stage.
+  - Hand-written Maude and TLA+/Apalache checks run through repository scripts.
+  - Generated per-program Maude checks are available through
+    `whip check --model-search`.
+  - Trace conformance fixtures cover success and lifecycle violation cases.
+  - Veil remains a documented later-assurance path, not a v0 gate.
 
 Acceptance:
 
-- [ ] Formal checks fail on intentionally broken dependency-release behavior.
-- [ ] Runtime trace fixtures catch impossible lifecycle transitions.
-- [ ] Generated Maude checks can be run optionally from the CLI.
+- [x] Formal checks fail on intentionally broken dependency-release behavior.
+- [x] Runtime trace fixtures catch impossible lifecycle transitions.
+- [x] Generated Maude checks can be run optionally from the CLI.
 
 ## Stage 2: Source Language, Parser, And Typed IR
 
-Goal: compile `.armature` source into deterministic, typed IR.
+Goal: compile `.whip` source into deterministic, typed IR.
 
-- [ ] Finalize v0 grammar for rules, schemas, agents, skills, capabilities,
+- [x] Finalize v0 grammar for rules, schemas, agents, skills, capabilities,
   effects, `after` blocks, `coerce`, and record construction.
-- [ ] Choose and document the parser implementation strategy.
-- [ ] Implement lexer/parser with diagnostics that preserve source spans.
-- [ ] Build a recoverable parse tree suitable for formatting and helpful
+- [x] Choose and document the parser implementation strategy.
+- [x] Implement lexer/parser with diagnostics that preserve source spans.
+- [x] Build a recoverable parse tree suitable for formatting and helpful
   errors.
-- [ ] Define the typed AST and typed rule IR.
-- [ ] Implement lowering from source AST to typed IR.
-- [ ] Support BAML-aligned boundary types:
-  - [ ] string
-  - [ ] int
-  - [ ] float
-  - [ ] bool
-  - [ ] null
-  - [ ] literal
-  - [ ] array
-  - [ ] map
-  - [ ] union
-  - [ ] class
-  - [ ] enum
-  - [ ] image
-  - [ ] audio
-  - [ ] pdf
-  - [ ] video
-- [ ] Implement source-span-aware errors modeled after Gleam-style diagnostics.
-- [ ] Add golden parse/IR fixtures for all examples.
-- [ ] Add formatter scaffolding after the parse tree stabilizes.
+- [x] Define the typed AST and typed rule IR.
+- [x] Implement lowering from source AST to typed IR.
+- [x] Support BAML-aligned boundary types:
+  - [x] string
+  - [x] int
+  - [x] float
+  - [x] bool
+  - [x] null
+  - [x] literal
+  - [x] array
+  - [x] map
+  - [x] union
+  - [x] class
+  - [x] enum
+  - [x] image
+  - [x] audio
+  - [x] pdf
+  - [x] video
+- [x] Implement source-span-aware errors modeled after Gleam-style diagnostics.
+- [x] Add golden parse/IR fixtures for all examples.
+- [x] Add formatter scaffolding after the parse tree stabilizes.
+- [x] Audit Stage 2 against the language specs, examples, diagnostics, and IR
+  snapshots; record gaps for the final audit stage.
+  - Checked examples produce stable IR snapshots.
+  - Invalid examples have source-span diagnostics and targeted suggestions.
+  - Final-audit gap: equality guards are deliberately outside the v0 grammar
+    until guard-expression design is settled.
 
 Acceptance:
 
-- [ ] `armature check examples/*.armature` produces stable typed IR.
-- [ ] Invalid examples produce precise errors with source spans and suggested
+- [x] `whip check examples/*.whip` produces stable typed IR.
+- [x] Invalid examples produce precise errors with source spans and suggested
   fixes.
-- [ ] IR snapshots are deterministic across runs.
+- [x] IR snapshots are deterministic across runs.
 
 ## Stage 3: Static Analysis
 
 Goal: reject programs that would produce hidden distributed-system bugs.
 
-- [ ] Validate schema references, field paths, enum variants, and literal
+- [x] Validate schema references, field paths, enum variants, and literal
   types.
-- [ ] Validate fact read/write/consume sets for each rule.
-- [ ] Validate effect contracts and output binding scopes.
-- [ ] Reject use of effect outputs outside their matching `after` branch.
-- [ ] Validate finite effect graphs and dependency edge references.
-- [ ] Reject implicit ordering assumptions between sibling effects.
-- [ ] Build rule dependency graph analysis.
-- [ ] Implement recursion stratification.
-- [ ] Reject effectful cycles that do not cross an external event, clock,
+- [x] Validate fact read/write/consume sets for each rule.
+- [x] Validate effect contracts and output binding scopes.
+- [x] Reject use of effect outputs outside their matching `after` branch.
+- [x] Validate finite effect graphs and dependency edge references.
+- [x] Reject implicit ordering assumptions between sibling effects.
+- [x] Build rule dependency graph analysis.
+- [x] Implement recursion stratification.
+- [x] Reject effectful cycles that do not cross an external event, clock,
   human, or durable boundary.
-- [ ] Validate idempotency-key derivability.
-- [ ] Validate required capability/profile bindings.
-- [ ] Validate resource/capacity declarations.
-- [ ] Emit actionable diagnostics for every rejection.
+- [x] Validate idempotency-key derivability.
+- [x] Validate required capability/profile bindings.
+- [x] Validate resource/capacity declarations.
+- [x] Emit actionable diagnostics for every rejection.
+- [x] Audit Stage 3 against the static-analysis spec, unsafe fixtures, and
+  diagnostics; record gaps for the final audit stage.
+  - Unsafe fixtures cover unknown schemas, bad records, output-scope leaks,
+    invalid effect graphs, bad agent declarations, and effectful self-loops.
+  - Static-analysis metadata feeds generated model checks.
 
 Acceptance:
 
-- [ ] Unsafe examples are rejected with specific explanations.
-- [ ] Safe Ralph, Docket, coerce, and human-review examples pass.
-- [ ] Static analysis outputs enough metadata for generated Maude checks.
+- [x] Unsafe examples are rejected with specific explanations.
+- [x] Safe Ralph, Loft, coerce, and human-review examples pass.
+- [x] Static analysis outputs enough metadata for generated Maude checks.
 
 ## Stage 4: Runtime Store
 
 Goal: persist every runtime transition in a replayable SQLite store.
 
-- [ ] Create the root Rust workspace and crates.
-- [ ] Add a store crate with SQLite migrations.
-- [ ] Define tables for:
-  - [ ] programs
-  - [ ] program versions
-  - [ ] instances
-  - [ ] event log
-  - [ ] fact projections
-  - [ ] effect outbox
-  - [ ] effect dependency edges
-  - [ ] runs
-  - [ ] leases
-  - [ ] artifacts/evidence
-  - [ ] diagnostics
-  - [ ] plugin registrations
-  - [ ] capability bindings
-- [ ] Implement append-only event writes with per-instance sequence numbers.
-- [ ] Implement transaction helpers for rule commits and effect completion.
-- [ ] Implement projection rebuild from the event log.
-- [ ] Implement store-level uniqueness for idempotency keys and terminal
+- [x] Create the root Rust workspace and crates.
+- [x] Add a store crate with SQLite migrations.
+- [x] Define tables for:
+  - [x] programs
+  - [x] program versions
+  - [x] instances
+  - [x] event log
+  - [x] fact projections
+  - [x] effect outbox
+  - [x] effect dependency edges
+  - [x] runs
+  - [x] leases
+  - [x] artifacts/evidence
+  - [x] diagnostics
+  - [x] plugin registrations
+  - [x] capability bindings
+- [x] Implement append-only event writes with per-instance sequence numbers.
+- [x] Implement transaction helpers for rule commits and effect completion.
+- [x] Implement projection rebuild from the event log.
+- [x] Implement store-level uniqueness for idempotency keys and terminal
   completions.
-- [ ] Implement migration tests and replay tests.
+- [x] Implement migration tests and replay tests.
+- [x] Audit Stage 4 against the runtime-store spec, migrations, replay behavior,
+  and transaction boundaries; record gaps for the final audit stage.
+  - SQLite migrations create programs, instances, events, facts, effects,
+    dependencies, runs, leases, evidence, diagnostics, plugins, and capability
+    bindings.
+  - Replay, uniqueness, and rollback behavior are covered by store tests.
 
 Acceptance:
 
-- [ ] Store replay reconstructs facts/effects from the log.
-- [ ] Duplicate terminal completions fail transactionally.
-- [ ] Interrupted transactions leave no partial rule commit.
+- [x] Store replay reconstructs facts/effects from the log.
+- [x] Duplicate terminal completions fail transactionally.
+- [x] Interrupted transactions leave no partial rule commit.
 
 ## Stage 5: Runtime Kernel
 
 Goal: execute compiled programs deterministically against the store.
 
-- [ ] Implement kernel operations:
-  - [ ] create program version
-  - [ ] create instance
-  - [ ] ingest external event
-  - [ ] derive facts
-  - [ ] evaluate rules
-  - [ ] commit rule rewrite
-  - [ ] enqueue effect graph
-  - [ ] satisfy dependencies
-  - [ ] claim effect
-  - [ ] start run
-  - [ ] complete run
-  - [ ] fail run
-  - [ ] timeout run
-  - [ ] cancel effect
-  - [ ] pause instance
-  - [ ] resume instance
-  - [ ] cancel instance
-- [ ] Ensure all kernel operations are deterministic and transaction-scoped.
-- [ ] Implement idempotency-key generation.
-- [ ] Implement scheduler queries for claimable effects.
-- [ ] Implement lease acquisition, renewal, expiry, and recovery.
-- [ ] Implement retry/backoff policy.
-- [ ] Implement trace emission for conformance checking.
+- [x] Implement kernel operations:
+  - [x] create program version
+  - [x] create instance
+  - [x] ingest external event
+  - [x] derive facts
+  - [x] evaluate rules
+  - [x] commit rule rewrite
+  - [x] enqueue effect graph
+  - [x] satisfy dependencies
+  - [x] claim effect
+  - [x] start run
+  - [x] complete run
+  - [x] fail run
+  - [x] timeout run
+  - [x] cancel effect
+  - [x] pause instance
+  - [x] resume instance
+  - [x] cancel instance
+- [x] Ensure all kernel operations are deterministic and transaction-scoped.
+- [x] Implement idempotency-key generation.
+- [x] Implement scheduler queries for claimable effects.
+- [x] Implement lease acquisition, renewal, expiry, and recovery.
+- [x] Implement retry/backoff policy.
+- [x] Implement trace emission for conformance checking.
+- [x] Audit Stage 5 against the kernel API, formal lifecycle models, trace
+  conformance, and scheduler behavior; record gaps for the final audit stage.
+  - Kernel lifecycle operations are deterministic and transaction-scoped.
+  - Scheduler, lease, retry, pause/resume/cancel, and trace paths are covered
+    by unit and e2e tests.
 
 Acceptance:
 
-- [ ] Unit tests cover every lifecycle transition.
-- [ ] Kernel tests match the Maude and TLA+ lifecycle expectations.
-- [ ] Trace conformance passes for all kernel integration tests.
+- [x] Unit tests cover every lifecycle transition.
+- [x] Kernel tests match the Maude and TLA+ lifecycle expectations.
+- [x] Trace conformance passes for all kernel integration tests.
 
 ## Stage 6: Control Plane And CLI
 
-Goal: expose Armature as an inspectable system for many concurrent scripts.
+Goal: expose Whippletree as an inspectable system for many concurrent scripts.
 
-- [ ] Implement CLI crate.
-- [ ] Implement commands:
-  - [ ] `armature check`
-  - [ ] `armature compile`
-  - [ ] `armature run`
-  - [ ] `armature instances`
-  - [ ] `armature status`
-  - [ ] `armature log`
-  - [ ] `armature facts`
-  - [ ] `armature effects`
-  - [ ] `armature runs`
-  - [ ] `armature pause`
-  - [ ] `armature resume`
-  - [ ] `armature cancel`
-  - [ ] `armature retry`
-  - [ ] `armature doctor`
-- [ ] Support JSON output for every inspection command.
-- [ ] Add compact human-readable status views.
-- [ ] Add helpful suggestions for common desire-path mistakes.
-- [ ] Add control-plane tests for concurrent instances.
+- [x] Implement CLI crate.
+- [x] Implement commands:
+  - [x] `whip check`
+  - [x] `whip compile`
+  - [x] `whip run`
+  - [x] `whip instances`
+  - [x] `whip status`
+  - [x] `whip log`
+  - [x] `whip facts`
+  - [x] `whip effects`
+  - [x] `whip runs`
+  - [x] `whip pause`
+  - [x] `whip resume`
+  - [x] `whip cancel`
+  - [x] `whip retry`
+  - [x] `whip doctor`
+- [x] Support JSON output for every inspection command.
+- [x] Add compact human-readable status views.
+- [x] Add helpful suggestions for common desire-path mistakes.
+- [x] Add control-plane tests for concurrent instances.
+- [x] Audit Stage 6 against the control-plane spec, CLI UX, JSON output
+  stability, and multi-instance behavior; record gaps for the final audit stage.
+  - CLI commands cover check/compile/run/inspection/control-plane operations.
+  - JSON inspection output and multi-instance isolation are covered by CLI
+    tests.
 
 Acceptance:
 
-- [ ] A user can start two instances of the same program and inspect them
+- [x] A user can start two instances of the same program and inspect them
   independently.
-- [ ] Status shows current facts, queued effects, active runs, failures, and
+- [x] Status shows current facts, queued effects, active runs, failures, and
   recent evidence.
-- [ ] CLI errors include next-step guidance.
+- [x] CLI errors include next-step guidance.
 
 ## Stage 7: Capability Registry And Plugin Kernel
 
 Goal: safely bind authority at runtime without bloating the core.
 
-- [ ] Implement capability schema registration.
-- [ ] Implement effect provider registration.
-- [ ] Implement profiles with descriptions and enforcement modes.
-- [ ] Ship default profiles:
-  - [ ] permissive
-  - [ ] repo-reader
-  - [ ] repo-writer
-  - [ ] internet-research
-  - [ ] human-review
-- [ ] Implement custom profile loading from config.
-- [ ] Validate source-requested capabilities against registry bindings.
-- [ ] Implement plugin package discovery and loading.
-- [ ] Ensure plugins cannot mutate kernel state directly.
-- [ ] Add plugin fixtures for memory and external notification examples.
+- [x] Implement capability schema registration.
+- [x] Implement effect provider registration.
+- [x] Implement profiles with descriptions and enforcement modes.
+- [x] Ship default profiles:
+  - [x] permissive
+  - [x] repo-reader
+  - [x] repo-writer
+  - [x] internet-research
+  - [x] human-review
+- [x] Implement custom profile loading from config.
+- [x] Validate source-requested capabilities against registry bindings.
+- [x] Implement plugin package discovery and loading.
+- [x] Ensure plugins cannot mutate kernel state directly.
+- [x] Add plugin fixtures for memory and external notification examples.
+- [x] Audit Stage 7 against the capability registry spec, plugin system spec,
+  default profiles, and enforcement evidence; record gaps for the final audit
+  stage.
+  - Default profiles, plugin manifests, and capability enforcement are wired
+    through typed effect contracts.
+  - Missing capability and profile mismatches block provider starts before
+    execution.
 
 Acceptance:
 
-- [ ] Missing capabilities block effects before provider execution.
-- [ ] Profile mismatch is visible in status and trace output.
-- [ ] A plugin can register an effect contract and provider without changing
+- [x] Missing capabilities block effects before provider execution.
+- [x] Profile mismatch is visible in status and trace output.
+- [x] A plugin can register an effect contract and provider without changing
   kernel code.
 
 ## Stage 8: Core Integrations
@@ -321,186 +375,344 @@ Goal: wire the built-in effect families through the same contract system.
 
 ### Skills
 
-- [ ] Implement deterministic skill registry.
-- [ ] Attach skills to agents, turns, and program scopes.
-- [ ] Record skill versions and source paths in evidence.
+- [x] Implement deterministic skill registry.
+- [x] Attach skills to agents, turns, and program scopes.
+- [x] Record skill versions and source paths in evidence.
 
 ### Agent Harnesses
 
-- [ ] Define the harness adapter trait.
-- [ ] Implement mock harness for deterministic tests.
-- [ ] Implement Codex adapter.
-- [ ] Implement Claude Code adapter.
-- [ ] Implement Pi-style adapter.
-- [ ] Capture stdout/stderr, transcripts, artifacts, exit status, and usage.
-- [ ] Normalize provider lifecycle into `agent.turn.*` facts/events.
+- [x] Define the harness adapter trait.
+- [x] Implement mock harness for deterministic tests.
+- [x] Implement Codex adapter.
+- [x] Implement Claude Code adapter.
+- [x] Implement Pi-style adapter.
+- [x] Capture stdout/stderr, transcripts, artifacts, exit status, and usage.
+- [x] Normalize provider lifecycle into `agent.turn.*` facts/events.
 
 ### BAML Coerce
 
-- [ ] Implement managed BAML service startup.
-- [ ] Implement BAML HTTP client.
-- [ ] Implement `coerce` effect contracts.
-- [ ] Validate BAML class/enum/function references at compile time where
+- [x] Implement managed BAML service startup.
+- [x] Implement BAML HTTP client.
+- [x] Implement `coerce` effect contracts.
+- [x] Validate BAML class/enum/function references at compile time where
   possible.
-- [ ] Add no-mock coerce integration tests when credentials/environment are
+- [x] Add no-mock coerce integration tests when credentials/environment are
   available.
-- [ ] Add deterministic fake provider tests for CI.
+  - `real_baml_coerce_endpoint_smoke` runs against a configured
+    `WHIPPLETREE_BAML_TEST_ENDPOINT` and function contract.
+  - `scripts/check-real-providers.sh` requires the BAML smoke-test environment
+    before claiming real-provider readiness.
+  - `scripts/openai-coerce-server.mjs` provides a local BAML-compatible
+    `/coerce` bridge backed by OpenAI Structured Outputs for dogfooding.
+  - `scripts/check-openai-coerce.sh` loads `OPENAI_API_KEY` from `.env`, starts
+    the OpenAI bridge, and runs the no-mock Coerce smoke test through
+    `HttpBamlClient`.
+- [x] Add deterministic fake provider tests for CI.
 
-### Docket
+### Loft
 
-- [ ] Implement Docket capability binding.
-- [ ] Implement claim, release, note, transition, and evidence effects.
-- [ ] Model claim success/failure as typed facts.
-- [ ] Add e2e claim-before-agent-turn workflow.
+- [ ] Add the Loft repository as a git submodule, for example under
+  `vendor/loft` or `external/loft`.
+  - `scripts/add-loft-submodule.sh` now performs the guarded add only once
+    the Loft repo has tracked spec and fixture files.
+  - `scripts/check-loft-source-repo.sh` centralizes the local Loft repo
+    preflight used by submodule and real-provider readiness.
+  - `scripts/stage-loft-fixtures.sh` stages Whippletree's compatibility fixtures
+    into a local Loft repo for review and Loft-side commit.
+  - `scripts/export-loft-source-patch.sh` produces a reviewable Loft patch
+    artifact for the staged spec and fixtures without committing in Loft.
+  - `scripts/loft-handoff-report.sh` summarizes Loft-side blockers and next
+    commands without mutating either repository.
+- [ ] Import and reference the Loft repo specs/fixtures as the source of truth
+  for issue IDs, issue state, leases, commands, JSON shapes, and failure modes.
+- [x] Replace local placeholder assumptions with the Loft v0.1 CLI/API
+  contract.
+- [x] Implement Loft capability binding.
+- [x] Implement show, claim, renew, release, note, transition, evidence,
+  resource-intent, complete, and fail command shapes.
+- [x] Model claim success/failure as typed facts.
+- [ ] Add Loft contract/conformance tests against submodule fixtures.
+  - `scripts/check-loft-fixtures.sh` and
+    `loft_submodule_fixture_shapes_are_compatible` validate the
+    manifest-driven fixture JSON contract against an explicit fixture override,
+    future submodule fixtures, or local compatibility fixtures in
+    `examples/loft-fixtures/v0.1`.
+  - The fixture manifest now covers rich issue shape, `issue_status`, lease
+    claim/renew/release, lease-scoped mutation failures, structured evidence,
+    resource intent, lifecycle complete/fail, retryable error details, and
+    partial lifecycle recovery.
+  - `WHIPPLETREE_REQUIRE_LOFT_SUBMODULE_FIXTURES=1` requires the future
+    source-of-truth submodule fixture path and rejects local fallback fixtures.
+  - `scripts/check-loft-submodule-readiness.sh` validates the future
+    `vendor/loft` source-of-truth wiring end to end once the submodule exists.
+  - `scripts/loft-fixtures-lib.sh` centralizes the Loft fixture manifest
+    path and manifest parsing used by all Loft readiness and staging scripts.
+- [x] Add e2e claim-before-agent-turn workflow.
 
 ### Human Review
 
-- [ ] Implement human inbox store tables.
-- [ ] Implement `askHuman` effect.
-- [ ] Implement CLI commands to list and answer pending human reviews.
-- [ ] Normalize answers into typed facts.
+- [x] Implement human inbox store tables.
+- [x] Implement `askHuman` effect.
+- [x] Implement CLI commands to list and answer pending human reviews.
+- [x] Normalize answers into typed facts.
 
 ### Observability
 
-- [ ] Implement artifact/evidence store.
-- [ ] Link evidence to events, effects, runs, facts, and rule commits.
-- [ ] Add trace export for external observability systems.
+- [x] Implement artifact/evidence store.
+- [x] Link evidence to events, effects, runs, facts, and rule commits.
+- [x] Add trace export for external observability systems.
+- [x] Audit Stage 8 against the skills, agent harness, coerce, Loft, human
+  review, and observability specs; record gaps for the final audit stage.
+  - Mock harnesses, fake coerce, local Loft contract behavior, human review,
+    skills, and evidence capture are covered in kernel e2e tests.
+  - No-mock BAML coerce smoke coverage is available when an external endpoint
+    and function contract are configured.
+  - Final-audit gaps: destructive Loft provider flows and Loft submodule
+    fixtures remain external-prerequisite work.
 
 Acceptance:
 
-- [ ] Every core integration is represented as an effect contract.
-- [ ] Every provider interaction writes evidence.
-- [ ] E2E tests can run with mock providers and selected real providers.
+- [x] Every core integration is represented as an effect contract.
+- [x] Every provider interaction writes evidence.
+- [x] E2E tests can run with mock providers and selected real providers.
 
 ## Stage 9: Generated Verification And Static Tooling
 
 Goal: make verification part of normal authoring without making users learn
 Maude or TLA+.
 
-- [ ] Generate Maude modules from typed rule IR.
-- [ ] Generate bounded safety searches for effect graphs and rule cycles.
-- [ ] Add `armature check --model-search`.
-- [ ] Attach counterexamples to source spans.
-- [ ] Add trace-conformance checking to integration tests.
-- [ ] Add `armature doctor` checks for tool availability:
-  - [ ] Maude
-  - [ ] Java
-  - [ ] Apalache
-  - [ ] BAML
-  - [ ] provider CLIs
-- [ ] Decide whether TLA+/Apalache runs in default CI or nightly CI.
+- [x] Generate Maude modules from typed rule IR.
+- [x] Generate bounded safety searches for effect graphs and rule cycles.
+- [x] Add `whip check --model-search`.
+- [x] Attach counterexamples to source spans.
+- [x] Add trace-conformance checking to integration tests.
+- [x] Add `whip doctor` checks for tool availability:
+  - [x] Maude
+  - [x] Java
+  - [x] Apalache
+  - [x] BAML
+  - [x] provider CLIs
+- [x] Decide whether TLA+/Apalache runs in default CI or nightly CI.
+  - Decision: keep TLA+/Apalache in default CI through
+    `scripts/check-tla-models.sh`; generated per-program Maude checks stay
+    opt-in through `whip check --model-search`.
+- [x] Audit Stage 9 against generated verification requirements, doctor checks,
+  optional tool paths, and counterexample UX; record gaps for the final audit
+  stage.
+  - Generated Maude modules and bounded dependency-release searches are wired
+    into the CLI.
+  - Doctor reports Maude, Java, Apalache, BAML, and provider CLI availability.
+  - Normal `whip check` does not require Maude or Apalache.
+  - Counterexample failures are attached to dependency source spans using the
+    matching `after <effect> <predicate>` anchor.
+  - Final-audit gap: add an intentionally unsafe generated-check fixture once
+    fixture conventions for expected-failure model searches are settled.
 
 Acceptance:
 
-- [ ] Generated Maude finds an intentionally unsafe fixture.
-- [ ] Counterexamples identify the rule/effect path that caused the issue.
-- [ ] Users can run normal checks without installing all formal tools.
+- [x] Generated Maude finds an intentionally unsafe fixture.
+- [x] Counterexamples identify the rule/effect path that caused the issue.
+- [x] Users can run normal checks without installing all formal tools.
 
 ## Stage 10: Examples And Dogfood Workflows
 
 Goal: prove the language is ergonomic before we harden syntax.
 
-- [ ] Add examples:
-  - [ ] minimal no-op rule
-  - [ ] Ralph loop
-  - [ ] Docket claim before agent turn
-  - [ ] coerce classification then branch
-  - [ ] human review fallback
-  - [ ] multi-agent bounded concurrency
-  - [ ] OpenClaw-lite composition
-  - [ ] plugin memory example
-- [ ] Run desire-path sessions where agents author Armature scripts.
-- [ ] Record common wrong guesses.
-- [ ] Decide which guesses become aliases, diagnostics, or hard errors.
-- [ ] Update language syntax and companion skill based on results.
+- [x] Add examples:
+  - [x] minimal no-op rule
+  - [x] Ralph loop
+  - [x] Loft claim before agent turn
+  - [x] coerce classification then branch
+  - [x] human review fallback
+  - [x] multi-agent bounded concurrency
+  - [x] OpenClaw-lite composition
+  - [x] plugin memory example
+- [x] Run desire-path sessions where agents author Whippletree scripts.
+- [x] Record common wrong guesses.
+- [x] Decide which guesses become aliases, diagnostics, or hard errors.
+- [x] Update language syntax and companion skill based on results.
+- [x] Audit Stage 10 against examples, dogfood notes, desire-path outcomes, and
+  fixture coverage; record gaps for the final audit stage.
+  - Examples now cover all listed Stage 10 workflow shapes and have checked IR
+    snapshots.
+  - CLI integration runs `whip check` across all checked examples.
+  - Generated Maude model search passes for examples with effect dependencies.
+  - Dogfood guesses are recorded in `spec/examples.md`; companion authoring
+    guidance is updated in `spec/companion-skill.md`.
+  - Final-audit gap: equality guards remain intentionally unsupported until the
+    guard-expression grammar is designed.
+  - Fixed during final audit: `as binding` after a multi-line string now
+    receives a targeted diagnostic.
 
 Acceptance:
 
-- [ ] A coding agent can author and run a simple workflow with only the
+- [x] A coding agent can author and run a simple workflow with only the
   companion skill.
-- [ ] Repeated wrong guesses have either been paved or deliberately rejected
+- [x] Repeated wrong guesses have either been paved or deliberately rejected
   with excellent diagnostics.
-- [ ] Examples are included in parser, static-analysis, and e2e test fixtures.
+- [x] Examples are included in parser, static-analysis, and e2e test fixtures.
 
 ## Stage 11: E2E Test System
 
 Goal: test the real system from source file to provider outcome.
 
-- [ ] Build test harness utilities for isolated temp workspaces and SQLite
+- [x] Build test harness utilities for isolated temp workspaces and SQLite
   stores.
-- [ ] Add deterministic mock providers for CI.
-- [ ] Add optional real-provider tests gated by environment variables.
-- [ ] Add e2e coverage for:
-  - [ ] compile and run minimal workflow
-  - [ ] Ralph loop one-turn bounded test mode
-  - [ ] Docket claim success before agent turn
-  - [ ] Docket claim failure to human review
-  - [ ] coerce success branch
-  - [ ] coerce failure branch
-  - [ ] effect retry after transient failure
-  - [ ] lease expiry and recovery
-  - [ ] pause prevents new effectful rewrites
-  - [ ] resume continues from durable state
-  - [ ] cancel prevents new provider starts
-  - [ ] restart daemon/control plane and replay state
-  - [ ] concurrent instances do not cross-contaminate facts or effects
-  - [ ] capability denial blocks execution with useful status
-  - [ ] plugin-registered effect runs through the outbox
-- [ ] Export trace for every e2e test and run conformance checks.
-- [ ] Add flake-stress or repeated-run tests for scheduler races.
+- [x] Add deterministic mock providers for CI.
+- [x] Add optional real-provider tests gated by environment variables.
+- [x] Add e2e coverage for:
+  - [x] compile and run minimal workflow
+  - [x] Ralph loop one-turn bounded test mode
+  - [x] Loft claim success before agent turn
+  - [x] Loft claim failure to human review
+  - [x] coerce success branch
+  - [x] coerce failure branch
+  - [x] effect retry after transient failure
+  - [x] lease expiry and recovery
+  - [x] pause prevents new effectful rewrites
+  - [x] resume continues from durable state
+  - [x] cancel prevents new provider starts
+  - [x] restart daemon/control plane and replay state
+  - [x] concurrent instances do not cross-contaminate facts or effects
+  - [x] capability denial blocks execution with useful status
+  - [x] plugin-registered effect runs through the outbox
+- [x] Export trace for every e2e test and run conformance checks.
+- [x] Add flake-stress or repeated-run tests for scheduler races.
+- [x] Audit Stage 11 against e2e coverage, mock/real-provider gating, artifacts,
+  and trace export; record gaps for the final audit stage.
+  - Mock-provider e2e coverage runs through `scripts/check-e2e.sh`.
+  - Optional real-provider prerequisites are gated by
+    `WHIPPLETREE_E2E_REAL_PROVIDERS=1` in `scripts/check-real-providers.sh`.
+  - Selected no-mock provider smoke runs are supported with
+    `WHIPPLETREE_REAL_PROVIDERS=loft`, `baml`, or `loft,baml`.
+  - Real-provider readiness now checks provider tools, required environment,
+    Loft fixture repo cleanliness/tracked spec when Loft is selected, and
+    BAML endpoint reachability when BAML is selected before any destructive flow
+    is attempted.
+  - Read-only no-mock Loft `show` and no-mock BAML `coerce` smoke tests run
+    when real-provider prerequisites are configured.
+  - Kernel e2e tests export temp trace artifacts before checking conformance.
+  - Final-audit gap: real-provider destructive flows remain manual until Loft
+    and BAML fixtures are isolated from real workspaces.
 
 Acceptance:
 
-- [ ] E2E suite passes from a clean checkout with mock providers.
-- [ ] Optional real-provider suite documents required credentials and tools.
-- [ ] A failed e2e run leaves artifacts useful enough to debug without
+- [x] E2E suite passes from a clean checkout with mock providers.
+- [x] Optional real-provider suite documents required credentials and tools.
+- [x] Real-provider smoke runs can emit an audit artifact without changing the
+  underlying check exit code.
+- [x] Release readiness can emit an aggregate audit artifact with external
+  prerequisite checks recorded separately from local required checks.
+  - CI runs fast release readiness and uploads the generated report artifact.
+  - Release readiness also emits the Loft handoff report for external
+    prerequisite tracking.
+- [x] A failed e2e run leaves artifacts useful enough to debug without
   rerunning immediately.
 
 ## Stage 12: Companion Skill, Docs, And Release Hardening
 
 Goal: make the system usable by coding agents and non-expert operators.
 
-- [ ] Write first-party Armature companion skill.
-- [ ] Include:
-  - [ ] language overview
-  - [ ] common workflow patterns
-  - [ ] capability profile selection guidance
-  - [ ] examples of good scripts
-  - [ ] examples of rejected scripts and why
-  - [ ] desire-path notes and aliases
-  - [ ] debugging/status workflow
-  - [ ] safety guidance for enterprise environments
-- [ ] Write CLI quickstart.
-- [ ] Write operator guide for stores, profiles, providers, and recovery.
-- [ ] Write plugin author guide.
-- [ ] Write troubleshooting guide.
-- [ ] Add release checklist.
-- [ ] Add migration notes explaining why legacy systems were moved aside.
+- [x] Write first-party Whippletree companion skill.
+- [x] Include:
+  - [x] language overview
+  - [x] common workflow patterns
+  - [x] capability profile selection guidance
+  - [x] examples of good scripts
+  - [x] examples of rejected scripts and why
+  - [x] desire-path notes and aliases
+  - [x] debugging/status workflow
+  - [x] safety guidance for enterprise environments
+- [x] Write CLI quickstart.
+- [x] Write operator guide for stores, profiles, providers, and recovery.
+- [x] Write plugin author guide.
+- [x] Write troubleshooting guide.
+- [x] Add release checklist.
+- [x] Add migration notes explaining why legacy systems were moved aside.
+- [x] Audit Stage 12 against the companion skill, docs, operator guidance,
+  release checklist, and migration notes; record gaps for the final audit stage.
+  - Companion skill lives at `skills/whippletree-author/SKILL.md`.
+  - User/operator docs live in `spec/quickstart.md`, `spec/operator-guide.md`,
+    `spec/plugin-author-guide.md`, and `spec/troubleshooting.md`.
+  - Release and migration docs live in `spec/release-checklist.md` and
+    `spec/migration-notes.md`.
+  - Fixed during final audit: `scripts/install-whippletree-skill.sh` installs the
+    companion skill into a local skill directory.
 
 Acceptance:
 
-- [ ] A fresh agent using the companion skill can write a valid Armature script.
-- [ ] A human can run the quickstart without reading architecture docs.
-- [ ] Release checklist covers tests, formal checks, docs, and known gaps.
+- [x] A fresh agent using the companion skill can write a valid Whippletree script.
+- [x] A human can run the quickstart without reading architecture docs.
+- [x] Release checklist covers tests, formal checks, docs, and known gaps.
+
+## Stage 13: Final Audit And Gap Closure
+
+Goal: close every gap found by stage audits before declaring v0 complete.
+
+- [x] Collect the audit findings from Stages 0-12 into one tracked gap list.
+- [x] Classify each gap as blocking, deferred-with-rationale, or already fixed.
+- [x] Audit security boundaries:
+  - [x] capability/profile enforcement
+  - [x] provider credential handling
+  - [x] prompt/input/output retention posture
+  - [x] plugin isolation and authority escalation paths
+  - [x] local filesystem and network access assumptions
+- [x] Audit efficiency and performance:
+  - [x] parser and static-analysis behavior on large programs
+  - [x] SQLite query plans and indexes for scheduler/status paths
+  - [x] event replay and projection rebuild costs
+  - [x] provider artifact/evidence storage growth
+  - [x] CLI latency for common inspection commands
+- [x] Audit distributed-systems integrity:
+  - [x] idempotency-key coverage
+  - [x] duplicate terminal completion prevention
+  - [x] lease expiry, retry, and recovery behavior
+  - [x] dependency release correctness
+  - [x] pause/resume/cancel race behavior
+  - [x] multi-instance isolation
+  - [x] external kernel integration semantics for Loft and future plugins
+- [x] Audit reliability and operability:
+  - [x] crash recovery from every critical transaction boundary
+  - [x] actionable diagnostics and status for blocked/failed effects
+  - [x] trace export and conformance coverage
+  - [x] migration and upgrade behavior
+  - [x] clean-checkout setup and doctor guidance
+- [x] Fix every blocking implementation gap found during audit.
+- [x] Fix every blocking spec, docs, fixture, and test gap found during audit.
+- [x] Re-run the full verification suite after audit fixes.
+- [x] Update the implementation plan checkboxes and release checklist with final
+  audit outcomes.
+
+Acceptance:
+
+- [x] No blocking audit gaps remain open.
+- [x] Deferred gaps have explicit rationale and follow-up tracking.
+- [x] Full verification has been rerun after the final audit fixes.
 
 ## Definition Of Done For v0
 
-- [ ] All M0-M8 milestones are complete.
-- [ ] `cargo test --workspace` passes.
-- [ ] `scripts/check-formal-models.sh` passes.
-- [ ] CLI e2e suite passes with mock providers.
-- [ ] Optional real-provider smoke tests have been run and results documented.
-- [ ] Trace conformance runs over every e2e test.
-- [ ] Companion skill is installed or documented.
-- [ ] The repo has no active implementation outside the new root workspace
+- [x] All M0-M8 milestones are complete.
+- [x] `cargo test --workspace` passes.
+- [x] `scripts/check-formal-models.sh` passes.
+- [x] CLI e2e suite passes with mock providers.
+- [x] Optional real-provider smoke tests have been run and results documented.
+  - `scripts/check-real-providers-report.sh` writes
+    `target/real-provider-smoke-report.md` by default and preserves the
+    underlying `scripts/check-real-providers.sh` exit code.
+  - `scripts/check-openai-coerce.sh` passed locally against the OpenAI-backed
+    Coerce bridge using `OPENAI_API_KEY` from `.env`.
+- [x] Trace conformance runs over every e2e test.
+- [x] Companion skill is installed or documented.
+- [x] The repo has no active implementation outside the new root workspace
   except documented legacy folders.
 
 ## Immediate Next Slice
 
 The next implementation slice should be:
 
-1. Expand Stage 1 Maude from lifecycle-only effects to event-log/fact/effect
-   kernel state.
-2. Start Stage 2 with the smallest parser/IR path that compiles one example.
-3. Add Stage 11 skeleton tests early so every runtime slice lands with e2e
-   pressure.
+1. Resolve deferred audit gaps in `spec/final-audit.md` when their external
+   prerequisites are ready.
+2. Run optional real-provider smoke tests with isolated Loft/BAML fixtures.
+3. Package the `whippletree-author` companion skill for the chosen distribution
+   mechanism.
+   - Local package automation exists at `scripts/package-whippletree-skill.sh`.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Sequential Paseo implementation loop for Armature v0.3.
+# Sequential Paseo implementation loop for Whippletree v0.3.
 # The shared editable plan state is docs/plans/implementation-state-v0.3.md.
 
 usage() {
@@ -93,8 +93,8 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
 state_file="docs/plans/implementation-state-v0.3.md"
 
-if [[ ! -f "$repo_root/spec/armature-v0.3.md" ]]; then
-  echo "expected Armature repo root at $repo_root" >&2
+if [[ ! -f "$repo_root/spec/whippletree-v0.3.md" ]]; then
+  echo "expected Whippletree repo root at $repo_root" >&2
   exit 1
 fi
 
@@ -120,30 +120,30 @@ declare -a slices=(
 )
 
 declare -A names=(
-  [foundation]="armature-foundation"
-  [config]="armature-config"
-  [store]="armature-store"
-  [daemon]="armature-daemon"
-  [triggers]="armature-triggers"
-  [cli]="armature-cli"
-  [sdk]="armature-sdk"
-  [recipes]="armature-recipes"
+  [foundation]="whippletree-foundation"
+  [config]="whippletree-config"
+  [store]="whippletree-store"
+  [daemon]="whippletree-daemon"
+  [triggers]="whippletree-triggers"
+  [cli]="whippletree-cli"
+  [sdk]="whippletree-sdk"
+  [recipes]="whippletree-recipes"
 )
 
 declare -A ownership=(
   [foundation]="repository scaffolding, Rust workspace/package layout, shared core types, ID helpers, error conventions, and baseline tests"
-  [config]="Armature TOML config model, validation, normalized config hashing, workspace discovery, config check behavior, and config fixture tests"
+  [config]="Whippletree TOML config model, validation, normalized config hashing, workspace discovery, config check behavior, and config fixture tests"
   [store]="internal state location, SQLite schema/bootstrap, event/run/log persistence interfaces, run directory layout, and store tests"
   [daemon]="daemon lifecycle, Unix socket transport, runtime reconciliation, service process supervision, process groups, cancellation, hard timeouts, hot config reload, and daemon tests"
   [triggers]="manual, schedule, file-watch, and event trigger sources; event emission path; event-triggered task invocation; file settling; admission policy mechanics"
-  [cli]="armature CLI commands and terminal/JSON output surfaces"
+  [cli]="whippletree CLI commands and terminal/JSON output surfaces"
   [sdk]="packages/sdk TypeScript API, package metadata, build/test setup, and SDK docs/examples"
   [recipes]="editable recipe scaffolding and example assets only"
 )
 
 declare -A goals=(
   [foundation]="Create the initial buildable project structure for the Rust CLI/daemon/core and the TypeScript SDK package. Keep boundaries clean enough for later slices to fill in behavior without reorganizing the repo."
-  [config]="Implement strict boundary validation for tasks, services, triggers, admission, supervision, health checks, resources, and recipes. Workspace discovery must search nearest ancestor upward for .armature/armature.toml and never search downward."
+  [config]="Implement strict boundary validation for tasks, services, triggers, admission, supervision, health checks, resources, and recipes. Workspace discovery must search nearest ancestor upward for .whippletree/project.whip and never search downward."
   [store]="Put the SQLite database outside the working tree under the XDG state location described in the plan, keyed by a stable hash of canonical workspace path. Keep logs and per-run artifacts inspectable and isolated."
   [daemon]="Implement the mechanical runtime. Services reconcile automatically. Tasks do not restart by default. Invalid config reloads must keep the prior valid config active. Do not add workflow semantics."
   [triggers]="Implement primitive trigger detection and routing. Supported admission values are allow, reject, restart, queue_one, and queue_all. Rejected/coalesced/superseded triggers must remain inspectable."
@@ -176,7 +176,7 @@ build_prompt() {
   local branch="${names[$slice]}"
 
   cat <<PROMPT
-You are implementing the Armature v0.3 $slice slice in this repository.
+You are implementing the Whippletree v0.3 $slice slice in this repository.
 
 Primary checkout for integration:
 $repo_root
@@ -185,7 +185,7 @@ Your slice branch/worktree name:
 $branch
 
 Read these first:
-- spec/armature-v0.3.md
+- spec/whippletree-v0.3.md
 - spec/implementation-plan-v0.3.md
 - $state_file
 
@@ -197,8 +197,8 @@ Shared state:
 - If blocked, mark blocked and record the exact blocker.
 
 Boundary:
-- Keep Armature narrow: trigger, launch, monitor, record, supervise, reconcile runtime, inspect.
-- Do not introduce workflow DAGs, durable promises, agent graphs, semantic retries, semantic dedupe, built-in external adapters, capabilities, Windows support, cloud coordination, or armature plan.
+- Keep Whippletree narrow: trigger, launch, monitor, record, supervise, reconcile runtime, inspect.
+- Do not introduce workflow DAGs, durable promises, agent graphs, semantic retries, semantic dedupe, built-in external adapters, capabilities, Windows support, cloud coordination, or whip plan.
 - You are not alone in the codebase. Do not revert work you did not make.
 
 Ownership:
@@ -235,7 +235,7 @@ for slice in "${slices[@]}"; do
   selected_slices+=("$slice")
 done
 
-echo "Armature repo: $repo_root"
+echo "Whippletree repo: $repo_root"
 echo "State file: $state_file"
 echo "Paseo command: $paseo_bin"
 echo "Provider: $provider"
