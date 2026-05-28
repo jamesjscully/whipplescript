@@ -3222,6 +3222,10 @@ rule_dependencies
                 include_str!("../../../examples/coerce-branch.ir"),
             ),
             (
+                include_str!("../../../examples/codex-french-poem-dogfood.whip"),
+                include_str!("../../../examples/codex-french-poem-dogfood.ir"),
+            ),
+            (
                 include_str!("../../../examples/human-review.whip"),
                 include_str!("../../../examples/human-review.ir"),
             ),

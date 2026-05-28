@@ -1,0 +1,53 @@
+workflow CodexFrenchPoemDogfood
+schemas
+  class FrenchPoemRequest
+    topic string
+    poemPath string
+    verdictPath string
+    status literal<"queued">
+  class FrenchPoemDraft
+    topic string
+    poemPath string
+    verdictPath string
+    turn ref<AgentTurn>
+    status literal<"written">
+  class FrenchPoemJudgment
+    poemPath string
+    verdictPath string
+    turn ref<AgentTurn>
+    status literal<"judged">
+agents
+  agent codex profile=repo-writer capacity=1 skills=[]
+rules
+  rule seed_poem_request
+    when started
+    reads
+      pattern:started
+    writes
+      schema:FrenchPoemRequest
+    body_hash 073c55ea1b4838d7
+  rule write_french_poem
+    when FrenchPoemRequest as request
+    when codex is available
+    reads
+      pattern:codex is available
+      schema:FrenchPoemRequest
+    writes
+      schema:FrenchPoemDraft
+    effects
+      poemTurn kind=agent.tell binding=poemTurn key=c78540c94fd343b8
+    body_hash 19852963b71ba8c7
+  rule judge_french_poem
+    when FrenchPoemDraft as draft
+    when codex is available
+    reads
+      pattern:codex is available
+      schema:FrenchPoemDraft
+    writes
+      schema:FrenchPoemJudgment
+    effects
+      judgmentTurn kind=agent.tell binding=judgmentTurn key=27f996b85e2a9fe2
+    body_hash b5768e89ad0cf558
+rule_dependencies
+  seed_poem_request --schema:FrenchPoemRequest--> write_french_poem
+  write_french_poem --schema:FrenchPoemDraft--> judge_french_poem

@@ -455,6 +455,8 @@ The checked example fixtures in `examples/` are:
   review, and human fallback.
 - `coerce-branch.whip`: typed model classification followed by explicit
   routing.
+- `codex-french-poem-dogfood.whip`: Codex writes a French poem artifact, then
+  a second Codex turn judges whether it is a real French poem.
 - `human-review.whip`: manual review request and answer recording.
 - `implementation-plan-phase-review.whip`: fan out implementation-plan phase
   reviews to Codex/repo-reader turns and a visible tracker.

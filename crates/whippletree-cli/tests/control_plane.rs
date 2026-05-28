@@ -15,6 +15,7 @@ fn checks_all_example_workflows() {
         "ralph.whip",
         "loft-worker-with-review.whip",
         "coerce-branch.whip",
+        "codex-french-poem-dogfood.whip",
         "human-review.whip",
         "implementation-plan-phase-review.whip",
         "multi-agent-bounded-concurrency.whip",

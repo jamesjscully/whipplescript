@@ -1,0 +1,96 @@
+workflow CodexFrenchPoemDogfood
+
+class FrenchPoemRequest {
+  topic string
+  poemPath string
+  verdictPath string
+  status "queued"
+}
+
+class FrenchPoemDraft {
+  topic string
+  poemPath string
+  verdictPath string
+  turn AgentTurn
+  status "written"
+}
+
+class FrenchPoemJudgment {
+  poemPath string
+  verdictPath string
+  turn AgentTurn
+  status "judged"
+}
+
+agent codex {
+  profile "repo-writer"
+  capacity 1
+}
+
+rule seed_poem_request
+  when started
+=> {
+  record FrenchPoemRequest {
+    topic "rain over a city at night"
+    poemPath "target/dogfood/french-poem.txt"
+    verdictPath "target/dogfood/french-poem-verdict.json"
+    status "queued"
+  }
+}
+
+rule write_french_poem
+  when FrenchPoemRequest as request
+  when codex is available
+=> {
+  tell codex as poemTurn """
+  Write an original poem in French.
+
+  Requirements:
+  - Use 8 to 12 verse lines.
+  - Do not include an explanation or translation.
+  - Use the theme: {{ request.topic }}.
+  - Write only the poem text to {{ request.poemPath }}.
+  - Do not edit files outside target/dogfood.
+
+  Finish your turn with a concise summary that includes the poem path.
+  """
+
+  after poemTurn succeeds {
+    record FrenchPoemDraft {
+      topic request.topic
+      poemPath request.poemPath
+      verdictPath request.verdictPath
+      turn poemTurn
+      status "written"
+    }
+  }
+}
+
+rule judge_french_poem
+  when FrenchPoemDraft as draft
+  when codex is available
+=> {
+  tell codex as judgmentTurn """
+  Read the poem at {{ draft.poemPath }}.
+
+  Decide whether it is genuinely a poem and whether it is in French.
+
+  Write exactly one compact JSON object to {{ draft.verdictPath }} with these fields:
+  - is_french: boolean
+  - is_poem: boolean
+  - reason: short French explanation
+
+  Do not edit files outside target/dogfood.
+
+  Finish your turn with a concise summary that includes the verdict path.
+  """
+
+  after judgmentTurn succeeds {
+    record FrenchPoemJudgment {
+      poemPath draft.poemPath
+      verdictPath draft.verdictPath
+      turn judgmentTurn
+      status "judged"
+    }
+  }
+}
