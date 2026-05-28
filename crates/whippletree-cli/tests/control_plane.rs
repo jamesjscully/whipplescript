@@ -16,6 +16,7 @@ fn checks_all_example_workflows() {
         "loft-worker-with-review.whip",
         "coerce-branch.whip",
         "codex-french-poem-dogfood.whip",
+        "codex-poem-coerce-review.whip",
         "human-review.whip",
         "implementation-plan-phase-review.whip",
         "multi-agent-bounded-concurrency.whip",
@@ -794,6 +795,102 @@ rule recall_before_work
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(workflow_path);
+}
+
+#[test]
+fn dev_codex_then_coerce_rehydrates_after_bound_baml_arguments() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let example = example_path("codex-poem-coerce-review.whip");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            example.to_str().expect("utf-8 example path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let workers = dev
+        .get("workers")
+        .and_then(Value::as_array)
+        .expect("workers");
+    assert_eq!(
+        workers
+            .iter()
+            .map(|worker| worker
+                .get("ran_effects")
+                .and_then(Value::as_u64)
+                .unwrap_or(0))
+            .collect::<Vec<_>>(),
+        vec![1, 1, 0, 0]
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let evidence = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "evidence",
+            instance_id,
+        ],
+    );
+    let evidence_items = evidence
+        .get("evidence")
+        .and_then(Value::as_array)
+        .expect("evidence array");
+    let baml = evidence_items
+        .iter()
+        .find(|item| item.get("kind").and_then(Value::as_str) == Some("baml.coerce.provider"))
+        .expect("baml provider evidence");
+    let arguments = baml
+        .get("metadata")
+        .and_then(|metadata| metadata.get("arguments"))
+        .expect("baml arguments");
+    assert_eq!(
+        arguments.get("arg0").and_then(Value::as_str),
+        Some("rain over a city at night")
+    );
+    assert_eq!(
+        arguments.get("arg1").and_then(Value::as_str),
+        Some("target/dogfood/coerce-french-poem.txt")
+    );
+    assert_eq!(
+        arguments.get("arg2").and_then(Value::as_str),
+        Some("fixture completed")
+    );
+
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+    assert!(facts.iter().any(|fact| {
+        fact.get("name").and_then(Value::as_str) == Some("ReviewedPoem")
+            && fact
+                .get("value")
+                .and_then(|value| value.get("review"))
+                .and_then(|review| review.get("isFrench"))
+                .and_then(Value::as_bool)
+                == Some(true)
+    }));
+
+    let _ = fs::remove_file(store_path);
 }
 
 fn run_json(bin: &str, args: &[&str]) -> Value {

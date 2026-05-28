@@ -457,6 +457,8 @@ The checked example fixtures in `examples/` are:
   routing.
 - `codex-french-poem-dogfood.whip`: Codex writes a French poem artifact, then
   a second Codex turn judges whether it is a real French poem.
+- `codex-poem-coerce-review.whip`: Codex writes a French poem artifact, then a
+  typed BAML `coerce` reviews the completed turn.
 - `human-review.whip`: manual review request and answer recording.
 - `implementation-plan-phase-review.whip`: fan out implementation-plan phase
   reviews to Codex/repo-reader turns and a visible tracker.

@@ -1,0 +1,46 @@
+workflow CodexPoemCoerceReview
+uses
+  skill baml-coerce-user
+schemas
+  class PoemRequest
+    topic string
+    poemPath string
+    status literal<"queued">
+  class FrenchPoemReview
+    isFrench bool
+    isPoem bool
+    reason string
+    confidence float
+  class ReviewedPoem
+    request ref<PoemRequest>
+    turn ref<AgentTurn>
+    review ref<FrenchPoemReview>
+    status literal<"reviewed">
+agents
+  agent codex profile=repo-writer capacity=1 skills=[]
+coerces
+  coerce reviewFrenchPoem(topic string, poemPath string, turnSummary string) -> ref<FrenchPoemReview>
+rules
+  rule seed_poem_request
+    when started
+    reads
+      pattern:started
+    writes
+      schema:PoemRequest
+    body_hash 746bc0a67ce23a00
+  rule write_and_review_poem
+    when PoemRequest as request
+    when codex is available
+    reads
+      pattern:codex is available
+      schema:PoemRequest
+    writes
+      schema:ReviewedPoem
+    effects
+      poemTurn kind=agent.tell binding=poemTurn key=c99af6aeb446d4ca
+      review kind=baml.coerce binding=review key=fadf644fc82dc8bf
+    dependencies
+      poemTurn --succeeds--> review
+    body_hash 747604080a273015
+rule_dependencies
+  seed_poem_request --schema:PoemRequest--> write_and_review_poem

@@ -796,7 +796,8 @@ fn run_baml_effect(
     effect: &ClaimableEffect,
     options: &WorkerOptions,
 ) -> Result<whippletree_store::StoredEvent, StoreError> {
-    let input = json_from_str(&effect.input_json);
+    let input_json = resolve_effect_input_after_bindings(store_path, instance_id, effect)?;
+    let input = json_from_str(&input_json);
     let function_name = input
         .get("function_name")
         .and_then(Value::as_str)
@@ -984,25 +985,31 @@ fn resolve_effect_input_after_bindings(
     if let Some(bindings) = input.get_mut("bindings").and_then(Value::as_object_mut) {
         bindings.insert(binding.to_owned(), binding_value.clone());
     }
+    let mut context = context_from_input_bindings(&input);
+    context.bindings.push((
+        binding.to_owned(),
+        FactView {
+            fact_id: upstream_effect_id.to_owned(),
+            name: binding.to_owned(),
+            key: upstream_effect_id.to_owned(),
+            value_json: binding_value.to_string(),
+            provenance_class: "effect".to_owned(),
+        },
+    ));
+    if let Some(argument_exprs) = input.get("argument_exprs").and_then(Value::as_array) {
+        let mut arguments = serde_json::Map::new();
+        for (index, expr) in argument_exprs.iter().filter_map(Value::as_str).enumerate() {
+            arguments.insert(format!("arg{index}"), parse_field_value(expr, &context));
+        }
+        if let Some(object) = input.as_object_mut() {
+            object.insert("arguments".to_owned(), Value::Object(arguments));
+        }
+    }
     if let Some(prompt) = input
         .get("prompt")
         .and_then(Value::as_str)
         .map(str::to_owned)
     {
-        let context = RuleContext {
-            trigger_event_id: None,
-            identity: None,
-            bindings: vec![(
-                binding.to_owned(),
-                FactView {
-                    fact_id: upstream_effect_id.to_owned(),
-                    name: binding.to_owned(),
-                    key: upstream_effect_id.to_owned(),
-                    value_json: binding_value.to_string(),
-                    provenance_class: "effect".to_owned(),
-                },
-            )],
-        };
         if let Some(object) = input.as_object_mut() {
             object.insert(
                 "prompt".to_owned(),
@@ -1011,6 +1018,30 @@ fn resolve_effect_input_after_bindings(
         }
     }
     Ok(input.to_string())
+}
+
+fn context_from_input_bindings(input: &Value) -> RuleContext {
+    let mut context = RuleContext {
+        trigger_event_id: None,
+        identity: None,
+        bindings: Vec::new(),
+    };
+    let Some(bindings) = input.get("bindings").and_then(Value::as_object) else {
+        return context;
+    };
+    for (binding, value) in bindings {
+        context.bindings.push((
+            binding.clone(),
+            FactView {
+                fact_id: binding.clone(),
+                name: binding.clone(),
+                key: binding.clone(),
+                value_json: value.to_string(),
+                provenance_class: "input".to_owned(),
+            },
+        ));
+    }
+    context
 }
 
 fn run_capability_effect(
@@ -1157,6 +1188,12 @@ fn fixture_baml_value(output_type: &str) -> String {
             "status": "Accept",
             "reason": "Fixture review",
             "followups": [],
+            "confidence": 0.75,
+        }),
+        "FrenchPoemReview" => json!({
+            "isFrench": true,
+            "isPoem": true,
+            "reason": "Fixture review saw a completed poem turn",
             "confidence": 0.75,
         }),
         _ => json!({
@@ -1570,16 +1607,20 @@ fn lower_rule(
             continue;
         };
         let mut after_context = context.clone();
-        after_context.bindings.push((
-            after.binding.clone(),
-            FactView {
-                fact_id: upstream_effect_id.clone(),
-                name: after.binding.clone(),
-                key: upstream_effect_id.clone(),
-                value_json: binding_value.to_string(),
-                provenance_class: "effect".to_owned(),
-            },
-        ));
+        push_effect_binding(
+            &mut after_context,
+            &after.binding,
+            upstream_effect_id,
+            binding_value,
+        );
+        for (binding, effect_id) in &binding_to_effect_id {
+            if binding == &after.binding {
+                continue;
+            }
+            if let Some(value) = effect_binding_value(facts, effect_id, "succeeds") {
+                push_effect_binding(&mut after_context, binding, effect_id, value);
+            }
+        }
         let value = parse_record_fields(&after.record.body, &after_context);
         let value_json = Value::Object(value).to_string();
         let fact_key = record_fact_key(&after.record.schema, &value_json);
@@ -1610,6 +1651,22 @@ fn lower_rule(
     }
 
     lowering
+}
+
+fn push_effect_binding(context: &mut RuleContext, binding: &str, effect_id: &str, value: Value) {
+    context
+        .bindings
+        .retain(|(candidate, _)| candidate != binding);
+    context.bindings.push((
+        binding.to_owned(),
+        FactView {
+            fact_id: effect_id.to_owned(),
+            name: binding.to_owned(),
+            key: effect_id.to_owned(),
+            value_json: value.to_string(),
+            provenance_class: "effect".to_owned(),
+        },
+    ));
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1777,7 +1834,9 @@ fn parsed_effect_input_json(
             json!({
                 "function_name": function_name,
                 "arguments": Value::Object(arguments),
+                "argument_exprs": effect.args,
                 "output_type": output_type,
+                "bindings": context_bindings_json(context),
                 "rule": rule.name,
             })
         }
