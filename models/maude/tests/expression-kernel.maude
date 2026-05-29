@@ -41,6 +41,77 @@ search [1] in WHIPPLETREE-KERNEL :
   event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued)
   domainMember(codexValue, providerDomain) .
 
+--- A finite enum/literal pattern branch cannot match values outside its domain.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  patternBranch(guardedRule, issueFact, invalidProviderValue, providerDomain, g1)
+  domainNonMember(invalidProviderValue, providerDomain)
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) .
+
+--- A finite enum/literal pattern branch can fire for a covered value.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  patternBranch(guardedRule, issueFact, codexValue, providerDomain, g1)
+  domainMember(codexValue, providerDomain)
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued)
+  domainMember(codexValue, providerDomain) .
+
+--- An exhaustive finite-domain pattern miss produces a diagnostic without committing effects.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  exhaustivePattern(guardedRule, issueFact, invalidProviderValue, providerDomain)
+  domainNonMember(invalidProviderValue, providerDomain)
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) diagnostic(guardedRule)
+  domainNonMember(invalidProviderValue, providerDomain) graph(g1, tellEff) .
+
+--- An exhaustive finite-domain pattern miss cannot commit its effect graph.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  exhaustivePattern(guardedRule, issueFact, invalidProviderValue, providerDomain)
+  domainNonMember(invalidProviderValue, providerDomain)
+  graph(g1, tellEff)
+  =>*
+  diagnostic(guardedRule) graphCommitted(g1) effect(tellEff, queued) .
+
+--- A Some/non-null pattern branch cannot fire for a missing optional path.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  optionalSomeBranch(guardedRule, issueFact, assigneePath, g1)
+  path(assigneePath, missing)
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) .
+
+--- A Some/non-null pattern branch binds a proven-present optional path.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  optionalSomeBranch(guardedRule, issueFact, assigneePath, g1)
+  path(assigneePath, present)
+  readPath(assigneePath)
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued)
+  path(assigneePath, present) boundPresent(assigneePath) readOk(assigneePath) .
+
+--- A None/null pattern branch can fire for a missing optional path.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  optionalNoneBranch(guardedRule, issueFact, assigneePath, g1)
+  path(assigneePath, missing)
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued)
+  path(assigneePath, missing) .
+
 --- Assertion failure is observable, but it cannot mutate workflow facts/effects.
 search [1] in WHIPPLETREE-KERNEL :
   assertion(assertion1, aFail)

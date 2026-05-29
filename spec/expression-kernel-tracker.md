@@ -36,8 +36,9 @@ The expression kernel covers deterministic logic used by:
   BAML coerce counts in source.
 - [~] Compiler validates known field paths in guards.
 - [~] Maude has a finite abstract expression model for guard true/false/error,
-  assertion pass/fail/error, optional presence, enum/literal domains, and
-  dynamic agent target validity.
+  assertion pass/fail/error, optional presence, enum/literal domains, typed
+  pattern branches, exhaustive finite-domain misses, and dynamic agent target
+  validity.
 - [ ] Real compiler/runtime guard evaluation does not yet use a typed expression
   AST.
 - [ ] Full guard/assertion type checking is not implemented.
@@ -67,6 +68,9 @@ The expression kernel covers deterministic logic used by:
 | Map index `path["key"]` | [x] | [ ] | [ ] | [ ] | [ ] | [ ] | Field paths currently support dot access only in guard/assertion runtime. |
 | Enum variant values | [x] | [~] | [~] | [~] | [~] | [~] | Enum schemas exist; expression values are currently strings at runtime. |
 | Literal-union values | [x] | [~] | [~] | [~] | [~] | [x] | Literal types exist; guards do not yet verify literal-domain membership. |
+| Typed finite-domain pattern branches | [x] | [ ] | [ ] | [ ] | [x] | [x] | Maude models branch match, non-match, exhaustive miss diagnostics, and optional-present binding. |
+| Exhaustiveness checks for finite patterns | [x] | [ ] | [ ] | [ ] | [x] | [x] | Abstract model covers diagnostic on missing enum/literal branch; compiler support is not implemented. |
+| Optional Some/None pattern branches | [x] | [ ] | [ ] | [ ] | [x] | [x] | Abstract model proves Some branch binds present path and missing path cannot fire Some branch. |
 | Optional presence proofs | [x] | [ ] | [ ] | [ ] | [~] | [ ] | Must reject unsafe optional field access unless proven present. |
 | Missing vs null distinction | [x] | [ ] | [ ] | [~] | [~] | [ ] | Runtime currently collapses missing path lookup to `null` in guards. |
 | Type-directed interpolation paths | [x] | [~] | [ ] | [~] | [ ] | [x] | Existing interpolation is path-oriented but not fully expression-kernel typed. |
@@ -164,7 +168,31 @@ The expression kernel covers deterministic logic used by:
 - [ ] Add provider-language dogfood coverage that routes through typed
   `AgentRef` once available.
 
-### 6. Tests And Fixtures
+### 6. Pattern Matching And Branching
+
+- [ ] Specify concrete source syntax for finite-domain branching, such as
+  `case expr { Variant => ... }`, guarded rule alternatives, or another
+  source form that fits Whippletree's rule style.
+- [ ] Support enum and literal-union branch matching.
+- [ ] Support optional Some/None or present/missing branch matching that binds a
+  proven-present value in the Some branch.
+- [ ] Support tagged terminal-output union branch matching for effect
+  completion facts.
+- [ ] Allow branch guards that reuse the expression kernel.
+- [ ] Reject unknown enum/literal variants in patterns.
+- [ ] Emit exhaustiveness diagnostics for finite domains where the branch result
+  must be total.
+- [ ] Preserve source spans for branch alternatives in IR and diagnostics.
+- [ ] Lower pattern branches into deterministic rule alternatives or typed
+  expression branches before effect graph commit.
+- [x] Model finite-domain branch match/non-match in Maude.
+- [x] Model exhaustive finite-domain miss diagnostics in Maude.
+- [x] Model optional Some/None branch readiness and present binding in Maude.
+- [ ] Defer deep object destructuring, array destructuring, user-defined
+  extractors, and provider-text pattern matching until a concrete workflow
+  requires them.
+
+### 7. Tests And Fixtures
 
 - [ ] Parser tests for every expression form.
 - [ ] Golden IR snapshots for guards and assertions using every operator class.
@@ -173,16 +201,20 @@ The expression kernel covers deterministic logic used by:
   bad array literals, and bad `AgentRef` targets.
 - [ ] Runtime tests for guard true, false, and error paths.
 - [ ] Runtime tests for assertion pass, fail, and error paths.
+- [ ] Parser/type-checker tests for enum, literal, optional, and tagged-union
+  pattern branches.
+- [ ] Exhaustiveness diagnostic tests for finite pattern domains.
 - [ ] E2E test showing `&&`, `||`, `!`, ordering, `in`, `exists`, `empty`, and
   `count` in source.
 - [ ] E2E test showing assertion failures reach JSON output and nonzero exit.
 - [ ] E2E test showing failed guards do not enqueue effects.
-- [ ] Maude tests for guard false/error, optional presence, enum/literal domain
-  validity, dynamic agent target validity, and assertion non-mutation.
+- [x] Maude tests for guard false/error, optional presence, enum/literal domain
+  validity, finite-domain pattern branches, optional Some/None branches,
+  dynamic agent target validity, and assertion non-mutation.
 - [ ] Companion-skill dogfood test that authors deterministic routing without
   asking an LLM to identify provider/model identity.
 
-### 7. Docs And Agent Guidance
+### 8. Docs And Agent Guidance
 
 - [ ] Update [language.md](language.md) with concrete expression syntax once the
   AST parser lands.
@@ -204,6 +236,8 @@ The expression kernel covers deterministic logic used by:
   are rejected or diagnosed before runtime.
 - [ ] Boolean, ordering, membership, presence, count, empty, and exists
   expressions work in both guards and assertions where semantically valid.
+- [ ] Enum/literal, optional, and tagged-union pattern branches are typed,
+  deterministic, and exhaustiveness-checked where the domain is finite.
 - [ ] Optional field access is rejected unless presence is proven.
 - [ ] Dynamic agent routing is typed as `AgentRef` or equivalent, and plain
   strings cannot target `tell`.

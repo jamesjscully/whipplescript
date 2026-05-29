@@ -65,6 +65,12 @@ mod WHIPPLETREE-KERNEL is
   op guard : RuleId FactId GuardResult -> Cfg .
   op domainGuard : RuleId FactId Value Domain -> Cfg .
   op domainMember : Value Domain -> Cfg .
+  op domainNonMember : Value Domain -> Cfg .
+  op patternBranch : RuleId FactId Value Domain GraphId -> Cfg .
+  op exhaustivePattern : RuleId FactId Value Domain -> Cfg .
+  op optionalSomeBranch : RuleId FactId Path GraphId -> Cfg .
+  op optionalNoneBranch : RuleId FactId Path GraphId -> Cfg .
+  op boundPresent : Path -> Cfg .
   op ruleReady : RuleId FactId GraphId -> Cfg .
   op ruleFired : RuleId FactId GraphId -> Cfg .
   op graph : GraphId EffectId -> Cfg .
@@ -123,6 +129,30 @@ mod WHIPPLETREE-KERNEL is
     fact(F) domainGuard(R, F, V, Dm) domainMember(V, Dm)
     => fact(F) guard(R, F, gTrue) domainMember(V, Dm) .
 
+  --- Typed finite-domain pattern branches are rule-readiness gates. A branch
+  --- can fire only when the matched value belongs to the branch's enum/literal
+  --- domain. Non-matching branches do not produce diagnostics by themselves.
+  rl [pattern-branch-match] :
+    fact(F) patternBranch(R, F, V, Dm, G) domainMember(V, Dm)
+    => fact(F) ruleReady(R, F, G) domainMember(V, Dm) .
+
+  --- Exhaustive matches over finite domains may produce a diagnostic when the
+  --- value is outside every covered branch. This models compiler/runtime
+  --- evidence for missing enum/literal cases without committing a graph.
+  rl [exhaustive-pattern-miss] :
+    fact(F) exhaustivePattern(R, F, V, Dm) domainNonMember(V, Dm)
+    => fact(F) diagnostic(R) domainNonMember(V, Dm) .
+
+  --- Optional/non-null pattern branches bind a proven-present value. The bound
+  --- path can then be read without treating Missing as Null.
+  rl [optional-some-branch] :
+    fact(F) optionalSomeBranch(R, F, X, G) path(X, present)
+    => fact(F) ruleReady(R, F, G) path(X, present) boundPresent(X) .
+
+  rl [optional-none-branch] :
+    fact(F) optionalNoneBranch(R, F, X, G) path(X, missing)
+    => fact(F) ruleReady(R, F, G) path(X, missing) .
+
   rl [fire-rule] :
     fact(F) rule(R, F, G) ruleReady(R, F, G)
     => fact(F) rule(R, F, G) ruleFired(R, F, G) graphReady(G) event(ruleCommitEvt) .
@@ -140,6 +170,10 @@ mod WHIPPLETREE-KERNEL is
   rl [read-present-path] :
     path(X, present) readPath(X)
     => path(X, present) readOk(X) .
+
+  rl [read-bound-present-path] :
+    boundPresent(X) readPath(X)
+    => boundPresent(X) readOk(X) .
 
   --- Effect graph commits create durable outbox nodes and dependency edges.
   rl [commit-single-effect-graph] :

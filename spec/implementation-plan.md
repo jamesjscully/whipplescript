@@ -616,7 +616,8 @@ not be considered complete until that tracker reaches its acceptance gates.
   membership, count/empty/exists, query filters, array literals, map indexing,
   parentheses, and precedence.
 - [x] Add a finite Maude expression-kernel model for guard true/false/error,
-  optional presence, enum/literal domains, assertions, and AgentRef validity.
+  optional presence, enum/literal domains, typed pattern branches, assertions,
+  and AgentRef validity.
 - [ ] Extend generated per-program Maude checks so rule firing is gated by
   lowered guard predicates before effect graphs can commit.
 - [x] Add deterministic assertion syntax over fact/effect projections for e2e

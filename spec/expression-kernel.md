@@ -85,6 +85,7 @@ expr
   | "empty" "(" expr ")"
   | "empty" "(" collection ")"
   | "count" "(" collection ")"
+  | caseExpr
   | objectLiteral
   | arrayLiteral
 
@@ -101,6 +102,12 @@ factQuery
 
 effectQuery
   = "effect" ("kind" EffectKind)? ("where" expr)?
+
+caseExpr
+  = "case" expr "{" caseBranch+ "}"
+
+caseBranch
+  = pattern ("where" expr)? "=>" expr
 ```
 
 The implementation may choose different concrete syntax, but it must preserve
@@ -131,6 +138,9 @@ Every expression is typed before runtime evaluation. The compiler must reject:
 - enum variants outside the enum
 - literal values outside a literal union
 - membership against non-arrays and non-maps
+- patterns that cannot match the scrutinee type
+- unknown enum variants or literal values in finite-domain patterns
+- non-exhaustive finite-domain patterns where a total expression is required
 - object literals that do not satisfy the expected class/effect schema
 - arrays whose elements do not share the declared item type
 - plain strings used as `AgentRef` or dynamic `tell` targets
@@ -190,6 +200,64 @@ equivalent algebraic rewrites
 presence hidden behind user-defined functions
 presence inferred from string parsing
 presence inferred from provider/model text
+```
+
+## Pattern Matching And Branching
+
+Pattern matching is a typed finite-domain branching tool, not a general
+destructuring language. It exists to keep deterministic routing and variant
+handling out of prompts.
+
+The v0 pattern surface should cover:
+
+```text
+enum variants
+literal-union values
+optional Some/None or present/missing branches
+tagged terminal-output unions from effect completions
+wildcard/default branch, when an explicit catch-all is intended
+```
+
+Patterns may have guards, and those guards use the ordinary expression kernel.
+Branch guards must not perform I/O or call providers.
+
+The compiler should exhaustiveness-check finite domains when the branch result
+must be total:
+
+```whippletree
+case review.status {
+  Accept => "ready"
+  Revise => "needs-work"
+  Blocked => "blocked"
+}
+```
+
+Optional branches may bind a proven-present value:
+
+```whippletree
+case issue.assignee {
+  Some assignee => assignee.name
+  None => "unassigned"
+}
+```
+
+Exact concrete syntax may change, but the semantics must stay restricted:
+
+- enum/literal patterns can match only variants in the declared domain
+- optional `Some` branches prove presence for the bound value
+- `None` branches do not permit reading fields through the missing value
+- branch selection is deterministic and side-effect-free
+- non-matching branches do not commit facts or effects
+- exhaustive finite-domain misses produce diagnostics instead of hidden fallthrough
+
+Deferred until a concrete workflow requires them:
+
+```text
+deep object destructuring
+array/list destructuring
+user-defined extractors
+regex/string pattern matching
+provider transcript pattern matching
 ```
 
 ## Equality
