@@ -38,6 +38,9 @@ assertions
   assert count(LanguageE2EResult where provider == "pi") == 2
     reads
       fact:LanguageE2EResult where provider == "pi"
+  assert count(LanguageTask where status == "queued") == 0
+    reads
+      fact:LanguageTask where status == "queued"
   assert count(effect kind agent.tell where status == completed) == 6
     reads
       effect:kind agent.tell where status == completed
@@ -53,18 +56,20 @@ rules
       schema:LanguageTask
     body_hash aa1075d1dfb7271e
   rule run_language_task
-    when LanguageTask as task
+    when LanguageTask as task where task.status == "queued"
     when task.provider is available
     reads
       pattern:task.provider is available
       schema:LanguageTask
     writes
       schema:LanguageE2EResult
+    consumes
+      schema:LanguageTask
     effects
       turn kind=agent.tell binding=turn key=dcc419597b331e20
       review kind=baml.coerce binding=review key=2ffc7caad53c6757
     dependencies
       turn --succeeds--> review
-    body_hash d507a020c0856e0e
+    body_hash 246dcf952799949b
 rule_dependencies
   seed_language_matrix --schema:LanguageTask--> run_language_task

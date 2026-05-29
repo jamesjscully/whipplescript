@@ -308,6 +308,13 @@ fn dev_phase_review_creates_requests_and_runs_fixture_turns() {
             .iter()
             .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("PhaseReviewRequest"))
             .count(),
+        0
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("PhaseReviewDispatch"))
+            .count(),
         14
     );
     assert_eq!(
@@ -959,7 +966,7 @@ fn dev_provider_language_e2e_runs_agent_matrix_and_baml_reviews() {
         .get("assertions")
         .and_then(Value::as_array)
         .expect("assertions");
-    assert_eq!(assertions.len(), 5);
+    assert_eq!(assertions.len(), 6);
     assert!(assertions
         .iter()
         .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));

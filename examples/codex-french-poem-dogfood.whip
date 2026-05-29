@@ -27,6 +27,11 @@ agent codex {
   capacity 1
 }
 
+assert count(FrenchPoemRequest where status == "queued") == 0
+assert count(FrenchPoemDraft where status == "written") == 0
+assert count(FrenchPoemJudgment where status == "judged") == 1
+assert count(effect kind agent.tell where status == completed) == 2
+
 rule seed_poem_request
   when started
 => {
@@ -39,7 +44,7 @@ rule seed_poem_request
 }
 
 rule write_french_poem
-  when FrenchPoemRequest as request
+  when FrenchPoemRequest as request where request.status == "queued"
   when codex is available
 => {
   tell codex as poemTurn """
@@ -56,6 +61,8 @@ rule write_french_poem
   """
 
   after poemTurn succeeds {
+    done request
+
     record FrenchPoemDraft {
       topic request.topic
       poemPath request.poemPath
@@ -67,7 +74,7 @@ rule write_french_poem
 }
 
 rule judge_french_poem
-  when FrenchPoemDraft as draft
+  when FrenchPoemDraft as draft where draft.status == "written"
   when codex is available
 => {
   tell codex as judgmentTurn """
@@ -86,6 +93,8 @@ rule judge_french_poem
   """
 
   after judgmentTurn succeeds {
+    done draft
+
     record FrenchPoemJudgment {
       poemPath draft.poemPath
       verdictPath draft.verdictPath

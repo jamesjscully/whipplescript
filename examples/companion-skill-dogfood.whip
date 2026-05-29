@@ -38,7 +38,7 @@ agent pi {
   capabilities ["agent.tell"]
 }
 
-assert count(CompanionReviewTask where status == "queued") == 3
+assert count(CompanionReviewTask where status == "queued") == 0
 assert count(CompanionReviewDispatch where provider == "codex") == 1
 assert count(CompanionReviewDispatch where provider == "claude") == 1
 assert count(CompanionReviewDispatch where provider == "pi") == 1
@@ -77,7 +77,7 @@ rule seed_companion_review_matrix
 }
 
 rule dispatch_companion_review
-  when CompanionReviewTask as task where task.route in ["spec", "validation", "docs"]
+  when CompanionReviewTask as task where task.status == "queued" && task.route in ["spec", "validation", "docs"]
   when task.reviewer is available
 => {
   tell task.reviewer requires ["agent.tell"] as turn """
@@ -94,6 +94,8 @@ rule dispatch_companion_review
   """
 
   after turn succeeds {
+    done task
+
     record CompanionReviewDispatch {
       provider task.reviewer
       phase task.phase

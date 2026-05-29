@@ -19,7 +19,11 @@ class KernelTask {
 class KernelRoute {
   provider string
   title string
+  route string
+  tags string[]
+  metadata map<string>
   owner KernelOwner?
+  priority int
   status "routed"
 }
 
@@ -38,12 +42,11 @@ agent pi {
   capacity 1
 }
 
-assert count(KernelTask where status == "queued") == 3
+assert count(KernelTask where status == "queued") == 0
 assert count(KernelRoute where provider in ["codex", "claude", "pi"]) == 3
-assert exists(KernelTask where route == "docs" && "expression-kernel" in tags)
-assert empty(KernelTask where status == "blocked" || priority > 9)
-assert count(KernelTask where "phase" in metadata && metadata["phase"] == "kernel") >= 1
-assert exists(KernelTask where owner != null && owner.name == "Ada")
+assert exists(KernelRoute where route == "docs" && "expression-kernel" in tags)
+assert empty(KernelRoute where priority > 9)
+assert count(KernelRoute where "phase" in metadata && metadata["phase"] == "kernel") >= 1
 assert count(effect kind agent.tell where status == completed) == 3
 
 rule seed_expression_kernel_tasks
@@ -101,17 +104,23 @@ rule route_expression_kernel_task
   """
 
   after turn succeeds {
+    done task
+
     record KernelRoute {
       provider task.provider
       title task.title
+      route task.route
+      tags task.tags
+      metadata task.metadata
       owner task.owner
+      priority task.priority
       status "routed"
     }
   }
 }
 
 rule route_owned_expression_kernel_task
-  when KernelTask as task where exists task.owner && task.owner.name == "Ada" && task.metadata["phase"] not in ["deferred", "blocked"]
+  when KernelTask as task where task.status == "queued" && exists task.owner && task.owner.name == "Ada" && task.metadata["phase"] not in ["deferred", "blocked"]
   when task.provider is available
 => {
   tell task.provider """
@@ -122,6 +131,6 @@ rule route_owned_expression_kernel_task
 }
 
 rule notice_routed_codex_task
-  when KernelTask as task where task.provider == "codex" && exists(KernelRoute where provider == "codex")
+  when KernelRoute as route where route.provider == "codex" && exists(KernelRoute where provider == "codex")
 => {
 }

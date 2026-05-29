@@ -11,7 +11,9 @@ class PhaseReviewRequest {
 }
 
 class PhaseReviewDispatch {
-  request PhaseReviewRequest
+  number int
+  title string
+  trackerPath string
   turn AgentTurn
   status "dispatched"
 }
@@ -21,6 +23,9 @@ agent codex {
   capacity 4
   skills ["whippletree-author"]
 }
+
+assert count(PhaseReviewRequest where status == "queued") == 0
+assert count(PhaseReviewDispatch where status == "dispatched") == 14
 
 rule seed_phase_reviews
   when started
@@ -139,7 +144,7 @@ rule seed_phase_reviews
 }
 
 rule dispatch_phase_review
-  when PhaseReviewRequest as phase
+  when PhaseReviewRequest as phase where phase.status == "queued"
   when codex is available
 => {
   tell codex as turn """
@@ -170,8 +175,12 @@ rule dispatch_phase_review
   """
 
   after turn succeeds {
+    done phase
+
     record PhaseReviewDispatch {
-      request phase
+      number phase.number
+      title phase.title
+      trackerPath phase.trackerPath
       turn turn
       status "dispatched"
     }

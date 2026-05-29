@@ -9,11 +9,20 @@ schemas
     trackerPath string
     status literal<"queued">
   class PhaseReviewDispatch
-    request ref<PhaseReviewRequest>
+    number int
+    title string
+    trackerPath string
     turn ref<AgentTurn>
     status literal<"dispatched">
 agents
   agent codex profile=repo-reader capacity=4 skills=[whippletree-author] capabilities=[]
+assertions
+  assert count(PhaseReviewRequest where status == "queued") == 0
+    reads
+      fact:PhaseReviewRequest where status == "queued"
+  assert count(PhaseReviewDispatch where status == "dispatched") == 14
+    reads
+      fact:PhaseReviewDispatch where status == "dispatched"
 rules
   rule seed_phase_reviews
     when started
@@ -23,15 +32,17 @@ rules
       schema:PhaseReviewRequest
     body_hash 0482a45d585b4fae
   rule dispatch_phase_review
-    when PhaseReviewRequest as phase
+    when PhaseReviewRequest as phase where phase.status == "queued"
     when codex is available
     reads
       pattern:codex is available
       schema:PhaseReviewRequest
     writes
       schema:PhaseReviewDispatch
+    consumes
+      schema:PhaseReviewRequest
     effects
       turn kind=agent.tell binding=turn key=adc5c89b0182f885
-    body_hash 827b406e0b89e9ac
+    body_hash 8dde0d7537605610
 rule_dependencies
   seed_phase_reviews --schema:PhaseReviewRequest--> dispatch_phase_review

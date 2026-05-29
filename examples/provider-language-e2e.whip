@@ -69,6 +69,7 @@ agent pi {
 assert count(LanguageE2EResult where provider == "codex") == 2
 assert count(LanguageE2EResult where provider == "claude") == 2
 assert count(LanguageE2EResult where provider == "pi") == 2
+assert count(LanguageTask where status == "queued") == 0
 assert count(effect kind agent.tell where status == completed) == 6
 assert count(effect kind baml.coerce where status == completed) == 6
 
@@ -131,7 +132,7 @@ rule seed_language_matrix
 }
 
 rule run_language_task
-  when LanguageTask as task
+  when LanguageTask as task where task.status == "queued"
   when task.provider is available
 => {
   tell task.provider as turn """
@@ -157,6 +158,8 @@ rule run_language_task
   }
 
   after review succeeds {
+    done task
+
     record LanguageE2EResult {
       provider task.provider
       language task.language
