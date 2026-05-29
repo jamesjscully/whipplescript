@@ -15,7 +15,7 @@ class Task {
 }
 
 assert count() == 0
-assert count(Task, Task) == 0
+assert count(["a"], ["b"]) == 0
 assert count(MissingTask) == 0
 assert count(Task where missing == "x") == 0
 assert count(Task where priority) == 0

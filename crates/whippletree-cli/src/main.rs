@@ -2450,12 +2450,14 @@ fn select_case_branch(case: &CaseBlock, context: &mut RuleContext) -> Option<Cas
             fallback = Some(branch.clone());
             continue;
         }
-        if case_pattern_matches(&branch.pattern, &value, context)
+        let mut candidate_context = context.clone();
+        if case_pattern_matches(&branch.pattern, &value, &mut candidate_context)
             && branch
                 .guard
                 .as_deref()
-                .is_none_or(|guard| eval_guard_source(guard, context))
+                .is_none_or(|guard| eval_guard_source(guard, &candidate_context))
         {
+            *context = candidate_context;
             return Some(branch.clone());
         }
     }
@@ -5043,6 +5045,40 @@ mod tests {
 
         assert_eq!(records.len(), 9);
         check_trace(&records).expect("reconstructed trace conforms");
+    }
+
+    #[test]
+    fn renders_provider_diagnostic_trace_json() {
+        let record = TraceRecord {
+            sequence: 7,
+            event: TraceEvent::ProviderDiagnostic {
+                run_id: "run-1".to_owned(),
+                effect_id: "effect-1".to_owned(),
+                provider: "fixture".to_owned(),
+                status: EffectStatus::Failed,
+                summary: "provider failed".to_owned(),
+                diagnostics_json: json!({"stage": "tool", "retryable": false}).to_string(),
+            },
+        };
+
+        let rendered = trace_record_to_json(&record);
+        let event = rendered.get("event").expect("event");
+        assert_eq!(
+            event.get("type").and_then(Value::as_str),
+            Some("provider_diagnostic")
+        );
+        assert_eq!(
+            event.get("provider").and_then(Value::as_str),
+            Some("fixture")
+        );
+        assert_eq!(event.get("status").and_then(Value::as_str), Some("failed"));
+        assert_eq!(
+            event
+                .get("diagnostics")
+                .and_then(|diagnostics| diagnostics.get("stage"))
+                .and_then(Value::as_str),
+            Some("tool")
+        );
     }
 
     #[test]

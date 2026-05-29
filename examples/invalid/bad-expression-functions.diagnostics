@@ -1,44 +1,44 @@
 error: assertion calls `count` with 0 arguments, expected 1
-  --> examples/invalid/bad-expression-functions.whip:17:1
+   --> examples/invalid/bad-expression-functions.whip:17:8
    |
 17 | assert count() == 0
-   | ^^^^^^^^^^^^^^^^^^^
+   |        ^^^^^^^^^^^^
    = help: call `count` with exactly one array, map, fact query, or effect query argument
 error: assertion calls `count` with 2 arguments, expected 1
-  --> examples/invalid/bad-expression-functions.whip:18:1
+   --> examples/invalid/bad-expression-functions.whip:18:8
    |
-18 | assert count(Task, Task) == 0
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+18 | assert count(["a"], ["b"]) == 0
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^
    = help: call `count` with exactly one array, map, fact query, or effect query argument
 error: assertion queries unknown fact schema `MissingTask`
-  --> examples/invalid/bad-expression-functions.whip:19:1
+   --> examples/invalid/bad-expression-functions.whip:19:8
    |
 19 | assert count(MissingTask) == 0
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |        ^^^^^^^^^^^^^^^^^^^^^^^
    = help: use a declared class name in fact queries
 error: assertion fact query `Task` has unknown field `missing`
-  --> examples/invalid/bad-expression-functions.whip:20:1
+   --> examples/invalid/bad-expression-functions.whip:20:8
    |
 20 | assert count(Task where missing == "x") == 0
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = help: use a field declared on `Task` inside the query `where` expression
 error: assertion fact query `Task` has non-boolean `where` expression
-  --> examples/invalid/bad-expression-functions.whip:21:1
+   --> examples/invalid/bad-expression-functions.whip:21:8
    |
 21 | assert count(Task where priority) == 0
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = help: query `where` expressions must evaluate to bool
 error: assertion calls `exists` with unsupported argument type `int`
-  --> examples/invalid/bad-expression-functions.whip:22:1
+   --> examples/invalid/bad-expression-functions.whip:22:8
    |
 22 | assert exists(1)
-   | ^^^^^^^^^^^^^^^^
-   = help: use `exists path` for presence checks or pass an array, map, fact query, or effect query
+   |        ^^^^^^^^^
+   = help: use `exists path` for optional/map presence checks or pass an array, map, fact query, or effect query
 error: assertion calls `empty` with unsupported argument type `bool`
-  --> examples/invalid/bad-expression-functions.whip:23:1
+   --> examples/invalid/bad-expression-functions.whip:23:8
    |
 23 | assert empty(true)
-   | ^^^^^^^^^^^^^^^^^^
+   |        ^^^^^^^^^^^
    = help: use `empty` only with arrays, maps, strings, fact queries, effect queries, null, or supported optional values
 error: rule `bad_function_shapes` calls `count` with unsupported argument type `string`
    --> examples/invalid/bad-expression-functions.whip:31:4
@@ -57,16 +57,16 @@ error: rule `bad_function_shapes` calls `exists` with unsupported argument type 
    |
 31 | => {
    |    ^
-   = help: use `exists path` for presence checks or pass an array, map, fact query, or effect query
+   = help: use `exists path` for optional/map presence checks or pass an array, map, fact query, or effect query
 error: rule `bad_function_shapes` calls `empty` with unsupported argument type `bool`
    --> examples/invalid/bad-expression-functions.whip:31:4
    |
 31 | => {
    |    ^
    = help: use `empty` only with arrays, maps, strings, fact queries, effect queries, null, or supported optional values
-error: rule `bad_function_shapes` calls `empty` with unsupported optional argument type `Owner?`
+error: rule `bad_function_shapes` calls `empty` with unsupported optional argument type `object?`
    --> examples/invalid/bad-expression-functions.whip:31:4
    |
 31 | => {
    |    ^
-   = help: optional values can use `empty` only when their present value also supports `empty`
+   = help: use `empty` only with arrays, maps, strings, fact queries, effect queries, null, or supported optional values

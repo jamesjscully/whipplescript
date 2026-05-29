@@ -447,6 +447,7 @@ enum ExprType {
     Float,
     String,
     Null,
+    Object,
     Optional(Box<ExprType>),
     Array(Box<ExprType>),
     Map(Box<ExprType>),
@@ -2195,14 +2196,25 @@ fn validate_expr_node(
                 presence_proofs,
                 diagnostics,
             );
+            validate_unknown_implicit_idents(
+                *op,
+                left,
+                right,
+                semantic,
+                scope,
+                context,
+                diagnostics,
+            );
             validate_finite_domain_expr(*op, left, right, semantic, scope, context, diagnostics);
         }
-        Expr::Call { args, .. } => {
+        Expr::Call { name, args } => {
+            validate_function_call(name, args, semantic, scope, context, diagnostics);
             for arg in args {
                 validate_expr_node(arg, semantic, scope, context, presence_proofs, diagnostics);
             }
         }
         Expr::Query { guard, .. } => {
+            validate_query_expr(expr, semantic, scope, context, diagnostics);
             if let Some(guard) = guard {
                 let guard_scope = query_guard_scope(expr, semantic, scope);
                 validate_expr_node(
@@ -2216,6 +2228,229 @@ fn validate_expr_node(
             }
         }
         Expr::Literal(_) => {}
+    }
+}
+
+fn validate_unknown_implicit_idents(
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    semantic: &SemanticContext,
+    scope: &ExprScope,
+    context: &ExprValidationContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !matches!(
+        op,
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+    ) {
+        return;
+    }
+    validate_unknown_implicit_ident(left, right, semantic, scope, context, diagnostics);
+    validate_unknown_implicit_ident(right, left, semantic, scope, context, diagnostics);
+}
+
+fn validate_unknown_implicit_ident(
+    expr: &Expr,
+    other: &Expr,
+    semantic: &SemanticContext,
+    scope: &ExprScope,
+    context: &ExprValidationContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Expr::Literal(ExprLiteral::Ident(name)) = expr else {
+        return;
+    };
+    let Some(schema) = &scope.implicit_schema else {
+        return;
+    };
+    let field_exists = semantic
+        .schemas
+        .classes
+        .get(schema)
+        .is_some_and(|fields| fields.contains_key(name));
+    if field_exists
+        || expr_domain(other, semantic, scope).is_some()
+        || implicit_ident_field_exists(other, semantic, scope)
+    {
+        return;
+    }
+    diagnostics.push(Diagnostic {
+        span: context.span,
+        message: format!(
+            "{} fact query `{schema}` has unknown field `{name}`",
+            context.subject
+        ),
+        suggestion: Some(format!(
+            "use a field declared on `{schema}` inside the query `where` expression"
+        )),
+    });
+}
+
+fn implicit_ident_field_exists(expr: &Expr, semantic: &SemanticContext, scope: &ExprScope) -> bool {
+    let Expr::Literal(ExprLiteral::Ident(name)) = expr else {
+        return false;
+    };
+    let Some(schema) = &scope.implicit_schema else {
+        return false;
+    };
+    semantic
+        .schemas
+        .classes
+        .get(schema)
+        .is_some_and(|fields| fields.contains_key(name))
+}
+
+fn validate_function_call(
+    name: &str,
+    args: &[Expr],
+    semantic: &SemanticContext,
+    scope: &ExprScope,
+    context: &ExprValidationContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match name {
+        "count" => {
+            if args.len() != 1 {
+                diagnostics.push(Diagnostic {
+                    span: context.span,
+                    message: format!(
+                        "{} calls `count` with {} arguments, expected 1",
+                        context.subject,
+                        args.len()
+                    ),
+                    suggestion: Some(
+                        "call `count` with exactly one array, map, fact query, or effect query argument"
+                            .to_owned(),
+                    ),
+                });
+                return;
+            }
+            let ty = infer_expr_type(&args[0], semantic, scope, context, diagnostics);
+            if !is_countable_type(&ty) {
+                diagnostics.push(Diagnostic {
+                    span: context.span,
+                    message: format!(
+                        "{} calls `count` with unsupported argument type `{}`",
+                        context.subject,
+                        expr_type_label(&ty)
+                    ),
+                    suggestion: Some(
+                        "use `count` only with arrays, maps, fact queries, or effect queries"
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+        "exists" => {
+            if args.len() != 1 {
+                diagnostics.push(Diagnostic {
+                    span: context.span,
+                    message: format!(
+                        "{} calls `exists` with {} arguments, expected 1",
+                        context.subject,
+                        args.len()
+                    ),
+                    suggestion: Some("call `exists` with exactly one argument".to_owned()),
+                });
+                return;
+            }
+            let ty = infer_expr_type(&args[0], semantic, scope, context, diagnostics);
+            if !matches!(args[0], Expr::Index { .. }) && !is_exists_type(&ty) {
+                diagnostics.push(Diagnostic {
+                    span: context.span,
+                    message: format!(
+                        "{} calls `exists` with unsupported argument type `{}`",
+                        context.subject,
+                        expr_type_label(&ty)
+                    ),
+                    suggestion: Some(
+                        "use `exists path` for optional/map presence checks or pass an array, map, fact query, or effect query"
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+        "empty" => {
+            if args.len() != 1 {
+                diagnostics.push(Diagnostic {
+                    span: context.span,
+                    message: format!(
+                        "{} calls `empty` with {} arguments, expected 1",
+                        context.subject,
+                        args.len()
+                    ),
+                    suggestion: Some("call `empty` with exactly one argument".to_owned()),
+                });
+                return;
+            }
+            let ty = infer_expr_type(&args[0], semantic, scope, context, diagnostics);
+            if !is_empty_type(&ty) {
+                let optional = matches!(ty, ExprType::Optional(_));
+                diagnostics.push(Diagnostic {
+                    span: context.span,
+                    message: if optional {
+                        format!(
+                            "{} calls `empty` with unsupported optional argument type `{}`",
+                            context.subject,
+                            expr_type_label(&ty)
+                        )
+                    } else {
+                        format!(
+                            "{} calls `empty` with unsupported argument type `{}`",
+                            context.subject,
+                            expr_type_label(&ty)
+                        )
+                    },
+                    suggestion: Some(
+                        "use `empty` only with arrays, maps, strings, fact queries, effect queries, null, or supported optional values"
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_query_expr(
+    expr: &Expr,
+    semantic: &SemanticContext,
+    scope: &ExprScope,
+    context: &ExprValidationContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Expr::Query { kind, head, guard } = expr else {
+        return;
+    };
+    if *kind == QueryKind::Fact {
+        let Some(schema) = query_head_schema(head, semantic) else {
+            diagnostics.push(Diagnostic {
+                span: context.span,
+                message: format!(
+                    "{} queries unknown fact schema `{}`",
+                    context.subject,
+                    head.trim()
+                ),
+                suggestion: Some("use a declared class name in fact queries".to_owned()),
+            });
+            return;
+        };
+        if let Some(guard) = guard {
+            let guard_scope = scope.with_implicit_schema(schema);
+            let ty = infer_expr_type(guard, semantic, &guard_scope, context, diagnostics);
+            if !matches!(ty, ExprType::Bool | ExprType::Unknown) {
+                diagnostics.push(Diagnostic {
+                    span: context.span,
+                    message: format!(
+                        "{} fact query `{}` has non-boolean `where` expression",
+                        context.subject,
+                        head.trim()
+                    ),
+                    suggestion: Some("query `where` expressions must evaluate to bool".to_owned()),
+                });
+            }
+        }
     }
 }
 
@@ -2343,7 +2578,11 @@ fn query_guard_scope(expr: &Expr, semantic: &SemanticContext, scope: &ExprScope)
 }
 
 fn query_head_schema(head: &str, semantic: &SemanticContext) -> Option<String> {
-    let schema = head.split_whitespace().next()?;
+    let mut parts = head.split_whitespace();
+    let schema = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
     semantic
         .schemas
         .class_exists(schema)
@@ -2610,9 +2849,8 @@ fn expr_type_from_type_syntax(ty: &TypeSyntax) -> ExprType {
             "string" | "duration" | "time" => ExprType::String,
             _ => ExprType::Unknown,
         },
-        TypeSyntax::LiteralString { .. } | TypeSyntax::Ref { .. } | TypeSyntax::AgentRef { .. } => {
-            ExprType::String
-        }
+        TypeSyntax::LiteralString { .. } | TypeSyntax::AgentRef { .. } => ExprType::String,
+        TypeSyntax::Ref { .. } => ExprType::Object,
         TypeSyntax::Optional { inner, .. } => {
             ExprType::Optional(Box::new(expr_type_from_type_syntax(inner)))
         }
@@ -2663,6 +2901,53 @@ fn types_comparable(left: &ExprType, right: &ExprType) -> bool {
 
 fn is_numeric_type(ty: &ExprType) -> bool {
     matches!(ty, ExprType::Int | ExprType::Float)
+}
+
+fn is_countable_type(ty: &ExprType) -> bool {
+    matches!(
+        ty,
+        ExprType::Array(_) | ExprType::Map(_) | ExprType::Collection | ExprType::Unknown
+    )
+}
+
+fn is_exists_type(ty: &ExprType) -> bool {
+    matches!(
+        ty,
+        ExprType::Array(_)
+            | ExprType::Map(_)
+            | ExprType::Collection
+            | ExprType::Optional(_)
+            | ExprType::Unknown
+    )
+}
+
+fn is_empty_type(ty: &ExprType) -> bool {
+    match ty {
+        ExprType::String
+        | ExprType::Array(_)
+        | ExprType::Map(_)
+        | ExprType::Collection
+        | ExprType::Null
+        | ExprType::Unknown => true,
+        ExprType::Optional(inner) => is_empty_type(inner),
+        _ => false,
+    }
+}
+
+fn expr_type_label(ty: &ExprType) -> String {
+    match ty {
+        ExprType::Bool => "bool".to_owned(),
+        ExprType::Int => "int".to_owned(),
+        ExprType::Float => "float".to_owned(),
+        ExprType::String => "string".to_owned(),
+        ExprType::Null => "null".to_owned(),
+        ExprType::Object => "object".to_owned(),
+        ExprType::Array(inner) => format!("{}[]", expr_type_label(inner)),
+        ExprType::Map(inner) => format!("map<{}>", expr_type_label(inner)),
+        ExprType::Optional(inner) => format!("{}?", expr_type_label(inner)),
+        ExprType::Collection => "query".to_owned(),
+        ExprType::Unknown => "unknown".to_owned(),
+    }
 }
 
 fn validate_finite_domain_expr(
@@ -6905,6 +7190,10 @@ rule branch
             (
                 "bad-effect-graph",
                 include_str!("../../../examples/invalid/bad-effect-graph.whip"),
+            ),
+            (
+                "bad-expression-functions",
+                include_str!("../../../examples/invalid/bad-expression-functions.whip"),
             ),
             (
                 "broken",

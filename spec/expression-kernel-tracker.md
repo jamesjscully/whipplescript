@@ -40,16 +40,16 @@ as complete:
 
 | Feature | Spec | Validation | Implementation | Tests | Owner / Notes |
 | --- | --- | --- | --- | --- | --- |
-| Full guard/assertion type checking | [x] | [x] | [~] | [x] | Assertions now reuse guard-style expression validation for boolean results, finite-domain checks, unknown dotted roots, and simple fact-query guards. Added a pending invalid fixture for full function/query diagnostics; implementation still accepts it. |
+| Full guard/assertion type checking | [x] | [x] | [~] | [x] | Assertions now reuse guard-style expression validation for boolean results, finite-domain checks, unknown dotted roots, simple fact-query guards, function arity/shape checks, and unknown query-field/schema diagnostics. |
 | Expression object literals | [x] | [x] | [~] | [x] | Record-field expected-schema object/map literals now work for inline construction and dogfood metadata. Remaining gaps: effect argument fields, multiline nested object bodies, and general expression AST object literals. |
 | Duration/time ordering | [x] | [x] | [~] | [x] | Added executable tests documenting current limitations: duration/time ordering is rejected as non-numeric and source cannot seed concrete duration/time values yet. |
 | Enum/literal finite-domain typing | [x] | [~] | [~] | [~] | Spec now requires precise finite-domain types, symmetric comparison checks, and contradiction diagnostics. Typed query heads remain partial. |
 | Generated per-program Maude checks | [x] | [x] | [~] | [x] | Generated searches now cover symbolic guard true/false/error and assertion pass/fail/error non-mutation while preserving dependency checks. Remaining gap: full expression-semantics lowering rather than finite symbolic outcomes. |
 | AgentRef profile/capacity/capability constraints | [x] | [x] | [~] | [x] | Store claimability now filters policy-blocked effects and enforces per-agent capacity when declarations are persisted. Remaining gaps: persist declared agents from real programs, dynamic AgentRef ambiguity checks, and durable blocked-by-capacity status. |
 | Tagged terminal-output union branch matching | [x] | [x] | [ ] | [~] | Tracker now has a concrete source/IR/lowering/runtime/test checklist. `after ... completes` still lacks a typed terminal union payload. |
-| Branch pattern spans and typed lowering | [~] | [x] | [~] | [~] | Read-only analysis identified exact parser/CLI targets and a branch-binding leak risk. Implementation still pending. |
-| Assertion diagnostics and event surfaces | [x] | [x] | [~] | [x] | Store now records/lists durable diagnostics; kernel trace now emits provider diagnostics. Remaining gap: persist assertion/provider diagnostics through store transactions and CLI trace export. |
-| Provider/harness failure capture | [x] | [x] | [~] | [x] | Kernel trace now includes provider diagnostics before terminal failure/timeout events. Durable store/CLI export wiring remains partial. |
+| Branch pattern spans and typed lowering | [~] | [x] | [~] | [x] | Read-only analysis identified exact parser/CLI targets. The branch-binding leak is fixed and tested; branch-level source spans and typed rule-body lowering remain pending. |
+| Assertion diagnostics and event surfaces | [x] | [x] | [~] | [x] | Store now records/lists durable diagnostics; kernel trace and CLI trace JSON now support provider diagnostics. Remaining gap: persist assertion/provider diagnostics through store transactions. |
+| Provider/harness failure capture | [x] | [x] | [~] | [x] | Kernel trace now includes provider diagnostics before terminal failure/timeout events and CLI trace rendering is tested. Durable store persistence remains partial. |
 | Parser-only expression matrix | [x] | [x] | [x] | [x] | Parser-only tests now cover precedence, calls, fact/effect queries, map indexes, arrays, invalid syntax, and optional presence-proof syntax. |
 | Golden IR expression fixture | [x] | [x] | [x] | [x] | Added `examples/expression-kernel-dogfood.whip/.ir` covering guards, assertions, projections, maps, arrays, optional presence, and deterministic routing. |
 | Static-analysis diagnostic matrix | [x] | [x] | [~] | [x] | Added tests for assertion validation, symmetric finite-domain literal checks, and unknown dotted roots. Remaining categories need broader per-row coverage. |
@@ -65,10 +65,11 @@ as complete:
 | Golden dogfood fixture | `examples/expression-kernel-dogfood.whip`, `examples/expression-kernel-dogfood.ir` | Compiled golden fixture landed for guards, assertions, projections, map indexes, optional presence, arrays, and deterministic routing. |
 | Object/map literal construction | `crates/whippletree-parser/src/lib.rs`, `crates/whippletree-cli/src/main.rs`, `examples/expression-kernel-dogfood.*` | Record-field map/object literals now validate and materialize, including dogfood `metadata { phase "kernel" }`. |
 | Duration/time validation coverage | `crates/whippletree-cli/tests/control_plane.rs` | Added tests pinning the current unsupported state for duration/time ordering and value seeding. |
-| Function/query validation fixture | `examples/invalid/bad-expression-functions.*` | Added desired diagnostics fixture; current compiler still accepts it, so it is not wired into invalid fixture discovery yet. |
+| Function/query validation fixture | `examples/invalid/bad-expression-functions.*`, `crates/whippletree-parser/src/lib.rs` | Invalid function/query diagnostics are now enforced and included in invalid fixture discovery. |
 | Provider diagnostics trace slice | `crates/whippletree-kernel/src/trace.rs`, `crates/whippletree-kernel/src/lib.rs`, `crates/whippletree-cli/src/main.rs` | Provider diagnostics now appear in kernel trace and CLI trace JSON before terminal events. |
 | AgentRef store enforcement | `crates/whippletree-store/src/lib.rs` | Claimability filters profile/capability-blocked effects and start-run enforces per-agent capacity when metadata exists. |
 | Tagged terminal checklist | `spec/expression-kernel-tracker.md` | Added implementation checklist for tagged terminal-output union branch matching. |
+| Case branch context safety | `crates/whippletree-cli/src/main.rs`, `crates/whippletree-cli/tests/control_plane.rs` | Failed guarded `Some` branches no longer leak payload bindings into later branches or fallbacks. |
 
 ## Current Implementation Summary
 

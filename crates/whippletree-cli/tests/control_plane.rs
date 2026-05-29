@@ -1154,6 +1154,79 @@ rule route
 }
 
 #[test]
+fn dev_does_not_leak_failed_case_branch_bindings() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("case-binding-leak");
+    fs::write(
+        &source_path,
+        r#"
+workflow CaseBindingLeak
+
+class Task {
+  assignee string?
+}
+
+class Routed {
+  owner string
+}
+
+assert count(Routed where owner == "owner") == 1
+
+rule seed
+  when started
+=> {
+  record Task {
+    assignee "Ada"
+  }
+}
+
+rule route
+  when Task as task
+=> {
+  case task.assignee {
+    Some owner where false => {
+      record Routed {
+        owner "wrong"
+      }
+    }
+    _ => {
+      record Routed {
+        owner owner
+      }
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    assert!(dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("assertions")
+        .iter()
+        .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
 fn dev_evaluates_shared_expression_kernel_for_guards_and_assertions() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
@@ -1453,7 +1526,7 @@ rule accept
 }
 
 #[test]
-fn dev_reports_guard_errors_without_committing_effects() {
+fn check_reports_invalid_query_guards_before_dev_runs() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let source_path = temp_workflow_path("guard-error");
@@ -1504,48 +1577,15 @@ rule accept
         .output()
         .expect("command runs");
     assert!(!output.status.success());
-    let dev: Value = serde_json::from_slice(&output.stdout).expect("json stdout");
-    let guards = dev
-        .get("steps")
-        .and_then(Value::as_array)
-        .expect("steps")
-        .iter()
-        .flat_map(|step| {
-            step.get("guards")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-        })
-        .collect::<Vec<_>>();
-    assert!(guards.iter().any(|guard| {
-        guard.get("rule").and_then(Value::as_str) == Some("accept")
-            && guard.get("status").and_then(Value::as_str) == Some("error")
-            && guard.get("error").and_then(Value::as_str)
-                == Some("guard expression evaluation failed")
-    }));
-
-    let instance_id = dev
-        .get("instance_id")
-        .and_then(Value::as_str)
-        .expect("instance id");
-    let facts = run_json(
-        bin,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "facts",
-            instance_id,
-        ],
+    assert!(
+        output.stdout.is_empty(),
+        "static diagnostics should not emit dev JSON\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
     );
-    assert_eq!(
-        facts
-            .as_array()
-            .expect("facts")
-            .iter()
-            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("Result"))
-            .count(),
-        0
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("rule `accept` fact query `Task` has non-boolean `where` expression"),
+        "stderr:\n{stderr}"
     );
 
     let _ = fs::remove_file(store_path);
@@ -1631,19 +1671,21 @@ workflow MissingNull
 
 class MaybeOwner {
   owner string?
+  metadata map<string>
   status "open"
 }
 
 assert count(MaybeOwner) == 1
 assert exists(MaybeOwner where owner == null)
-assert empty(MaybeOwner where missing == null)
-assert empty(MaybeOwner where exists missing)
+assert empty(MaybeOwner where metadata["missing"] == null)
+assert empty(MaybeOwner where exists metadata["missing"])
 
 rule seed
   when started
 => {
   record MaybeOwner {
     owner null
+    metadata { present "value" }
     status "open"
   }
 }
