@@ -1,7 +1,8 @@
 mod WHIPPLETREE-KERNEL is
   sorts
     EffectId FactId RunId EventId RuleId GraphId
-    Predicate EffectStatus ProjectionStatus LeaseStatus Cfg .
+    Predicate EffectStatus ProjectionStatus LeaseStatus GuardResult
+    AssertionId AssertionResult AgentTarget Path Presence Value Domain Cfg .
 
   --- Sample identifiers used by hand-written model tests.
   ops e1 e2 e3 : -> EffectId .
@@ -12,7 +13,13 @@ mod WHIPPLETREE-KERNEL is
   ops event1 initEvt turnCompletedEvt coerceCompletedEvt coerceFailedEvt : -> EventId .
   ops ruleCommitEvt leaseExpiredEvt : -> EventId .
   ops ralphRule coerceRule : -> RuleId .
+  ops guardedRule agentRule : -> RuleId .
   ops g1 g2 g3 : -> GraphId .
+  ops assertion1 : -> AssertionId .
+  ops codexAgent claudeAgent piAgent missingAgent : -> AgentTarget .
+  ops assigneePath providerPath : -> Path .
+  ops codexValue claudeValue invalidProviderValue : -> Value .
+  op providerDomain : -> Domain .
 
   --- Effect lifecycle states.
   ops
@@ -36,6 +43,11 @@ mod WHIPPLETREE-KERNEL is
   --- `after effect succeeds|fails|completes` edges.
   ops succeeds fails completes : -> Predicate .
 
+  --- Expression-kernel abstraction.
+  ops gTrue gFalse gError : -> GuardResult .
+  ops aPass aFail aError : -> AssertionResult .
+  ops present missing : -> Presence .
+
   --- Runtime configuration as a multiset.
   op none : -> Cfg .
   op __ : Cfg Cfg -> Cfg [assoc comm id: none] .
@@ -50,12 +62,24 @@ mod WHIPPLETREE-KERNEL is
   op projection : EventId FactId ProjectionStatus -> Cfg .
   op completionProjection : EffectId EffectStatus FactId ProjectionStatus -> Cfg .
   op rule : RuleId FactId GraphId -> Cfg .
+  op guard : RuleId FactId GuardResult -> Cfg .
+  op domainGuard : RuleId FactId Value Domain -> Cfg .
+  op domainMember : Value Domain -> Cfg .
   op ruleReady : RuleId FactId GraphId -> Cfg .
   op ruleFired : RuleId FactId GraphId -> Cfg .
   op graph : GraphId EffectId -> Cfg .
   op graph2 : GraphId EffectId Predicate EffectId -> Cfg .
+  op graphAgent : GraphId EffectId AgentTarget -> Cfg .
   op graphReady : GraphId -> Cfg .
   op graphCommitted : GraphId -> Cfg .
+  op assertion : AssertionId AssertionResult -> Cfg .
+  op declaredAgent : AgentTarget -> Cfg .
+  op tellTarget : EffectId AgentTarget -> Cfg .
+  op path : Path Presence -> Cfg .
+  op readPath : Path -> Cfg .
+  op readOk : Path -> Cfg .
+  op diagnostic : RuleId -> Cfg .
+  op assertionDiagnostic : AssertionId -> Cfg .
   op policyAllows : EffectId -> Cfg .
   op capacityAvailable : EffectId -> Cfg .
   op lease : EffectId LeaseStatus -> Cfg .
@@ -67,6 +91,11 @@ mod WHIPPLETREE-KERNEL is
   vars Ev : EventId .
   vars R : RuleId .
   vars G : GraphId .
+  vars A : AssertionId .
+  vars T : AgentTarget .
+  vars X : Path .
+  vars V : Value .
+  vars Dm : Domain .
   vars P : Predicate .
   vars S : EffectStatus .
 
@@ -82,9 +111,35 @@ mod WHIPPLETREE-KERNEL is
 
   --- Rules are one-shot rewrites over facts. The graph is committed later by
   --- the kernel; provider execution never happens during rule firing.
+  rl [guard-true-ready] :
+    fact(F) rule(R, F, G) guard(R, F, gTrue)
+    => fact(F) rule(R, F, G) ruleReady(R, F, G) .
+
+  rl [guard-error-diagnostic] :
+    fact(F) rule(R, F, G) guard(R, F, gError)
+    => fact(F) rule(R, F, G) diagnostic(R) .
+
+  rl [domain-guard-true] :
+    fact(F) domainGuard(R, F, V, Dm) domainMember(V, Dm)
+    => fact(F) guard(R, F, gTrue) domainMember(V, Dm) .
+
   rl [fire-rule] :
     fact(F) rule(R, F, G) ruleReady(R, F, G)
     => fact(F) rule(R, F, G) ruleFired(R, F, G) graphReady(G) event(ruleCommitEvt) .
+
+  --- Assertions are read-only checks over projected state.
+  rl [assertion-fail-diagnostic] :
+    assertion(A, aFail)
+    => assertionDiagnostic(A) .
+
+  rl [assertion-error-diagnostic] :
+    assertion(A, aError)
+    => assertionDiagnostic(A) .
+
+  --- Optional path reads are allowed only when presence is known.
+  rl [read-present-path] :
+    path(X, present) readPath(X)
+    => path(X, present) readOk(X) .
 
   --- Effect graph commits create durable outbox nodes and dependency edges.
   rl [commit-single-effect-graph] :
@@ -94,6 +149,10 @@ mod WHIPPLETREE-KERNEL is
   rl [commit-dependent-effect-graph] :
     graph2(G, U, P, D) graphReady(G)
     => graphCommitted(G) effect(U, queued) dep(U, P, D) effect(D, blocked) .
+
+  rl [commit-agent-effect-graph] :
+    graphAgent(G, U, T) graphReady(G) declaredAgent(T)
+    => graphCommitted(G) effect(U, queued) tellTarget(U, T) declaredAgent(T) .
 
   --- A queued effect can be claimed and then started by an external worker.
   rl [claim-effect] : effect(E, queued) => effect(E, claimed) .

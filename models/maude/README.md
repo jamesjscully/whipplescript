@@ -39,6 +39,7 @@ Current test suites:
 coerce-branches.maude       BAML-style coerce success/failure branches
 loft-claim-turn.maude       claim-gated coding-agent turn lifecycle
 effect-dependencies.maude   success/failure/completes dependency release
+expression-kernel.maude     guards, assertions, optional reads, AgentRef targets
 policy-capacity-retry.maude policy/capacity blocks, lease expiry, retry
 ralph-loop.maude            external-event-bounded Ralph loop
 ```
@@ -48,10 +49,10 @@ The shell script runs every Maude test file and checks the expected number of
 simple: generated checks can later emit a richer manifest, but the first kernel
 already fails CI when an expected safety search starts finding a path.
 
-## Next Model: Expression Kernel
+## Expression Kernel Model
 
-The next Maude layer should model the finite expression-kernel abstraction from
-`spec/expression-kernel.md`. It should add guard and assertion semantics without
+The Maude kernel includes the finite expression-kernel abstraction from
+`spec/expression-kernel.md`. It adds guard and assertion semantics without
 turning Maude into a JSON/string interpreter.
 
 Target checks:

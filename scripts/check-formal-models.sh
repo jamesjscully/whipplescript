@@ -12,6 +12,7 @@ declare -A EXPECTED_NO_SOLUTION=(
   ["coerce-branches.maude"]=1
   ["loft-claim-turn.maude"]=2
   ["effect-dependencies.maude"]=2
+  ["expression-kernel.maude"]=6
   ["policy-capacity-retry.maude"]=2
   ["ralph-loop.maude"]=1
 )
@@ -20,6 +21,7 @@ declare -A EXPECTED_SOLUTION=(
   ["coerce-branches.maude"]=3
   ["loft-claim-turn.maude"]=2
   ["effect-dependencies.maude"]=4
+  ["expression-kernel.maude"]=5
   ["policy-capacity-retry.maude"]=4
   ["ralph-loop.maude"]=2
 )

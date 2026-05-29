@@ -607,7 +607,7 @@ while keeping workflow source compact.
   `when LanguageTask as task where task.provider == "codex"`.
 - [ ] Type-check guard expressions against matched schemas, enum variants,
   literal unions, optional presence proofs, and scalar comparison rules.
-- [ ] Add a finite Maude expression-kernel model for guard true/false/error,
+- [x] Add a finite Maude expression-kernel model for guard true/false/error,
   optional presence, enum/literal domains, assertions, and AgentRef validity.
 - [ ] Extend generated per-program Maude checks so rule firing is gated by
   lowered guard predicates before effect graphs can commit.

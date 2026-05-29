@@ -1,0 +1,78 @@
+load ../kernel.maude
+
+--- A false guard cannot make a rule ready or commit its effect graph.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1) guard(guardedRule, issueFact, gFalse)
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) .
+
+--- An error guard produces diagnostics but cannot commit its effect graph.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1) guard(guardedRule, issueFact, gError)
+  graph(g1, tellEff)
+  =>*
+  diagnostic(guardedRule) graphCommitted(g1) effect(tellEff, queued) .
+
+--- A true guard can make the same rule/effect graph fire.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1) guard(guardedRule, issueFact, gTrue)
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
+
+--- A finite enum/literal domain guard cannot match values outside its domain.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  domainGuard(guardedRule, issueFact, invalidProviderValue, providerDomain)
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) .
+
+--- A finite enum/literal domain guard can match values inside its domain.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  domainGuard(guardedRule, issueFact, codexValue, providerDomain)
+  domainMember(codexValue, providerDomain)
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued)
+  domainMember(codexValue, providerDomain) .
+
+--- Assertion failure is observable, but it cannot mutate workflow facts/effects.
+search [1] in WHIPPLETREE-KERNEL :
+  assertion(assertion1, aFail)
+  =>*
+  assertionDiagnostic(assertion1) effect(tellEff, queued) .
+
+--- Assertion failure can produce a diagnostic by itself.
+search [1] in WHIPPLETREE-KERNEL :
+  assertion(assertion1, aFail)
+  =>*
+  assertionDiagnostic(assertion1) .
+
+--- Missing optional paths cannot be read successfully.
+search [1] in WHIPPLETREE-KERNEL :
+  path(assigneePath, missing) readPath(assigneePath)
+  =>*
+  path(assigneePath, missing) readPath(assigneePath) readOk(assigneePath) .
+
+--- Present optional paths can be read successfully.
+search [1] in WHIPPLETREE-KERNEL :
+  path(assigneePath, present) readPath(assigneePath)
+  =>*
+  path(assigneePath, present) readOk(assigneePath) .
+
+--- Dynamic agent targets cannot enqueue effects for undeclared agents.
+search [1] in WHIPPLETREE-KERNEL :
+  graphAgent(g1, tellEff, missingAgent) graphReady(g1)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) tellTarget(tellEff, missingAgent) .
+
+--- Dynamic agent targets can enqueue effects for declared agents.
+search [1] in WHIPPLETREE-KERNEL :
+  graphAgent(g1, tellEff, codexAgent) graphReady(g1) declaredAgent(codexAgent)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) tellTarget(tellEff, codexAgent) declaredAgent(codexAgent) .
