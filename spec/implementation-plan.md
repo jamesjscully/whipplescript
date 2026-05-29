@@ -603,7 +603,7 @@ Acceptance:
 Goal: remove provider/model routing decisions from prompts and model outputs
 while keeping workflow source compact.
 
-- [ ] Add guarded fact matches:
+- [x] Add guarded fact matches:
   `when LanguageTask as task where task.provider == "codex"`.
 - [ ] Type-check guard expressions against matched schemas, enum variants,
   literal unions, optional presence proofs, and scalar comparison rules.
@@ -620,7 +620,7 @@ while keeping workflow source compact.
 - [ ] Reject plain strings as dynamic `tell` targets.
 - [ ] Add a deterministic validation capability path for checks that should not
   require BAML/model judgment.
-- [ ] Rewrite `examples/provider-language-e2e.whip` to use one shared
+- [x] Rewrite `examples/provider-language-e2e.whip` to use one shared
   `LanguageTask` schema once guarded matching or typed agent refs exist.
 - [ ] Update the companion authoring skill to recommend deterministic routing
   metadata and warn against asking models to identify providers/routes.

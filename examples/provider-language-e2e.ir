@@ -2,19 +2,8 @@ workflow ProviderLanguageE2E
 uses
   skill baml-coerce-user
 schemas
-  class CodexLanguageTask
-    language string
-    expectedScript string
-    prompt string
-    artifactPath string
-    status literal<"queued">
-  class ClaudeLanguageTask
-    language string
-    expectedScript string
-    prompt string
-    artifactPath string
-    status literal<"queued">
-  class PiLanguageTask
+  class LanguageTask
+    provider union<literal<"codex"> | literal<"claude"> | literal<"pi">>
     language string
     expectedScript string
     prompt string
@@ -45,16 +34,14 @@ rules
     reads
       pattern:started
     writes
-      schema:ClaudeLanguageTask
-      schema:CodexLanguageTask
-      schema:PiLanguageTask
-    body_hash 2577ba4d3786ea2c
+      schema:LanguageTask
+    body_hash 0b4d6b76ae7919da
   rule run_codex_language_task
-    when CodexLanguageTask as task
+    when LanguageTask as task where task.provider == "codex"
     when codex is available
     reads
       pattern:codex is available
-      schema:CodexLanguageTask
+      schema:LanguageTask
     writes
       schema:LanguageE2EResult
     effects
@@ -64,11 +51,11 @@ rules
       turn --succeeds--> review
     body_hash 16613845fcc333da
   rule run_claude_language_task
-    when ClaudeLanguageTask as task
+    when LanguageTask as task where task.provider == "claude"
     when claude is available
     reads
       pattern:claude is available
-      schema:ClaudeLanguageTask
+      schema:LanguageTask
     writes
       schema:LanguageE2EResult
     effects
@@ -78,11 +65,11 @@ rules
       turn --succeeds--> review
     body_hash a5a68ce414e15f98
   rule run_pi_language_task
-    when PiLanguageTask as task
+    when LanguageTask as task where task.provider == "pi"
     when pi is available
     reads
       pattern:pi is available
-      schema:PiLanguageTask
+      schema:LanguageTask
     writes
       schema:LanguageE2EResult
     effects
@@ -92,6 +79,6 @@ rules
       turn --succeeds--> review
     body_hash 447742abf091d1aa
 rule_dependencies
-  seed_language_matrix --schema:ClaudeLanguageTask--> run_claude_language_task
-  seed_language_matrix --schema:CodexLanguageTask--> run_codex_language_task
-  seed_language_matrix --schema:PiLanguageTask--> run_pi_language_task
+  seed_language_matrix --schema:LanguageTask--> run_claude_language_task
+  seed_language_matrix --schema:LanguageTask--> run_codex_language_task
+  seed_language_matrix --schema:LanguageTask--> run_pi_language_task

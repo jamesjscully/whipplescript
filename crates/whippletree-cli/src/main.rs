@@ -1452,16 +1452,17 @@ fn ready_contexts(
         bindings: Vec::new(),
     }];
     for when in &rule.whens {
-        if when == "started" {
+        let (pattern, guard) = split_when_guard(when);
+        if pattern == "started" {
             if started_event_id.is_none() {
                 return Vec::new();
             }
             continue;
         }
-        if when.ends_with(" is available") {
+        if pattern.ends_with(" is available") {
             continue;
         }
-        if let Some((schema, binding)) = when.split_once(" as ") {
+        if let Some((schema, binding)) = pattern.split_once(" as ") {
             let schema = schema.trim();
             let binding = binding.trim();
             let matching = facts
@@ -1478,7 +1479,9 @@ fn ready_contexts(
                     let mut context = context.clone();
                     context.identity = Some(format!("{binding}:{}", fact.key));
                     context.bindings.push((binding.to_owned(), fact.clone()));
-                    expanded.push(context);
+                    if guard.is_none_or(|guard| eval_guard(guard, &context)) {
+                        expanded.push(context);
+                    }
                 }
             }
             contexts = expanded;
@@ -1487,6 +1490,49 @@ fn ready_contexts(
         return Vec::new();
     }
     contexts
+}
+
+fn split_when_guard(when: &str) -> (&str, Option<&str>) {
+    match when.split_once(" where ") {
+        Some((pattern, guard)) => (pattern.trim(), Some(guard.trim())),
+        None => (when.trim(), None),
+    }
+}
+
+fn eval_guard(guard: &str, context: &RuleContext) -> bool {
+    let guard = guard.trim();
+    if let Some((left, right)) = guard.split_once("==") {
+        return guard_value(left, context) == guard_literal(right);
+    }
+    if let Some((left, right)) = guard.split_once("!=") {
+        return guard_value(left, context) != guard_literal(right);
+    }
+    false
+}
+
+fn guard_value(expr: &str, context: &RuleContext) -> Value {
+    let expr = expr.trim();
+    if let Some((binding, path)) = expr.split_once('.') {
+        return context_path_value(context, binding.trim(), path.trim()).unwrap_or(Value::Null);
+    }
+    parse_guard_literal(expr)
+}
+
+fn guard_literal(expr: &str) -> Value {
+    parse_guard_literal(expr.trim())
+}
+
+fn parse_guard_literal(expr: &str) -> Value {
+    let expr = expr.trim();
+    if let Some(unquoted) = expr.strip_prefix('"').and_then(|value| value.strip_suffix('"')) {
+        return Value::String(unquoted.to_owned());
+    }
+    match expr {
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        "null" => Value::Null,
+        value => Value::String(value.to_owned()),
+    }
 }
 
 fn lower_rule(
@@ -2174,6 +2220,10 @@ fn render_interpolation_value(value: &Value) -> String {
 }
 
 fn context_field_value(context: &RuleContext, binding: &str, field: &str) -> Option<Value> {
+    context_path_value(context, binding, field)
+}
+
+fn context_path_value(context: &RuleContext, binding: &str, path: &str) -> Option<Value> {
     let fact = context
         .bindings
         .iter()
@@ -2181,7 +2231,11 @@ fn context_field_value(context: &RuleContext, binding: &str, field: &str) -> Opt
         .1
         .value_json
         .clone();
-    json_from_str(&fact).get(field).cloned()
+    let mut value = json_from_str(&fact);
+    for field in path.split('.') {
+        value = value.get(field)?.clone();
+    }
+    Some(value)
 }
 
 fn context_bindings_json(context: &RuleContext) -> Value {

@@ -1218,6 +1218,11 @@ fn analyze_rule(
             binding_types.insert(binding, schema);
         }
     }
+    for when in &rule.whens {
+        if let (_, Some(guard)) = split_when_guard(&when.text) {
+            validate_known_field_paths(rule, guard, semantic, &binding_types, diagnostics);
+        }
+    }
     let mut block_stack: Vec<BlockFrame> = Vec::new();
     let mut misplaced_effect_bindings = BTreeSet::new();
     let mut anonymous_effects = 0usize;
@@ -1456,23 +1461,31 @@ fn active_record_schema(block_stack: &[BlockFrame]) -> Option<&str> {
 }
 
 fn binding_from_when(when: &str) -> Option<(String, String)> {
-    let binding = binding_after_as(when)?;
-    let first = when.split_whitespace().next()?;
+    let (pattern, _) = split_when_guard(when);
+    let binding = binding_after_as(pattern)?;
+    let first = pattern.split_whitespace().next()?;
     let schema = if first.chars().next().is_some_and(char::is_uppercase) {
         first.to_owned()
-    } else if when.starts_with("loft has ready issue ") {
+    } else if pattern.starts_with("loft has ready issue ") {
         "LoftIssue".to_owned()
-    } else if when.starts_with("worker completed turn ") {
+    } else if pattern.starts_with("worker completed turn ") {
         "AgentTurn".to_owned()
-    } else if when.starts_with("human answered ") {
+    } else if pattern.starts_with("human answered ") {
         "HumanAnswer".to_owned()
-    } else if when.starts_with("manual review requested ") {
+    } else if pattern.starts_with("manual review requested ") {
         "WorkItem".to_owned()
     } else {
         return None;
     };
 
     Some((binding, schema))
+}
+
+fn split_when_guard(when: &str) -> (&str, Option<&str>) {
+    match when.split_once(" where ") {
+        Some((pattern, guard)) => (pattern.trim(), Some(guard.trim())),
+        None => (when.trim(), None),
+    }
 }
 
 fn effect_binding_schema(
@@ -1605,11 +1618,12 @@ fn interpolation_roots(line: &str) -> Vec<String> {
 }
 
 fn fact_read_from_when(when: &str) -> String {
-    let first = when.split_whitespace().next().unwrap_or("<empty>");
+    let (pattern, _) = split_when_guard(when);
+    let first = pattern.split_whitespace().next().unwrap_or("<empty>");
     if first.chars().next().is_some_and(char::is_uppercase) {
         format!("schema:{first}")
     } else {
-        format!("pattern:{when}")
+        format!("pattern:{pattern}")
     }
 }
 
@@ -2230,16 +2244,11 @@ fn lex(source: &str) -> Lexed {
         }
 
         if byte == b'=' && bytes.get(index + 1) == Some(&b'=') {
-            diagnostics.push(Diagnostic {
-                span: SourceSpan {
-                    start: index,
-                    end: index + 2,
-                },
-                message: "equality guards in `when` clauses are not implemented yet".to_owned(),
-                suggestion: Some(
-                    "model this branch as a typed fact or BAML `coerce` result for now".to_owned(),
-                ),
-            });
+            index += 2;
+            continue;
+        }
+
+        if byte == b'!' && bytes.get(index + 1) == Some(&b'=') {
             index += 2;
             continue;
         }
@@ -3325,25 +3334,26 @@ rule_dependencies
     }
 
     #[test]
-    fn explains_equality_guards_are_not_implemented() {
+    fn accepts_equality_guards_in_when_clauses() {
         let source = r#"
 workflow GuardGuess
 
+class WorkItem {
+  state "ready" | "blocked"
+}
+
 rule branch
-  when WorkItem as item
-  when item.state == ready
+  when WorkItem as item where item.state == "ready"
 => {
 }
 "#;
-        let parsed = parse_program(source);
-
-        assert!(parsed
-            .diagnostics
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("valid ir");
+        assert!(ir.rules.iter().any(|rule| rule
+            .whens
             .iter()
-            .any(|diagnostic| diagnostic.message
-                == "equality guards in `when` clauses are not implemented yet"
-                && diagnostic.suggestion.as_deref()
-                    == Some("model this branch as a typed fact or BAML `coerce` result for now")));
+            .any(|when| when == "WorkItem as item where item.state == \"ready\"")));
     }
 
     #[test]

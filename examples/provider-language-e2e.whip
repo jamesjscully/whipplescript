@@ -2,23 +2,8 @@ workflow ProviderLanguageE2E
 
 use skill "baml-coerce-user"
 
-class CodexLanguageTask {
-  language string
-  expectedScript string
-  prompt string
-  artifactPath string
-  status "queued"
-}
-
-class ClaudeLanguageTask {
-  language string
-  expectedScript string
-  prompt string
-  artifactPath string
-  status "queued"
-}
-
-class PiLanguageTask {
+class LanguageTask {
+  provider "codex" | "claude" | "pi"
   language string
   expectedScript string
   prompt string
@@ -84,7 +69,8 @@ agent pi {
 rule seed_language_matrix
   when started
 => {
-  record CodexLanguageTask {
+  record LanguageTask {
+    provider "codex"
     language "French"
     expectedScript "Latin"
     prompt "Write a four-line original poem about rain over a city at night."
@@ -92,7 +78,8 @@ rule seed_language_matrix
     status "queued"
   }
 
-  record CodexLanguageTask {
+  record LanguageTask {
+    provider "codex"
     language "Arabic"
     expectedScript "Arabic"
     prompt "Write a four-line original poem about a desert sunrise."
@@ -100,7 +87,8 @@ rule seed_language_matrix
     status "queued"
   }
 
-  record ClaudeLanguageTask {
+  record LanguageTask {
+    provider "claude"
     language "Spanish"
     expectedScript "Latin"
     prompt "Write a four-line original poem about a harbor at dawn."
@@ -108,7 +96,8 @@ rule seed_language_matrix
     status "queued"
   }
 
-  record ClaudeLanguageTask {
+  record LanguageTask {
+    provider "claude"
     language "Hindi"
     expectedScript "Devanagari"
     prompt "Write a four-line original poem about monsoon clouds."
@@ -116,7 +105,8 @@ rule seed_language_matrix
     status "queued"
   }
 
-  record PiLanguageTask {
+  record LanguageTask {
+    provider "pi"
     language "Japanese"
     expectedScript "Kana and kanji"
     prompt "Write a four-line original poem about a quiet train station."
@@ -124,7 +114,8 @@ rule seed_language_matrix
     status "queued"
   }
 
-  record PiLanguageTask {
+  record LanguageTask {
+    provider "pi"
     language "German"
     expectedScript "Latin"
     prompt "Write a four-line original poem about snow on rooftops."
@@ -134,7 +125,7 @@ rule seed_language_matrix
 }
 
 rule run_codex_language_task
-  when CodexLanguageTask as task
+  when LanguageTask as task where task.provider == "codex"
   when codex is available
 => {
   tell codex as turn """
@@ -172,7 +163,7 @@ rule run_codex_language_task
 }
 
 rule run_claude_language_task
-  when ClaudeLanguageTask as task
+  when LanguageTask as task where task.provider == "claude"
   when claude is available
 => {
   tell claude as turn """
@@ -210,7 +201,7 @@ rule run_claude_language_task
 }
 
 rule run_pi_language_task
-  when PiLanguageTask as task
+  when LanguageTask as task where task.provider == "pi"
   when pi is available
 => {
   tell pi as turn """

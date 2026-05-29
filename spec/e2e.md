@@ -28,10 +28,8 @@ requiring real provider credentials.
 This workflow is also a language-feature regression target. The intended
 source shape is one shared `LanguageTask` schema with deterministic routing
 guards such as `where task.provider == "codex"`, not one duplicate task class
-per provider. Until guarded `when` clauses and typed dynamic agent references
-exist, provider-specific classes are only a workaround for missing language
-features. The test should not ask BAML or any language model to decide provider
-identity, model identity, or route selection.
+per provider. The test should not ask BAML or any language model to decide
+provider identity, model identity, or route selection.
 
 The e2e suite should eventually encode these assertions in Whippletree source
 rather than only in Rust test code:
