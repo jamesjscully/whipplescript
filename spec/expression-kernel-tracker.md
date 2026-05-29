@@ -64,7 +64,7 @@ The expression kernel covers deterministic logic used by:
 | Boolean `||` | [x] | [x] | [~] | [x] | [ ] | [x] | Runtime short-circuits; presence-proof behavior remains conservative. |
 | Boolean `!` | [x] | [x] | [~] | [x] | [ ] | [x] | Implemented in shared expression parser/evaluator. |
 | Ordering `< <= > >=` | [x] | [x] | [~] | [x] | [ ] | [x] | Runtime supports numeric ordering; compiler rejects obvious non-numeric ordering. |
-| Membership `in` / `not in` | [x] | [x] | [~] | [x] | [~] | [x] | Runtime supports array membership; compiler rejects obvious non-array membership and incompatible array item types. |
+| Membership `in` / `not in` | [x] | [x] | [~] | [x] | [~] | [x] | Runtime supports array membership and map key membership; compiler rejects obvious non-array/non-map membership and incompatible item/key types. |
 | Parentheses and precedence | [x] | [x] | [~] | [x] | [ ] | [x] | Shared recursive-descent parser handles precedence. |
 | Array literals | [x] | [x] | [~] | [x] | [~] | [x] | Implemented for expression evaluation; compiler rejects obvious mixed scalar arrays. |
 | Object literals in expected schema contexts | [x] | [~] | [~] | [~] | [ ] | [x] | Record bodies exist; expression-level object literals are not general AST nodes. |
@@ -135,7 +135,7 @@ The expression kernel covers deterministic logic used by:
 - [x] Implement `!`.
 - [x] Implement scalar equality and inequality over typed values.
 - [~] Implement ordering over int, float, duration, and time.
-- [~] Implement membership for arrays and map keys.
+- [x] Implement membership for arrays and map keys.
 - [x] Implement `exists path`, `exists(collection)`, `empty(...)`, and
   `count(...)`.
 - [x] Implement fact and effect projection reads over typed query filters.

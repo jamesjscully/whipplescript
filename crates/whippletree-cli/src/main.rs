@@ -1965,9 +1965,13 @@ fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, scope: &EvalScope<'_>) -
         BinaryOp::In | BinaryOp::NotIn => {
             let needle = eval_expr_value(left, scope).into_json();
             let haystack = eval_expr_value(right, scope).into_json();
-            let contains = haystack
-                .as_array()
-                .is_some_and(|items| items.iter().any(|item| item == &needle));
+            let contains = match &haystack {
+                Value::Array(items) => items.iter().any(|item| item == &needle),
+                Value::Object(object) => {
+                    needle.as_str().is_some_and(|key| object.contains_key(key))
+                }
+                _ => false,
+            };
             EvalValue::Json(Value::Bool(if op == BinaryOp::In {
                 contains
             } else {

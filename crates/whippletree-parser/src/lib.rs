@@ -2434,14 +2434,30 @@ fn infer_binary_type(
                         });
                     }
                 }
+                ExprType::Map(_) => {
+                    if !matches!(left_ty, ExprType::String | ExprType::Unknown) {
+                        diagnostics.push(Diagnostic {
+                            span: rule.body.span,
+                            message: format!(
+                                "rule `{}` uses map membership with a non-string key",
+                                rule.name.name
+                            ),
+                            suggestion: Some(
+                                "use a string value on the left side of map membership".to_owned(),
+                            ),
+                        });
+                    }
+                }
                 ExprType::Unknown => {}
                 _ => diagnostics.push(Diagnostic {
                     span: rule.body.span,
                     message: format!(
-                        "rule `{}` uses membership against a non-array expression",
+                        "rule `{}` uses membership against a non-array/non-map expression",
                         rule.name.name
                     ),
-                    suggestion: Some("use `in` with an array literal or array value".to_owned()),
+                    suggestion: Some(
+                        "use `in` with an array literal, array value, or map value".to_owned(),
+                    ),
                 }),
             }
             ExprType::Bool
@@ -5529,6 +5545,11 @@ rule bad_map_key
   when Task as task where task.labels[1] == "urgent"
 => {
 }
+
+rule bad_map_membership
+  when Task as task where 1 in task.labels
+=> {
+}
 "#;
 
         let compiled = compile_program(source);
@@ -5542,7 +5563,7 @@ rule bad_map_key
             .contains("orders non-numeric expression values")));
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
-            .contains("uses membership against a non-array expression")));
+            .contains("uses membership against a non-array/non-map expression")));
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("compares incompatible expression types")));
@@ -5554,6 +5575,9 @@ rule bad_map_key
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message.contains("non-string key")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("map membership with a non-string key")));
     }
 
     #[test]

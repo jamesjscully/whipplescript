@@ -1454,6 +1454,8 @@ class MapResult {
 }
 
 assert exists(MapTask where metadata["priority"] == "high")
+assert exists(MapTask where "priority" in metadata)
+assert exists(MapTask where "missing" not in metadata)
 assert count(MapResult where priority == "high") == 1
 
 rule seed
@@ -1465,7 +1467,7 @@ rule seed
 }
 
 rule route
-  when MapTask as task where task.metadata["priority"] == "high"
+  when MapTask as task where "priority" in task.metadata && task.metadata["priority"] == "high"
 => {
   record MapResult {
     priority "high"
