@@ -22,6 +22,7 @@ fn checks_all_example_workflows() {
         "multi-agent-bounded-concurrency.whip",
         "openclaw-lite.whip",
         "plugin-memory.whip",
+        "provider-language-e2e.whip",
     ];
     let paths = examples
         .iter()
@@ -889,6 +890,90 @@ fn dev_codex_then_coerce_rehydrates_after_bound_baml_arguments() {
                 .and_then(Value::as_bool)
                 == Some(true)
     }));
+
+    let _ = fs::remove_file(store_path);
+}
+
+#[test]
+fn dev_provider_language_e2e_runs_agent_matrix_and_baml_reviews() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let example = example_path("provider-language-e2e.whip");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            example.to_str().expect("utf-8 example path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let workers = dev
+        .get("workers")
+        .and_then(Value::as_array)
+        .expect("workers");
+    assert_eq!(
+        workers
+            .iter()
+            .map(|worker| worker
+                .get("ran_effects")
+                .and_then(Value::as_u64)
+                .unwrap_or(0))
+            .collect::<Vec<_>>(),
+        vec![6, 6, 0, 0]
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("agent.turn.completed"))
+            .count(),
+        6
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("baml.coerce.succeeded"))
+            .count(),
+        6
+    );
+    let result_languages = facts
+        .iter()
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("LanguageE2EResult"))
+        .map(|fact| {
+            fact.get("value")
+                .and_then(|value| value.get("language"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        result_languages,
+        ["Arabic", "French", "German", "Hindi", "Japanese", "Spanish"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+    );
 
     let _ = fs::remove_file(store_path);
 }

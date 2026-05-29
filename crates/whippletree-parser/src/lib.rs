@@ -3246,6 +3246,10 @@ rule_dependencies
                 include_str!("../../../examples/plugin-memory.ir"),
             ),
             (
+                include_str!("../../../examples/provider-language-e2e.whip"),
+                include_str!("../../../examples/provider-language-e2e.ir"),
+            ),
+            (
                 include_str!("../../../examples/ralph.whip"),
                 include_str!("../../../examples/ralph.ir"),
             ),

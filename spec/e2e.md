@@ -18,6 +18,13 @@ whippletree-e2e-<test>-<pid>-trace.txt
 Those artifacts are written before trace conformance is checked, so a failed
 test leaves the abstract lifecycle trace available for debugging.
 
+The deterministic CLI e2e suite includes `examples/provider-language-e2e.whip`.
+That workflow drives logical `codex`, `claude`, and `pi` agents through six
+language-generation tasks, then reviews every completed turn with a typed BAML
+`coerce`. The default run uses the fixture worker, so it checks orchestration,
+dependencies, effect/fact projection, and BAML argument rehydration without
+requiring real provider credentials.
+
 ## Optional Real Providers
 
 Real-provider checks are opt-in:

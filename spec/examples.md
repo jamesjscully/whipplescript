@@ -467,6 +467,8 @@ The checked example fixtures in `examples/` are:
 - `openclaw-lite.whip`: planner, implementer, verifier, and human approval
   composition.
 - `plugin-memory.whip`: memory plugin capability call before an agent turn.
+- `provider-language-e2e.whip`: Codex, Claude, and Pi language-generation
+  turns across six languages, each reviewed by typed BAML coercion.
 
 Each checked source has a matching `.ir` snapshot consumed by parser tests.
 

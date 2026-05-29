@@ -1,0 +1,271 @@
+workflow ProviderLanguageE2E
+
+use skill "baml-coerce-user"
+
+class CodexLanguageTask {
+  provider string
+  language string
+  expectedScript string
+  prompt string
+  artifactPath string
+  status "queued"
+}
+
+class ClaudeLanguageTask {
+  provider string
+  language string
+  expectedScript string
+  prompt string
+  artifactPath string
+  status "queued"
+}
+
+class PiLanguageTask {
+  provider string
+  language string
+  expectedScript string
+  prompt string
+  artifactPath string
+  status "queued"
+}
+
+class LanguageQualityReview {
+  provider string
+  language string
+  isTargetLanguage bool
+  usesExpectedScript bool
+  isWellFormed bool
+  reason string
+  confidence float
+}
+
+class LanguageE2EResult {
+  provider string
+  language string
+  artifactPath string
+  turn AgentTurn
+  review LanguageQualityReview
+  status "reviewed"
+}
+
+coerce reviewLanguageArtifact(provider string, language string, expectedScript string, artifactPath string, turnSummary string) -> LanguageQualityReview {
+  prompt """
+  Review the completed provider language task.
+
+  Provider:
+  {{ provider }}
+
+  Language:
+  {{ language }}
+
+  Expected script:
+  {{ expectedScript }}
+
+  Artifact path:
+  {{ artifactPath }}
+
+  Turn summary:
+  {{ turnSummary }}
+
+  Decide whether the artifact is in the target language, uses the expected script,
+  and is a well-formed short text for the requested task.
+
+  {{ ctx.output_format }}
+  """
+}
+
+agent codex {
+  profile "repo-writer"
+  capacity 2
+}
+
+agent claude {
+  profile "repo-writer"
+  capacity 2
+}
+
+agent pi {
+  profile "repo-writer"
+  capacity 2
+}
+
+rule seed_language_matrix
+  when started
+=> {
+  record CodexLanguageTask {
+    provider "codex"
+    language "French"
+    expectedScript "Latin"
+    prompt "Write a four-line original poem about rain over a city at night."
+    artifactPath "target/dogfood/language/codex-french.txt"
+    status "queued"
+  }
+
+  record CodexLanguageTask {
+    provider "codex"
+    language "Arabic"
+    expectedScript "Arabic"
+    prompt "Write a four-line original poem about a desert sunrise."
+    artifactPath "target/dogfood/language/codex-arabic.txt"
+    status "queued"
+  }
+
+  record ClaudeLanguageTask {
+    provider "claude"
+    language "Spanish"
+    expectedScript "Latin"
+    prompt "Write a four-line original poem about a harbor at dawn."
+    artifactPath "target/dogfood/language/claude-spanish.txt"
+    status "queued"
+  }
+
+  record ClaudeLanguageTask {
+    provider "claude"
+    language "Hindi"
+    expectedScript "Devanagari"
+    prompt "Write a four-line original poem about monsoon clouds."
+    artifactPath "target/dogfood/language/claude-hindi.txt"
+    status "queued"
+  }
+
+  record PiLanguageTask {
+    provider "pi"
+    language "Japanese"
+    expectedScript "Kana and kanji"
+    prompt "Write a four-line original poem about a quiet train station."
+    artifactPath "target/dogfood/language/pi-japanese.txt"
+    status "queued"
+  }
+
+  record PiLanguageTask {
+    provider "pi"
+    language "German"
+    expectedScript "Latin"
+    prompt "Write a four-line original poem about snow on rooftops."
+    artifactPath "target/dogfood/language/pi-german.txt"
+    status "queued"
+  }
+}
+
+rule run_codex_language_task
+  when CodexLanguageTask as task
+  when codex is available
+=> {
+  tell codex as turn """
+  Complete this language e2e task.
+
+  Provider under test:
+  {{ task.provider }}
+
+  Target language:
+  {{ task.language }}
+
+  Expected script:
+  {{ task.expectedScript }}
+
+  Task:
+  {{ task.prompt }}
+
+  Write only the requested text to {{ task.artifactPath }}.
+  Do not edit files outside target/dogfood/language.
+
+  Finish your turn with a concise summary that includes the artifact path.
+  """
+
+  after turn succeeds {
+    coerce reviewLanguageArtifact(task.provider, task.language, task.expectedScript, task.artifactPath, turn.summary) as review
+  }
+
+  after review succeeds {
+    record LanguageE2EResult {
+      provider task.provider
+      language task.language
+      artifactPath task.artifactPath
+      turn turn
+      review review
+      status "reviewed"
+    }
+  }
+}
+
+rule run_claude_language_task
+  when ClaudeLanguageTask as task
+  when claude is available
+=> {
+  tell claude as turn """
+  Complete this language e2e task.
+
+  Provider under test:
+  {{ task.provider }}
+
+  Target language:
+  {{ task.language }}
+
+  Expected script:
+  {{ task.expectedScript }}
+
+  Task:
+  {{ task.prompt }}
+
+  Write only the requested text to {{ task.artifactPath }}.
+  Do not edit files outside target/dogfood/language.
+
+  Finish your turn with a concise summary that includes the artifact path.
+  """
+
+  after turn succeeds {
+    coerce reviewLanguageArtifact(task.provider, task.language, task.expectedScript, task.artifactPath, turn.summary) as review
+  }
+
+  after review succeeds {
+    record LanguageE2EResult {
+      provider task.provider
+      language task.language
+      artifactPath task.artifactPath
+      turn turn
+      review review
+      status "reviewed"
+    }
+  }
+}
+
+rule run_pi_language_task
+  when PiLanguageTask as task
+  when pi is available
+=> {
+  tell pi as turn """
+  Complete this language e2e task.
+
+  Provider under test:
+  {{ task.provider }}
+
+  Target language:
+  {{ task.language }}
+
+  Expected script:
+  {{ task.expectedScript }}
+
+  Task:
+  {{ task.prompt }}
+
+  Write only the requested text to {{ task.artifactPath }}.
+  Do not edit files outside target/dogfood/language.
+
+  Finish your turn with a concise summary that includes the artifact path.
+  """
+
+  after turn succeeds {
+    coerce reviewLanguageArtifact(task.provider, task.language, task.expectedScript, task.artifactPath, turn.summary) as review
+  }
+
+  after review succeeds {
+    record LanguageE2EResult {
+      provider task.provider
+      language task.language
+      artifactPath task.artifactPath
+      turn turn
+      review review
+      status "reviewed"
+    }
+  }
+}

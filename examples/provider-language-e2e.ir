@@ -1,0 +1,102 @@
+workflow ProviderLanguageE2E
+uses
+  skill baml-coerce-user
+schemas
+  class CodexLanguageTask
+    provider string
+    language string
+    expectedScript string
+    prompt string
+    artifactPath string
+    status literal<"queued">
+  class ClaudeLanguageTask
+    provider string
+    language string
+    expectedScript string
+    prompt string
+    artifactPath string
+    status literal<"queued">
+  class PiLanguageTask
+    provider string
+    language string
+    expectedScript string
+    prompt string
+    artifactPath string
+    status literal<"queued">
+  class LanguageQualityReview
+    provider string
+    language string
+    isTargetLanguage bool
+    usesExpectedScript bool
+    isWellFormed bool
+    reason string
+    confidence float
+  class LanguageE2EResult
+    provider string
+    language string
+    artifactPath string
+    turn ref<AgentTurn>
+    review ref<LanguageQualityReview>
+    status literal<"reviewed">
+agents
+  agent codex profile=repo-writer capacity=2 skills=[]
+  agent claude profile=repo-writer capacity=2 skills=[]
+  agent pi profile=repo-writer capacity=2 skills=[]
+coerces
+  coerce reviewLanguageArtifact(provider string, language string, expectedScript string, artifactPath string, turnSummary string) -> ref<LanguageQualityReview>
+rules
+  rule seed_language_matrix
+    when started
+    reads
+      pattern:started
+    writes
+      schema:ClaudeLanguageTask
+      schema:CodexLanguageTask
+      schema:PiLanguageTask
+    body_hash 1f0d8d131d198346
+  rule run_codex_language_task
+    when CodexLanguageTask as task
+    when codex is available
+    reads
+      pattern:codex is available
+      schema:CodexLanguageTask
+    writes
+      schema:LanguageE2EResult
+    effects
+      turn kind=agent.tell binding=turn key=e34f3e7758319a38
+      review kind=baml.coerce binding=review key=188ef005f89cad9f
+    dependencies
+      turn --succeeds--> review
+    body_hash 0bbddff01fdab186
+  rule run_claude_language_task
+    when ClaudeLanguageTask as task
+    when claude is available
+    reads
+      pattern:claude is available
+      schema:ClaudeLanguageTask
+    writes
+      schema:LanguageE2EResult
+    effects
+      turn kind=agent.tell binding=turn key=b02a27e18358cc3b
+      review kind=baml.coerce binding=review key=df9a333314166a16
+    dependencies
+      turn --succeeds--> review
+    body_hash fa903b71b68287ff
+  rule run_pi_language_task
+    when PiLanguageTask as task
+    when pi is available
+    reads
+      pattern:pi is available
+      schema:PiLanguageTask
+    writes
+      schema:LanguageE2EResult
+    effects
+      turn kind=agent.tell binding=turn key=409d40e57a436994
+      review kind=baml.coerce binding=review key=ec93804fca41a4ab
+    dependencies
+      turn --succeeds--> review
+    body_hash 730395b197d5b75e
+rule_dependencies
+  seed_language_matrix --schema:ClaudeLanguageTask--> run_claude_language_task
+  seed_language_matrix --schema:CodexLanguageTask--> run_codex_language_task
+  seed_language_matrix --schema:PiLanguageTask--> run_pi_language_task

@@ -65,5 +65,6 @@ Checked examples live in `examples/`:
 - `multi-agent-bounded-concurrency.whip`
 - `openclaw-lite.whip`
 - `plugin-memory.whip`
+- `provider-language-e2e.whip`
 
 Each has a matching `.ir` snapshot used by parser tests.

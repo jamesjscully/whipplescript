@@ -1196,6 +1196,15 @@ fn fixture_baml_value(output_type: &str) -> String {
             "reason": "Fixture review saw a completed poem turn",
             "confidence": 0.75,
         }),
+        "LanguageQualityReview" => json!({
+            "provider": "fixture",
+            "language": "fixture",
+            "isTargetLanguage": true,
+            "usesExpectedScript": true,
+            "isWellFormed": true,
+            "reason": "Fixture review accepted the provider language task",
+            "confidence": 0.75,
+        }),
         _ => json!({
             "summary": "Fixture value",
             "confidence": 0.75,
