@@ -26,6 +26,8 @@ Use Maude for:
 
 ```text
 rule commits
+guard/readiness evaluation
+workflow assertions
 effect graph dependency behavior
 claimability
 completion events
@@ -103,6 +105,11 @@ blocked effect -> claimable effect, when dependency predicates are satisfied
 
 Initial checks:
 
+- a rule cannot fire unless all fact matches are present and its guard evaluates
+  to true
+- false or error guards do not commit facts/effects
+- assertion failures are observable diagnostics/evidence, not workflow-state
+  mutations
 - a dependent effect cannot run before its dependency predicate is satisfied
 - dependency failure blocks downstream success-only effects instead of running
   them
@@ -192,7 +199,9 @@ Compiler checks should be fast, local, and explainable:
 
 ```text
 type checking
+expression kernel typing
 read/write/consume sets
+guard satisfiability over literal/enum domains
 effect graph validation
 output binding scopes
 rule dependency graph
@@ -234,6 +243,46 @@ counterexample when `maude` is available on `PATH`.
 
 Do not generate TLA+ per user program in v0. TLA+ models the runtime/control
 plane; Maude models user program behavior.
+
+### Expression-Kernel Maude Model
+
+The expression-kernel model should be a finite abstraction of
+[expression-kernel.md](expression-kernel.md), not an interpreter for JSON or
+strings. It should add a readiness gate ahead of the existing rule/effect graph:
+
+```text
+fact match + guard true  -> rule can fire
+fact match + guard false -> no rule rewrite
+fact match + guard error -> diagnostic, no graph commit
+```
+
+The hand-written Maude model should cover:
+
+```text
+typed true/false/error guard results
+optional present/missing paths
+enum/literal domain checks
+membership over finite arrays/maps
+count/empty over finite projections
+assertion pass/fail/error
+declared vs undeclared AgentRef targets
+```
+
+Generated per-program Maude should lower parsed guards and assertions to
+abstract predicates over finite fact/effect symbols. It should not try to prove
+semantic truth of provider/model output. A BAML `coerce` result is modeled only
+as a typed success/failure/timeout/cancel event.
+
+Initial expression-kernel searches:
+
+- no `ruleFired` state is reachable from a false guard
+- no `graphCommitted` state is reachable from an error guard
+- a true guard permits the same effect graph checks already used by dependency
+  searches
+- an assertion failure cannot create new user facts or effects
+- an undeclared dynamic agent target cannot create an `agent.tell` effect
+- two evaluations over the same projection cannot produce different guard
+  results
 
 ## CI Policy
 

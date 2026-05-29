@@ -228,6 +228,10 @@ Rules:
 
 ## Allowed Operations
 
+Detailed expression semantics live in
+[expression-kernel.md](expression-kernel.md). This section names the operation
+surface from the type-system perspective.
+
 The v0 expression kernel supports:
 
 ```text

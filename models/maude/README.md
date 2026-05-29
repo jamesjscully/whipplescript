@@ -6,6 +6,8 @@ Use it to model:
 
 ```text
 rule commits
+guard/readiness evaluation
+workflow assertions
 effect nodes
 effect dependency edges
 claimability
@@ -45,3 +47,29 @@ The shell script runs every Maude test file and checks the expected number of
 `No solution.` and `Solution 1` results for each suite. This is intentionally
 simple: generated checks can later emit a richer manifest, but the first kernel
 already fails CI when an expected safety search starts finding a path.
+
+## Next Model: Expression Kernel
+
+The next Maude layer should model the finite expression-kernel abstraction from
+`spec/expression-kernel.md`. It should add guard and assertion semantics without
+turning Maude into a JSON/string interpreter.
+
+Target checks:
+
+```text
+false guard cannot fire a rule
+error guard cannot commit facts/effects
+true guard preserves existing effect dependency searches
+assertion failure cannot mutate workflow state
+optional missing path cannot be read without a presence proof
+enum/literal guards cannot match values outside their domain
+dynamic tell cannot target an undeclared agent
+```
+
+Recommended shape:
+
+```text
+fact(F) + guard(R, F, true)  -> ruleReady(R, F, G)
+fact(F) + guard(R, F, false) -> no rewrite
+fact(F) + guard(R, F, error) -> diagnostic, no graph
+```

@@ -13,12 +13,33 @@ Every fact, event, guard, template reference, and effect payload must be typed.
 Unknown fields are errors. Optional fields must be handled before use.
 
 Type checking uses [type-system.md](type-system.md) as the source of truth for
-boundary types, allowed operations, optional/null handling, media references,
-and BAML lowerability.
+boundary types, [expression-kernel.md](expression-kernel.md) for guard and
+assertion expressions, optional/null handling, media references, and BAML
+lowerability.
 
 Fact production through `record` must be checked against a known class schema.
 Conversational facts supplied by core integrations must lower to typed fact
 queries before later compiler phases.
+
+### Expression Kernel Checks
+
+For every guard, assertion, interpolation, matrix row, and effect argument, the
+compiler must compute:
+
+```text
+free bindings
+field paths
+result type
+presence requirements
+literal/enum domains
+projection query reads
+dynamic agent target domain, if any
+```
+
+The compiler rejects expressions that can evaluate to `Error` in a well-typed
+state. It may keep `false` guards as ordinary non-matches, but must report
+guards that are statically unsatisfiable over finite enum/literal domains when
+that likely indicates a typo.
 
 ### Read/Write Sets
 
