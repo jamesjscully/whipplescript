@@ -176,6 +176,36 @@ The workflow records durable dispatch facts, while the agent prompt tells each
 thread exactly which tracker row or file to update. Keep the tracker path in a
 fact so the prompt, evidence, and later review are tied to the same input.
 
+Companion-skill dogfood routing:
+
+```whippletree
+class ReviewTask {
+  reviewer AgentRef<codex | claude | pi>
+  phase int
+  trackerPath string
+  route "spec" | "validation" | "docs"
+  status "queued"
+}
+
+rule dispatch_review
+  when ReviewTask as task where task.route in ["spec", "validation", "docs"]
+  when task.reviewer is available
+=> {
+  tell task.reviewer requires ["agent.tell"] as turn """
+  Use the whippletree-author companion skill.
+  Review phase {{ task.phase }} and update {{ task.trackerPath }}.
+
+  Do not infer provider, model, or route identity from prompt text; the workflow
+  selected the logical reviewer through typed AgentRef metadata.
+  """
+}
+```
+
+Use this shape for provider/language/phased-review matrices. One shared task
+schema plus `AgentRef` metadata is preferred over one class per provider. Source
+assertions should check dispatch/result counts; BAML reviews should judge the
+artifact or evidence, not choose the route.
+
 ## Profiles
 
 Choose profiles by authority intent:
@@ -191,14 +221,16 @@ and capacity.
 
 ## Current Grammar Limits
 
-Guards are supported for simple deterministic routing:
+Guards are supported for deterministic routing over the expression kernel:
 
 ```whippletree
 when Review as review where review.status == Accept
 ```
 
-Keep guards over typed facts and deterministic values. Use BAML or a registered
-capability only when semantic judgment is required.
+Keep guards over typed facts and deterministic values: booleans, comparisons,
+membership, presence checks, projections, map indexes, and count/exists/empty
+queries. Use BAML or a registered capability only when semantic judgment is
+required.
 
 Put `as binding` on the effect line:
 

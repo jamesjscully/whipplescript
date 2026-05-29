@@ -355,6 +355,7 @@ pub struct IrRuleMetadata {
     pub fact_writes: Vec<String>,
     pub effects: Vec<IrEffectNode>,
     pub dependencies: Vec<IrEffectDependency>,
+    pub case_branches: Vec<IrRuleCaseBranch>,
     pub terminal_outputs: Vec<IrTerminalOutput>,
     pub terminal_branches: Vec<IrTerminalCaseBranch>,
 }
@@ -404,6 +405,39 @@ pub struct IrEffectDependency {
     pub upstream: String,
     pub predicate: DependencyPredicate,
     pub downstream: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrRuleCaseBranch {
+    pub scrutinee: String,
+    pub scrutinee_type: IrType,
+    pub pattern: IrCasePattern,
+    pub guard: Option<IrExpression>,
+    pub body_hash: String,
+    pub pattern_span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IrCasePattern {
+    EnumVariant(String),
+    LiteralString(String),
+    Agent(String),
+    OptionalSome { binding: String },
+    OptionalNone,
+    Wildcard,
+}
+
+impl IrCasePattern {
+    fn to_snapshot(&self) -> String {
+        match self {
+            IrCasePattern::EnumVariant(value) => format!("enum:{value}"),
+            IrCasePattern::LiteralString(value) => format!("literal:\"{value}\""),
+            IrCasePattern::Agent(value) => format!("agent:{value}"),
+            IrCasePattern::OptionalSome { binding } => format!("some:{binding}"),
+            IrCasePattern::OptionalNone => "none".to_owned(),
+            IrCasePattern::Wildcard => "_".to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -482,6 +516,7 @@ enum ExprType {
     Optional(Box<ExprType>),
     Array(Box<ExprType>),
     Map(Box<ExprType>),
+    Finite { label: String, values: Vec<String> },
     Collection,
     Unknown,
 }
@@ -869,6 +904,29 @@ impl IrProgram {
                                 dependency.upstream,
                                 dependency.predicate.as_str(),
                                 dependency.downstream
+                            ),
+                        );
+                    }
+                }
+                if !rule.metadata.case_branches.is_empty() {
+                    push_line(&mut snapshot, "    case_branches");
+                    for branch in &rule.metadata.case_branches {
+                        let guard = branch
+                            .guard
+                            .as_ref()
+                            .map(|guard| guard.expr.to_snapshot())
+                            .unwrap_or_else(|| "-".to_owned());
+                        push_line(
+                            &mut snapshot,
+                            format!(
+                                "      case {} type={} pattern={} guard={} body_hash={} span={}..{}",
+                                branch.scrutinee,
+                                branch.scrutinee_type.to_snapshot(),
+                                branch.pattern.to_snapshot(),
+                                guard,
+                                branch.body_hash,
+                                branch.pattern_span.start,
+                                branch.pattern_span.end
                             ),
                         );
                     }
@@ -1854,6 +1912,8 @@ fn analyze_rule(
         validate_availability_when(rule, &when.text, semantic, &binding_types, diagnostics);
     }
     validate_case_blocks(rule, semantic, &binding_types, diagnostics);
+    metadata.case_branches =
+        collect_rule_case_metadata(rule, semantic, &binding_types, diagnostics);
     let terminal_metadata = collect_terminal_case_metadata(
         rule,
         semantic,
@@ -2016,6 +2076,16 @@ struct TerminalBranchSource {
     pattern_span: SourceSpan,
 }
 
+#[derive(Clone, Debug)]
+struct RuleCaseBranchSource {
+    scrutinee: String,
+    scrutinee_type: TypeSyntax,
+    pattern: String,
+    guard: Option<String>,
+    body: String,
+    pattern_span: SourceSpan,
+}
+
 fn collect_effect_payload_types(
     rule: &RuleDecl,
     semantic: &SemanticContext,
@@ -2051,6 +2121,212 @@ fn terminal_completed_payload_type(
         IrEffectKind::AgentTell => IrType::Ref("AgentTurn".to_owned()),
         IrEffectKind::CapabilityCall | IrEffectKind::EventEmit => terminal_unknown_payload_type(),
     }
+}
+
+fn collect_rule_case_metadata(
+    rule: &RuleDecl,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<IrRuleCaseBranch> {
+    let mut branches = Vec::new();
+    for branch in rule_case_branch_sources(rule, semantic, binding_types) {
+        let mut branch_scope = binding_types.clone();
+        if let Some((binding, schema)) =
+            case_branch_payload_binding(&branch.pattern, &branch.scrutinee_type, semantic)
+        {
+            branch_scope.insert(binding, schema);
+        }
+        if let Some(guard) = &branch.guard {
+            validate_expression(
+                rule,
+                guard,
+                semantic,
+                &branch_scope,
+                "case guard",
+                diagnostics,
+            );
+            validate_known_field_paths_at_span(
+                rule,
+                guard,
+                branch.pattern_span,
+                semantic,
+                &branch_scope,
+                diagnostics,
+            );
+        }
+        validate_known_field_paths_at_span(
+            rule,
+            &branch.body,
+            branch.pattern_span,
+            semantic,
+            &branch_scope,
+            diagnostics,
+        );
+        if let Some(pattern) = lower_case_pattern(&branch.pattern, &branch.scrutinee_type, semantic)
+        {
+            branches.push(IrRuleCaseBranch {
+                scrutinee: branch.scrutinee,
+                scrutinee_type: lower_type(branch.scrutinee_type),
+                pattern,
+                guard: branch.guard.as_ref().and_then(|guard| {
+                    lower_expression(
+                        guard,
+                        SourceSpan {
+                            start: branch.pattern_span.start,
+                            end: branch.pattern_span.end,
+                        },
+                    )
+                }),
+                body_hash: stable_hash(&branch.body),
+                pattern_span: branch.pattern_span,
+            });
+        }
+    }
+    branches.sort_by(|left, right| {
+        (left.scrutinee.as_str(), left.pattern_span.start)
+            .cmp(&(right.scrutinee.as_str(), right.pattern_span.start))
+    });
+    branches
+}
+
+fn rule_case_branch_sources(
+    rule: &RuleDecl,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+) -> Vec<RuleCaseBranchSource> {
+    let lines = rule
+        .body
+        .text
+        .lines()
+        .scan(0usize, |offset, line| {
+            let current = *offset;
+            *offset += line.len() + 1;
+            Some((line, current))
+        })
+        .collect::<Vec<_>>();
+    let text_lines = lines.iter().map(|(line, _)| *line).collect::<Vec<_>>();
+    let mut branches = Vec::new();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let (line, _) = lines[index];
+        let trimmed = line.trim();
+        let Some(scrutinee) = case_scrutinee(trimmed) else {
+            index += 1;
+            continue;
+        };
+        if active_completes_binding_for_case(&text_lines, index, scrutinee) {
+            index += 1;
+            continue;
+        }
+        let Some(scrutinee_type) = expression_type(scrutinee, semantic, binding_types) else {
+            index += 1;
+            continue;
+        };
+        let mut depth = brace_delta(trimmed).max(1);
+        index += 1;
+        while index < lines.len() && depth > 0 {
+            let (branch_line, branch_line_offset) = lines[index];
+            let branch_trimmed = branch_line.trim();
+            if depth == 1 {
+                if let Some((pattern, guard, body_start)) = terminal_branch_header(branch_trimmed) {
+                    let pattern_column = case_pattern_column(branch_line, pattern);
+                    let pattern_span = SourceSpan {
+                        start: rule_body_text_start(rule) + branch_line_offset + pattern_column,
+                        end: rule_body_text_start(rule)
+                            + branch_line_offset
+                            + pattern_column
+                            + pattern.len(),
+                    };
+                    let mut body_lines = Vec::new();
+                    let mut branch_depth = brace_delta(body_start).max(1);
+                    index += 1;
+                    while index < lines.len() && branch_depth > 0 {
+                        let body_line = lines[index].0;
+                        let next_depth = branch_depth + brace_delta(body_line);
+                        if next_depth >= 1 {
+                            body_lines.push(body_line.to_owned());
+                        }
+                        branch_depth = next_depth;
+                        index += 1;
+                    }
+                    branches.push(RuleCaseBranchSource {
+                        scrutinee: scrutinee.to_owned(),
+                        scrutinee_type: scrutinee_type.clone(),
+                        pattern: pattern.to_owned(),
+                        guard,
+                        body: body_lines.join("\n"),
+                        pattern_span,
+                    });
+                    continue;
+                }
+            }
+            depth += brace_delta(branch_trimmed);
+            index += 1;
+        }
+    }
+    branches
+}
+
+fn lower_case_pattern(
+    pattern: &str,
+    scrutinee_type: &TypeSyntax,
+    semantic: &SemanticContext,
+) -> Option<IrCasePattern> {
+    if is_fallback_pattern(pattern) {
+        return Some(IrCasePattern::Wildcard);
+    }
+    if pattern == "None" {
+        return Some(IrCasePattern::OptionalNone);
+    }
+    if let Some(binding) = pattern.strip_prefix("Some ").map(str::trim) {
+        if !binding.is_empty() {
+            return Some(IrCasePattern::OptionalSome {
+                binding: binding.to_owned(),
+            });
+        }
+    }
+    match scrutinee_type {
+        TypeSyntax::Ref { name } if semantic.schemas.enums.contains_key(&name.name) => {
+            Some(IrCasePattern::EnumVariant(pattern.to_owned()))
+        }
+        TypeSyntax::Union { .. } => parse_literal_expr(pattern).and_then(|literal| match literal {
+            LiteralExpr::String(value) => Some(IrCasePattern::LiteralString(value.to_owned())),
+            LiteralExpr::Ident(value) => Some(IrCasePattern::LiteralString(value.to_owned())),
+            _ => None,
+        }),
+        TypeSyntax::AgentRef { .. } => {
+            parse_literal_expr(pattern).and_then(|literal| match literal {
+                LiteralExpr::String(value) | LiteralExpr::Ident(value) => {
+                    Some(IrCasePattern::Agent(value.to_owned()))
+                }
+                _ => None,
+            })
+        }
+        TypeSyntax::Optional { inner, .. } => lower_case_pattern(pattern, inner, semantic),
+        _ => None,
+    }
+}
+
+fn case_branch_payload_binding(
+    pattern: &str,
+    scrutinee_type: &TypeSyntax,
+    semantic: &SemanticContext,
+) -> Option<(String, String)> {
+    let binding = pattern.strip_prefix("Some ").map(str::trim)?;
+    if binding.is_empty() {
+        return None;
+    }
+    let TypeSyntax::Optional { inner, .. } = scrutinee_type else {
+        return None;
+    };
+    let schema = match inner.as_ref() {
+        TypeSyntax::Ref { name } if semantic.schemas.class_exists(&name.name) => {
+            Some(name.name.clone())
+        }
+        _ => None,
+    }?;
+    Some((binding.to_owned(), schema))
 }
 
 fn collect_terminal_case_metadata(
@@ -2157,10 +2433,10 @@ fn terminal_case_branch_sources(rule: &RuleDecl) -> Vec<TerminalBranchSource> {
             let branch_trimmed = branch_line.trim();
             if depth == 1 {
                 if let Some((pattern, guard, body_start)) = terminal_branch_header(branch_trimmed) {
-                    let pattern_column = branch_line.find(pattern).unwrap_or(0);
+                    let pattern_column = case_pattern_column(branch_line, pattern);
                     let pattern_span = SourceSpan {
-                        start: rule.body.span.start + branch_line_offset + pattern_column,
-                        end: rule.body.span.start
+                        start: rule_body_text_start(rule) + branch_line_offset + pattern_column,
+                        end: rule_body_text_start(rule)
                             + branch_line_offset
                             + pattern_column
                             + pattern.len(),
@@ -2195,6 +2471,10 @@ fn terminal_case_branch_sources(rule: &RuleDecl) -> Vec<TerminalBranchSource> {
     branches
 }
 
+fn rule_body_text_start(rule: &RuleDecl) -> usize {
+    rule.body.span.end.saturating_sub(2 + rule.body.text.len())
+}
+
 fn terminal_branch_header(line: &str) -> Option<(&str, Option<String>, &str)> {
     let (head, body_start) = line.split_once("=>")?;
     let body_start = body_start.trim();
@@ -2207,6 +2487,13 @@ fn terminal_branch_header(line: &str) -> Option<(&str, Option<String>, &str)> {
         None => (head, None),
     };
     Some((pattern, guard, body_start))
+}
+
+fn case_pattern_column(line: &str, pattern: &str) -> usize {
+    line.find(pattern).unwrap_or_else(|| {
+        let indent = line.len().saturating_sub(line.trim_start().len());
+        indent + line.trim_start().find(pattern).unwrap_or(0)
+    })
 }
 
 fn parse_terminal_pattern_parts(pattern: &str) -> (Option<String>, Option<String>) {
@@ -3219,7 +3506,7 @@ fn infer_expr_type(
 ) -> ExprType {
     match expr {
         Expr::Literal(ExprLiteral::Ident(name)) => implicit_field_type(name, semantic, scope)
-            .map(|ty| expr_type_from_type_syntax(&ty))
+            .map(|ty| expr_type_from_type_syntax(&ty, semantic))
             .unwrap_or_else(|| expr_literal_type(&ExprLiteral::Ident(name.clone()))),
         Expr::Literal(literal) => expr_literal_type(literal),
         Expr::Path(path) => expr_path_type(path, semantic, scope).unwrap_or(ExprType::Unknown),
@@ -3375,7 +3662,7 @@ fn infer_binary_type(
                     }
                 }
                 ExprType::Map(_) => {
-                    if !matches!(left_ty, ExprType::String | ExprType::Unknown) {
+                    if !is_string_like_key_type(&left_ty) {
                         diagnostics.push(Diagnostic {
                             span: context.span,
                             message: format!(
@@ -3447,17 +3734,17 @@ fn expr_path_type(
             .schemas
             .resolve_field_path(schema, &path[1..])
             .ok()
-            .map(|ty| expr_type_from_type_syntax(&ty));
+            .map(|ty| expr_type_from_type_syntax(&ty, semantic));
     }
     let schema = scope.implicit_schema.as_ref()?;
     semantic
         .schemas
         .resolve_field_path(schema, path)
         .ok()
-        .map(|ty| expr_type_from_type_syntax(&ty))
+        .map(|ty| expr_type_from_type_syntax(&ty, semantic))
 }
 
-fn expr_type_from_type_syntax(ty: &TypeSyntax) -> ExprType {
+fn expr_type_from_type_syntax(ty: &TypeSyntax, semantic: &SemanticContext) -> ExprType {
     match ty {
         TypeSyntax::Primitive { name, .. } => match name.as_str() {
             "bool" => ExprType::Bool,
@@ -3468,21 +3755,45 @@ fn expr_type_from_type_syntax(ty: &TypeSyntax) -> ExprType {
             "time" => ExprType::Time,
             _ => ExprType::Unknown,
         },
-        TypeSyntax::LiteralString { .. } | TypeSyntax::AgentRef { .. } => ExprType::String,
-        TypeSyntax::Ref { .. } => ExprType::Object,
+        TypeSyntax::LiteralString { value, .. } => ExprType::Finite {
+            label: "literal".to_owned(),
+            values: vec![value.clone()],
+        },
+        TypeSyntax::AgentRef { agents, .. } => ExprType::Finite {
+            label: "AgentRef".to_owned(),
+            values: agents.iter().map(|agent| agent.name.clone()).collect(),
+        },
+        TypeSyntax::Ref { name } => semantic
+            .schemas
+            .enums
+            .get(&name.name)
+            .map(|variants| ExprType::Finite {
+                label: format!("enum `{}`", name.name),
+                values: variants.iter().cloned().collect(),
+            })
+            .unwrap_or(ExprType::Object),
         TypeSyntax::Optional { inner, .. } => {
-            ExprType::Optional(Box::new(expr_type_from_type_syntax(inner)))
+            ExprType::Optional(Box::new(expr_type_from_type_syntax(inner, semantic)))
         }
         TypeSyntax::Array { inner, .. } => {
-            ExprType::Array(Box::new(expr_type_from_type_syntax(inner)))
+            ExprType::Array(Box::new(expr_type_from_type_syntax(inner, semantic)))
         }
-        TypeSyntax::Map { inner, .. } => ExprType::Map(Box::new(expr_type_from_type_syntax(inner))),
+        TypeSyntax::Map { inner, .. } => {
+            ExprType::Map(Box::new(expr_type_from_type_syntax(inner, semantic)))
+        }
         TypeSyntax::Union { variants, .. } => {
-            let all_strings = variants
+            let values = variants
                 .iter()
-                .all(|variant| matches!(variant, TypeSyntax::LiteralString { .. }));
-            if all_strings {
-                ExprType::String
+                .filter_map(|variant| match variant {
+                    TypeSyntax::LiteralString { value, .. } => Some(value.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if values.len() == variants.len() && !values.is_empty() {
+                ExprType::Finite {
+                    label: "literal union".to_owned(),
+                    values,
+                }
             } else {
                 ExprType::Unknown
             }
@@ -3514,12 +3825,23 @@ fn types_comparable(left: &ExprType, right: &ExprType) -> bool {
         (ExprType::Optional(left), right) | (right, ExprType::Optional(left)) => {
             types_comparable(left, right)
         }
+        (ExprType::Finite { .. }, ExprType::String)
+        | (ExprType::String, ExprType::Finite { .. })
+        | (ExprType::Finite { .. }, ExprType::Finite { .. }) => true,
         _ => left == right,
     }
 }
 
 fn is_numeric_type(ty: &ExprType) -> bool {
     matches!(ty, ExprType::Int | ExprType::Float)
+}
+
+fn is_string_like_key_type(ty: &ExprType) -> bool {
+    match ty {
+        ExprType::String | ExprType::Unknown | ExprType::Finite { .. } => true,
+        ExprType::Optional(inner) => is_string_like_key_type(inner),
+        _ => false,
+    }
 }
 
 fn is_orderable_pair(left: &ExprType, right: &ExprType) -> bool {
@@ -3570,6 +3892,7 @@ fn expr_type_label(ty: &ExprType) -> String {
         ExprType::Int => "int".to_owned(),
         ExprType::Float => "float".to_owned(),
         ExprType::String => "string".to_owned(),
+        ExprType::Finite { label, values } => format!("{label}<{}>", values.join(" | ")),
         ExprType::Duration => "duration".to_owned(),
         ExprType::Time => "time".to_owned(),
         ExprType::Null => "null".to_owned(),
@@ -3600,6 +3923,7 @@ fn validate_finite_domain_expr(
     let Some((domain, literals)) = finite_domain_comparison(left, right, semantic, scope)
         .or_else(|| finite_domain_comparison(right, left, semantic, scope))
     else {
+        validate_finite_domain_relation(op, left, right, semantic, scope, context, diagnostics);
         return;
     };
     for literal in literals.into_iter().flatten() {
@@ -3613,6 +3937,91 @@ fn validate_finite_domain_expr(
                 suggestion: Some(format!("use one of: {}", domain.join(", "))),
             });
         }
+    }
+    validate_finite_domain_relation(op, left, right, semantic, scope, context, diagnostics);
+}
+
+fn validate_finite_domain_relation(
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    semantic: &SemanticContext,
+    scope: &ExprScope,
+    context: &ExprValidationContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match op {
+        BinaryOp::Eq => {
+            let Some(left_domain) = expr_domain(left, semantic, scope) else {
+                return;
+            };
+            let Some(right_domain) = expr_domain(right, semantic, scope) else {
+                return;
+            };
+            if left_domain
+                .iter()
+                .all(|value| !right_domain.iter().any(|right| right == value))
+            {
+                diagnostics.push(Diagnostic {
+                    span: context.span,
+                    message: format!(
+                        "{} has statically unsatisfiable finite-domain equality",
+                        context.subject
+                    ),
+                    suggestion: Some(format!(
+                        "compare domains with at least one shared value; left: {}, right: {}",
+                        left_domain.join(", "),
+                        right_domain.join(", ")
+                    )),
+                });
+            }
+        }
+        BinaryOp::In => {
+            let Some(domain) = expr_domain(left, semantic, scope) else {
+                return;
+            };
+            let Some(literals) = literal_array_values(right) else {
+                return;
+            };
+            if literals
+                .iter()
+                .all(|literal| !domain.iter().any(|value| value == literal))
+            {
+                diagnostics.push(Diagnostic {
+                    span: context.span,
+                    message: format!(
+                        "{} has statically unsatisfiable finite-domain membership",
+                        context.subject
+                    ),
+                    suggestion: Some(format!("use one of: {}", domain.join(", "))),
+                });
+            }
+        }
+        BinaryOp::NotIn => {
+            let Some(domain) = expr_domain(left, semantic, scope) else {
+                return;
+            };
+            let Some(literals) = literal_array_values(right) else {
+                return;
+            };
+            if !domain.is_empty()
+                && domain
+                    .iter()
+                    .all(|value| literals.iter().any(|literal| literal == value))
+            {
+                diagnostics.push(Diagnostic {
+                    span: context.span,
+                    message: format!(
+                        "{} has statically unsatisfiable finite-domain exclusion",
+                        context.subject
+                    ),
+                    suggestion: Some(
+                        "leave at least one domain value outside the exclusion set".to_owned(),
+                    ),
+                });
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3641,11 +4050,15 @@ fn expr_domain(expr: &Expr, semantic: &SemanticContext, scope: &ExprScope) -> Op
     let ty = match expr {
         Expr::Path(path) => {
             let root = path.first()?;
-            let schema = scope.binding_types.get(root)?;
-            semantic
-                .schemas
-                .resolve_field_path(schema, path.get(1..)?)
-                .ok()?
+            if let Some(schema) = scope.binding_types.get(root) {
+                semantic
+                    .schemas
+                    .resolve_field_path(schema, path.get(1..)?)
+                    .ok()?
+            } else {
+                let schema = scope.implicit_schema.as_ref()?;
+                semantic.schemas.resolve_field_path(schema, path).ok()?
+            }
         }
         Expr::Literal(ExprLiteral::Ident(name)) => implicit_field_type(name, semantic, scope)?,
         _ => return None,
@@ -3684,6 +4097,19 @@ fn expr_literal_name(literal: &ExprLiteral) -> Option<String> {
     }
 }
 
+fn literal_array_values(expr: &Expr) -> Option<Vec<String>> {
+    let Expr::Array(items) = expr else {
+        return None;
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            Expr::Literal(literal) => expr_literal_name(literal),
+            _ => None,
+        })
+        .collect()
+}
+
 fn parse_tell_target(line: &str) -> Option<&str> {
     line.strip_prefix("tell ")?
         .split_whitespace()
@@ -3719,17 +4145,27 @@ fn validate_case_blocks(
     binding_types: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let lines = rule.body.text.lines().collect::<Vec<_>>();
+    let lines = rule
+        .body
+        .text
+        .lines()
+        .scan(0usize, |offset, line| {
+            let current = *offset;
+            *offset += line.len() + 1;
+            Some((line, current))
+        })
+        .collect::<Vec<_>>();
+    let text_lines = lines.iter().map(|(line, _)| *line).collect::<Vec<_>>();
     let mut index = 0usize;
     while index < lines.len() {
-        let trimmed = lines[index].trim();
+        let trimmed = lines[index].0.trim();
         let Some(scrutinee) = case_scrutinee(trimmed) else {
             index += 1;
             continue;
         };
         let scrutinee_ty = expression_type(scrutinee, semantic, binding_types);
-        let terminal_case =
-            scrutinee_ty.is_none() && active_completes_binding_for_case(&lines, index, scrutinee);
+        let terminal_case = scrutinee_ty.is_none()
+            && active_completes_binding_for_case(&text_lines, index, scrutinee);
         if scrutinee_ty.is_none() && !terminal_case {
             diagnostics.push(Diagnostic {
                 span: rule.body.span,
@@ -3744,35 +4180,63 @@ fn validate_case_blocks(
         let mut case_index = index + 1;
         let mut branches = Vec::new();
         while case_index < lines.len() && depth > 0 {
-            let line = lines[case_index].trim();
+            let (raw_line, line_offset) = lines[case_index];
+            let line = raw_line.trim();
             if depth == 1 {
                 if let Some(branch) = parse_case_branch_head(line) {
+                    let pattern_column = case_pattern_column(raw_line, branch.pattern);
+                    let branch = SpanCaseBranchHead {
+                        pattern: branch.pattern,
+                        guard: branch.guard,
+                        pattern_span: SourceSpan {
+                            start: rule_body_text_start(rule) + line_offset + pattern_column,
+                            end: rule_body_text_start(rule)
+                                + line_offset
+                                + pattern_column
+                                + branch.pattern.len(),
+                        },
+                    };
                     branches.push(branch);
                     if terminal_case {
-                        validate_terminal_case_pattern(rule, branch.pattern, diagnostics);
+                        validate_terminal_case_pattern(
+                            rule,
+                            branch.pattern,
+                            branch.pattern_span,
+                            diagnostics,
+                        );
                     } else {
                         validate_case_pattern(
                             rule,
                             branch.pattern,
                             scrutinee_ty.as_ref(),
+                            branch.pattern_span,
                             semantic,
                             diagnostics,
                         );
                     }
                     if let Some(guard) = branch.guard {
+                        let mut branch_scope = binding_types.clone();
+                        if let Some(scrutinee_ty) = scrutinee_ty.as_ref() {
+                            if let Some((binding, schema)) =
+                                case_branch_payload_binding(branch.pattern, scrutinee_ty, semantic)
+                            {
+                                branch_scope.insert(binding, schema);
+                            }
+                        }
                         validate_expression(
                             rule,
                             guard,
                             semantic,
-                            binding_types,
+                            &branch_scope,
                             "case guard",
                             diagnostics,
                         );
-                        validate_known_field_paths(
+                        validate_known_field_paths_at_span(
                             rule,
                             guard,
+                            branch.pattern_span,
                             semantic,
-                            binding_types,
+                            &branch_scope,
                             diagnostics,
                         );
                     }
@@ -3839,6 +4303,13 @@ struct CaseBranchHead<'a> {
     guard: Option<&'a str>,
 }
 
+#[derive(Clone, Copy)]
+struct SpanCaseBranchHead<'a> {
+    pattern: &'a str,
+    guard: Option<&'a str>,
+    pattern_span: SourceSpan,
+}
+
 fn parse_case_branch_head(line: &str) -> Option<CaseBranchHead<'_>> {
     let (pattern, _) = line.split_once("=>")?;
     let pattern = pattern.trim();
@@ -3871,6 +4342,7 @@ fn validate_case_pattern(
     rule: &RuleDecl,
     pattern: &str,
     scrutinee_ty: Option<&TypeSyntax>,
+    span: SourceSpan,
     semantic: &SemanticContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -3880,7 +4352,7 @@ fn validate_case_pattern(
     if pattern == "None" {
         if !matches!(scrutinee_ty, Some(TypeSyntax::Optional { .. })) {
             diagnostics.push(Diagnostic {
-                span: rule.body.span,
+                span,
                 message: format!(
                     "rule `{}` uses `None` for a non-optional case",
                     rule.name.name
@@ -3893,7 +4365,7 @@ fn validate_case_pattern(
     if pattern.starts_with("Some ") {
         if !matches!(scrutinee_ty, Some(TypeSyntax::Optional { .. })) {
             diagnostics.push(Diagnostic {
-                span: rule.body.span,
+                span,
                 message: format!(
                     "rule `{}` uses `Some` for a non-optional case",
                     rule.name.name
@@ -3913,7 +4385,7 @@ fn validate_case_pattern(
             };
             if !variants.contains(pattern) {
                 diagnostics.push(Diagnostic {
-                    span: rule.body.span,
+                    span,
                     message: format!("enum `{}` has no variant `{pattern}`", name.name),
                     suggestion: Some(format!(
                         "use one of: {}",
@@ -3925,7 +4397,7 @@ fn validate_case_pattern(
         TypeSyntax::Union { variants, .. } => {
             let Some(literal) = parse_literal_expr(pattern) else {
                 diagnostics.push(Diagnostic {
-                    span: rule.body.span,
+                    span,
                     message: format!(
                         "rule `{}` has unsupported case pattern `{pattern}`",
                         rule.name.name
@@ -3934,12 +4406,12 @@ fn validate_case_pattern(
                 });
                 return;
             };
-            validate_union_case_pattern(rule, variants, &literal, diagnostics);
+            validate_union_case_pattern(rule, variants, &literal, span, diagnostics);
         }
         TypeSyntax::AgentRef { agents, .. } => {
             let Some(literal) = parse_literal_expr(pattern) else {
                 diagnostics.push(Diagnostic {
-                    span: rule.body.span,
+                    span,
                     message: format!(
                         "rule `{}` has unsupported AgentRef case pattern `{pattern}`",
                         rule.name.name
@@ -3950,14 +4422,14 @@ fn validate_case_pattern(
                 });
                 return;
             };
-            validate_agent_ref_case_pattern(rule, agents, &literal, diagnostics);
+            validate_agent_ref_case_pattern(rule, agents, &literal, span, diagnostics);
         }
         TypeSyntax::Optional { inner, .. } => {
-            validate_case_pattern(rule, pattern, Some(inner), semantic, diagnostics);
+            validate_case_pattern(rule, pattern, Some(inner), span, semantic, diagnostics);
         }
         _ => {
             diagnostics.push(Diagnostic {
-                span: rule.body.span,
+                span,
                 message: format!(
                     "rule `{}` cannot pattern-match this scrutinee type",
                     rule.name.name
@@ -3977,6 +4449,7 @@ fn terminal_case_tags() -> [&'static str; 4] {
 fn validate_terminal_case_pattern(
     rule: &RuleDecl,
     pattern: &str,
+    span: SourceSpan,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if is_fallback_pattern(pattern) {
@@ -3989,7 +4462,7 @@ fn validate_terminal_case_pattern(
     let binding = parts.next();
     if parts.next().is_some() || binding.is_none() {
         diagnostics.push(Diagnostic {
-            span: rule.body.span,
+            span,
             message: format!(
                 "rule `{}` has malformed terminal-output case pattern `{pattern}`",
                 rule.name.name
@@ -4001,7 +4474,7 @@ fn validate_terminal_case_pattern(
     let tags = terminal_case_tags();
     if !tags.contains(&tag) {
         diagnostics.push(Diagnostic {
-            span: rule.body.span,
+            span,
             message: format!(
                 "rule `{}` terminal-output case pattern cannot be `{tag}`",
                 rule.name.name
@@ -4013,7 +4486,7 @@ fn validate_terminal_case_pattern(
 
 fn validate_terminal_case_coverage(
     rule: &RuleDecl,
-    branches: &[CaseBranchHead<'_>],
+    branches: &[SpanCaseBranchHead<'_>],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if branches.is_empty()
@@ -4052,7 +4525,7 @@ fn validate_terminal_case_coverage(
 
 fn validate_duplicate_terminal_case_patterns(
     rule: &RuleDecl,
-    branches: &[CaseBranchHead<'_>],
+    branches: &[SpanCaseBranchHead<'_>],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut seen = BTreeSet::new();
@@ -4062,7 +4535,7 @@ fn validate_duplicate_terminal_case_patterns(
         };
         if !seen.insert(pattern.to_owned()) {
             diagnostics.push(Diagnostic {
-                span: rule.body.span,
+                span: branch.pattern_span,
                 message: format!(
                     "rule `{}` has duplicate unguarded terminal-output case pattern `{pattern}`",
                     rule.name.name
@@ -4079,7 +4552,7 @@ fn validate_duplicate_terminal_case_patterns(
 fn validate_case_coverage(
     rule: &RuleDecl,
     scrutinee_ty: Option<&TypeSyntax>,
-    branches: &[CaseBranchHead<'_>],
+    branches: &[SpanCaseBranchHead<'_>],
     semantic: &SemanticContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -4121,7 +4594,7 @@ fn validate_case_coverage(
 
 fn validate_duplicate_case_patterns(
     rule: &RuleDecl,
-    branches: &[CaseBranchHead<'_>],
+    branches: &[SpanCaseBranchHead<'_>],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut seen = BTreeSet::new();
@@ -4131,7 +4604,7 @@ fn validate_duplicate_case_patterns(
         };
         if !seen.insert(pattern.to_owned()) {
             diagnostics.push(Diagnostic {
-                span: rule.body.span,
+                span: branch.pattern_span,
                 message: format!(
                     "rule `{}` has duplicate unguarded case pattern `{pattern}`",
                     rule.name.name
@@ -4204,6 +4677,7 @@ fn validate_union_case_pattern(
     rule: &RuleDecl,
     variants: &[TypeSyntax],
     literal: &LiteralExpr<'_>,
+    span: SourceSpan,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let allowed = variants
@@ -4218,7 +4692,7 @@ fn validate_union_case_pattern(
     }
     let LiteralExpr::String(value) = literal else {
         diagnostics.push(Diagnostic {
-            span: rule.body.span,
+            span,
             message: format!(
                 "rule `{}` case pattern must be one of its literal variants",
                 rule.name.name
@@ -4229,7 +4703,7 @@ fn validate_union_case_pattern(
     };
     if !allowed.contains(value) {
         diagnostics.push(Diagnostic {
-            span: rule.body.span,
+            span,
             message: format!("rule `{}` case pattern cannot be `{value}`", rule.name.name),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
         });
@@ -4240,6 +4714,7 @@ fn validate_agent_ref_case_pattern(
     rule: &RuleDecl,
     agents: &[Ident],
     literal: &LiteralExpr<'_>,
+    span: SourceSpan,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let allowed = agents
@@ -4248,7 +4723,7 @@ fn validate_agent_ref_case_pattern(
         .collect::<Vec<_>>();
     let (LiteralExpr::String(value) | LiteralExpr::Ident(value)) = literal else {
         diagnostics.push(Diagnostic {
-            span: rule.body.span,
+            span,
             message: format!("rule `{}` has non-agent case pattern", rule.name.name),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
         });
@@ -4256,7 +4731,7 @@ fn validate_agent_ref_case_pattern(
     };
     if !allowed.contains(value) {
         diagnostics.push(Diagnostic {
-            span: rule.body.span,
+            span,
             message: format!("AgentRef has no agent `{value}`"),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
         });
@@ -4475,6 +4950,24 @@ fn validate_known_field_paths(
     binding_types: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    validate_known_field_paths_at_span(
+        rule,
+        line,
+        rule.body.span,
+        semantic,
+        binding_types,
+        diagnostics,
+    );
+}
+
+fn validate_known_field_paths_at_span(
+    rule: &RuleDecl,
+    line: &str,
+    span: SourceSpan,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     for (root, path) in dotted_paths(line) {
         let Some(schema) = binding_types.get(&root) else {
             continue;
@@ -4484,7 +4977,7 @@ fn validate_known_field_paths(
         }
         if let Err(message) = semantic.schemas.resolve_field_path(schema, &path) {
             diagnostics.push(Diagnostic {
-                span: rule.body.span,
+                span,
                 message: format!(
                     "rule `{}` has invalid field path `{root}.{}`: {message}",
                     rule.name.name,
@@ -5156,7 +5649,7 @@ fn validate_inferred_assignment_type(
     let mut local_diagnostics = Vec::new();
     let actual_ty = infer_expr_type(expr, semantic, scope, &context, &mut local_diagnostics);
     diagnostics.extend(local_diagnostics);
-    let expected_expr_ty = expr_type_from_type_syntax(expected_ty);
+    let expected_expr_ty = expr_type_from_type_syntax(expected_ty, semantic);
     if !types_comparable(&actual_ty, &expected_expr_ty) {
         diagnostics.push(Diagnostic {
             span: rule.body.span,
@@ -5252,7 +5745,20 @@ fn validate_agent_ref_literal(
         .iter()
         .map(|agent| agent.name.as_str())
         .collect::<Vec<_>>();
-    let (LiteralExpr::String(value) | LiteralExpr::Ident(value)) = literal else {
+    if let LiteralExpr::String(value) = literal {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!(
+                "field `{record_schema}.{field}` expects an AgentRef value, not string `{value}`"
+            ),
+            suggestion: Some(format!(
+                "use an unquoted declared agent name: {}",
+                allowed.join(", ")
+            )),
+        });
+        return;
+    }
+    let LiteralExpr::Ident(value) = literal else {
         diagnostics.push(Diagnostic {
             span: rule.body.span,
             message: format!("field `{record_schema}.{field}` expects an AgentRef value"),
@@ -7378,7 +7884,14 @@ rule run_task
 
         let compiled = compile_program(source);
         assert_eq!(compiled.diagnostics, Vec::new());
-        assert!(compiled.ir.is_some());
+        let ir = compiled.ir.expect("valid ir");
+        let rule = ir
+            .rules
+            .iter()
+            .find(|rule| rule.name == "run_task")
+            .expect("run_task");
+        assert_eq!(rule.metadata.effects.len(), 1);
+        assert_eq!(rule.metadata.effects[0].kind, IrEffectKind::AgentTell);
     }
 
     #[test]
@@ -7465,7 +7978,7 @@ rule seed
   when started
 => {
   record LanguageTask {
-    provider "claude"
+    provider claude
   }
 }
 "#;
@@ -7478,6 +7991,36 @@ rule seed
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("field `LanguageTask.provider` cannot reference agent `claude`")));
+    }
+
+    #[test]
+    fn rejects_quoted_agent_ref_record_values() {
+        let source = r#"
+workflow BadQuotedAgentRef
+
+agent codex {
+  profile "repo-writer"
+  capacity 1
+}
+
+class LanguageTask {
+  provider AgentRef<codex>
+}
+
+rule seed
+  when started
+=> {
+  record LanguageTask {
+    provider "codex"
+  }
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("expects an AgentRef value, not string `codex`")));
     }
 
     #[test]
@@ -7842,12 +8385,33 @@ assert missing.root == "value"
         let source = r#"
 workflow SymmetricFiniteDomain
 
+enum ReviewStatus {
+  Accept
+  Revise
+}
+
 class Task {
+  status ReviewStatus
   provider "codex" | "claude"
 }
 
 rule symmetric_literal
   when Task as task where "bad" == task.provider
+=> {
+}
+
+rule enum_variant_literal
+  when Task as task where Missing == task.status
+=> {
+}
+
+rule array_membership_literal
+  when Task as task where task.provider in ["codex", "bad"]
+=> {
+}
+
+rule implicit_query_head
+  when Task as task where exists(Task where status == Missing)
 => {
 }
 
@@ -7864,7 +8428,49 @@ rule unknown_root
             .contains("finite-domain value to unknown `bad`")));
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
+            .contains("finite-domain value to unknown `Missing`")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
             .contains("unknown expression root `other`")));
+    }
+
+    #[test]
+    fn rejects_unsatisfiable_finite_domain_expression_relations() {
+        let source = r#"
+workflow UnsatisfiableFiniteDomains
+
+class Task {
+  provider "codex" | "claude"
+  route "pi" | "baml"
+}
+
+rule disjoint_equality
+  when Task as task where task.provider == task.route
+=> {
+}
+
+rule empty_membership
+  when Task as task where task.provider in []
+=> {
+}
+
+rule excluded_membership
+  when Task as task where task.provider not in ["codex", "claude"]
+=> {
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("statically unsatisfiable finite-domain equality")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("statically unsatisfiable finite-domain membership")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("statically unsatisfiable finite-domain exclusion")));
     }
 
     #[test]
@@ -8012,6 +8618,10 @@ rule_dependencies
             (
                 include_str!("../../../examples/provider-language-e2e.whip"),
                 include_str!("../../../examples/provider-language-e2e.ir"),
+            ),
+            (
+                include_str!("../../../examples/companion-skill-dogfood.whip"),
+                include_str!("../../../examples/companion-skill-dogfood.ir"),
             ),
             (
                 include_str!("../../../examples/expression-kernel-dogfood.whip"),
@@ -8488,12 +9098,26 @@ rule route
 "#;
         let compiled = compile_program(source);
         assert!(compiled.ir.is_none());
-        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
-            .message
-            .contains("enum `ReviewStatus` has no variant `Missing`")));
-        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
-            .message
-            .contains("uses `Some` for a non-optional case")));
+        let missing = compiled
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("enum `ReviewStatus` has no variant `Missing`")
+            })
+            .expect("missing variant diagnostic");
+        assert!(source[missing.span.start..missing.span.end].contains("Mis"));
+        let some = compiled
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("uses `Some` for a non-optional case")
+            })
+            .expect("some diagnostic");
+        assert!(source[some.span.start..some.span.end].contains("Some"));
     }
 
     #[test]
@@ -8643,6 +9267,10 @@ rule branch
             (
                 "bad-expression-functions",
                 include_str!("../../../examples/invalid/bad-expression-functions.whip"),
+            ),
+            (
+                "bad-finite-domain",
+                include_str!("../../../examples/invalid/bad-finite-domain.whip"),
             ),
             (
                 "broken",

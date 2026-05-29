@@ -3,7 +3,7 @@ mod WHIPPLETREE-KERNEL is
     EffectId FactId RunId EventId RuleId GraphId
     Predicate EffectStatus ProjectionStatus LeaseStatus GuardResult
     AssertionId AssertionResult AgentTarget Path Presence Value Domain
-    Scalar QueryId QueryCardinality Expr Cfg .
+    Scalar QueryId QueryCardinality Expr ExprList Entry EntryList TerminalTag Cfg .
 
   --- Sample identifiers used by hand-written model tests.
   ops e1 e2 e3 : -> EffectId .
@@ -50,9 +50,10 @@ mod WHIPPLETREE-KERNEL is
   ops gTrue gFalse gError : -> GuardResult .
   ops aPass aFail aError : -> AssertionResult .
   ops present missing : -> Presence .
-  ops qZero qOne qMany qError : -> QueryCardinality .
-  ops boolTrue boolFalse exprError countZero countOne countMany : -> Expr .
+  ops qZero qOne qTwo qThree qMany qError : -> QueryCardinality .
+  ops boolTrue boolFalse exprError countZero countOne countTwo countThree countMany : -> Expr .
   ops orderLow orderEqual orderHigh arrayEmpty objectEmpty mapEmpty : -> Expr .
+  ops terminalCompleted terminalFailed terminalTimedOut terminalCancelled : -> TerminalTag .
 
   --- Runtime configuration as a multiset.
   op none : -> Cfg .
@@ -104,12 +105,28 @@ mod WHIPPLETREE-KERNEL is
   op inExpr : Expr Expr -> Expr .
   op arrayHas : Expr -> Expr .
   op arrayMissing : Expr -> Expr .
+  op exprNil : -> ExprList .
+  op exprCons : Expr ExprList -> ExprList .
+  op entry : Expr Expr -> Entry .
+  op entryNil : -> EntryList .
+  op entryCons : Entry EntryList -> EntryList .
+  op arrayOf : ExprList -> Expr .
+  op mapOf : EntryList -> Expr .
+  op objectOf : EntryList -> Expr .
+  op countList : ExprList -> Expr .
+  op countEntries : EntryList -> Expr .
+  op inList : Expr ExprList -> Expr .
+  op inEntryKeys : Expr EntryList -> Expr .
+  op indexEntries : Expr EntryList -> Expr .
   op mapHas : Expr Expr -> Expr .
   op mapMissing : Expr -> Expr .
   op objectHas : Expr Expr -> Expr .
   op objectMissing : Expr -> Expr .
   op indexExpr : Expr Expr -> Expr .
   op queryFilter : QueryId Expr QueryCardinality -> Expr .
+  op terminalBranch : RuleId FactId TerminalTag TerminalTag GraphId -> Cfg .
+  op terminalBranchGuard : RuleId FactId TerminalTag TerminalTag Expr GraphId -> Cfg .
+  op exhaustiveTerminal : RuleId FactId TerminalTag TerminalTag -> Cfg .
   op evalGuard : Expr -> GuardResult .
   op evalAssertion : Expr -> AssertionResult .
   op declaredAgent : AgentTarget -> Cfg .
@@ -140,17 +157,25 @@ mod WHIPPLETREE-KERNEL is
   vars Sc : Scalar .
   vars Q : QueryId .
   var C : QueryCardinality .
-  vars Ex Ex1 Ex2 : Expr .
+  vars Ex Ex1 Ex2 Ex3 : Expr .
+  var EL : ExprList .
+  vars EN EN2 EN3 : Entry .
+  var KL : EntryList .
+  vars Tag Tag2 : TerminalTag .
 
   --- Deterministic expression-kernel subset used by generated per-program
   --- checks. Generated models lower guards/assertions into these terms instead
   --- of asserting symbolic true/false/error outcomes directly.
   eq countExpr(query(Q, qZero)) = countZero .
   eq countExpr(query(Q, qOne)) = countOne .
+  eq countExpr(query(Q, qTwo)) = countTwo .
+  eq countExpr(query(Q, qThree)) = countThree .
   eq countExpr(query(Q, qMany)) = countMany .
   eq countExpr(query(Q, qError)) = exprError .
   eq countExpr(queryFilter(Q, boolTrue, qZero)) = countZero .
   eq countExpr(queryFilter(Q, boolTrue, qOne)) = countOne .
+  eq countExpr(queryFilter(Q, boolTrue, qTwo)) = countTwo .
+  eq countExpr(queryFilter(Q, boolTrue, qThree)) = countThree .
   eq countExpr(queryFilter(Q, boolTrue, qMany)) = countMany .
   eq countExpr(queryFilter(Q, boolTrue, qError)) = exprError .
   eq countExpr(queryFilter(Q, boolFalse, C)) = countZero .
@@ -158,18 +183,35 @@ mod WHIPPLETREE-KERNEL is
   eq countExpr(arrayEmpty) = countZero .
   eq countExpr(arrayHas(Ex)) = countOne .
   eq countExpr(arrayMissing(Ex)) = countZero .
+  eq countExpr(arrayOf(EL)) = countList(EL) .
   eq countExpr(mapEmpty) = countZero .
   eq countExpr(mapHas(Ex1, Ex2)) = countOne .
   eq countExpr(mapMissing(Ex)) = countZero .
+  eq countExpr(mapOf(KL)) = countEntries(KL) .
   eq countExpr(objectEmpty) = countZero .
   eq countExpr(objectHas(Ex1, Ex2)) = countOne .
   eq countExpr(objectMissing(Ex)) = countZero .
+  eq countExpr(objectOf(KL)) = countEntries(KL) .
+  eq countList(exprNil) = countZero .
+  eq countList(exprCons(Ex, exprNil)) = countOne .
+  eq countList(exprCons(Ex, exprCons(Ex1, exprNil))) = countTwo .
+  eq countList(exprCons(Ex, exprCons(Ex1, exprCons(Ex2, exprNil)))) = countThree .
+  eq countList(exprCons(Ex, exprCons(Ex1, exprCons(Ex2, exprCons(Ex3, EL))))) = countMany .
+  eq countEntries(entryNil) = countZero .
+  eq countEntries(entryCons(EN, entryNil)) = countOne .
+  eq countEntries(entryCons(EN, entryCons(EN2, entryNil))) = countTwo .
+  eq countEntries(entryCons(EN, entryCons(EN2, entryCons(EN3, entryNil)))) = countThree .
+  eq countEntries(entryCons(EN, entryCons(EN2, entryCons(EN3, entryCons(EN, KL))))) = countMany .
   eq existsExpr(query(Q, qZero)) = boolFalse .
   eq existsExpr(query(Q, qOne)) = boolTrue .
+  eq existsExpr(query(Q, qTwo)) = boolTrue .
+  eq existsExpr(query(Q, qThree)) = boolTrue .
   eq existsExpr(query(Q, qMany)) = boolTrue .
   eq existsExpr(query(Q, qError)) = exprError .
   eq existsExpr(queryFilter(Q, boolTrue, qZero)) = boolFalse .
   eq existsExpr(queryFilter(Q, boolTrue, qOne)) = boolTrue .
+  eq existsExpr(queryFilter(Q, boolTrue, qTwo)) = boolTrue .
+  eq existsExpr(queryFilter(Q, boolTrue, qThree)) = boolTrue .
   eq existsExpr(queryFilter(Q, boolTrue, qMany)) = boolTrue .
   eq existsExpr(queryFilter(Q, boolTrue, qError)) = exprError .
   eq existsExpr(queryFilter(Q, boolFalse, C)) = boolFalse .
@@ -177,12 +219,15 @@ mod WHIPPLETREE-KERNEL is
   eq existsExpr(arrayEmpty) = boolFalse .
   eq existsExpr(arrayHas(Ex)) = boolTrue .
   eq existsExpr(arrayMissing(Ex)) = boolFalse .
+  eq existsExpr(arrayOf(EL)) = notExpr(eqExpr(countList(EL), countZero)) .
   eq existsExpr(mapEmpty) = boolFalse .
   eq existsExpr(mapHas(Ex1, Ex2)) = boolTrue .
   eq existsExpr(mapMissing(Ex)) = boolFalse .
+  eq existsExpr(mapOf(KL)) = notExpr(eqExpr(countEntries(KL), countZero)) .
   eq existsExpr(objectEmpty) = boolFalse .
   eq existsExpr(objectHas(Ex1, Ex2)) = boolTrue .
   eq existsExpr(objectMissing(Ex)) = boolFalse .
+  eq existsExpr(objectOf(KL)) = notExpr(eqExpr(countEntries(KL), countZero)) .
   eq emptyExpr(query(Q, qZero)) = boolTrue .
   eq emptyExpr(query(Q, qOne)) = boolFalse .
   eq emptyExpr(query(Q, qMany)) = boolFalse .
@@ -196,12 +241,15 @@ mod WHIPPLETREE-KERNEL is
   eq emptyExpr(arrayEmpty) = boolTrue .
   eq emptyExpr(arrayHas(Ex)) = boolFalse .
   eq emptyExpr(arrayMissing(Ex)) = boolTrue .
+  eq emptyExpr(arrayOf(EL)) = eqExpr(countList(EL), countZero) .
   eq emptyExpr(mapEmpty) = boolTrue .
   eq emptyExpr(mapHas(Ex1, Ex2)) = boolFalse .
   eq emptyExpr(mapMissing(Ex)) = boolTrue .
+  eq emptyExpr(mapOf(KL)) = eqExpr(countEntries(KL), countZero) .
   eq emptyExpr(objectEmpty) = boolTrue .
   eq emptyExpr(objectHas(Ex1, Ex2)) = boolFalse .
   eq emptyExpr(objectMissing(Ex)) = boolTrue .
+  eq emptyExpr(objectOf(KL)) = eqExpr(countEntries(KL), countZero) .
   eq notExpr(boolTrue) = boolFalse .
   eq notExpr(boolFalse) = boolTrue .
   eq notExpr(exprError) = exprError .
@@ -223,18 +271,54 @@ mod WHIPPLETREE-KERNEL is
   eq neExpr(boolFalse, boolFalse) = boolFalse .
   eq eqExpr(countZero, countZero) = boolTrue .
   eq eqExpr(countZero, countOne) = boolFalse .
+  eq eqExpr(countZero, countTwo) = boolFalse .
+  eq eqExpr(countZero, countThree) = boolFalse .
+  eq eqExpr(countZero, countMany) = boolFalse .
   eq eqExpr(countOne, countZero) = boolFalse .
   eq eqExpr(countOne, countOne) = boolTrue .
+  eq eqExpr(countOne, countTwo) = boolFalse .
+  eq eqExpr(countOne, countThree) = boolFalse .
+  eq eqExpr(countTwo, countZero) = boolFalse .
+  eq eqExpr(countTwo, countOne) = boolFalse .
+  eq eqExpr(countTwo, countTwo) = boolTrue .
+  eq eqExpr(countTwo, countThree) = boolFalse .
+  eq eqExpr(countTwo, countMany) = boolFalse .
+  eq eqExpr(countThree, countZero) = boolFalse .
+  eq eqExpr(countThree, countOne) = boolFalse .
+  eq eqExpr(countThree, countTwo) = boolFalse .
+  eq eqExpr(countThree, countThree) = boolTrue .
+  eq eqExpr(countThree, countMany) = boolFalse .
   eq eqExpr(countMany, countMany) = boolTrue .
   eq eqExpr(countOne, countMany) = boolFalse .
   eq eqExpr(countMany, countOne) = boolFalse .
+  eq eqExpr(countMany, countZero) = boolFalse .
+  eq eqExpr(countMany, countTwo) = boolFalse .
+  eq eqExpr(countMany, countThree) = boolFalse .
   eq neExpr(countZero, countZero) = boolFalse .
   eq neExpr(countZero, countOne) = boolTrue .
+  eq neExpr(countZero, countTwo) = boolTrue .
+  eq neExpr(countZero, countThree) = boolTrue .
+  eq neExpr(countZero, countMany) = boolTrue .
   eq neExpr(countOne, countZero) = boolTrue .
   eq neExpr(countOne, countOne) = boolFalse .
+  eq neExpr(countOne, countTwo) = boolTrue .
+  eq neExpr(countOne, countThree) = boolTrue .
+  eq neExpr(countTwo, countZero) = boolTrue .
+  eq neExpr(countTwo, countOne) = boolTrue .
+  eq neExpr(countTwo, countTwo) = boolFalse .
+  eq neExpr(countTwo, countThree) = boolTrue .
+  eq neExpr(countTwo, countMany) = boolTrue .
+  eq neExpr(countThree, countZero) = boolTrue .
+  eq neExpr(countThree, countOne) = boolTrue .
+  eq neExpr(countThree, countTwo) = boolTrue .
+  eq neExpr(countThree, countThree) = boolFalse .
+  eq neExpr(countThree, countMany) = boolTrue .
   eq neExpr(countMany, countMany) = boolFalse .
   eq neExpr(countOne, countMany) = boolTrue .
   eq neExpr(countMany, countOne) = boolTrue .
+  eq neExpr(countMany, countZero) = boolTrue .
+  eq neExpr(countMany, countTwo) = boolTrue .
+  eq neExpr(countMany, countThree) = boolTrue .
   eq ltExpr(orderLow, orderHigh) = boolTrue .
   eq ltExpr(orderLow, orderEqual) = boolTrue .
   eq ltExpr(orderEqual, orderHigh) = boolTrue .
@@ -242,14 +326,30 @@ mod WHIPPLETREE-KERNEL is
   eq ltExpr(orderEqual, orderEqual) = boolFalse .
   eq ltExpr(orderHigh, orderLow) = boolFalse .
   eq ltExpr(countZero, countOne) = boolTrue .
+  eq ltExpr(countZero, countTwo) = boolTrue .
+  eq ltExpr(countZero, countThree) = boolTrue .
   eq ltExpr(countZero, countMany) = boolTrue .
   eq ltExpr(countOne, countMany) = boolTrue .
+  eq ltExpr(countOne, countTwo) = boolTrue .
+  eq ltExpr(countOne, countThree) = boolTrue .
+  eq ltExpr(countTwo, countThree) = boolTrue .
+  eq ltExpr(countTwo, countMany) = boolTrue .
+  eq ltExpr(countThree, countMany) = boolTrue .
   eq ltExpr(countZero, countZero) = boolFalse .
   eq ltExpr(countOne, countOne) = boolFalse .
+  eq ltExpr(countTwo, countTwo) = boolFalse .
+  eq ltExpr(countThree, countThree) = boolFalse .
   eq ltExpr(countMany, countMany) = boolFalse .
   eq ltExpr(countOne, countZero) = boolFalse .
+  eq ltExpr(countTwo, countZero) = boolFalse .
+  eq ltExpr(countTwo, countOne) = boolFalse .
+  eq ltExpr(countThree, countZero) = boolFalse .
+  eq ltExpr(countThree, countOne) = boolFalse .
+  eq ltExpr(countThree, countTwo) = boolFalse .
   eq ltExpr(countMany, countZero) = boolFalse .
   eq ltExpr(countMany, countOne) = boolFalse .
+  eq ltExpr(countMany, countTwo) = boolFalse .
+  eq ltExpr(countMany, countThree) = boolFalse .
   eq ltExpr(exprError, Ex) = exprError .
   eq ltExpr(Ex, exprError) = exprError .
   eq leExpr(orderLow, orderHigh) = boolTrue .
@@ -260,13 +360,29 @@ mod WHIPPLETREE-KERNEL is
   eq leExpr(orderHigh, orderLow) = boolFalse .
   eq leExpr(countZero, countZero) = boolTrue .
   eq leExpr(countZero, countOne) = boolTrue .
+  eq leExpr(countZero, countTwo) = boolTrue .
+  eq leExpr(countZero, countThree) = boolTrue .
   eq leExpr(countZero, countMany) = boolTrue .
   eq leExpr(countOne, countOne) = boolTrue .
+  eq leExpr(countOne, countTwo) = boolTrue .
+  eq leExpr(countOne, countThree) = boolTrue .
   eq leExpr(countOne, countMany) = boolTrue .
+  eq leExpr(countTwo, countTwo) = boolTrue .
+  eq leExpr(countTwo, countThree) = boolTrue .
+  eq leExpr(countTwo, countMany) = boolTrue .
+  eq leExpr(countThree, countThree) = boolTrue .
+  eq leExpr(countThree, countMany) = boolTrue .
   eq leExpr(countMany, countMany) = boolTrue .
   eq leExpr(countOne, countZero) = boolFalse .
+  eq leExpr(countTwo, countZero) = boolFalse .
+  eq leExpr(countTwo, countOne) = boolFalse .
+  eq leExpr(countThree, countZero) = boolFalse .
+  eq leExpr(countThree, countOne) = boolFalse .
+  eq leExpr(countThree, countTwo) = boolFalse .
   eq leExpr(countMany, countZero) = boolFalse .
   eq leExpr(countMany, countOne) = boolFalse .
+  eq leExpr(countMany, countTwo) = boolFalse .
+  eq leExpr(countMany, countThree) = boolFalse .
   eq leExpr(exprError, Ex) = exprError .
   eq leExpr(Ex, exprError) = exprError .
   eq gtExpr(orderHigh, orderLow) = boolTrue .
@@ -276,14 +392,30 @@ mod WHIPPLETREE-KERNEL is
   eq gtExpr(orderEqual, orderEqual) = boolFalse .
   eq gtExpr(orderLow, orderHigh) = boolFalse .
   eq gtExpr(countOne, countZero) = boolTrue .
+  eq gtExpr(countTwo, countZero) = boolTrue .
+  eq gtExpr(countTwo, countOne) = boolTrue .
+  eq gtExpr(countThree, countZero) = boolTrue .
+  eq gtExpr(countThree, countOne) = boolTrue .
+  eq gtExpr(countThree, countTwo) = boolTrue .
   eq gtExpr(countMany, countZero) = boolTrue .
   eq gtExpr(countMany, countOne) = boolTrue .
+  eq gtExpr(countMany, countTwo) = boolTrue .
+  eq gtExpr(countMany, countThree) = boolTrue .
   eq gtExpr(countZero, countZero) = boolFalse .
   eq gtExpr(countOne, countOne) = boolFalse .
+  eq gtExpr(countTwo, countTwo) = boolFalse .
+  eq gtExpr(countThree, countThree) = boolFalse .
   eq gtExpr(countMany, countMany) = boolFalse .
   eq gtExpr(countZero, countOne) = boolFalse .
+  eq gtExpr(countZero, countTwo) = boolFalse .
+  eq gtExpr(countZero, countThree) = boolFalse .
   eq gtExpr(countZero, countMany) = boolFalse .
+  eq gtExpr(countOne, countTwo) = boolFalse .
+  eq gtExpr(countOne, countThree) = boolFalse .
   eq gtExpr(countOne, countMany) = boolFalse .
+  eq gtExpr(countTwo, countThree) = boolFalse .
+  eq gtExpr(countTwo, countMany) = boolFalse .
+  eq gtExpr(countThree, countMany) = boolFalse .
   eq gtExpr(exprError, Ex) = exprError .
   eq gtExpr(Ex, exprError) = exprError .
   eq geExpr(orderHigh, orderLow) = boolTrue .
@@ -295,20 +427,45 @@ mod WHIPPLETREE-KERNEL is
   eq geExpr(countZero, countZero) = boolTrue .
   eq geExpr(countOne, countZero) = boolTrue .
   eq geExpr(countOne, countOne) = boolTrue .
+  eq geExpr(countTwo, countZero) = boolTrue .
+  eq geExpr(countTwo, countOne) = boolTrue .
+  eq geExpr(countTwo, countTwo) = boolTrue .
+  eq geExpr(countThree, countZero) = boolTrue .
+  eq geExpr(countThree, countOne) = boolTrue .
+  eq geExpr(countThree, countTwo) = boolTrue .
+  eq geExpr(countThree, countThree) = boolTrue .
   eq geExpr(countMany, countZero) = boolTrue .
   eq geExpr(countMany, countOne) = boolTrue .
+  eq geExpr(countMany, countTwo) = boolTrue .
+  eq geExpr(countMany, countThree) = boolTrue .
   eq geExpr(countMany, countMany) = boolTrue .
   eq geExpr(countZero, countOne) = boolFalse .
+  eq geExpr(countZero, countTwo) = boolFalse .
+  eq geExpr(countZero, countThree) = boolFalse .
   eq geExpr(countZero, countMany) = boolFalse .
+  eq geExpr(countOne, countTwo) = boolFalse .
+  eq geExpr(countOne, countThree) = boolFalse .
   eq geExpr(countOne, countMany) = boolFalse .
+  eq geExpr(countTwo, countThree) = boolFalse .
+  eq geExpr(countTwo, countMany) = boolFalse .
+  eq geExpr(countThree, countMany) = boolFalse .
   eq geExpr(exprError, Ex) = exprError .
   eq geExpr(Ex, exprError) = exprError .
   eq inExpr(Ex, arrayHas(Ex)) = boolTrue .
   eq inExpr(Ex, arrayMissing(Ex)) = boolFalse .
+  eq inExpr(Ex, arrayOf(EL)) = inList(Ex, EL) .
+  eq inList(Ex, exprNil) = boolFalse .
+  eq inList(Ex, exprCons(Ex, EL)) = boolTrue .
+  eq inList(Ex, exprCons(Ex1, EL)) = inList(Ex, EL) [owise] .
   eq inExpr(Ex, mapHas(Ex, Ex1)) = boolTrue .
   eq inExpr(Ex, mapMissing(Ex)) = boolFalse .
+  eq inExpr(Ex, mapOf(KL)) = inEntryKeys(Ex, KL) .
   eq inExpr(Ex, objectHas(Ex, Ex1)) = boolTrue .
   eq inExpr(Ex, objectMissing(Ex)) = boolFalse .
+  eq inExpr(Ex, objectOf(KL)) = inEntryKeys(Ex, KL) .
+  eq inEntryKeys(Ex, entryNil) = boolFalse .
+  eq inEntryKeys(Ex, entryCons(entry(Ex, Ex1), KL)) = boolTrue .
+  eq inEntryKeys(Ex, entryCons(entry(Ex1, Ex2), KL)) = inEntryKeys(Ex, KL) [owise] .
   eq inExpr(Ex, arrayEmpty) = boolFalse .
   eq inExpr(Ex, mapEmpty) = boolFalse .
   eq inExpr(Ex, objectEmpty) = boolFalse .
@@ -316,8 +473,13 @@ mod WHIPPLETREE-KERNEL is
   eq inExpr(Ex, exprError) = exprError .
   eq indexExpr(mapHas(Ex1, Ex2), Ex1) = Ex2 .
   eq indexExpr(mapMissing(Ex1), Ex1) = exprError .
+  eq indexExpr(mapOf(KL), Ex) = indexEntries(Ex, KL) .
   eq indexExpr(objectHas(Ex1, Ex2), Ex1) = Ex2 .
   eq indexExpr(objectMissing(Ex1), Ex1) = exprError .
+  eq indexExpr(objectOf(KL), Ex) = indexEntries(Ex, KL) .
+  eq indexEntries(Ex, entryNil) = exprError .
+  eq indexEntries(Ex, entryCons(entry(Ex, Ex1), KL)) = Ex1 .
+  eq indexEntries(Ex, entryCons(entry(Ex1, Ex2), KL)) = indexEntries(Ex, KL) [owise] .
   eq indexExpr(exprError, Ex) = exprError .
   eq indexExpr(Ex, exprError) = exprError .
   eq evalGuard(boolTrue) = gTrue .
@@ -384,6 +546,27 @@ mod WHIPPLETREE-KERNEL is
   rl [optional-none-branch] :
     fact(F) optionalNoneBranch(R, F, X, G) path(X, missing)
     => fact(F) ruleReady(R, F, G) path(X, missing) .
+
+  --- Terminal-output union branches are finite-domain gates over effect
+  --- terminal tags. The tag must match before the branch graph can commit; an
+  --- optional branch guard is evaluated after tag refinement.
+  rl [terminal-branch-match] :
+    fact(F) terminalBranch(R, F, Tag, Tag, G)
+    => fact(F) ruleReady(R, F, G) .
+
+  crl [terminal-branch-guard-match] :
+    fact(F) terminalBranchGuard(R, F, Tag, Tag, Ex, G)
+    => fact(F) ruleReady(R, F, G)
+    if evalGuard(Ex) == gTrue .
+
+  crl [terminal-branch-guard-error] :
+    fact(F) terminalBranchGuard(R, F, Tag, Tag, Ex, G)
+    => fact(F) diagnostic(R)
+    if evalGuard(Ex) == gError .
+
+  rl [exhaustive-terminal-miss] :
+    fact(F) exhaustiveTerminal(R, F, Tag, Tag2)
+    => fact(F) diagnostic(R) .
 
   rl [fire-rule] :
     fact(F) rule(R, F, G) ruleReady(R, F, G)

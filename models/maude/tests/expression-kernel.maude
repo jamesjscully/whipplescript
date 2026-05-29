@@ -91,6 +91,60 @@ search [1] in WHIPPLETREE-KERNEL :
   =>*
   diagnostic(guardedRule) graphCommitted(g1) effect(tellEff, queued) .
 
+--- Exact finite arrays preserve multi-item cardinality and membership.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact,
+    andExpr(eqExpr(countExpr(arrayOf(exprCons(scalar(scalar1), exprCons(scalar(scalar2), exprNil)))), countTwo),
+      inExpr(scalar(scalar2), arrayOf(exprCons(scalar(scalar1), exprCons(scalar(scalar2), exprNil))))))
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
+
+--- Exact finite objects preserve key cardinality and path-sensitive index reads.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact,
+    andExpr(eqExpr(countExpr(objectOf(entryCons(entry(scalar(scalar1), scalar(scalar2)), entryCons(entry(scalar(scalar2), scalar(scalar1)), entryNil)))), countTwo),
+      eqExpr(indexExpr(objectOf(entryCons(entry(scalar(scalar1), scalar(scalar2)), entryCons(entry(scalar(scalar2), scalar(scalar1)), entryNil))), scalar(scalar2)), scalar(scalar1))))
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
+
+--- Terminal tag matches can commit the matching branch.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  terminalBranch(guardedRule, issueFact, terminalCompleted, terminalCompleted, g1)
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
+
+--- Terminal tag misses cannot commit a sibling branch.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  terminalBranch(guardedRule, issueFact, terminalFailed, terminalCompleted, g1)
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) .
+
+--- Terminal branch guards are evaluated after tag matching.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  terminalBranchGuard(guardedRule, issueFact, terminalCompleted, terminalCompleted, boolFalse, g1)
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) .
+
+--- Exhaustive terminal tag misses emit diagnostics.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact)
+  exhaustiveTerminal(guardedRule, issueFact, terminalFailed, terminalCompleted)
+  =>*
+  fact(issueFact) diagnostic(guardedRule) .
+
 --- A finite enum/literal domain guard cannot match values outside its domain.
 search [1] in WHIPPLETREE-KERNEL :
   fact(issueFact) rule(guardedRule, issueFact, g1)

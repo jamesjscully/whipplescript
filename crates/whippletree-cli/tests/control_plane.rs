@@ -18,6 +18,7 @@ fn checks_all_example_workflows() {
         "coerce-branch.whip",
         "codex-french-poem-dogfood.whip",
         "codex-poem-coerce-review.whip",
+        "companion-skill-dogfood.whip",
         "human-review.whip",
         "implementation-plan-phase-review.whip",
         "multi-agent-bounded-concurrency.whip",
@@ -1045,6 +1046,70 @@ fn dev_provider_language_e2e_runs_agent_matrix_and_baml_reviews() {
 }
 
 #[test]
+fn dev_companion_skill_dogfood_routes_with_agentref_metadata() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let example = example_path("companion-skill-dogfood.whip");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            example.to_str().expect("utf-8 example path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let assertions = dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("assertions");
+    assert_eq!(assertions.len(), 6);
+    assert!(assertions
+        .iter()
+        .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+    let providers = facts
+        .iter()
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("CompanionReviewDispatch"))
+        .map(|fact| {
+            fact.get("value")
+                .and_then(|value| value.get("provider"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        providers,
+        ["codex", "claude", "pi"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+
+    let _ = fs::remove_file(store_path);
+}
+
+#[test]
 fn dev_evaluates_case_branches_for_literal_and_optional_patterns() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
@@ -1252,15 +1317,18 @@ rule route
     let _ = fs::remove_file(source_path);
 }
 
-#[test]
-fn dev_branches_on_completed_terminal_union_payload() {
-    let bin = env!("CARGO_BIN_EXE_whip");
+fn run_terminal_branch_workflow(
+    bin: &str,
+    flag: Option<&str>,
+    expected_branch: &str,
+    expected_detail: &str,
+) {
     let store_path = temp_store_path();
-    let source_path = temp_workflow_path("terminal-completed-branch");
+    let source_path = temp_workflow_path(&format!("terminal-{expected_branch}-branch"));
     fs::write(
         &source_path,
         r#"
-workflow TerminalCompletedBranch
+workflow TerminalBranch
 
 class WorkItem {
   title string
@@ -1278,12 +1346,13 @@ class TerminalRoute {
   detail string
 }
 
+class BranchEffect {
+  branch string
+}
+
 coerce classifyMessage(title string, body string) -> MessageClassification {
   prompt "Classify"
 }
-
-assert count(TerminalRoute where branch == "completed") == 1
-assert count(TerminalRoute where detail == "Fixture classification") == 1
 
 rule seed
   when started
@@ -1306,24 +1375,28 @@ rule classify_request
           branch "completed"
           detail result.summary
         }
+        askHuman "completed branch effect"
       }
       Failed failure => {
         record TerminalRoute {
           branch "failed"
           detail failure.reason
         }
+        askHuman "failed branch effect"
       }
       TimedOut timeout => {
         record TerminalRoute {
           branch "timed_out"
           detail timeout.summary
         }
+        askHuman "timed_out branch effect"
       }
       Cancelled cancel => {
         record TerminalRoute {
           branch "cancelled"
           detail cancel.summary
         }
+        askHuman "cancelled branch effect"
       }
     }
   }
@@ -1332,29 +1405,78 @@ rule classify_request
     )
     .expect("write source");
 
-    let dev = run_json(
+    let mut args = vec![
+        "--store",
+        store_path.to_str().expect("utf-8 temp path"),
+        "--json",
+        "dev",
+        source_path.to_str().expect("utf-8 source path"),
+        "--provider",
+        "fixture",
+    ];
+    if let Some(flag) = flag {
+        args.push(flag);
+    }
+    args.extend(["--until", "idle"]);
+
+    let dev = run_json(bin, &args);
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
         bin,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
-            source_path.to_str().expect("utf-8 source path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
+            "facts",
+            instance_id,
         ],
     );
-    assert!(dev
-        .get("assertions")
-        .and_then(Value::as_array)
-        .expect("assertions")
+    let facts = facts.as_array().expect("facts array");
+    let terminal_routes = facts
         .iter()
-        .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("TerminalRoute"))
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_routes.len(), 1, "{facts:#?}");
+    let route = terminal_routes[0]
+        .get("value")
+        .and_then(Value::as_object)
+        .expect("route value");
+    assert_eq!(
+        route.get("branch").and_then(Value::as_str),
+        Some(expected_branch)
+    );
+    assert_eq!(
+        route.get("detail").and_then(Value::as_str),
+        Some(expected_detail)
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("human.ask.created"))
+            .count(),
+        1,
+        "{facts:#?}"
+    );
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn dev_branches_on_all_terminal_union_payloads_and_branch_local_effects() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    run_terminal_branch_workflow(bin, None, "completed", "Fixture classification");
+    run_terminal_branch_workflow(bin, Some("--fail"), "failed", "fixture coerce failure");
+    run_terminal_branch_workflow(bin, Some("--timeout"), "timed_out", "coerce timed out");
+    run_terminal_branch_workflow(
+        bin,
+        Some("--cancel"),
+        "cancelled",
+        "fixture coerce cancelled",
+    );
 }
 
 #[test]
@@ -1741,6 +1863,39 @@ fn check_rejects_bad_effect_payload_arguments() {
     );
     assert!(
         stderr.contains("field `loft claim.issue` receives incompatible expression type"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn check_rejects_bad_finite_domain_expressions() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let source_path = example_path("invalid/bad-finite-domain.whip");
+
+    let output = Command::new(bin)
+        .args(["check", source_path.to_str().expect("utf-8 source path")])
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("finite-domain value to unknown `pi`"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("finite-domain value to unknown `Missing`"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("finite-domain value to unknown `bad`"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("statically unsatisfiable finite-domain equality"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("statically unsatisfiable finite-domain exclusion"),
         "stderr:\n{stderr}"
     );
 }

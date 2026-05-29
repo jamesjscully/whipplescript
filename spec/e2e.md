@@ -31,6 +31,16 @@ guards such as `where task.provider == "codex"`, not one duplicate task class
 per provider. The test should not ask BAML or any language model to decide
 provider identity, model identity, or route selection.
 
+The deterministic suite also includes `examples/companion-skill-dogfood.whip`.
+That workflow is the companion-skill acceptance fixture: it declares
+`use skill "whippletree-author"`, seeds three phase-review tasks, routes them
+through typed `AgentRef<codex | claude | pi>` metadata, tells each logical
+reviewer to update the same visible tracker path, and records
+`CompanionReviewDispatch` facts after successful fixture turns. Source
+assertions prove one dispatch per logical reviewer and three completed
+`agent.tell` effects. The test fails if routing moves into BAML output, prompt
+text inspection, or duplicate provider-specific task schemas.
+
 The e2e suite should eventually encode these assertions in Whippletree source
 rather than only in Rust test code:
 
@@ -77,18 +87,19 @@ changes so implementation cannot silently create a second expression dialect.
 
 ## Companion-Skill Dogfood
 
-The companion-skill dogfood test should author deterministic routing and
-validation metadata directly in Whippletree source:
+The companion-skill dogfood test authors deterministic routing and validation
+metadata directly in Whippletree source:
 
 - provider/model identity is represented by literals, enums, or `AgentRef`
   values supplied by the workflow, not by a BAML classifier or model answer
-- provider-language tasks are seeded from a typed matrix or equivalent typed
-  facts with one shared task schema
+- provider-language or phase-review tasks are seeded from typed facts with one
+  shared task schema; static matrix syntax remains future sugar
 - companion instructions encourage agents to emit artifacts and trace evidence,
   while source assertions check counts, route coverage, and terminal effect
   states
-- a deterministic validator capability checks exact script/fixture properties
-  in CI, with BAML review kept as a separate integration path
+- source assertions check counts, route coverage, and terminal effect states in
+  CI; a deterministic validator capability for exact script/fixture properties
+  remains a future integration path, with BAML review kept separate
 - assertions prove that all expected provider/language pairs completed and that
   no duplicate provider-specific task classes were needed
 

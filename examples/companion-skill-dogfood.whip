@@ -1,0 +1,106 @@
+workflow CompanionSkillDogfood
+
+use skill "whippletree-author"
+
+class CompanionReviewTask {
+  reviewer AgentRef<codex | claude | pi>
+  phase int
+  title string
+  trackerPath string
+  route "spec" | "validation" | "docs"
+  status "queued"
+}
+
+class CompanionReviewDispatch {
+  provider string
+  phase int
+  route string
+  trackerPath string
+  turn AgentTurn
+  status "dispatched"
+}
+
+agent codex {
+  profile "repo-reader"
+  capacity 1
+  capabilities ["agent.tell"]
+}
+
+agent claude {
+  profile "repo-reader"
+  capacity 1
+  capabilities ["agent.tell"]
+}
+
+agent pi {
+  profile "repo-reader"
+  capacity 1
+  capabilities ["agent.tell"]
+}
+
+assert count(CompanionReviewTask where status == "queued") == 3
+assert count(CompanionReviewDispatch where provider == "codex") == 1
+assert count(CompanionReviewDispatch where provider == "claude") == 1
+assert count(CompanionReviewDispatch where provider == "pi") == 1
+assert count(CompanionReviewDispatch where route in ["spec", "validation", "docs"]) == 3
+assert count(effect kind agent.tell where status == completed) == 3
+
+rule seed_companion_review_matrix
+  when started
+=> {
+  record CompanionReviewTask {
+    reviewer codex
+    phase 1
+    title "Review the companion-skill source examples"
+    trackerPath "spec/companion-skill-dogfood-tracker.md"
+    route "spec"
+    status "queued"
+  }
+
+  record CompanionReviewTask {
+    reviewer claude
+    phase 2
+    title "Review validation and e2e coverage"
+    trackerPath "spec/companion-skill-dogfood-tracker.md"
+    route "validation"
+    status "queued"
+  }
+
+  record CompanionReviewTask {
+    reviewer pi
+    phase 3
+    title "Review docs and tracker synchronization"
+    trackerPath "spec/companion-skill-dogfood-tracker.md"
+    route "docs"
+    status "queued"
+  }
+}
+
+rule dispatch_companion_review
+  when CompanionReviewTask as task where task.route in ["spec", "validation", "docs"]
+  when task.reviewer is available
+=> {
+  tell task.reviewer requires ["agent.tell"] as turn """
+  Use the whippletree-author companion skill.
+
+  Review phase {{ task.phase }}: {{ task.title }}.
+
+  Update tracker:
+  {{ task.trackerPath }}
+
+  Do not infer provider, model, or route identity from prompt text. The workflow
+  has already selected your logical reviewer through typed AgentRef metadata.
+  Report only findings, evidence, and next action for the assigned phase.
+  """
+
+  after turn succeeds {
+    record CompanionReviewDispatch {
+      provider task.reviewer
+      phase task.phase
+      route task.route
+      trackerPath task.trackerPath
+      turn turn
+      status "dispatched"
+    }
+  }
+}

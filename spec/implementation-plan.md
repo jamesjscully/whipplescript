@@ -642,15 +642,15 @@ not be considered complete until that tracker reaches its acceptance gates.
 
 - [x] Add guarded fact matches:
   `when LanguageTask as task where task.provider == "codex"`.
-- [ ] Type-check guard expressions against matched schemas, enum variants,
+- [x] Type-check guard expressions against matched schemas, enum variants,
   literal unions, optional presence proofs, and scalar comparison rules.
-- [ ] Add full expression parser/AST support for boolean logic, ordering,
+- [x] Add full expression parser/AST support for boolean logic, ordering,
   membership, count/empty/exists, query filters, array literals, map indexing,
   parentheses, and precedence.
 - [x] Add a finite Maude expression-kernel model for guard true/false/error,
   optional presence, enum/literal domains, typed pattern branches, assertions,
   and AgentRef validity.
-- [ ] Extend generated per-program Maude checks so rule firing is gated by
+- [x] Extend generated per-program Maude checks so rule firing is gated by
   lowered guard predicates before effect graphs can commit.
 - [x] Add deterministic assertion syntax over fact/effect projections for e2e
   checks.
@@ -667,6 +667,10 @@ not be considered complete until that tracker reaches its acceptance gates.
   require BAML/model judgment.
 - [x] Rewrite `examples/provider-language-e2e.whip` to use one shared
   `LanguageTask` schema routed by typed `AgentRef`.
+- [x] Add `examples/companion-skill-dogfood.whip` to prove companion-skill
+  authored workflows can route phase-review work through typed `AgentRef`
+  metadata, source assertions, and tracker-path prompts without provider/model
+  identity classification by an LLM.
 - [x] Update the companion authoring skill to recommend deterministic routing
   metadata and warn against asking models to identify providers/routes.
 
@@ -676,9 +680,9 @@ Acceptance:
   Claude, and Pi without duplicate provider-specific classes.
 - [x] Provider counts, agent-turn counts, and BAML-review counts are asserted in
   source or first-class assertion fixtures.
-- [ ] The BAML review output contains only reviewable artifact qualities unless
+- [x] The BAML review output contains only reviewable artifact qualities unless
   the workflow explicitly reviews provider evidence.
-- [ ] Guard expressions are parsed, typed, and evaluated through the expression
+- [x] Guard expressions are parsed, typed, and evaluated through the expression
   kernel rather than raw string splitting.
 
 ## Stage 11: E2E Test System

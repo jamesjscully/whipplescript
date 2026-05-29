@@ -50,7 +50,7 @@ rule seed_expression_kernel_tasks
   when started
 => {
   record KernelTask {
-    provider "codex"
+    provider codex
     title "Implement expression guards"
     status "queued"
     route "code"
@@ -62,7 +62,7 @@ rule seed_expression_kernel_tasks
   }
 
   record KernelTask {
-    provider "claude"
+    provider claude
     title "Review expression assertions"
     status "queued"
     route "review"
@@ -74,7 +74,7 @@ rule seed_expression_kernel_tasks
   }
 
   record KernelTask {
-    provider "pi"
+    provider pi
     title "Summarize expression docs"
     status "queued"
     route "docs"

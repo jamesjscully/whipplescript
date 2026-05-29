@@ -70,6 +70,20 @@ source-level repair, for example adding `exists issue.assignee &&` before an
 optional access or changing a provider string to an `AgentRef<codex | claude |
 pi>` field.
 
+Current checked coverage includes invalid fixtures for unknown schemas, bad
+records, effect-output scope leaks, effectful self-loops, bad effect payloads,
+and expression-function/query diagnostics. Parser and CLI tests also cover
+finite-domain comparison typos, optional presence proofs, duration/time literal
+validation, `coerce` argument type validation, `claim ... with loft` payload
+typing, dynamic `AgentRef` target/capability checks, terminal-output branch
+tag validation, and branch-binding context safety.
+
+The remaining static-analysis hardening work is mostly diagnostic breadth and
+precision: more per-row golden fixtures, exact source spans for every lowered
+effect line and branch alternative, formatter-stable expression rendering, and
+full typed lowering for rule bodies that currently compile through practical
+runtime metadata.
+
 ### Read/Write Sets
 
 For each rule, compute:

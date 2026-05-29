@@ -364,6 +364,26 @@ impl FakeBamlClient {
             },
         }
     }
+
+    pub fn times_out(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            result: BamlCoerceResult {
+                status: BamlCoerceStatus::TimedOut,
+                value_json: None,
+                error_json: Some(
+                    json!({
+                        "reason": reason,
+                        "recoverable": true,
+                    })
+                    .to_string(),
+                ),
+                summary: "coerce timed out".to_owned(),
+                transcript: "fake baml timeout transcript\n".to_owned(),
+                usage_json: r#"{"input_tokens":1,"output_tokens":0}"#.to_owned(),
+            },
+        }
+    }
 }
 
 impl BamlClient for FakeBamlClient {

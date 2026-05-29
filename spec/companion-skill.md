@@ -1,6 +1,6 @@
 # Companion Skill
 
-Status: draft
+Status: implemented local package, active dogfood
 
 Whippletree should ship a companion skill for coding agents that author or operate
 Whippletree workflows.
@@ -64,6 +64,36 @@ Current authoring guidance from dogfood:
   parser.
 - Use `call <capability> ... as <binding>` for plugin capabilities such as
   memory. Do not invent plugin-specific control-flow syntax.
+
+## Dogfood Fixture
+
+`examples/companion-skill-dogfood.whip` is the checked companion-skill dogfood
+fixture. It uses:
+
+- `use skill "whippletree-author"` to make the authored workflow explicitly
+  depend on this skill.
+- one shared `CompanionReviewTask` schema with
+  `reviewer AgentRef<codex | claude | pi>`.
+- deterministic source-seeded review tasks for spec, validation, and docs
+  review phases.
+- `tell task.reviewer requires ["agent.tell"]` so the compiler and runtime
+  enforce declared agent capability metadata before provider execution.
+- source assertions over `CompanionReviewDispatch` and `effect kind agent.tell`
+  counts.
+
+The fixture deliberately does not ask BAML, Codex, Claude, Pi, or any other
+model to identify which provider/model is active or which route should be
+selected. The prompt repeats that route identity has already been selected by
+typed source metadata and asks the thread only to review its assigned phase and
+update the visible tracker.
+
+Validation:
+
+```sh
+cargo run -q -p whippletree-cli -- check examples/companion-skill-dogfood.whip
+cargo run -q -p whippletree-cli -- compile examples/companion-skill-dogfood.whip
+cargo test -p whippletree-cli --test control_plane dev_companion_skill_dogfood_routes_with_agentref_metadata
+```
 
 ## Anti-Patterns
 

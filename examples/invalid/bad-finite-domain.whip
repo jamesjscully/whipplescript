@@ -1,0 +1,42 @@
+workflow BadFiniteDomain
+
+enum ReviewStatus {
+  Accept
+  Revise
+}
+
+class Task {
+  status ReviewStatus
+  provider "codex" | "claude"
+  route "pi" | "baml"
+}
+
+rule invalid_guard_literal
+  when Task as task where task.provider == "pi"
+=> {
+}
+
+rule invalid_enum_variant
+  when Task as task where Missing == task.status
+=> {
+}
+
+rule invalid_membership_literal
+  when Task as task where task.provider in ["codex", "bad"]
+=> {
+}
+
+rule implicit_query_invalid_variant
+  when Task as task where exists(Task where status == Missing)
+=> {
+}
+
+rule impossible_domain_equality
+  when Task as task where task.provider == task.route
+=> {
+}
+
+rule impossible_domain_membership
+  when Task as task where task.provider not in ["codex", "claude"]
+=> {
+}

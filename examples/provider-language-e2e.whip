@@ -76,7 +76,7 @@ rule seed_language_matrix
   when started
 => {
   record LanguageTask {
-    provider "codex"
+    provider codex
     language "French"
     expectedScript "Latin"
     prompt "Write a four-line original poem about rain over a city at night."
@@ -85,7 +85,7 @@ rule seed_language_matrix
   }
 
   record LanguageTask {
-    provider "codex"
+    provider codex
     language "Arabic"
     expectedScript "Arabic"
     prompt "Write a four-line original poem about a desert sunrise."
@@ -94,7 +94,7 @@ rule seed_language_matrix
   }
 
   record LanguageTask {
-    provider "claude"
+    provider claude
     language "Spanish"
     expectedScript "Latin"
     prompt "Write a four-line original poem about a harbor at dawn."
@@ -103,7 +103,7 @@ rule seed_language_matrix
   }
 
   record LanguageTask {
-    provider "claude"
+    provider claude
     language "Hindi"
     expectedScript "Devanagari"
     prompt "Write a four-line original poem about monsoon clouds."
@@ -112,7 +112,7 @@ rule seed_language_matrix
   }
 
   record LanguageTask {
-    provider "pi"
+    provider pi
     language "Japanese"
     expectedScript "Kana and kanji"
     prompt "Write a four-line original poem about a quiet train station."
@@ -121,7 +121,7 @@ rule seed_language_matrix
   }
 
   record LanguageTask {
-    provider "pi"
+    provider pi
     language "German"
     expectedScript "Latin"
     prompt "Write a four-line original poem about snow on rooftops."

@@ -288,7 +288,11 @@ Golden IR fixtures should exercise every row with stable snapshots for source
 span preservation, precedence, query reads, dynamic `AgentRef` values, and
 runtime-visible `Missing` versus `null` behavior. The fixtures should include
 both concise examples and one provider-language dogfood workflow that routes
-through deterministic metadata instead of model judgment.
+through deterministic metadata instead of model judgment. The checked fixtures
+now include `examples/expression-kernel-dogfood.whip`,
+`examples/provider-language-e2e.whip`,
+`examples/terminal-output-union.whip`, and
+`examples/companion-skill-dogfood.whip`.
 
 ## Pattern Branches
 
@@ -506,6 +510,9 @@ matrix language_tasks as LanguageTask [
 
 Matrix rows lower to ordinary `record` writes during rule evaluation. They must
 be fully typed and deterministic; they are not loops over runtime collections.
+Until matrix syntax lands, dogfood workflows should seed the equivalent typed
+facts explicitly in a `when started` rule. That is the shape used by
+`provider-language-e2e.whip` and `companion-skill-dogfood.whip`.
 
 Repeated effect chains should be reusable without obscuring the durable graph.
 A rule template or action block may abstract identical `tell -> coerce ->

@@ -40,26 +40,27 @@ as complete:
 
 | Feature | Spec | Validation | Implementation | Tests | Owner / Notes |
 | --- | --- | --- | --- | --- | --- |
-| Full guard/assertion type checking | [x] | [x] | [~] | [x] | Assertions now reuse guard-style expression validation for boolean results, finite-domain checks, unknown dotted roots, simple fact-query guards, function arity/shape checks, and unknown query-field/schema diagnostics. |
+| Full guard/assertion type checking | [x] | [x] | [x] | [x] | Assertions and guards now reuse shared expression validation for free binding/path checks, result typing, boolean result enforcement, incompatible equality, membership, array common-type checks, finite-domain contradictions, function arity/shape checks, and query-field/schema diagnostics. |
 | Expression object literals | [x] | [x] | [~] | [x] | Expression AST object literals now parse/evaluate, record-field expected-schema object/map literals support multiline nested bodies, and BAML effect arguments validate against declared parameter types. Anonymous object literals are rejected in untyped guard/assertion contexts. Remaining gaps: payload schemas for effect kinds that still expose no structured source args and broader typed rule-body lowering. |
 | Duration/time ordering | [x] | [x] | [x] | [x] | Parser type checking now accepts same-type duration/time ordering, validates ISO-8601 duration and RFC3339 time source literals, accepts fractional seconds and timezone offsets, and CLI evaluator orders parsed duration/time string values. Invalid external duration/time facts now surface deterministic guard/assertion errors where IR field type context is available. Calendar months/years remain unsupported. |
-| Enum/literal finite-domain typing | [x] | [~] | [~] | [~] | Spec now requires precise finite-domain types, symmetric comparison checks, and contradiction diagnostics. Typed query heads remain partial. |
-| Generated per-program Maude checks | [x] | [x] | [~] | [x] | Generated searches now lower a useful expression subset into Maude terms for guard true/false/error and assertion non-mutation: scalar equality, boolean `&&`/`||`/`!`, count equality/ordering, `exists(...)`, `empty(...)`, ordering witnesses, membership, array/object/map emptiness, map/object index misses, and filtered-query cardinality. Effect dependency checks are preserved. Remaining gap: exact runtime cardinality/value domains for multi-item collections and full path-sensitive query semantics. |
+| Enum/literal finite-domain typing | [x] | [x] | [x] | [x] | Parser inference now preserves enum, literal-union, and AgentRef finite domains; guards/assertions/query filters reject out-of-domain literals symmetrically and diagnose useful unsatisfiable finite-domain equality/membership/exclusion cases. Runtime still stores these values as JSON scalars. |
+| Generated per-program Maude checks | [x] | [x] | [x] | [x] | Generated searches now lower the currently-supported expression subset into Maude terms for guard true/false/error and assertion non-mutation: scalar equality, boolean `&&`/`||`/`!`, count equality/ordering through 0/1/2/3/many thresholds, `exists(...)`, `empty(...)`, ordering witnesses, membership, exact finite array/object cardinality and membership/index reads, map/object index misses, filtered-query cardinality, and terminal-output tag branches. Effect dependency checks are preserved. Remaining gaps are outside the current supported generator subset: exact runtime map values for non-literal maps, deep path-sensitive query filtering over concrete row sets, and exact counts above the `many` bucket. |
 | AgentRef profile/capacity/capability constraints | [x] | [x] | [x] | [x] | Compiled program versions now persist declared agents, including capabilities. Parser checks `tell ... requires [...]` against static and dynamic `AgentRef` domains; store/kernel policy rejects undeclared targets, profile mismatches, capability mismatches, and capacity exhaustion before provider start. |
-| Tagged terminal-output union branch matching | [x] | [x] | [~] | [x] | `after ... completes` now exposes a deterministic terminal union in the dev stepper, validates `Completed`/`Failed`/`TimedOut`/`Cancelled` branch tags, snapshots explicit typed IR payload alternatives/branches, and covers completed BAML routing plus failed-variant branch binding. Remaining gaps: post-failure record commits, cancel/timeout producer fixtures, and effect creation inside terminal case bodies. |
-| Branch pattern spans and typed lowering | [~] | [x] | [~] | [x] | Read-only analysis identified exact parser/CLI targets. The branch-binding leak is fixed and tested; branch-level source spans and typed rule-body lowering remain pending. |
+| Tagged terminal-output union branch matching | [x] | [x] | [x] | [x] | `after ... completes` now exposes a deterministic terminal union in the dev stepper, validates `Completed`/`Failed`/`TimedOut`/`Cancelled` branch tags, snapshots explicit typed IR payload alternatives/branches, and covers completed/failed/timed-out/cancelled BAML routing with branch-local record and effect commits. Runtime branch guard errors are reported without selecting sibling branches. |
+| Branch pattern spans and typed lowering | [x] | [x] | [x] | [x] | Ordinary rule-body `case` branches now lower typed IR metadata with scrutinee type, pattern kind, guard expression, branch body hash, and branch pattern span. Parser diagnostics point at branch alternatives for invalid enum/literal/optional patterns, and `whip dev` selects case branches before committing branch-local records/effects, including nested terminal case bodies. Runtime reports guard errors and no-match cases without selecting sibling branches. |
 | Assertion diagnostics and event surfaces | [x] | [x] | [x] | [x] | Failed/error assertions now persist deterministic diagnostic rows during `dev` with assertion source spans; CLI JSON/human output, exit status, and `whip diagnostics` list the durable surface after store reopen. |
 | Provider/harness failure capture | [x] | [x] | [x] | [x] | Failed/timed-out agent, BAML, and Loft provider runs now persist diagnostic rows linked to terminal event, effect, run, provider evidence, and source span metadata when the effect came from compiled source. Terminal events embed the diagnostic payload so provider diagnostics can be reconstructed from event replay. |
 | Parser-only expression matrix | [x] | [x] | [x] | [x] | Parser-only tests now cover precedence, calls, fact/effect queries, map indexes, arrays, invalid syntax, and optional presence-proof syntax. |
 | Golden IR expression fixture | [x] | [x] | [x] | [x] | Added `examples/expression-kernel-dogfood.whip/.ir` covering guards, assertions, projections, maps, arrays, optional presence, and deterministic routing. |
-| Static-analysis diagnostic matrix | [x] | [x] | [~] | [x] | Added tests for assertion validation, symmetric finite-domain literal checks, and unknown dotted roots. Remaining categories need broader per-row coverage. |
-| Companion-skill dogfood cleanup | [x] | [ ] | [~] | [ ] | Docs now define companion-skill dogfood expectations. Need deterministic routing workflows authored through the companion skill without LLM provider/model classification. |
+| Static-analysis diagnostic matrix | [x] | [x] | [x] | [x] | Parser tests now cover assertion validation, unknown roots/fields, non-boolean guards/assertions, incompatible equality, membership misuse, bad array literals, finite-domain typos/contradictions, quoted AgentRef misuse, expression function/query errors, bad effect payloads, terminal-output tags, dynamic `AgentRef` capability checks, and duration/time literal errors. |
+| Companion-skill dogfood cleanup | [x] | [x] | [x] | [x] | `examples/companion-skill-dogfood.whip/.ir` and CLI e2e coverage now dogfood `use skill "whippletree-author"`, typed `AgentRef` routing, tracker-path prompts, source assertions, and no LLM provider/model classification. |
 
 ### Completed Implementation Slices
 
 | Slice | Files | Result |
 | --- | --- | --- |
 | Parser/type-checker validation | `crates/whippletree-parser/src/lib.rs` | Assertion validation, symmetric finite-domain diagnostics, unknown dotted-root diagnostics, simple fact-query guard typing, and parser-only expression matrix tests landed. |
+| Full guard/assertion type-checking closure | `crates/whippletree-parser/src/lib.rs`, `examples/*dogfood.*`, `spec/expression-kernel-tracker.md` | Expression inference now preserves finite domains and AgentRefs, rejects non-boolean/incompatible/membership/array errors in guards and assertions, rejects quoted AgentRef record values, and diagnoses unsatisfiable finite-domain relations. |
 | Generated Maude validation | `crates/whippletree-cli/src/main.rs`, `models/maude/kernel.maude` | Guard-gated rule and assertion non-mutation searches now use generated expression terms for equality, boolean connectives, and query count/exists/empty while preserving dependency checks. |
 | Broadened generated Maude expressions | `crates/whippletree-cli/src/main.rs`, `models/maude/kernel.maude`, `models/maude/tests/expression-kernel.maude` | Generated model searches now include abstract Maude terms for ordering, membership, array/object/map collection witnesses, index misses, and query filters, with hand-written Maude tests for true/false/error behavior. |
 | Store diagnostics | `crates/whippletree-store/src/lib.rs`, `crates/whippletree-store/migrations/0001_runtime_store.sql` | Durable diagnostic record/list APIs, schema columns, idempotency indexes, and legacy upgrade coverage landed. |
@@ -74,6 +75,7 @@ as complete:
 | Tagged terminal checklist | `spec/expression-kernel-tracker.md` | Added implementation checklist for tagged terminal-output union branch matching. |
 | Case branch context safety | `crates/whippletree-cli/src/main.rs`, `crates/whippletree-cli/tests/control_plane.rs` | Failed guarded `Some` branches no longer leak payload bindings into later branches or fallbacks. |
 | Tagged terminal branch runtime | `crates/whippletree-parser/src/lib.rs`, `crates/whippletree-cli/src/main.rs`, `crates/whippletree-cli/tests/control_plane.rs` | Parser validates terminal-output tags inside `after ... completes`; runtime binds completed/failed terminal payload variants for deterministic case routing. |
+| Companion skill dogfood | `skills/whippletree-author/SKILL.md`, `spec/companion-skill.md`, `examples/companion-skill-dogfood.*`, `crates/whippletree-cli/tests/control_plane.rs` | Companion-skill workflow authored with one shared task schema, typed `AgentRef` reviewers, source assertions, and fixture-provider e2e coverage. |
 
 ## Current Implementation Summary
 
@@ -85,6 +87,9 @@ as complete:
   projections and exits nonzero on assertion failure.
 - [x] Provider-language dogfood asserts provider counts, agent-turn counts, and
   BAML coerce counts in source.
+- [x] Companion-skill dogfood asserts deterministic phase-review dispatch counts
+  in source without asking providers or BAML to identify route/provider/model
+  identity.
 - [~] Compiler validates known field paths in guards.
 - [~] Rule bodies support concrete `case expr { Pattern => { ... } }` branches
   for enum/literal values and optional `Some`/`None` branches in the dev
@@ -104,9 +109,9 @@ as complete:
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Guarded fact match `when X as x where expr` | [x] | [x] | [~] | [x] | [~] | [x] | Guards now use the shared expression parser/evaluator; static typing remains partial. |
 | Top-level `assert expr` | [x] | [x] | [~] | [x] | [~] | [x] | Assertions parse through the shared expression parser and run after `dev`; typed assertion scopes remain partial. |
-| Fact projection query `Class where expr` | [x] | [x] | [~] | [x] | [~] | [x] | Parsed as expression query nodes and evaluated in assertions; generated Maude models filtered-query cardinality abstractly. |
-| Effect projection query `effect kind K where expr` | [x] | [x] | [~] | [x] | [~] | [x] | Parsed as expression query nodes and evaluated in assertions; generated Maude models filtered-query cardinality abstractly. |
-| `count(collection)` | [x] | [x] | [~] | [x] | [~] | [x] | Implemented over fact/effect projection queries; generated Maude covers query/array/map/object cardinality witnesses. |
+| Fact projection query `Class where expr` | [x] | [x] | [~] | [x] | [~] | [x] | Parsed as expression query nodes and evaluated in assertions; generated Maude preserves filter true/false/error and 0/1/2/3/many cardinality buckets. Full concrete row-set filtering remains outside the current generated model. |
+| Effect projection query `effect kind K where expr` | [x] | [x] | [~] | [x] | [~] | [x] | Parsed as expression query nodes and evaluated in assertions; generated Maude preserves filter true/false/error and 0/1/2/3/many cardinality buckets. Full concrete row-set filtering remains outside the current generated model. |
+| `count(collection)` | [x] | [x] | [~] | [x] | [~] | [x] | Implemented over fact/effect projection queries; generated Maude now covers exact finite array/object literal cardinality plus query count thresholds through 0/1/2/3/many. |
 | `exists(collection)` | [x] | [x] | [~] | [x] | [~] | [x] | Implemented over projection queries; generated Maude covers query/array/map/object presence witnesses. |
 | `exists path` presence proof | [x] | [x] | [~] | [x] | [~] | [x] | Runtime checks non-missing/non-null; local parser proof tracking accepts `exists x` before optional field access. |
 | `empty(collection)` / `empty(expr)` | [x] | [x] | [~] | [x] | [~] | [x] | Implemented for projections, arrays, objects, strings, and null; generated Maude covers query/array/map/object emptiness witnesses. |
@@ -118,11 +123,11 @@ as complete:
 | Ordering `< <= > >=` | [x] | [x] | [~] | [x] | [~] | [x] | Runtime supports numeric/duration/time ordering; generated Maude has abstract order and count-order witnesses. |
 | Membership `in` / `not in` | [x] | [x] | [~] | [x] | [~] | [x] | Runtime supports array membership and map key membership; compiler rejects obvious non-array/non-map membership and incompatible item/key types. |
 | Parentheses and precedence | [x] | [x] | [~] | [x] | [ ] | [x] | Shared recursive-descent parser handles precedence. |
-| Array literals | [x] | [x] | [~] | [x] | [~] | [x] | Implemented for expression evaluation; generated Maude models empty/has/missing membership witnesses rather than exact element lists. |
-| Object literals in expected schema contexts | [x] | [~] | [~] | [~] | [~] | [x] | General expression AST object literals parse/evaluate; generated Maude models object empty/has/missing/index witnesses abstractly. |
-| Map index `path["key"]` | [x] | [x] | [~] | [x] | [~] | [x] | String-key map indexing works in guards/assertions; generated Maude models successful index reads and missing-key guard errors abstractly. |
+| Array literals | [x] | [x] | [~] | [x] | [x] | [x] | Implemented for expression evaluation; generated Maude now represents finite literal arrays with exact cardinality and membership. |
+| Object literals in expected schema contexts | [x] | [~] | [~] | [~] | [x] | [x] | General expression AST object literals parse/evaluate; generated Maude now represents finite literal objects with exact key cardinality, membership, and index reads. |
+| Map index `path["key"]` | [x] | [x] | [~] | [x] | [~] | [x] | String-key map indexing works in guards/assertions; generated Maude models literal object index reads exactly and keeps abstract witnesses for runtime map paths. |
 | Enum variant values | [x] | [~] | [~] | [~] | [~] | [~] | Enum schemas exist; expression values are currently strings at runtime. |
-| Literal-union values | [x] | [~] | [~] | [~] | [~] | [x] | Literal types exist; guards do not yet verify literal-domain membership. |
+| Literal-union values | [x] | [x] | [~] | [x] | [~] | [x] | Literal-union guards, assertions, query filters, membership arrays, and record values verify domain membership before runtime. |
 | Typed finite-domain pattern branches | [x] | [~] | [~] | [x] | [x] | [x] | Concrete rule-body `case` branches work for enum/literal values in `whip dev`; branch guards use the shared expression evaluator. |
 | Exhaustiveness checks for finite patterns | [x] | [~] | [~] | [ ] | [x] | [x] | Parser diagnostics cover enum/literal/optional rule-body cases without fallback; not yet expression-level or source-span precise. |
 | Optional Some/None pattern branches | [x] | [~] | [~] | [~] | [x] | [x] | Rule-body `Some name` binds a present runtime value; static presence proof is still local to case validation. |
@@ -154,28 +159,29 @@ as complete:
 
 ### 2. Type Checker
 
-- [~] Compute expression free bindings and verify each binding exists in the
+- [x] Compute expression free bindings and verify each binding exists in the
   current rule/assertion scope.
 - [~] Resolve every field/index path against class, array, map, optional, ref,
   and projection types.
-- [~] Track result type for every expression node.
-- [~] Reject non-boolean guard/assertion results.
-- [~] Reject unknown fields and map indexes with non-string keys.
+- [x] Track result type for every expression node in the shared guard/assertion
+  subset.
+- [x] Reject non-boolean guard/assertion results.
+- [x] Reject unknown fields and map indexes with non-string keys.
 - [x] Reject field access through optional values without an accepted presence
   proof.
 - [x] Implement presence proof tracking for:
   `x != null`, `null != x`, `exists x`, `!(x == null)`, and left-to-right
   `a && b`.
-- [~] Reject incompatible equality comparisons.
+- [x] Reject incompatible equality comparisons.
 - [x] Reject ordering on unsupported types and incompatible numeric/time types.
 - [x] Reject string ordering unless a later spec explicitly enables it.
-- [~] Reject enum variants outside their enum domain.
-- [~] Reject literal values outside literal unions.
-- [~] Reject membership against non-array and non-map operands.
-- [~] Reject array literals whose elements do not share a valid common type.
+- [x] Reject enum variants outside their enum domain.
+- [x] Reject literal values outside literal unions.
+- [x] Reject membership against non-array and non-map operands.
+- [x] Reject array literals whose elements do not share a valid common type.
 - [x] Reject object literals outside an expected schema context.
-- [ ] Reject plain strings where `AgentRef<...>` is required.
-- [~] Emit statically unsatisfiable finite-domain guard diagnostics when useful,
+- [x] Reject plain strings where `AgentRef<...>` is required.
+- [x] Emit statically unsatisfiable finite-domain guard diagnostics when useful,
   for example `task.provider == "gpt5"` against `"codex" | "claude" | "pi"`.
 
 ### 3. Runtime Evaluator
@@ -236,8 +242,8 @@ as complete:
 - [x] Reject unknown enum/literal variants in patterns.
 - [x] Emit exhaustiveness diagnostics for finite domains where the branch result
   must be total.
-- [~] Preserve source spans for branch alternatives in diagnostics.
-- [~] Lower matching pattern branches before effect graph commit in `whip dev`.
+- [x] Preserve source spans for branch alternatives in diagnostics.
+- [x] Lower matching pattern branches before effect graph commit in `whip dev`.
 - [x] Model finite-domain branch match/non-match in Maude.
 - [x] Model exhaustive finite-domain miss diagnostics in Maude.
 - [x] Model optional Some/None branch readiness and present binding in Maude.
@@ -258,7 +264,7 @@ Tagged terminal-output union branch matching implementation checklist:
   terminal-output union whose alternatives carry `{ tag, payloadType,
   sourceSpan }`, and represent each branch as `{ tag, binding, guardExpr,
   body, patternSpan }` rather than lowering tags to ad hoc string comparisons.
-- [~] CLI lowering behavior: lower tagged branches before effect graph commit
+- [x] CLI lowering behavior: lower tagged branches before effect graph commit
   in `whip dev`; evaluate the terminal tag match first, then the branch guard
   with the tag-refined payload binding, and commit only the selected branch's
   facts/effects.
@@ -268,21 +274,21 @@ Tagged terminal-output union branch matching implementation checklist:
   non-boolean branch guards, and non-exhaustive total matches without wildcard
   or default coverage. Typed payload field reads now reject mismatches such as
   reading failure-only fields from a `Completed` payload.
-- [~] Runtime branch selection: select exactly one branch for each terminal
+- [x] Runtime branch selection: select exactly one branch for each terminal
   output by tag plus guard; treat non-matching guards as branch misses; surface
-  multiple-match, no-match for required total cases, and guard evaluation errors
-  as structured diagnostics with the branch span.
+  multiple-match/no-match cases through static coverage checks, and guard
+  evaluation errors as structured dev-step diagnostics.
 - [~] Validation matrix: add parser/type-checker cases for accepted
   `Completed`/`Failed`/`TimedOut`/`Cancelled` branches, guarded branches, unknown tags,
   duplicate tags, wrong-scope patterns, invalid payload fields, and missing
   payload bindings.
 - [x] IR snapshots: add a golden fixture showing terminal-output union
   alternatives and branch-level source spans for `after ... completes`.
-- [ ] Runtime/e2e acceptance: add an e2e workflow where a completed turn records
+- [x] Runtime/e2e acceptance: add an e2e workflow where a completed turn records
   an artifact, a failed turn records provider failure, a blocked turn asks for
   human action, and an unmatched or erroring branch produces a deterministic
   diagnostic without committing sibling branch effects.
-- [ ] Maude acceptance: extend the existing finite-domain branch model with
+- [x] Maude acceptance: extend the existing finite-domain branch model with
   terminal tags so generated/search tests cover tag match, tag miss,
   guard-filtered miss, and exhaustiveness diagnostics.
 
@@ -309,30 +315,30 @@ Tagged terminal-output union branch matching implementation checklist:
 - [x] Maude tests for guard false/error, optional presence, enum/literal domain
   validity, finite-domain pattern branches, optional Some/None branches,
   dynamic agent target validity, and assertion non-mutation.
-- [ ] Companion-skill dogfood test that authors deterministic routing without
+- [x] Companion-skill dogfood test that authors deterministic routing without
   asking an LLM to identify provider/model identity.
 
 ### 8. Docs And Agent Guidance
 
-- [ ] Update [language.md](language.md) with concrete expression syntax once the
+- [x] Update [language.md](language.md) with concrete expression syntax once the
   AST parser lands.
-- [ ] Update [static-analysis.md](static-analysis.md) with the implemented
+- [x] Update [static-analysis.md](static-analysis.md) with the implemented
   finite-domain and presence-proof diagnostics.
 - [x] Update [type-system.md](type-system.md) with final `AgentRef` syntax and
   JSON/IR representation.
 - [x] Update [companion-skill.md](companion-skill.md) to recommend deterministic
   routing metadata, `AgentRef`, source assertions, and projection checks.
-- [ ] Update [e2e.md](e2e.md) with expression-kernel dogfood coverage.
-- [ ] Keep this tracker and [implementation-plan.md](implementation-plan.md)
+- [x] Update [e2e.md](e2e.md) with expression-kernel dogfood coverage.
+- [x] Keep this tracker and [implementation-plan.md](implementation-plan.md)
   synchronized as features land.
 
 ## Acceptance Gates
 
 - [x] A shared task schema can route work across Codex, Claude, and Pi using
   deterministic source metadata without duplicate provider-specific classes.
-- [~] Guards using enum/literal fields are type-checked and finite-domain typos
+- [x] Guards using enum/literal fields are type-checked and finite-domain typos
   are rejected or diagnosed before runtime.
-- [~] Boolean, ordering, membership, presence, count, empty, and exists
+- [x] Boolean, ordering, membership, presence, count, empty, and exists
   expressions work in both guards and assertions where semantically valid.
 - [~] Enum/literal, optional, and tagged-union pattern branches are typed,
   deterministic, and exhaustiveness-checked where the domain is finite.

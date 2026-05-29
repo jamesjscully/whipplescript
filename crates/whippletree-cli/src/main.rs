@@ -18,14 +18,15 @@ use whippletree_kernel::{
 };
 use whippletree_parser::{
     parse_duration_seconds, parse_expression, parse_time_epoch_seconds, BinaryOp,
-    DependencyPredicate as IrDependencyPredicate, Diagnostic, Expr, ExprLiteral, IrEffectNode,
-    IrPrimitiveType, IrProgram, IrRule, IrSchema, IrType, QueryKind, SourceSpan, UnaryOp,
+    DependencyPredicate as IrDependencyPredicate, Diagnostic, Expr, ExprLiteral, ExprObjectField,
+    IrEffectNode, IrPrimitiveType, IrProgram, IrRule, IrSchema, IrType, QueryKind, SourceSpan,
+    UnaryOp,
 };
 use whippletree_store::{
-    ClaimableEffect, DiagnosticRecord, DiagnosticView, EffectCompletion, EffectView, EventView,
-    EvidenceLinkView, EvidenceView, FactView, HumanAnswer, InboxItemView, InstanceView, NewEffect,
-    NewEffectDependency, NewFact, RetryEffect, RuleCommit, RunStart, RunView, SqliteStore,
-    StatusView, StoreError,
+    ClaimableEffect, DiagnosticRecord, DiagnosticView, EffectCancellation, EffectCompletion,
+    EffectView, EventView, EvidenceLinkView, EvidenceView, FactView, HumanAnswer, InboxItemView,
+    InstanceView, NewEffect, NewEffectDependency, NewFact, RetryEffect, RuleCommit, RunStart,
+    RunView, SqliteStore, StatusView, StoreError,
 };
 
 fn main() -> ExitCode {
@@ -607,6 +608,7 @@ struct StepReport {
     facts_created: usize,
     effects_created: usize,
     guard_reports: Vec<GuardReport>,
+    branch_reports: Vec<BranchReport>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -633,6 +635,33 @@ impl GuardStatus {
         match self {
             Self::Matched => "matched",
             Self::False => "false",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BranchReport {
+    scrutinee: String,
+    status: BranchStatus,
+    matched: bool,
+    tag: Option<String>,
+    actual: Value,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BranchStatus {
+    Matched,
+    NoMatch,
+    Error,
+}
+
+impl BranchStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Matched => "matched",
+            Self::NoMatch => "no_match",
             Self::Error => "error",
         }
     }
@@ -692,6 +721,9 @@ fn step_instance(
             report.guard_reports.extend(ready.guard_reports);
             for context in ready.contexts {
                 let lowering = lower_rule(ir, rule, &context, &facts, &effects, source_path);
+                report
+                    .branch_reports
+                    .extend(lowering.branch_reports.iter().cloned());
                 if lowering.facts.is_empty() && lowering.effects.is_empty() {
                     continue;
                 }
@@ -770,14 +802,14 @@ fn worker(options: &CliOptions) -> ExitCode {
 struct WorkerOptions {
     instance_id: String,
     provider: String,
-    fail: bool,
+    outcome: FixtureOutcome,
 }
 
 impl WorkerOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut instance_id = None;
         let mut provider = "fixture".to_owned();
-        let mut fail = false;
+        let mut outcome = FixtureOutcome::Completed;
         let mut index = 0;
         while index < args.len() {
             match args[index].as_str() {
@@ -788,7 +820,9 @@ impl WorkerOptions {
                     };
                     provider = value.clone();
                 }
-                "--fail" => fail = true,
+                "--fail" => outcome = FixtureOutcome::Failed,
+                "--timeout" => outcome = FixtureOutcome::TimedOut,
+                "--cancel" => outcome = FixtureOutcome::Cancelled,
                 "--once" => {}
                 other if other.starts_with('-') => {
                     return Err(format!("unknown worker option `{other}`"));
@@ -796,20 +830,38 @@ impl WorkerOptions {
                 value if instance_id.is_none() => instance_id = Some(value.to_owned()),
                 _ => {
                     return Err(
-                        "usage: whip worker <instance> [--provider fixture] [--once]".to_owned(),
+                        "usage: whip worker <instance> [--provider fixture] [--once] [--fail|--timeout|--cancel]".to_owned(),
                     )
                 }
             }
             index += 1;
         }
         let Some(instance_id) = instance_id else {
-            return Err("usage: whip worker <instance> [--provider fixture] [--once]".to_owned());
+            return Err(
+                "usage: whip worker <instance> [--provider fixture] [--once] [--fail|--timeout|--cancel]"
+                    .to_owned(),
+            );
         };
         Ok(Self {
             instance_id,
             provider,
-            fail,
+            outcome,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FixtureOutcome {
+    #[default]
+    Completed,
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+impl FixtureOutcome {
+    fn is_failed(self) -> bool {
+        self == Self::Failed
     }
 }
 
@@ -857,7 +909,7 @@ fn run_agent_effect(
     let mut kernel = RuntimeKernel::new(store);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "lease"]);
-    let harness = fixture_harness(options.fail);
+    let harness = fixture_harness(options.outcome.is_failed());
     kernel.run_agent_turn(
         AgentTurnExecution {
             instance_id,
@@ -908,10 +960,14 @@ fn run_baml_effect(
         output_schema_hash: "fixture".to_owned(),
     };
     let value = fixture_baml_value(&output_type);
-    let client = if options.fail {
-        FakeBamlClient::fails("fixture coerce failure")
-    } else {
-        FakeBamlClient::succeeds(value)
+    if options.outcome == FixtureOutcome::Cancelled {
+        return cancel_baml_effect(store_path, instance_id, effect, &input, options);
+    }
+    let client = match options.outcome {
+        FixtureOutcome::Completed => FakeBamlClient::succeeds(value),
+        FixtureOutcome::Failed => FakeBamlClient::fails("fixture coerce failure"),
+        FixtureOutcome::TimedOut => FakeBamlClient::times_out("fixture coerce timeout"),
+        FixtureOutcome::Cancelled => unreachable!("cancelled handled above"),
     };
     let store = SqliteStore::open(store_path)?;
     let mut kernel = RuntimeKernel::new(store);
@@ -930,6 +986,65 @@ fn run_baml_effect(
         },
         &client,
     )
+}
+
+fn cancel_baml_effect(
+    store_path: &Path,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    input: &Value,
+    options: &WorkerOptions,
+) -> Result<whippletree_store::StoredEvent, StoreError> {
+    let store = SqliteStore::open(store_path)?;
+    let mut kernel = RuntimeKernel::new(store);
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "baml-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "baml-lease"]);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: &options.provider,
+        worker_id: "whip-worker",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: "{}",
+    })?;
+    let terminal = kernel.cancel_effect(EffectCancellation {
+        instance_id,
+        effect_id: &effect.effect_id,
+        reason: Some("fixture coerce cancelled"),
+        idempotency_key: Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "baml-cancelled",
+        ])),
+    })?;
+    let value_json = json!({
+        "effect_id": effect.effect_id,
+        "run_id": run_id,
+        "function_name": input.get("function_name").cloned().unwrap_or(Value::Null),
+        "status": "cancelled",
+        "value": null,
+        "error": {
+            "reason": "fixture coerce cancelled",
+            "recoverable": true
+        },
+        "summary": "fixture coerce cancelled"
+    })
+    .to_string();
+    kernel.derive_fact(
+        instance_id,
+        "baml.coerce.cancelled",
+        &effect.effect_id,
+        &value_json,
+        Some(&terminal.event_id),
+        Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "baml.coerce.cancelled",
+        ])),
+    )?;
+    Ok(terminal)
 }
 
 fn run_loft_effect(
@@ -965,7 +1080,7 @@ fn run_loft_effect(
         expect_heads: Vec::new(),
         metadata_json: effect.input_json.clone(),
     };
-    let client = if options.fail {
+    let client = if options.outcome.is_failed() {
         FakeLoftClient::fails("fixture loft failure")
     } else {
         FakeLoftClient::succeeds(
@@ -1156,7 +1271,7 @@ fn run_capability_effect(
         .to_string(),
     })?;
 
-    let terminal = if options.fail {
+    let terminal = if options.outcome.is_failed() {
         let metadata_json = json!({
             "failure": {
                 "phase": "provider.capability.failed",
@@ -1347,7 +1462,7 @@ fn dev(options: &CliOptions) -> ExitCode {
             &WorkerOptions {
                 instance_id: started.instance_id.clone(),
                 provider: dev_options.provider.clone(),
-                fail: dev_options.fail,
+                outcome: dev_options.outcome,
             },
         ) {
             Ok(report) => report,
@@ -1396,6 +1511,11 @@ fn dev(options: &CliOptions) -> ExitCode {
         .flat_map(|step| &step.guard_reports)
         .filter(|guard| guard.status == GuardStatus::Error)
         .collect::<Vec<_>>();
+    let branch_errors = steps
+        .iter()
+        .flat_map(|step| &step.branch_reports)
+        .filter(|branch| branch.status != BranchStatus::Matched)
+        .collect::<Vec<_>>();
     if options.json {
         let _ = emit_json(json!({
             "instance_id": started.instance_id,
@@ -1404,7 +1524,7 @@ fn dev(options: &CliOptions) -> ExitCode {
             "workers": workers.iter().map(worker_report_to_json).collect::<Vec<_>>(),
             "assertions": assertions.iter().map(assertion_report_to_json).collect::<Vec<_>>(),
         }));
-        if failed_assertions.is_empty() && guard_errors.is_empty() {
+        if failed_assertions.is_empty() && guard_errors.is_empty() && branch_errors.is_empty() {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(1)
@@ -1416,6 +1536,20 @@ fn dev(options: &CliOptions) -> ExitCode {
                 guard.rule,
                 guard.expr,
                 guard
+                    .error
+                    .as_deref()
+                    .map(|error| format!(" ({error})"))
+                    .unwrap_or_default()
+            );
+        }
+        ExitCode::from(1)
+    } else if !branch_errors.is_empty() {
+        for branch in branch_errors {
+            eprintln!(
+                "case branch {} in rule body for {}{}",
+                branch.status.as_str(),
+                branch.scrutinee,
+                branch
                     .error
                     .as_deref()
                     .map(|error| format!(" ({error})"))
@@ -1452,7 +1586,7 @@ fn dev(options: &CliOptions) -> ExitCode {
 struct DevOptions {
     program_path: String,
     provider: String,
-    fail: bool,
+    outcome: FixtureOutcome,
     max_iterations: usize,
 }
 
@@ -1460,7 +1594,7 @@ impl DevOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut program_path = None;
         let mut provider = "fixture".to_owned();
-        let mut fail = false;
+        let mut outcome = FixtureOutcome::Completed;
         let mut max_iterations = 8usize;
         let mut index = 0;
         while index < args.len() {
@@ -1472,7 +1606,9 @@ impl DevOptions {
                     };
                     provider = value.clone();
                 }
-                "--fail" => fail = true,
+                "--fail" => outcome = FixtureOutcome::Failed,
+                "--timeout" => outcome = FixtureOutcome::TimedOut,
+                "--cancel" => outcome = FixtureOutcome::Cancelled,
                 "--max-iterations" => {
                     index += 1;
                     let Some(value) = args.get(index) else {
@@ -1497,7 +1633,7 @@ impl DevOptions {
                 value if program_path.is_none() => program_path = Some(value.to_owned()),
                 _ => {
                     return Err(
-                        "usage: whip dev <workflow.whip> [--provider fixture] [--until idle]"
+                        "usage: whip dev <workflow.whip> [--provider fixture] [--until idle] [--fail|--timeout|--cancel]"
                             .to_owned(),
                     )
                 }
@@ -1506,13 +1642,14 @@ impl DevOptions {
         }
         let Some(program_path) = program_path else {
             return Err(
-                "usage: whip dev <workflow.whip> [--provider fixture] [--until idle]".to_owned(),
+                "usage: whip dev <workflow.whip> [--provider fixture] [--until idle] [--fail|--timeout|--cancel]"
+                    .to_owned(),
             );
         };
         Ok(Self {
             program_path,
             provider,
-            fail,
+            outcome,
             max_iterations,
         })
     }
@@ -1530,6 +1667,7 @@ struct OwnedLowering {
     facts: Vec<OwnedFact>,
     effects: Vec<OwnedEffect>,
     dependencies: Vec<OwnedDependency>,
+    branch_reports: Vec<BranchReport>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1722,15 +1860,22 @@ fn eval_guard(
     }
 }
 
-fn eval_guard_source(guard: &str, context: &RuleContext) -> bool {
-    parse_expression(guard).ok().is_some_and(|expr| {
-        let empty_ir = empty_ir_program();
-        guard_result(eval_expr_value(
-            &expr,
-            &EvalScope::rule(context, &[], &[], &empty_ir),
-        ))
-        .0 == GuardStatus::Matched
-    })
+fn eval_guard_source_result(
+    guard: &str,
+    context: &RuleContext,
+) -> (GuardStatus, Value, Option<String>) {
+    let Ok(expr) = parse_expression(guard) else {
+        return (
+            GuardStatus::Error,
+            json!({"internal": "ParseError"}),
+            Some("case guard could not be parsed".to_owned()),
+        );
+    };
+    let empty_ir = empty_ir_program();
+    guard_result(eval_expr_value(
+        &expr,
+        &EvalScope::rule(context, &[], &[], &empty_ir),
+    ))
 }
 
 fn guard_result(value: EvalValue) -> (GuardStatus, Value, Option<String>) {
@@ -2430,7 +2575,7 @@ fn lower_rule(
     effects: &[EffectView],
     source_path: Option<&Path>,
 ) -> OwnedLowering {
-    let (body, context) = selected_rule_body(&rule.body, context);
+    let (body, context, branch_reports) = selected_rule_body(&rule.body, context);
     let existing_fact_ids = facts
         .iter()
         .map(|fact| fact.fact_id.as_str())
@@ -2440,6 +2585,8 @@ fn lower_rule(
         .map(|effect| effect.effect_id.as_str())
         .collect::<Vec<_>>();
     let mut lowering = OwnedLowering::default();
+    lowering.branch_reports.extend(branch_reports);
+    let pre_terminal_body = strip_after_blocks(&body);
 
     for block in top_level_record_blocks(&body) {
         let value = parse_record_fields(&block.body, &context);
@@ -2463,7 +2610,7 @@ fn lower_rule(
         });
     }
 
-    let parsed_effects = parse_effect_statements(&body, &context);
+    let parsed_effects = parse_effect_statements(&pre_terminal_body, &context);
     let mut node_to_effect_id = std::collections::BTreeMap::new();
     let mut binding_to_effect_id = std::collections::BTreeMap::new();
     for (index, parsed) in parsed_effects.iter().enumerate() {
@@ -2569,7 +2716,9 @@ fn lower_rule(
                 push_effect_binding(&mut after_context, binding, effect_id, value);
             }
         }
-        let (selected_after_body, after_context) = selected_rule_body(&after.body, &after_context);
+        let (selected_after_body, after_context, branch_reports) =
+            selected_rule_body(&after.body, &after_context);
+        lowering.branch_reports.extend(branch_reports);
         for record in top_level_record_blocks(&selected_after_body) {
             let value = parse_record_fields(&record.body, &after_context);
             let value_json = Value::Object(value).to_string();
@@ -2597,6 +2746,85 @@ fn lower_rule(
                 schema_id: Some(record.schema),
                 provenance_class: "rule".to_owned(),
                 correlation_id: context.identity.clone(),
+            });
+        }
+        let mut selected_effects = parse_effect_statements(&selected_after_body, &after_context);
+        for effect in &mut selected_effects {
+            effect.after.get_or_insert_with(|| AfterScope {
+                binding: after.binding.clone(),
+                predicate: after.predicate.clone(),
+            });
+        }
+        let mut selected_binding_to_effect_id = binding_to_effect_id.clone();
+        let mut selected_node_to_effect_id = std::collections::BTreeMap::new();
+        for (index, parsed) in selected_effects.iter().enumerate() {
+            let effect_node = effect_node_for_parsed(rule, parsed, index);
+            let node_id = effect_node
+                .map(|effect| effect.id.as_str())
+                .unwrap_or(parsed.kind.as_str());
+            let effect_id = idempotency_key(&[
+                &rule.name,
+                &after.binding,
+                &after.predicate,
+                node_id,
+                after_context.identity.as_deref().unwrap_or("started"),
+            ]);
+            selected_node_to_effect_id.insert(node_id.to_owned(), effect_id.clone());
+            if let Some(binding) = effect_node
+                .and_then(|effect| effect.binding.as_ref())
+                .or(parsed.binding.as_ref())
+            {
+                selected_binding_to_effect_id.insert(binding.clone(), effect_id);
+            }
+        }
+        for (binding, effect_id) in &selected_binding_to_effect_id {
+            binding_to_effect_id
+                .entry(binding.clone())
+                .or_insert_with(|| effect_id.clone());
+        }
+        for (index, parsed) in selected_effects.iter().enumerate() {
+            let effect_node = effect_node_for_parsed(rule, parsed, index);
+            let node_id = effect_node
+                .map(|effect| effect.id.as_str())
+                .unwrap_or(parsed.kind.as_str());
+            let Some(effect_id) = selected_node_to_effect_id.get(node_id).cloned() else {
+                continue;
+            };
+            if existing_effect_ids
+                .iter()
+                .any(|existing| *existing == effect_id)
+                || lowering
+                    .effects
+                    .iter()
+                    .any(|existing| existing.effect_id == effect_id)
+            {
+                continue;
+            }
+            let input_json = parsed_effect_input_json(
+                ir,
+                rule,
+                parsed,
+                &after_context,
+                &selected_binding_to_effect_id,
+            );
+            let profile = parsed
+                .target
+                .as_deref()
+                .and_then(|target| ir.agents.iter().find(|agent| agent.name == target))
+                .and_then(|agent| agent.profile.clone());
+            let effect_idempotency_key = idempotency_key(&[&effect_id, "effect"]);
+            lowering.effects.push(OwnedEffect {
+                effect_id,
+                kind: parsed.kind.clone(),
+                target: parsed.target.clone(),
+                input_json,
+                status: "queued".to_owned(),
+                idempotency_key: effect_idempotency_key,
+                required_capabilities_json: parsed.required_capabilities_json(),
+                profile,
+                correlation_id: after_context.identity.clone(),
+                source_span_json: effect_node
+                    .map(|effect| source_span_json(source_path, effect.span, "effect")),
             });
         }
     }
@@ -2637,10 +2865,14 @@ fn push_effect_binding(context: &mut RuleContext, binding: &str, effect_id: &str
     ));
 }
 
-fn selected_rule_body(body: &str, context: &RuleContext) -> (String, RuleContext) {
+fn selected_rule_body(
+    body: &str,
+    context: &RuleContext,
+) -> (String, RuleContext, Vec<BranchReport>) {
     let lines = body.lines().collect::<Vec<_>>();
     let mut selected = Vec::new();
     let mut context = context.clone();
+    let mut branch_reports = Vec::new();
     let mut index = 0usize;
     while index < lines.len() {
         let trimmed = lines[index].trim();
@@ -2666,15 +2898,41 @@ fn selected_rule_body(body: &str, context: &RuleContext) -> (String, RuleContext
             index += 1;
             continue;
         };
-        if let Some(branch) = select_case_branch(&case, &mut context) {
-            let (branch_body, branch_context) =
+        let selection = select_case_branch(&case, &mut context);
+        if let Some(report) = selection.report {
+            branch_reports.push(report);
+        }
+        if let Some(branch) = selection.branch {
+            let (branch_body, branch_context, nested_reports) =
                 selected_rule_body(&branch.body.join("\n"), &context);
             context = branch_context;
+            branch_reports.extend(nested_reports);
             selected.extend(branch_body.lines().map(str::to_owned));
         }
         index = next_index;
     }
-    (selected.join("\n"), context)
+    (selected.join("\n"), context, branch_reports)
+}
+
+fn strip_after_blocks(body: &str) -> String {
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut selected = Vec::new();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        if trimmed.starts_with("after ") {
+            let mut depth = brace_delta(trimmed).max(1);
+            index += 1;
+            while index < lines.len() && depth > 0 {
+                depth += brace_delta(lines[index]);
+                index += 1;
+            }
+            continue;
+        }
+        selected.push(lines[index].to_owned());
+        index += 1;
+    }
+    selected.join("\n")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2688,6 +2946,12 @@ struct CaseBranch {
     pattern: String,
     guard: Option<String>,
     body: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CaseSelection {
+    branch: Option<CaseBranch>,
+    report: Option<BranchReport>,
 }
 
 fn parse_case_block(lines: &[&str], start: usize) -> Option<(CaseBlock, usize)> {
@@ -2749,7 +3013,7 @@ fn case_branch_header(line: &str) -> Option<(String, Option<String>, &str)> {
     Some((pattern.to_owned(), guard, body_start))
 }
 
-fn select_case_branch(case: &CaseBlock, context: &mut RuleContext) -> Option<CaseBranch> {
+fn select_case_branch(case: &CaseBlock, context: &mut RuleContext) -> CaseSelection {
     let value = parse_field_value(&case.scrutinee, context);
     let mut fallback = None;
     for branch in &case.branches {
@@ -2758,17 +3022,68 @@ fn select_case_branch(case: &CaseBlock, context: &mut RuleContext) -> Option<Cas
             continue;
         }
         let mut candidate_context = context.clone();
-        if case_pattern_matches(&branch.pattern, &value, &mut candidate_context)
-            && branch
-                .guard
-                .as_deref()
-                .is_none_or(|guard| eval_guard_source(guard, &candidate_context))
+        if !case_pattern_matches(&branch.pattern, &value, &mut candidate_context) {
+            continue;
+        }
+        if let Some(guard) = branch.guard.as_deref() {
+            let (status, actual, error) = eval_guard_source_result(guard, &candidate_context);
+            match status {
+                GuardStatus::Matched => {}
+                GuardStatus::False => continue,
+                GuardStatus::Error => {
+                    return CaseSelection {
+                        branch: None,
+                        report: Some(BranchReport {
+                            scrutinee: case.scrutinee.clone(),
+                            status: BranchStatus::Error,
+                            matched: false,
+                            tag: terminal_case_tag(&value).map(str::to_owned),
+                            actual,
+                            error,
+                        }),
+                    };
+                }
+            }
+        }
         {
             *context = candidate_context;
-            return Some(branch.clone());
+            return CaseSelection {
+                branch: Some(branch.clone()),
+                report: Some(BranchReport {
+                    scrutinee: case.scrutinee.clone(),
+                    status: BranchStatus::Matched,
+                    matched: true,
+                    tag: terminal_case_tag(&value).map(str::to_owned),
+                    actual: value.clone(),
+                    error: None,
+                }),
+            };
         }
     }
-    fallback
+    if let Some(branch) = fallback {
+        return CaseSelection {
+            branch: Some(branch),
+            report: Some(BranchReport {
+                scrutinee: case.scrutinee.clone(),
+                status: BranchStatus::Matched,
+                matched: true,
+                tag: terminal_case_tag(&value).map(str::to_owned),
+                actual: value,
+                error: None,
+            }),
+        };
+    }
+    CaseSelection {
+        branch: None,
+        report: terminal_case_tag(&value).map(|tag| BranchReport {
+            scrutinee: case.scrutinee.clone(),
+            status: BranchStatus::NoMatch,
+            matched: false,
+            tag: Some(tag.to_owned()),
+            actual: value.clone(),
+            error: Some("terminal-output case matched no branch".to_owned()),
+        }),
+    }
 }
 
 fn case_pattern_matches(pattern: &str, value: &Value, context: &mut RuleContext) -> bool {
@@ -2846,11 +3161,25 @@ fn terminal_payload_for_tag(value: &Value, tag: &str) -> Value {
             .cloned()
             .or_else(|| value.get("output").cloned())
             .unwrap_or(Value::Null),
-        "Failed" | "TimedOut" | "Cancelled" => value
-            .get("error")
-            .cloned()
-            .or_else(|| value.get("failure").cloned())
-            .unwrap_or_else(|| value.clone()),
+        "Failed" | "TimedOut" | "Cancelled" => {
+            let mut payload = value
+                .get("error")
+                .cloned()
+                .or_else(|| value.get("failure").cloned())
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            for field in ["summary", "effect_id", "run_id"] {
+                if let Some(field_value) = value.get(field) {
+                    payload.insert(field.to_owned(), field_value.clone());
+                }
+            }
+            if !payload.contains_key("reason") {
+                if let Some(summary) = value.get("summary") {
+                    payload.insert("reason".to_owned(), summary.clone());
+                }
+            }
+            Value::Object(payload)
+        }
         _ => value.clone(),
     }
 }
@@ -3342,10 +3671,11 @@ fn after_blocks(body: &str) -> Vec<AfterBlock> {
         index += 1;
         while index < lines.len() && depth > 0 {
             let line = lines[index];
-            depth += brace_delta(line);
-            if depth >= 1 && line.trim() != "}" {
+            let next_depth = depth + brace_delta(line);
+            if next_depth >= 1 {
                 inner.push(line.to_owned());
             }
+            depth = next_depth;
             index += 1;
         }
         blocks.push(AfterBlock {
@@ -3592,6 +3922,18 @@ fn step_report_to_json(report: &StepReport) -> Value {
         "facts_created": report.facts_created,
         "effects_created": report.effects_created,
         "guards": report.guard_reports.iter().map(guard_report_to_json).collect::<Vec<_>>(),
+        "branches": report.branch_reports.iter().map(branch_report_to_json).collect::<Vec<_>>(),
+    })
+}
+
+fn branch_report_to_json(report: &BranchReport) -> Value {
+    json!({
+        "scrutinee": report.scrutinee,
+        "status": report.status.as_str(),
+        "matched": report.matched,
+        "tag": report.tag,
+        "actual": report.actual,
+        "error": report.error,
     })
 }
 
@@ -4783,6 +5125,15 @@ fn generate_maude_model_search(
                 .entry(graph_key.clone())
                 .or_insert_with(|| maude_symbol("graph", &graph_key));
         }
+        for branch in &rule.metadata.terminal_branches {
+            let graph_key = terminal_branch_graph_key(&rule.name, branch);
+            graph_symbols
+                .entry(graph_key.clone())
+                .or_insert_with(|| maude_symbol("graph", &graph_key));
+            if let Some(guard) = &branch.guard {
+                let _ = maude_bool_cases(&guard.expr, &mut expr_context);
+            }
+        }
         for effect in &rule.metadata.effects {
             let key = effect_key(&rule.name, &effect.id);
             effect_symbols
@@ -4967,6 +5318,120 @@ fn generate_maude_model_search(
                     downstream: dependency.downstream.clone(),
                 });
             }
+        }
+        for branch in &rule.metadata.terminal_branches {
+            let Some(tag) = branch.tag.as_deref() else {
+                continue;
+            };
+            let Some(rule_symbol) = rule_symbols.get(&rule.name) else {
+                continue;
+            };
+            let Some(first_when) = rule.whens.first() else {
+                continue;
+            };
+            let first_fact_key = rule_fact_key(&rule.name, 0, &first_when.pattern);
+            let Some(fact_symbol) = fact_symbols.get(&first_fact_key) else {
+                continue;
+            };
+            let graph_key = terminal_branch_graph_key(&rule.name, branch);
+            let Some(graph_symbol) = graph_symbols.get(&graph_key) else {
+                continue;
+            };
+            let tag_symbol = maude_terminal_tag(tag);
+            let miss_tag_symbol = maude_terminal_miss_tag(tag);
+            let guard_cases = branch
+                .guard
+                .as_ref()
+                .map(|guard| maude_bool_cases(&guard.expr, &mut expr_context));
+            let matching_gate = if let Some(cases) = &guard_cases {
+                format!(
+                    "terminalBranchGuard({rule_symbol}, {fact_symbol}, {tag_symbol}, {tag_symbol}, {}, {graph_symbol})",
+                    cases.true_expr
+                )
+            } else {
+                format!(
+                    "terminalBranch({rule_symbol}, {fact_symbol}, {tag_symbol}, {tag_symbol}, {graph_symbol})"
+                )
+            };
+            output.push_str(&format!(
+                "--- {}: terminal branch `{tag}` commits only for matching terminal tag.\n",
+                rule.name
+            ));
+            output.push_str(&format!(
+                "search [1] in WHIPPLETREE-GENERATED-CHECK :\n  fact({fact_symbol}) rule({rule_symbol}, {fact_symbol}, {graph_symbol}) {matching_gate} graph({graph_symbol}, tellEff)\n  =>*\n  fact({fact_symbol}) rule({rule_symbol}, {fact_symbol}, {graph_symbol}) ruleFired({rule_symbol}, {fact_symbol}, {graph_symbol}) event(ruleCommitEvt) graphCommitted({graph_symbol}) effect(tellEff, queued) .\n\n"
+            ));
+            expected.push(ExpectedSearch {
+                outcome: ExpectedSearchResult::Solution,
+                span: branch.pattern_span,
+                description: format!(
+                    "{} terminal {tag} branch commits on matching tag",
+                    rule.name
+                ),
+                upstream: rule.name.clone(),
+                predicate: "terminal-branch-match",
+                downstream: "ruleCommitEvt".to_owned(),
+            });
+
+            let miss_gate = if let Some(cases) = &guard_cases {
+                format!(
+                    "terminalBranchGuard({rule_symbol}, {fact_symbol}, {miss_tag_symbol}, {tag_symbol}, {}, {graph_symbol})",
+                    cases.true_expr
+                )
+            } else {
+                format!(
+                    "terminalBranch({rule_symbol}, {fact_symbol}, {miss_tag_symbol}, {tag_symbol}, {graph_symbol})"
+                )
+            };
+            output.push_str(&format!(
+                "--- {}: terminal branch `{tag}` cannot commit for another terminal tag.\n",
+                rule.name
+            ));
+            output.push_str(&format!(
+                "search [1] in WHIPPLETREE-GENERATED-CHECK :\n  fact({fact_symbol}) rule({rule_symbol}, {fact_symbol}, {graph_symbol}) {miss_gate} graph({graph_symbol}, tellEff)\n  =>*\n  event(ruleCommitEvt) .\n\n"
+            ));
+            expected.push(ExpectedSearch {
+                outcome: ExpectedSearchResult::NoSolution,
+                span: branch.pattern_span,
+                description: format!("{} terminal {tag} branch misses on other tag", rule.name),
+                upstream: rule.name.clone(),
+                predicate: "terminal-branch-miss",
+                downstream: "ruleCommitEvt".to_owned(),
+            });
+
+            if let Some(cases) = &guard_cases {
+                output.push_str(&format!(
+                    "--- {}: terminal branch `{tag}` cannot commit when its branch guard is false.\n",
+                    rule.name
+                ));
+                output.push_str(&format!(
+                    "search [1] in WHIPPLETREE-GENERATED-CHECK :\n  fact({fact_symbol}) rule({rule_symbol}, {fact_symbol}, {graph_symbol}) terminalBranchGuard({rule_symbol}, {fact_symbol}, {tag_symbol}, {tag_symbol}, {}, {graph_symbol}) graph({graph_symbol}, tellEff)\n  =>*\n  event(ruleCommitEvt) .\n\n",
+                    cases.false_expr
+                ));
+                expected.push(ExpectedSearch {
+                    outcome: ExpectedSearchResult::NoSolution,
+                    span: branch.pattern_span,
+                    description: format!("{} terminal {tag} false guard cannot commit", rule.name),
+                    upstream: rule.name.clone(),
+                    predicate: "terminal-branch-guard-false",
+                    downstream: "ruleCommitEvt".to_owned(),
+                });
+            }
+
+            output.push_str(&format!(
+                "--- {}: exhaustive terminal branch miss emits a diagnostic.\n",
+                rule.name
+            ));
+            output.push_str(&format!(
+                "search [1] in WHIPPLETREE-GENERATED-CHECK :\n  fact({fact_symbol}) exhaustiveTerminal({rule_symbol}, {fact_symbol}, {miss_tag_symbol}, {tag_symbol})\n  =>*\n  fact({fact_symbol}) diagnostic({rule_symbol}) .\n\n"
+            ));
+            expected.push(ExpectedSearch {
+                outcome: ExpectedSearchResult::Solution,
+                span: branch.pattern_span,
+                description: format!("{} terminal {tag} exhaustive miss diagnoses", rule.name),
+                upstream: rule.name.clone(),
+                predicate: "terminal-exhaustive-miss",
+                downstream: "diagnostic".to_owned(),
+            });
         }
     }
 
@@ -5291,10 +5756,12 @@ fn maude_count_literal(number: &str) -> Option<String> {
     match number {
         "0" => Some("countZero".to_owned()),
         "1" => Some("countOne".to_owned()),
+        "2" => Some("countTwo".to_owned()),
+        "3" => Some("countThree".to_owned()),
         _ => number
             .parse::<i64>()
             .ok()
-            .filter(|value| *value > 1)
+            .filter(|value| *value > 3)
             .map(|_| "countMany".to_owned()),
     }
 }
@@ -5303,6 +5770,8 @@ fn maude_query_cardinality_for_count(number: &str) -> &'static str {
     match number {
         "0" => "qZero",
         "1" => "qOne",
+        "2" => "qTwo",
+        "3" => "qThree",
         _ => "qMany",
     }
 }
@@ -5332,20 +5801,8 @@ fn maude_scalar_expr(expr: &Expr, context: &mut MaudeExprContext) -> String {
 
 fn maude_value_expr(expr: &Expr, context: &mut MaudeExprContext) -> String {
     match expr {
-        Expr::Array(items) => items
-            .first()
-            .map(|item| format!("arrayHas({})", maude_scalar_expr(item, context)))
-            .unwrap_or_else(|| "arrayEmpty".to_owned()),
-        Expr::Object(fields) => fields
-            .first()
-            .map(|field| {
-                format!(
-                    "objectHas({}, {})",
-                    maude_field_key_expr(&field.key, context),
-                    maude_scalar_expr(&field.value, context)
-                )
-            })
-            .unwrap_or_else(|| "objectEmpty".to_owned()),
+        Expr::Array(items) => maude_array_literal_expr(items, context),
+        Expr::Object(fields) => maude_object_literal_expr(fields, context),
         Expr::Index { target, key } => {
             let key = maude_scalar_expr(key, context);
             let target = maude_index_target_expr(target, &key, expr, context);
@@ -5354,6 +5811,43 @@ fn maude_value_expr(expr: &Expr, context: &mut MaudeExprContext) -> String {
         Expr::Query { .. } => maude_collection_expr(expr, "qOne", context),
         _ => maude_scalar_expr(expr, context),
     }
+}
+
+fn maude_array_literal_expr(items: &[Expr], context: &mut MaudeExprContext) -> String {
+    if items.is_empty() {
+        return "arrayEmpty".to_owned();
+    }
+    format!("arrayOf({})", maude_expr_list(items, context))
+}
+
+fn maude_object_literal_expr(fields: &[ExprObjectField], context: &mut MaudeExprContext) -> String {
+    if fields.is_empty() {
+        return "objectEmpty".to_owned();
+    }
+    format!("objectOf({})", maude_entry_list(fields, context))
+}
+
+fn maude_expr_list(items: &[Expr], context: &mut MaudeExprContext) -> String {
+    let Some((first, rest)) = items.split_first() else {
+        return "exprNil".to_owned();
+    };
+    format!(
+        "exprCons({}, {})",
+        maude_scalar_expr(first, context),
+        maude_expr_list(rest, context)
+    )
+}
+
+fn maude_entry_list(fields: &[ExprObjectField], context: &mut MaudeExprContext) -> String {
+    let Some((first, rest)) = fields.split_first() else {
+        return "entryNil".to_owned();
+    };
+    format!(
+        "entryCons(entry({}, {}), {})",
+        maude_field_key_expr(&first.key, context),
+        maude_scalar_expr(&first.value, context),
+        maude_entry_list(rest, context)
+    )
 }
 
 fn maude_collection_expr(
@@ -5375,22 +5869,12 @@ fn maude_collection_expr(
             }
         }
         Expr::Array(items) => {
-            if cardinality == "qZero" || items.is_empty() {
-                "arrayEmpty".to_owned()
-            } else {
-                format!("arrayHas({})", maude_scalar_expr(&items[0], context))
-            }
+            let _ = cardinality;
+            maude_array_literal_expr(items, context)
         }
         Expr::Object(fields) => {
-            if cardinality == "qZero" || fields.is_empty() {
-                "objectEmpty".to_owned()
-            } else {
-                format!(
-                    "objectHas({}, {})",
-                    maude_field_key_expr(&fields[0].key, context),
-                    maude_scalar_expr(&fields[0].value, context)
-                )
-            }
+            let _ = cardinality;
+            maude_object_literal_expr(fields, context)
         }
         Expr::Index { .. } => maude_value_expr(expr, context),
         _ => format!(
@@ -5451,16 +5935,10 @@ fn maude_index_target_expr(
     context: &mut MaudeExprContext,
 ) -> String {
     match target {
-        Expr::Object(fields) => fields
-            .first()
-            .map(|field| {
-                format!(
-                    "objectHas({}, {})",
-                    maude_field_key_expr(&field.key, context),
-                    maude_scalar_expr(&field.value, context)
-                )
-            })
-            .unwrap_or_else(|| format!("objectMissing({key_expr})")),
+        Expr::Object(fields) => {
+            let _ = key_expr;
+            maude_object_literal_expr(fields, context)
+        }
         Expr::Index { .. } => maude_value_expr(target, context),
         _ => format!(
             "mapHas({key_expr}, scalar({}))",
@@ -5559,6 +6037,14 @@ fn rule_graph_key(rule_name: &str, when_index: usize) -> String {
     format!("{rule_name}:when{when_index}:graph")
 }
 
+fn terminal_branch_graph_key(
+    rule_name: &str,
+    branch: &whippletree_parser::IrTerminalCaseBranch,
+) -> String {
+    let tag = branch.tag.as_deref().unwrap_or("_");
+    format!("{rule_name}:terminal:{tag}:{}", branch.body_hash)
+}
+
 fn assertion_key(index: usize, assertion: &whippletree_parser::IrAssertion) -> String {
     format!("{index}:{}", assertion.expr.source)
 }
@@ -5572,6 +6058,26 @@ fn maude_predicate(predicate: &whippletree_parser::DependencyPredicate) -> &'sta
         whippletree_parser::DependencyPredicate::Succeeds => "succeeds",
         whippletree_parser::DependencyPredicate::Fails => "fails",
         whippletree_parser::DependencyPredicate::Completes => "completes",
+    }
+}
+
+fn maude_terminal_tag(tag: &str) -> &'static str {
+    match tag {
+        "Completed" => "terminalCompleted",
+        "Failed" => "terminalFailed",
+        "TimedOut" => "terminalTimedOut",
+        "Cancelled" => "terminalCancelled",
+        _ => "terminalCompleted",
+    }
+}
+
+fn maude_terminal_miss_tag(tag: &str) -> &'static str {
+    match tag {
+        "Completed" => "terminalFailed",
+        "Failed" => "terminalCompleted",
+        "TimedOut" => "terminalCompleted",
+        "Cancelled" => "terminalCompleted",
+        _ => "terminalFailed",
     }
 }
 
@@ -6151,14 +6657,53 @@ case classification {
             }),
         );
 
-        let (selected, selected_context) = selected_rule_body(body, &context);
+        let (selected, selected_context, reports) = selected_rule_body(body, &context);
 
         assert!(selected.contains("branch \"failed\""));
         assert!(!selected.contains("branch \"completed\""));
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, BranchStatus::Matched);
         assert_eq!(
             parse_field_value("failure.reason", &selected_context),
             Value::String("fixture coerce failure".to_owned())
         );
+    }
+
+    #[test]
+    fn terminal_case_guard_error_selects_no_sibling_branch() {
+        let body = r#"
+case classification {
+  Completed result where result.summary => {
+    askHuman "should not commit"
+  }
+  Failed failure => {
+    askHuman "failed sibling"
+  }
+}
+"#;
+        let mut context = RuleContext::default();
+        push_effect_binding(
+            &mut context,
+            "classification",
+            "effect",
+            json!({
+                "tag": "Completed",
+                "status": "completed",
+                "value": {
+                    "summary": "Fixture classification"
+                }
+            }),
+        );
+
+        let (selected, _selected_context, reports) = selected_rule_body(body, &context);
+
+        assert!(!selected.contains("askHuman"));
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, BranchStatus::Error);
+        assert!(reports[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("did not evaluate to bool")));
     }
 
     #[test]
@@ -6319,7 +6864,9 @@ rule accept
 }
 "#;
         let compiled = whippletree_parser::compile_program(source);
-        let ir = compiled.ir.expect("source compiles");
+        let ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("source compiles: {:?}", compiled.diagnostics));
         let (maude, expected) =
             generate_maude_model_search(source, &ir, Path::new("/tmp/kernel.maude"));
 
@@ -6355,6 +6902,69 @@ rule accept
                     && result.outcome == ExpectedSearchResult::NoSolution)
                 .count(),
             15
+        );
+    }
+
+    #[test]
+    fn generates_model_searches_for_terminal_branches() {
+        let source = include_str!("../../../examples/terminal-output-union.whip");
+        let compiled = whippletree_parser::compile_program(source);
+        let ir = compiled.ir.expect("example compiles");
+        let (maude, expected) =
+            generate_maude_model_search(source, &ir, Path::new("/tmp/kernel.maude"));
+
+        assert!(maude.contains("terminalBranch("));
+        assert!(maude.contains("exhaustiveTerminal("));
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|result| result.predicate == "terminal-branch-match")
+                .count(),
+            4
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|result| result.predicate == "terminal-branch-miss")
+                .count(),
+            4
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|result| result.predicate == "terminal-exhaustive-miss")
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn generates_model_searches_for_guarded_terminal_branch_misses() {
+        let source = include_str!("../../../examples/terminal-output-union.whip");
+        let compiled = whippletree_parser::compile_program(source);
+        let mut ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("source compiles: {:?}", compiled.diagnostics));
+        let branch = ir.rules[0]
+            .metadata
+            .terminal_branches
+            .first_mut()
+            .expect("terminal branch");
+        branch.guard = Some(whippletree_parser::IrExpression {
+            source: "true".to_owned(),
+            expr: parse_expression("true").expect("guard parses"),
+            span: branch.pattern_span,
+        });
+        let (maude, expected) =
+            generate_maude_model_search(source, &ir, Path::new("/tmp/kernel.maude"));
+
+        assert!(maude.contains("terminalBranchGuard("));
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|result| result.predicate == "terminal-branch-guard-false")
+                .count(),
+            1
         );
     }
 

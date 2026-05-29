@@ -51,7 +51,7 @@ rules
       pattern:started
     writes
       schema:LanguageTask
-    body_hash 0b4d6b76ae7919da
+    body_hash aa1075d1dfb7271e
   rule run_language_task
     when LanguageTask as task
     when task.provider is available
