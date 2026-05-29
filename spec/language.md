@@ -263,6 +263,76 @@ Guards are the preferred way to express routing over a shared schema. Authors
 should not need one schema per provider when the data shape is identical and
 only a literal or enum field selects the target.
 
+## Pattern Branches
+
+Whippletree supports only typed finite-domain pattern matching. The feature is
+for deterministic branching over workflow data, not for general destructuring or
+string parsing.
+
+The v0 pattern surface is:
+
+```text
+enum variants
+literal-union values
+optional Some/None or present/missing branches
+tagged terminal-output unions from effect completions
+explicit wildcard/default branches
+```
+
+Pattern branches may have `where` guards, and those guards use the expression
+kernel. Branch guards cannot call providers, invoke `coerce`, read files, parse
+strings, or perform I/O.
+
+Example finite enum branch:
+
+```whippletree
+case review.status {
+  Accept => record AcceptedWork {
+    review review
+  }
+  Revise => record RevisionNeeded {
+    review review
+  }
+  Blocked => askHuman """
+    This review is blocked:
+    {{ review.reason }}
+  """
+}
+```
+
+Example optional branch:
+
+```whippletree
+case issue.assignee {
+  Some assignee => tell reviewer """
+    Review {{ issue.title }} for {{ assignee.name }}.
+  """
+  None => askHuman """
+    Assign an owner before this issue can continue.
+  """
+}
+```
+
+The concrete branch syntax may still change as implementation lands. The
+semantic requirements are fixed:
+
+- variants must belong to the scrutinee's enum or literal-union domain
+- optional `Some` branches bind a proven-present value
+- `None` branches cannot read fields through the missing value
+- finite domains are exhaustiveness-checked when a total result is required
+- non-matching branches do not commit facts or effects
+- exhaustive finite-domain misses produce diagnostics, not hidden fallthrough
+
+Deferred until there is a concrete workflow need:
+
+```text
+deep object destructuring
+array/list destructuring
+user-defined extractors
+regex/string pattern matching
+provider transcript pattern matching
+```
+
 `record` is the source-level marker for durable fact production. It is not
 assignment and not an inline local variable. If a rule commits, recorded facts
 commit atomically with any effect graph nodes and dependency edges produced by

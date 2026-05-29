@@ -264,6 +264,9 @@ Operation constraints:
 - object construction must satisfy a known class/effect/fact schema where one
   is expected
 - list items must satisfy the declared item schema where known
+- pattern branches are allowed only over finite typed domains, optional
+  presence, and tagged terminal-output unions
+- pattern branch bindings refine types for that branch only
 
 Not supported in v0:
 
@@ -275,6 +278,10 @@ string parsing toolkit
 media manipulation
 general user-defined functions
 user-defined methods
+general object destructuring
+array/list destructuring
+regex/string pattern matching
+user-defined pattern extractors
 ```
 
 Nontrivial data reasoning belongs in BAML `coerce` functions or registered
@@ -348,6 +355,76 @@ case branch matching non-null variant
 
 It should reject clever boolean reasoning and suggest an explicit presence
 guard.
+
+## Pattern Matching Types
+
+Pattern matching is type refinement over a finite or presence-aware domain. It
+does not introduce a general destructuring language.
+
+Allowed v0 scrutinee types:
+
+```text
+enum
+literal union
+optional<T>
+tagged terminal-output union
+```
+
+Enum patterns must name declared variants:
+
+```whippletree
+enum ReviewStatus {
+  Accept
+  Revise
+  Blocked
+}
+
+case review.status {
+  Accept => ...
+  Revise => ...
+  Blocked => ...
+}
+```
+
+Literal-union patterns must use one of the exact literal values in the union:
+
+```whippletree
+class LanguageTask {
+  provider "codex" | "claude" | "pi"
+}
+
+case task.provider {
+  "codex" => ...
+  "claude" => ...
+  "pi" => ...
+}
+```
+
+Optional patterns refine presence:
+
+```whippletree
+case issue.assignee {
+  Some assignee => assignee.name
+  None => "unassigned"
+}
+```
+
+Inside the `Some` branch, `assignee` has the non-optional inner type. Inside the
+`None` branch, the missing value cannot be dereferenced.
+
+Tagged terminal-output unions are matched by terminal status/variant. This is
+the typed form of branching over effect completions; providers do not decide
+which branch should run through free-form text.
+
+Compiler obligations:
+
+- reject patterns that cannot match the scrutinee type
+- reject unknown enum variants and literal values outside the declared domain
+- reject duplicate branches unless the duplicate is unreachable by construction
+- require an explicit wildcard/default branch when a total expression is needed
+  and the finite domain is not fully covered
+- preserve branch-specific type refinements in later field access checks
+- keep branch guards type-checked with the normal expression kernel
 
 ## BAML Lowering
 
