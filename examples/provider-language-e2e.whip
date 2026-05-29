@@ -66,6 +66,12 @@ agent pi {
   capacity 2
 }
 
+assert count(LanguageE2EResult where provider == "codex") == 2
+assert count(LanguageE2EResult where provider == "claude") == 2
+assert count(LanguageE2EResult where provider == "pi") == 2
+assert count(effect kind agent.tell where status == completed) == 6
+assert count(effect kind baml.coerce where status == completed) == 6
+
 rule seed_language_matrix
   when started
 => {

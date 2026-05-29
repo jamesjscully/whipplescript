@@ -581,6 +581,13 @@ struct StepReport {
     effects_created: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssertionReport {
+    expr: String,
+    passed: bool,
+    actual: Value,
+}
+
 fn step_instance(
     store_path: &Path,
     instance_id: &str,
@@ -1269,13 +1276,41 @@ fn dev(options: &CliOptions) -> ExitCode {
             break;
         }
     }
+    let store = match SqliteStore::open(&options.store_path) {
+        Ok(store) => store,
+        Err(error) => return report_store_error("failed to open store", error),
+    };
+    let facts = match store.list_facts(&started.instance_id) {
+        Ok(facts) => facts,
+        Err(error) => return report_store_error("failed to list facts", error),
+    };
+    let effects = match store.list_effects(&started.instance_id) {
+        Ok(effects) => effects,
+        Err(error) => return report_store_error("failed to list effects", error),
+    };
+    let assertions = eval_assertions(&ir, &facts, &effects);
+    let failed_assertions = assertions
+        .iter()
+        .filter(|assertion| !assertion.passed)
+        .collect::<Vec<_>>();
     if options.json {
-        emit_json(json!({
+        let _ = emit_json(json!({
             "instance_id": started.instance_id,
             "workflow": started.workflow,
             "steps": steps.iter().map(step_report_to_json).collect::<Vec<_>>(),
             "workers": workers.iter().map(worker_report_to_json).collect::<Vec<_>>(),
-        }))
+            "assertions": assertions.iter().map(assertion_report_to_json).collect::<Vec<_>>(),
+        }));
+        if failed_assertions.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        }
+    } else if !failed_assertions.is_empty() {
+        for assertion in failed_assertions {
+            eprintln!("assertion failed: {}", assertion.expr);
+        }
+        ExitCode::from(1)
     } else {
         println!("dev {}", started.instance_id);
         println!("workflow {}", started.workflow);
@@ -1524,8 +1559,14 @@ fn guard_literal(expr: &str) -> Value {
 
 fn parse_guard_literal(expr: &str) -> Value {
     let expr = expr.trim();
-    if let Some(unquoted) = expr.strip_prefix('"').and_then(|value| value.strip_suffix('"')) {
+    if let Some(unquoted) = expr
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
         return Value::String(unquoted.to_owned());
+    }
+    if let Ok(number) = expr.parse::<i64>() {
+        return Value::Number(number.into());
     }
     match expr {
         "true" => Value::Bool(true),
@@ -1533,6 +1574,159 @@ fn parse_guard_literal(expr: &str) -> Value {
         "null" => Value::Null,
         value => Value::String(value.to_owned()),
     }
+}
+
+fn eval_assertions(
+    ir: &IrProgram,
+    facts: &[FactView],
+    effects: &[EffectView],
+) -> Vec<AssertionReport> {
+    ir.assertions
+        .iter()
+        .map(|assertion| eval_assertion(&assertion.expr, facts, effects))
+        .collect()
+}
+
+fn eval_assertion(expr: &str, facts: &[FactView], effects: &[EffectView]) -> AssertionReport {
+    let expr = expr.trim();
+    let (passed, actual) = if let Some((left, op, right)) = split_top_level_comparison(expr) {
+        let actual = eval_projection_expr(left, facts, effects);
+        let expected = parse_guard_literal(right);
+        match op {
+            "==" => (actual == expected, actual),
+            "!=" => (actual != expected, actual),
+            _ => (false, actual),
+        }
+    } else {
+        let actual = eval_projection_expr(expr, facts, effects);
+        (actual == Value::Bool(true), actual)
+    };
+    AssertionReport {
+        expr: expr.to_owned(),
+        passed,
+        actual,
+    }
+}
+
+fn split_top_level_comparison(expr: &str) -> Option<(&str, &'static str, &str)> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in expr.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '=' if depth == 0 && expr[index..].starts_with("==") => {
+                return Some((expr[..index].trim(), "==", expr[index + 2..].trim()));
+            }
+            '!' if depth == 0 && expr[index..].starts_with("!=") => {
+                return Some((expr[..index].trim(), "!=", expr[index + 2..].trim()));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn eval_projection_expr(expr: &str, facts: &[FactView], effects: &[EffectView]) -> Value {
+    let expr = expr.trim();
+    if let Some(inner) = expr
+        .strip_prefix("count(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return Value::Number(count_projection_query(inner, facts, effects).into());
+    }
+    if let Some(inner) = expr
+        .strip_prefix("exists(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return Value::Bool(count_projection_query(inner, facts, effects) > 0);
+    }
+    parse_guard_literal(expr)
+}
+
+fn count_projection_query(query: &str, facts: &[FactView], effects: &[EffectView]) -> i64 {
+    let query = query.trim();
+    if let Some(rest) = query.strip_prefix("effect") {
+        return count_effect_query(rest.trim(), effects);
+    }
+    count_fact_query(query, facts)
+}
+
+fn count_fact_query(query: &str, facts: &[FactView]) -> i64 {
+    let (name, guard) = split_query_guard(query);
+    facts
+        .iter()
+        .filter(|fact| fact.name == name)
+        .filter(|fact| {
+            guard.is_none_or(|guard| {
+                let value = json_from_str(&fact.value_json);
+                eval_projection_guard(guard, &value)
+            })
+        })
+        .count() as i64
+}
+
+fn count_effect_query(query: &str, effects: &[EffectView]) -> i64 {
+    let (head, guard) = split_query_guard(query);
+    let kind = head
+        .strip_prefix("kind ")
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    effects
+        .iter()
+        .filter(|effect| kind.is_none_or(|kind| effect.kind == kind))
+        .filter(|effect| {
+            guard.is_none_or(|guard| {
+                let value = json!({
+                    "kind": effect.kind,
+                    "target": effect.target,
+                    "status": effect.status,
+                    "profile": effect.profile,
+                });
+                eval_projection_guard(guard, &value)
+            })
+        })
+        .count() as i64
+}
+
+fn split_query_guard(query: &str) -> (&str, Option<&str>) {
+    match query.split_once(" where ") {
+        Some((head, guard)) => (head.trim(), Some(guard.trim())),
+        None => (query.trim(), None),
+    }
+}
+
+fn eval_projection_guard(guard: &str, value: &Value) -> bool {
+    let guard = guard.trim();
+    if let Some((left, right)) = guard.split_once("==") {
+        return projection_path_value(value, left.trim())
+            == Some(parse_guard_literal(right.trim()));
+    }
+    if let Some((left, right)) = guard.split_once("!=") {
+        return projection_path_value(value, left.trim())
+            != Some(parse_guard_literal(right.trim()));
+    }
+    false
+}
+
+fn projection_path_value(value: &Value, path: &str) -> Option<Value> {
+    let mut current = value;
+    for field in path.split('.') {
+        current = current.get(field.trim())?;
+    }
+    Some(current.clone())
 }
 
 fn lower_rule(
@@ -2263,6 +2457,14 @@ fn step_report_to_json(report: &StepReport) -> Value {
         "committed_rules": report.committed_rules,
         "facts_created": report.facts_created,
         "effects_created": report.effects_created,
+    })
+}
+
+fn assertion_report_to_json(report: &AssertionReport) -> Value {
+    json!({
+        "expr": report.expr,
+        "passed": report.passed,
+        "actual": report.actual,
     })
 }
 

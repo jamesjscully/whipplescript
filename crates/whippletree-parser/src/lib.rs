@@ -56,7 +56,14 @@ pub enum Item {
     Enum(EnumDecl),
     Class(ClassDecl),
     Coerce(CoerceDecl),
+    Assert(AssertDecl),
     Rule(RuleDecl),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssertDecl {
+    pub expr: String,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -207,8 +214,14 @@ pub struct IrProgram {
     pub schemas: Vec<IrSchema>,
     pub agents: Vec<IrAgent>,
     pub coerces: Vec<IrCoerce>,
+    pub assertions: Vec<IrAssertion>,
     pub rules: Vec<IrRule>,
     pub rule_dependencies: Vec<IrRuleDependency>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrAssertion {
+    pub expr: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -515,6 +528,13 @@ impl IrProgram {
             }
         }
 
+        if !self.assertions.is_empty() {
+            push_line(&mut snapshot, "assertions");
+            for assertion in &self.assertions {
+                push_line(&mut snapshot, format!("  assert {}", assertion.expr));
+            }
+        }
+
         if !self.rules.is_empty() {
             push_line(&mut snapshot, "rules");
             for rule in &self.rules {
@@ -681,6 +701,7 @@ fn lower_program(program: Program) -> CompileOutput {
         schemas: Vec::new(),
         agents: Vec::new(),
         coerces: Vec::new(),
+        assertions: Vec::new(),
         rules: Vec::new(),
         rule_dependencies: Vec::new(),
     };
@@ -694,6 +715,7 @@ fn lower_program(program: Program) -> CompileOutput {
                 lower_class(class_decl, &mut ir, &schema_names, &mut diagnostics)
             }
             Item::Coerce(coerce) => lower_coerce(coerce, &mut ir, &schema_names, &mut diagnostics),
+            Item::Assert(assertion) => lower_assert(assertion, &mut ir),
             Item::Rule(rule) => lower_rule(rule, &semantic, &mut ir, &mut diagnostics),
         }
     }
@@ -704,6 +726,12 @@ fn lower_program(program: Program) -> CompileOutput {
         ir: diagnostics.is_empty().then_some(ir),
         diagnostics,
     }
+}
+
+fn lower_assert(assertion: AssertDecl, ir: &mut IrProgram) {
+    ir.assertions.push(IrAssertion {
+        expr: assertion.expr,
+    });
 }
 
 fn collect_schema_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> BTreeSet<String> {
@@ -2014,6 +2042,9 @@ fn format_syntax(program: Program) -> String {
             Item::Enum(enum_decl) => format_enum(enum_decl, &mut formatted),
             Item::Class(class_decl) => format_class(class_decl, &mut formatted),
             Item::Coerce(coerce) => format_coerce(coerce, &mut formatted),
+            Item::Assert(assertion) => {
+                push_line(&mut formatted, format!("assert {}", assertion.expr))
+            }
             Item::Rule(rule) => format_rule(rule, &mut formatted),
         }
 
@@ -2265,7 +2296,7 @@ fn lex(source: &str) -> Lexed {
             continue;
         }
 
-        if b"{}[]()<>,?|.".contains(&byte) {
+        if b"{}[]()<>,?|.+".contains(&byte) {
             tokens.push(Token {
                 kind: TokenKind::Symbol(byte as char),
                 span: SourceSpan {
@@ -2402,6 +2433,10 @@ impl Parser<'_> {
             } else if self.at_ident("coerce") {
                 if let Some(item) = self.parse_coerce() {
                     items.push(Item::Coerce(item));
+                }
+            } else if self.at_ident("assert") {
+                if let Some(item) = self.parse_assert() {
+                    items.push(Item::Assert(item));
                 }
             } else if self.at_ident("rule") {
                 if let Some(item) = self.parse_rule() {
@@ -2620,6 +2655,30 @@ impl Parser<'_> {
             name,
             whens,
             body,
+            span,
+        })
+    }
+
+    fn parse_assert(&mut self) -> Option<AssertDecl> {
+        let assert = self.expect_keyword("assert")?;
+        let expr_start = assert.span.end;
+        let line_end = self.source[expr_start..]
+            .find('\n')
+            .map(|offset| expr_start + offset)
+            .unwrap_or(self.source.len());
+        let mut expr_end = line_end;
+
+        while !self.is_at_end() && self.peek()?.span.start < line_end {
+            expr_end = self.peek()?.span.end.min(line_end);
+            self.advance();
+        }
+
+        let span = SourceSpan {
+            start: expr_start,
+            end: expr_end,
+        };
+        Some(AssertDecl {
+            expr: self.source_text(span).trim().to_owned(),
             span,
         })
     }

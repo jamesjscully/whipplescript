@@ -927,6 +927,14 @@ fn dev_provider_language_e2e_runs_agent_matrix_and_baml_reviews() {
             .collect::<Vec<_>>(),
         vec![6, 6, 0, 0]
     );
+    let assertions = dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("assertions");
+    assert_eq!(assertions.len(), 5);
+    assert!(assertions
+        .iter()
+        .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
