@@ -1055,7 +1055,14 @@ rule route
   when Task as task
 => {
   case task.provider {
-    "codex" => {
+    "codex" where task.assignee == null => {
+      record Routed {
+        provider task.provider
+        target "wrong"
+        owner "wrong"
+      }
+    }
+    "codex" where task.assignee == "Ada" => {
       case task.assignee {
         Some owner => {
           record Routed {

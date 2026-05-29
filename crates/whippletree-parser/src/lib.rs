@@ -1479,14 +1479,23 @@ fn validate_case_blocks(
         while case_index < lines.len() && depth > 0 {
             let line = lines[case_index].trim();
             if depth == 1 {
-                if let Some(pattern) = case_branch_pattern(line) {
+                if let Some(branch) = parse_case_branch_head(line) {
                     validate_case_pattern(
                         rule,
-                        pattern,
+                        branch.pattern,
                         scrutinee_ty.as_ref(),
                         semantic,
                         diagnostics,
                     );
+                    if let Some(guard) = branch.guard {
+                        validate_known_field_paths(
+                            rule,
+                            guard,
+                            semantic,
+                            binding_types,
+                            diagnostics,
+                        );
+                    }
                 }
             }
             depth += brace_delta(line);
@@ -1514,10 +1523,27 @@ fn is_case_branch_start(line: &str) -> bool {
     line.contains("=>")
 }
 
-fn case_branch_pattern(line: &str) -> Option<&str> {
+struct CaseBranchHead<'a> {
+    pattern: &'a str,
+    guard: Option<&'a str>,
+}
+
+fn parse_case_branch_head(line: &str) -> Option<CaseBranchHead<'_>> {
     let (pattern, _) = line.split_once("=>")?;
     let pattern = pattern.trim();
-    (!pattern.is_empty()).then_some(pattern)
+    if pattern.is_empty() {
+        return None;
+    }
+    match pattern.split_once(" where ") {
+        Some((pattern, guard)) => Some(CaseBranchHead {
+            pattern: pattern.trim(),
+            guard: Some(guard.trim()),
+        }),
+        None => Some(CaseBranchHead {
+            pattern,
+            guard: None,
+        }),
+    }
 }
 
 fn expression_type(
@@ -3650,7 +3676,7 @@ rule route
   when Review as review
 => {
   case review.status {
-    Accept => {
+    Accept where review.assignee != null => {
       record Routed {
         status Accept
       }

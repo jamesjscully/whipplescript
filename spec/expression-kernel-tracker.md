@@ -37,7 +37,7 @@ The expression kernel covers deterministic logic used by:
 - [~] Compiler validates known field paths in guards.
 - [~] Rule bodies support concrete `case expr { Pattern => { ... } }` branches
   for enum/literal values and optional `Some`/`None` branches in the dev
-  stepper.
+  stepper, including branch-level `where` guards.
 - [~] Maude has a finite abstract expression model for guard true/false/error,
   assertion pass/fail/error, optional presence, enum/literal domains, typed
   pattern branches, exhaustive finite-domain misses, and dynamic agent target
@@ -180,7 +180,7 @@ The expression kernel covers deterministic logic used by:
   proven-present value in the Some branch.
 - [ ] Support tagged terminal-output union branch matching for effect
   completion facts.
-- [ ] Allow branch guards that reuse the expression kernel.
+- [x] Allow branch guards that reuse the current deterministic guard evaluator.
 - [x] Reject unknown enum/literal variants in patterns.
 - [ ] Emit exhaustiveness diagnostics for finite domains where the branch result
   must be total.

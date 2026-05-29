@@ -1975,6 +1975,7 @@ struct CaseBlock {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CaseBranch {
     pattern: String,
+    guard: Option<String>,
     body: Vec<String>,
 }
 
@@ -1991,7 +1992,7 @@ fn parse_case_block(lines: &[&str], start: usize) -> Option<(CaseBlock, usize)> 
     let mut case_depth = brace_delta(header).max(1);
     while index < lines.len() && case_depth > 0 {
         let trimmed = lines[index].trim();
-        if let Some((pattern, before_body)) = case_branch_header(trimmed) {
+        if let Some((pattern, guard, before_body)) = case_branch_header(trimmed) {
             let mut body = Vec::new();
             let mut branch_depth = brace_delta(before_body).max(1);
             index += 1;
@@ -2004,7 +2005,11 @@ fn parse_case_block(lines: &[&str], start: usize) -> Option<(CaseBlock, usize)> 
                 branch_depth = next_depth;
                 index += 1;
             }
-            branches.push(CaseBranch { pattern, body });
+            branches.push(CaseBranch {
+                pattern,
+                guard,
+                body,
+            });
             continue;
         }
         case_depth += brace_delta(trimmed);
@@ -2019,13 +2024,18 @@ fn parse_case_block(lines: &[&str], start: usize) -> Option<(CaseBlock, usize)> 
     ))
 }
 
-fn case_branch_header(line: &str) -> Option<(String, &str)> {
-    let (pattern, body_start) = line.split_once("=>")?;
+fn case_branch_header(line: &str) -> Option<(String, Option<String>, &str)> {
+    let (head, body_start) = line.split_once("=>")?;
     let body_start = body_start.trim();
     if !body_start.starts_with('{') {
         return None;
     }
-    Some((pattern.trim().to_owned(), body_start))
+    let head = head.trim();
+    let (pattern, guard) = match head.split_once(" where ") {
+        Some((pattern, guard)) => (pattern.trim(), Some(guard.trim().to_owned())),
+        None => (head, None),
+    };
+    Some((pattern.to_owned(), guard, body_start))
 }
 
 fn select_case_branch(case: &CaseBlock, context: &mut RuleContext) -> Option<CaseBranch> {
@@ -2036,7 +2046,12 @@ fn select_case_branch(case: &CaseBlock, context: &mut RuleContext) -> Option<Cas
             fallback = Some(branch.clone());
             continue;
         }
-        if case_pattern_matches(&branch.pattern, &value, context) {
+        if case_pattern_matches(&branch.pattern, &value, context)
+            && branch
+                .guard
+                .as_deref()
+                .is_none_or(|guard| eval_guard(guard, context))
+        {
             return Some(branch.clone());
         }
     }
