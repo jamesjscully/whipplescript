@@ -1237,6 +1237,205 @@ rule accept_task
 }
 
 #[test]
+fn dev_reports_false_guards_without_committing_effects() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("false-guard");
+    fs::write(
+        &source_path,
+        r#"
+workflow FalseGuard
+
+class Task {
+  status "blocked"
+}
+
+class Result {
+  status "accepted"
+}
+
+assert empty(Result)
+
+rule seed
+  when started
+=> {
+  record Task {
+    status "blocked"
+  }
+}
+
+rule accept
+  when Task as task where task.status == "queued"
+=> {
+  record Result {
+    status "accepted"
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let guards = dev
+        .get("steps")
+        .and_then(Value::as_array)
+        .expect("steps")
+        .iter()
+        .flat_map(|step| {
+            step.get("guards")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    assert!(guards.iter().any(|guard| {
+        guard.get("rule").and_then(Value::as_str) == Some("accept")
+            && guard.get("status").and_then(Value::as_str) == Some("false")
+            && guard.get("matched").and_then(Value::as_bool) == Some(false)
+    }));
+
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    assert_eq!(
+        facts
+            .as_array()
+            .expect("facts")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("Result"))
+            .count(),
+        0
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn dev_reports_guard_errors_without_committing_effects() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("guard-error");
+    fs::write(
+        &source_path,
+        r#"
+workflow GuardError
+
+class Task {
+  status "queued"
+}
+
+class Result {
+  status "accepted"
+}
+
+rule seed
+  when started
+=> {
+  record Task {
+    status "queued"
+  }
+}
+
+rule accept
+  when Task as task where exists(Task where missing)
+=> {
+  record Result {
+    status "accepted"
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success());
+    let dev: Value = serde_json::from_slice(&output.stdout).expect("json stdout");
+    let guards = dev
+        .get("steps")
+        .and_then(Value::as_array)
+        .expect("steps")
+        .iter()
+        .flat_map(|step| {
+            step.get("guards")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    assert!(guards.iter().any(|guard| {
+        guard.get("rule").and_then(Value::as_str) == Some("accept")
+            && guard.get("status").and_then(Value::as_str) == Some("error")
+            && guard.get("error").and_then(Value::as_str)
+                == Some("guard expression evaluation failed")
+    }));
+
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    assert_eq!(
+        facts
+            .as_array()
+            .expect("facts")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("Result"))
+            .count(),
+        0
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
 fn dev_distinguishes_missing_from_null_in_expression_kernel() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();

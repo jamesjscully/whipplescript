@@ -526,6 +526,22 @@ fn step(options: &CliOptions) -> ExitCode {
                 report.facts_created,
                 report.effects_created
             );
+            for guard in report
+                .guard_reports
+                .iter()
+                .filter(|guard| guard.status == GuardStatus::Error)
+            {
+                eprintln!(
+                    "guard error in rule {}: {}{}",
+                    guard.rule,
+                    guard.expr,
+                    guard
+                        .error
+                        .as_deref()
+                        .map(|error| format!(" ({error})"))
+                        .unwrap_or_default()
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(error) => report_store_error("failed to step instance", error),
@@ -580,6 +596,35 @@ struct StepReport {
     committed_rules: usize,
     facts_created: usize,
     effects_created: usize,
+    guard_reports: Vec<GuardReport>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GuardReport {
+    rule: String,
+    when: String,
+    expr: String,
+    status: GuardStatus,
+    matched: bool,
+    actual: Value,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GuardStatus {
+    Matched,
+    False,
+    Error,
+}
+
+impl GuardStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Matched => "matched",
+            Self::False => "false",
+            Self::Error => "error",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -630,8 +675,9 @@ fn step_instance(
             .map(|event| event.event_id.clone());
 
         for rule in &ir.rules {
-            let contexts = ready_contexts(rule, &facts, started_event_id.as_deref());
-            for context in contexts {
+            let ready = ready_contexts(rule, &facts, &effects, started_event_id.as_deref());
+            report.guard_reports.extend(ready.guard_reports);
+            for context in ready.contexts {
                 let lowering = lower_rule(ir, rule, &context, &facts, &effects);
                 if lowering.facts.is_empty() && lowering.effects.is_empty() {
                     continue;
@@ -1313,6 +1359,11 @@ fn dev(options: &CliOptions) -> ExitCode {
         .iter()
         .filter(|assertion| !assertion.passed)
         .collect::<Vec<_>>();
+    let guard_errors = steps
+        .iter()
+        .flat_map(|step| &step.guard_reports)
+        .filter(|guard| guard.status == GuardStatus::Error)
+        .collect::<Vec<_>>();
     if options.json {
         let _ = emit_json(json!({
             "instance_id": started.instance_id,
@@ -1321,11 +1372,25 @@ fn dev(options: &CliOptions) -> ExitCode {
             "workers": workers.iter().map(worker_report_to_json).collect::<Vec<_>>(),
             "assertions": assertions.iter().map(assertion_report_to_json).collect::<Vec<_>>(),
         }));
-        if failed_assertions.is_empty() {
+        if failed_assertions.is_empty() && guard_errors.is_empty() {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(1)
         }
+    } else if !guard_errors.is_empty() {
+        for guard in guard_errors {
+            eprintln!(
+                "guard error in rule {}: {}{}",
+                guard.rule,
+                guard.expr,
+                guard
+                    .error
+                    .as_deref()
+                    .map(|error| format!(" ({error})"))
+                    .unwrap_or_default()
+            );
+        }
+        ExitCode::from(1)
     } else if !failed_assertions.is_empty() {
         for assertion in failed_assertions {
             match assertion.status {
@@ -1511,18 +1576,20 @@ impl OwnedDependency {
 fn ready_contexts(
     rule: &IrRule,
     facts: &[FactView],
+    effects: &[EffectView],
     started_event_id: Option<&str>,
-) -> Vec<RuleContext> {
+) -> ReadyContexts {
     let mut contexts = vec![RuleContext {
         trigger_event_id: started_event_id.map(str::to_owned),
         identity: None,
         bindings: Vec::new(),
     }];
+    let mut guard_reports = Vec::new();
     for when in &rule.whens {
         let pattern = when.pattern.as_str();
         if pattern == "started" {
             if started_event_id.is_none() {
-                return Vec::new();
+                return ReadyContexts::empty(guard_reports);
             }
             continue;
         }
@@ -1538,7 +1605,7 @@ fn ready_contexts(
                 .cloned()
                 .collect::<Vec<_>>();
             if matching.is_empty() {
-                return Vec::new();
+                return ReadyContexts::empty(guard_reports);
             }
             let mut expanded = Vec::new();
             for context in contexts {
@@ -1546,31 +1613,104 @@ fn ready_contexts(
                     let mut context = context.clone();
                     context.identity = Some(format!("{binding}:{}", fact.key));
                     context.bindings.push((binding.to_owned(), fact.clone()));
-                    if when
-                        .guard
-                        .as_ref()
-                        .is_none_or(|guard| eval_guard(&guard.expr, &context))
-                    {
-                        expanded.push(context);
+                    match &when.guard {
+                        Some(guard) => {
+                            let report = eval_guard(
+                                &rule.name,
+                                &when.source,
+                                &guard.source,
+                                &guard.expr,
+                                &context,
+                                facts,
+                                effects,
+                            );
+                            let matched = report.matched;
+                            guard_reports.push(report);
+                            if matched {
+                                expanded.push(context);
+                            }
+                        }
+                        None => expanded.push(context),
                     }
                 }
             }
             contexts = expanded;
             continue;
         }
-        return Vec::new();
+        return ReadyContexts::empty(guard_reports);
     }
-    contexts
+    ReadyContexts {
+        contexts,
+        guard_reports,
+    }
 }
 
-fn eval_guard(guard: &Expr, context: &RuleContext) -> bool {
-    eval_expr_value(guard, &EvalScope::rule(context, &[], &[])).as_bool() == Some(true)
+struct ReadyContexts {
+    contexts: Vec<RuleContext>,
+    guard_reports: Vec<GuardReport>,
+}
+
+impl ReadyContexts {
+    fn empty(guard_reports: Vec<GuardReport>) -> Self {
+        Self {
+            contexts: Vec::new(),
+            guard_reports,
+        }
+    }
+}
+
+fn eval_guard(
+    rule: &str,
+    when: &str,
+    source: &str,
+    guard: &Expr,
+    context: &RuleContext,
+    facts: &[FactView],
+    effects: &[EffectView],
+) -> GuardReport {
+    let (status, actual, error) = guard_result(eval_expr_value(
+        guard,
+        &EvalScope::rule(context, facts, effects),
+    ));
+    let matched = status == GuardStatus::Matched;
+    GuardReport {
+        rule: rule.to_owned(),
+        when: when.to_owned(),
+        expr: source.to_owned(),
+        status,
+        matched,
+        actual,
+        error,
+    }
 }
 
 fn eval_guard_source(guard: &str, context: &RuleContext) -> bool {
-    parse_expression(guard)
-        .ok()
-        .is_some_and(|expr| eval_guard(&expr, context))
+    parse_expression(guard).ok().is_some_and(|expr| {
+        guard_result(eval_expr_value(&expr, &EvalScope::rule(context, &[], &[]))).0
+            == GuardStatus::Matched
+    })
+}
+
+fn guard_result(value: EvalValue) -> (GuardStatus, Value, Option<String>) {
+    match value {
+        EvalValue::Json(Value::Bool(true)) => (GuardStatus::Matched, Value::Bool(true), None),
+        EvalValue::Json(Value::Bool(false)) => (GuardStatus::False, Value::Bool(false), None),
+        EvalValue::Json(value) => (
+            GuardStatus::Error,
+            value,
+            Some("guard expression did not evaluate to bool".to_owned()),
+        ),
+        EvalValue::Missing => (
+            GuardStatus::Error,
+            json!({"internal": "Missing"}),
+            Some("guard expression evaluated to Missing".to_owned()),
+        ),
+        EvalValue::Error => (
+            GuardStatus::Error,
+            json!({"internal": "Error"}),
+            Some("guard expression evaluation failed".to_owned()),
+        ),
+    }
 }
 
 fn parse_guard_literal(expr: &str) -> Value {
@@ -1705,13 +1845,6 @@ impl EvalValue {
         }
     }
 
-    fn as_bool(&self) -> Option<bool> {
-        match self {
-            Self::Json(Value::Bool(value)) => Some(*value),
-            _ => None,
-        }
-    }
-
     fn is_missing_or_null(&self) -> bool {
         matches!(self, Self::Missing | Self::Json(Value::Null))
     }
@@ -1733,7 +1866,9 @@ fn eval_expr_value(expr: &Expr, scope: &EvalScope<'_>) -> EvalValue {
         },
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, scope),
         Expr::Call { name, args } => eval_call(name, args, scope),
-        Expr::Query { .. } => EvalValue::Json(Value::Number(count_query(expr, scope).into())),
+        Expr::Query { .. } => eval_query_count(expr, scope)
+            .map(|count| EvalValue::Json(Value::Number(count.into())))
+            .unwrap_or(EvalValue::Error),
     }
 }
 
@@ -1824,18 +1959,18 @@ fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, scope: &EvalScope<'_>) -
 
 fn eval_call(name: &str, args: &[Expr], scope: &EvalScope<'_>) -> EvalValue {
     match (name, args) {
-        ("count", [query @ Expr::Query { .. }]) => {
-            EvalValue::Json(Value::Number(count_query(query, scope).into()))
-        }
-        ("exists", [query @ Expr::Query { .. }]) => {
-            EvalValue::Json(Value::Bool(count_query(query, scope) > 0))
-        }
+        ("count", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
+            .map(|count| EvalValue::Json(Value::Number(count.into())))
+            .unwrap_or(EvalValue::Error),
+        ("exists", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
+            .map(|count| EvalValue::Json(Value::Bool(count > 0)))
+            .unwrap_or(EvalValue::Error),
         ("exists", [expr]) => EvalValue::Json(Value::Bool(
             !eval_expr_value(expr, scope).is_missing_or_null(),
         )),
-        ("empty", [query @ Expr::Query { .. }]) => {
-            EvalValue::Json(Value::Bool(count_query(query, scope) == 0))
-        }
+        ("empty", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
+            .map(|count| EvalValue::Json(Value::Bool(count == 0)))
+            .unwrap_or(EvalValue::Error),
         ("empty", [expr]) => {
             EvalValue::Json(Value::Bool(is_empty_value(&eval_expr_value(expr, scope))))
         }
@@ -1843,45 +1978,60 @@ fn eval_call(name: &str, args: &[Expr], scope: &EvalScope<'_>) -> EvalValue {
     }
 }
 
-fn count_query(query: &Expr, scope: &EvalScope<'_>) -> i64 {
+fn eval_query_count(query: &Expr, scope: &EvalScope<'_>) -> Result<i64, EvalValue> {
     let Expr::Query { kind, head, guard } = query else {
-        return 0;
+        return Ok(0);
     };
     match kind {
-        QueryKind::Fact => scope
-            .facts
-            .iter()
-            .filter(|fact| fact.name == head.trim())
-            .filter(|fact| {
-                guard.as_ref().is_none_or(|guard| {
+        QueryKind::Fact => {
+            let mut count = 0;
+            for fact in scope.facts.iter().filter(|fact| fact.name == head.trim()) {
+                if let Some(guard) = guard {
                     let value = json_from_str(&fact.value_json);
-                    eval_expr_value(guard, &scope.projection(&value)).as_bool() == Some(true)
-                })
-            })
-            .count() as i64,
+                    if guard_filter_matches(eval_expr_value(guard, &scope.projection(&value)))? {
+                        count += 1;
+                    }
+                } else {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        }
         QueryKind::Effect => {
             let kind = head
                 .trim()
                 .strip_prefix("kind ")
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
-            scope
+            let mut count = 0;
+            for effect in scope
                 .effects
                 .iter()
                 .filter(|effect| kind.is_none_or(|kind| effect.kind == kind))
-                .filter(|effect| {
-                    guard.as_ref().is_none_or(|guard| {
-                        let value = json!({
-                            "kind": effect.kind,
-                            "target": effect.target,
-                            "status": effect.status,
-                            "profile": effect.profile,
-                        });
-                        eval_expr_value(guard, &scope.projection(&value)).as_bool() == Some(true)
-                    })
-                })
-                .count() as i64
+            {
+                if let Some(guard) = guard {
+                    let value = json!({
+                        "kind": effect.kind,
+                        "target": effect.target,
+                        "status": effect.status,
+                        "profile": effect.profile,
+                    });
+                    if guard_filter_matches(eval_expr_value(guard, &scope.projection(&value)))? {
+                        count += 1;
+                    }
+                } else {
+                    count += 1;
+                }
+            }
+            Ok(count)
         }
+    }
+}
+
+fn guard_filter_matches(value: EvalValue) -> Result<bool, EvalValue> {
+    match value {
+        EvalValue::Json(Value::Bool(value)) => Ok(value),
+        value => Err(value),
     }
 }
 
@@ -2883,7 +3033,25 @@ fn step_report_to_json(report: &StepReport) -> Value {
         "committed_rules": report.committed_rules,
         "facts_created": report.facts_created,
         "effects_created": report.effects_created,
+        "guards": report.guard_reports.iter().map(guard_report_to_json).collect::<Vec<_>>(),
     })
+}
+
+fn guard_report_to_json(report: &GuardReport) -> Value {
+    let mut value = json!({
+        "rule": report.rule,
+        "when": report.when,
+        "expr": report.expr,
+        "status": report.status.as_str(),
+        "matched": report.matched,
+        "actual": report.actual,
+    });
+    if let Some(error) = &report.error {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("error".to_owned(), Value::String(error.clone()));
+        }
+    }
+    value
 }
 
 fn assertion_report_to_json(report: &AssertionReport) -> Value {

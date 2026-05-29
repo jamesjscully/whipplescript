@@ -139,7 +139,7 @@ The expression kernel covers deterministic logic used by:
 - [x] Implement `exists path`, `exists(collection)`, `empty(...)`, and
   `count(...)`.
 - [x] Implement fact and effect projection reads over typed query filters.
-- [ ] Ensure guard `false` means non-match and guard `Error` means no rule
+- [x] Ensure guard `false` means non-match and guard `Error` means no rule
   commit plus diagnostic.
 - [x] Ensure assertion `false` or `Error` cannot mutate facts/effects and
   produces structured failure output.
@@ -200,7 +200,7 @@ The expression kernel covers deterministic logic used by:
 - [ ] Static-analysis tests for unknown bindings, unknown fields, optional
   misuse, invalid enums, invalid literal values, bad membership, bad ordering,
   bad array literals, and bad `AgentRef` targets.
-- [ ] Runtime tests for guard true, false, and error paths.
+- [x] Runtime tests for guard true, false, and error paths.
 - [x] Runtime tests for assertion pass, fail, and error paths.
 - [~] Parser/type-checker tests for enum, literal, optional, and tagged-union
   pattern branches.
@@ -208,7 +208,7 @@ The expression kernel covers deterministic logic used by:
 - [x] E2E test showing `&&`, `||`, `!`, ordering, `in`, `exists`, `empty`, and
   `count` in source.
 - [x] E2E test showing assertion failures reach JSON output and nonzero exit.
-- [ ] E2E test showing failed guards do not enqueue effects.
+- [x] E2E test showing failed guards do not enqueue effects.
 - [x] E2E test showing rule-body `case` branches select literal and optional
   patterns before recording facts.
 - [x] Maude tests for guard false/error, optional presence, enum/literal domain
