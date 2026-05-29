@@ -1537,7 +1537,7 @@ fn split_when_guard(when: &str) -> (&str, Option<&str>) {
 
 fn eval_guard(guard: &str, context: &RuleContext) -> bool {
     parse_expression(guard).ok().is_some_and(|expr| {
-        eval_expr(&expr, &EvalScope::rule(context, &[], &[])).as_bool() == Some(true)
+        eval_expr_value(&expr, &EvalScope::rule(context, &[], &[])).as_bool() == Some(true)
     })
 }
 
@@ -1574,7 +1574,7 @@ fn eval_assertions(
 fn eval_assertion(expr: &str, facts: &[FactView], effects: &[EffectView]) -> AssertionReport {
     let expr = expr.trim();
     let actual = parse_expression(expr)
-        .map(|parsed| eval_expr(&parsed, &EvalScope::assertions(facts, effects)))
+        .map(|parsed| eval_expr_value(&parsed, &EvalScope::assertions(facts, effects)).into_json())
         .unwrap_or(Value::Bool(false));
     let passed = actual.as_bool() == Some(true);
     AssertionReport {
@@ -1620,30 +1620,61 @@ impl<'a> EvalScope<'a> {
     }
 }
 
-fn eval_expr(expr: &Expr, scope: &EvalScope<'_>) -> Value {
-    match expr {
-        Expr::Literal(ExprLiteral::Ident(value)) => eval_ident_literal(value, scope),
-        Expr::Literal(literal) => eval_expr_literal(literal),
-        Expr::Path(path) => eval_path(path, scope).unwrap_or(Value::Null),
-        Expr::Array(items) => {
-            Value::Array(items.iter().map(|item| eval_expr(item, scope)).collect())
+#[derive(Clone, Debug, PartialEq)]
+enum EvalValue {
+    Json(Value),
+    Missing,
+    Error,
+}
+
+impl EvalValue {
+    fn into_json(self) -> Value {
+        match self {
+            Self::Json(value) => value,
+            Self::Missing => json!({"internal": "Missing"}),
+            Self::Error => json!({"internal": "Error"}),
         }
-        Expr::Unary { op, expr } => match op {
-            UnaryOp::Not => Value::Bool(!truthy(&eval_expr(expr, scope))),
-        },
-        Expr::Binary { op, left, right } => eval_binary(*op, left, right, scope),
-        Expr::Call { name, args } => eval_call(name, args, scope),
-        Expr::Query { .. } => Value::Number(count_query(expr, scope).into()),
+    }
+
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Json(Value::Bool(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn is_missing_or_null(&self) -> bool {
+        matches!(self, Self::Missing | Self::Json(Value::Null))
     }
 }
 
-fn eval_ident_literal(value: &str, scope: &EvalScope<'_>) -> Value {
+fn eval_expr_value(expr: &Expr, scope: &EvalScope<'_>) -> EvalValue {
+    match expr {
+        Expr::Literal(ExprLiteral::Ident(value)) => eval_ident_literal(value, scope),
+        Expr::Literal(literal) => EvalValue::Json(eval_expr_literal(literal)),
+        Expr::Path(path) => eval_path(path, scope),
+        Expr::Array(items) => EvalValue::Json(Value::Array(
+            items
+                .iter()
+                .map(|item| eval_expr_value(item, scope).into_json())
+                .collect(),
+        )),
+        Expr::Unary { op, expr } => match op {
+            UnaryOp::Not => EvalValue::Json(Value::Bool(!truthy(&eval_expr_value(expr, scope)))),
+        },
+        Expr::Binary { op, left, right } => eval_binary(*op, left, right, scope),
+        Expr::Call { name, args } => eval_call(name, args, scope),
+        Expr::Query { .. } => EvalValue::Json(Value::Number(count_query(expr, scope).into())),
+    }
+}
+
+fn eval_ident_literal(value: &str, scope: &EvalScope<'_>) -> EvalValue {
     if let Some(projection) = scope.projection {
         if let Some(value) = projection.get(value) {
-            return value.clone();
+            return EvalValue::Json(value.clone());
         }
     }
-    eval_expr_literal(&ExprLiteral::Ident(value.to_owned()))
+    EvalValue::Json(eval_expr_literal(&ExprLiteral::Ident(value.to_owned())))
 }
 
 fn eval_expr_literal(literal: &ExprLiteral) -> Value {
@@ -1666,29 +1697,35 @@ fn eval_expr_literal(literal: &ExprLiteral) -> Value {
     }
 }
 
-fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, scope: &EvalScope<'_>) -> Value {
+fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, scope: &EvalScope<'_>) -> EvalValue {
     match op {
         BinaryOp::Or => {
-            let left = eval_expr(left, scope);
+            let left = eval_expr_value(left, scope);
             if truthy(&left) {
-                Value::Bool(true)
+                EvalValue::Json(Value::Bool(true))
             } else {
-                Value::Bool(truthy(&eval_expr(right, scope)))
+                EvalValue::Json(Value::Bool(truthy(&eval_expr_value(right, scope))))
             }
         }
         BinaryOp::And => {
-            let left = eval_expr(left, scope);
+            let left = eval_expr_value(left, scope);
             if !truthy(&left) {
-                Value::Bool(false)
+                EvalValue::Json(Value::Bool(false))
             } else {
-                Value::Bool(truthy(&eval_expr(right, scope)))
+                EvalValue::Json(Value::Bool(truthy(&eval_expr_value(right, scope))))
             }
         }
-        BinaryOp::Eq => Value::Bool(eval_expr(left, scope) == eval_expr(right, scope)),
-        BinaryOp::Ne => Value::Bool(eval_expr(left, scope) != eval_expr(right, scope)),
+        BinaryOp::Eq => EvalValue::Json(Value::Bool(compare_eq(
+            &eval_expr_value(left, scope),
+            &eval_expr_value(right, scope),
+        ))),
+        BinaryOp::Ne => EvalValue::Json(Value::Bool(!compare_eq(
+            &eval_expr_value(left, scope),
+            &eval_expr_value(right, scope),
+        ))),
         BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
-            let left = eval_expr(left, scope);
-            let right = eval_expr(right, scope);
+            let left = eval_expr_value(left, scope);
+            let right = eval_expr_value(right, scope);
             let result = match (number_value(&left), number_value(&right)) {
                 (Some(left), Some(right)) => match op {
                     BinaryOp::Lt => left < right,
@@ -1699,31 +1736,41 @@ fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, scope: &EvalScope<'_>) -
                 },
                 _ => false,
             };
-            Value::Bool(result)
+            EvalValue::Json(Value::Bool(result))
         }
         BinaryOp::In | BinaryOp::NotIn => {
-            let needle = eval_expr(left, scope);
-            let haystack = eval_expr(right, scope);
+            let needle = eval_expr_value(left, scope).into_json();
+            let haystack = eval_expr_value(right, scope).into_json();
             let contains = haystack
                 .as_array()
                 .is_some_and(|items| items.iter().any(|item| item == &needle));
-            Value::Bool(if op == BinaryOp::In {
+            EvalValue::Json(Value::Bool(if op == BinaryOp::In {
                 contains
             } else {
                 !contains
-            })
+            }))
         }
     }
 }
 
-fn eval_call(name: &str, args: &[Expr], scope: &EvalScope<'_>) -> Value {
+fn eval_call(name: &str, args: &[Expr], scope: &EvalScope<'_>) -> EvalValue {
     match (name, args) {
-        ("count", [query @ Expr::Query { .. }]) => Value::Number(count_query(query, scope).into()),
-        ("exists", [query @ Expr::Query { .. }]) => Value::Bool(count_query(query, scope) > 0),
-        ("exists", [expr]) => Value::Bool(!eval_expr(expr, scope).is_null()),
-        ("empty", [query @ Expr::Query { .. }]) => Value::Bool(count_query(query, scope) == 0),
-        ("empty", [expr]) => Value::Bool(is_empty_value(&eval_expr(expr, scope))),
-        _ => Value::Null,
+        ("count", [query @ Expr::Query { .. }]) => {
+            EvalValue::Json(Value::Number(count_query(query, scope).into()))
+        }
+        ("exists", [query @ Expr::Query { .. }]) => {
+            EvalValue::Json(Value::Bool(count_query(query, scope) > 0))
+        }
+        ("exists", [expr]) => EvalValue::Json(Value::Bool(
+            !eval_expr_value(expr, scope).is_missing_or_null(),
+        )),
+        ("empty", [query @ Expr::Query { .. }]) => {
+            EvalValue::Json(Value::Bool(count_query(query, scope) == 0))
+        }
+        ("empty", [expr]) => {
+            EvalValue::Json(Value::Bool(is_empty_value(&eval_expr_value(expr, scope))))
+        }
+        _ => EvalValue::Error,
     }
 }
 
@@ -1739,7 +1786,7 @@ fn count_query(query: &Expr, scope: &EvalScope<'_>) -> i64 {
             .filter(|fact| {
                 guard.as_ref().is_none_or(|guard| {
                     let value = json_from_str(&fact.value_json);
-                    eval_expr(guard, &scope.projection(&value)).as_bool() == Some(true)
+                    eval_expr_value(guard, &scope.projection(&value)).as_bool() == Some(true)
                 })
             })
             .count() as i64,
@@ -1761,7 +1808,7 @@ fn count_query(query: &Expr, scope: &EvalScope<'_>) -> i64 {
                             "status": effect.status,
                             "profile": effect.profile,
                         });
-                        eval_expr(guard, &scope.projection(&value)).as_bool() == Some(true)
+                        eval_expr_value(guard, &scope.projection(&value)).as_bool() == Some(true)
                     })
                 })
                 .count() as i64
@@ -1769,55 +1816,76 @@ fn count_query(query: &Expr, scope: &EvalScope<'_>) -> i64 {
     }
 }
 
-fn eval_path(path: &[String], scope: &EvalScope<'_>) -> Option<Value> {
+fn eval_path(path: &[String], scope: &EvalScope<'_>) -> EvalValue {
     if path.is_empty() {
-        return None;
+        return EvalValue::Error;
     }
     if let Some(context) = scope.context {
         if let Some(first) = path.first() {
             if let Some(rest) = path.get(1..) {
                 if rest.is_empty() {
-                    return context.bindings.iter().find_map(|(binding, fact)| {
-                        (binding == first).then(|| json_from_str(&fact.value_json))
-                    });
+                    return context
+                        .bindings
+                        .iter()
+                        .find_map(|(binding, fact)| {
+                            (binding == first)
+                                .then(|| EvalValue::Json(json_from_str(&fact.value_json)))
+                        })
+                        .unwrap_or(EvalValue::Missing);
                 }
                 if let Some(value) = context_path_value(context, first, &rest.join(".")) {
-                    return Some(value);
+                    return EvalValue::Json(value);
                 }
+                return EvalValue::Missing;
             }
         }
     }
     if let Some(projection) = scope.projection {
         let mut current = projection;
         for field in path {
-            current = current.get(field)?;
+            let Some(next) = current.get(field) else {
+                return EvalValue::Missing;
+            };
+            current = next;
         }
-        return Some(current.clone());
+        return EvalValue::Json(current.clone());
     }
-    None
+    EvalValue::Missing
 }
 
-fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Bool(value) => *value,
-        Value::Null => false,
-        Value::Array(values) => !values.is_empty(),
-        Value::String(value) => !value.is_empty(),
-        Value::Number(value) => value.as_i64().unwrap_or(0) != 0,
-        Value::Object(value) => !value.is_empty(),
+fn compare_eq(left: &EvalValue, right: &EvalValue) -> bool {
+    match (left, right) {
+        (EvalValue::Json(left), EvalValue::Json(right)) => left == right,
+        (EvalValue::Missing, EvalValue::Missing) => true,
+        _ => false,
     }
 }
 
-fn number_value(value: &Value) -> Option<f64> {
-    value.as_f64()
+fn truthy(value: &EvalValue) -> bool {
+    match value {
+        EvalValue::Json(Value::Bool(value)) => *value,
+        EvalValue::Json(Value::Null) | EvalValue::Missing | EvalValue::Error => false,
+        EvalValue::Json(Value::Array(values)) => !values.is_empty(),
+        EvalValue::Json(Value::String(value)) => !value.is_empty(),
+        EvalValue::Json(Value::Number(value)) => value.as_i64().unwrap_or(0) != 0,
+        EvalValue::Json(Value::Object(value)) => !value.is_empty(),
+    }
 }
 
-fn is_empty_value(value: &Value) -> bool {
+fn number_value(value: &EvalValue) -> Option<f64> {
     match value {
-        Value::Null => true,
-        Value::String(value) => value.is_empty(),
-        Value::Array(value) => value.is_empty(),
-        Value::Object(value) => value.is_empty(),
+        EvalValue::Json(value) => value.as_f64(),
+        _ => None,
+    }
+}
+
+fn is_empty_value(value: &EvalValue) -> bool {
+    match value {
+        EvalValue::Missing => true,
+        EvalValue::Json(Value::Null) => true,
+        EvalValue::Json(Value::String(value)) => value.is_empty(),
+        EvalValue::Json(Value::Array(value)) => value.is_empty(),
+        EvalValue::Json(Value::Object(value)) => value.is_empty(),
         _ => false,
     }
 }

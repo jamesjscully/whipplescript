@@ -1701,7 +1701,17 @@ fn validate_expression(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match parse_expression(expr) {
-        Ok(expr) => validate_expr_node(rule, &expr, semantic, binding_types, diagnostics),
+        Ok(expr) => {
+            let presence_proofs = BTreeSet::new();
+            validate_expr_node(
+                rule,
+                &expr,
+                semantic,
+                binding_types,
+                &presence_proofs,
+                diagnostics,
+            );
+        }
         Err(message) => diagnostics.push(Diagnostic {
             span: rule.body.span,
             message: format!("rule `{}` has invalid {label} expression: {message}", rule.name.name),
@@ -1715,6 +1725,7 @@ fn validate_expr_node(
     expr: &Expr,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
+    presence_proofs: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match expr {
@@ -1726,6 +1737,22 @@ fn validate_expr_node(
             let Some(schema) = binding_types.get(root) else {
                 return;
             };
+            if let Err(message) =
+                validate_optional_path_access(schema, &path[1..], semantic, presence_proofs)
+            {
+                diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` has unsafe optional path `{}`: {message}",
+                        rule.name.name,
+                        path.join(".")
+                    ),
+                    suggestion: Some(
+                        "prove the optional value is present before reading through it".to_owned(),
+                    ),
+                });
+                return;
+            }
             if let Err(message) = semantic.schemas.resolve_field_path(schema, &path[1..]) {
                 diagnostics.push(Diagnostic {
                     span: rule.body.span,
@@ -1740,15 +1767,65 @@ fn validate_expr_node(
         }
         Expr::Array(items) => {
             for item in items {
-                validate_expr_node(rule, item, semantic, binding_types, diagnostics);
+                validate_expr_node(
+                    rule,
+                    item,
+                    semantic,
+                    binding_types,
+                    presence_proofs,
+                    diagnostics,
+                );
             }
         }
-        Expr::Unary { expr, .. } => {
-            validate_expr_node(rule, expr, semantic, binding_types, diagnostics)
+        Expr::Unary { expr, .. } => validate_expr_node(
+            rule,
+            expr,
+            semantic,
+            binding_types,
+            presence_proofs,
+            diagnostics,
+        ),
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            validate_expr_node(
+                rule,
+                left,
+                semantic,
+                binding_types,
+                presence_proofs,
+                diagnostics,
+            );
+            let mut right_proofs = presence_proofs.clone();
+            collect_presence_proofs(left, &mut right_proofs);
+            validate_expr_node(
+                rule,
+                right,
+                semantic,
+                binding_types,
+                &right_proofs,
+                diagnostics,
+            );
         }
         Expr::Binary { op, left, right } => {
-            validate_expr_node(rule, left, semantic, binding_types, diagnostics);
-            validate_expr_node(rule, right, semantic, binding_types, diagnostics);
+            validate_expr_node(
+                rule,
+                left,
+                semantic,
+                binding_types,
+                presence_proofs,
+                diagnostics,
+            );
+            validate_expr_node(
+                rule,
+                right,
+                semantic,
+                binding_types,
+                presence_proofs,
+                diagnostics,
+            );
             validate_finite_domain_expr(
                 rule,
                 *op,
@@ -1761,15 +1838,129 @@ fn validate_expr_node(
         }
         Expr::Call { args, .. } => {
             for arg in args {
-                validate_expr_node(rule, arg, semantic, binding_types, diagnostics);
+                validate_expr_node(
+                    rule,
+                    arg,
+                    semantic,
+                    binding_types,
+                    presence_proofs,
+                    diagnostics,
+                );
             }
         }
         Expr::Query { guard, .. } => {
             if let Some(guard) = guard {
-                validate_expr_node(rule, guard, semantic, binding_types, diagnostics);
+                validate_expr_node(
+                    rule,
+                    guard,
+                    semantic,
+                    binding_types,
+                    presence_proofs,
+                    diagnostics,
+                );
             }
         }
         Expr::Literal(_) => {}
+    }
+}
+
+fn validate_optional_path_access(
+    root_schema: &str,
+    path: &[String],
+    semantic: &SemanticContext,
+    presence_proofs: &BTreeSet<String>,
+) -> Result<(), String> {
+    let mut schema = root_schema.to_owned();
+    let mut prefix = Vec::new();
+    for (index, field) in path.iter().enumerate() {
+        let Some(fields) = semantic.schemas.classes.get(&schema) else {
+            return Ok(());
+        };
+        let Some(field_ty) = fields.get(field) else {
+            return Ok(());
+        };
+        prefix.push(field.clone());
+        if let TypeSyntax::Optional { inner, .. } = field_ty {
+            if index + 1 < path.len() && !presence_proofs.contains(&prefix.join(".")) {
+                return Err(format!(
+                    "`{}` must be proven present before accessing `{}`",
+                    prefix.join("."),
+                    path[index + 1..].join(".")
+                ));
+            }
+            if let Some(next_schema) = schema_name_for_path(inner) {
+                schema = next_schema;
+            }
+            continue;
+        }
+        if let Some(next_schema) = schema_name_for_path(field_ty) {
+            schema = next_schema;
+        }
+    }
+    Ok(())
+}
+
+fn collect_presence_proofs(expr: &Expr, proofs: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::Ne,
+            left,
+            right,
+        } => {
+            if matches!(**right, Expr::Literal(ExprLiteral::Null)) {
+                if let Some(path) = expr_path_key(left) {
+                    proofs.insert(path);
+                }
+            }
+            if matches!(**left, Expr::Literal(ExprLiteral::Null)) {
+                if let Some(path) = expr_path_key(right) {
+                    proofs.insert(path);
+                }
+            }
+        }
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => {
+            if let Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } = expr.as_ref()
+            {
+                if matches!(**right, Expr::Literal(ExprLiteral::Null)) {
+                    if let Some(path) = expr_path_key(left) {
+                        proofs.insert(path);
+                    }
+                }
+                if matches!(**left, Expr::Literal(ExprLiteral::Null)) {
+                    if let Some(path) = expr_path_key(right) {
+                        proofs.insert(path);
+                    }
+                }
+            }
+        }
+        Expr::Call { name, args } if name == "exists" && args.len() == 1 => {
+            if let Some(path) = expr_path_key(&args[0]) {
+                proofs.insert(path);
+            }
+        }
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            collect_presence_proofs(left, proofs);
+            collect_presence_proofs(right, proofs);
+        }
+        _ => {}
+    }
+}
+
+fn expr_path_key(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Path(path) if path.len() >= 2 => Some(path[1..].join(".")),
+        _ => None,
     }
 }
 
@@ -2840,9 +3031,13 @@ impl<'a> ExprParser<'a> {
                 Ok(Expr::Literal(ExprLiteral::Null))
             }
             Some(ExprTokenKind::Ident(value)) if value == "exists" && !self.at_symbol('(') => {
+                let arg = match self.parse_primary()? {
+                    Expr::Literal(ExprLiteral::Ident(path)) => Expr::Path(vec![path]),
+                    expr => expr,
+                };
                 Ok(Expr::Call {
                     name: value,
-                    args: vec![self.parse_primary()?],
+                    args: vec![arg],
                 })
             }
             Some(ExprTokenKind::Ident(value))
@@ -4603,6 +4798,66 @@ rule seed
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("field `LanguageTask.provider` cannot reference agent `claude`")));
+    }
+
+    #[test]
+    fn requires_presence_proof_for_optional_field_access() {
+        let source = r#"
+workflow OptionalProof
+
+class Person {
+  name string
+}
+
+class Issue {
+  assignee Person?
+}
+
+rule unsafe_optional
+  when Issue as issue where issue.assignee.name == "Ada"
+=> {
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("unsafe optional path `issue.assignee.name`")));
+    }
+
+    #[test]
+    fn accepts_presence_proof_before_optional_field_access() {
+        let source = r#"
+workflow OptionalProof
+
+class Person {
+  name string
+}
+
+class Issue {
+  assignee Person?
+}
+
+rule safe_optional
+  when Issue as issue where issue.assignee != null && issue.assignee.name == "Ada"
+=> {
+}
+
+rule safe_exists
+  when Issue as issue where exists issue.assignee && issue.assignee.name == "Ada"
+=> {
+}
+
+rule safe_not_null
+  when Issue as issue where !(issue.assignee == null) && issue.assignee.name == "Ada"
+=> {
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        assert!(compiled.ir.is_some());
     }
 
     #[test]

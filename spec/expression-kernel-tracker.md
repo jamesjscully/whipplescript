@@ -56,11 +56,11 @@ The expression kernel covers deterministic logic used by:
 | Effect projection query `effect kind K where expr` | [x] | [x] | [~] | [x] | [ ] | [x] | Parsed as expression query nodes and evaluated in assertions. |
 | `count(collection)` | [x] | [x] | [~] | [x] | [ ] | [x] | Implemented over fact/effect projection queries. |
 | `exists(collection)` | [x] | [x] | [~] | [x] | [ ] | [x] | Implemented over projection queries. |
-| `exists path` presence proof | [x] | [x] | [~] | [x] | [~] | [ ] | Runtime checks non-null; proof tracking is not implemented. |
+| `exists path` presence proof | [x] | [x] | [~] | [x] | [~] | [x] | Runtime checks non-missing/non-null; local parser proof tracking accepts `exists x` before optional field access. |
 | `empty(collection)` / `empty(expr)` | [x] | [x] | [~] | [x] | [ ] | [x] | Implemented for projections, arrays, objects, strings, and null. |
 | Equality `==` | [x] | [x] | [~] | [x] | [~] | [x] | Runtime supports JSON scalar equality; compiler has finite-domain typo diagnostics but not full comparability typing. |
 | Inequality `!=` | [x] | [x] | [~] | [x] | [~] | [x] | Implemented with same limitations as equality. |
-| Boolean `&&` | [x] | [x] | [~] | [x] | [ ] | [x] | Runtime short-circuits; presence-proof tracking remains future work. |
+| Boolean `&&` | [x] | [x] | [~] | [x] | [ ] | [x] | Runtime short-circuits; parser carries presence proofs left-to-right. |
 | Boolean `||` | [x] | [x] | [~] | [x] | [ ] | [x] | Runtime short-circuits; presence-proof behavior remains conservative. |
 | Boolean `!` | [x] | [x] | [~] | [x] | [ ] | [x] | Implemented in shared expression parser/evaluator. |
 | Ordering `< <= > >=` | [x] | [x] | [~] | [x] | [ ] | [x] | Runtime supports numeric ordering; static type rejection is still partial. |
@@ -74,8 +74,8 @@ The expression kernel covers deterministic logic used by:
 | Typed finite-domain pattern branches | [x] | [~] | [~] | [x] | [x] | [x] | Concrete rule-body `case` branches work for enum/literal values in `whip dev`; branch guards use the shared expression evaluator. |
 | Exhaustiveness checks for finite patterns | [x] | [~] | [~] | [ ] | [x] | [x] | Parser diagnostics cover enum/literal/optional rule-body cases without fallback; not yet expression-level or source-span precise. |
 | Optional Some/None pattern branches | [x] | [~] | [~] | [~] | [x] | [x] | Rule-body `Some name` binds a present runtime value; static presence proof is still local to case validation. |
-| Optional presence proofs | [x] | [ ] | [ ] | [ ] | [~] | [ ] | Must reject unsafe optional field access unless proven present. |
-| Missing vs null distinction | [x] | [ ] | [ ] | [~] | [~] | [ ] | Runtime currently collapses missing path lookup to `null` in guards. |
+| Optional presence proofs | [x] | [x] | [~] | [x] | [~] | [x] | Parser rejects local optional field access without `x != null`, `null != x`, `exists x`, or `!(x == null)` proof. |
+| Missing vs null distinction | [x] | [x] | [~] | [x] | [~] | [x] | Expression evaluator preserves internal Missing separately from JSON null for guards/assertions/query filters. |
 | Type-directed interpolation paths | [x] | [~] | [ ] | [~] | [ ] | [x] | Existing interpolation is path-oriented but not fully expression-kernel typed. |
 | Dynamic `AgentRef<...>` | [x] | [~] | [~] | [~] | [~] | [~] | Source/IR support typed agent domains for record values and dynamic `tell`; still needs shared expression evaluator coverage. |
 | Deterministic validation capability | [~] | [ ] | [ ] | [ ] | [ ] | [ ] | Still design-level; should handle checks that do not need BAML/model judgment. |
@@ -109,9 +109,9 @@ The expression kernel covers deterministic logic used by:
 - [ ] Track result type for every expression node.
 - [ ] Reject non-boolean guard/assertion results.
 - [ ] Reject unknown fields and map indexes with non-string keys.
-- [ ] Reject field access through optional values without an accepted presence
+- [x] Reject field access through optional values without an accepted presence
   proof.
-- [ ] Implement presence proof tracking for:
+- [x] Implement presence proof tracking for:
   `x != null`, `null != x`, `exists x`, `!(x == null)`, and left-to-right
   `a && b`.
 - [ ] Reject incompatible equality comparisons.
@@ -130,7 +130,7 @@ The expression kernel covers deterministic logic used by:
 
 - [x] Replace ad hoc guard and assertion string evaluators with one typed
   expression evaluator.
-- [ ] Preserve a strict `Missing` result distinct from `Null`.
+- [x] Preserve a strict `Missing` result distinct from `Null`.
 - [x] Implement short-circuiting `&&` and `||`.
 - [x] Implement `!`.
 - [x] Implement scalar equality and inequality over typed values.
@@ -241,7 +241,7 @@ The expression kernel covers deterministic logic used by:
   expressions work in both guards and assertions where semantically valid.
 - [ ] Enum/literal, optional, and tagged-union pattern branches are typed,
   deterministic, and exhaustiveness-checked where the domain is finite.
-- [ ] Optional field access is rejected unless presence is proven.
+- [x] Optional field access is rejected unless presence is proven.
 - [x] Dynamic agent routing is typed as `AgentRef` or equivalent, and plain
   strings cannot target `tell`.
 - [ ] Assertion failures are visible in CLI JSON/human output, event or

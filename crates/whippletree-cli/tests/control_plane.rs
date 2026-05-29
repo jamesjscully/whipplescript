@@ -1236,6 +1236,63 @@ rule accept_task
     let _ = fs::remove_file(source_path);
 }
 
+#[test]
+fn dev_distinguishes_missing_from_null_in_expression_kernel() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("missing-null");
+    fs::write(
+        &source_path,
+        r#"
+workflow MissingNull
+
+class MaybeOwner {
+  owner string?
+  status "open"
+}
+
+assert count(MaybeOwner) == 1
+assert exists(MaybeOwner where owner == null)
+assert empty(MaybeOwner where missing == null)
+assert empty(MaybeOwner where exists missing)
+
+rule seed
+  when started
+=> {
+  record MaybeOwner {
+    owner null
+    status "open"
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    assert!(dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("assertions")
+        .iter()
+        .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
 fn run_json(bin: &str, args: &[&str]) -> Value {
     let text = run_text(bin, args);
     serde_json::from_str(&text).expect("valid JSON output")
