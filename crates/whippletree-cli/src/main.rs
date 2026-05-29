@@ -2973,6 +2973,9 @@ fn parse_field_value(value: &str, context: &RuleContext) -> Value {
         if let Ok(parsed) = serde_json::from_str(value) {
             return parsed;
         }
+        if let Some(parsed) = parse_inline_object_literal(value, context) {
+            return parsed;
+        }
     }
     if value == "true" {
         return Value::Bool(true);
@@ -2995,6 +2998,20 @@ fn parse_field_value(value: &str, context: &RuleContext) -> Value {
         .find(|(binding, _)| binding == value)
         .map(|(_, fact)| json_from_str(&fact.value_json))
         .unwrap_or_else(|| Value::String(value.to_owned()))
+}
+
+fn parse_inline_object_literal(value: &str, context: &RuleContext) -> Option<Value> {
+    let body = value.strip_prefix('{')?.strip_suffix('}')?.trim();
+    let mut object = serde_json::Map::new();
+    if body.is_empty() {
+        return Some(Value::Object(object));
+    }
+    for field in body.split(',') {
+        let field = field.trim();
+        let (name, value) = field.split_once(char::is_whitespace)?;
+        object.insert(name.to_owned(), parse_field_value(value.trim(), context));
+    }
+    Some(Value::Object(object))
 }
 
 fn interpolate_prompt(prompt: &str, context: &RuleContext) -> String {
@@ -4613,6 +4630,22 @@ fn trace_event_to_json(event: &TraceEvent) -> Value {
             "run_id": run_id,
             "effect_id": effect_id,
             "status": trace_status_name(status),
+        }),
+        TraceEvent::ProviderDiagnostic {
+            run_id,
+            effect_id,
+            provider,
+            status,
+            summary,
+            diagnostics_json,
+        } => json!({
+            "type": "provider_diagnostic",
+            "run_id": run_id,
+            "effect_id": effect_id,
+            "provider": provider,
+            "status": trace_status_name(status),
+            "summary": summary,
+            "diagnostics": json_from_str(diagnostics_json),
         }),
         TraceEvent::EffectBlocked { effect_id, reason } => json!({
             "type": "effect_blocked",

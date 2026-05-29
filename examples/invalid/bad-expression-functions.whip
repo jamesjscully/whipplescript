@@ -1,0 +1,32 @@
+workflow BadExpressionFunctions
+
+class Owner {
+  name string
+}
+
+class Task {
+  title string
+  labels string[]
+  metadata map<string>
+  priority int
+  ready bool
+  status "open" | "done"
+  owner Owner?
+}
+
+assert count() == 0
+assert count(Task, Task) == 0
+assert count(MissingTask) == 0
+assert count(Task where missing == "x") == 0
+assert count(Task where priority) == 0
+assert exists(1)
+assert empty(true)
+
+rule bad_function_shapes
+  when Task as task where count(task.title) == 0
+  when Task as array_task where count(array_task.labels, array_task.metadata) == 0
+  when Task as task_exists where exists(task_exists.priority)
+  when Task as task_empty where empty(task_empty.ready)
+  when Task as task_optional where empty(task_optional.owner)
+=> {
+}

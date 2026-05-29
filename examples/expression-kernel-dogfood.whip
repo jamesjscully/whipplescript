@@ -55,6 +55,7 @@ rule seed_expression_kernel_tasks
     status "queued"
     route "code"
     tags ["expression-kernel", "guards"]
+    metadata { phase "kernel" }
     owner null
     attempts 0
     priority 3
@@ -66,6 +67,7 @@ rule seed_expression_kernel_tasks
     status "queued"
     route "review"
     tags ["expression-kernel", "assertions"]
+    metadata { phase "kernel" }
     owner null
     attempts 1
     priority 2
@@ -77,6 +79,7 @@ rule seed_expression_kernel_tasks
     status "queued"
     route "docs"
     tags ["expression-kernel", "docs"]
+    metadata { phase "kernel" }
     owner null
     attempts 0
     priority 1

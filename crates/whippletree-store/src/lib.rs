@@ -1006,7 +1006,17 @@ impl SqliteStore {
             })?
             .collect::<result::Result<Vec<_>, _>>()
             .map_err(StoreError::from)?;
-        Ok(effects)
+        let mut claimable = Vec::new();
+        for effect in effects {
+            if policy_block_on(&self.connection, instance_id, &effect.effect_id)?.is_some() {
+                continue;
+            }
+            if capacity_block_on(&self.connection, instance_id, &effect.effect_id)?.is_some() {
+                continue;
+            }
+            claimable.push(effect);
+        }
+        Ok(claimable)
     }
 
     pub fn fact_exists(&self, instance_id: &str, fact_name: &str) -> StoreResult<bool> {
@@ -2191,6 +2201,9 @@ impl SqliteStore {
                 "effect dependencies are not satisfied".to_owned(),
             ));
         }
+        if let Some(reason) = capacity_block_on(&tx, run.instance_id, run.effect_id)? {
+            return Err(StoreError::Conflict(reason));
+        }
 
         let event = append_event_on(
             &tx,
@@ -3129,6 +3142,117 @@ fn policy_block_on(
     }
 
     Ok(None)
+}
+
+fn capacity_block_on(
+    connection: &Connection,
+    instance_id: &str,
+    effect_id: &str,
+) -> StoreResult<Option<String>> {
+    let Some((kind, target, declared_profiles)) = connection
+        .query_row(
+            r#"
+            SELECT effects.kind,
+                   effects.target,
+                   program_versions.declared_profiles
+            FROM effects
+            JOIN instances ON instances.instance_id = effects.instance_id
+            JOIN program_versions ON program_versions.version_id = instances.version_id
+            WHERE effects.instance_id = ?1
+              AND effects.effect_id = ?2
+            "#,
+            params![instance_id, effect_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    if kind != "agent.tell" {
+        return Ok(None);
+    }
+    let Some(agent) = target else {
+        return Ok(None);
+    };
+    let Some(capacity) = declared_agent_capacity(&declared_profiles, &agent)? else {
+        return Ok(None);
+    };
+    let running = connection.query_row(
+        r#"
+        SELECT COUNT(*)
+        FROM effects
+        WHERE instance_id = ?1
+          AND kind = 'agent.tell'
+          AND target = ?2
+          AND status = 'running'
+        "#,
+        params![instance_id, agent],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if running >= capacity {
+        Ok(Some(format!(
+            "agent `{agent}` capacity exhausted ({running}/{capacity} running)"
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+fn declared_agent_capacity(declared_profiles_json: &str, agent: &str) -> StoreResult<Option<i64>> {
+    let parsed = serde_json::from_str::<Value>(declared_profiles_json)?;
+    Ok(agent_capacity_in_value(&parsed, agent))
+}
+
+fn agent_capacity_in_value(value: &Value, agent: &str) -> Option<i64> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| agent_capacity_in_value(item, agent)),
+        Value::Object(object) => {
+            if let Some(capacity) = object.get(agent).and_then(capacity_value) {
+                return Some(capacity);
+            }
+            if let Some(capacity) = object
+                .get(agent)
+                .and_then(|entry| entry.get("capacity"))
+                .and_then(capacity_value)
+            {
+                return Some(capacity);
+            }
+            if let Some(capacity) = object
+                .get("agents")
+                .and_then(|agents| agent_capacity_in_value(agents, agent))
+            {
+                return Some(capacity);
+            }
+            let declared_agent = object
+                .get("name")
+                .or_else(|| object.get("agent"))
+                .or_else(|| object.get("agent_name"))
+                .or_else(|| object.get("target"))
+                .and_then(Value::as_str);
+            if declared_agent == Some(agent) {
+                object.get("capacity").and_then(capacity_value)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn capacity_value(value: &Value) -> Option<i64> {
+    value.as_i64().or_else(|| {
+        value
+            .as_u64()
+            .and_then(|capacity| i64::try_from(capacity).ok())
+    })
 }
 
 fn required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
@@ -4684,6 +4808,142 @@ mod tests {
             .as_deref()
             .expect("policy reason")
             .contains("repo.write"));
+    }
+
+    #[test]
+    fn policy_blocked_effects_are_not_claimable() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Ralph", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let effects = [NewEffect {
+            required_capabilities_json: r#"["plugin.memory"]"#,
+            ..test_effect("memory", "agent.tell", "rule=start;effect=memory")
+        }];
+
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                effects: &effects,
+                dependencies: &[],
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commits");
+
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+
+        assert!(claimable.is_empty());
+        assert_eq!(effect_status(&store, "memory"), "queued");
+    }
+
+    #[test]
+    fn agent_capacity_limits_claimability_and_run_start() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(NewProgramVersion {
+                declared_profiles_json: r#"[{"name":"worker","profile":"repo-writer","capacity":1}]"#,
+                ..test_program_version("Capacity", "source-1", "ir-1")
+            })
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let effects = [
+            test_effect("tell-one", "agent.tell", "rule=start;effect=tell-one"),
+            test_effect("tell-two", "agent.tell", "rule=start;effect=tell-two"),
+        ];
+
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                effects: &effects,
+                dependencies: &[],
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commits");
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert_eq!(
+            claimable
+                .iter()
+                .map(|effect| effect.effect_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tell-one", "tell-two"]
+        );
+
+        store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell-one",
+                run_id: "run-one",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-one",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("first run starts");
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects reload");
+        assert!(claimable.is_empty());
+
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell-two",
+                run_id: "run-two",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-two",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("capacity blocks second run");
+        assert!(
+            matches!(blocked, StoreError::Conflict(message) if message.contains("capacity exhausted"))
+        );
+        assert_eq!(effect_status(&store, "tell-two"), "queued");
+
+        store
+            .complete_effect(EffectCompletion {
+                instance_id: &instance.instance_id,
+                effect_id: "tell-one",
+                run_id: "run-one",
+                provider: "test",
+                worker_id: "worker-1",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some("done"),
+                metadata_json: "{}",
+                idempotency_key: Some("complete-one"),
+            })
+            .expect("first run completes");
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects after completion");
+        assert_eq!(claimable.len(), 1);
+        assert_eq!(claimable[0].effect_id, "tell-two");
     }
 
     #[test]

@@ -40,16 +40,16 @@ as complete:
 
 | Feature | Spec | Validation | Implementation | Tests | Owner / Notes |
 | --- | --- | --- | --- | --- | --- |
-| Full guard/assertion type checking | [x] | [x] | [~] | [x] | Assertions now reuse guard-style expression validation for boolean results, finite-domain checks, unknown dotted roots, and simple fact-query guards. Remaining gaps: typed query heads beyond simple classes and full function arity/shape checking. |
-| Expression object literals | [x] | [ ] | [~] | [~] | Spec now requires expected-schema-only expression object literals. Record-body JSON exists, but expression-level object AST and schema-directed validation are missing. |
-| Duration/time ordering | [x] | [ ] | [~] | [ ] | Spec now defines allowed ordered pairs and normalization. Primitive type names exist, but expression typing/evaluation still treats them mostly as strings/numbers. |
+| Full guard/assertion type checking | [x] | [x] | [~] | [x] | Assertions now reuse guard-style expression validation for boolean results, finite-domain checks, unknown dotted roots, and simple fact-query guards. Added a pending invalid fixture for full function/query diagnostics; implementation still accepts it. |
+| Expression object literals | [x] | [x] | [~] | [x] | Record-field expected-schema object/map literals now work for inline construction and dogfood metadata. Remaining gaps: effect argument fields, multiline nested object bodies, and general expression AST object literals. |
+| Duration/time ordering | [x] | [x] | [~] | [x] | Added executable tests documenting current limitations: duration/time ordering is rejected as non-numeric and source cannot seed concrete duration/time values yet. |
 | Enum/literal finite-domain typing | [x] | [~] | [~] | [~] | Spec now requires precise finite-domain types, symmetric comparison checks, and contradiction diagnostics. Typed query heads remain partial. |
 | Generated per-program Maude checks | [x] | [x] | [~] | [x] | Generated searches now cover symbolic guard true/false/error and assertion pass/fail/error non-mutation while preserving dependency checks. Remaining gap: full expression-semantics lowering rather than finite symbolic outcomes. |
-| AgentRef profile/capacity/capability constraints | [x] | [~] | [~] | [~] | Spec now defines declared-agent metadata, static constraints, runtime authorization, claimability, and IR provenance. Implementation is incomplete. |
-| Tagged terminal-output union branch matching | [x] | [~] | [ ] | [~] | Docs now define tagged terminal-output branch semantics. `after ... completes` still lacks a typed terminal union payload. |
-| Branch pattern spans and typed lowering | [~] | [ ] | [~] | [~] | Main/parser+CLI. Case validation exists, but diagnostics point at coarse rule-body spans and CLI lowering duplicates parser heuristics. |
-| Assertion diagnostics and event surfaces | [x] | [x] | [~] | [x] | Store now records/lists durable diagnostics with source spans and links. Remaining gap: wire assertion/provider failures into rule/provider transactions and trace export. |
-| Provider/harness failure capture | [x] | [~] | [~] | [~] | Specs now define startup/auth/tool/transport/timeout failure events and idempotent retry behavior. Codex/Claude/Pi harness implementations remain partial. |
+| AgentRef profile/capacity/capability constraints | [x] | [x] | [~] | [x] | Store claimability now filters policy-blocked effects and enforces per-agent capacity when declarations are persisted. Remaining gaps: persist declared agents from real programs, dynamic AgentRef ambiguity checks, and durable blocked-by-capacity status. |
+| Tagged terminal-output union branch matching | [x] | [x] | [ ] | [~] | Tracker now has a concrete source/IR/lowering/runtime/test checklist. `after ... completes` still lacks a typed terminal union payload. |
+| Branch pattern spans and typed lowering | [~] | [x] | [~] | [~] | Read-only analysis identified exact parser/CLI targets and a branch-binding leak risk. Implementation still pending. |
+| Assertion diagnostics and event surfaces | [x] | [x] | [~] | [x] | Store now records/lists durable diagnostics; kernel trace now emits provider diagnostics. Remaining gap: persist assertion/provider diagnostics through store transactions and CLI trace export. |
+| Provider/harness failure capture | [x] | [x] | [~] | [x] | Kernel trace now includes provider diagnostics before terminal failure/timeout events. Durable store/CLI export wiring remains partial. |
 | Parser-only expression matrix | [x] | [x] | [x] | [x] | Parser-only tests now cover precedence, calls, fact/effect queries, map indexes, arrays, invalid syntax, and optional presence-proof syntax. |
 | Golden IR expression fixture | [x] | [x] | [x] | [x] | Added `examples/expression-kernel-dogfood.whip/.ir` covering guards, assertions, projections, maps, arrays, optional presence, and deterministic routing. |
 | Static-analysis diagnostic matrix | [x] | [x] | [~] | [x] | Added tests for assertion validation, symmetric finite-domain literal checks, and unknown dotted roots. Remaining categories need broader per-row coverage. |
@@ -63,6 +63,12 @@ as complete:
 | Generated Maude validation | `crates/whippletree-cli/src/main.rs` | Guard-gated rule and assertion non-mutation generated searches landed while preserving dependency checks. |
 | Store diagnostics | `crates/whippletree-store/src/lib.rs`, `crates/whippletree-store/migrations/0001_runtime_store.sql` | Durable diagnostic record/list APIs, schema columns, idempotency indexes, and legacy upgrade coverage landed. |
 | Golden dogfood fixture | `examples/expression-kernel-dogfood.whip`, `examples/expression-kernel-dogfood.ir` | Compiled golden fixture landed for guards, assertions, projections, map indexes, optional presence, arrays, and deterministic routing. |
+| Object/map literal construction | `crates/whippletree-parser/src/lib.rs`, `crates/whippletree-cli/src/main.rs`, `examples/expression-kernel-dogfood.*` | Record-field map/object literals now validate and materialize, including dogfood `metadata { phase "kernel" }`. |
+| Duration/time validation coverage | `crates/whippletree-cli/tests/control_plane.rs` | Added tests pinning the current unsupported state for duration/time ordering and value seeding. |
+| Function/query validation fixture | `examples/invalid/bad-expression-functions.*` | Added desired diagnostics fixture; current compiler still accepts it, so it is not wired into invalid fixture discovery yet. |
+| Provider diagnostics trace slice | `crates/whippletree-kernel/src/trace.rs`, `crates/whippletree-kernel/src/lib.rs`, `crates/whippletree-cli/src/main.rs` | Provider diagnostics now appear in kernel trace and CLI trace JSON before terminal events. |
+| AgentRef store enforcement | `crates/whippletree-store/src/lib.rs` | Claimability filters profile/capability-blocked effects and start-run enforces per-agent capacity when metadata exists. |
+| Tagged terminal checklist | `spec/expression-kernel-tracker.md` | Added implementation checklist for tagged terminal-output union branch matching. |
 
 ## Current Implementation Summary
 
@@ -233,6 +239,46 @@ as complete:
   extractors, and provider-text pattern matching until a concrete workflow
   requires them.
 
+Tagged terminal-output union branch matching implementation checklist:
+
+- [ ] Source syntax: accept `case <effectBinding>.output { <Tag> <name> [where
+  <expr>] => { ... } }` in `after <effectBinding> completes` bodies, using the
+  documented terminal tags such as `Completed`, `Failed`, and `Blocked`; keep
+  plain status strings and provider transcript text out of the pattern syntax.
+- [ ] Source binding rules: require each tagged branch to bind a payload name;
+  inside the branch, the payload has only the fields declared for that terminal
+  tag, while the outer effect binding remains available for common metadata.
+- [ ] IR shape: represent the `after ... completes` binding as a typed
+  terminal-output union whose alternatives carry `{ tag, payloadType,
+  sourceSpan }`, and represent each branch as `{ tag, binding, guardExpr,
+  body, patternSpan }` rather than lowering tags to ad hoc string comparisons.
+- [ ] CLI lowering behavior: lower tagged branches before effect graph commit
+  in `whip dev`; evaluate the terminal tag match first, then the branch guard
+  with the tag-refined payload binding, and commit only the selected branch's
+  facts/effects.
+- [ ] Parser diagnostics: reject tagged-terminal patterns outside typed
+  `after ... completes` scopes, unknown terminal tags, duplicate tags,
+  branches without payload bindings, field reads invalid for the refined tag,
+  non-boolean branch guards, and non-exhaustive total matches without wildcard
+  or default coverage.
+- [ ] Runtime branch selection: select exactly one branch for each terminal
+  output by tag plus guard; treat non-matching guards as branch misses; surface
+  multiple-match, no-match for required total cases, and guard evaluation errors
+  as structured diagnostics with the branch span.
+- [ ] Validation matrix: add parser/type-checker cases for accepted
+  `Completed`/`Failed`/`Blocked` branches, guarded branches, unknown tags,
+  duplicate tags, wrong-scope patterns, invalid payload fields, and missing
+  payload bindings.
+- [ ] IR snapshots: add a golden fixture showing terminal-output union
+  alternatives and branch-level source spans for `after ... completes`.
+- [ ] Runtime/e2e acceptance: add an e2e workflow where a completed turn records
+  an artifact, a failed turn records provider failure, a blocked turn asks for
+  human action, and an unmatched or erroring branch produces a deterministic
+  diagnostic without committing sibling branch effects.
+- [ ] Maude acceptance: extend the existing finite-domain branch model with
+  terminal tags so generated/search tests cover tag match, tag miss,
+  guard-filtered miss, and exhaustiveness diagnostics.
+
 ### 7. Tests And Fixtures
 
 - [ ] Parser tests for every expression form.
@@ -245,6 +291,8 @@ as complete:
 - [~] Parser/type-checker tests for enum, literal, optional, and tagged-union
   pattern branches.
 - [x] Exhaustiveness diagnostic tests for finite pattern domains.
+- [ ] Golden IR and e2e tests for tagged terminal-output union branches over
+  `after ... completes` payloads.
 - [x] E2E test showing `&&`, `||`, `!`, ordering, `in`, `exists`, `empty`, and
   `count` in source.
 - [x] E2E test showing assertion failures reach JSON output and nonzero exit.

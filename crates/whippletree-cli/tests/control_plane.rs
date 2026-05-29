@@ -1237,6 +1237,123 @@ rule accept_task
 }
 
 #[test]
+fn check_reports_duration_and_time_ordering_as_non_numeric() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let source_path = temp_workflow_path("duration-time-ordering-check");
+    fs::write(
+        &source_path,
+        r#"
+workflow DurationTimeOrderingCheck
+
+class Window {
+  elapsed duration
+  limit duration
+  opened_at time
+  due_at time
+}
+
+rule duration_guard
+  when Window as window where window.elapsed < window.limit
+=> {
+}
+
+rule time_guard
+  when Window as window where window.opened_at < window.due_at
+=> {
+}
+"#,
+    )
+    .expect("write source");
+
+    let output = Command::new(bin)
+        .args(["check", source_path.to_str().expect("utf-8 source path")])
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "static diagnostics should not emit check snapshots\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("rule `duration_guard` orders non-numeric expression values"));
+    assert!(stderr.contains("rule `time_guard` orders non-numeric expression values"));
+    assert!(stderr.contains("use ordering only with int or float values"));
+
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn dev_cannot_yet_seed_duration_or_time_values_for_ordering() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("duration-time-ordering-literals");
+    fs::write(
+        &source_path,
+        r#"
+workflow DurationTimeOrderingLiterals
+
+class Window {
+  elapsed duration
+  limit duration
+  opened_at time
+  due_at time
+}
+
+assert exists(Window where elapsed < limit)
+assert exists(Window where opened_at < due_at)
+
+rule seed
+  when started
+=> {
+  record Window {
+    elapsed "PT1H"
+    limit "PT2H"
+    opened_at "2026-05-29T10:00:00Z"
+    due_at "2026-05-29T11:00:00Z"
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "static diagnostics should not emit dev JSON\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "field `Window.elapsed` expects `duration`",
+        "field `Window.limit` expects `duration`",
+        "field `Window.opened_at` expects `time`",
+        "field `Window.due_at` expects `time`",
+    ] {
+        assert!(stderr.contains(expected), "stderr:\n{stderr}");
+    }
+    assert!(stderr.contains("record a value compatible with `duration`"));
+    assert!(stderr.contains("record a value compatible with `time`"));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
 fn dev_reports_false_guards_without_committing_effects() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
@@ -1462,7 +1579,7 @@ rule seed
   when started
 => {
   record MapTask {
-    metadata {"priority":"high","owner":"ada"}
+    metadata { priority "high", owner "ada" }
   }
 }
 

@@ -60,6 +60,14 @@ pub enum TraceEvent {
         effect_id: String,
         status: EffectStatus,
     },
+    ProviderDiagnostic {
+        run_id: String,
+        effect_id: String,
+        provider: String,
+        status: EffectStatus,
+        summary: String,
+        diagnostics_json: String,
+    },
     EffectBlocked {
         effect_id: String,
         reason: String,
@@ -269,6 +277,61 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
             state.terminal_effects.insert(effect_id.clone());
             state.effects.insert(effect_id.clone(), status.clone());
         }
+        TraceEvent::ProviderDiagnostic {
+            run_id,
+            effect_id,
+            status,
+            diagnostics_json,
+            ..
+        } => {
+            if !status.is_terminal() {
+                return violation(
+                    record,
+                    format!("provider diagnostic used non-terminal status {status:?}"),
+                );
+            }
+            let Some(run_effect_id) = state.run_effects.get(run_id) else {
+                return violation(
+                    record,
+                    format!("provider diagnostic for unknown run {run_id}"),
+                );
+            };
+            if run_effect_id != effect_id {
+                return violation(
+                    record,
+                    format!("provider diagnostic for run {run_id} on wrong effect {effect_id}"),
+                );
+            }
+            if state.stale_runs.contains(run_id) {
+                return violation(
+                    record,
+                    format!("provider diagnostic from stale run {run_id}"),
+                );
+            }
+            if !state.live_runs.contains(run_id) {
+                return violation(
+                    record,
+                    format!("provider diagnostic for non-live run {run_id}"),
+                );
+            }
+            let Some(effect_status) = state.effects.get(effect_id) else {
+                return violation(
+                    record,
+                    format!("provider diagnostic for unknown effect {effect_id}"),
+                );
+            };
+            if *effect_status != EffectStatus::Running {
+                return violation(
+                    record,
+                    format!(
+                        "provider diagnostic for effect {effect_id} in status {effect_status:?}"
+                    ),
+                );
+            }
+            if serde_json::from_str::<serde_json::Value>(diagnostics_json).is_err() {
+                return violation(record, "provider diagnostic metadata is not valid JSON");
+            }
+        }
         TraceEvent::EffectBlocked { effect_id, .. } => {
             let Some(status) = state.effects.get(effect_id) else {
                 return violation(record, format!("blocked unknown effect {effect_id}"));
@@ -402,6 +465,20 @@ mod tests {
         }
     }
 
+    fn diagnostic(sequence: u64, effect_id: &str, status: EffectStatus) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::ProviderDiagnostic {
+                run_id: format!("run-{effect_id}"),
+                effect_id: effect_id.to_owned(),
+                provider: "test".to_owned(),
+                status,
+                summary: "provider failed".to_owned(),
+                diagnostics_json: r#"{"error":"boom"}"#.to_owned(),
+            },
+        }
+    }
+
     #[test]
     fn accepts_claim_after_success_dependency() {
         let trace = vec![
@@ -420,6 +497,19 @@ mod tests {
             terminal(6, "upstream", EffectStatus::Completed),
             claim(7, "downstream"),
             start(8, "downstream"),
+        ];
+
+        assert_eq!(check_trace(&trace), Ok(()));
+    }
+
+    #[test]
+    fn accepts_provider_diagnostic_before_terminal_event() {
+        let trace = vec![
+            effect_created(1, "a"),
+            claim(2, "a"),
+            start(3, "a"),
+            diagnostic(4, "a", EffectStatus::Failed),
+            terminal(5, "a", EffectStatus::Failed),
         ];
 
         assert_eq!(check_trace(&trace), Ok(()));
@@ -479,6 +569,43 @@ mod tests {
 
         let violation = check_trace(&trace).expect_err("stale lease completion should fail");
         assert!(violation.message.contains("stale run"));
+    }
+
+    #[test]
+    fn rejects_provider_diagnostic_after_terminal_event() {
+        let trace = vec![
+            effect_created(1, "a"),
+            claim(2, "a"),
+            start(3, "a"),
+            terminal(4, "a", EffectStatus::Failed),
+            diagnostic(5, "a", EffectStatus::Failed),
+        ];
+
+        let violation = check_trace(&trace).expect_err("late diagnostic should fail");
+        assert!(violation.message.contains("non-live run"));
+    }
+
+    #[test]
+    fn rejects_provider_diagnostic_with_invalid_json() {
+        let trace = vec![
+            effect_created(1, "a"),
+            claim(2, "a"),
+            start(3, "a"),
+            TraceRecord {
+                sequence: 4,
+                event: TraceEvent::ProviderDiagnostic {
+                    run_id: "run-a".to_owned(),
+                    effect_id: "a".to_owned(),
+                    provider: "test".to_owned(),
+                    status: EffectStatus::Failed,
+                    summary: "provider failed".to_owned(),
+                    diagnostics_json: "not json".to_owned(),
+                },
+            },
+        ];
+
+        let violation = check_trace(&trace).expect_err("invalid diagnostic JSON should fail");
+        assert!(violation.message.contains("valid JSON"));
     }
 
     #[test]

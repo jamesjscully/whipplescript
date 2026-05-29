@@ -50,7 +50,7 @@ rules
       pattern:started
     writes
       schema:KernelTask
-    body_hash 7c137273acced3db
+    body_hash 67c80e9beb46dbc4
   rule route_expression_kernel_task
     when KernelTask as task where ((((((task.status == "queued") && (task.route in ["code", "review", "docs"])) && ("expression-kernel" in task.tags)) && ("phase" in task.metadata)) && (task.metadata["phase"] == "kernel")) && ((task.owner == null) || exists(task.owner))) && !(task.priority > 5)
     when task.provider is available

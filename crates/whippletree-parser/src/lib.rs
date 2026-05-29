@@ -2076,6 +2076,39 @@ fn validate_expr_node(
             }
             let root = &path[0];
             let Some(schema) = scope.binding_types.get(root) else {
+                if let Some(schema) = &scope.implicit_schema {
+                    if let Err(message) =
+                        validate_optional_path_access(schema, path, semantic, presence_proofs)
+                    {
+                        diagnostics.push(Diagnostic {
+                            span: context.span,
+                            message: format!(
+                                "{} has unsafe optional path `{}`: {message}",
+                                context.subject,
+                                path.join(".")
+                            ),
+                            suggestion: Some(
+                                "prove the optional value is present before reading through it"
+                                    .to_owned(),
+                            ),
+                        });
+                        return;
+                    }
+                    if let Err(message) = semantic.schemas.resolve_field_path(schema, path) {
+                        diagnostics.push(Diagnostic {
+                            span: context.span,
+                            message: format!(
+                                "{} has invalid expression path `{}`: {message}",
+                                context.subject,
+                                path.join(".")
+                            ),
+                            suggestion: Some(
+                                "use a field declared on the queried schema".to_owned(),
+                            ),
+                        });
+                    }
+                    return;
+                }
                 diagnostics.push(Diagnostic {
                     span: context.span,
                     message: format!("{} has unknown expression root `{root}`", context.subject),
@@ -2281,6 +2314,7 @@ fn collect_presence_proofs(expr: &Expr, proofs: &mut BTreeSet<String>) {
 
 fn expr_path_key(expr: &Expr) -> Option<String> {
     match expr {
+        Expr::Literal(ExprLiteral::Ident(name)) => Some(name.clone()),
         Expr::Path(path) if path.len() >= 2 => Some(path[1..].join(".")),
         Expr::Index { target, key } => {
             let target = expr_path_key(target)?;
@@ -2552,10 +2586,17 @@ fn expr_path_type(
     if path.len() < 2 {
         return None;
     }
-    let schema = scope.binding_types.get(&path[0])?;
+    if let Some(schema) = scope.binding_types.get(&path[0]) {
+        return semantic
+            .schemas
+            .resolve_field_path(schema, &path[1..])
+            .ok()
+            .map(|ty| expr_type_from_type_syntax(&ty));
+    }
+    let schema = scope.implicit_schema.as_ref()?;
     semantic
         .schemas
-        .resolve_field_path(schema, &path[1..])
+        .resolve_field_path(schema, path)
         .ok()
         .map(|ty| expr_type_from_type_syntax(&ty))
 }
@@ -3424,6 +3465,16 @@ fn validate_record_field(
         semantic,
         diagnostics,
     );
+    validate_expected_assignment(
+        rule,
+        record_schema,
+        field,
+        field_ty,
+        expr,
+        semantic,
+        binding_types,
+        diagnostics,
+    );
 }
 
 fn record_field_assignment(line: &str) -> Option<(&str, &str)> {
@@ -3431,6 +3482,93 @@ fn record_field_assignment(line: &str) -> Option<(&str, &str)> {
     let field = &line[..field_end];
     let expr = line[field_end..].trim();
     (!field.is_empty() && !expr.is_empty()).then_some((field, expr))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObjectLiteralField {
+    key: String,
+    value: String,
+}
+
+fn parse_object_literal(expr: &str) -> Result<Vec<ObjectLiteralField>, String> {
+    let tokens = lex_expr(expr);
+    let mut pos = 0usize;
+    if !matches!(
+        tokens.get(pos).map(|token| &token.kind),
+        Some(ExprTokenKind::Symbol('{'))
+    ) {
+        return Err("expected `{`".to_owned());
+    }
+    pos += 1;
+    let mut fields = Vec::new();
+    if matches!(
+        tokens.get(pos).map(|token| &token.kind),
+        Some(ExprTokenKind::Symbol('}'))
+    ) {
+        pos += 1;
+        if pos == tokens.len() {
+            return Ok(fields);
+        }
+        return Err("unexpected token after object literal".to_owned());
+    }
+
+    while pos < tokens.len() {
+        let key = match tokens.get(pos).map(|token| &token.kind) {
+            Some(ExprTokenKind::Ident(value) | ExprTokenKind::String(value)) => value.clone(),
+            _ => return Err("expected object field name".to_owned()),
+        };
+        pos += 1;
+
+        let value_start = pos;
+        let mut depth = 0i32;
+        while pos < tokens.len() {
+            match tokens.get(pos).map(|token| &token.kind) {
+                Some(ExprTokenKind::Symbol('{') | ExprTokenKind::Symbol('[')) => {
+                    depth += 1;
+                    pos += 1;
+                }
+                Some(ExprTokenKind::Symbol('}') | ExprTokenKind::Symbol(']')) if depth > 0 => {
+                    depth -= 1;
+                    pos += 1;
+                }
+                Some(ExprTokenKind::Symbol('}' | ',')) if depth == 0 => break,
+                Some(_) => pos += 1,
+                None => break,
+            }
+        }
+        if value_start == pos {
+            return Err(format!("field `{key}` is missing a value"));
+        }
+        let value = tokens[value_start..pos]
+            .iter()
+            .map(expr_token_text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        fields.push(ObjectLiteralField { key, value });
+
+        match tokens.get(pos).map(|token| &token.kind) {
+            Some(ExprTokenKind::Symbol(',')) => pos += 1,
+            Some(ExprTokenKind::Symbol('}')) => {
+                pos += 1;
+                if pos == tokens.len() {
+                    return Ok(fields);
+                }
+                return Err("unexpected token after object literal".to_owned());
+            }
+            _ => return Err("expected `}`".to_owned()),
+        }
+    }
+
+    Err("unterminated object literal".to_owned())
+}
+
+fn expr_token_text(token: &ExprToken) -> String {
+    match &token.kind {
+        ExprTokenKind::Ident(value) | ExprTokenKind::Number(value) => value.clone(),
+        ExprTokenKind::String(value) => format!("{value:?}"),
+        ExprTokenKind::Symbol(value) => value.to_string(),
+        ExprTokenKind::Op(value) => value.to_string(),
+    }
 }
 
 fn expression_path(expr: &str) -> Option<(String, Vec<String>)> {
@@ -3500,6 +3638,404 @@ fn validate_literal_assignment(
             }
         }
         TypeSyntax::Array { .. } | TypeSyntax::Map { .. } => {}
+    }
+}
+
+fn validate_expected_assignment(
+    rule: &RuleDecl,
+    record_schema: &str,
+    field: &str,
+    field_ty: &TypeSyntax,
+    expr: &str,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !(expr.trim_start().starts_with('{') || expr.trim_start().starts_with('[')) {
+        return;
+    }
+    validate_expr_source_against_type(
+        rule,
+        record_schema,
+        field,
+        field_ty,
+        expr,
+        semantic,
+        &ExprScope::from_bindings(binding_types),
+        diagnostics,
+    );
+}
+
+fn validate_expr_source_against_type(
+    rule: &RuleDecl,
+    record_schema: &str,
+    field: &str,
+    expected_ty: &TypeSyntax,
+    expr: &str,
+    semantic: &SemanticContext,
+    scope: &ExprScope,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match expected_ty {
+        TypeSyntax::Map { inner, .. } => {
+            let fields = match parse_object_literal(expr) {
+                Ok(fields) => fields,
+                Err(message) => {
+                    diagnostics.push(Diagnostic {
+                        span: rule.body.span,
+                        message: format!(
+                            "field `{record_schema}.{field}` expects a map literal: {message}"
+                        ),
+                        suggestion: Some(format!("record `{field} {{ key value }}`")),
+                    });
+                    return;
+                }
+            };
+            for map_field in &fields {
+                validate_expr_source_against_type(
+                    rule,
+                    record_schema,
+                    field,
+                    inner,
+                    &map_field.value,
+                    semantic,
+                    scope,
+                    diagnostics,
+                );
+            }
+        }
+        TypeSyntax::Array { inner, .. } => match parse_expression(expr) {
+            Ok(Expr::Array(items)) => {
+                for item in items {
+                    validate_expr_against_type(
+                        rule,
+                        record_schema,
+                        field,
+                        inner,
+                        &item,
+                        semantic,
+                        scope,
+                        diagnostics,
+                    );
+                }
+            }
+            Ok(expr) => validate_inferred_assignment_type(
+                rule,
+                record_schema,
+                field,
+                expected_ty,
+                &expr,
+                semantic,
+                scope,
+                diagnostics,
+            ),
+            Err(message) => {
+                push_invalid_assignment_expr(rule, record_schema, field, message, diagnostics)
+            }
+        },
+        TypeSyntax::Optional { inner, .. } => {
+            if expr.trim() != "null" {
+                validate_expr_source_against_type(
+                    rule,
+                    record_schema,
+                    field,
+                    inner,
+                    expr,
+                    semantic,
+                    scope,
+                    diagnostics,
+                );
+            }
+        }
+        TypeSyntax::Ref { name } if semantic.schemas.class_exists(&name.name) => {
+            let fields = match parse_object_literal(expr) {
+                Ok(fields) => fields,
+                Err(_) => {
+                    match parse_expression(expr) {
+                        Ok(expr) => validate_inferred_assignment_type(
+                            rule,
+                            record_schema,
+                            field,
+                            expected_ty,
+                            &expr,
+                            semantic,
+                            scope,
+                            diagnostics,
+                        ),
+                        Err(message) => push_invalid_assignment_expr(
+                            rule,
+                            record_schema,
+                            field,
+                            message,
+                            diagnostics,
+                        ),
+                    }
+                    return;
+                }
+            };
+            validate_object_literal_fields(
+                rule,
+                record_schema,
+                field,
+                &name.name,
+                &fields,
+                semantic,
+                scope,
+                diagnostics,
+            );
+        }
+        _ => match parse_expression(expr) {
+            Ok(expr) => validate_inferred_assignment_type(
+                rule,
+                record_schema,
+                field,
+                expected_ty,
+                &expr,
+                semantic,
+                scope,
+                diagnostics,
+            ),
+            Err(message) => {
+                push_invalid_assignment_expr(rule, record_schema, field, message, diagnostics)
+            }
+        },
+    }
+}
+
+fn validate_expr_against_type(
+    rule: &RuleDecl,
+    record_schema: &str,
+    field: &str,
+    expected_ty: &TypeSyntax,
+    expr: &Expr,
+    semantic: &SemanticContext,
+    scope: &ExprScope,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match expr {
+        Expr::Array(items) if matches!(expected_ty, TypeSyntax::Array { .. }) => {
+            if let TypeSyntax::Array { inner, .. } = expected_ty {
+                for item in items {
+                    validate_expr_against_type(
+                        rule,
+                        record_schema,
+                        field,
+                        inner,
+                        item,
+                        semantic,
+                        scope,
+                        diagnostics,
+                    );
+                }
+            }
+        }
+        _ => validate_inferred_assignment_type(
+            rule,
+            record_schema,
+            field,
+            expected_ty,
+            expr,
+            semantic,
+            scope,
+            diagnostics,
+        ),
+    }
+}
+
+fn push_invalid_assignment_expr(
+    rule: &RuleDecl,
+    record_schema: &str,
+    field: &str,
+    message: String,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    diagnostics.push(Diagnostic {
+        span: rule.body.span,
+        message: format!(
+            "rule `{}` has invalid expression for field `{record_schema}.{field}`: {message}",
+            rule.name.name
+        ),
+        suggestion: Some(
+            "use array literals or expected-schema object literals for collection fields"
+                .to_owned(),
+        ),
+    });
+}
+
+fn validate_object_literal_fields(
+    rule: &RuleDecl,
+    record_schema: &str,
+    field: &str,
+    object_schema: &str,
+    object_fields: &[ObjectLiteralField],
+    semantic: &SemanticContext,
+    scope: &ExprScope,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(schema_fields) = semantic.schemas.classes.get(object_schema) else {
+        return;
+    };
+    let mut seen = BTreeSet::new();
+    for object_field in object_fields {
+        if !seen.insert(object_field.key.clone()) {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!(
+                    "field `{record_schema}.{field}` repeats object field `{}`",
+                    object_field.key
+                ),
+                suggestion: Some("remove the duplicate object field".to_owned()),
+            });
+            continue;
+        }
+        let Some(field_ty) = schema_fields.get(&object_field.key) else {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!(
+                    "class `{object_schema}` has no field `{}`",
+                    object_field.key
+                ),
+                suggestion: Some(format!(
+                    "add `{}` to `class {object_schema}` or use an existing field",
+                    object_field.key
+                )),
+            });
+            continue;
+        };
+        validate_expr_source_against_type(
+            rule,
+            object_schema,
+            &object_field.key,
+            field_ty,
+            &object_field.value,
+            semantic,
+            scope,
+            diagnostics,
+        );
+    }
+    for (required, ty) in schema_fields {
+        if seen.contains(required) || matches!(ty, TypeSyntax::Optional { .. }) {
+            continue;
+        }
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!(
+                "field `{record_schema}.{field}` is missing required object field `{object_schema}.{required}`"
+            ),
+            suggestion: Some(format!("add `{required}` to the `{field}` object literal")),
+        });
+    }
+}
+
+fn validate_inferred_assignment_type(
+    rule: &RuleDecl,
+    record_schema: &str,
+    field: &str,
+    expected_ty: &TypeSyntax,
+    expr: &Expr,
+    semantic: &SemanticContext,
+    scope: &ExprScope,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let literal = expr_literal_as_literal_expr(expr);
+    if let Some(literal) = literal {
+        validate_literal_against_type(
+            rule,
+            record_schema,
+            field,
+            expected_ty,
+            &literal,
+            semantic,
+            diagnostics,
+        );
+        return;
+    }
+
+    let context = ExprValidationContext::rule(rule);
+    let mut local_diagnostics = Vec::new();
+    let actual_ty = infer_expr_type(expr, semantic, scope, &context, &mut local_diagnostics);
+    diagnostics.extend(local_diagnostics);
+    let expected_expr_ty = expr_type_from_type_syntax(expected_ty);
+    if !types_comparable(&actual_ty, &expected_expr_ty) {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!(
+                "field `{record_schema}.{field}` receives incompatible expression type"
+            ),
+            suggestion: Some(format!(
+                "record a value compatible with `{}`",
+                expected_ty.to_source()
+            )),
+        });
+    }
+}
+
+fn validate_literal_against_type(
+    rule: &RuleDecl,
+    record_schema: &str,
+    field: &str,
+    field_ty: &TypeSyntax,
+    literal: &LiteralExpr<'_>,
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match field_ty {
+        TypeSyntax::Primitive { name, .. } => {
+            validate_primitive_literal(rule, record_schema, field, name, literal, diagnostics)
+        }
+        TypeSyntax::LiteralString { value, .. } => {
+            if literal != &LiteralExpr::String(value.as_str()) {
+                diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!(
+                        "field `{record_schema}.{field}` expects literal string `{value}`"
+                    ),
+                    suggestion: Some(format!("record `{field} {value:?}`")),
+                });
+            }
+        }
+        TypeSyntax::Ref { name } => {
+            validate_enum_literal(
+                rule,
+                record_schema,
+                field,
+                &name.name,
+                literal,
+                semantic,
+                diagnostics,
+            );
+        }
+        TypeSyntax::Union { variants, .. } => {
+            validate_union_literal(rule, record_schema, field, variants, literal, diagnostics);
+        }
+        TypeSyntax::AgentRef { agents, .. } => {
+            validate_agent_ref_literal(rule, record_schema, field, agents, literal, diagnostics);
+        }
+        TypeSyntax::Optional { inner, .. } => {
+            if literal != &LiteralExpr::Null {
+                validate_literal_against_type(
+                    rule,
+                    record_schema,
+                    field,
+                    inner,
+                    literal,
+                    semantic,
+                    diagnostics,
+                );
+            }
+        }
+        TypeSyntax::Array { .. } | TypeSyntax::Map { .. } => {}
+    }
+}
+
+fn expr_literal_as_literal_expr(expr: &Expr) -> Option<LiteralExpr<'_>> {
+    match expr {
+        Expr::Literal(ExprLiteral::String(value)) => Some(LiteralExpr::String(value)),
+        Expr::Literal(ExprLiteral::Number(value)) => Some(LiteralExpr::Number(value)),
+        Expr::Literal(ExprLiteral::Bool(_)) => Some(LiteralExpr::Bool),
+        Expr::Literal(ExprLiteral::Null) => Some(LiteralExpr::Null),
+        Expr::Literal(ExprLiteral::Ident(value)) => Some(LiteralExpr::Ident(value)),
+        _ => None,
     }
 }
 
@@ -5601,6 +6137,83 @@ rule safe_not_null
     }
 
     #[test]
+    fn validates_expected_schema_object_and_map_record_fields() {
+        let source = r#"
+workflow ObjectRecordFields
+
+class Owner {
+  name string
+}
+
+class Task {
+  title string
+  metadata map<string>
+  owner Owner?
+}
+
+rule seed
+  when started
+=> {
+  record Task {
+    title "Implement object literals"
+    metadata { phase "kernel" }
+    owner { name "Ada" }
+  }
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_expected_schema_object_and_map_record_fields() {
+        let source = r#"
+workflow BadObjectRecordFields
+
+class Owner {
+  name string
+}
+
+class Task {
+  metadata map<string>
+  owner Owner
+}
+
+rule seed
+  when started
+=> {
+  record Task {
+    metadata { phase 1 }
+    owner { alias "Ada" }
+  }
+}
+
+rule bad_guard
+  when Task as task where { phase "kernel" } == task.metadata
+=> {
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("field `Task.metadata` expects `string`")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("class `Owner` has no field `alias`")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("missing required object field `Owner.name`")));
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("invalid guard expression")));
+    }
+
+    #[test]
     fn rejects_invalid_expression_types() {
         let source = r#"
 workflow BadExpressionTypes
@@ -5879,6 +6492,10 @@ rule_dependencies
             (
                 include_str!("../../../examples/provider-language-e2e.whip"),
                 include_str!("../../../examples/provider-language-e2e.ir"),
+            ),
+            (
+                include_str!("../../../examples/expression-kernel-dogfood.whip"),
+                include_str!("../../../examples/expression-kernel-dogfood.ir"),
             ),
             (
                 include_str!("../../../examples/ralph.whip"),

@@ -425,6 +425,14 @@ impl RuntimeKernel {
         });
         self.record_provider_result(execution, &result)?;
         let metadata_json = provider_metadata(&result);
+        self.emit_provider_diagnostic(
+            execution.run_id,
+            execution.effect_id,
+            execution.provider,
+            provider_effect_status(&result.status),
+            &result.summary,
+            &metadata_json,
+        );
         let completion = EffectCompletion {
             instance_id: execution.instance_id,
             effect_id: execution.effect_id,
@@ -470,6 +478,14 @@ impl RuntimeKernel {
         let result = client.coerce(execution.request);
         self.record_baml_result(execution, &result)?;
         let metadata_json = baml_metadata(&result);
+        self.emit_provider_diagnostic(
+            execution.run_id,
+            execution.effect_id,
+            execution.provider,
+            baml_effect_status(&result.status),
+            &result.summary,
+            &metadata_json,
+        );
         let completion = EffectCompletion {
             instance_id: execution.instance_id,
             effect_id: execution.effect_id,
@@ -515,6 +531,14 @@ impl RuntimeKernel {
         let result = client.execute(execution.request);
         self.record_loft_result(execution, &result)?;
         let metadata_json = loft_metadata(&result);
+        self.emit_provider_diagnostic(
+            execution.run_id,
+            execution.effect_id,
+            execution.provider,
+            loft_effect_status(&result.status),
+            &result.summary,
+            &metadata_json,
+        );
         let completion = EffectCompletion {
             instance_id: execution.instance_id,
             effect_id: execution.effect_id,
@@ -965,6 +989,28 @@ impl RuntimeKernel {
             event,
         });
     }
+
+    fn emit_provider_diagnostic(
+        &mut self,
+        run_id: &str,
+        effect_id: &str,
+        provider: &str,
+        status: EffectStatus,
+        summary: &str,
+        diagnostics_json: &str,
+    ) {
+        if status == EffectStatus::Completed {
+            return;
+        }
+        self.emit(TraceEvent::ProviderDiagnostic {
+            run_id: run_id.to_owned(),
+            effect_id: effect_id.to_owned(),
+            provider: provider.to_owned(),
+            status,
+            summary: summary.to_owned(),
+            diagnostics_json: diagnostics_json.to_owned(),
+        });
+    }
 }
 
 fn effect_status(status: &str) -> EffectStatus {
@@ -1009,6 +1055,14 @@ fn provider_status(status: &ProviderRunStatus) -> &'static str {
     }
 }
 
+fn provider_effect_status(status: &ProviderRunStatus) -> EffectStatus {
+    match status {
+        ProviderRunStatus::Completed => EffectStatus::Completed,
+        ProviderRunStatus::Failed => EffectStatus::Failed,
+        ProviderRunStatus::TimedOut => EffectStatus::TimedOut,
+    }
+}
+
 fn provider_metadata(result: &ProviderRunResult) -> String {
     json!({
         "stdout": result.stdout,
@@ -1041,6 +1095,14 @@ fn baml_status(status: &BamlCoerceStatus) -> &'static str {
     }
 }
 
+fn baml_effect_status(status: &BamlCoerceStatus) -> EffectStatus {
+    match status {
+        BamlCoerceStatus::Succeeded => EffectStatus::Completed,
+        BamlCoerceStatus::Failed => EffectStatus::Failed,
+        BamlCoerceStatus::TimedOut => EffectStatus::TimedOut,
+    }
+}
+
 fn baml_exit_code(status: &BamlCoerceStatus) -> Option<i64> {
     match status {
         BamlCoerceStatus::Succeeded => Some(0),
@@ -1064,6 +1126,14 @@ fn loft_status(status: &LoftEffectStatus) -> &'static str {
         LoftEffectStatus::Succeeded => "completed",
         LoftEffectStatus::Failed => "failed",
         LoftEffectStatus::TimedOut => "timed_out",
+    }
+}
+
+fn loft_effect_status(status: &LoftEffectStatus) -> EffectStatus {
+    match status {
+        LoftEffectStatus::Succeeded => EffectStatus::Completed,
+        LoftEffectStatus::Failed => EffectStatus::Failed,
+        LoftEffectStatus::TimedOut => EffectStatus::TimedOut,
     }
 }
 
@@ -1793,6 +1863,22 @@ rule wait
             )
             .expect("mock turn records failure");
 
+        assert!(kernel.trace().iter().any(|record| matches!(
+            &record.event,
+            TraceEvent::ProviderDiagnostic {
+                run_id,
+                effect_id,
+                provider,
+                status,
+                diagnostics_json,
+                ..
+            } if run_id == "run-tell"
+                && effect_id == "tell"
+                && provider == "mock"
+                && *status == EffectStatus::Failed
+                && diagnostics_json.contains("\"phase\":\"provider.fixture.failed\"")
+        )));
+        check_trace(kernel.trace()).expect("kernel trace conforms");
         let store = kernel.into_store();
         let events = store.list_events(&instance_id).expect("events list");
         assert!(events
@@ -2015,6 +2101,21 @@ rule wait
             )
             .expect("failed coerce records terminal event");
 
+        assert!(kernel.trace().iter().any(|record| matches!(
+            &record.event,
+            TraceEvent::ProviderDiagnostic {
+                run_id,
+                effect_id,
+                provider,
+                status,
+                diagnostics_json,
+                ..
+            } if run_id == "run-review"
+                && effect_id == "review"
+                && provider == "fake-baml"
+                && *status == EffectStatus::Failed
+                && diagnostics_json.contains("invalid output")
+        )));
         check_trace(kernel.trace()).expect("kernel trace conforms");
         let store = kernel.into_store();
         let facts = store.list_facts(&instance_id).expect("facts list");
@@ -2193,6 +2294,21 @@ rule wait
             )
             .expect("failed claim records terminal event");
 
+        assert!(kernel.trace().iter().any(|record| matches!(
+            &record.event,
+            TraceEvent::ProviderDiagnostic {
+                run_id,
+                effect_id,
+                provider,
+                status,
+                diagnostics_json,
+                ..
+            } if run_id == "run-claim"
+                && effect_id == "claim"
+                && provider == "fake-loft"
+                && *status == EffectStatus::Failed
+                && diagnostics_json.contains("issue already leased")
+        )));
         check_trace(kernel.trace()).expect("kernel trace conforms");
         let store = kernel.into_store();
         let facts = store.list_facts(&instance_id).expect("facts list");
