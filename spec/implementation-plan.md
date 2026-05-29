@@ -622,9 +622,9 @@ not be considered complete until that tracker reaches its acceptance gates.
   lowered guard predicates before effect graphs can commit.
 - [x] Add deterministic assertion syntax over fact/effect projections for e2e
   checks.
-- [ ] Replace ad hoc guard/assertion string evaluators with a shared typed
+- [x] Replace ad hoc guard/assertion string evaluators with a shared typed
   expression evaluator.
-- [ ] Preserve `Missing` separately from `Null` and reject unsafe optional field
+- [x] Preserve `Missing` separately from `Null` and reject unsafe optional field
   access unless a presence proof exists.
 - [ ] Add static matrix seeding for small typed fixture tables.
 - [ ] Add rule-template/action-block expansion for repeated effect chains,

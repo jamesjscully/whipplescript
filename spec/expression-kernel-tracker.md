@@ -151,7 +151,7 @@ The expression kernel covers deterministic logic used by:
 - [x] Add typed expression IR with source spans and stable snapshot rendering.
 - [x] Lower guard expressions into rule readiness predicates.
 - [x] Lower assertion expressions into deterministic checkpoint metadata.
-- [ ] Lower fact/effect projection reads into rule/assertion read metadata.
+- [x] Lower fact/effect projection reads into rule/assertion read metadata.
 - [ ] Extend generated per-program Maude checks so a rule can commit only after
   its lowered guard predicate is true.
 - [ ] Generate Maude coverage for false/error guard cases and assertion failure
@@ -196,7 +196,7 @@ The expression kernel covers deterministic logic used by:
 ### 7. Tests And Fixtures
 
 - [ ] Parser tests for every expression form.
-- [ ] Golden IR snapshots for guards and assertions using every operator class.
+- [~] Golden IR snapshots for guards and assertions using every operator class.
 - [ ] Static-analysis tests for unknown bindings, unknown fields, optional
   misuse, invalid enums, invalid literal values, bad membership, bad ordering,
   bad array literals, and bad `AgentRef` targets.

@@ -227,6 +227,7 @@ pub struct IrProgram {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrAssertion {
     pub expr: IrExpression,
+    pub projection_reads: Vec<IrProjectionRead>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -347,9 +348,30 @@ pub struct IrRuleDependency {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IrRuleMetadata {
     pub fact_reads: Vec<String>,
+    pub projection_reads: Vec<IrProjectionRead>,
     pub fact_writes: Vec<String>,
     pub effects: Vec<IrEffectNode>,
     pub dependencies: Vec<IrEffectDependency>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrProjectionRead {
+    pub kind: QueryKind,
+    pub head: String,
+    pub guard: Option<String>,
+}
+
+impl IrProjectionRead {
+    fn to_snapshot(&self) -> String {
+        let prefix = match self.kind {
+            QueryKind::Fact => format!("fact:{}", self.head),
+            QueryKind::Effect => format!("effect:{}", self.head),
+        };
+        match &self.guard {
+            Some(guard) => format!("{prefix} where {guard}"),
+            None => prefix,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -713,6 +735,12 @@ impl IrProgram {
                     &mut snapshot,
                     format!("  assert {}", assertion.expr.expr.to_snapshot()),
                 );
+                if !assertion.projection_reads.is_empty() {
+                    push_line(&mut snapshot, "    reads");
+                    for read in &assertion.projection_reads {
+                        push_line(&mut snapshot, format!("      {}", read.to_snapshot()));
+                    }
+                }
             }
         }
 
@@ -737,6 +765,12 @@ impl IrProgram {
                     push_line(&mut snapshot, "    reads");
                     for read in &rule.metadata.fact_reads {
                         push_line(&mut snapshot, format!("      {}", read));
+                    }
+                }
+                if !rule.metadata.projection_reads.is_empty() {
+                    push_line(&mut snapshot, "    projection_reads");
+                    for read in &rule.metadata.projection_reads {
+                        push_line(&mut snapshot, format!("      {}", read.to_snapshot()));
                     }
                 }
                 if !rule.metadata.fact_writes.is_empty() {
@@ -933,13 +967,18 @@ fn lower_program(program: Program) -> CompileOutput {
 
 fn lower_assert(assertion: AssertDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
     match parse_expression(&assertion.expr) {
-        Ok(expr) => ir.assertions.push(IrAssertion {
-            expr: IrExpression {
-                source: assertion.expr,
-                expr,
-                span: assertion.span,
-            },
-        }),
+        Ok(expr) => {
+            let mut projection_reads = collect_projection_reads(&expr);
+            sort_projection_reads(&mut projection_reads);
+            ir.assertions.push(IrAssertion {
+                expr: IrExpression {
+                    source: assertion.expr,
+                    expr,
+                    span: assertion.span,
+                },
+                projection_reads,
+            });
+        }
         Err(message) => diagnostics.push(Diagnostic {
             span: assertion.span,
             message: format!("invalid assertion expression: {message}"),
@@ -948,6 +987,56 @@ fn lower_assert(assertion: AssertDecl, ir: &mut IrProgram, diagnostics: &mut Vec
             ),
         }),
     }
+}
+
+fn lower_expression(source: &str, span: SourceSpan) -> Option<IrExpression> {
+    parse_expression(source).ok().map(|expr| IrExpression {
+        source: source.to_owned(),
+        expr,
+        span,
+    })
+}
+
+fn collect_projection_reads(expr: &Expr) -> Vec<IrProjectionRead> {
+    let mut reads = Vec::new();
+    collect_projection_reads_into(expr, &mut reads);
+    reads
+}
+
+fn collect_projection_reads_into(expr: &Expr, reads: &mut Vec<IrProjectionRead>) {
+    match expr {
+        Expr::Literal(_) | Expr::Path(_) => {}
+        Expr::Array(items) => {
+            for item in items {
+                collect_projection_reads_into(item, reads);
+            }
+        }
+        Expr::Unary { expr, .. } => collect_projection_reads_into(expr, reads),
+        Expr::Binary { left, right, .. } => {
+            collect_projection_reads_into(left, reads);
+            collect_projection_reads_into(right, reads);
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_projection_reads_into(arg, reads);
+            }
+        }
+        Expr::Query { kind, head, guard } => {
+            reads.push(IrProjectionRead {
+                kind: *kind,
+                head: head.clone(),
+                guard: guard.as_ref().map(|guard| guard.to_snapshot()),
+            });
+            if let Some(guard) = guard {
+                collect_projection_reads_into(guard, reads);
+            }
+        }
+    }
+}
+
+fn sort_projection_reads(reads: &mut Vec<IrProjectionRead>) {
+    reads.sort_by_key(IrProjectionRead::to_snapshot);
+    reads.dedup();
 }
 
 fn collect_schema_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> BTreeSet<String> {
@@ -1448,16 +1537,13 @@ fn lower_when_clause(when: WhenClause) -> IrWhen {
     let pattern = pattern.to_owned();
     let guard = guard_source.and_then(|guard_source| {
         let guard_offset = source.find(guard_source).unwrap_or(0);
-        parse_expression(guard_source)
-            .ok()
-            .map(|expr| IrExpression {
-                source: guard_source.to_owned(),
-                expr,
-                span: SourceSpan {
-                    start: when.span.start + guard_offset,
-                    end: when.span.start + guard_offset + guard_source.len(),
-                },
-            })
+        lower_expression(
+            guard_source,
+            SourceSpan {
+                start: when.span.start + guard_offset,
+                end: when.span.start + guard_offset + guard_source.len(),
+            },
+        )
     });
     IrWhen {
         source,
@@ -1542,6 +1628,11 @@ fn analyze_rule(
         if let (_, Some(guard)) = split_when_guard(&when.text) {
             validate_expression(rule, guard, semantic, &binding_types, "guard", diagnostics);
             validate_known_field_paths(rule, guard, semantic, &binding_types, diagnostics);
+            if let Some(expr) = lower_expression(guard, when.span) {
+                metadata
+                    .projection_reads
+                    .extend(collect_projection_reads(&expr.expr));
+            }
         }
         validate_availability_when(rule, &when.text, semantic, &binding_types, diagnostics);
     }
@@ -1681,6 +1772,7 @@ fn analyze_rule(
 
     metadata.fact_reads.sort();
     metadata.fact_reads.dedup();
+    sort_projection_reads(&mut metadata.projection_reads);
     metadata.fact_writes.sort();
     metadata.fact_writes.dedup();
     metadata
@@ -5603,6 +5695,46 @@ assert count(Result where status == "done") == 1
         assert_eq!(
             assertion.expr.expr.to_snapshot(),
             "count(Result where status == \"done\") == 1"
+        );
+        assert_eq!(
+            assertion
+                .projection_reads
+                .iter()
+                .map(IrProjectionRead::to_snapshot)
+                .collect::<Vec<_>>(),
+            vec!["fact:Result where status == \"done\""]
+        );
+    }
+
+    #[test]
+    fn lowers_guard_projection_reads_to_rule_metadata() {
+        let source = r#"
+workflow GuardProjection
+
+class Task {
+  status "ready"
+}
+
+class Result {
+  status "done"
+}
+
+rule gated
+  when Task as task where exists(Result where status == "done")
+=> {
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("valid ir");
+        let rule = ir.rules.first().expect("rule");
+        assert_eq!(
+            rule.metadata
+                .projection_reads
+                .iter()
+                .map(IrProjectionRead::to_snapshot)
+                .collect::<Vec<_>>(),
+            vec!["fact:Result where status == \"done\""]
         );
     }
 

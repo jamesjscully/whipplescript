@@ -30,10 +30,20 @@ coerces
   coerce reviewLanguageArtifact(language string, expectedScript string, artifactPath string, turnSummary string) -> ref<LanguageQualityReview>
 assertions
   assert count(LanguageE2EResult where provider == "codex") == 2
+    reads
+      fact:LanguageE2EResult where provider == "codex"
   assert count(LanguageE2EResult where provider == "claude") == 2
+    reads
+      fact:LanguageE2EResult where provider == "claude"
   assert count(LanguageE2EResult where provider == "pi") == 2
+    reads
+      fact:LanguageE2EResult where provider == "pi"
   assert count(effect kind agent.tell where status == completed) == 6
+    reads
+      effect:kind agent.tell where status == completed
   assert count(effect kind baml.coerce where status == completed) == 6
+    reads
+      effect:kind baml.coerce where status == completed
 rules
   rule seed_language_matrix
     when started
