@@ -84,6 +84,7 @@ pub enum AgentField {
     Profile(StringLiteral),
     Capacity(u32, SourceSpan),
     Skills(Vec<StringLiteral>, SourceSpan),
+    Capabilities(Vec<StringLiteral>, SourceSpan),
     Unknown { name: Ident, span: SourceSpan },
 }
 
@@ -279,6 +280,7 @@ pub enum IrType {
     LiteralString(String),
     Ref(String),
     AgentRef(Vec<String>),
+    Object(Vec<IrClassField>),
     Optional(Box<IrType>),
     Array(Box<IrType>),
     Map(Box<IrType>),
@@ -306,6 +308,7 @@ pub struct IrAgent {
     pub profile: Option<String>,
     pub capacity: Option<u32>,
     pub skills: Vec<String>,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -352,6 +355,8 @@ pub struct IrRuleMetadata {
     pub fact_writes: Vec<String>,
     pub effects: Vec<IrEffectNode>,
     pub dependencies: Vec<IrEffectDependency>,
+    pub terminal_outputs: Vec<IrTerminalOutput>,
+    pub terminal_branches: Vec<IrTerminalCaseBranch>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -379,7 +384,9 @@ pub struct IrEffectNode {
     pub id: String,
     pub kind: IrEffectKind,
     pub binding: Option<String>,
+    pub required_capabilities: Vec<String>,
     pub idempotency_key: String,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -400,6 +407,30 @@ pub struct IrEffectDependency {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrTerminalOutput {
+    pub binding: String,
+    pub alternatives: Vec<IrTerminalAlternative>,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrTerminalAlternative {
+    pub tag: String,
+    pub payload_type: IrType,
+    pub source_span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrTerminalCaseBranch {
+    pub scrutinee: String,
+    pub tag: Option<String>,
+    pub binding: Option<String>,
+    pub guard: Option<IrExpression>,
+    pub body_hash: String,
+    pub pattern_span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DependencyPredicate {
     Succeeds,
     Fails,
@@ -410,8 +441,9 @@ pub enum DependencyPredicate {
 struct SemanticContext {
     schemas: SchemaIndex,
     agents: BTreeSet<String>,
+    agent_capabilities: BTreeMap<String, BTreeSet<String>>,
     coerce_outputs: BTreeMap<String, TypeSyntax>,
-    coerce_param_counts: BTreeMap<String, usize>,
+    coerce_params: BTreeMap<String, Vec<ParamDecl>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -724,11 +756,16 @@ impl IrProgram {
                 } else {
                     format!("[{}]", agent.skills.join(", "))
                 };
+                let capabilities = if agent.capabilities.is_empty() {
+                    "[]".to_owned()
+                } else {
+                    format!("[{}]", agent.capabilities.join(", "))
+                };
                 push_line(
                     &mut snapshot,
                     format!(
-                        "  agent {} profile={} capacity={} skills={}",
-                        agent.name, profile, capacity, skills
+                        "  agent {} profile={} capacity={} skills={} capabilities={}",
+                        agent.name, profile, capacity, skills, capabilities
                     ),
                 );
             }
@@ -836,6 +873,55 @@ impl IrProgram {
                         );
                     }
                 }
+                if !rule.metadata.terminal_outputs.is_empty() {
+                    push_line(&mut snapshot, "    terminal_outputs");
+                    for output in &rule.metadata.terminal_outputs {
+                        push_line(
+                            &mut snapshot,
+                            format!(
+                                "      {} span={}..{}",
+                                output.binding, output.span.start, output.span.end
+                            ),
+                        );
+                        for alternative in &output.alternatives {
+                            push_line(
+                                &mut snapshot,
+                                format!(
+                                    "        {} payload={} span={}..{}",
+                                    alternative.tag,
+                                    alternative.payload_type.to_snapshot(),
+                                    alternative.source_span.start,
+                                    alternative.source_span.end
+                                ),
+                            );
+                        }
+                    }
+                }
+                if !rule.metadata.terminal_branches.is_empty() {
+                    push_line(&mut snapshot, "    terminal_branches");
+                    for branch in &rule.metadata.terminal_branches {
+                        let tag = branch.tag.as_deref().unwrap_or("_");
+                        let binding = branch.binding.as_deref().unwrap_or("-");
+                        let guard = branch
+                            .guard
+                            .as_ref()
+                            .map(|guard| guard.expr.to_snapshot())
+                            .unwrap_or_else(|| "-".to_owned());
+                        push_line(
+                            &mut snapshot,
+                            format!(
+                                "      case {} {} binding={} guard={} body_hash={} span={}..{}",
+                                branch.scrutinee,
+                                tag,
+                                binding,
+                                guard,
+                                branch.body_hash,
+                                branch.pattern_span.start,
+                                branch.pattern_span.end
+                            ),
+                        );
+                    }
+                }
                 push_line(
                     &mut snapshot,
                     format!("    body_hash {}", stable_hash(&rule.body)),
@@ -899,6 +985,14 @@ impl IrType {
             Self::LiteralString(value) => format!("literal<{value:?}>"),
             Self::Ref(name) => format!("ref<{name}>"),
             Self::AgentRef(agents) => format!("agentref<{}>", agents.join(" | ")),
+            Self::Object(fields) => {
+                let fields = fields
+                    .iter()
+                    .map(|field| format!("{} {}", field.name, field.ty.to_snapshot()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("object<{{{fields}}}>")
+            }
             Self::Optional(inner) => format!("optional<{}>", inner.to_snapshot()),
             Self::Array(inner) => format!("array<{}>", inner.to_snapshot()),
             Self::Map(inner) => format!("map<{}>", inner.to_snapshot()),
@@ -1132,8 +1226,9 @@ impl SemanticContext {
     fn from_program(program: &Program) -> Self {
         let mut schemas = SchemaIndex::with_builtins();
         let mut agents = BTreeSet::new();
+        let mut agent_capabilities = BTreeMap::new();
         let mut coerce_outputs = BTreeMap::new();
-        let mut coerce_param_counts = BTreeMap::new();
+        let mut coerce_params = BTreeMap::new();
 
         for item in &program.items {
             match item {
@@ -1159,10 +1254,24 @@ impl SemanticContext {
                 }
                 Item::Agent(agent) => {
                     agents.insert(agent.name.name.clone());
+                    let capabilities = agent
+                        .fields
+                        .iter()
+                        .find_map(|field| match field {
+                            AgentField::Capabilities(capabilities, _) => Some(
+                                capabilities
+                                    .iter()
+                                    .map(|capability| capability.value.clone())
+                                    .collect::<BTreeSet<_>>(),
+                            ),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    agent_capabilities.insert(agent.name.name.clone(), capabilities);
                 }
                 Item::Coerce(coerce) => {
                     coerce_outputs.insert(coerce.name.name.clone(), coerce.output.clone());
-                    coerce_param_counts.insert(coerce.name.name.clone(), coerce.params.len());
+                    coerce_params.insert(coerce.name.name.clone(), coerce.params.clone());
                 }
                 _ => {}
             }
@@ -1171,8 +1280,9 @@ impl SemanticContext {
         Self {
             schemas,
             agents,
+            agent_capabilities,
             coerce_outputs,
-            coerce_param_counts,
+            coerce_params,
         }
     }
 }
@@ -1220,6 +1330,31 @@ impl SchemaIndex {
                 ("title", string_ty()),
                 ("path", string_ty()),
                 ("summary", string_ty()),
+            ],
+        );
+        index.insert_class(
+            "TerminalFailed",
+            [
+                ("reason", string_ty()),
+                ("summary", string_ty()),
+                ("effect_id", string_ty()),
+                ("run_id", string_ty()),
+            ],
+        );
+        index.insert_class(
+            "TerminalTimedOut",
+            [
+                ("summary", string_ty()),
+                ("effect_id", string_ty()),
+                ("run_id", string_ty()),
+            ],
+        );
+        index.insert_class(
+            "TerminalCancelled",
+            [
+                ("summary", string_ty()),
+                ("effect_id", string_ty()),
+                ("run_id", string_ty()),
             ],
         );
         index
@@ -1330,6 +1465,7 @@ fn lower_agent(agent: AgentDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
         profile: None,
         capacity: None,
         skills: Vec::new(),
+        capabilities: Vec::new(),
     };
 
     for field in agent.fields {
@@ -1364,6 +1500,22 @@ fn lower_agent(agent: AgentDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                     lowered.skills.push(skill.value);
                 }
             }
+            AgentField::Capabilities(capabilities, _) => {
+                let mut seen = BTreeSet::new();
+                for capability in capabilities {
+                    if !seen.insert(capability.value.clone()) {
+                        diagnostics.push(Diagnostic {
+                            span: capability.span,
+                            message: format!(
+                                "agent `{}` declares capability `{}` more than once",
+                                agent.name.name, capability.value
+                            ),
+                            suggestion: Some("remove the duplicate capability entry".to_owned()),
+                        });
+                    }
+                    lowered.capabilities.push(capability.value);
+                }
+            }
             AgentField::Unknown { name, .. } => {
                 diagnostics.push(Diagnostic {
                     span: name.span,
@@ -1372,7 +1524,7 @@ fn lower_agent(agent: AgentDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                         name.name, agent.name.name
                     ),
                     suggestion: Some(
-                        "supported agent fields are `profile`, `capacity`, and `skills`".to_owned(),
+                        "supported agent fields are `profile`, `capacity`, `skills`, and `capabilities`".to_owned(),
                     ),
                 });
             }
@@ -1562,7 +1714,15 @@ fn validate_type_refs(
 fn is_builtin_schema_ref(name: &str) -> bool {
     matches!(
         name,
-        "AgentTurn" | "WorkItem" | "LoftIssue" | "LoftClaim" | "HumanAnswer" | "Evidence"
+        "AgentTurn"
+            | "WorkItem"
+            | "LoftIssue"
+            | "LoftClaim"
+            | "HumanAnswer"
+            | "Evidence"
+            | "TerminalFailed"
+            | "TerminalTimedOut"
+            | "TerminalCancelled"
     )
 }
 
@@ -1675,6 +1835,12 @@ fn analyze_rule(
             binding_types.insert(binding, schema);
         }
     }
+    let effect_payload_types = collect_effect_payload_types(rule, semantic);
+    for (binding, payload_type) in &effect_payload_types {
+        if let IrType::Ref(schema) = payload_type {
+            binding_types.insert(binding.clone(), schema.clone());
+        }
+    }
     for when in &rule.whens {
         if let (_, Some(guard)) = split_when_guard(&when.text) {
             validate_expression(rule, guard, semantic, &binding_types, "guard", diagnostics);
@@ -1688,7 +1854,15 @@ fn analyze_rule(
         validate_availability_when(rule, &when.text, semantic, &binding_types, diagnostics);
     }
     validate_case_blocks(rule, semantic, &binding_types, diagnostics);
+    let terminal_metadata = collect_terminal_case_metadata(
+        rule,
+        semantic,
+        &binding_types,
+        &effect_payload_types,
+        diagnostics,
+    );
     validate_record_blocks(rule, semantic, &binding_types, diagnostics);
+    validate_effect_payloads(rule, semantic, &binding_types, diagnostics);
     let mut block_stack: Vec<BlockFrame> = Vec::new();
     let mut misplaced_effect_bindings = BTreeSet::new();
     let mut anonymous_effects = 0usize;
@@ -1787,7 +1961,6 @@ fn analyze_rule(
         }
 
         if let Some((kind, binding)) = parse_effect_line(line) {
-            validate_coerce_call(rule, line, &kind, semantic, diagnostics);
             validate_agent_tell_target(rule, line, &kind, semantic, &binding_types, diagnostics);
             anonymous_effects += 1;
             let id = binding
@@ -1811,7 +1984,9 @@ fn analyze_rule(
                 id,
                 kind,
                 binding,
+                required_capabilities: parse_required_capabilities(line),
                 idempotency_key,
+                span: rule.body.span,
             });
         }
     }
@@ -1821,7 +1996,306 @@ fn analyze_rule(
     sort_projection_reads(&mut metadata.projection_reads);
     metadata.fact_writes.sort();
     metadata.fact_writes.dedup();
+    metadata.terminal_outputs = terminal_metadata.outputs;
+    metadata.terminal_branches = terminal_metadata.branches;
     metadata
+}
+
+#[derive(Clone, Debug, Default)]
+struct TerminalMetadata {
+    outputs: Vec<IrTerminalOutput>,
+    branches: Vec<IrTerminalCaseBranch>,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalBranchSource {
+    scrutinee: String,
+    pattern: String,
+    guard: Option<String>,
+    body: String,
+    pattern_span: SourceSpan,
+}
+
+fn collect_effect_payload_types(
+    rule: &RuleDecl,
+    semantic: &SemanticContext,
+) -> BTreeMap<String, IrType> {
+    let mut payloads = BTreeMap::new();
+    for statement in effect_payload_statements(&rule.body.text) {
+        let line = statement.trim();
+        let Some((kind, Some(binding))) = parse_effect_line(line) else {
+            continue;
+        };
+        payloads.insert(
+            binding,
+            terminal_completed_payload_type(line, &kind, semantic),
+        );
+    }
+
+    payloads
+}
+
+fn terminal_completed_payload_type(
+    line: &str,
+    kind: &IrEffectKind,
+    semantic: &SemanticContext,
+) -> IrType {
+    match kind {
+        IrEffectKind::BamlCoerce => parse_coerce_call_name(line)
+            .and_then(|name| semantic.coerce_outputs.get(name))
+            .cloned()
+            .map(lower_type)
+            .unwrap_or_else(terminal_unknown_payload_type),
+        IrEffectKind::LoftClaim => IrType::Ref("LoftClaim".to_owned()),
+        IrEffectKind::HumanAsk => IrType::Ref("HumanAnswer".to_owned()),
+        IrEffectKind::AgentTell => IrType::Ref("AgentTurn".to_owned()),
+        IrEffectKind::CapabilityCall | IrEffectKind::EventEmit => terminal_unknown_payload_type(),
+    }
+}
+
+fn collect_terminal_case_metadata(
+    rule: &RuleDecl,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    effect_payload_types: &BTreeMap<String, IrType>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> TerminalMetadata {
+    let mut metadata = TerminalMetadata::default();
+    let mut output_bindings = BTreeSet::new();
+
+    for branch in terminal_case_branch_sources(rule) {
+        if output_bindings.insert(branch.scrutinee.clone()) {
+            let completed_payload = effect_payload_types
+                .get(&branch.scrutinee)
+                .cloned()
+                .unwrap_or_else(terminal_unknown_payload_type);
+            metadata.outputs.push(IrTerminalOutput {
+                binding: branch.scrutinee.clone(),
+                alternatives: terminal_alternatives(completed_payload, branch.pattern_span),
+                span: branch.pattern_span,
+            });
+        }
+
+        let (tag, binding) = parse_terminal_pattern_parts(&branch.pattern);
+        let mut branch_scope = binding_types.clone();
+        if let (Some(tag), Some(binding)) = (&tag, &binding) {
+            if let Some(schema) =
+                terminal_payload_schema_for_tag(tag, &branch.scrutinee, effect_payload_types)
+            {
+                branch_scope.insert(binding.clone(), schema);
+            }
+        }
+        if let Some(guard) = &branch.guard {
+            validate_expression(
+                rule,
+                guard,
+                semantic,
+                &branch_scope,
+                "case guard",
+                diagnostics,
+            );
+            validate_known_field_paths(rule, guard, semantic, &branch_scope, diagnostics);
+        }
+        validate_known_field_paths(rule, &branch.body, semantic, &branch_scope, diagnostics);
+        metadata.branches.push(IrTerminalCaseBranch {
+            scrutinee: branch.scrutinee,
+            tag,
+            binding,
+            guard: branch.guard.as_ref().and_then(|guard| {
+                lower_expression(
+                    guard,
+                    SourceSpan {
+                        start: branch.pattern_span.start,
+                        end: branch.pattern_span.end,
+                    },
+                )
+            }),
+            body_hash: stable_hash(&branch.body),
+            pattern_span: branch.pattern_span,
+        });
+    }
+
+    metadata
+        .outputs
+        .sort_by(|left, right| left.binding.cmp(&right.binding));
+    metadata.branches.sort_by(|left, right| {
+        (left.scrutinee.as_str(), left.pattern_span.start)
+            .cmp(&(right.scrutinee.as_str(), right.pattern_span.start))
+    });
+    metadata
+}
+
+fn terminal_case_branch_sources(rule: &RuleDecl) -> Vec<TerminalBranchSource> {
+    let lines = rule
+        .body
+        .text
+        .lines()
+        .scan(0usize, |offset, line| {
+            let current = *offset;
+            *offset += line.len() + 1;
+            Some((line, current))
+        })
+        .collect::<Vec<_>>();
+    let text_lines = lines.iter().map(|(line, _)| *line).collect::<Vec<_>>();
+    let mut branches = Vec::new();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let (line, line_offset) = lines[index];
+        let trimmed = line.trim();
+        let Some(scrutinee) = case_scrutinee(trimmed) else {
+            index += 1;
+            continue;
+        };
+        if !active_completes_binding_for_case(&text_lines, index, scrutinee) {
+            index += 1;
+            continue;
+        }
+        let mut depth = brace_delta(trimmed).max(1);
+        index += 1;
+        while index < lines.len() && depth > 0 {
+            let (branch_line, branch_line_offset) = lines[index];
+            let branch_trimmed = branch_line.trim();
+            if depth == 1 {
+                if let Some((pattern, guard, body_start)) = terminal_branch_header(branch_trimmed) {
+                    let pattern_column = branch_line.find(pattern).unwrap_or(0);
+                    let pattern_span = SourceSpan {
+                        start: rule.body.span.start + branch_line_offset + pattern_column,
+                        end: rule.body.span.start
+                            + branch_line_offset
+                            + pattern_column
+                            + pattern.len(),
+                    };
+                    let mut body_lines = Vec::new();
+                    let mut branch_depth = brace_delta(body_start).max(1);
+                    index += 1;
+                    while index < lines.len() && branch_depth > 0 {
+                        let body_line = lines[index].0;
+                        let next_depth = branch_depth + brace_delta(body_line);
+                        if next_depth >= 1 {
+                            body_lines.push(body_line.to_owned());
+                        }
+                        branch_depth = next_depth;
+                        index += 1;
+                    }
+                    branches.push(TerminalBranchSource {
+                        scrutinee: scrutinee.to_owned(),
+                        pattern: pattern.to_owned(),
+                        guard,
+                        body: body_lines.join("\n"),
+                        pattern_span,
+                    });
+                    continue;
+                }
+            }
+            depth += brace_delta(branch_trimmed);
+            index += 1;
+        }
+        let _ = line_offset;
+    }
+    branches
+}
+
+fn terminal_branch_header(line: &str) -> Option<(&str, Option<String>, &str)> {
+    let (head, body_start) = line.split_once("=>")?;
+    let body_start = body_start.trim();
+    if !body_start.starts_with('{') {
+        return None;
+    }
+    let head = head.trim();
+    let (pattern, guard) = match head.split_once(" where ") {
+        Some((pattern, guard)) => (pattern.trim(), Some(guard.trim().to_owned())),
+        None => (head, None),
+    };
+    Some((pattern, guard, body_start))
+}
+
+fn parse_terminal_pattern_parts(pattern: &str) -> (Option<String>, Option<String>) {
+    if is_fallback_pattern(pattern) {
+        return (None, None);
+    }
+    let mut parts = pattern.split_whitespace();
+    let tag = parts.next().map(str::to_owned);
+    let binding = parts.next().map(str::to_owned);
+    if parts.next().is_some() {
+        return (tag, None);
+    }
+    (tag, binding)
+}
+
+fn terminal_payload_schema_for_tag(
+    tag: &str,
+    scrutinee: &str,
+    effect_payload_types: &BTreeMap<String, IrType>,
+) -> Option<String> {
+    match tag {
+        "Completed" => match effect_payload_types.get(scrutinee) {
+            Some(IrType::Ref(schema)) => Some(schema.clone()),
+            _ => None,
+        },
+        "Failed" => Some("TerminalFailed".to_owned()),
+        "TimedOut" => Some("TerminalTimedOut".to_owned()),
+        "Cancelled" => Some("TerminalCancelled".to_owned()),
+        _ => None,
+    }
+}
+
+fn terminal_alternatives(
+    completed_payload: IrType,
+    span: SourceSpan,
+) -> Vec<IrTerminalAlternative> {
+    [
+        ("Completed", completed_payload),
+        ("Failed", terminal_failure_payload_type()),
+        ("TimedOut", terminal_timeout_payload_type()),
+        ("Cancelled", terminal_cancelled_payload_type()),
+    ]
+    .into_iter()
+    .map(|(tag, payload_type)| IrTerminalAlternative {
+        tag: tag.to_owned(),
+        payload_type,
+        source_span: span,
+    })
+    .collect()
+}
+
+fn terminal_failure_payload_type() -> IrType {
+    IrType::Object(vec![
+        ir_field("reason", IrType::Primitive(IrPrimitiveType::String)),
+        ir_field("summary", IrType::Primitive(IrPrimitiveType::String)),
+        ir_field("effect_id", IrType::Primitive(IrPrimitiveType::String)),
+        ir_field("run_id", IrType::Primitive(IrPrimitiveType::String)),
+    ])
+}
+
+fn terminal_timeout_payload_type() -> IrType {
+    IrType::Object(vec![
+        ir_field("summary", IrType::Primitive(IrPrimitiveType::String)),
+        ir_field("effect_id", IrType::Primitive(IrPrimitiveType::String)),
+        ir_field("run_id", IrType::Primitive(IrPrimitiveType::String)),
+    ])
+}
+
+fn terminal_cancelled_payload_type() -> IrType {
+    IrType::Object(vec![
+        ir_field("summary", IrType::Primitive(IrPrimitiveType::String)),
+        ir_field("effect_id", IrType::Primitive(IrPrimitiveType::String)),
+        ir_field("run_id", IrType::Primitive(IrPrimitiveType::String)),
+    ])
+}
+
+fn terminal_unknown_payload_type() -> IrType {
+    IrType::Object(vec![
+        ir_field("summary", IrType::Primitive(IrPrimitiveType::String)),
+        ir_field("effect_id", IrType::Primitive(IrPrimitiveType::String)),
+        ir_field("run_id", IrType::Primitive(IrPrimitiveType::String)),
+    ])
+}
+
+fn ir_field(name: &str, ty: IrType) -> IrClassField {
+    IrClassField {
+        name: name.to_owned(),
+        ty,
+    }
 }
 
 fn effect_idempotency_key(
@@ -1840,14 +2314,11 @@ fn effect_idempotency_key(
 fn validate_coerce_call(
     rule: &RuleDecl,
     line: &str,
-    kind: &IrEffectKind,
     semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if kind != &IrEffectKind::BamlCoerce {
-        return;
-    }
-    let Some(function_name) = parse_coerce_call_name(line) else {
+    let Some((function_name, args)) = parse_coerce_call(line) else {
         diagnostics.push(Diagnostic {
             span: rule.body.span,
             message: format!("rule `{}` has malformed coerce call", rule.name.name),
@@ -1855,7 +2326,7 @@ fn validate_coerce_call(
         });
         return;
     };
-    let Some(expected) = semantic.coerce_param_counts.get(function_name) else {
+    let Some(params) = semantic.coerce_params.get(function_name) else {
         diagnostics.push(Diagnostic {
             span: rule.body.span,
             message: format!(
@@ -1868,18 +2339,75 @@ fn validate_coerce_call(
         });
         return;
     };
-    if let Some(actual) = parse_coerce_arg_count(line) {
-        if actual != *expected {
-            diagnostics.push(Diagnostic {
-                span: rule.body.span,
-                message: format!(
-                    "rule `{}` calls coerce `{function_name}` with {actual} argument(s), expected {expected}",
-                    rule.name.name
-                ),
-                suggestion: Some("pass one argument for each declared coerce parameter".to_owned()),
-            });
+    if args.len() != params.len() {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!(
+                "rule `{}` calls coerce `{function_name}` with {} argument(s), expected {}",
+                rule.name.name,
+                args.len(),
+                params.len()
+            ),
+            suggestion: Some("pass one argument for each declared coerce parameter".to_owned()),
+        });
+        return;
+    }
+    let scope = ExprScope::from_bindings(binding_types);
+    for (arg, param) in args.iter().zip(params) {
+        validate_expr_source_against_type(
+            rule,
+            &format!("coerce `{function_name}`"),
+            &param.name.name,
+            &param.ty,
+            arg,
+            semantic,
+            &scope,
+            diagnostics,
+        );
+    }
+}
+
+fn validate_effect_payloads(
+    rule: &RuleDecl,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in effect_payload_statements(&rule.body.text) {
+        let trimmed = statement.trim();
+        if trimmed.starts_with("coerce ") {
+            validate_coerce_call(rule, trimmed, semantic, binding_types, diagnostics);
+        } else if trimmed.starts_with("claim ") {
+            validate_loft_claim_payload(rule, trimmed, semantic, binding_types, diagnostics);
         }
     }
+}
+
+fn validate_loft_claim_payload(
+    rule: &RuleDecl,
+    line: &str,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(issue_expr) = parse_loft_claim_issue_expr(line) else {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!("rule `{}` has malformed loft claim", rule.name.name),
+            suggestion: Some("write `claim issueBinding with loft as claim`".to_owned()),
+        });
+        return;
+    };
+    validate_expr_source_against_type(
+        rule,
+        "loft claim",
+        "issue",
+        &ref_ty("LoftIssue"),
+        issue_expr,
+        semantic,
+        &ExprScope::from_bindings(binding_types),
+        diagnostics,
+    );
 }
 
 fn validate_agent_tell_target(
@@ -1912,11 +2440,22 @@ fn validate_agent_tell_target(
         });
         return;
     }
+    let required_capabilities = parse_required_capabilities(line);
     if target.contains('.') {
         let Some(ty) = expression_type(target, semantic, binding_types) else {
             return;
         };
-        if !matches!(ty, TypeSyntax::AgentRef { .. }) {
+        if let TypeSyntax::AgentRef { agents, .. } = ty {
+            for agent in agents {
+                validate_agent_capabilities(
+                    rule,
+                    &agent.name,
+                    &required_capabilities,
+                    semantic,
+                    diagnostics,
+                );
+            }
+        } else {
             diagnostics.push(Diagnostic {
                 span: rule.body.span,
                 message: format!(
@@ -1937,6 +2476,39 @@ fn validate_agent_tell_target(
             message: format!("rule `{}` tells unknown agent `{target}`", rule.name.name),
             suggestion: Some("declare the target agent before telling it".to_owned()),
         });
+        return;
+    }
+    validate_agent_capabilities(rule, target, &required_capabilities, semantic, diagnostics);
+}
+
+fn validate_agent_capabilities(
+    rule: &RuleDecl,
+    agent: &str,
+    required_capabilities: &[String],
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if required_capabilities.is_empty() {
+        return;
+    }
+    let declared = semantic
+        .agent_capabilities
+        .get(agent)
+        .cloned()
+        .unwrap_or_default();
+    for capability in required_capabilities {
+        if !declared.contains(capability) {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` tells agent `{agent}` requiring undeclared capability `{capability}`",
+                    rule.name.name
+                ),
+                suggestion: Some(format!(
+                    "add `{capability}` to agent `{agent}` capabilities or choose another AgentRef target"
+                )),
+            });
+        }
     }
 }
 
@@ -2188,6 +2760,17 @@ fn validate_expr_node(
             }
         }
         Expr::Object(fields) => {
+            diagnostics.push(Diagnostic {
+                span: context.span,
+                message: format!(
+                    "{} uses an object literal without an expected object or map type",
+                    context.subject
+                ),
+                suggestion: Some(
+                    "use object literals only in typed record fields or typed effect arguments"
+                        .to_owned(),
+                ),
+            });
             for field in fields {
                 validate_expr_node(
                     &field.value,
@@ -3108,6 +3691,28 @@ fn parse_tell_target(line: &str) -> Option<&str> {
         .filter(|target| !target.is_empty())
 }
 
+fn parse_required_capabilities(line: &str) -> Vec<String> {
+    let Some(rest) = line.split_once(" requires ") else {
+        return Vec::new();
+    };
+    let Some(list) = rest.1.trim_start().strip_prefix('[') else {
+        return Vec::new();
+    };
+    let Some((items, _)) = list.split_once(']') else {
+        return Vec::new();
+    };
+    let mut capabilities = items
+        .split(',')
+        .filter_map(|item| {
+            let value = item.trim().trim_matches('"');
+            (!value.is_empty()).then(|| value.to_owned())
+        })
+        .collect::<Vec<_>>();
+    capabilities.sort();
+    capabilities.dedup();
+    capabilities
+}
+
 fn validate_case_blocks(
     rule: &RuleDecl,
     semantic: &SemanticContext,
@@ -3746,16 +4351,12 @@ fn parse_coerce_call_name(line: &str) -> Option<&str> {
     rest.split_once('(').map(|(name, _)| name.trim())
 }
 
-fn parse_coerce_arg_count(line: &str) -> Option<usize> {
-    let open = line.find('(')?;
-    let after_open = &line[open + 1..];
-    let close = after_open.find(')')?;
-    let args = after_open[..close].trim();
-    if args.is_empty() {
-        Some(0)
-    } else {
-        Some(split_expression_args(args).len())
-    }
+fn parse_coerce_call(line: &str) -> Option<(&str, Vec<&str>)> {
+    let rest = line.strip_prefix("coerce ")?;
+    let call = rest.split(" as ").next().unwrap_or(rest).trim();
+    let (name, tail) = call.split_once('(')?;
+    let (args, _) = tail.rsplit_once(')')?;
+    Some((name.trim(), split_expression_args(args)))
 }
 
 fn split_expression_args(args: &str) -> Vec<&str> {
@@ -3788,6 +4389,83 @@ fn split_expression_args(args: &str) -> Vec<&str> {
         values.push(value);
     }
     values
+}
+
+fn parse_loft_claim_issue_expr(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("claim ")?;
+    let (issue_expr, _) = rest.split_once(" with loft")?;
+    let issue_expr = issue_expr.trim();
+    (!issue_expr.is_empty()).then_some(issue_expr)
+}
+
+fn effect_payload_statements(body: &str) -> Vec<String> {
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut statements = Vec::new();
+    let mut index = 0usize;
+    let mut record_depth = 0i32;
+    let mut multiline_string = false;
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        if trimmed.is_empty() {
+            index += 1;
+            continue;
+        }
+        if multiline_string {
+            if trimmed.contains("\"\"\"") {
+                multiline_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if record_depth > 0 {
+            record_depth += brace_delta(trimmed);
+            index += 1;
+            continue;
+        }
+        if parse_record_start(trimmed).is_some() {
+            record_depth = brace_delta(trimmed).max(1);
+            index += 1;
+            continue;
+        }
+        if trimmed.contains("\"\"\"") {
+            multiline_string = trimmed.matches("\"\"\"").count() % 2 == 1;
+            index += 1;
+            continue;
+        }
+        if trimmed.starts_with("coerce ") {
+            let (statement, next_index) = statement_until_balanced_parens(&lines, index, trimmed);
+            statements.push(statement);
+            index = next_index + 1;
+            continue;
+        }
+        if trimmed.starts_with("claim ") {
+            statements.push(trimmed.to_owned());
+        }
+        index += 1;
+    }
+    statements
+}
+
+fn statement_until_balanced_parens(lines: &[&str], index: usize, trimmed: &str) -> (String, usize) {
+    let mut statement = trimmed.to_owned();
+    let mut depth = paren_delta(trimmed);
+    let mut cursor = index;
+    while depth > 0 && cursor + 1 < lines.len() {
+        cursor += 1;
+        let next = lines[cursor].trim();
+        statement.push(' ');
+        statement.push_str(next);
+        depth += paren_delta(next);
+    }
+    (statement, cursor)
+}
+
+fn paren_delta(line: &str) -> i32 {
+    line.chars().fold(0, |depth, ch| match ch {
+        '(' => depth + 1,
+        ')' => depth - 1,
+        _ => depth,
+    })
 }
 
 fn validate_known_field_paths(
@@ -5324,7 +6002,7 @@ pub fn parse_duration_seconds(value: &str) -> Option<f64> {
     consumed.then_some(seconds)
 }
 
-pub fn parse_time_epoch_seconds(value: &str) -> Option<i64> {
+pub fn parse_time_epoch_seconds(value: &str) -> Option<f64> {
     if value.len() < 20 {
         return None;
     }
@@ -5339,7 +6017,20 @@ pub fn parse_time_epoch_seconds(value: &str) -> Option<i64> {
     let minute = parse_fixed_u32(value, 14, 2)?;
     require_byte(value, 16, b':')?;
     let second = parse_fixed_u32(value, 17, 2)?;
-    let offset_start = 19;
+    let mut offset_start = 19;
+    let mut fractional_second = 0.0;
+    if value.as_bytes().get(offset_start).copied() == Some(b'.') {
+        let fraction_start = offset_start + 1;
+        let fraction_len = value[fraction_start..]
+            .char_indices()
+            .take_while(|(_, ch)| ch.is_ascii_digit())
+            .map(|(index, ch)| index + ch.len_utf8())
+            .last()?;
+        let fraction = &value[fraction_start..fraction_start + fraction_len];
+        let scale = 10_f64.powi(i32::try_from(fraction.len()).ok()?);
+        fractional_second = fraction.parse::<f64>().ok()? / scale;
+        offset_start = fraction_start + fraction_len;
+    }
     if !(1..=12).contains(&month)
         || !(1..=days_in_month(year, month)).contains(&day)
         || hour > 23
@@ -5370,7 +6061,7 @@ pub fn parse_time_epoch_seconds(value: &str) -> Option<i64> {
 
     let days = days_from_civil(year, month, day);
     let local_seconds = days * 86_400 + i64::from(hour * 3_600 + minute * 60 + second.min(59));
-    Some(local_seconds - i64::from(offset_seconds))
+    Some((local_seconds - i64::from(offset_seconds)) as f64 + fractional_second)
 }
 
 fn parse_fixed_i32(value: &str, start: usize, len: usize) -> Option<i32> {
@@ -5461,6 +6152,14 @@ fn format_agent(agent: AgentDecl, formatted: &mut String) {
                     .collect::<Vec<_>>()
                     .join(", ");
                 push_line(formatted, format!("  skills [{skills}]"));
+            }
+            AgentField::Capabilities(capabilities, _) => {
+                let capabilities = capabilities
+                    .into_iter()
+                    .map(|capability| format!("{:?}", capability.value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                push_line(formatted, format!("  capabilities [{capabilities}]"));
             }
             AgentField::Unknown { name, .. } => {
                 push_line(formatted, format!("  {}", name.name));
@@ -5903,6 +6602,13 @@ impl Parser<'_> {
                 "skills" => {
                     if let Some((skills, span)) = self.parse_string_list() {
                         fields.push(AgentField::Skills(skills, span));
+                    } else {
+                        self.synchronize_to_block_item();
+                    }
+                }
+                "capabilities" => {
+                    if let Some((capabilities, span)) = self.parse_string_list() {
+                        fields.push(AgentField::Capabilities(capabilities, span));
                     } else {
                         self.synchronize_to_block_item();
                     }
@@ -6450,6 +7156,7 @@ impl Parser<'_> {
                 || self.at_ident("profile")
                 || self.at_ident("capacity")
                 || self.at_ident("skills")
+                || self.at_ident("capabilities")
             {
                 return;
             }
@@ -6647,11 +7354,13 @@ workflow AgentRefRouting
 agent codex {
   profile "repo-writer"
   capacity 1
+  capabilities ["agent.tell"]
 }
 
 agent claude {
   profile "repo-writer"
   capacity 1
+  capabilities ["agent.tell"]
 }
 
 class LanguageTask {
@@ -6663,13 +7372,51 @@ rule run_task
   when LanguageTask as task
   when task.provider is available
 => {
-  tell task.provider as turn "{{ task.prompt }}"
+  tell task.provider requires ["agent.tell"] as turn "{{ task.prompt }}"
 }
 "#;
 
         let compiled = compile_program(source);
         assert_eq!(compiled.diagnostics, Vec::new());
         assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn rejects_agent_ref_targets_missing_required_capabilities() {
+        let source = r#"
+workflow BadAgentRefCapabilities
+
+agent codex {
+  profile "repo-writer"
+  capacity 1
+  capabilities ["agent.tell", "repo.write"]
+}
+
+agent claude {
+  profile "repo-reader"
+  capacity 1
+  capabilities ["agent.tell"]
+}
+
+class LanguageTask {
+  provider AgentRef<codex | claude>
+  prompt string
+}
+
+rule run_task
+  when LanguageTask as task
+=> {
+  tell task.provider requires ["repo.write"] as turn """
+  {{ task.prompt }}
+  """
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("agent `claude` requiring undeclared capability `repo.write`")));
     }
 
     #[test]
@@ -7014,10 +7761,10 @@ rule seed
   when started
 => {
   record Window {
-    elapsed "PT30M"
-    limit "PT1H"
-    opened_at "2026-05-29T10:00:00Z"
-    due_at "2026-05-29T11:00:00Z"
+    elapsed "PT30.5M"
+    limit "PT1.25H"
+    opened_at "2026-05-29T10:00:00.250-04:00"
+    due_at "2026-05-29T14:00:00.500Z"
   }
 }
 "#;
@@ -7034,6 +7781,7 @@ workflow BadDurationTimeExpressions
 
 class Window {
   elapsed duration
+  limit duration
   opened_at time
 }
 
@@ -7042,6 +7790,7 @@ rule seed
 => {
   record Window {
     elapsed "thirty minutes"
+    limit "P1M"
     opened_at "morning"
   }
 }
@@ -7052,6 +7801,9 @@ rule seed
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("field `Window.elapsed` has invalid duration literal")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("field `Window.limit` has invalid duration literal")));
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("field `Window.opened_at` has invalid time literal")));
@@ -7195,7 +7947,7 @@ schemas
     files array<string>
     state union<literal<\"open\"> | literal<\"done\">>
 agents
-  agent worker profile=repo-writer capacity=2 skills=[loft-user]
+  agent worker profile=repo-writer capacity=2 skills=[loft-user] capabilities=[]
 rules
   rule start
     when Work as work
@@ -7264,6 +8016,10 @@ rule_dependencies
             (
                 include_str!("../../../examples/expression-kernel-dogfood.whip"),
                 include_str!("../../../examples/expression-kernel-dogfood.ir"),
+            ),
+            (
+                include_str!("../../../examples/terminal-output-union.whip"),
+                include_str!("../../../examples/terminal-output-union.ir"),
             ),
             (
                 include_str!("../../../examples/ralph.whip"),
@@ -7558,6 +8314,108 @@ rule classify
     }
 
     #[test]
+    fn lowers_terminal_output_case_branches_to_typed_ir() {
+        let source = include_str!("../../../examples/terminal-output-union.whip");
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("expected lowered IR");
+        let rule = ir
+            .rules
+            .iter()
+            .find(|rule| rule.name == "classify_work")
+            .expect("rule");
+
+        let terminal_output = rule
+            .metadata
+            .terminal_outputs
+            .iter()
+            .find(|output| output.binding == "classification")
+            .expect("terminal output");
+        assert_eq!(terminal_output.alternatives.len(), 4);
+        assert_eq!(
+            terminal_output.alternatives[0].payload_type,
+            IrType::Ref("Classification".to_owned())
+        );
+        assert_eq!(
+            rule.metadata
+                .terminal_branches
+                .iter()
+                .map(|branch| {
+                    (
+                        branch.tag.as_deref().unwrap_or("_"),
+                        branch.binding.as_deref().unwrap_or("-"),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("Completed", "result"),
+                ("Failed", "failure"),
+                ("TimedOut", "timeout"),
+                ("Cancelled", "cancel"),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_terminal_payload_fields_outside_refined_tag_schema() {
+        let source = r#"
+workflow BadTerminalPayload
+
+class WorkItem {
+  title string
+}
+
+class Classification {
+  summary string
+}
+
+class TerminalRoute {
+  detail string
+}
+
+coerce classify(title string) -> Classification {
+  prompt "Classify"
+}
+
+rule classify_work
+  when WorkItem as item
+=> {
+  coerce classify(item.title) as classification
+
+  after classification completes {
+    case classification {
+      Completed result => {
+        record TerminalRoute {
+          detail result.reason
+        }
+      }
+      Failed failure => {
+        record TerminalRoute {
+          detail failure.reason
+        }
+      }
+      TimedOut timeout => {
+        record TerminalRoute {
+          detail timeout.summary
+        }
+      }
+      Cancelled cancel => {
+        record TerminalRoute {
+          detail cancel.summary
+        }
+      }
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("invalid field path `result.reason`")));
+    }
+
+    #[test]
     fn rejects_invalid_terminal_output_case_branches() {
         let source = r#"
 workflow BadTerminalCaseGuess
@@ -7779,6 +8637,10 @@ rule branch
                 include_str!("../../../examples/invalid/bad-effect-graph.whip"),
             ),
             (
+                "bad-effect-payload",
+                include_str!("../../../examples/invalid/bad-effect-payload.whip"),
+            ),
+            (
                 "bad-expression-functions",
                 include_str!("../../../examples/invalid/bad-expression-functions.whip"),
             ),
@@ -7901,6 +8763,89 @@ rule bad
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("with 2 argument(s), expected 1")));
+    }
+
+    #[test]
+    fn rejects_bad_effect_payload_argument_types() {
+        let source = r#"
+workflow BadEffectPayloads
+
+class Owner {
+  name string
+}
+
+class Payload {
+  title string
+  owner Owner
+  metadata map<string>
+  tags string[]
+}
+
+class Task {
+  title string
+  owner string
+}
+
+class Review {
+  accepted bool
+}
+
+coerce reviewPayload(payload Payload, metadata map<string>, score int) -> Review {
+  prompt "review"
+}
+
+rule bad_coerce
+  when Task as task where { owner "Ada" } == task.owner
+=> {
+  coerce reviewPayload(
+    {
+      title task.title
+      owner { handle task.owner }
+      metadata { phase 3 }
+      tags ["object", 7]
+      extra "bad"
+    },
+    { phase task.owner, count 3 },
+    "high"
+  ) as review
+}
+
+rule bad_claim
+  when Task as task
+=> {
+  claim task.title with loft as claim
+}
+"#;
+        let compiled = compile_program(source);
+
+        assert!(compiled.ir.is_none());
+        let messages = compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("object literal without an expected object")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("class `Owner` has no field `handle`")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("missing required object field `Owner.name`")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("class `Payload` has no field `extra`")));
+        assert!(messages
+            .iter()
+            .any(|message| message
+                .contains("field `coerce `reviewPayload`.metadata` expects `string`")));
+        assert!(messages.iter().any(|message| {
+            message.contains("field `coerce `reviewPayload`.score` expects `int`")
+        }));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("field `loft claim.issue` receives incompatible")));
     }
 
     #[test]

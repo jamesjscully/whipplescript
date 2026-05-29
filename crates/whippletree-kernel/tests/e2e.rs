@@ -439,6 +439,7 @@ fn e2e_capability_denial_blocks_with_useful_status() {
         required_capabilities_json: r#"["repo.write"]"#,
         profile: Some("repo-reader"),
         correlation_id: None,
+        source_span_json: None,
     };
     commit_single_effect(&mut kernel, &instance_id, denied, "deny_write");
 
@@ -496,6 +497,7 @@ fn e2e_plugin_registered_effect_runs_through_outbox() {
         required_capabilities_json: r#"["memory.query"]"#,
         profile: Some("memory-user"),
         correlation_id: None,
+        source_span_json: None,
     };
     commit_single_effect(
         &mut kernel,
@@ -843,6 +845,7 @@ fn effect<'a>(effect_id: &'a str, kind: &'a str, input_json: &'a str) -> NewEffe
         required_capabilities_json: "[]",
         profile: None,
         correlation_id: None,
+        source_span_json: None,
     }
 }
 

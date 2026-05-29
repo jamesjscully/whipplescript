@@ -17,7 +17,7 @@ schemas
     turn ref<AgentTurn>
     status literal<"judged">
 agents
-  agent codex profile=repo-writer capacity=1 skills=[]
+  agent codex profile=repo-writer capacity=1 skills=[] capabilities=[]
 rules
   rule seed_poem_request
     when started

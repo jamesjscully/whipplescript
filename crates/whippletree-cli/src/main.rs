@@ -19,7 +19,7 @@ use whippletree_kernel::{
 use whippletree_parser::{
     parse_duration_seconds, parse_expression, parse_time_epoch_seconds, BinaryOp,
     DependencyPredicate as IrDependencyPredicate, Diagnostic, Expr, ExprLiteral, IrEffectNode,
-    IrPrimitiveType, IrProgram, IrRule, IrType, QueryKind, SourceSpan, UnaryOp,
+    IrPrimitiveType, IrProgram, IrRule, IrSchema, IrType, QueryKind, SourceSpan, UnaryOp,
 };
 use whippletree_store::{
     ClaimableEffect, DiagnosticRecord, DiagnosticView, EffectCompletion, EffectView, EventView,
@@ -521,7 +521,12 @@ fn step(options: &CliOptions) -> ExitCode {
         Ok(compiled) => compiled,
         Err(error) => return report_compile_failure(&step_options.program_path, error),
     };
-    match step_instance(&options.store_path, &step_options.instance_id, &ir) {
+    match step_instance(
+        &options.store_path,
+        &step_options.instance_id,
+        &ir,
+        Some(Path::new(&step_options.program_path)),
+    ) {
         Ok(report) if options.json => emit_json(step_report_to_json(&report)),
         Ok(report) => {
             println!(
@@ -609,6 +614,7 @@ struct GuardReport {
     rule: String,
     when: String,
     expr: String,
+    source_span_json: Option<String>,
     status: GuardStatus,
     matched: bool,
     actual: Value,
@@ -635,6 +641,7 @@ impl GuardStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AssertionReport {
     expr: String,
+    source_span_json: Option<String>,
     status: AssertionStatus,
     passed: bool,
     actual: Value,
@@ -662,6 +669,7 @@ fn step_instance(
     store_path: &Path,
     instance_id: &str,
     ir: &IrProgram,
+    source_path: Option<&Path>,
 ) -> Result<StepReport, StoreError> {
     let mut report = StepReport {
         instance_id: instance_id.to_owned(),
@@ -680,10 +688,10 @@ fn step_instance(
             .map(|event| event.event_id.clone());
 
         for rule in &ir.rules {
-            let ready = ready_contexts(rule, &facts, &effects, started_event_id.as_deref());
+            let ready = ready_contexts(ir, rule, &facts, &effects, started_event_id.as_deref());
             report.guard_reports.extend(ready.guard_reports);
             for context in ready.contexts {
-                let lowering = lower_rule(ir, rule, &context, &facts, &effects);
+                let lowering = lower_rule(ir, rule, &context, &facts, &effects, source_path);
                 if lowering.facts.is_empty() && lowering.effects.is_empty() {
                     continue;
                 }
@@ -1325,7 +1333,12 @@ fn dev(options: &CliOptions) -> ExitCode {
     let mut steps = Vec::new();
     let mut workers = Vec::new();
     for _ in 0..dev_options.max_iterations {
-        let step_report = match step_instance(&options.store_path, &started.instance_id, &ir) {
+        let step_report = match step_instance(
+            &options.store_path,
+            &started.instance_id,
+            &ir,
+            Some(Path::new(&dev_options.program_path)),
+        ) {
             Ok(report) => report,
             Err(error) => return report_store_error("failed to step instance", error),
         };
@@ -1359,7 +1372,12 @@ fn dev(options: &CliOptions) -> ExitCode {
         Ok(effects) => effects,
         Err(error) => return report_store_error("failed to list effects", error),
     };
-    let assertions = eval_assertions(&ir, &facts, &effects);
+    let assertions = eval_assertions(
+        &ir,
+        &facts,
+        &effects,
+        Some(Path::new(&dev_options.program_path)),
+    );
     if let Err(error) = persist_assertion_diagnostics(
         &store,
         &started.instance_id,
@@ -1550,6 +1568,7 @@ struct OwnedEffect {
     required_capabilities_json: String,
     profile: Option<String>,
     correlation_id: Option<String>,
+    source_span_json: Option<String>,
 }
 
 impl OwnedEffect {
@@ -1564,6 +1583,7 @@ impl OwnedEffect {
             required_capabilities_json: &self.required_capabilities_json,
             profile: self.profile.as_deref(),
             correlation_id: self.correlation_id.as_deref(),
+            source_span_json: self.source_span_json.as_deref(),
         }
     }
 }
@@ -1588,6 +1608,7 @@ impl OwnedDependency {
 }
 
 fn ready_contexts(
+    ir: &IrProgram,
     rule: &IrRule,
     facts: &[FactView],
     effects: &[EffectView],
@@ -1637,6 +1658,7 @@ fn ready_contexts(
                                 &context,
                                 facts,
                                 effects,
+                                ir,
                             );
                             let matched = report.matched;
                             guard_reports.push(report);
@@ -1681,16 +1703,18 @@ fn eval_guard(
     context: &RuleContext,
     facts: &[FactView],
     effects: &[EffectView],
+    ir: &IrProgram,
 ) -> GuardReport {
     let (status, actual, error) = guard_result(eval_expr_value(
         guard,
-        &EvalScope::rule(context, facts, effects),
+        &EvalScope::rule(context, facts, effects, ir),
     ));
     let matched = status == GuardStatus::Matched;
     GuardReport {
         rule: rule.to_owned(),
         when: when.to_owned(),
         expr: source.to_owned(),
+        source_span_json: None,
         status,
         matched,
         actual,
@@ -1700,8 +1724,12 @@ fn eval_guard(
 
 fn eval_guard_source(guard: &str, context: &RuleContext) -> bool {
     parse_expression(guard).ok().is_some_and(|expr| {
-        guard_result(eval_expr_value(&expr, &EvalScope::rule(context, &[], &[]))).0
-            == GuardStatus::Matched
+        let empty_ir = empty_ir_program();
+        guard_result(eval_expr_value(
+            &expr,
+            &EvalScope::rule(context, &[], &[], &empty_ir),
+        ))
+        .0 == GuardStatus::Matched
     })
 }
 
@@ -1719,10 +1747,10 @@ fn guard_result(value: EvalValue) -> (GuardStatus, Value, Option<String>) {
             json!({"internal": "Missing"}),
             Some("guard expression evaluated to Missing".to_owned()),
         ),
-        EvalValue::Error => (
+        EvalValue::Error(message) => (
             GuardStatus::Error,
-            json!({"internal": "Error"}),
-            Some("guard expression evaluation failed".to_owned()),
+            json!({"internal": "Error", "message": message}),
+            Some(message),
         ),
     }
 }
@@ -1750,6 +1778,7 @@ fn eval_assertions(
     ir: &IrProgram,
     facts: &[FactView],
     effects: &[EffectView],
+    source_path: Option<&Path>,
 ) -> Vec<AssertionReport> {
     ir.assertions
         .iter()
@@ -1757,6 +1786,9 @@ fn eval_assertions(
             eval_assertion(
                 assertion.expr.source.as_str(),
                 &assertion.expr.expr,
+                ir,
+                source_path.map(|_| assertion.expr.span),
+                source_path,
                 facts,
                 effects,
             )
@@ -1798,7 +1830,7 @@ fn persist_assertion_diagnostics(
                 AssertionStatus::Passed => unreachable!("passed assertions filtered out"),
             }),
             message: &message,
-            source_span_json: None,
+            source_span_json: assertion.source_span_json.as_deref(),
             subject_type: Some("assertion"),
             subject_id: Some(&assertion.expr),
             event_id: None,
@@ -1824,22 +1856,36 @@ fn persist_assertion_diagnostics(
 fn eval_assertion(
     source: &str,
     expr: &Expr,
+    ir: &IrProgram,
+    span: Option<SourceSpan>,
+    source_path: Option<&Path>,
     facts: &[FactView],
     effects: &[EffectView],
 ) -> AssertionReport {
     let source = source.trim();
     let (status, actual, error) = assertion_result(eval_expr_value(
         expr,
-        &EvalScope::assertions(facts, effects),
+        &EvalScope::assertions(facts, effects, ir),
     ));
     let passed = status == AssertionStatus::Passed;
     AssertionReport {
         expr: source.to_owned(),
+        source_span_json: span.map(|span| source_span_json(source_path, span, "assertion")),
         status,
         passed,
         actual,
         error,
     }
+}
+
+fn source_span_json(source_path: Option<&Path>, span: SourceSpan, construct: &str) -> String {
+    json!({
+        "path": source_path.map(|path| path.display().to_string()),
+        "start": span.start,
+        "end": span.end,
+        "construct": construct,
+    })
+    .to_string()
 }
 
 fn assertion_result(value: EvalValue) -> (AssertionStatus, Value, Option<String>) {
@@ -1856,10 +1902,10 @@ fn assertion_result(value: EvalValue) -> (AssertionStatus, Value, Option<String>
             json!({"internal": "Missing"}),
             Some("assertion expression evaluated to Missing".to_owned()),
         ),
-        EvalValue::Error => (
+        EvalValue::Error(message) => (
             AssertionStatus::Error,
-            json!({"internal": "Error"}),
-            Some("assertion expression evaluation failed".to_owned()),
+            json!({"internal": "Error", "message": message}),
+            Some(message),
         ),
     }
 }
@@ -1868,35 +1914,61 @@ struct EvalScope<'a> {
     context: Option<&'a RuleContext>,
     facts: &'a [FactView],
     effects: &'a [EffectView],
+    ir: &'a IrProgram,
     projection: Option<&'a Value>,
+    projection_schema: Option<&'a str>,
 }
 
 impl<'a> EvalScope<'a> {
-    fn rule(context: &'a RuleContext, facts: &'a [FactView], effects: &'a [EffectView]) -> Self {
+    fn rule(
+        context: &'a RuleContext,
+        facts: &'a [FactView],
+        effects: &'a [EffectView],
+        ir: &'a IrProgram,
+    ) -> Self {
         Self {
             context: Some(context),
             facts,
             effects,
+            ir,
             projection: None,
+            projection_schema: None,
         }
     }
 
-    fn assertions(facts: &'a [FactView], effects: &'a [EffectView]) -> Self {
+    fn assertions(facts: &'a [FactView], effects: &'a [EffectView], ir: &'a IrProgram) -> Self {
         Self {
             context: None,
             facts,
             effects,
+            ir,
             projection: None,
+            projection_schema: None,
         }
     }
 
-    fn projection(&self, projection: &'a Value) -> Self {
+    fn projection(&self, projection: &'a Value, schema: Option<&'a str>) -> Self {
         Self {
             context: self.context,
             facts: self.facts,
             effects: self.effects,
+            ir: self.ir,
             projection: Some(projection),
+            projection_schema: schema,
         }
+    }
+}
+
+fn empty_ir_program() -> IrProgram {
+    IrProgram {
+        workflow: String::new(),
+        uses: Vec::new(),
+        schemas: Vec::new(),
+        agents: Vec::new(),
+        coerces: Vec::new(),
+        assertions: Vec::new(),
+        rules: Vec::new(),
+        rule_dependencies: Vec::new(),
     }
 }
 
@@ -1904,15 +1976,19 @@ impl<'a> EvalScope<'a> {
 enum EvalValue {
     Json(Value),
     Missing,
-    Error,
+    Error(String),
 }
 
 impl EvalValue {
+    fn error(message: impl Into<String>) -> Self {
+        Self::Error(message.into())
+    }
+
     fn into_json(self) -> Value {
         match self {
             Self::Json(value) => value,
             Self::Missing => json!({"internal": "Missing"}),
-            Self::Error => json!({"internal": "Error"}),
+            Self::Error(message) => json!({"internal": "Error", "message": message}),
         }
     }
 
@@ -1950,7 +2026,7 @@ fn eval_expr_value(expr: &Expr, scope: &EvalScope<'_>) -> EvalValue {
         Expr::Call { name, args } => eval_call(name, args, scope),
         Expr::Query { .. } => eval_query_count(expr, scope)
             .map(|count| EvalValue::Json(Value::Number(count.into())))
-            .unwrap_or(EvalValue::Error),
+            .unwrap_or_else(|value| value),
     }
 }
 
@@ -1960,7 +2036,7 @@ fn eval_index(target: &Expr, key: &Expr, scope: &EvalScope<'_>) -> EvalValue {
     let key = match key {
         EvalValue::Json(Value::String(value)) => value,
         EvalValue::Missing => return EvalValue::Missing,
-        _ => return EvalValue::Error,
+        _ => return EvalValue::error("index expression key did not evaluate to string"),
     };
     match target {
         EvalValue::Json(Value::Object(object)) => object
@@ -1969,7 +2045,7 @@ fn eval_index(target: &Expr, key: &Expr, scope: &EvalScope<'_>) -> EvalValue {
             .map(EvalValue::Json)
             .unwrap_or(EvalValue::Missing),
         EvalValue::Missing => EvalValue::Missing,
-        _ => EvalValue::Error,
+        _ => EvalValue::error("index expression target did not evaluate to object"),
     }
 }
 
@@ -2029,18 +2105,30 @@ fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, scope: &EvalScope<'_>) -
             &eval_expr_value(right, scope),
         ))),
         BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
-            let left = eval_expr_value(left, scope);
-            let right = eval_expr_value(right, scope);
-            let result = ordered_cmp(&left, &right)
-                .map(|ordering| match op {
-                    BinaryOp::Lt => ordering.is_lt(),
-                    BinaryOp::Le => ordering.is_le(),
-                    BinaryOp::Gt => ordering.is_gt(),
-                    BinaryOp::Ge => ordering.is_ge(),
-                    _ => false,
-                })
-                .unwrap_or(false);
-            EvalValue::Json(Value::Bool(result))
+            let left_value = eval_expr_value(left, scope);
+            let right_value = eval_expr_value(right, scope);
+            let left_ty = expr_runtime_primitive(left, scope);
+            let right_ty = expr_runtime_primitive(right, scope);
+            match ordered_cmp(
+                &left_value,
+                &right_value,
+                left_ty.as_ref(),
+                right_ty.as_ref(),
+            ) {
+                Ok(ordering) => {
+                    let result = ordering
+                        .map(|ordering| match op {
+                            BinaryOp::Lt => ordering.is_lt(),
+                            BinaryOp::Le => ordering.is_le(),
+                            BinaryOp::Gt => ordering.is_gt(),
+                            BinaryOp::Ge => ordering.is_ge(),
+                            _ => false,
+                        })
+                        .unwrap_or(false);
+                    EvalValue::Json(Value::Bool(result))
+                }
+                Err(message) => EvalValue::error(message),
+            }
         }
         BinaryOp::In | BinaryOp::NotIn => {
             let needle = eval_expr_value(left, scope).into_json();
@@ -2065,20 +2153,20 @@ fn eval_call(name: &str, args: &[Expr], scope: &EvalScope<'_>) -> EvalValue {
     match (name, args) {
         ("count", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
             .map(|count| EvalValue::Json(Value::Number(count.into())))
-            .unwrap_or(EvalValue::Error),
+            .unwrap_or_else(|value| value),
         ("exists", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
             .map(|count| EvalValue::Json(Value::Bool(count > 0)))
-            .unwrap_or(EvalValue::Error),
+            .unwrap_or_else(|value| value),
         ("exists", [expr]) => EvalValue::Json(Value::Bool(
             !eval_expr_value(expr, scope).is_missing_or_null(),
         )),
         ("empty", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
             .map(|count| EvalValue::Json(Value::Bool(count == 0)))
-            .unwrap_or(EvalValue::Error),
+            .unwrap_or_else(|value| value),
         ("empty", [expr]) => {
             EvalValue::Json(Value::Bool(is_empty_value(&eval_expr_value(expr, scope))))
         }
-        _ => EvalValue::Error,
+        _ => EvalValue::error("unknown expression function"),
     }
 }
 
@@ -2092,7 +2180,10 @@ fn eval_query_count(query: &Expr, scope: &EvalScope<'_>) -> Result<i64, EvalValu
             for fact in scope.facts.iter().filter(|fact| fact.name == head.trim()) {
                 if let Some(guard) = guard {
                     let value = json_from_str(&fact.value_json);
-                    if guard_filter_matches(eval_expr_value(guard, &scope.projection(&value)))? {
+                    if guard_filter_matches(eval_expr_value(
+                        guard,
+                        &scope.projection(&value, Some(head.trim())),
+                    ))? {
                         count += 1;
                     }
                 } else {
@@ -2120,7 +2211,10 @@ fn eval_query_count(query: &Expr, scope: &EvalScope<'_>) -> Result<i64, EvalValu
                         "status": effect.status,
                         "profile": effect.profile,
                     });
-                    if guard_filter_matches(eval_expr_value(guard, &scope.projection(&value)))? {
+                    if guard_filter_matches(eval_expr_value(
+                        guard,
+                        &scope.projection(&value, None),
+                    ))? {
                         count += 1;
                     }
                 } else {
@@ -2141,7 +2235,7 @@ fn guard_filter_matches(value: EvalValue) -> Result<bool, EvalValue> {
 
 fn eval_path(path: &[String], scope: &EvalScope<'_>) -> EvalValue {
     if path.is_empty() {
-        return EvalValue::Error;
+        return EvalValue::error("empty expression path");
     }
     if let Some(context) = scope.context {
         if let Some(first) = path.first() {
@@ -2187,7 +2281,7 @@ fn compare_eq(left: &EvalValue, right: &EvalValue) -> bool {
 fn truthy(value: &EvalValue) -> bool {
     match value {
         EvalValue::Json(Value::Bool(value)) => *value,
-        EvalValue::Json(Value::Null) | EvalValue::Missing | EvalValue::Error => false,
+        EvalValue::Json(Value::Null) | EvalValue::Missing | EvalValue::Error(_) => false,
         EvalValue::Json(Value::Array(values)) => !values.is_empty(),
         EvalValue::Json(Value::String(value)) => !value.is_empty(),
         EvalValue::Json(Value::Number(value)) => value.as_i64().unwrap_or(0) != 0,
@@ -2202,28 +2296,119 @@ fn number_value(value: &EvalValue) -> Option<f64> {
     }
 }
 
-fn ordered_cmp(left: &EvalValue, right: &EvalValue) -> Option<std::cmp::Ordering> {
+fn ordered_cmp(
+    left: &EvalValue,
+    right: &EvalValue,
+    left_ty: Option<&IrPrimitiveType>,
+    right_ty: Option<&IrPrimitiveType>,
+) -> Result<Option<std::cmp::Ordering>, String> {
+    let typed = left_ty.or(right_ty);
+    match typed {
+        Some(IrPrimitiveType::Duration) => {
+            let left = typed_string_seconds(left, "duration")?;
+            let right = typed_string_seconds(right, "duration")?;
+            return Ok(left.partial_cmp(&right));
+        }
+        Some(IrPrimitiveType::Time) => {
+            let left = typed_string_seconds(left, "time")?;
+            let right = typed_string_seconds(right, "time")?;
+            return Ok(left.partial_cmp(&right));
+        }
+        _ => {}
+    }
+
     match (number_value(left), number_value(right)) {
-        (Some(left), Some(right)) => return left.partial_cmp(&right),
-        (Some(_), None) | (None, Some(_)) => return None,
+        (Some(left), Some(right)) => return Ok(left.partial_cmp(&right)),
+        (Some(_), None) | (None, Some(_)) => return Ok(None),
         (None, None) => {}
     }
     let (EvalValue::Json(Value::String(left)), EvalValue::Json(Value::String(right))) =
         (left, right)
     else {
-        return None;
+        return Ok(None);
     };
     if let (Some(left), Some(right)) = (parse_duration_seconds(left), parse_duration_seconds(right))
     {
-        return left.partial_cmp(&right);
+        return Ok(left.partial_cmp(&right));
     }
     if let (Some(left), Some(right)) = (
         parse_time_epoch_seconds(left),
         parse_time_epoch_seconds(right),
     ) {
-        return Some(left.cmp(&right));
+        return Ok(left.partial_cmp(&right));
+    }
+    Ok(None)
+}
+
+fn typed_string_seconds(value: &EvalValue, expected: &str) -> Result<f64, String> {
+    let EvalValue::Json(Value::String(value)) = value else {
+        return Err(format!("{expected} ordering expected string value"));
+    };
+    let parsed = match expected {
+        "duration" => parse_duration_seconds(value),
+        "time" => parse_time_epoch_seconds(value),
+        _ => None,
+    };
+    parsed.ok_or_else(|| format!("invalid {expected} value `{value}`"))
+}
+
+fn expr_runtime_primitive(expr: &Expr, scope: &EvalScope<'_>) -> Option<IrPrimitiveType> {
+    match expr {
+        Expr::Path(path) => path_runtime_primitive(path, scope),
+        Expr::Literal(ExprLiteral::Ident(field)) if scope.projection_schema.is_some() => {
+            let path = [field.clone()];
+            path_runtime_primitive(&path, scope)
+        }
+        _ => None,
+    }
+}
+
+fn path_runtime_primitive(path: &[String], scope: &EvalScope<'_>) -> Option<IrPrimitiveType> {
+    if let Some(context) = scope.context {
+        let (binding, rest) = path.split_first()?;
+        let (_, fact) = context
+            .bindings
+            .iter()
+            .find(|(candidate, _)| candidate == binding)?;
+        return ir_path_primitive(scope.ir, &fact.name, rest);
+    }
+    if let Some(schema) = scope.projection_schema {
+        return ir_path_primitive(scope.ir, schema, path);
     }
     None
+}
+
+fn ir_path_primitive(ir: &IrProgram, schema: &str, path: &[String]) -> Option<IrPrimitiveType> {
+    let mut current_schema = schema;
+    for (index, field_name) in path.iter().enumerate() {
+        let ty = ir.schemas.iter().find_map(|schema| match schema {
+            IrSchema::Class(class) if class.name == current_schema => class
+                .fields
+                .iter()
+                .find(|field| field.name == *field_name)
+                .map(|field| &field.ty),
+            _ => None,
+        });
+        let next_ty = unwrap_optional_type(ty?)?;
+        if index == path.len() - 1 {
+            return match next_ty {
+                IrType::Primitive(primitive) => Some(primitive.clone()),
+                _ => None,
+            };
+        }
+        match next_ty {
+            IrType::Ref(next_schema) => current_schema = next_schema,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn unwrap_optional_type(ty: &IrType) -> Option<&IrType> {
+    match ty {
+        IrType::Optional(inner) => unwrap_optional_type(inner),
+        other => Some(other),
+    }
 }
 
 fn is_empty_value(value: &EvalValue) -> bool {
@@ -2243,6 +2428,7 @@ fn lower_rule(
     context: &RuleContext,
     facts: &[FactView],
     effects: &[EffectView],
+    source_path: Option<&Path>,
 ) -> OwnedLowering {
     let (body, context) = selected_rule_body(&rule.body, context);
     let existing_fact_ids = facts
@@ -2330,6 +2516,8 @@ fn lower_rule(
             required_capabilities_json: parsed.required_capabilities_json(),
             profile,
             correlation_id: context.identity.clone(),
+            source_span_json: effect_node
+                .map(|effect| source_span_json(source_path, effect.span, "effect")),
         });
     }
 
@@ -2693,19 +2881,23 @@ struct ParsedEffect {
     binding: Option<String>,
     args: Vec<String>,
     prompt: Option<String>,
+    required_capabilities: Vec<String>,
     after: Option<AfterScope>,
 }
 
 impl ParsedEffect {
     fn required_capabilities_json(&self) -> String {
-        match self.kind.as_str() {
-            "baml.coerce" => r#"["baml.coerce"]"#,
-            "loft.claim" => r#"["loft.claim"]"#,
-            "human.ask" => r#"["human.ask"]"#,
-            "capability.call" => r#"["capability.call"]"#,
-            _ => "[]",
-        }
-        .to_owned()
+        let mut capabilities = match self.kind.as_str() {
+            "baml.coerce" => vec!["baml.coerce".to_owned()],
+            "loft.claim" => vec!["loft.claim".to_owned()],
+            "human.ask" => vec!["human.ask".to_owned()],
+            "capability.call" => vec!["capability.call".to_owned()],
+            _ => Vec::new(),
+        };
+        capabilities.extend(self.required_capabilities.iter().cloned());
+        capabilities.sort();
+        capabilities.dedup();
+        serde_json::to_string(&capabilities).unwrap_or_else(|_| "[]".to_owned())
     }
 }
 
@@ -2735,6 +2927,7 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 binding: binding_after_as(trimmed),
                 args: Vec::new(),
                 prompt: Some(interpolate_prompt(&prompt, context)),
+                required_capabilities: parse_required_capabilities(trimmed),
                 after: current_after,
             });
             index = next_index;
@@ -2756,6 +2949,7 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 binding: binding_after_as(trimmed),
                 args,
                 prompt: None,
+                required_capabilities: Vec::new(),
                 after: current_after,
             });
             index = next_index;
@@ -2767,6 +2961,7 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 binding: binding_after_as(trimmed),
                 args: Vec::new(),
                 prompt: None,
+                required_capabilities: Vec::new(),
                 after: current_after,
             });
         } else if trimmed.starts_with("askHuman ") {
@@ -2778,6 +2973,7 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 binding: binding_after_as(trimmed),
                 args: Vec::new(),
                 prompt: Some(interpolate_prompt(&prompt, context)),
+                required_capabilities: Vec::new(),
                 after: current_after,
             });
             index = next_index;
@@ -2794,6 +2990,7 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 binding: binding_after_as(trimmed),
                 args: Vec::new(),
                 prompt: None,
+                required_capabilities: Vec::new(),
                 after: current_after,
             });
         }
@@ -2838,6 +3035,28 @@ fn resolve_tell_target(target_expr: &str, context: &RuleContext) -> String {
         .as_str()
         .unwrap_or(target_expr)
         .to_owned()
+}
+
+fn parse_required_capabilities(line: &str) -> Vec<String> {
+    let Some(rest) = line.split_once(" requires ") else {
+        return Vec::new();
+    };
+    let Some(list) = rest.1.trim_start().strip_prefix('[') else {
+        return Vec::new();
+    };
+    let Some((items, _)) = list.split_once(']') else {
+        return Vec::new();
+    };
+    let mut capabilities = items
+        .split(',')
+        .filter_map(|item| {
+            let value = item.trim().trim_matches('"');
+            (!value.is_empty()).then(|| value.to_owned())
+        })
+        .collect::<Vec<_>>();
+    capabilities.sort();
+    capabilities.dedup();
+    capabilities
 }
 
 fn parsed_effect_input_json(
@@ -3029,6 +3248,14 @@ fn ir_type_name(ty: &IrType) -> String {
         IrType::Optional(inner) => ir_type_name(inner),
         IrType::Array(inner) => format!("{}[]", ir_type_name(inner)),
         IrType::Map(inner) => format!("map<{}>", ir_type_name(inner)),
+        IrType::Object(fields) => format!(
+            "{{{}}}",
+            fields
+                .iter()
+                .map(|field| format!("{} {}", field.name, ir_type_name(&field.ty)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         IrType::Union(types) => types
             .iter()
             .map(ir_type_name)
@@ -3236,7 +3463,9 @@ fn parse_field_value(value: &str, context: &RuleContext) -> Value {
     }
     if let Ok(expr) = whippletree_parser::parse_expression(value) {
         if !matches!(expr, Expr::Literal(ExprLiteral::Ident(_))) {
-            return eval_expr_value(&expr, &EvalScope::rule(context, &[], &[])).into_json();
+            let empty_ir = empty_ir_program();
+            return eval_expr_value(&expr, &EvalScope::rule(context, &[], &[], &empty_ir))
+                .into_json();
         }
     }
     if matches!(value.as_bytes().first(), Some(b'{' | b'[')) {
@@ -3393,6 +3622,11 @@ fn assertion_report_to_json(report: &AssertionReport) -> Value {
     if let Some(error) = &report.error {
         if let Some(object) = value.as_object_mut() {
             object.insert("error".to_owned(), Value::String(error.clone()));
+        }
+    }
+    if let Some(source_span_json) = &report.source_span_json {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("source_span".to_owned(), json_from_str(source_span_json));
         }
     }
     value
@@ -4847,27 +5081,143 @@ fn maude_bool_cases(expr: &Expr, context: &mut MaudeExprContext) -> MaudeBoolCas
             ),
             error_expr: "exprError".to_owned(),
         },
+        Expr::Binary {
+            op: BinaryOp::Lt,
+            left,
+            right,
+        } => maude_order_bool_cases("ltExpr", left, right, context),
+        Expr::Binary {
+            op: BinaryOp::Le,
+            left,
+            right,
+        } => maude_order_bool_cases("leExpr", left, right, context),
+        Expr::Binary {
+            op: BinaryOp::Gt,
+            left,
+            right,
+        } => maude_order_bool_cases("gtExpr", left, right, context),
+        Expr::Binary {
+            op: BinaryOp::Ge,
+            left,
+            right,
+        } => maude_order_bool_cases("geExpr", left, right, context),
+        Expr::Binary {
+            op: BinaryOp::In,
+            left,
+            right,
+        } => maude_membership_bool_cases(left, right, false, context),
+        Expr::Binary {
+            op: BinaryOp::NotIn,
+            left,
+            right,
+        } => maude_membership_bool_cases(left, right, true, context),
         Expr::Call { name, args } if name == "exists" && args.len() == 1 => {
-            let query = maude_query_arg(&args[0], context);
+            let collection = maude_collection_expr(&args[0], "qOne", context);
             MaudeBoolCases {
-                true_expr: format!("existsExpr(query({query}, qOne))"),
-                false_expr: format!("existsExpr(query({query}, qZero))"),
-                error_expr: format!("existsExpr(query({query}, qError))"),
+                true_expr: format!("existsExpr({collection})"),
+                false_expr: format!(
+                    "existsExpr({})",
+                    maude_collection_expr(&args[0], "qZero", context)
+                ),
+                error_expr: format!(
+                    "existsExpr({})",
+                    maude_collection_expr(&args[0], "qError", context)
+                ),
             }
         }
-        Expr::Call { name, args } if name == "empty" && args.len() == 1 => {
-            let query = maude_query_or_collection_arg(&args[0], context);
-            MaudeBoolCases {
-                true_expr: format!("emptyExpr(query({query}, qZero))"),
-                false_expr: format!("emptyExpr(query({query}, qOne))"),
-                error_expr: format!("emptyExpr(query({query}, qError))"),
-            }
-        }
+        Expr::Call { name, args } if name == "empty" && args.len() == 1 => MaudeBoolCases {
+            true_expr: format!(
+                "emptyExpr({})",
+                maude_collection_expr(&args[0], "qZero", context)
+            ),
+            false_expr: format!(
+                "emptyExpr({})",
+                maude_collection_expr(&args[0], "qOne", context)
+            ),
+            error_expr: format!(
+                "emptyExpr({})",
+                maude_collection_expr(&args[0], "qError", context)
+            ),
+        },
         _ => MaudeBoolCases {
             true_expr: "boolTrue".to_owned(),
             false_expr: "boolFalse".to_owned(),
             error_expr: "exprError".to_owned(),
         },
+    }
+}
+
+fn maude_order_bool_cases(
+    op: &str,
+    left: &Expr,
+    right: &Expr,
+    context: &mut MaudeExprContext,
+) -> MaudeBoolCases {
+    if let Some((count_expr, literal_expr)) = maude_count_number_pair(left, right, true, context) {
+        return MaudeBoolCases {
+            true_expr: format!("{op}({count_expr}, {literal_expr})"),
+            false_expr: maude_false_order_expr(op),
+            error_expr: format!("{op}(exprError, {literal_expr})"),
+        };
+    }
+    if let Some((literal_expr, count_expr)) = maude_count_number_pair(right, left, true, context) {
+        return MaudeBoolCases {
+            true_expr: format!("{op}({literal_expr}, {count_expr})"),
+            false_expr: maude_false_order_expr(op),
+            error_expr: format!("{op}({literal_expr}, exprError)"),
+        };
+    }
+    let _ = maude_scalar_expr(left, context);
+    let _ = maude_scalar_expr(right, context);
+    MaudeBoolCases {
+        true_expr: maude_true_order_expr(op),
+        false_expr: maude_false_order_expr(op),
+        error_expr: format!("{op}(exprError, orderHigh)"),
+    }
+}
+
+fn maude_true_order_expr(op: &str) -> String {
+    let (left, right) = match op {
+        "ltExpr" | "leExpr" => ("orderLow", "orderHigh"),
+        "gtExpr" | "geExpr" => ("orderHigh", "orderLow"),
+        _ => ("orderLow", "orderHigh"),
+    };
+    format!("{op}({left}, {right})")
+}
+
+fn maude_false_order_expr(op: &str) -> String {
+    let (left, right) = match op {
+        "ltExpr" | "leExpr" => ("orderHigh", "orderLow"),
+        "gtExpr" | "geExpr" => ("orderLow", "orderHigh"),
+        _ => ("orderHigh", "orderLow"),
+    };
+    format!("{op}({left}, {right})")
+}
+
+fn maude_membership_bool_cases(
+    item: &Expr,
+    collection: &Expr,
+    negated: bool,
+    context: &mut MaudeExprContext,
+) -> MaudeBoolCases {
+    let item_expr = maude_scalar_expr(item, context);
+    let present_collection = maude_collection_with_member(collection, &item_expr, true, context);
+    let missing_collection = maude_collection_with_member(collection, &item_expr, false, context);
+    let true_expr = format!("inExpr({item_expr}, {present_collection})");
+    let false_expr = format!("inExpr({item_expr}, {missing_collection})");
+    let error_expr = format!("inExpr(exprError, {present_collection})");
+    if negated {
+        MaudeBoolCases {
+            true_expr: format!("notExpr({false_expr})"),
+            false_expr: format!("notExpr({true_expr})"),
+            error_expr,
+        }
+    } else {
+        MaudeBoolCases {
+            true_expr,
+            false_expr,
+            error_expr,
+        }
     }
 }
 
@@ -4930,8 +5280,10 @@ fn maude_count_number_pair(
     } else {
         "qZero"
     };
-    let query = maude_query_arg(&args[0], context);
-    let count = format!("countExpr(query({query}, {cardinality}))");
+    let count = format!(
+        "countExpr({})",
+        maude_collection_expr(&args[0], cardinality, context)
+    );
     Some((count, expected))
 }
 
@@ -4962,23 +5314,164 @@ fn maude_scalar_expr(expr: &Expr, context: &mut MaudeExprContext) -> String {
         Expr::Literal(ExprLiteral::Number(number)) => {
             maude_count_literal(number).unwrap_or_else(|| maude_scalar_symbol(expr, context))
         }
+        Expr::Index { target, key } => {
+            let key = maude_scalar_expr(key, context);
+            let target = maude_index_target_expr(target, &key, expr, context);
+            format!("indexExpr({target}, {key})")
+        }
+        Expr::Array(_) | Expr::Object(_) => maude_value_expr(expr, context),
         Expr::Call { name, args } if name == "count" && args.len() == 1 => {
-            let query = maude_query_arg(&args[0], context);
-            format!("countExpr(query({query}, qOne))")
+            format!(
+                "countExpr({})",
+                maude_collection_expr(&args[0], "qOne", context)
+            )
         }
         _ => format!("scalar({})", maude_scalar_symbol(expr, context)),
     }
 }
 
-fn maude_query_arg(expr: &Expr, context: &mut MaudeExprContext) -> String {
+fn maude_value_expr(expr: &Expr, context: &mut MaudeExprContext) -> String {
     match expr {
-        Expr::Query { .. } => maude_query_symbol(expr, context),
-        _ => maude_query_symbol(expr, context),
+        Expr::Array(items) => items
+            .first()
+            .map(|item| format!("arrayHas({})", maude_scalar_expr(item, context)))
+            .unwrap_or_else(|| "arrayEmpty".to_owned()),
+        Expr::Object(fields) => fields
+            .first()
+            .map(|field| {
+                format!(
+                    "objectHas({}, {})",
+                    maude_field_key_expr(&field.key, context),
+                    maude_scalar_expr(&field.value, context)
+                )
+            })
+            .unwrap_or_else(|| "objectEmpty".to_owned()),
+        Expr::Index { target, key } => {
+            let key = maude_scalar_expr(key, context);
+            let target = maude_index_target_expr(target, &key, expr, context);
+            format!("indexExpr({target}, {key})")
+        }
+        Expr::Query { .. } => maude_collection_expr(expr, "qOne", context),
+        _ => maude_scalar_expr(expr, context),
     }
 }
 
-fn maude_query_or_collection_arg(expr: &Expr, context: &mut MaudeExprContext) -> String {
-    maude_query_arg(expr, context)
+fn maude_collection_expr(
+    expr: &Expr,
+    cardinality: &'static str,
+    context: &mut MaudeExprContext,
+) -> String {
+    match expr {
+        Expr::Query { guard, .. } => {
+            let query = maude_query_symbol(expr, context);
+            if let Some(guard) = guard {
+                let guard_cases = maude_bool_cases(guard, context);
+                format!(
+                    "queryFilter({query}, {}, {cardinality})",
+                    guard_cases.true_expr
+                )
+            } else {
+                format!("query({query}, {cardinality})")
+            }
+        }
+        Expr::Array(items) => {
+            if cardinality == "qZero" || items.is_empty() {
+                "arrayEmpty".to_owned()
+            } else {
+                format!("arrayHas({})", maude_scalar_expr(&items[0], context))
+            }
+        }
+        Expr::Object(fields) => {
+            if cardinality == "qZero" || fields.is_empty() {
+                "objectEmpty".to_owned()
+            } else {
+                format!(
+                    "objectHas({}, {})",
+                    maude_field_key_expr(&fields[0].key, context),
+                    maude_scalar_expr(&fields[0].value, context)
+                )
+            }
+        }
+        Expr::Index { .. } => maude_value_expr(expr, context),
+        _ => format!(
+            "query({}, {cardinality})",
+            maude_query_symbol(expr, context)
+        ),
+    }
+}
+
+fn maude_collection_with_member(
+    collection: &Expr,
+    item_expr: &str,
+    present: bool,
+    context: &mut MaudeExprContext,
+) -> String {
+    match collection {
+        Expr::Array(_) => {
+            if present {
+                format!("arrayHas({item_expr})")
+            } else {
+                format!("arrayMissing({item_expr})")
+            }
+        }
+        Expr::Object(_) => {
+            if present {
+                format!(
+                    "objectHas({item_expr}, scalar({}))",
+                    maude_scalar_symbol(collection, context)
+                )
+            } else {
+                format!("objectMissing({item_expr})")
+            }
+        }
+        Expr::Path(_) | Expr::Index { .. } => {
+            if present {
+                format!(
+                    "mapHas({item_expr}, scalar({}))",
+                    maude_scalar_symbol(collection, context)
+                )
+            } else {
+                format!("mapMissing({item_expr})")
+            }
+        }
+        _ => {
+            if present {
+                format!("arrayHas({item_expr})")
+            } else {
+                format!("arrayMissing({item_expr})")
+            }
+        }
+    }
+}
+
+fn maude_index_target_expr(
+    target: &Expr,
+    key_expr: &str,
+    index_expr: &Expr,
+    context: &mut MaudeExprContext,
+) -> String {
+    match target {
+        Expr::Object(fields) => fields
+            .first()
+            .map(|field| {
+                format!(
+                    "objectHas({}, {})",
+                    maude_field_key_expr(&field.key, context),
+                    maude_scalar_expr(&field.value, context)
+                )
+            })
+            .unwrap_or_else(|| format!("objectMissing({key_expr})")),
+        Expr::Index { .. } => maude_value_expr(target, context),
+        _ => format!(
+            "mapHas({key_expr}, scalar({}))",
+            maude_scalar_symbol(index_expr, context)
+        ),
+    }
+}
+
+fn maude_field_key_expr(key: &str, context: &mut MaudeExprContext) -> String {
+    let expr = Expr::Literal(ExprLiteral::String(key.to_owned()));
+    maude_scalar_expr(&expr, context)
 }
 
 fn maude_scalar_symbol(expr: &Expr, context: &mut MaudeExprContext) -> String {
@@ -5594,6 +6087,39 @@ mod tests {
     }
 
     #[test]
+    fn assertion_reports_typed_error_for_invalid_external_duration_value() {
+        let source = r#"
+workflow DurationAssertionExternalInvalid
+
+class Window {
+  elapsed duration
+  limit duration
+}
+
+assert exists(Window where elapsed < limit)
+"#;
+        let ir = whippletree_parser::compile_program(source)
+            .ir
+            .expect("compile");
+        let facts = vec![FactView {
+            fact_id: "fact-invalid-duration".to_owned(),
+            name: "Window".to_owned(),
+            key: "fact-invalid-duration".to_owned(),
+            value_json: r#"{"elapsed":"bad-duration","limit":"PT1H"}"#.to_owned(),
+            provenance_class: "external".to_owned(),
+        }];
+
+        let assertions = eval_assertions(&ir, &facts, &[], None);
+
+        assert_eq!(assertions.len(), 1);
+        assert_eq!(assertions[0].status, AssertionStatus::Error);
+        assert!(assertions[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("invalid duration value `bad-duration`")));
+    }
+
+    #[test]
     fn selects_failed_terminal_case_branch_and_binds_payload() {
         let body = r#"
 case classification {
@@ -5768,20 +6294,27 @@ workflow GeneratedChecks
 class Task {
   priority int
   status string
+  labels string[]
+  metadata map<string>
 }
 
 class Result {
   status string
+  metadata map<string>
 }
 
 assert empty(Result)
 assert count(Result) == 0
+assert count(Result where status == "accepted") >= 0
+assert empty(Result where status not in ["accepted", "queued"])
+assert "urgent" in ["urgent", "later"]
 
 rule accept
-  when Task as task where task.status == "queued" && empty(Result)
+  when Task as task where task.status == "queued" && task.priority >= 1 && "urgent" in task.labels && task.metadata["phase"] == "kernel" && empty(Result where metadata["phase"] == "done")
 => {
   record Result {
     status "accepted"
+    metadata { phase task.metadata["phase"] }
   }
 }
 "#;
@@ -5790,11 +6323,17 @@ rule accept
         let (maude, expected) =
             generate_maude_model_search(source, &ir, Path::new("/tmp/kernel.maude"));
 
-        assert_eq!(expected.len(), 10);
+        assert_eq!(expected.len(), 19);
         assert!(maude.contains("guardExpr("));
         assert!(maude.contains("assertionExpr("));
         assert!(maude.contains("andExpr("));
         assert!(maude.contains("eqExpr("));
+        assert!(maude.contains("geExpr("));
+        assert!(maude.contains("inExpr("));
+        assert!(maude.contains("indexExpr("));
+        assert!(maude.contains("arrayHas("));
+        assert!(maude.contains("mapHas("));
+        assert!(maude.contains("queryFilter("));
         assert!(maude.contains("emptyExpr(query("));
         assert!(maude.contains("countExpr(query("));
         assert!(expected.iter().any(|result| {
@@ -5815,7 +6354,7 @@ rule accept
                 .filter(|result| result.predicate == "assertion-read-only"
                     && result.outcome == ExpectedSearchResult::NoSolution)
                 .count(),
-            6
+            15
         );
     }
 

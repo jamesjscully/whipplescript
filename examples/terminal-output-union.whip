@@ -1,0 +1,56 @@
+workflow TerminalOutputUnion
+
+class WorkItem {
+  title string
+  body string
+}
+
+class Classification {
+  summary string
+  priority string
+}
+
+class TerminalRoute {
+  branch string
+  detail string
+}
+
+coerce classify(title string, body string) -> Classification {
+  prompt "Classify the work item"
+}
+
+rule classify_work
+  when WorkItem as item
+=>
+{
+  coerce classify(item.title, item.body) as classification
+
+  after classification completes {
+    case classification {
+      Completed result => {
+        record TerminalRoute {
+          branch "completed"
+          detail result.summary
+        }
+      }
+      Failed failure => {
+        record TerminalRoute {
+          branch "failed"
+          detail failure.reason
+        }
+      }
+      TimedOut timeout => {
+        record TerminalRoute {
+          branch "timed_out"
+          detail timeout.summary
+        }
+      }
+      Cancelled cancel => {
+        record TerminalRoute {
+          branch "cancelled"
+          detail cancel.summary
+        }
+      }
+    }
+  }
+}

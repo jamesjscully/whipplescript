@@ -394,6 +394,31 @@ payload. Failure-like tags bind the structured error/failure payload when
 available, falling back to the terminal payload if the provider did not expose a
 separate error object.
 
+The typed IR represents this as a terminal-output union on the active effect
+binding, not as ad hoc status strings. Each `after <binding> completes` case
+captures:
+
+- the terminal output binding and source span
+- four alternatives with explicit tags and payload types
+- each branch's tag, payload binding, optional guard expression, branch body
+  hash, and pattern span
+
+The `Completed` payload type is the effect's success output type, such as a
+BAML coerce result class, `AgentTurn`, `LoftClaim`, or `HumanAnswer`. The
+failure-like alternatives use structured payload schemas:
+
+```text
+Failed    { reason string, summary string, effect_id string, run_id string }
+TimedOut  { summary string, effect_id string, run_id string }
+Cancelled { summary string, effect_id string, run_id string }
+```
+
+Branch bodies are validated with the payload binding refined to the selected
+tag's schema. For example, `Completed result` may read fields declared on the
+success output class, while `Failed failure` may read `failure.reason`; reading
+`result.reason` from a completed coerce whose output class has no `reason`
+field is a static diagnostic.
+
 Exact expression-level syntax may still change, but the semantics must stay
 restricted:
 

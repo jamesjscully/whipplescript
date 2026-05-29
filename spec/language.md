@@ -23,11 +23,13 @@ workflow SpecImplementation
 agent worker {
   profile "repo-writer"
   capacity 5
+  capabilities ["agent.tell", "repo.write"]
 }
 
 agent reviewer {
   profile "repo-reader"
   capacity 1
+  capabilities ["agent.tell", "repo.read"]
 }
 
 rule discover_ready_work
@@ -470,7 +472,7 @@ rule run_language_task
   when LanguageTask as task
   when task.provider is available
 => {
-  tell task.provider as turn """
+  tell task.provider requires ["agent.tell"] as turn """
   Write {{ task.language }} text to {{ task.artifactPath }}.
   """
 }
@@ -480,6 +482,13 @@ The compiler rejects `tell` targets that are plain strings or non-`AgentRef`
 dynamic fields. Runtime lowering resolves the `AgentRef` value from the matched
 fact before enqueuing the `agent.tell` effect, so effect targets and profiles are
 chosen deterministically before any provider starts.
+
+`agent` declarations may include a finite `capabilities [...]` list. A `tell`
+statement may declare the target capability contract with `requires [...]`; for
+dynamic `AgentRef` targets, every possible target in the refined domain must
+declare every required capability. The runtime repeats the same check against
+the program-version agent metadata before claiming or starting a provider run,
+so externally inserted or replayed effects cannot bypass source validation.
 
 ## Reuse And Matrices
 

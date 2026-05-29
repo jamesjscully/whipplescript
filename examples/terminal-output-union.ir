@@ -1,0 +1,34 @@
+workflow TerminalOutputUnion
+schemas
+  class WorkItem
+    title string
+    body string
+  class Classification
+    summary string
+    priority string
+  class TerminalRoute
+    branch string
+    detail string
+coerces
+  coerce classify(title string, body string) -> ref<Classification>
+rules
+  rule classify_work
+    when WorkItem as item
+    reads
+      schema:WorkItem
+    writes
+      schema:TerminalRoute
+    effects
+      classification kind=baml.coerce binding=classification key=9cc6833fa173e479
+    terminal_outputs
+      classification span=468..484
+        Completed payload=ref<Classification> span=468..484
+        Failed payload=object<{reason string, summary string, effect_id string, run_id string}> span=468..484
+        TimedOut payload=object<{summary string, effect_id string, run_id string}> span=468..484
+        Cancelled payload=object<{summary string, effect_id string, run_id string}> span=468..484
+    terminal_branches
+      case classification Completed binding=result guard=- body_hash=68cc197fa99f85c2 span=468..484
+      case classification Failed binding=failure guard=- body_hash=2380b8f08533fbed span=606..620
+      case classification TimedOut binding=timeout guard=- body_hash=41b33e02ef29fa29 span=739..755
+      case classification Cancelled binding=cancel guard=- body_hash=52481a247ffe13d7 span=878..894
+    body_hash e7b3c42ca4066628

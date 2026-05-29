@@ -163,6 +163,20 @@ are declared agents. Guards and effect targets may further constrain the domain
 by profile, capacity, and required capabilities; every remaining possible
 target must satisfy those static constraints before the rule is accepted.
 
+Agent-routing effects can declare their target capability contract directly:
+
+```whippletree
+tell task.provider requires ["repo.write"] as turn """
+Update the implementation.
+"""
+```
+
+For a static target, the named agent must declare every required capability. For
+a dynamic `AgentRef`, every agent still possible after type and pattern
+refinement must declare every required capability. Runtime policy enforcement
+repeats this check against persisted program-version agent metadata and blocks
+mismatches as `blocked_by_capability` before provider execution starts.
+
 Union types are limited in v0. The compiler may produce tagged unions for
 effect terminal outputs, but user-authored arbitrary unions should wait until
 we need them.
@@ -392,6 +406,8 @@ Static checking rules:
 - `tell task.provider` is accepted only when `task.provider` has an
   `AgentRef<...>` type and the current refined domain satisfies the target
   effect's declared constraints
+- `tell task.provider requires [...]` is accepted only when every agent in the
+  current refined domain declares every listed capability
 
 Dynamic target checking still runs after static checking. When a rule fires,
 the runtime validates that the selected JSON string is one of the IR

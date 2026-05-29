@@ -1143,13 +1143,18 @@ impl RuntimeKernel {
         let message = provider_diagnostic_message(provider, summary, diagnostics_json);
         let idempotency_key =
             idempotency_key(&[instance_id, run_id, "provider-diagnostic", diagnostics_json]);
+        let source_span_json = self
+            .store
+            .effect_source_span_json(instance_id, effect_id)
+            .ok()
+            .flatten();
         Some(TerminalDiagnosticRecord {
             program_id: None,
             program_version_id: None,
             severity: "error".to_owned(),
             code: code.map(str::to_owned),
             message,
-            source_span_json: None,
+            source_span_json,
             subject_type: Some("effect".to_owned()),
             subject_id: Some(effect_id.to_owned()),
             assertion_id: None,
@@ -1188,6 +1193,7 @@ fn declared_profiles_json(program: &IrProgram) -> String {
                 "profile": agent.profile,
                 "capacity": agent.capacity,
                 "skills": agent.skills,
+                "capabilities": agent.capabilities,
             })
         })
         .collect::<Vec<_>>();
@@ -1499,6 +1505,7 @@ workflow CapacityFromSource
 agent worker {
   profile "repo-writer"
   capacity 1
+  capabilities ["agent.tell"]
 }
 
 rule start
@@ -1537,6 +1544,7 @@ rule start
                 required_capabilities_json: "[]",
                 profile: Some("repo-writer"),
                 correlation_id: None,
+                source_span_json: None,
             },
             NewEffect {
                 effect_id: "tell-two",
@@ -1548,6 +1556,7 @@ rule start
                 required_capabilities_json: "[]",
                 profile: Some("repo-writer"),
                 correlation_id: None,
+                source_span_json: None,
             },
         ];
         kernel
@@ -1605,6 +1614,82 @@ rule start
             .as_deref()
             .expect("capacity reason")
             .contains("capacity exhausted"));
+    }
+
+    #[test]
+    fn program_agent_capabilities_block_mismatched_effects() {
+        let compiled = compile_program(
+            r#"
+workflow CapabilityFromSource
+
+agent worker {
+  profile "repo-writer"
+  capacity 1
+  capabilities ["agent.tell"]
+}
+
+rule start
+  when started
+=> {
+  tell worker "write"
+}
+"#,
+        );
+        let program = compiled.ir.expect("program compiles");
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &program.workflow,
+                    source_hash: "source",
+                    ir_hash: "ir",
+                    compiler_version: "test",
+                },
+                &program,
+            )
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        let effects = [NewEffect {
+            effect_id: "tell-write",
+            kind: "agent.tell",
+            target: Some("worker"),
+            input_json: r#"{"prompt":"write"}"#,
+            status: "queued",
+            idempotency_key: "rule=start;effect=tell-write",
+            required_capabilities_json: r#"["repo.write"]"#,
+            profile: Some("repo-writer"),
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                effects: &effects,
+                dependencies: &[],
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commits");
+
+        let blocked = kernel.start_run(RunStart {
+            instance_id: &instance_id,
+            effect_id: "tell-write",
+            run_id: "run-write",
+            provider: "test",
+            worker_id: "worker-1",
+            lease_id: "lease-write",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        });
+
+        assert!(
+            matches!(blocked, Err(StoreError::PolicyBlocked { reason, .. }) if reason.contains("does not declare required capability `repo.write`"))
+        );
     }
 
     #[test]
@@ -1696,6 +1781,7 @@ rule wait
             required_capabilities_json: "[]",
             profile: Some("repo-writer"),
             correlation_id: None,
+            source_span_json: None,
         }];
         let event = kernel
             .commit_rule(RuleCommit {
@@ -1726,6 +1812,7 @@ rule wait
             required_capabilities_json: "[]",
             profile: Some("repo-writer"),
             correlation_id: None,
+            source_span_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {
@@ -1789,6 +1876,7 @@ rule wait
             required_capabilities_json: "[]",
             profile: Some("repo-writer"),
             correlation_id: None,
+            source_span_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {
@@ -1846,6 +1934,7 @@ rule wait
             required_capabilities_json: "[]",
             profile: Some("repo-writer"),
             correlation_id: None,
+            source_span_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {
@@ -1960,6 +2049,7 @@ rule wait
             required_capabilities_json: "[]",
             profile: Some("repo-writer"),
             correlation_id: None,
+            source_span_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {
@@ -2023,6 +2113,7 @@ rule wait
             required_capabilities_json: r#"["agent.tell","repo.write"]"#,
             profile: Some("repo-reader"),
             correlation_id: None,
+            source_span_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {
@@ -2093,6 +2184,7 @@ rule wait
             required_capabilities_json: "[]",
             profile: Some("repo-writer"),
             correlation_id: None,
+            source_span_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {
@@ -2191,6 +2283,9 @@ rule wait
             required_capabilities_json: "[]",
             profile: Some("repo-reader"),
             correlation_id: None,
+            source_span_json: Some(
+                r#"{"path":"workflow.whip","start":10,"end":42,"construct":"effect"}"#,
+            ),
         }];
         kernel
             .commit_rule(RuleCommit {
@@ -2275,6 +2370,19 @@ rule wait
         assert!(diagnostics[0].event_id.is_some());
         assert!(diagnostics[0].message.contains("fixture exploded"));
         assert_ne!(diagnostics[0].evidence_ids_json, "[]");
+        assert_eq!(
+            diagnostics[0].source_span_json.as_deref(),
+            Some(r#"{"construct":"effect","end":42,"path":"workflow.whip","start":10}"#)
+        );
+        let replayed = store
+            .list_diagnostics_from_events(&instance_id)
+            .expect("event diagnostics replay");
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].code.as_deref(), Some("fixture_failure"));
+        assert_eq!(
+            replayed[0].source_span_json.as_deref(),
+            diagnostics[0].source_span_json.as_deref()
+        );
 
         let facts = store.list_facts(&instance_id).expect("facts list");
         assert!(facts.iter().any(|fact| fact.name == "agent.turn.failed"
@@ -2360,6 +2468,7 @@ rule wait
             required_capabilities_json: r#"["baml.coerce"]"#,
             profile: Some("repo-writer"),
             correlation_id: None,
+            source_span_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {
@@ -2437,6 +2546,7 @@ rule wait
             required_capabilities_json: r#"["baml.coerce"]"#,
             profile: Some("repo-writer"),
             correlation_id: None,
+            source_span_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {
@@ -2532,6 +2642,7 @@ rule wait
             required_capabilities_json: r#"["loft.claim"]"#,
             profile: Some("repo-writer"),
             correlation_id: None,
+            source_span_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {
@@ -2627,6 +2738,7 @@ rule wait
             required_capabilities_json: r#"["loft.claim"]"#,
             profile: Some("repo-writer"),
             correlation_id: None,
+            source_span_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {
@@ -2732,6 +2844,7 @@ rule wait
             required_capabilities_json: r#"["loft.renew"]"#,
             profile: Some("repo-writer"),
             correlation_id: None,
+            source_span_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {
@@ -2825,6 +2938,7 @@ rule wait
             required_capabilities_json: r#"["human.ask"]"#,
             profile: Some("human-review"),
             correlation_id: None,
+            source_span_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {
@@ -2910,6 +3024,7 @@ rule wait
             required_capabilities_json: "[]",
             profile: Some("repo-reader"),
             correlation_id: None,
+            source_span_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {

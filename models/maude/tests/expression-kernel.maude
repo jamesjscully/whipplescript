@@ -47,6 +47,50 @@ search [1] in WHIPPLETREE-KERNEL :
   =>*
   diagnostic(guardedRule) graphCommitted(g1) effect(tellEff, queued) .
 
+--- Lowered ordering, membership, map index, and filtered-query expressions compose.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact,
+    andExpr(
+      andExpr(geExpr(countExpr(queryFilter(query1, boolTrue, qOne)), countOne),
+        inExpr(scalar(scalar1), arrayHas(scalar(scalar1)))),
+      eqExpr(indexExpr(mapHas(scalar(scalar2), scalar(scalar1)), scalar(scalar2)),
+        scalar(scalar1))))
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
+
+--- Lowered membership misses and failed filtered-query guards block commits.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact,
+    orExpr(inExpr(scalar(scalar1), arrayMissing(scalar(scalar1))),
+      existsExpr(queryFilter(query1, boolFalse, qOne))))
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) .
+
+--- Lowered object-literal witnesses support emptiness and field membership.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact,
+    andExpr(emptyExpr(objectEmpty),
+      inExpr(scalar(scalar1), objectHas(scalar(scalar1), scalar(scalar2)))))
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
+
+--- Lowered index misses are guard errors and still cannot commit effects.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact,
+    eqExpr(indexExpr(mapMissing(scalar(scalar1)), scalar(scalar1)), scalar(scalar2)))
+  graph(g1, tellEff)
+  =>*
+  diagnostic(guardedRule) graphCommitted(g1) effect(tellEff, queued) .
+
 --- A finite enum/literal domain guard cannot match values outside its domain.
 search [1] in WHIPPLETREE-KERNEL :
   fact(issueFact) rule(guardedRule, issueFact, g1)

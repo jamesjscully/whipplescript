@@ -23,9 +23,9 @@ schemas
     review ref<LanguageQualityReview>
     status literal<"reviewed">
 agents
-  agent codex profile=repo-writer capacity=2 skills=[]
-  agent claude profile=repo-writer capacity=2 skills=[]
-  agent pi profile=repo-writer capacity=2 skills=[]
+  agent codex profile=repo-writer capacity=2 skills=[] capabilities=[]
+  agent claude profile=repo-writer capacity=2 skills=[] capabilities=[]
+  agent pi profile=repo-writer capacity=2 skills=[] capabilities=[]
 coerces
   coerce reviewLanguageArtifact(language string, expectedScript string, artifactPath string, turnSummary string) -> ref<LanguageQualityReview>
 assertions

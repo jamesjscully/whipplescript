@@ -6,6 +6,7 @@ use std::{
 };
 
 use serde_json::Value;
+use whippletree_store::{NewFact, RuleCommit, SqliteStore};
 
 #[test]
 fn checks_all_example_workflows() {
@@ -1508,8 +1509,8 @@ rule seed
   record Window {
     elapsed "PT1H"
     limit "PT2H"
-    opened_at "2026-05-29T10:00:00Z"
-    due_at "2026-05-29T11:00:00Z"
+    opened_at "2026-05-29T10:00:00.250-04:00"
+    due_at "2026-05-29T14:00:00.500Z"
   }
 }
 "#,
@@ -1564,6 +1565,116 @@ rule seed
 }
 
 #[test]
+fn step_reports_typed_errors_for_invalid_external_duration_values() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("duration-time-external-invalid");
+    fs::write(
+        &source_path,
+        r#"
+workflow DurationTimeExternalInvalid
+
+class Window {
+  elapsed duration
+  limit duration
+}
+
+class Outcome {
+  status string
+}
+
+rule accept
+  when Window as window where window.elapsed < window.limit
+=> {
+  record Outcome {
+    status "accepted"
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let started = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "run",
+            source_path.to_str().expect("utf-8 source path"),
+            "--json",
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+    let mut store = SqliteStore::open(&store_path).expect("open store");
+    let fact_value = r#"{"elapsed":"not-a-duration","limit":"PT1H"}"#;
+    let fact = NewFact {
+        fact_id: "external-window-invalid-duration",
+        name: "Window",
+        key: "external-window-invalid-duration",
+        value_json: fact_value,
+        schema_id: Some("Window"),
+        provenance_class: "external",
+        correlation_id: None,
+    };
+    store
+        .commit_rule(RuleCommit {
+            instance_id: &instance_id,
+            rule: "external",
+            trigger_event_id: None,
+            facts: &[fact],
+            effects: &[],
+            dependencies: &[],
+            idempotency_key: Some("external-window-invalid-duration"),
+        })
+        .expect("commit external fact");
+
+    let step = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "step",
+            &instance_id,
+            source_path.to_str().expect("utf-8 source path"),
+        ],
+    );
+    let guards = step
+        .get("guards")
+        .and_then(Value::as_array)
+        .expect("guards");
+    assert!(guards.iter().any(|guard| {
+        guard.get("status").and_then(Value::as_str) == Some("error")
+            && guard
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("invalid duration value `not-a-duration`"))
+    }));
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            &instance_id,
+        ],
+    );
+    assert!(!facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .any(|fact| { fact.get("name").and_then(Value::as_str) == Some("Outcome") }));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
 fn check_rejects_invalid_duration_and_time_literals() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let source_path = temp_workflow_path("duration-time-invalid-literals");
@@ -1599,6 +1710,39 @@ rule seed
     assert!(stderr.contains("field `Window.opened_at` has invalid time literal"));
 
     let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn check_rejects_bad_effect_payload_arguments() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let source_path = example_path("invalid/bad-effect-payload.whip");
+
+    let output = Command::new(bin)
+        .args(["check", source_path.to_str().expect("utf-8 source path")])
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("object literal without an expected object"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("class `Owner` has no field `handle`"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("field `coerce `reviewPayload`.metadata` expects `string`"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("field `coerce `reviewPayload`.score` expects `int`"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("field `loft claim.issue` receives incompatible expression type"),
+        "stderr:\n{stderr}"
+    );
 }
 
 #[test]
@@ -2148,6 +2292,14 @@ rule seed
                 .get("assertion_id")
                 .and_then(Value::as_str)
                 .is_some()
+            && diagnostic
+                .pointer("/source_span/construct")
+                .and_then(Value::as_str)
+                == Some("assertion")
+            && diagnostic
+                .pointer("/source_span/path")
+                .and_then(Value::as_str)
+                == source_path.to_str()
             && diagnostic
                 .get("message")
                 .and_then(Value::as_str)

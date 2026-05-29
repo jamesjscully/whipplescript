@@ -250,6 +250,13 @@ This includes workspace preparation, adapter resolution, process/session launch,
 stdin/request submission, streaming, timeout, cancellation, result validation,
 and artifact capture.
 
+Terminal provider diagnostics must be recoverable from the appended terminal
+event. The durable diagnostics table is a query projection for CLI and API
+surfaces; replaying `effect.terminal` events with embedded diagnostic payloads
+must reproduce the provider diagnostic identity, event/effect/run links,
+evidence/artifact links, message/code/severity, and source span when the effect
+originated from compiled source metadata.
+
 Failures before a provider run is created should be represented as blocked
 effect state with diagnostics and evidence. Examples include missing provider
 configuration, missing credentials, insufficient native enforcement, or no

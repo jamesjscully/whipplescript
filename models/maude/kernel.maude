@@ -52,6 +52,7 @@ mod WHIPPLETREE-KERNEL is
   ops present missing : -> Presence .
   ops qZero qOne qMany qError : -> QueryCardinality .
   ops boolTrue boolFalse exprError countZero countOne countMany : -> Expr .
+  ops orderLow orderEqual orderHigh arrayEmpty objectEmpty mapEmpty : -> Expr .
 
   --- Runtime configuration as a multiset.
   op none : -> Cfg .
@@ -96,6 +97,19 @@ mod WHIPPLETREE-KERNEL is
   op countExpr : Expr -> Expr .
   op existsExpr : Expr -> Expr .
   op emptyExpr : Expr -> Expr .
+  op ltExpr : Expr Expr -> Expr .
+  op leExpr : Expr Expr -> Expr .
+  op gtExpr : Expr Expr -> Expr .
+  op geExpr : Expr Expr -> Expr .
+  op inExpr : Expr Expr -> Expr .
+  op arrayHas : Expr -> Expr .
+  op arrayMissing : Expr -> Expr .
+  op mapHas : Expr Expr -> Expr .
+  op mapMissing : Expr -> Expr .
+  op objectHas : Expr Expr -> Expr .
+  op objectMissing : Expr -> Expr .
+  op indexExpr : Expr Expr -> Expr .
+  op queryFilter : QueryId Expr QueryCardinality -> Expr .
   op evalGuard : Expr -> GuardResult .
   op evalAssertion : Expr -> AssertionResult .
   op declaredAgent : AgentTarget -> Cfg .
@@ -125,6 +139,7 @@ mod WHIPPLETREE-KERNEL is
   vars S : EffectStatus .
   vars Sc : Scalar .
   vars Q : QueryId .
+  var C : QueryCardinality .
   vars Ex Ex1 Ex2 : Expr .
 
   --- Deterministic expression-kernel subset used by generated per-program
@@ -134,14 +149,59 @@ mod WHIPPLETREE-KERNEL is
   eq countExpr(query(Q, qOne)) = countOne .
   eq countExpr(query(Q, qMany)) = countMany .
   eq countExpr(query(Q, qError)) = exprError .
+  eq countExpr(queryFilter(Q, boolTrue, qZero)) = countZero .
+  eq countExpr(queryFilter(Q, boolTrue, qOne)) = countOne .
+  eq countExpr(queryFilter(Q, boolTrue, qMany)) = countMany .
+  eq countExpr(queryFilter(Q, boolTrue, qError)) = exprError .
+  eq countExpr(queryFilter(Q, boolFalse, C)) = countZero .
+  eq countExpr(queryFilter(Q, exprError, C)) = exprError .
+  eq countExpr(arrayEmpty) = countZero .
+  eq countExpr(arrayHas(Ex)) = countOne .
+  eq countExpr(arrayMissing(Ex)) = countZero .
+  eq countExpr(mapEmpty) = countZero .
+  eq countExpr(mapHas(Ex1, Ex2)) = countOne .
+  eq countExpr(mapMissing(Ex)) = countZero .
+  eq countExpr(objectEmpty) = countZero .
+  eq countExpr(objectHas(Ex1, Ex2)) = countOne .
+  eq countExpr(objectMissing(Ex)) = countZero .
   eq existsExpr(query(Q, qZero)) = boolFalse .
   eq existsExpr(query(Q, qOne)) = boolTrue .
   eq existsExpr(query(Q, qMany)) = boolTrue .
   eq existsExpr(query(Q, qError)) = exprError .
+  eq existsExpr(queryFilter(Q, boolTrue, qZero)) = boolFalse .
+  eq existsExpr(queryFilter(Q, boolTrue, qOne)) = boolTrue .
+  eq existsExpr(queryFilter(Q, boolTrue, qMany)) = boolTrue .
+  eq existsExpr(queryFilter(Q, boolTrue, qError)) = exprError .
+  eq existsExpr(queryFilter(Q, boolFalse, C)) = boolFalse .
+  eq existsExpr(queryFilter(Q, exprError, C)) = exprError .
+  eq existsExpr(arrayEmpty) = boolFalse .
+  eq existsExpr(arrayHas(Ex)) = boolTrue .
+  eq existsExpr(arrayMissing(Ex)) = boolFalse .
+  eq existsExpr(mapEmpty) = boolFalse .
+  eq existsExpr(mapHas(Ex1, Ex2)) = boolTrue .
+  eq existsExpr(mapMissing(Ex)) = boolFalse .
+  eq existsExpr(objectEmpty) = boolFalse .
+  eq existsExpr(objectHas(Ex1, Ex2)) = boolTrue .
+  eq existsExpr(objectMissing(Ex)) = boolFalse .
   eq emptyExpr(query(Q, qZero)) = boolTrue .
   eq emptyExpr(query(Q, qOne)) = boolFalse .
   eq emptyExpr(query(Q, qMany)) = boolFalse .
   eq emptyExpr(query(Q, qError)) = exprError .
+  eq emptyExpr(queryFilter(Q, boolTrue, qZero)) = boolTrue .
+  eq emptyExpr(queryFilter(Q, boolTrue, qOne)) = boolFalse .
+  eq emptyExpr(queryFilter(Q, boolTrue, qMany)) = boolFalse .
+  eq emptyExpr(queryFilter(Q, boolTrue, qError)) = exprError .
+  eq emptyExpr(queryFilter(Q, boolFalse, C)) = boolTrue .
+  eq emptyExpr(queryFilter(Q, exprError, C)) = exprError .
+  eq emptyExpr(arrayEmpty) = boolTrue .
+  eq emptyExpr(arrayHas(Ex)) = boolFalse .
+  eq emptyExpr(arrayMissing(Ex)) = boolTrue .
+  eq emptyExpr(mapEmpty) = boolTrue .
+  eq emptyExpr(mapHas(Ex1, Ex2)) = boolFalse .
+  eq emptyExpr(mapMissing(Ex)) = boolTrue .
+  eq emptyExpr(objectEmpty) = boolTrue .
+  eq emptyExpr(objectHas(Ex1, Ex2)) = boolFalse .
+  eq emptyExpr(objectMissing(Ex)) = boolTrue .
   eq notExpr(boolTrue) = boolFalse .
   eq notExpr(boolFalse) = boolTrue .
   eq notExpr(exprError) = exprError .
@@ -175,6 +235,91 @@ mod WHIPPLETREE-KERNEL is
   eq neExpr(countMany, countMany) = boolFalse .
   eq neExpr(countOne, countMany) = boolTrue .
   eq neExpr(countMany, countOne) = boolTrue .
+  eq ltExpr(orderLow, orderHigh) = boolTrue .
+  eq ltExpr(orderLow, orderEqual) = boolTrue .
+  eq ltExpr(orderEqual, orderHigh) = boolTrue .
+  eq ltExpr(orderLow, orderLow) = boolFalse .
+  eq ltExpr(orderEqual, orderEqual) = boolFalse .
+  eq ltExpr(orderHigh, orderLow) = boolFalse .
+  eq ltExpr(countZero, countOne) = boolTrue .
+  eq ltExpr(countZero, countMany) = boolTrue .
+  eq ltExpr(countOne, countMany) = boolTrue .
+  eq ltExpr(countZero, countZero) = boolFalse .
+  eq ltExpr(countOne, countOne) = boolFalse .
+  eq ltExpr(countMany, countMany) = boolFalse .
+  eq ltExpr(countOne, countZero) = boolFalse .
+  eq ltExpr(countMany, countZero) = boolFalse .
+  eq ltExpr(countMany, countOne) = boolFalse .
+  eq ltExpr(exprError, Ex) = exprError .
+  eq ltExpr(Ex, exprError) = exprError .
+  eq leExpr(orderLow, orderHigh) = boolTrue .
+  eq leExpr(orderLow, orderEqual) = boolTrue .
+  eq leExpr(orderEqual, orderHigh) = boolTrue .
+  eq leExpr(orderLow, orderLow) = boolTrue .
+  eq leExpr(orderEqual, orderEqual) = boolTrue .
+  eq leExpr(orderHigh, orderLow) = boolFalse .
+  eq leExpr(countZero, countZero) = boolTrue .
+  eq leExpr(countZero, countOne) = boolTrue .
+  eq leExpr(countZero, countMany) = boolTrue .
+  eq leExpr(countOne, countOne) = boolTrue .
+  eq leExpr(countOne, countMany) = boolTrue .
+  eq leExpr(countMany, countMany) = boolTrue .
+  eq leExpr(countOne, countZero) = boolFalse .
+  eq leExpr(countMany, countZero) = boolFalse .
+  eq leExpr(countMany, countOne) = boolFalse .
+  eq leExpr(exprError, Ex) = exprError .
+  eq leExpr(Ex, exprError) = exprError .
+  eq gtExpr(orderHigh, orderLow) = boolTrue .
+  eq gtExpr(orderHigh, orderEqual) = boolTrue .
+  eq gtExpr(orderEqual, orderLow) = boolTrue .
+  eq gtExpr(orderHigh, orderHigh) = boolFalse .
+  eq gtExpr(orderEqual, orderEqual) = boolFalse .
+  eq gtExpr(orderLow, orderHigh) = boolFalse .
+  eq gtExpr(countOne, countZero) = boolTrue .
+  eq gtExpr(countMany, countZero) = boolTrue .
+  eq gtExpr(countMany, countOne) = boolTrue .
+  eq gtExpr(countZero, countZero) = boolFalse .
+  eq gtExpr(countOne, countOne) = boolFalse .
+  eq gtExpr(countMany, countMany) = boolFalse .
+  eq gtExpr(countZero, countOne) = boolFalse .
+  eq gtExpr(countZero, countMany) = boolFalse .
+  eq gtExpr(countOne, countMany) = boolFalse .
+  eq gtExpr(exprError, Ex) = exprError .
+  eq gtExpr(Ex, exprError) = exprError .
+  eq geExpr(orderHigh, orderLow) = boolTrue .
+  eq geExpr(orderHigh, orderEqual) = boolTrue .
+  eq geExpr(orderEqual, orderLow) = boolTrue .
+  eq geExpr(orderHigh, orderHigh) = boolTrue .
+  eq geExpr(orderEqual, orderEqual) = boolTrue .
+  eq geExpr(orderLow, orderHigh) = boolFalse .
+  eq geExpr(countZero, countZero) = boolTrue .
+  eq geExpr(countOne, countZero) = boolTrue .
+  eq geExpr(countOne, countOne) = boolTrue .
+  eq geExpr(countMany, countZero) = boolTrue .
+  eq geExpr(countMany, countOne) = boolTrue .
+  eq geExpr(countMany, countMany) = boolTrue .
+  eq geExpr(countZero, countOne) = boolFalse .
+  eq geExpr(countZero, countMany) = boolFalse .
+  eq geExpr(countOne, countMany) = boolFalse .
+  eq geExpr(exprError, Ex) = exprError .
+  eq geExpr(Ex, exprError) = exprError .
+  eq inExpr(Ex, arrayHas(Ex)) = boolTrue .
+  eq inExpr(Ex, arrayMissing(Ex)) = boolFalse .
+  eq inExpr(Ex, mapHas(Ex, Ex1)) = boolTrue .
+  eq inExpr(Ex, mapMissing(Ex)) = boolFalse .
+  eq inExpr(Ex, objectHas(Ex, Ex1)) = boolTrue .
+  eq inExpr(Ex, objectMissing(Ex)) = boolFalse .
+  eq inExpr(Ex, arrayEmpty) = boolFalse .
+  eq inExpr(Ex, mapEmpty) = boolFalse .
+  eq inExpr(Ex, objectEmpty) = boolFalse .
+  eq inExpr(exprError, Ex) = exprError .
+  eq inExpr(Ex, exprError) = exprError .
+  eq indexExpr(mapHas(Ex1, Ex2), Ex1) = Ex2 .
+  eq indexExpr(mapMissing(Ex1), Ex1) = exprError .
+  eq indexExpr(objectHas(Ex1, Ex2), Ex1) = Ex2 .
+  eq indexExpr(objectMissing(Ex1), Ex1) = exprError .
+  eq indexExpr(exprError, Ex) = exprError .
+  eq indexExpr(Ex, exprError) = exprError .
   eq evalGuard(boolTrue) = gTrue .
   eq evalGuard(boolFalse) = gFalse .
   eq evalGuard(exprError) = gError .

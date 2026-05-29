@@ -13,7 +13,7 @@ schemas
     turn ref<AgentTurn>
     status literal<"dispatched">
 agents
-  agent codex profile=repo-reader capacity=4 skills=[whippletree-author]
+  agent codex profile=repo-reader capacity=4 skills=[whippletree-author] capabilities=[]
 rules
   rule seed_phase_reviews
     when started

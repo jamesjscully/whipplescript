@@ -1,6 +1,6 @@
 //! Durable SQLite store for event logs, facts, effects, and evidence.
 
-use std::{fs, path::Path, result};
+use std::{collections::BTreeSet, fs, path::Path, result};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -143,6 +143,7 @@ pub struct NewEffect<'a> {
     pub required_capabilities_json: &'a str,
     pub profile: Option<&'a str>,
     pub correlation_id: Option<&'a str>,
+    pub source_span_json: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -873,7 +874,7 @@ impl SqliteStore {
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
     ) -> StoreResult<StoredEvent> {
-        let payload = effect_completion_payload(completion);
+        let payload = effect_completion_payload(completion, diagnostic.as_ref());
         let tx = self.connection.transaction()?;
         let event = append_event_on(
             &tx,
@@ -1634,6 +1635,114 @@ impl SqliteStore {
                 .collect::<result::Result<Vec<_>, _>>()?
         };
         Ok(rows)
+    }
+
+    pub fn list_diagnostics_from_events(
+        &self,
+        instance_id: &str,
+    ) -> StoreResult<Vec<DiagnosticView>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT event_id, payload_json, occurred_at
+            FROM events
+            WHERE instance_id = ?1
+              AND event_type = 'effect.terminal'
+            ORDER BY sequence
+            "#,
+        )?;
+        let rows = statement
+            .query_map([instance_id], |row| {
+                let event_id: String = row.get(0)?;
+                let payload_json: String = row.get(1)?;
+                let occurred_at: String = row.get(2)?;
+                Ok((event_id, payload_json, occurred_at))
+            })?
+            .collect::<result::Result<Vec<_>, _>>()?;
+
+        let mut diagnostics = Vec::new();
+        for (event_id, payload_json, occurred_at) in rows {
+            let payload = serde_json::from_str::<Value>(&payload_json)?;
+            let Some(diagnostic) = payload.get("diagnostic").filter(|value| !value.is_null())
+            else {
+                continue;
+            };
+            diagnostics.push(DiagnosticView {
+                diagnostic_id: format!("dia_event_{}", stable_hash_hex(&event_id)),
+                instance_id: Some(instance_id.to_owned()),
+                program_id: optional_string(diagnostic.get("program_id")),
+                program_version_id: optional_string(diagnostic.get("program_version_id")),
+                severity: optional_string(diagnostic.get("severity"))
+                    .unwrap_or_else(|| "error".to_owned()),
+                code: optional_string(diagnostic.get("code")),
+                message: optional_string(diagnostic.get("message")).unwrap_or_default(),
+                source_span_json: diagnostic.get("source_span").and_then(|value| {
+                    if value.is_null() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    }
+                }),
+                subject_type: optional_string(diagnostic.get("subject_type")),
+                subject_id: optional_string(diagnostic.get("subject_id")),
+                event_id: Some(event_id.clone()),
+                effect_id: optional_string(payload.get("effect_id")),
+                run_id: optional_string(payload.get("run_id")),
+                assertion_id: optional_string(diagnostic.get("assertion_id")),
+                evidence_ids_json: diagnostic
+                    .get("evidence_ids")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]))
+                    .to_string(),
+                artifact_ids_json: diagnostic
+                    .get("artifact_ids")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]))
+                    .to_string(),
+                causation_id: optional_string(diagnostic.get("causation_id")),
+                correlation_id: optional_string(diagnostic.get("correlation_id")),
+                idempotency_key: optional_string(diagnostic.get("idempotency_key")),
+                created_at: occurred_at,
+            });
+        }
+        Ok(diagnostics)
+    }
+
+    pub fn effect_source_span_json(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+    ) -> StoreResult<Option<String>> {
+        let payload_json = self
+            .connection
+            .query_row(
+                r#"
+                SELECT events.payload_json
+                FROM effects
+                JOIN events ON events.event_id = effects.created_by_event_id
+                WHERE effects.instance_id = ?1
+                  AND effects.effect_id = ?2
+                "#,
+                params![instance_id, effect_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(payload_json) = payload_json else {
+            return Ok(None);
+        };
+        let payload = serde_json::from_str::<Value>(&payload_json)?;
+        let span = payload
+            .get("effects")
+            .and_then(Value::as_array)
+            .and_then(|effects| {
+                effects.iter().find_map(|effect| {
+                    (effect.get("effect_id").and_then(Value::as_str) == Some(effect_id))
+                        .then(|| effect.get("source_span"))
+                        .flatten()
+                        .filter(|value| !value.is_null())
+                        .map(Value::to_string)
+                })
+            });
+        Ok(span)
     }
 
     pub fn create_inbox_item(&self, item: NewInboxItem<'_>) -> StoreResult<()> {
@@ -3033,6 +3142,10 @@ fn insert_diagnostic_on(
         .map_err(Into::into)
 }
 
+fn optional_string(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_str).map(str::to_owned)
+}
+
 fn existing_diagnostic_id_on(
     connection: &Connection,
     diagnostic: &DiagnosticRecord<'_>,
@@ -3277,7 +3390,22 @@ fn agent_target_policy_block(effect: &PolicyEffect) -> StoreResult<Option<Policy
             status: "blocked_by_profile",
             reason: format!("agent `{target}` requires declared profile `{expected}`"),
         })),
-        _ => Ok(None),
+        _ => {
+            let declared_capabilities =
+                declared_agent_capabilities(&effect.declared_profiles_json, target)?;
+            let required_capabilities = explicit_required_capabilities(effect)?;
+            for capability in required_capabilities {
+                if !declared_capabilities.contains(&capability) {
+                    return Ok(Some(PolicyBlock {
+                        status: "blocked_by_capability",
+                        reason: format!(
+                            "agent `{target}` does not declare required capability `{capability}`"
+                        ),
+                    }));
+                }
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -3407,6 +3535,58 @@ fn declared_agent_capacity(declared_profiles_json: &str, agent: &str) -> StoreRe
     Ok(agent_capacity_in_value(&parsed, agent))
 }
 
+fn declared_agent_capabilities(
+    declared_profiles_json: &str,
+    agent: &str,
+) -> StoreResult<BTreeSet<String>> {
+    let parsed = serde_json::from_str::<Value>(declared_profiles_json)?;
+    Ok(agent_capabilities_in_value(&parsed, agent).unwrap_or_default())
+}
+
+fn agent_capabilities_in_value(value: &Value, agent: &str) -> Option<BTreeSet<String>> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| agent_capabilities_in_value(item, agent)),
+        Value::Object(object) => {
+            if let Some(entry) = object.get(agent) {
+                return Some(capabilities_value(entry.get("capabilities")?));
+            }
+            if let Some(capabilities) = object
+                .get("agents")
+                .and_then(|agents| agent_capabilities_in_value(agents, agent))
+            {
+                return Some(capabilities);
+            }
+            let declared_agent = object
+                .get("name")
+                .or_else(|| object.get("agent"))
+                .or_else(|| object.get("agent_name"))
+                .or_else(|| object.get("target"))
+                .and_then(Value::as_str);
+            if declared_agent == Some(agent) {
+                object.get("capabilities").map(capabilities_value)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn capabilities_value(value: &Value) -> BTreeSet<String> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn agent_capacity_in_value(value: &Value, agent: &str) -> Option<i64> {
     match value {
         Value::Array(items) => items
@@ -3454,6 +3634,16 @@ fn capacity_value(value: &Value) -> Option<i64> {
 }
 
 fn required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
+    let mut capabilities = explicit_required_capabilities(effect)?;
+    if capabilities.is_empty() {
+        capabilities.push(effect.kind.clone());
+    }
+    capabilities.sort();
+    capabilities.dedup();
+    Ok(capabilities)
+}
+
+fn explicit_required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
     let parsed = serde_json::from_str::<Value>(&effect.required_capabilities_json)?;
     let mut capabilities = parsed
         .as_array()
@@ -3465,9 +3655,6 @@ fn required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if capabilities.is_empty() {
-        capabilities.push(effect.kind.clone());
-    }
     capabilities.sort();
     capabilities.dedup();
     Ok(capabilities)
@@ -3645,6 +3832,9 @@ fn rule_commit_payload(commit: RuleCommit<'_>) -> StoreResult<String> {
         .effects
         .iter()
         .map(|effect| {
+            if let Some(source_span_json) = effect.source_span_json {
+                serde_json::from_str::<Value>(source_span_json)?;
+            }
             Ok(json!({
                 "effect_id": effect.effect_id,
                 "kind": effect.kind,
@@ -3655,6 +3845,7 @@ fn rule_commit_payload(commit: RuleCommit<'_>) -> StoreResult<String> {
                 "required_capabilities": serde_json::from_str::<Value>(effect.required_capabilities_json)?,
                 "profile": effect.profile,
                 "correlation_id": effect.correlation_id,
+                "source_span": effect.source_span_json.map(|span| serde_json::from_str::<Value>(span)).transpose()?.unwrap_or(Value::Null),
             }))
         })
         .collect::<StoreResult<Vec<_>>>()?;
@@ -3680,7 +3871,10 @@ fn rule_commit_payload(commit: RuleCommit<'_>) -> StoreResult<String> {
     serde_json::to_string(&payload).map_err(Into::into)
 }
 
-fn effect_completion_payload(completion: EffectCompletion<'_>) -> String {
+fn effect_completion_payload(
+    completion: EffectCompletion<'_>,
+    diagnostic: Option<&TerminalDiagnosticRecord>,
+) -> String {
     json!({
         "effect_id": completion.effect_id,
         "run_id": completion.run_id,
@@ -3690,8 +3884,32 @@ fn effect_completion_payload(completion: EffectCompletion<'_>) -> String {
         "exit_code": completion.exit_code,
         "summary": completion.summary,
         "metadata": serde_json::from_str::<Value>(completion.metadata_json).unwrap_or(Value::Null),
+        "diagnostic": diagnostic.map(terminal_diagnostic_payload),
     })
     .to_string()
+}
+
+fn terminal_diagnostic_payload(diagnostic: &TerminalDiagnosticRecord) -> Value {
+    json!({
+        "program_id": diagnostic.program_id,
+        "program_version_id": diagnostic.program_version_id,
+        "severity": diagnostic.severity,
+        "code": diagnostic.code,
+        "message": diagnostic.message,
+        "source_span": diagnostic.source_span_json.as_deref().map(|span| {
+            serde_json::from_str::<Value>(span).unwrap_or(Value::Null)
+        }),
+        "subject_type": diagnostic.subject_type,
+        "subject_id": diagnostic.subject_id,
+        "assertion_id": diagnostic.assertion_id,
+        "evidence_ids": serde_json::from_str::<Value>(&diagnostic.evidence_ids_json)
+            .unwrap_or_else(|_| json!([])),
+        "artifact_ids": serde_json::from_str::<Value>(&diagnostic.artifact_ids_json)
+            .unwrap_or_else(|_| json!([])),
+        "causation_id": diagnostic.causation_id,
+        "correlation_id": diagnostic.correlation_id,
+        "idempotency_key": diagnostic.idempotency_key,
+    })
 }
 
 fn run_start_payload(run: RunStart<'_>) -> String {
@@ -3766,6 +3984,7 @@ fn replay_rule_commit(
             .get("required_capabilities")
             .map(Value::to_string)
             .unwrap_or_else(|| "[]".to_owned());
+        let source_span_json = effect.get("source_span").map(Value::to_string);
         let new_effect = NewEffect {
             effect_id,
             kind,
@@ -3782,6 +4001,7 @@ fn replay_rule_commit(
             required_capabilities_json: &required_capabilities_json,
             profile: effect.get("profile").and_then(Value::as_str),
             correlation_id: effect.get("correlation_id").and_then(Value::as_str),
+            source_span_json: source_span_json.as_deref(),
         };
         insert_effect(connection, instance_id, rule, event_id, &new_effect)?;
     }
@@ -4180,6 +4400,7 @@ mod tests {
                 required_capabilities_json: "[]",
                 profile: Some("repo-writer"),
                 correlation_id: None,
+                source_span_json: None,
             },
         ];
         let dependencies = [NewEffectDependency {
@@ -4257,6 +4478,7 @@ mod tests {
                 required_capabilities_json: "[]",
                 profile: Some("repo-writer"),
                 correlation_id: None,
+                source_span_json: None,
             },
         ];
         let dependencies = [NewEffectDependency {
@@ -4403,6 +4625,7 @@ mod tests {
                 required_capabilities_json: "[]",
                 profile: Some("repo-writer"),
                 correlation_id: None,
+                source_span_json: None,
             },
         ];
         let dependencies = [NewEffectDependency {
@@ -4806,6 +5029,104 @@ mod tests {
     }
 
     #[test]
+    fn reconstructs_terminal_diagnostics_from_event_payloads() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("DiagnosticReplay", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let source_span_json =
+            r#"{"path":"workflow.whip","start":42,"end":73,"construct":"effect"}"#;
+        let effects = [NewEffect {
+            source_span_json: Some(source_span_json),
+            ..test_effect("tell", "agent.tell", "rule=start;effect=tell")
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                effects: &effects,
+                dependencies: &[],
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commits");
+        store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "fixture",
+                worker_id: "worker-1",
+                lease_id: "lease-tell",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        let event = store
+            .complete_effect_with_terminal_diagnostic(
+                EffectCompletion {
+                    instance_id: &instance.instance_id,
+                    effect_id: "tell",
+                    run_id: "run-tell",
+                    provider: "fixture",
+                    worker_id: "worker-1",
+                    status: "failed",
+                    exit_code: Some(42),
+                    summary: Some("fixture failed"),
+                    metadata_json: r#"{"stderr":"boom"}"#,
+                    idempotency_key: Some("terminal-run-tell"),
+                },
+                Some(TerminalDiagnosticRecord {
+                    program_id: Some(version.program_id.clone()),
+                    program_version_id: Some(version.version_id.clone()),
+                    severity: "error".to_owned(),
+                    code: Some("fixture.failed".to_owned()),
+                    message: "fixture failed: boom".to_owned(),
+                    source_span_json: Some(source_span_json.to_owned()),
+                    subject_type: Some("effect".to_owned()),
+                    subject_id: Some("tell".to_owned()),
+                    assertion_id: None,
+                    evidence_ids_json: "[]".to_owned(),
+                    artifact_ids_json: "[]".to_owned(),
+                    causation_id: Some("run-tell".to_owned()),
+                    correlation_id: Some("tell".to_owned()),
+                    idempotency_key: Some("diagnostic-run-tell".to_owned()),
+                }),
+            )
+            .expect("terminal diagnostic completes");
+
+        let replayed = store
+            .list_diagnostics_from_events(&instance.instance_id)
+            .expect("event diagnostics replay");
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(
+            replayed[0].event_id.as_deref(),
+            Some(event.event_id.as_str())
+        );
+        assert_eq!(replayed[0].effect_id.as_deref(), Some("tell"));
+        assert_eq!(replayed[0].run_id.as_deref(), Some("run-tell"));
+        assert_eq!(replayed[0].code.as_deref(), Some("fixture.failed"));
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                replayed[0]
+                    .source_span_json
+                    .as_deref()
+                    .expect("source span")
+            )
+            .expect("replayed source span json"),
+            serde_json::from_str::<Value>(source_span_json).expect("expected source span json")
+        );
+    }
+
+    #[test]
     fn opening_legacy_v1_store_adds_diagnostic_columns() {
         let path = std::env::temp_dir().join(format!(
             "whippletree-store-legacy-{}-{}.sqlite",
@@ -4967,6 +5288,7 @@ mod tests {
             required_capabilities_json: r#"["agent.tell","repo.write"]"#,
             profile: Some("repo-reader"),
             correlation_id: None,
+            source_span_json: None,
         }];
         store
             .commit_rule(RuleCommit {
@@ -5051,7 +5373,7 @@ mod tests {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let version = store
             .create_program_version(NewProgramVersion {
-                declared_profiles_json: r#"[{"name":"worker","profile":"repo-writer","capacity":1}]"#,
+                declared_profiles_json: r#"[{"name":"worker","profile":"repo-writer","capacity":1,"capabilities":["agent.tell"]}]"#,
                 ..test_program_version("Capacity", "source-1", "ir-1")
             })
             .expect("program version creates");
@@ -5218,6 +5540,67 @@ mod tests {
     }
 
     #[test]
+    fn agent_missing_declared_capability_is_durably_blocked() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(NewProgramVersion {
+                declared_profiles_json: r#"{"agents":[{"name":"worker","profile":"repo-writer","capacity":1,"capabilities":["agent.tell"]}]}"#,
+                ..test_program_version("AgentCapabilities", "source-1", "ir-1")
+            })
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let effects = [NewEffect {
+            required_capabilities_json: r#"["repo.write"]"#,
+            ..test_effect("tell-write", "agent.tell", "rule=start;effect=tell-write")
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                effects: &effects,
+                dependencies: &[],
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commits");
+
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell-write",
+                run_id: "run-write",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-write",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("agent capability blocks run");
+
+        assert!(
+            matches!(blocked, StoreError::PolicyBlocked { reason, .. } if reason.contains("does not declare required capability `repo.write`"))
+        );
+        assert_eq!(effect_status(&store, "tell-write"), "blocked_by_capability");
+        let effect = store
+            .list_effects(&instance.instance_id)
+            .expect("effects load")
+            .pop()
+            .expect("effect exists");
+        assert!(effect
+            .policy_block_reason
+            .as_deref()
+            .expect("block reason")
+            .contains("repo.write"));
+    }
+
+    #[test]
     fn plugin_registered_effect_contract_can_run_without_kernel_changes() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let version = store
@@ -5245,6 +5628,7 @@ mod tests {
             required_capabilities_json: r#"["memory.query"]"#,
             profile: Some("memory-user"),
             correlation_id: None,
+            source_span_json: None,
         }];
         store
             .commit_rule(RuleCommit {
@@ -5452,6 +5836,7 @@ mod tests {
             required_capabilities_json: "[]",
             profile: Some("repo-writer"),
             correlation_id: None,
+            source_span_json: None,
         }
     }
 
