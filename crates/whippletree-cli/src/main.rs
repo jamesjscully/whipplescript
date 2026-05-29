@@ -2315,6 +2315,12 @@ fn eval_call(name: &str, args: &[Expr], scope: &EvalScope<'_>) -> EvalValue {
         ("count", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
             .map(|count| EvalValue::Json(Value::Number(count.into())))
             .unwrap_or_else(|value| value),
+        ("one", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
+            .map(|count| EvalValue::Json(Value::Bool(count == 1)))
+            .unwrap_or_else(|value| value),
+        ("none", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
+            .map(|count| EvalValue::Json(Value::Bool(count == 0)))
+            .unwrap_or_else(|value| value),
         ("exists", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
             .map(|count| EvalValue::Json(Value::Bool(count > 0)))
             .unwrap_or_else(|value| value),
@@ -2591,7 +2597,8 @@ fn lower_rule(
     effects: &[EffectView],
     source_path: Option<&Path>,
 ) -> OwnedLowering {
-    let (body, context, branch_reports) = selected_rule_body(&rule.body, context);
+    let rule_body = desugar_then_chains(&rule.body);
+    let (body, context, branch_reports) = selected_rule_body(&rule_body, context);
     let existing_fact_ids = facts
         .iter()
         .map(|fact| fact.fact_id.as_str())
@@ -2606,7 +2613,7 @@ fn lower_rule(
     append_consumed_fact_ids(&mut lowering, &pre_terminal_body, &context, facts);
 
     for block in top_level_record_blocks(&pre_terminal_body) {
-        let value = parse_record_fields(&block.body, &context);
+        let value = parse_record_fields(&block.body, &context, block.from_binding.as_deref());
         let value_json = Value::Object(value).to_string();
         let fact_key = record_fact_key(&block.schema, &value_json);
         let fact_id = idempotency_key(&[&rule.name, &block.schema, &fact_key, &value_json]);
@@ -2723,8 +2730,11 @@ fn lower_rule(
             &mut after_context,
             &after.binding,
             upstream_effect_id,
-            binding_value,
+            binding_value.clone(),
         );
+        if let Some(alias) = &after.alias {
+            push_effect_binding(&mut after_context, alias, upstream_effect_id, binding_value);
+        }
         for (binding, effect_id) in &binding_to_effect_id {
             if binding == &after.binding {
                 continue;
@@ -2738,7 +2748,8 @@ fn lower_rule(
         lowering.branch_reports.extend(branch_reports);
         append_consumed_fact_ids(&mut lowering, &selected_after_body, &after_context, facts);
         for record in top_level_record_blocks(&selected_after_body) {
-            let value = parse_record_fields(&record.body, &after_context);
+            let value =
+                parse_record_fields(&record.body, &after_context, record.from_binding.as_deref());
             let value_json = Value::Object(value).to_string();
             let fact_key = record_fact_key(&record.schema, &value_json);
             let fact_id = idempotency_key(&[
@@ -2920,6 +2931,9 @@ fn consume_statements(body: &str) -> Vec<String> {
             let binding = line
                 .strip_prefix("consume ")
                 .or_else(|| line.strip_prefix("done "))?
+                .split("->")
+                .next()
+                .unwrap_or_default()
                 .trim();
             is_identifier(binding).then(|| binding.to_owned())
         })
@@ -2982,6 +2996,56 @@ fn selected_rule_body(
         index = next_index;
     }
     (selected.join("\n"), context, branch_reports)
+}
+
+fn desugar_then_chains(body: &str) -> String {
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut output = Vec::new();
+    let mut last_effect_binding: Option<String> = None;
+    let mut index = 0usize;
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        if let (Some(statement), Some(upstream)) = (
+            trimmed.strip_prefix("then ").map(str::trim),
+            last_effect_binding.as_deref(),
+        ) {
+            output.push(format!("after {upstream} succeeds {{"));
+            output.push(format!("  {statement}"));
+            let mut depth = brace_delta(statement);
+            index += 1;
+            while depth > 0 && index < lines.len() {
+                let line = lines[index];
+                depth += brace_delta(line);
+                output.push(format!("  {line}"));
+                index += 1;
+            }
+            output.push("}".to_owned());
+            if let Some(binding) = effect_binding_from_statement(statement) {
+                last_effect_binding = Some(binding);
+            }
+            continue;
+        }
+        output.push(lines[index].to_owned());
+        if let Some(binding) = effect_binding_from_statement(trimmed) {
+            last_effect_binding = Some(binding);
+        }
+        index += 1;
+    }
+    output.join("\n")
+}
+
+fn effect_binding_from_statement(statement: &str) -> Option<String> {
+    if statement.starts_with("tell ")
+        || statement.starts_with("coerce ")
+        || statement.starts_with("claim ")
+        || statement.starts_with("askHuman ")
+        || statement.starts_with("call ")
+        || statement.starts_with("emit ")
+    {
+        binding_after_as(statement)
+    } else {
+        None
+    }
 }
 
 fn strip_after_blocks(body: &str) -> String {
@@ -3257,6 +3321,7 @@ fn terminal_payload_for_tag(value: &Value, tag: &str) -> Value {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RecordBlock {
     schema: String,
+    from_binding: Option<String>,
     body: String,
 }
 
@@ -3529,13 +3594,8 @@ fn parsed_effect_input_json(
 
 fn parse_after_scope(trimmed: &str) -> Option<AfterScope> {
     let rest = trimmed.strip_prefix("after ")?;
-    let mut parts = rest.split('{').next().unwrap_or(rest).split_whitespace();
-    let binding = parts.next()?;
-    let predicate = parts.next()?;
-    Some(AfterScope {
-        binding: binding.to_owned(),
-        predicate: predicate.to_owned(),
-    })
+    let (binding, predicate, _) = parse_after_header(rest)?;
+    Some(AfterScope { binding, predicate })
 }
 
 fn binding_after_as(line: &str) -> Option<String> {
@@ -3680,13 +3740,18 @@ fn top_level_record_blocks(body: &str) -> Vec<RecordBlock> {
             index += 1;
             continue;
         }
-        if let Some(rest) = trimmed.strip_prefix("record ") {
-            let schema = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .trim_end_matches('{')
-                .to_owned();
+        let record_rest = trimmed.strip_prefix("record ").or_else(|| {
+            trimmed
+                .strip_prefix("done ")
+                .and_then(|rest| rest.split_once("->"))
+                .map(|(_, record)| record.trim())
+                .and_then(|record| record.strip_prefix("record "))
+        });
+        if let Some(rest) = record_rest {
+            let Some((schema, from_binding)) = parse_record_header(rest) else {
+                index += 1;
+                continue;
+            };
             let mut record_lines = Vec::new();
             let mut depth = brace_delta(trimmed);
             index += 1;
@@ -3701,6 +3766,7 @@ fn top_level_record_blocks(body: &str) -> Vec<RecordBlock> {
             }
             blocks.push(RecordBlock {
                 schema,
+                from_binding,
                 body: record_lines.join("\n"),
             });
             continue;
@@ -3710,10 +3776,23 @@ fn top_level_record_blocks(body: &str) -> Vec<RecordBlock> {
     blocks
 }
 
+fn parse_record_header(rest: &str) -> Option<(String, Option<String>)> {
+    let before_brace = rest.split('{').next().unwrap_or(rest).trim();
+    let mut parts = before_brace.split_whitespace();
+    let schema = parts.next()?.to_owned();
+    let from_binding = match (parts.next(), parts.next(), parts.next()) {
+        (None, None, None) => None,
+        (Some("from"), Some(binding), None) if is_identifier(binding) => Some(binding.to_owned()),
+        _ => return None,
+    };
+    Some((schema, from_binding))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AfterBlock {
     binding: String,
     predicate: String,
+    alias: Option<String>,
     body: String,
 }
 
@@ -3727,12 +3806,7 @@ fn after_blocks(body: &str) -> Vec<AfterBlock> {
             index += 1;
             continue;
         };
-        let mut parts = rest.split('{').next().unwrap_or(rest).split_whitespace();
-        let Some(binding) = parts.next() else {
-            index += 1;
-            continue;
-        };
-        let Some(predicate) = parts.next() else {
+        let Some((binding, predicate, alias)) = parse_after_header(rest) else {
             index += 1;
             continue;
         };
@@ -3749,12 +3823,33 @@ fn after_blocks(body: &str) -> Vec<AfterBlock> {
             index += 1;
         }
         blocks.push(AfterBlock {
-            binding: binding.to_owned(),
-            predicate: predicate.to_owned(),
+            binding,
+            predicate,
+            alias,
             body: inner.join("\n"),
         });
     }
     blocks
+}
+
+fn parse_after_header(rest: &str) -> Option<(String, String, Option<String>)> {
+    let before_body = rest
+        .split('{')
+        .next()
+        .unwrap_or(rest)
+        .split("=>")
+        .next()
+        .unwrap_or(rest)
+        .trim();
+    let mut parts = before_body.split_whitespace();
+    let binding = parts.next()?.to_owned();
+    let predicate = parts.next()?.to_owned();
+    let alias = match (parts.next(), parts.next(), parts.next()) {
+        (None, None, None) => None,
+        (Some("as"), Some(alias), None) if is_identifier(alias) => Some(alias.to_owned()),
+        _ => return None,
+    };
+    Some((binding, predicate, alias))
 }
 
 fn effect_binding_value(
@@ -3831,12 +3926,72 @@ fn brace_delta(line: &str) -> i32 {
     })
 }
 
-fn parse_record_fields(body: &str, context: &RuleContext) -> serde_json::Map<String, Value> {
+fn parse_record_fields(
+    body: &str,
+    context: &RuleContext,
+    from_binding: Option<&str>,
+) -> serde_json::Map<String, Value> {
     let mut object = serde_json::Map::new();
-    for (name, value) in collect_field_assignments(body) {
-        object.insert(name, parse_field_value(&value, context));
+    for assignment in collect_field_assignments(body) {
+        match assignment {
+            FieldAssignment::Value { name, value } => {
+                object.insert(
+                    name.clone(),
+                    parse_record_field_value(&name, &value, context, from_binding),
+                );
+            }
+            FieldAssignment::Shorthand { name } => {
+                object.insert(
+                    name.clone(),
+                    parse_record_shorthand_value(&name, context, from_binding),
+                );
+            }
+        }
     }
     object
+}
+
+fn parse_record_field_value(
+    _field: &str,
+    value: &str,
+    context: &RuleContext,
+    from_binding: Option<&str>,
+) -> Value {
+    if let Some(binding) = from_binding {
+        if is_identifier(value)
+            && !context
+                .bindings
+                .iter()
+                .any(|(candidate, _)| candidate == value)
+        {
+            if let Some(copied) = context_field_value(context, binding, value) {
+                return copied;
+            }
+        }
+    }
+    parse_field_value(value, context)
+}
+
+fn parse_record_shorthand_value(
+    field: &str,
+    context: &RuleContext,
+    from_binding: Option<&str>,
+) -> Value {
+    if let Some(binding) = from_binding {
+        if let Some(value) = context_field_value(context, binding, field) {
+            return value;
+        }
+    }
+    let matches = context
+        .bindings
+        .iter()
+        .filter_map(|(binding, _)| context_field_value(context, binding, field))
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        matches.into_iter().next().unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    }
 }
 
 fn parse_field_value(value: &str, context: &RuleContext) -> Value {
@@ -3898,7 +4053,13 @@ fn parse_inline_object_literal(value: &str, context: &RuleContext) -> Option<Val
     Some(Value::Object(object))
 }
 
-fn collect_field_assignments(body: &str) -> Vec<(String, String)> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FieldAssignment {
+    Value { name: String, value: String },
+    Shorthand { name: String },
+}
+
+fn collect_field_assignments(body: &str) -> Vec<FieldAssignment> {
     let lines = body.lines().collect::<Vec<_>>();
     let mut assignments = Vec::new();
     let mut index = 0usize;
@@ -3909,6 +4070,11 @@ fn collect_field_assignments(body: &str) -> Vec<(String, String)> {
             continue;
         }
         let Some((name, value)) = trimmed.split_once(char::is_whitespace) else {
+            if is_identifier(trimmed) {
+                assignments.push(FieldAssignment::Shorthand {
+                    name: trimmed.to_owned(),
+                });
+            }
             index += 1;
             continue;
         };
@@ -3921,7 +4087,10 @@ fn collect_field_assignments(body: &str) -> Vec<(String, String)> {
             value_lines.push(next.to_owned());
             index += 1;
         }
-        assignments.push((name.to_owned(), value_lines.join(" ")));
+        assignments.push(FieldAssignment::Value {
+            name: name.to_owned(),
+            value: value_lines.join(" "),
+        });
     }
     assignments
 }
@@ -6750,6 +6919,74 @@ rule finish
 
         assert_eq!(lowering.consumed_fact_ids, vec!["fact-task"]);
         assert_eq!(lowering.facts.len(), 1);
+    }
+
+    #[test]
+    fn lowering_expands_done_record_from_and_then_chain() {
+        let body = r#"
+  tell codex as turn "write"
+  then tell codex as review "review"
+  then done task -> record Done from task {
+    topic
+    turn turn
+    review review
+    status "done"
+  }
+"#;
+        let desugared = desugar_then_chains(body);
+        assert!(desugared.contains("after turn succeeds"));
+        assert!(desugared.contains("after review succeeds"));
+
+        let context = RuleContext {
+            bindings: vec![
+                (
+                    "task".to_owned(),
+                    FactView {
+                        fact_id: "fact-task".to_owned(),
+                        name: "Task".to_owned(),
+                        key: "Task:queued".to_owned(),
+                        value_json: r#"{"topic":"rain","status":"queued"}"#.to_owned(),
+                        provenance_class: "rule".to_owned(),
+                    },
+                ),
+                (
+                    "turn".to_owned(),
+                    FactView {
+                        fact_id: "turn".to_owned(),
+                        name: "turn".to_owned(),
+                        key: "turn".to_owned(),
+                        value_json: r#"{"summary":"wrote"}"#.to_owned(),
+                        provenance_class: "effect".to_owned(),
+                    },
+                ),
+                (
+                    "review".to_owned(),
+                    FactView {
+                        fact_id: "review".to_owned(),
+                        name: "review".to_owned(),
+                        key: "review".to_owned(),
+                        value_json: r#"{"summary":"reviewed"}"#.to_owned(),
+                        provenance_class: "effect".to_owned(),
+                    },
+                ),
+            ],
+            ..RuleContext::default()
+        };
+        let final_after = after_blocks(&desugared)
+            .into_iter()
+            .last()
+            .expect("final after block");
+        let record = top_level_record_blocks(&final_after.body)
+            .into_iter()
+            .next()
+            .expect("record block");
+        let value = Value::Object(parse_record_fields(
+            &record.body,
+            &context,
+            record.from_binding.as_deref(),
+        ));
+        assert_eq!(value.get("topic").and_then(Value::as_str), Some("rain"));
+        assert_eq!(value.get("status").and_then(Value::as_str), Some("done"));
     }
 
     #[test]

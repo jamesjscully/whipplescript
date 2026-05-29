@@ -1792,11 +1792,12 @@ fn is_builtin_schema_ref(name: &str) -> bool {
 }
 
 fn lower_rule(
-    rule: RuleDecl,
+    mut rule: RuleDecl,
     semantic: &SemanticContext,
     ir: &mut IrProgram,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    rule.body.text = desugar_then_chains(&rule.body.text);
     let metadata = analyze_rule(&rule, semantic, diagnostics);
     validate_effectful_self_trigger(&rule, &metadata, diagnostics);
     ir.rules.push(IrRule {
@@ -1968,7 +1969,8 @@ fn analyze_rule(
             continue;
         }
 
-        if line.starts_with("case ") || is_case_branch_start(line) {
+        if line.starts_with("case ") || (!line.starts_with("after ") && is_case_branch_start(line))
+        {
             validate_known_field_paths(rule, line, semantic, &binding_types, diagnostics);
             continue;
         }
@@ -1992,7 +1994,9 @@ fn analyze_rule(
                     ),
                 }),
             }
-            continue;
+            if !line.contains("->") {
+                continue;
+            }
         }
 
         if line.starts_with("after ") {
@@ -2034,7 +2038,7 @@ fn analyze_rule(
             continue;
         }
 
-        if let Some(schema) = parse_record_start(line) {
+        if let Some((schema, _)) = parse_record_start(line) {
             if !semantic.schemas.class_exists(&schema) {
                 diagnostics.push(Diagnostic {
                     span: rule.body.span,
@@ -3267,6 +3271,36 @@ fn validate_function_call(
                 });
             }
         }
+        "one" | "none" => {
+            if args.len() != 1 {
+                diagnostics.push(Diagnostic {
+                    span: context.span,
+                    message: format!(
+                        "{} calls `{name}` with {} arguments, expected 1",
+                        context.subject,
+                        args.len()
+                    ),
+                    suggestion: Some(format!(
+                        "call `{name}` with exactly one fact or effect query argument"
+                    )),
+                });
+                return;
+            }
+            let ty = infer_expr_type(&args[0], semantic, scope, context, diagnostics);
+            if !matches!(ty, ExprType::Collection | ExprType::Unknown) {
+                diagnostics.push(Diagnostic {
+                    span: context.span,
+                    message: format!(
+                        "{} calls `{name}` with unsupported argument type `{}`",
+                        context.subject,
+                        expr_type_label(&ty)
+                    ),
+                    suggestion: Some(format!(
+                        "use `{name}` only with fact or effect projection queries"
+                    )),
+                });
+            }
+        }
         "exists" => {
             if args.len() != 1 {
                 diagnostics.push(Diagnostic {
@@ -3593,7 +3627,7 @@ fn infer_expr_type(
         }
         Expr::Call { name, args } => match name.as_str() {
             "count" => ExprType::Int,
-            "exists" | "empty" => ExprType::Bool,
+            "exists" | "empty" | "one" | "none" => ExprType::Bool,
             _ => {
                 diagnostics.push(Diagnostic {
                     span: context.span,
@@ -3601,7 +3635,7 @@ fn infer_expr_type(
                         "{} calls unsupported expression function `{name}`",
                         context.subject
                     ),
-                    suggestion: Some("use `count`, `exists`, or `empty`".to_owned()),
+                    suggestion: Some("use `count`, `exists`, `empty`, `one`, or `none`".to_owned()),
                 });
                 for arg in args {
                     infer_expr_type(arg, semantic, scope, context, diagnostics);
@@ -5094,10 +5128,22 @@ fn fact_read_from_when(when: &str) -> String {
     }
 }
 
-fn parse_record_start(line: &str) -> Option<String> {
-    line.strip_prefix("record ")
-        .and_then(|rest| rest.split_whitespace().next())
-        .map(str::to_owned)
+fn parse_record_start(line: &str) -> Option<(String, Option<String>)> {
+    let rest = line.strip_prefix("record ").or_else(|| {
+        line.strip_prefix("done ")
+            .and_then(|rest| rest.split_once("->"))
+            .map(|(_, record)| record.trim())
+            .and_then(|record| record.strip_prefix("record "))
+    })?;
+    let before_brace = rest.split('{').next().unwrap_or(rest).trim();
+    let mut parts = before_brace.split_whitespace();
+    let schema = parts.next()?.to_owned();
+    let from_binding = match (parts.next(), parts.next(), parts.next()) {
+        (None, None, None) => None,
+        (Some("from"), Some(binding), None) => Some(binding.to_owned()),
+        _ => return None,
+    };
+    Some((schema, from_binding))
 }
 
 fn validate_record_field(
@@ -5190,21 +5236,31 @@ fn validate_record_blocks(
     binding_types: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for (schema, body) in record_blocks(&rule.body.text) {
-        for (field, value) in collect_field_assignments(&body) {
+    for (schema, from_binding, body) in record_blocks(&rule.body.text) {
+        for assignment in collect_field_assignments(&body) {
+            let (field, value) = match assignment {
+                RecordFieldAssignment::Value { field, value } => (field, value),
+                RecordFieldAssignment::Shorthand { field } => {
+                    let value = from_binding
+                        .as_ref()
+                        .map(|binding| format!("{binding}.{field}"))
+                        .unwrap_or_else(|| field.clone());
+                    (field, value)
+                }
+            };
             let line = format!("{field} {value}");
             validate_record_field(rule, &line, &schema, semantic, binding_types, diagnostics);
         }
     }
 }
 
-fn record_blocks(body: &str) -> Vec<(String, String)> {
+fn record_blocks(body: &str) -> Vec<(String, Option<String>, String)> {
     let mut blocks = Vec::new();
     let lines = body.lines().collect::<Vec<_>>();
     let mut index = 0usize;
     while index < lines.len() {
         let trimmed = lines[index].trim();
-        let Some(schema) = parse_record_start(trimmed) else {
+        let Some((schema, from_binding)) = parse_record_start(trimmed) else {
             index += 1;
             continue;
         };
@@ -5220,12 +5276,18 @@ fn record_blocks(body: &str) -> Vec<(String, String)> {
             }
             index += 1;
         }
-        blocks.push((schema, record_lines.join("\n")));
+        blocks.push((schema, from_binding, record_lines.join("\n")));
     }
     blocks
 }
 
-fn collect_field_assignments(body: &str) -> Vec<(String, String)> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RecordFieldAssignment {
+    Value { field: String, value: String },
+    Shorthand { field: String },
+}
+
+fn collect_field_assignments(body: &str) -> Vec<RecordFieldAssignment> {
     let lines = body.lines().collect::<Vec<_>>();
     let mut assignments = Vec::new();
     let mut index = 0usize;
@@ -5236,6 +5298,11 @@ fn collect_field_assignments(body: &str) -> Vec<(String, String)> {
             continue;
         }
         let Some((name, value)) = record_field_assignment(trimmed) else {
+            if is_identifier(trimmed) {
+                assignments.push(RecordFieldAssignment::Shorthand {
+                    field: trimmed.to_owned(),
+                });
+            }
             index += 1;
             continue;
         };
@@ -5248,7 +5315,10 @@ fn collect_field_assignments(body: &str) -> Vec<(String, String)> {
             value_lines.push(next.to_owned());
             index += 1;
         }
-        assignments.push((name.to_owned(), value_lines.join(" ")));
+        assignments.push(RecordFieldAssignment::Value {
+            field: name.to_owned(),
+            value: value_lines.join(" "),
+        });
     }
     assignments
 }
@@ -6019,8 +6089,10 @@ impl<'a> ExprParser<'a> {
                 })
             }
             Some(ExprTokenKind::Ident(value))
-                if matches!(value.as_str(), "count" | "exists" | "empty")
-                    && self.at_symbol('(') =>
+                if matches!(
+                    value.as_str(),
+                    "count" | "exists" | "empty" | "one" | "none"
+                ) && self.at_symbol('(') =>
             {
                 self.expect_symbol('(')?;
                 if let Some(query) = self.try_parse_query()? {
@@ -6417,6 +6489,9 @@ fn parse_consume_line(line: &str) -> Option<String> {
         .trim_end_matches(';')
         .strip_prefix("consume ")
         .or_else(|| line.trim().trim_end_matches(';').strip_prefix("done "))?
+        .split("->")
+        .next()
+        .unwrap_or_default()
         .trim();
     let mut chars = binding.chars();
     let Some(first) = chars.next() else {
@@ -6455,7 +6530,15 @@ fn binding_after_as(line: &str) -> Option<String> {
 
 fn parse_after_line(line: &str) -> Option<(String, DependencyPredicate)> {
     let rest = line.strip_prefix("after ")?;
-    let mut parts = rest.split_whitespace();
+    let before_body = rest
+        .split('{')
+        .next()
+        .unwrap_or(rest)
+        .split("=>")
+        .next()
+        .unwrap_or(rest)
+        .trim();
+    let mut parts = before_body.split_whitespace();
     let binding = parts.next()?.to_owned();
     let predicate = match parts.next()? {
         "succeeds" => DependencyPredicate::Succeeds,
@@ -6463,7 +6546,65 @@ fn parse_after_line(line: &str) -> Option<(String, DependencyPredicate)> {
         "completes" => DependencyPredicate::Completes,
         _ => return None,
     };
+    match (parts.next(), parts.next(), parts.next()) {
+        (None, None, None) => {}
+        (Some("as"), Some(alias), None) if is_identifier(alias) => {}
+        _ => return None,
+    }
     Some((binding, predicate))
+}
+
+fn desugar_then_chains(body: &str) -> String {
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut output = Vec::new();
+    let mut last_effect_binding: Option<String> = None;
+    let mut index = 0usize;
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        if let (Some(statement), Some(upstream)) = (
+            trimmed.strip_prefix("then ").map(str::trim),
+            last_effect_binding.as_deref(),
+        ) {
+            output.push(format!("after {upstream} succeeds {{"));
+            output.push(format!("  {statement}"));
+            let mut depth = brace_delta(statement);
+            index += 1;
+            while depth > 0 && index < lines.len() {
+                let line = lines[index];
+                depth += brace_delta(line);
+                output.push(format!("  {line}"));
+                index += 1;
+            }
+            output.push("}".to_owned());
+            if let Some(binding) = effect_binding_from_statement(statement) {
+                last_effect_binding = Some(binding);
+            }
+            continue;
+        }
+        output.push(lines[index].to_owned());
+        if let Some(binding) = effect_binding_from_statement(trimmed) {
+            last_effect_binding = Some(binding);
+        }
+        index += 1;
+    }
+    output.join("\n")
+}
+
+fn effect_binding_from_statement(statement: &str) -> Option<String> {
+    if parse_effect_line(statement).is_some() {
+        binding_after_as(statement)
+    } else {
+        None
+    }
+}
+
+fn is_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn lower_type(ty: TypeSyntax) -> IrType {
@@ -9567,6 +9708,55 @@ rule finish
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("consumes unknown fact binding `missing`")));
+    }
+
+    #[test]
+    fn lowers_workflow_sugar_to_existing_metadata() {
+        let source = r#"
+workflow Sugar
+
+class Task {
+  topic string
+  status "queued"
+}
+
+class Result {
+  topic string
+  turn AgentTurn
+  status "done"
+}
+
+agent codex {
+  profile "repo-writer"
+  capacity 1
+}
+
+assert none(Task where status == "queued")
+assert one(Result where status == "done")
+
+rule finish
+  when Task as task where task.status == "queued"
+  when codex is available
+=> {
+  tell codex as turn "write"
+  then done task -> record Result from task {
+    topic
+    turn turn
+    status "done"
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        let ir = compiled.ir.expect("program compiles");
+        let rule = &ir.rules[0];
+
+        assert_eq!(ir.assertions.len(), 2);
+        assert_eq!(rule.metadata.fact_consumes, vec!["schema:Task"]);
+        assert_eq!(rule.metadata.fact_writes, vec!["schema:Result"]);
+        assert_eq!(rule.metadata.effects.len(), 1);
+        assert!(ir
+            .to_snapshot()
+            .contains("assert none(Task where status == \"queued\")"));
     }
 
     #[test]

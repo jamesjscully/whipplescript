@@ -269,8 +269,10 @@ For each rule body construct:
 
 ```text
 record Class { ... }        -> typed fact projection
+record Class from binding   -> typed fact projection with field-copy sugar
 consume binding             -> consume the matched fact from current projection
 done binding                -> alias for consume binding
+done binding -> record ...  -> consume plus result record in one commit
 tell agent ...              -> agent.tell effect with target/profile/skills
 coerce function(...)        -> baml.coerce effect with function and arguments
 claim issue with loft       -> loft.claim effect
@@ -278,6 +280,8 @@ askHuman ...                -> human.ask effect
 call plugin.capability ...  -> capability.call effect
 emit event                  -> event.emit effect
 after effect succeeds       -> dependency edge
+after effect succeeds as x  -> dependency edge with terminal-output alias
+then effect/done            -> success-chain sugar over after blocks
 matrix rows                 -> typed fact records
 action/template expansion   -> ordinary facts/effects before commit
 assert expression           -> read-only assertion result

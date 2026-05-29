@@ -22,16 +22,16 @@ agents
 coerces
   coerce reviewFrenchPoem(topic string, poemPath string, turnSummary string) -> ref<FrenchPoemReview>
 assertions
-  assert count(PoemRequest where status == "queued") == 0
+  assert none(PoemRequest where status == "queued")
     reads
       fact:PoemRequest where status == "queued"
-  assert count(ReviewedPoem where status == "reviewed") == 1
+  assert one(ReviewedPoem where status == "reviewed")
     reads
       fact:ReviewedPoem where status == "reviewed"
-  assert count(effect kind agent.tell where status == completed) == 1
+  assert one(effect kind agent.tell where status == completed)
     reads
       effect:kind agent.tell where status == completed
-  assert count(effect kind baml.coerce where status == completed) == 1
+  assert one(effect kind baml.coerce where status == completed)
     reads
       effect:kind baml.coerce where status == completed
 rules
@@ -57,6 +57,6 @@ rules
       review kind=baml.coerce binding=review key=fadf644fc82dc8bf
     dependencies
       poemTurn --succeeds--> review
-    body_hash 465529fd7f33a1ce
+    body_hash ef05d61608811ff7
 rule_dependencies
   seed_poem_request --schema:PoemRequest--> write_and_review_poem

@@ -292,6 +292,81 @@ Only fact bindings introduced by `when` clauses are consumable. Effect-output
 bindings are terminal observations and must be handled with `after` blocks
 instead.
 
+### Workflow Sugar
+
+The following forms are syntax sugar over ordinary rule commits, effects,
+dependencies, and fact consumption. They do not add lifecycle semantics.
+
+`none(query)` and `one(query)` are assertion/guard aliases:
+
+```whip
+assert none(Task where status == "queued")
+assert one(Result where provider == "codex")
+```
+
+They lower to `count(query) == 0` and `count(query) == 1` behavior.
+
+`record Class from binding { ... }` lets record fields copy from an in-scope
+fact without repeating the binding path:
+
+```whip
+record ReviewedPoem from task {
+  provider poet
+  language
+  topic
+  artifactPath
+  turn poemTurn
+  review review
+  status "reviewed"
+}
+```
+
+Bare fields such as `language` copy `task.language`. Field values such as
+`provider poet` copy `task.poet` when `poet` is a field on the `from` binding.
+Explicit expressions and bindings still work.
+
+`done binding -> record Class { ... }` combines fact consumption with the result
+record produced in the same rule commit:
+
+```whip
+done task -> record ReviewedPoem from task {
+  topic
+  artifactPath
+  turn poemTurn
+  review review
+  status "reviewed"
+}
+```
+
+This lowers exactly like `done task` followed by `record ReviewedPoem ...`.
+
+`after effect succeeds as output => { ... }` aliases the terminal output inside
+the block while keeping the original effect binding as the effect handle:
+
+```whip
+after poemTurn succeeds as turn => {
+  coerce reviewPoem(task.language, turn.summary) as review
+}
+```
+
+`then` chains are shorthand for common success dependencies:
+
+```whip
+tell task.poet as poemTurn """
+...
+"""
+then coerce reviewPoem(task.language, poemTurn.summary) as review
+then done task -> record ReviewedPoem from task {
+  language
+  turn poemTurn
+  review review
+  status "reviewed"
+}
+```
+
+This lowers to `after poemTurn succeeds { coerce ... }` followed by
+`after review succeeds { done task -> record ... }`.
+
 ### Expression Parser Coverage
 
 The source expression parser covers guards, assertions, projection filters,
