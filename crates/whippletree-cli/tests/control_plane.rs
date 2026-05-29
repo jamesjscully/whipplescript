@@ -1018,6 +1018,127 @@ fn dev_provider_language_e2e_runs_agent_matrix_and_baml_reviews() {
     let _ = fs::remove_file(store_path);
 }
 
+#[test]
+fn dev_evaluates_case_branches_for_literal_and_optional_patterns() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("case-routing");
+    fs::write(
+        &source_path,
+        r#"
+workflow CaseRouting
+
+class Task {
+  provider "codex" | "claude"
+  assignee string?
+}
+
+class Routed {
+  provider string
+  target string
+  owner string
+}
+
+assert count(Routed where target == "codex") == 1
+assert count(Routed where owner == "Ada") == 1
+
+rule seed
+  when started
+=> {
+  record Task {
+    provider "codex"
+    assignee "Ada"
+  }
+}
+
+rule route
+  when Task as task
+=> {
+  case task.provider {
+    "codex" => {
+      case task.assignee {
+        Some owner => {
+          record Routed {
+            provider task.provider
+            target "codex"
+            owner owner
+          }
+        }
+        None => {
+          record Routed {
+            provider task.provider
+            target "codex"
+            owner "unassigned"
+          }
+        }
+      }
+    }
+    "claude" => {
+      record Routed {
+        provider task.provider
+        target "claude"
+        owner "unassigned"
+      }
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    assert!(dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("assertions")
+        .iter()
+        .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
+
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let routed = facts
+        .as_array()
+        .expect("facts array")
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("Routed"))
+        .expect("routed fact");
+    assert_eq!(
+        routed
+            .get("value")
+            .and_then(|value| value.get("owner"))
+            .and_then(Value::as_str),
+        Some("Ada")
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
 fn run_json(bin: &str, args: &[&str]) -> Value {
     let text = run_text(bin, args);
     serde_json::from_str(&text).expect("valid JSON output")

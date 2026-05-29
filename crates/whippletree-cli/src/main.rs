@@ -17,8 +17,8 @@ use whippletree_kernel::{
     ProgramVersionInput, RuntimeKernel,
 };
 use whippletree_parser::{
-    DependencyPredicate as IrDependencyPredicate, Diagnostic, IrPrimitiveType, IrProgram, IrRule,
-    IrType, SourceSpan,
+    DependencyPredicate as IrDependencyPredicate, Diagnostic, IrEffectNode, IrPrimitiveType,
+    IrProgram, IrRule, IrType, SourceSpan,
 };
 use whippletree_store::{
     ClaimableEffect, EffectCompletion, EffectView, EventView, EvidenceLinkView, EvidenceView,
@@ -1736,6 +1736,7 @@ fn lower_rule(
     facts: &[FactView],
     effects: &[EffectView],
 ) -> OwnedLowering {
+    let (body, context) = selected_rule_body(&rule.body, context);
     let existing_fact_ids = facts
         .iter()
         .map(|fact| fact.fact_id.as_str())
@@ -1746,8 +1747,8 @@ fn lower_rule(
         .collect::<Vec<_>>();
     let mut lowering = OwnedLowering::default();
 
-    for block in top_level_record_blocks(&rule.body) {
-        let value = parse_record_fields(&block.body, context);
+    for block in top_level_record_blocks(&body) {
+        let value = parse_record_fields(&block.body, &context);
         let value_json = Value::Object(value).to_string();
         let fact_key = record_fact_key(&block.schema, &value_json);
         let fact_id = idempotency_key(&[&rule.name, &block.schema, &fact_key, &value_json]);
@@ -1768,11 +1769,11 @@ fn lower_rule(
         });
     }
 
-    let parsed_effects = parse_effect_statements(&rule.body, context);
+    let parsed_effects = parse_effect_statements(&body, &context);
     let mut node_to_effect_id = std::collections::BTreeMap::new();
     let mut binding_to_effect_id = std::collections::BTreeMap::new();
     for (index, parsed) in parsed_effects.iter().enumerate() {
-        let effect_node = rule.metadata.effects.get(index);
+        let effect_node = effect_node_for_parsed(rule, parsed, index);
         let node_id = effect_node
             .map(|effect| effect.id.as_str())
             .unwrap_or(parsed.kind.as_str());
@@ -1782,12 +1783,15 @@ fn lower_rule(
             context.identity.as_deref().unwrap_or("started"),
         ]);
         node_to_effect_id.insert(node_id.to_owned(), effect_id.clone());
-        if let Some(binding) = effect_node.and_then(|effect| effect.binding.as_ref()) {
+        if let Some(binding) = effect_node
+            .and_then(|effect| effect.binding.as_ref())
+            .or(parsed.binding.as_ref())
+        {
             binding_to_effect_id.insert(binding.clone(), effect_id);
         }
     }
     for (index, parsed) in parsed_effects.iter().enumerate() {
-        let effect_node = rule.metadata.effects.get(index);
+        let effect_node = effect_node_for_parsed(rule, parsed, index);
         let node_id = effect_node
             .map(|effect| effect.id.as_str())
             .unwrap_or(parsed.kind.as_str());
@@ -1800,7 +1804,8 @@ fn lower_rule(
         {
             continue;
         }
-        let input_json = parsed_effect_input_json(ir, rule, parsed, context, &binding_to_effect_id);
+        let input_json =
+            parsed_effect_input_json(ir, rule, parsed, &context, &binding_to_effect_id);
         let profile = parsed
             .target
             .as_deref()
@@ -1845,7 +1850,7 @@ fn lower_rule(
         });
     }
 
-    for after in after_record_blocks(&rule.body) {
+    for after in after_record_blocks(&body) {
         let Some(upstream_effect_id) = binding_to_effect_id.get(&after.binding) else {
             continue;
         };
@@ -1900,6 +1905,23 @@ fn lower_rule(
     lowering
 }
 
+fn effect_node_for_parsed<'a>(
+    rule: &'a IrRule,
+    parsed: &ParsedEffect,
+    index: usize,
+) -> Option<&'a IrEffectNode> {
+    parsed
+        .binding
+        .as_ref()
+        .and_then(|binding| {
+            rule.metadata
+                .effects
+                .iter()
+                .find(|effect| effect.binding.as_ref() == Some(binding))
+        })
+        .or_else(|| rule.metadata.effects.get(index))
+}
+
 fn push_effect_binding(context: &mut RuleContext, binding: &str, effect_id: &str, value: Value) {
     context
         .bindings
@@ -1914,6 +1936,134 @@ fn push_effect_binding(context: &mut RuleContext, binding: &str, effect_id: &str
             provenance_class: "effect".to_owned(),
         },
     ));
+}
+
+fn selected_rule_body(body: &str, context: &RuleContext) -> (String, RuleContext) {
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut selected = Vec::new();
+    let mut context = context.clone();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        if !trimmed.starts_with("case ") {
+            selected.push(lines[index].to_owned());
+            index += 1;
+            continue;
+        }
+        let Some((case, next_index)) = parse_case_block(&lines, index) else {
+            selected.push(lines[index].to_owned());
+            index += 1;
+            continue;
+        };
+        if let Some(branch) = select_case_branch(&case, &mut context) {
+            let (branch_body, branch_context) =
+                selected_rule_body(&branch.body.join("\n"), &context);
+            context = branch_context;
+            selected.extend(branch_body.lines().map(str::to_owned));
+        }
+        index = next_index;
+    }
+    (selected.join("\n"), context)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CaseBlock {
+    scrutinee: String,
+    branches: Vec<CaseBranch>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CaseBranch {
+    pattern: String,
+    body: Vec<String>,
+}
+
+fn parse_case_block(lines: &[&str], start: usize) -> Option<(CaseBlock, usize)> {
+    let header = lines.get(start)?.trim();
+    let scrutinee = header
+        .strip_prefix("case ")?
+        .strip_suffix('{')
+        .unwrap_or_else(|| header.strip_prefix("case ").expect("case prefix"))
+        .trim()
+        .to_owned();
+    let mut branches = Vec::new();
+    let mut index = start + 1;
+    let mut case_depth = brace_delta(header).max(1);
+    while index < lines.len() && case_depth > 0 {
+        let trimmed = lines[index].trim();
+        if let Some((pattern, before_body)) = case_branch_header(trimmed) {
+            let mut body = Vec::new();
+            let mut branch_depth = brace_delta(before_body).max(1);
+            index += 1;
+            while index < lines.len() && branch_depth > 0 {
+                let line = lines[index];
+                let next_depth = branch_depth + brace_delta(line);
+                if next_depth >= 1 {
+                    body.push(line.to_owned());
+                }
+                branch_depth = next_depth;
+                index += 1;
+            }
+            branches.push(CaseBranch { pattern, body });
+            continue;
+        }
+        case_depth += brace_delta(trimmed);
+        index += 1;
+    }
+    Some((
+        CaseBlock {
+            scrutinee,
+            branches,
+        },
+        index,
+    ))
+}
+
+fn case_branch_header(line: &str) -> Option<(String, &str)> {
+    let (pattern, body_start) = line.split_once("=>")?;
+    let body_start = body_start.trim();
+    if !body_start.starts_with('{') {
+        return None;
+    }
+    Some((pattern.trim().to_owned(), body_start))
+}
+
+fn select_case_branch(case: &CaseBlock, context: &mut RuleContext) -> Option<CaseBranch> {
+    let value = parse_field_value(&case.scrutinee, context);
+    let mut fallback = None;
+    for branch in &case.branches {
+        if matches!(branch.pattern.as_str(), "_" | "default") {
+            fallback = Some(branch.clone());
+            continue;
+        }
+        if case_pattern_matches(&branch.pattern, &value, context) {
+            return Some(branch.clone());
+        }
+    }
+    fallback
+}
+
+fn case_pattern_matches(pattern: &str, value: &Value, context: &mut RuleContext) -> bool {
+    if pattern == "None" {
+        return value.is_null();
+    }
+    if let Some(binding) = pattern.strip_prefix("Some ").map(str::trim) {
+        if value.is_null() || binding.is_empty() {
+            return false;
+        }
+        context.bindings.push((
+            binding.to_owned(),
+            FactView {
+                fact_id: format!("case:{binding}"),
+                name: binding.to_owned(),
+                key: binding.to_owned(),
+                value_json: value.to_string(),
+                provenance_class: "case".to_owned(),
+            },
+        ));
+        return true;
+    }
+    parse_guard_literal(pattern) == *value
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1946,6 +2096,7 @@ struct ParsedEffect {
     kind: String,
     target: Option<String>,
     name: Option<String>,
+    binding: Option<String>,
     args: Vec<String>,
     prompt: Option<String>,
     after: Option<AfterScope>,
@@ -1987,6 +2138,7 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 kind: "agent.tell".to_owned(),
                 target: Some(agent),
                 name: None,
+                binding: binding_after_as(trimmed),
                 args: Vec::new(),
                 prompt: Some(interpolate_prompt(&prompt, context)),
                 after: current_after,
@@ -2004,6 +2156,7 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 kind: "baml.coerce".to_owned(),
                 target: Some(name.to_owned()),
                 name: Some(name.to_owned()),
+                binding: binding_after_as(trimmed),
                 args,
                 prompt: None,
                 after: current_after,
@@ -2013,6 +2166,7 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 kind: "loft.claim".to_owned(),
                 target: Some("loft".to_owned()),
                 name: Some("claim".to_owned()),
+                binding: binding_after_as(trimmed),
                 args: Vec::new(),
                 prompt: None,
                 after: current_after,
@@ -2023,6 +2177,7 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 kind: "human.ask".to_owned(),
                 target: Some("human".to_owned()),
                 name: Some("askHuman".to_owned()),
+                binding: binding_after_as(trimmed),
                 args: Vec::new(),
                 prompt: Some(interpolate_prompt(&prompt, context)),
                 after: current_after,
@@ -2038,6 +2193,7 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 kind: "capability.call".to_owned(),
                 target: Some(target),
                 name: Some("call".to_owned()),
+                binding: binding_after_as(trimmed),
                 args: Vec::new(),
                 prompt: None,
                 after: current_after,
@@ -2131,6 +2287,20 @@ fn parse_after_scope(trimmed: &str) -> Option<AfterScope> {
         binding: binding.to_owned(),
         predicate: predicate.to_owned(),
     })
+}
+
+fn binding_after_as(line: &str) -> Option<String> {
+    let mut tokens = line.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "as" {
+            return tokens
+                .next()
+                .map(|binding| binding.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_'))
+                .filter(|binding| !binding.is_empty())
+                .map(str::to_owned);
+        }
+    }
+    None
 }
 
 fn parse_prompt_from_lines(lines: &[&str], index: usize, trimmed: &str) -> (String, usize) {
@@ -2377,6 +2547,9 @@ fn parse_field_value(value: &str, context: &RuleContext) -> Value {
     }
     if value == "false" {
         return Value::Bool(false);
+    }
+    if value == "null" {
+        return Value::Null;
     }
     if let Ok(number) = value.parse::<i64>() {
         return Value::Number(number.into());

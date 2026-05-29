@@ -35,6 +35,9 @@ The expression kernel covers deterministic logic used by:
 - [x] Provider-language dogfood asserts provider counts, agent-turn counts, and
   BAML coerce counts in source.
 - [~] Compiler validates known field paths in guards.
+- [~] Rule bodies support concrete `case expr { Pattern => { ... } }` branches
+  for enum/literal values and optional `Some`/`None` branches in the dev
+  stepper.
 - [~] Maude has a finite abstract expression model for guard true/false/error,
   assertion pass/fail/error, optional presence, enum/literal domains, typed
   pattern branches, exhaustive finite-domain misses, and dynamic agent target
@@ -68,9 +71,9 @@ The expression kernel covers deterministic logic used by:
 | Map index `path["key"]` | [x] | [ ] | [ ] | [ ] | [ ] | [ ] | Field paths currently support dot access only in guard/assertion runtime. |
 | Enum variant values | [x] | [~] | [~] | [~] | [~] | [~] | Enum schemas exist; expression values are currently strings at runtime. |
 | Literal-union values | [x] | [~] | [~] | [~] | [~] | [x] | Literal types exist; guards do not yet verify literal-domain membership. |
-| Typed finite-domain pattern branches | [x] | [ ] | [ ] | [ ] | [x] | [x] | Maude models branch match, non-match, exhaustive miss diagnostics, and optional-present binding. |
+| Typed finite-domain pattern branches | [x] | [~] | [~] | [~] | [x] | [x] | Concrete rule-body `case` branches work for enum/literal values in `whip dev`; no typed expression AST yet. |
 | Exhaustiveness checks for finite patterns | [x] | [ ] | [ ] | [ ] | [x] | [x] | Abstract model covers diagnostic on missing enum/literal branch; compiler support is not implemented. |
-| Optional Some/None pattern branches | [x] | [ ] | [ ] | [ ] | [x] | [x] | Abstract model proves Some branch binds present path and missing path cannot fire Some branch. |
+| Optional Some/None pattern branches | [x] | [~] | [~] | [~] | [x] | [x] | Rule-body `Some name` binds a present runtime value; static presence proof is still local to case validation. |
 | Optional presence proofs | [x] | [ ] | [ ] | [ ] | [~] | [ ] | Must reject unsafe optional field access unless proven present. |
 | Missing vs null distinction | [x] | [ ] | [ ] | [~] | [~] | [ ] | Runtime currently collapses missing path lookup to `null` in guards. |
 | Type-directed interpolation paths | [x] | [~] | [ ] | [~] | [ ] | [x] | Existing interpolation is path-oriented but not fully expression-kernel typed. |
@@ -170,21 +173,19 @@ The expression kernel covers deterministic logic used by:
 
 ### 6. Pattern Matching And Branching
 
-- [ ] Specify concrete source syntax for finite-domain branching, such as
-  `case expr { Variant => ... }`, guarded rule alternatives, or another
-  source form that fits Whippletree's rule style.
-- [ ] Support enum and literal-union branch matching.
-- [ ] Support optional Some/None or present/missing branch matching that binds a
+- [x] Specify concrete source syntax for finite-domain branching:
+  `case expr { Pattern => { ... } }`.
+- [x] Support enum and literal-union branch matching in rule bodies.
+- [x] Support optional Some/None branch matching that binds a
   proven-present value in the Some branch.
 - [ ] Support tagged terminal-output union branch matching for effect
   completion facts.
 - [ ] Allow branch guards that reuse the expression kernel.
-- [ ] Reject unknown enum/literal variants in patterns.
+- [x] Reject unknown enum/literal variants in patterns.
 - [ ] Emit exhaustiveness diagnostics for finite domains where the branch result
   must be total.
-- [ ] Preserve source spans for branch alternatives in IR and diagnostics.
-- [ ] Lower pattern branches into deterministic rule alternatives or typed
-  expression branches before effect graph commit.
+- [~] Preserve source spans for branch alternatives in diagnostics.
+- [~] Lower matching pattern branches before effect graph commit in `whip dev`.
 - [x] Model finite-domain branch match/non-match in Maude.
 - [x] Model exhaustive finite-domain miss diagnostics in Maude.
 - [x] Model optional Some/None branch readiness and present binding in Maude.
@@ -201,13 +202,15 @@ The expression kernel covers deterministic logic used by:
   bad array literals, and bad `AgentRef` targets.
 - [ ] Runtime tests for guard true, false, and error paths.
 - [ ] Runtime tests for assertion pass, fail, and error paths.
-- [ ] Parser/type-checker tests for enum, literal, optional, and tagged-union
+- [~] Parser/type-checker tests for enum, literal, optional, and tagged-union
   pattern branches.
 - [ ] Exhaustiveness diagnostic tests for finite pattern domains.
 - [ ] E2E test showing `&&`, `||`, `!`, ordering, `in`, `exists`, `empty`, and
   `count` in source.
 - [ ] E2E test showing assertion failures reach JSON output and nonzero exit.
 - [ ] E2E test showing failed guards do not enqueue effects.
+- [x] E2E test showing rule-body `case` branches select literal and optional
+  patterns before recording facts.
 - [x] Maude tests for guard false/error, optional presence, enum/literal domain
   validity, finite-domain pattern branches, optional Some/None branches,
   dynamic agent target validity, and assertion non-mutation.

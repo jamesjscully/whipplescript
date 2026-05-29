@@ -1251,6 +1251,7 @@ fn analyze_rule(
             validate_known_field_paths(rule, guard, semantic, &binding_types, diagnostics);
         }
     }
+    validate_case_blocks(rule, semantic, &binding_types, diagnostics);
     let mut block_stack: Vec<BlockFrame> = Vec::new();
     let mut misplaced_effect_bindings = BTreeSet::new();
     let mut anonymous_effects = 0usize;
@@ -1278,6 +1279,11 @@ fn analyze_rule(
 
         if line.starts_with('}') {
             block_stack.pop();
+            continue;
+        }
+
+        if line.starts_with("case ") || is_case_branch_start(line) {
+            validate_known_field_paths(rule, line, semantic, &binding_types, diagnostics);
             continue;
         }
 
@@ -1440,6 +1446,210 @@ fn validate_coerce_call(
                 suggestion: Some("pass one argument for each declared coerce parameter".to_owned()),
             });
         }
+    }
+}
+
+fn validate_case_blocks(
+    rule: &RuleDecl,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let lines = rule.body.text.lines().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        let Some(scrutinee) = case_scrutinee(trimmed) else {
+            index += 1;
+            continue;
+        };
+        let scrutinee_ty = expression_type(scrutinee, semantic, binding_types);
+        if scrutinee_ty.is_none() {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` has case scrutinee `{scrutinee}` that is not a typed path",
+                    rule.name.name
+                ),
+                suggestion: Some("match on a bound field such as `task.provider`".to_owned()),
+            });
+        }
+        let mut depth = brace_delta(trimmed).max(1);
+        let mut case_index = index + 1;
+        while case_index < lines.len() && depth > 0 {
+            let line = lines[case_index].trim();
+            if depth == 1 {
+                if let Some(pattern) = case_branch_pattern(line) {
+                    validate_case_pattern(
+                        rule,
+                        pattern,
+                        scrutinee_ty.as_ref(),
+                        semantic,
+                        diagnostics,
+                    );
+                }
+            }
+            depth += brace_delta(line);
+            case_index += 1;
+        }
+        index += 1;
+    }
+}
+
+fn brace_delta(line: &str) -> i32 {
+    line.chars().fold(0, |depth, ch| match ch {
+        '{' => depth + 1,
+        '}' => depth - 1,
+        _ => depth,
+    })
+}
+
+fn case_scrutinee(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("case ")?;
+    let expr = rest.strip_suffix('{').unwrap_or(rest).trim();
+    (!expr.is_empty()).then_some(expr)
+}
+
+fn is_case_branch_start(line: &str) -> bool {
+    line.contains("=>")
+}
+
+fn case_branch_pattern(line: &str) -> Option<&str> {
+    let (pattern, _) = line.split_once("=>")?;
+    let pattern = pattern.trim();
+    (!pattern.is_empty()).then_some(pattern)
+}
+
+fn expression_type(
+    expr: &str,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+) -> Option<TypeSyntax> {
+    let (root, path) = expression_path(expr)?;
+    let schema = binding_types.get(&root)?;
+    semantic.schemas.resolve_field_path(schema, &path).ok()
+}
+
+fn validate_case_pattern(
+    rule: &RuleDecl,
+    pattern: &str,
+    scrutinee_ty: Option<&TypeSyntax>,
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if matches!(pattern, "_" | "default") {
+        return;
+    }
+    if pattern == "None" {
+        if !matches!(scrutinee_ty, Some(TypeSyntax::Optional { .. })) {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` uses `None` for a non-optional case",
+                    rule.name.name
+                ),
+                suggestion: Some("use `None` only when matching an optional field".to_owned()),
+            });
+        }
+        return;
+    }
+    if pattern.starts_with("Some ") {
+        if !matches!(scrutinee_ty, Some(TypeSyntax::Optional { .. })) {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` uses `Some` for a non-optional case",
+                    rule.name.name
+                ),
+                suggestion: Some("use `Some name` only when matching an optional field".to_owned()),
+            });
+        }
+        return;
+    }
+    let Some(scrutinee_ty) = scrutinee_ty else {
+        return;
+    };
+    match scrutinee_ty {
+        TypeSyntax::Ref { name } => {
+            let Some(variants) = semantic.schemas.enums.get(&name.name) else {
+                return;
+            };
+            if !variants.contains(pattern) {
+                diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!("enum `{}` has no variant `{pattern}`", name.name),
+                    suggestion: Some(format!(
+                        "use one of: {}",
+                        variants.iter().cloned().collect::<Vec<_>>().join(", ")
+                    )),
+                });
+            }
+        }
+        TypeSyntax::Union { variants, .. } => {
+            let Some(literal) = parse_literal_expr(pattern) else {
+                diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` has unsupported case pattern `{pattern}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some("use a literal branch value or `_`".to_owned()),
+                });
+                return;
+            };
+            validate_union_case_pattern(rule, variants, &literal, diagnostics);
+        }
+        TypeSyntax::Optional { inner, .. } => {
+            validate_case_pattern(rule, pattern, Some(inner), semantic, diagnostics);
+        }
+        _ => {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` cannot pattern-match this scrutinee type",
+                    rule.name.name
+                ),
+                suggestion: Some(
+                    "match an enum, literal union, optional, or tagged output union".to_owned(),
+                ),
+            });
+        }
+    }
+}
+
+fn validate_union_case_pattern(
+    rule: &RuleDecl,
+    variants: &[TypeSyntax],
+    literal: &LiteralExpr<'_>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let allowed = variants
+        .iter()
+        .filter_map(|variant| match variant {
+            TypeSyntax::LiteralString { value, .. } => Some(value.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if allowed.is_empty() {
+        return;
+    }
+    let LiteralExpr::String(value) = literal else {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!(
+                "rule `{}` case pattern must be one of its literal variants",
+                rule.name.name
+            ),
+            suggestion: Some(format!("use one of: {}", allowed.join(", "))),
+        });
+        return;
+    };
+    if !allowed.contains(value) {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!("rule `{}` case pattern cannot be `{value}`", rule.name.name),
+            suggestion: Some(format!("use one of: {}", allowed.join(", "))),
+        });
     }
 }
 
@@ -1837,6 +2047,7 @@ fn validate_primitive_literal(
     let valid = matches!(
         (primitive, literal),
         ("string", LiteralExpr::String(_))
+            | ("string", LiteralExpr::Ident(_))
             | ("int", LiteralExpr::Number(_))
             | ("float", LiteralExpr::Number(_))
             | ("bool", LiteralExpr::Bool)
@@ -3413,6 +3624,105 @@ rule branch
             .whens
             .iter()
             .any(|when| when == "WorkItem as item where item.state == \"ready\"")));
+    }
+
+    #[test]
+    fn accepts_typed_case_branches_in_rule_bodies() {
+        let source = r#"
+workflow CaseGuess
+
+enum ReviewStatus {
+  Accept
+  Revise
+  Blocked
+}
+
+class Review {
+  status ReviewStatus
+  assignee string?
+}
+
+class Routed {
+  status ReviewStatus
+}
+
+rule route
+  when Review as review
+=> {
+  case review.status {
+    Accept => {
+      record Routed {
+        status Accept
+      }
+    }
+    Revise => {
+      record Routed {
+        status Revise
+      }
+    }
+    Blocked => {
+      record Routed {
+        status Blocked
+      }
+    }
+  }
+
+  case review.assignee {
+    Some owner => {
+      record Routed {
+        status Accept
+      }
+    }
+    None => {
+      record Routed {
+        status Blocked
+      }
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_case_branch_patterns() {
+        let source = r#"
+workflow BadCaseGuess
+
+enum ReviewStatus {
+  Accept
+  Revise
+}
+
+class Review {
+  status ReviewStatus
+  assignee string
+}
+
+rule route
+  when Review as review
+=> {
+  case review.status {
+    Missing => {
+    }
+  }
+
+  case review.assignee {
+    Some owner => {
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("enum `ReviewStatus` has no variant `Missing`")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("uses `Some` for a non-optional case")));
     }
 
     #[test]

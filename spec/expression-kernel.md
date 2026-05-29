@@ -108,6 +108,7 @@ caseExpr
 
 caseBranch
   = pattern ("where" expr)? "=>" expr
+  | pattern ("where" expr)? "=>" "{" ruleBody "}"
 ```
 
 The implementation may choose different concrete syntax, but it must preserve
@@ -241,7 +242,20 @@ case issue.assignee {
 }
 ```
 
-Exact concrete syntax may change, but the semantics must stay restricted:
+The initial implemented rule-body form is:
+
+```whippletree
+case task.provider {
+  "codex" => {
+    record RoutedTask {
+      provider task.provider
+    }
+  }
+}
+```
+
+Exact expression-level syntax may still change, but the semantics must stay
+restricted:
 
 - enum/literal patterns can match only variants in the declared domain
 - optional `Some` branches prove presence for the bound value
