@@ -78,6 +78,6 @@ rules
       review kind=baml.coerce binding=review key=fadf644fc82dc8bf
     dependencies
       poemTurn --succeeds--> review
-    body_hash bbc539c45f9bf744
+    body_hash 33dee64a3c96c9aa
 rule_dependencies
   seed_poem_tasks --schema:PoemTask--> write_and_review_poem

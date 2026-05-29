@@ -12,7 +12,8 @@ schemas
     reason string
     confidence float
   class ReviewedPoem
-    request ref<PoemRequest>
+    topic string
+    poemPath string
     turn ref<AgentTurn>
     review ref<FrenchPoemReview>
     status literal<"reviewed">
@@ -20,6 +21,19 @@ agents
   agent codex profile=repo-writer capacity=1 skills=[] capabilities=[]
 coerces
   coerce reviewFrenchPoem(topic string, poemPath string, turnSummary string) -> ref<FrenchPoemReview>
+assertions
+  assert count(PoemRequest where status == "queued") == 0
+    reads
+      fact:PoemRequest where status == "queued"
+  assert count(ReviewedPoem where status == "reviewed") == 1
+    reads
+      fact:ReviewedPoem where status == "reviewed"
+  assert count(effect kind agent.tell where status == completed) == 1
+    reads
+      effect:kind agent.tell where status == completed
+  assert count(effect kind baml.coerce where status == completed) == 1
+    reads
+      effect:kind baml.coerce where status == completed
 rules
   rule seed_poem_request
     when started
@@ -29,18 +43,20 @@ rules
       schema:PoemRequest
     body_hash 746bc0a67ce23a00
   rule write_and_review_poem
-    when PoemRequest as request
+    when PoemRequest as request where request.status == "queued"
     when codex is available
     reads
       pattern:codex is available
       schema:PoemRequest
     writes
       schema:ReviewedPoem
+    consumes
+      schema:PoemRequest
     effects
       poemTurn kind=agent.tell binding=poemTurn key=c99af6aeb446d4ca
       review kind=baml.coerce binding=review key=fadf644fc82dc8bf
     dependencies
       poemTurn --succeeds--> review
-    body_hash 747604080a273015
+    body_hash 465529fd7f33a1ce
 rule_dependencies
   seed_poem_request --schema:PoemRequest--> write_and_review_poem

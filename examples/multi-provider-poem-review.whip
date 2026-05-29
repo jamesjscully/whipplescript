@@ -141,7 +141,7 @@ rule write_and_review_poem
   }
 
   after review succeeds {
-    consume task
+    done task
 
     record ReviewedPoem {
       provider task.poet
