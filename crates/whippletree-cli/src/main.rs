@@ -1519,7 +1519,7 @@ fn ready_contexts(
         bindings: Vec::new(),
     }];
     for when in &rule.whens {
-        let (pattern, guard) = split_when_guard(when);
+        let pattern = when.pattern.as_str();
         if pattern == "started" {
             if started_event_id.is_none() {
                 return Vec::new();
@@ -1546,7 +1546,11 @@ fn ready_contexts(
                     let mut context = context.clone();
                     context.identity = Some(format!("{binding}:{}", fact.key));
                     context.bindings.push((binding.to_owned(), fact.clone()));
-                    if guard.is_none_or(|guard| eval_guard(guard, &context)) {
+                    if when
+                        .guard
+                        .as_ref()
+                        .is_none_or(|guard| eval_guard(&guard.expr, &context))
+                    {
                         expanded.push(context);
                     }
                 }
@@ -1559,17 +1563,14 @@ fn ready_contexts(
     contexts
 }
 
-fn split_when_guard(when: &str) -> (&str, Option<&str>) {
-    match when.split_once(" where ") {
-        Some((pattern, guard)) => (pattern.trim(), Some(guard.trim())),
-        None => (when.trim(), None),
-    }
+fn eval_guard(guard: &Expr, context: &RuleContext) -> bool {
+    eval_expr_value(guard, &EvalScope::rule(context, &[], &[])).as_bool() == Some(true)
 }
 
-fn eval_guard(guard: &str, context: &RuleContext) -> bool {
-    parse_expression(guard).ok().is_some_and(|expr| {
-        eval_expr_value(&expr, &EvalScope::rule(context, &[], &[])).as_bool() == Some(true)
-    })
+fn eval_guard_source(guard: &str, context: &RuleContext) -> bool {
+    parse_expression(guard)
+        .ok()
+        .is_some_and(|expr| eval_guard(&expr, context))
 }
 
 fn parse_guard_literal(expr: &str) -> Value {
@@ -1598,26 +1599,31 @@ fn eval_assertions(
 ) -> Vec<AssertionReport> {
     ir.assertions
         .iter()
-        .map(|assertion| eval_assertion(&assertion.expr, facts, effects))
+        .map(|assertion| {
+            eval_assertion(
+                assertion.expr.source.as_str(),
+                &assertion.expr.expr,
+                facts,
+                effects,
+            )
+        })
         .collect()
 }
 
-fn eval_assertion(expr: &str, facts: &[FactView], effects: &[EffectView]) -> AssertionReport {
-    let expr = expr.trim();
-    let (status, actual, error) = match parse_expression(expr) {
-        Ok(parsed) => assertion_result(eval_expr_value(
-            &parsed,
-            &EvalScope::assertions(facts, effects),
-        )),
-        Err(message) => (
-            AssertionStatus::Error,
-            Value::Null,
-            Some(format!("invalid assertion expression: {message}")),
-        ),
-    };
+fn eval_assertion(
+    source: &str,
+    expr: &Expr,
+    facts: &[FactView],
+    effects: &[EffectView],
+) -> AssertionReport {
+    let source = source.trim();
+    let (status, actual, error) = assertion_result(eval_expr_value(
+        expr,
+        &EvalScope::assertions(facts, effects),
+    ));
     let passed = status == AssertionStatus::Passed;
     AssertionReport {
-        expr: expr.to_owned(),
+        expr: source.to_owned(),
         status,
         passed,
         actual,
@@ -2274,7 +2280,7 @@ fn select_case_branch(case: &CaseBlock, context: &mut RuleContext) -> Option<Cas
             && branch
                 .guard
                 .as_deref()
-                .is_none_or(|guard| eval_guard(guard, context))
+                .is_none_or(|guard| eval_guard_source(guard, context))
         {
             return Some(branch.clone());
         }

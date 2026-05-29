@@ -42,7 +42,7 @@ The expression kernel covers deterministic logic used by:
   assertion pass/fail/error, optional presence, enum/literal domains, typed
   pattern branches, exhaustive finite-domain misses, and dynamic agent target
   validity.
-- [ ] Real compiler/runtime guard evaluation does not yet use a typed expression
+- [x] Real compiler/runtime guard evaluation now uses a typed expression
   AST.
 - [ ] Full guard/assertion type checking is not implemented.
 
@@ -87,9 +87,9 @@ The expression kernel covers deterministic logic used by:
 - [~] Add expression AST nodes for literals, paths, unary ops, binary ops,
   calls, array literals, object literals, fact queries, effect queries, and
   map indexing.
-- [ ] Replace raw guard strings in the typed IR with parsed expression nodes
+- [x] Replace raw guard strings in the typed IR with parsed expression nodes
   while preserving source spans.
-- [ ] Replace raw assertion strings in the typed IR with parsed expression nodes
+- [x] Replace raw assertion strings in the typed IR with parsed expression nodes
   while preserving source spans.
 - [x] Implement precedence and associativity exactly as specified:
   path/indexing, unary/calls, ordering/membership, equality, `&&`, `||`.
@@ -148,9 +148,9 @@ The expression kernel covers deterministic logic used by:
 
 ### 4. IR, Lowering, And Generated Checks
 
-- [ ] Add typed expression IR with source spans and stable snapshot rendering.
-- [ ] Lower guard expressions into rule readiness predicates.
-- [ ] Lower assertion expressions into deterministic checkpoint metadata.
+- [x] Add typed expression IR with source spans and stable snapshot rendering.
+- [x] Lower guard expressions into rule readiness predicates.
+- [x] Lower assertion expressions into deterministic checkpoint metadata.
 - [ ] Lower fact/effect projection reads into rule/assertion read metadata.
 - [ ] Extend generated per-program Maude checks so a rule can commit only after
   its lowered guard predicate is true.

@@ -226,7 +226,14 @@ pub struct IrProgram {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrAssertion {
-    pub expr: String,
+    pub expr: IrExpression,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrExpression {
+    pub source: String,
+    pub expr: Expr,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -317,9 +324,17 @@ pub struct IrParam {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrRule {
     pub name: String,
-    pub whens: Vec<String>,
+    pub whens: Vec<IrWhen>,
     pub body: String,
     pub metadata: IrRuleMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrWhen {
+    pub source: String,
+    pub pattern: String,
+    pub guard: Option<IrExpression>,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -480,6 +495,85 @@ pub fn parse_expression(expr: &str) -> Result<Expr, String> {
     ExprParser::new(expr).parse()
 }
 
+impl Expr {
+    pub fn to_snapshot(&self) -> String {
+        match self {
+            Self::Literal(literal) => literal.to_snapshot(),
+            Self::Path(path) => path.join("."),
+            Self::Array(items) => {
+                let items = items
+                    .iter()
+                    .map(Self::to_snapshot)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("[{items}]")
+            }
+            Self::Unary { op, expr } => match op {
+                UnaryOp::Not => format!("!{}", expr.to_snapshot_with_parentheses()),
+            },
+            Self::Binary { op, left, right } => format!(
+                "{} {} {}",
+                left.to_snapshot_with_parentheses(),
+                op.to_snapshot(),
+                right.to_snapshot_with_parentheses()
+            ),
+            Self::Call { name, args } => {
+                let args = args
+                    .iter()
+                    .map(Self::to_snapshot)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{name}({args})")
+            }
+            Self::Query { kind, head, guard } => {
+                let prefix = match kind {
+                    QueryKind::Fact => head.clone(),
+                    QueryKind::Effect => format!("effect {head}"),
+                };
+                match guard {
+                    Some(guard) => format!("{prefix} where {}", guard.to_snapshot()),
+                    None => prefix,
+                }
+            }
+        }
+    }
+
+    fn to_snapshot_with_parentheses(&self) -> String {
+        match self {
+            Self::Binary { .. } => format!("({})", self.to_snapshot()),
+            _ => self.to_snapshot(),
+        }
+    }
+}
+
+impl ExprLiteral {
+    fn to_snapshot(&self) -> String {
+        match self {
+            Self::String(value) => format!("{value:?}"),
+            Self::Number(value) | Self::Ident(value) => value.clone(),
+            Self::Bool(value) => value.to_string(),
+            Self::Null => "null".to_owned(),
+        }
+    }
+}
+
+impl BinaryOp {
+    fn to_snapshot(self) -> &'static str {
+        match self {
+            Self::Or => "||",
+            Self::And => "&&",
+            Self::Eq => "==",
+            Self::Ne => "!=",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+            Self::In => "in",
+            Self::NotIn => "not in",
+        }
+    }
+}
+
 /// Parses a source file into a recoverable AST plus diagnostics.
 pub fn parse_program(source: &str) -> ParseOutput {
     let lexed = lex(source);
@@ -615,7 +709,10 @@ impl IrProgram {
         if !self.assertions.is_empty() {
             push_line(&mut snapshot, "assertions");
             for assertion in &self.assertions {
-                push_line(&mut snapshot, format!("  assert {}", assertion.expr));
+                push_line(
+                    &mut snapshot,
+                    format!("  assert {}", assertion.expr.expr.to_snapshot()),
+                );
             }
         }
 
@@ -624,7 +721,17 @@ impl IrProgram {
             for rule in &self.rules {
                 push_line(&mut snapshot, format!("  rule {}", rule.name));
                 for when in &rule.whens {
-                    push_line(&mut snapshot, format!("    when {}", when));
+                    match &when.guard {
+                        Some(guard) => push_line(
+                            &mut snapshot,
+                            format!(
+                                "    when {} where {}",
+                                when.pattern,
+                                guard.expr.to_snapshot()
+                            ),
+                        ),
+                        None => push_line(&mut snapshot, format!("    when {}", when.pattern)),
+                    }
                 }
                 if !rule.metadata.fact_reads.is_empty() {
                     push_line(&mut snapshot, "    reads");
@@ -825,18 +932,22 @@ fn lower_program(program: Program) -> CompileOutput {
 }
 
 fn lower_assert(assertion: AssertDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
-    if let Err(message) = parse_expression(&assertion.expr) {
-        diagnostics.push(Diagnostic {
+    match parse_expression(&assertion.expr) {
+        Ok(expr) => ir.assertions.push(IrAssertion {
+            expr: IrExpression {
+                source: assertion.expr,
+                expr,
+                span: assertion.span,
+            },
+        }),
+        Err(message) => diagnostics.push(Diagnostic {
             span: assertion.span,
             message: format!("invalid assertion expression: {message}"),
             suggestion: Some(
                 "use a deterministic expression such as `count(Fact) == 1`".to_owned(),
             ),
-        });
+        }),
     }
-    ir.assertions.push(IrAssertion {
-        expr: assertion.expr,
-    });
 }
 
 fn collect_schema_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> BTreeSet<String> {
@@ -1325,10 +1436,35 @@ fn lower_rule(
     validate_effectful_self_trigger(&rule, &metadata, diagnostics);
     ir.rules.push(IrRule {
         name: rule.name.name,
-        whens: rule.whens.into_iter().map(|when| when.text).collect(),
+        whens: rule.whens.into_iter().map(lower_when_clause).collect(),
         body: rule.body.text,
         metadata,
     });
+}
+
+fn lower_when_clause(when: WhenClause) -> IrWhen {
+    let source = when.text;
+    let (pattern, guard_source) = split_when_guard(&source);
+    let pattern = pattern.to_owned();
+    let guard = guard_source.and_then(|guard_source| {
+        let guard_offset = source.find(guard_source).unwrap_or(0);
+        parse_expression(guard_source)
+            .ok()
+            .map(|expr| IrExpression {
+                source: guard_source.to_owned(),
+                expr,
+                span: SourceSpan {
+                    start: when.span.start + guard_offset,
+                    end: when.span.start + guard_offset + guard_source.len(),
+                },
+            })
+    });
+    IrWhen {
+        source,
+        pattern,
+        guard,
+        span: when.span,
+    }
 }
 
 fn build_rule_dependencies(rules: &[IrRule]) -> Vec<IrRuleDependency> {
@@ -4451,10 +4587,8 @@ impl Parser<'_> {
             start: expr_start,
             end: expr_end,
         };
-        Some(AssertDecl {
-            expr: self.source_text(span).trim().to_owned(),
-            span,
-        })
+        let (expr, span) = trimmed_source_text(self.source_text(span), span);
+        Some(AssertDecl { expr, span })
     }
 
     fn parse_when_clause(&mut self) -> Option<WhenClause> {
@@ -4475,10 +4609,8 @@ impl Parser<'_> {
             start: text_start,
             end: text_end,
         };
-        Some(WhenClause {
-            text: self.source_text(span).trim().to_owned(),
-            span,
-        })
+        let (text, span) = trimmed_source_text(self.source_text(span), span);
+        Some(WhenClause { text, span })
     }
 
     fn parse_block_source(&mut self) -> Option<BlockSource> {
@@ -4832,6 +4964,28 @@ impl Parser<'_> {
     fn source_text(&self, span: SourceSpan) -> &str {
         &self.source[span.start..span.end]
     }
+}
+
+fn trimmed_source_text(source: &str, span: SourceSpan) -> (String, SourceSpan) {
+    let leading = source.len() - source.trim_start().len();
+    let trailing = source.len() - source.trim_end().len();
+    let end = source.len().saturating_sub(trailing);
+    if leading > end {
+        return (
+            String::new(),
+            SourceSpan {
+                start: span.end,
+                end: span.end,
+            },
+        );
+    }
+    (
+        source[leading..end].to_owned(),
+        SourceSpan {
+            start: span.start + leading,
+            end: span.start + end,
+        },
+    )
 }
 
 fn is_primitive_type(name: &str) -> bool {
@@ -5414,10 +5568,42 @@ rule branch
         let compiled = compile_program(source);
         assert_eq!(compiled.diagnostics, Vec::new());
         let ir = compiled.ir.expect("valid ir");
-        assert!(ir.rules.iter().any(|rule| rule
-            .whens
+        let when = ir
+            .rules
             .iter()
-            .any(|when| when == "WorkItem as item where item.state == \"ready\"")));
+            .flat_map(|rule| &rule.whens)
+            .find(|when| when.source == "WorkItem as item where item.state == \"ready\"")
+            .expect("guarded when");
+        assert_eq!(when.pattern, "WorkItem as item");
+        assert_eq!(
+            when.guard.as_ref().map(|guard| guard.expr.to_snapshot()),
+            Some("item.state == \"ready\"".to_owned())
+        );
+    }
+
+    #[test]
+    fn lowers_assertions_to_parsed_expression_ir() {
+        let source = r#"
+workflow AssertionGuess
+
+class Result {
+  status "done"
+}
+
+assert count(Result where status == "done") == 1
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("valid ir");
+        let assertion = ir.assertions.first().expect("assertion");
+        assert_eq!(
+            assertion.expr.source,
+            "count(Result where status == \"done\") == 1"
+        );
+        assert_eq!(
+            assertion.expr.expr.to_snapshot(),
+            "count(Result where status == \"done\") == 1"
+        );
     }
 
     #[test]
