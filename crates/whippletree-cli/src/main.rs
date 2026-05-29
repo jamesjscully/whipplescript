@@ -531,10 +531,11 @@ fn step(options: &CliOptions) -> ExitCode {
         Ok(report) if options.json => emit_json(step_report_to_json(&report)),
         Ok(report) => {
             println!(
-                "step {} committed_rules={} facts={} effects={}",
+                "step {} committed_rules={} facts={} consumed={} effects={}",
                 report.instance_id,
                 report.committed_rules,
                 report.facts_created,
+                report.facts_consumed,
                 report.effects_created
             );
             for guard in report
@@ -606,6 +607,7 @@ struct StepReport {
     instance_id: String,
     committed_rules: usize,
     facts_created: usize,
+    facts_consumed: usize,
     effects_created: usize,
     guard_reports: Vec<GuardReport>,
     branch_reports: Vec<BranchReport>,
@@ -710,23 +712,33 @@ fn step_instance(
         let store = SqliteStore::open(store_path)?;
         let events = store.list_events(instance_id)?;
         let facts = store.list_facts(instance_id)?;
+        let all_facts = store.list_facts_including_consumed(instance_id)?;
         let effects = store.list_effects(instance_id)?;
         let started_event_id = events
             .iter()
             .find(|event| event.event_type == "external.started")
             .map(|event| event.event_id.clone());
 
-        for rule in &ir.rules {
+        'rules: for rule in &ir.rules {
             let ready = ready_contexts(ir, rule, &facts, &effects, started_event_id.as_deref());
             report.guard_reports.extend(ready.guard_reports);
             for context in ready.contexts {
-                let lowering = lower_rule(ir, rule, &context, &facts, &effects, source_path);
+                let lowering = lower_rule(ir, rule, &context, &all_facts, &effects, source_path);
                 report
                     .branch_reports
                     .extend(lowering.branch_reports.iter().cloned());
-                if lowering.facts.is_empty() && lowering.effects.is_empty() {
+                if lowering.facts.is_empty()
+                    && lowering.consumed_fact_ids.is_empty()
+                    && lowering.effects.is_empty()
+                    && lowering.dependencies.is_empty()
+                {
                     continue;
                 }
+                let consumed_fact_ids = lowering
+                    .consumed_fact_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
                 let new_facts = lowering
                     .facts
                     .iter()
@@ -756,6 +768,7 @@ fn step_instance(
                     rule: &rule.name,
                     trigger_event_id: context.trigger_event_id.as_deref(),
                     facts: &new_facts,
+                    consumed_fact_ids: &consumed_fact_ids,
                     effects: &new_effects,
                     dependencies: &new_dependencies,
                     idempotency_key: Some(&commit_key),
@@ -766,8 +779,10 @@ fn step_instance(
                     Ok(_) => {
                         report.committed_rules += 1;
                         report.facts_created += new_facts.len();
+                        report.facts_consumed += consumed_fact_ids.len();
                         report.effects_created += new_effects.len();
                         made_progress = true;
+                        break 'rules;
                     }
                     Err(error) => return Err(error),
                 }
@@ -1665,6 +1680,7 @@ struct RuleContext {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct OwnedLowering {
     facts: Vec<OwnedFact>,
+    consumed_fact_ids: Vec<String>,
     effects: Vec<OwnedEffect>,
     dependencies: Vec<OwnedDependency>,
     branch_reports: Vec<BranchReport>,
@@ -2587,8 +2603,9 @@ fn lower_rule(
     let mut lowering = OwnedLowering::default();
     lowering.branch_reports.extend(branch_reports);
     let pre_terminal_body = strip_after_blocks(&body);
+    append_consumed_fact_ids(&mut lowering, &pre_terminal_body, &context, facts);
 
-    for block in top_level_record_blocks(&body) {
+    for block in top_level_record_blocks(&pre_terminal_body) {
         let value = parse_record_fields(&block.body, &context);
         let value_json = Value::Object(value).to_string();
         let fact_key = record_fact_key(&block.schema, &value_json);
@@ -2719,6 +2736,7 @@ fn lower_rule(
         let (selected_after_body, after_context, branch_reports) =
             selected_rule_body(&after.body, &after_context);
         lowering.branch_reports.extend(branch_reports);
+        append_consumed_fact_ids(&mut lowering, &selected_after_body, &after_context, facts);
         for record in top_level_record_blocks(&selected_after_body) {
             let value = parse_record_fields(&record.body, &after_context);
             let value_json = Value::Object(value).to_string();
@@ -2863,6 +2881,58 @@ fn push_effect_binding(context: &mut RuleContext, binding: &str, effect_id: &str
             provenance_class: "effect".to_owned(),
         },
     ));
+}
+
+fn append_consumed_fact_ids(
+    lowering: &mut OwnedLowering,
+    body: &str,
+    context: &RuleContext,
+    facts: &[FactView],
+) {
+    for binding in consume_statements(body) {
+        let Some((_, fact)) = context
+            .bindings
+            .iter()
+            .find(|(candidate, _)| candidate == &binding)
+        else {
+            continue;
+        };
+        if fact.provenance_class == "effect" {
+            continue;
+        }
+        if !facts.iter().any(|active| active.fact_id == fact.fact_id) {
+            continue;
+        }
+        if !lowering
+            .consumed_fact_ids
+            .iter()
+            .any(|existing| existing == &fact.fact_id)
+        {
+            lowering.consumed_fact_ids.push(fact.fact_id.clone());
+        }
+    }
+}
+
+fn consume_statements(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim().trim_end_matches(';');
+            let binding = line
+                .strip_prefix("consume ")
+                .or_else(|| line.strip_prefix("done "))?
+                .trim();
+            is_identifier(binding).then(|| binding.to_owned())
+        })
+        .collect()
+}
+
+fn is_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn selected_rule_body(
@@ -3920,6 +3990,7 @@ fn step_report_to_json(report: &StepReport) -> Value {
         "instance_id": report.instance_id,
         "committed_rules": report.committed_rules,
         "facts_created": report.facts_created,
+        "facts_consumed": report.facts_consumed,
         "effects_created": report.effects_created,
         "guards": report.guard_reports.iter().map(guard_report_to_json).collect::<Vec<_>>(),
         "branches": report.branch_reports.iter().map(branch_report_to_json).collect::<Vec<_>>(),
@@ -3986,6 +4057,12 @@ fn worker_report_to_json(report: &WorkerReport) -> Value {
 fn lowering_idempotency_key(lowering: &OwnedLowering) -> String {
     let mut ids = Vec::new();
     ids.extend(lowering.facts.iter().map(|fact| fact.fact_id.as_str()));
+    ids.extend(
+        lowering
+            .consumed_fact_ids
+            .iter()
+            .map(|fact_id| fact_id.as_str()),
+    );
     ids.extend(
         lowering
             .effects
@@ -6623,6 +6700,56 @@ assert exists(Window where elapsed < limit)
             .error
             .as_deref()
             .is_some_and(|error| error.contains("invalid duration value `bad-duration`")));
+    }
+
+    #[test]
+    fn lowering_consumes_matched_fact_binding() {
+        let source = r#"
+workflow ConsumeTask
+
+class Task {
+  status "queued"
+}
+
+class Done {
+  status "done"
+}
+
+rule finish
+  when Task as task where task.status == "queued"
+=> {
+  consume task
+  record Done {
+    status "done"
+  }
+}
+"#;
+        let ir = whippletree_parser::compile_program(source)
+            .ir
+            .expect("compile");
+        let fact = FactView {
+            fact_id: "fact-task".to_owned(),
+            name: "Task".to_owned(),
+            key: "Task:queued".to_owned(),
+            value_json: r#"{"status":"queued"}"#.to_owned(),
+            provenance_class: "rule".to_owned(),
+        };
+        let facts = vec![fact];
+        let effects = Vec::new();
+        let ready = ready_contexts(&ir, &ir.rules[0], &facts, &effects, None);
+        assert_eq!(ready.contexts.len(), 1);
+
+        let lowering = lower_rule(
+            &ir,
+            &ir.rules[0],
+            &ready.contexts[0],
+            &facts,
+            &effects,
+            None,
+        );
+
+        assert_eq!(lowering.consumed_fact_ids, vec!["fact-task"]);
+        assert_eq!(lowering.facts.len(), 1);
     }
 
     #[test]

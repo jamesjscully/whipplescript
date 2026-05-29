@@ -305,6 +305,11 @@ Dependency satisfaction is scheduling state, not effect identity. Retries reuse
 the same effect identity unless the source rule explicitly creates a new
 attempt.
 
+Fact consumption is a rule-commit transition, not an effect or provider-side
+operation. The committed event records `consumed_facts` beside produced facts,
+effects, and dependencies. A consumed fact remains recoverable from history but
+is excluded from the active projection used by rule matching and assertions.
+
 ## Formal Model
 
 The execution contract extends the runtime state with dependency edges:

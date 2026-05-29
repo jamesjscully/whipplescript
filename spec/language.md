@@ -265,6 +265,33 @@ Guards are the preferred way to express routing over a shared schema. Authors
 should not need one schema per provider when the data shape is identical and
 only a literal or enum field selects the target.
 
+### Consumed Facts
+
+Rules can finish a matched work item without mutating it in place:
+
+```whip
+rule finish
+  when Task as task where task.status == "queued"
+=> {
+  consume task
+  record Done {
+    status "done"
+  }
+}
+```
+
+`consume binding` marks the fact bound by `when Class as binding` as consumed in
+the same rule commit. `done binding` is accepted as an alias for the same
+transition. Consumed facts remain in the append-only event log and replay
+history, but they leave the current fact projection: later rule matching,
+projection queries, and assertions do not see them by default. This is the
+first-class queue-item/done transition for rules that dispatch work, record a
+replacement fact, or otherwise need to avoid matching the same fact forever.
+
+Only fact bindings introduced by `when` clauses are consumable. Effect-output
+bindings are terminal observations and must be handled with `after` blocks
+instead.
+
 ### Expression Parser Coverage
 
 The source expression parser covers guards, assertions, projection filters,

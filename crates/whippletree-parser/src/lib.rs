@@ -353,6 +353,7 @@ pub struct IrRuleMetadata {
     pub fact_reads: Vec<String>,
     pub projection_reads: Vec<IrProjectionRead>,
     pub fact_writes: Vec<String>,
+    pub fact_consumes: Vec<String>,
     pub effects: Vec<IrEffectNode>,
     pub dependencies: Vec<IrEffectDependency>,
     pub case_branches: Vec<IrRuleCaseBranch>,
@@ -876,6 +877,12 @@ impl IrProgram {
                     push_line(&mut snapshot, "    writes");
                     for write in &rule.metadata.fact_writes {
                         push_line(&mut snapshot, format!("      {}", write));
+                    }
+                }
+                if !rule.metadata.fact_consumes.is_empty() {
+                    push_line(&mut snapshot, "    consumes");
+                    for consumed in &rule.metadata.fact_consumes {
+                        push_line(&mut snapshot, format!("      {}", consumed));
                     }
                 }
                 if !rule.metadata.effects.is_empty() {
@@ -1857,7 +1864,9 @@ fn validate_effectful_self_trigger(
     }
 
     for written_fact in &metadata.fact_writes {
-        if metadata.fact_reads.contains(written_fact) {
+        if metadata.fact_reads.contains(written_fact)
+            && !metadata.fact_consumes.contains(written_fact)
+        {
             diagnostics.push(Diagnostic {
                 span: rule.body.span,
                 message: format!(
@@ -1968,6 +1977,24 @@ fn analyze_rule(
         validate_binding_uses(rule, line, &seen_bindings, &active_afters, diagnostics);
         validate_known_field_paths(rule, line, semantic, &binding_types, diagnostics);
 
+        if let Some(binding) = parse_consume_line(line) {
+            match binding_types.get(&binding) {
+                Some(schema) => metadata.fact_consumes.push(format!("schema:{schema}")),
+                None => diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` consumes unknown fact binding `{binding}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some(
+                        "consume a binding introduced by a `when Class as binding` clause"
+                            .to_owned(),
+                    ),
+                }),
+            }
+            continue;
+        }
+
         if line.starts_with("after ") {
             match parse_after_line(line) {
                 Some((binding, predicate)) => {
@@ -2056,6 +2083,8 @@ fn analyze_rule(
     sort_projection_reads(&mut metadata.projection_reads);
     metadata.fact_writes.sort();
     metadata.fact_writes.dedup();
+    metadata.fact_consumes.sort();
+    metadata.fact_consumes.dedup();
     metadata.terminal_outputs = terminal_metadata.outputs;
     metadata.terminal_branches = terminal_metadata.branches;
     metadata
@@ -6382,6 +6411,25 @@ fn parse_effect_line(line: &str) -> Option<(IrEffectKind, Option<String>)> {
     Some((kind, binding_after_as(line)))
 }
 
+fn parse_consume_line(line: &str) -> Option<String> {
+    let binding = line
+        .trim()
+        .trim_end_matches(';')
+        .strip_prefix("consume ")
+        .or_else(|| line.trim().trim_end_matches(';').strip_prefix("done "))?
+        .trim();
+    let mut chars = binding.chars();
+    let Some(first) = chars.next() else {
+        return None;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    chars
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        .then(|| binding.to_owned())
+}
+
 fn binding_after_multiline_string_end(line: &str) -> Option<String> {
     line.strip_prefix("\"\"\"")
         .and_then(|rest| rest.trim().strip_prefix("as "))
@@ -9474,6 +9522,51 @@ rule bad_claim
         assert!(messages
             .iter()
             .any(|message| message.contains("field `loft claim.issue` receives incompatible")));
+    }
+
+    #[test]
+    fn lowers_fact_consumption_metadata() {
+        let source = r#"
+workflow ConsumeTask
+
+class Task {
+  status "queued"
+}
+
+rule finish
+  when Task as task
+=> {
+  consume task
+}
+"#;
+        let compiled = compile_program(source);
+        let ir = compiled.ir.expect("program compiles");
+
+        assert_eq!(ir.rules[0].metadata.fact_consumes, vec!["schema:Task"]);
+        assert!(ir.to_snapshot().contains("consumes\n      schema:Task"));
+    }
+
+    #[test]
+    fn rejects_unknown_fact_consumption_binding() {
+        let source = r#"
+workflow BadConsume
+
+class Task {
+  status "queued"
+}
+
+rule finish
+  when Task as task
+=> {
+  consume missing
+}
+"#;
+        let compiled = compile_program(source);
+
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("consumes unknown fact binding `missing`")));
     }
 
     #[test]

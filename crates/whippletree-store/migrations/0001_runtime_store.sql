@@ -68,6 +68,7 @@ CREATE TABLE facts (
     external_system TEXT,
     external_id TEXT,
     correlation_id TEXT,
+    consumed_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(instance_id, name, key)

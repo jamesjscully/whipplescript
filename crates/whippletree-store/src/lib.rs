@@ -107,6 +107,7 @@ pub struct RuleCommit<'a> {
     pub rule: &'a str,
     pub trigger_event_id: Option<&'a str>,
     pub facts: &'a [NewFact<'a>],
+    pub consumed_fact_ids: &'a [&'a str],
     pub effects: &'a [NewEffect<'a>],
     pub dependencies: &'a [NewEffectDependency<'a>],
     pub idempotency_key: Option<&'a str>,
@@ -728,6 +729,7 @@ impl SqliteStore {
         for fact in commit.facts {
             insert_fact(&tx, commit.instance_id, commit.rule, &event.event_id, fact)?;
         }
+        consume_facts(&tx, commit.instance_id, commit.consumed_fact_ids)?;
         for effect in commit.effects {
             insert_effect(
                 &tx,
@@ -745,6 +747,7 @@ impl SqliteStore {
             "trigger_event_id": commit.trigger_event_id,
             "event_id": event.event_id,
             "facts": commit.facts.iter().map(|fact| fact.fact_id).collect::<Vec<_>>(),
+            "consumed_facts": commit.consumed_fact_ids,
             "effects": commit.effects.iter().map(|effect| effect.effect_id).collect::<Vec<_>>(),
             "dependencies": commit
                 .dependencies
@@ -795,6 +798,18 @@ impl SqliteStore {
                     target_type: "fact",
                     target_id: fact.fact_id,
                     relation: "recorded",
+                },
+            )?;
+        }
+        for fact_id in commit.consumed_fact_ids {
+            insert_evidence_link_on(
+                &tx,
+                EvidenceLink {
+                    evidence_id: &evidence_id,
+                    instance_id: commit.instance_id,
+                    target_type: "fact",
+                    target_id: fact_id,
+                    relation: "consumed",
                 },
             )?;
         }
@@ -2156,6 +2171,30 @@ impl SqliteStore {
             SELECT fact_id, name, key, value_json, provenance_class
             FROM facts
             WHERE instance_id = ?1
+              AND consumed_at IS NULL
+            ORDER BY name, key
+            "#,
+        )?;
+        let rows = statement
+            .query_map([instance_id], |row| {
+                Ok(FactView {
+                    fact_id: row.get(0)?,
+                    name: row.get(1)?,
+                    key: row.get(2)?,
+                    value_json: row.get(3)?,
+                    provenance_class: row.get(4)?,
+                })
+            })?
+            .collect::<result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_facts_including_consumed(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT fact_id, name, key, value_json, provenance_class
+            FROM facts
+            WHERE instance_id = ?1
             ORDER BY name, key
             "#,
         )?;
@@ -2868,6 +2907,28 @@ fn insert_fact(
             fact.correlation_id,
         ],
     )?;
+    Ok(())
+}
+
+fn consume_facts(connection: &Connection, instance_id: &str, fact_ids: &[&str]) -> StoreResult<()> {
+    for fact_id in fact_ids {
+        let changed = connection.execute(
+            r#"
+            UPDATE facts
+            SET consumed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE instance_id = ?1
+              AND fact_id = ?2
+              AND consumed_at IS NULL
+            "#,
+            params![instance_id, fact_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "fact `{fact_id}` is not active and cannot be consumed"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -3828,6 +3889,11 @@ fn rule_commit_payload(commit: RuleCommit<'_>) -> StoreResult<String> {
             }))
         })
         .collect::<StoreResult<Vec<_>>>()?;
+    let consumed_facts = commit
+        .consumed_fact_ids
+        .iter()
+        .map(|fact_id| json!({ "fact_id": fact_id }))
+        .collect::<Vec<_>>();
     let effects = commit
         .effects
         .iter()
@@ -3865,6 +3931,7 @@ fn rule_commit_payload(commit: RuleCommit<'_>) -> StoreResult<String> {
     let payload = json!({
         "rule": commit.rule,
         "facts": facts,
+        "consumed_facts": consumed_facts,
         "effects": effects,
         "dependencies": dependencies,
     });
@@ -3964,6 +4031,19 @@ fn replay_rule_commit(
         };
         insert_fact(connection, instance_id, rule, event_id, &new_fact)?;
     }
+
+    let consumed_fact_ids = payload
+        .get("consumed_facts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|fact| {
+            fact.get("fact_id")
+                .and_then(Value::as_str)
+                .or_else(|| fact.as_str())
+        })
+        .collect::<Vec<_>>();
+    consume_facts(connection, instance_id, &consumed_fact_ids)?;
 
     for effect in payload
         .get("effects")
@@ -4069,7 +4149,26 @@ fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
         )?;
     }
     transaction.commit()?;
+    ensure_fact_schema(connection)?;
     ensure_diagnostics_schema(connection)?;
+    Ok(())
+}
+
+fn ensure_fact_schema(connection: &Connection) -> StoreResult<()> {
+    let facts_table_exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'facts'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !facts_table_exists {
+        return Ok(());
+    }
+    if !column_exists(connection, "facts", "consumed_at")? {
+        connection.execute("ALTER TABLE facts ADD COLUMN consumed_at TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -4275,6 +4374,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &facts,
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &dependencies,
                 idempotency_key: Some("commit-start"),
@@ -4300,6 +4400,7 @@ mod tests {
             rule: "bad",
             trigger_event_id: None,
             facts: &[],
+            consumed_fact_ids: &[],
             effects: &effects,
             dependencies: &[],
             idempotency_key: Some("bad-commit"),
@@ -4331,6 +4432,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &facts,
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &dependencies,
                 idempotency_key: Some("commit-start"),
@@ -4360,6 +4462,71 @@ mod tests {
     }
 
     #[test]
+    fn rule_commit_consumes_facts_and_replay_preserves_consumption() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let facts = [test_fact("fact-task", "Task", "Task:queued")];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "seed",
+                trigger_event_id: None,
+                facts: &facts,
+                consumed_fact_ids: &[],
+                effects: &[],
+                dependencies: &[],
+                idempotency_key: Some("commit-seed"),
+            })
+            .expect("seed commit succeeds");
+
+        assert_eq!(
+            store
+                .list_facts("instance-a")
+                .expect("active facts before consume")
+                .len(),
+            1
+        );
+
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "finish",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &["fact-task"],
+                effects: &[],
+                dependencies: &[],
+                idempotency_key: Some("commit-finish"),
+            })
+            .expect("consume commit succeeds");
+
+        assert_eq!(
+            store
+                .list_facts("instance-a")
+                .expect("active facts after consume")
+                .len(),
+            0
+        );
+        assert_eq!(row_count(&store, "facts"), 1);
+
+        store
+            .connection
+            .execute("DELETE FROM facts", [])
+            .expect("facts clear");
+        store
+            .rebuild_projections("instance-a")
+            .expect("projections rebuild");
+
+        assert_eq!(
+            store
+                .list_facts("instance-a")
+                .expect("active replayed facts")
+                .len(),
+            0
+        );
+        assert_eq!(row_count(&store, "facts"), 1);
+    }
+
+    #[test]
     fn duplicate_terminal_completion_rolls_back_event() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let effects = [test_effect("tell", "agent.tell", "rule=start;effect=tell")];
@@ -4369,6 +4536,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &[],
                 idempotency_key: Some("commit-start"),
@@ -4415,6 +4583,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &dependencies,
                 idempotency_key: Some("commit-start"),
@@ -4493,6 +4662,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &dependencies,
                 idempotency_key: Some("commit-start"),
@@ -4578,6 +4748,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &[test_effect("tell", "agent.tell", "rule=start;effect=tell")],
                 dependencies: &[],
                 idempotency_key: Some("commit-start"),
@@ -4640,6 +4811,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &dependencies,
                 idempotency_key: Some("commit-start"),
@@ -4669,6 +4841,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &[],
                 idempotency_key: Some("commit-start"),
@@ -4720,6 +4893,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &[],
                 idempotency_key: Some("commit-start"),
@@ -4782,6 +4956,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &[test_effect("tell", "agent.tell", "rule=start;effect=tell")],
                 dependencies: &[],
                 idempotency_key: Some("commit-start"),
@@ -4911,6 +5086,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &[test_effect("tell", "agent.tell", "rule=start;effect=tell")],
                 dependencies: &[],
                 idempotency_key: Some("commit-start"),
@@ -5053,6 +5229,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &[],
                 idempotency_key: Some("commit-start"),
@@ -5222,6 +5399,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &[],
                 idempotency_key: Some("commit-start"),
@@ -5296,6 +5474,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &[],
                 idempotency_key: Some("commit-start"),
@@ -5354,6 +5533,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &[],
                 idempotency_key: Some("commit-start"),
@@ -5395,6 +5575,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &[],
                 idempotency_key: Some("commit-start"),
@@ -5504,6 +5685,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &[],
                 idempotency_key: Some("commit-start"),
@@ -5565,6 +5747,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &[],
                 idempotency_key: Some("commit-start"),
@@ -5636,6 +5819,7 @@ mod tests {
                 rule: "start",
                 trigger_event_id: None,
                 facts: &[],
+                consumed_fact_ids: &[],
                 effects: &effects,
                 dependencies: &[],
                 idempotency_key: Some("commit-start"),

@@ -231,3 +231,8 @@ normalized_input_hash
 
 Retries reuse the same effect identity unless the source rule explicitly
 produces a new attempt.
+
+When a rule both consumes a matched fact and enqueues effects, the consumed fact
+ids are recorded in the same `rule.committed` event as the effects. Provider
+workers never infer or perform consumption; they only observe the effect outbox
+and append terminal events.

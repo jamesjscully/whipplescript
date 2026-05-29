@@ -1749,6 +1749,7 @@ rule accept
             rule: "external",
             trigger_event_id: None,
             facts: &[fact],
+            consumed_fact_ids: &[],
             effects: &[],
             dependencies: &[],
             idempotency_key: Some("external-window-invalid-duration"),

@@ -151,6 +151,7 @@ state, it should:
 4. Evaluate ready rules in a deterministic order.
 5. Lower each selected rule body into:
    - `NewFact` records for `record ...` blocks
+   - consumed fact ids for `consume binding` / `done binding`
    - `NewEffect` records for `tell`, `coerce`, `claim`, `askHuman`, `call`,
      and `emit`
    - `NewEffectDependency` records for `after` blocks
@@ -268,6 +269,8 @@ For each rule body construct:
 
 ```text
 record Class { ... }        -> typed fact projection
+consume binding             -> consume the matched fact from current projection
+done binding                -> alias for consume binding
 tell agent ...              -> agent.tell effect with target/profile/skills
 coerce function(...)        -> baml.coerce effect with function and arguments
 claim issue with loft       -> loft.claim effect
@@ -296,6 +299,12 @@ normalized input JSON
 stable idempotency key
 correlation id
 ```
+
+Consumed facts are part of the same atomic rule commit as produced facts,
+effects, dependencies, evidence, and diagnostics. The store records consumed
+fact ids in the `rule.committed` event payload and marks those active projection
+rows consumed. Rebuilding projections from the event log must replay the fact
+insertion events and then apply the recorded consumption transitions in sequence.
 
 Dynamic agent targets, when supported, must lower to a concrete declared agent
 before the `agent.tell` effect is created. The lowered effect stores both the

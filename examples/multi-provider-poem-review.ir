@@ -31,7 +31,7 @@ agents
 coerces
   coerce reviewPoem(language string, topic string, expectedLineCount int, artifactPath string, turnSummary string) -> ref<PoemQualityReview>
 assertions
-  assert count(PoemTask where status == "queued") == 3
+  assert count(PoemTask where status == "queued") == 0
     reads
       fact:PoemTask where status == "queued"
   assert count(ReviewedPoem where provider == "codex") == 1
@@ -71,11 +71,13 @@ rules
       schema:PoemTask
     writes
       schema:ReviewedPoem
+    consumes
+      schema:PoemTask
     effects
       poemTurn kind=agent.tell binding=poemTurn key=c99af6aeb446d4ca
       review kind=baml.coerce binding=review key=fadf644fc82dc8bf
     dependencies
       poemTurn --succeeds--> review
-    body_hash cb75c1fe979bbbed
+    body_hash bbc539c45f9bf744
 rule_dependencies
   seed_poem_tasks --schema:PoemTask--> write_and_review_poem
