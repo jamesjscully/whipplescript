@@ -1436,6 +1436,71 @@ rule accept
 }
 
 #[test]
+fn dev_evaluates_map_index_expressions() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("map-index");
+    fs::write(
+        &source_path,
+        r#"
+workflow MapIndex
+
+class MapTask {
+  metadata map<string>
+}
+
+class MapResult {
+  priority string
+}
+
+assert exists(MapTask where metadata["priority"] == "high")
+assert count(MapResult where priority == "high") == 1
+
+rule seed
+  when started
+=> {
+  record MapTask {
+    metadata {"priority":"high","owner":"ada"}
+  }
+}
+
+rule route
+  when MapTask as task where task.metadata["priority"] == "high"
+=> {
+  record MapResult {
+    priority "high"
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    assert!(dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("assertions")
+        .iter()
+        .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
 fn dev_distinguishes_missing_from_null_in_expression_kernel() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();

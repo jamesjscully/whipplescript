@@ -449,6 +449,7 @@ enum ExprType {
     Null,
     Optional(Box<ExprType>),
     Array(Box<ExprType>),
+    Map(Box<ExprType>),
     Collection,
     Unknown,
 }
@@ -457,6 +458,10 @@ enum ExprType {
 pub enum Expr {
     Literal(ExprLiteral),
     Path(Vec<String>),
+    Index {
+        target: Box<Expr>,
+        key: Box<Expr>,
+    },
     Array(Vec<Expr>),
     Unary {
         op: UnaryOp,
@@ -522,6 +527,13 @@ impl Expr {
         match self {
             Self::Literal(literal) => literal.to_snapshot(),
             Self::Path(path) => path.join("."),
+            Self::Index { target, key } => {
+                format!(
+                    "{}[{}]",
+                    target.to_snapshot_with_parentheses(),
+                    key.to_snapshot()
+                )
+            }
             Self::Array(items) => {
                 let items = items
                     .iter()
@@ -1006,6 +1018,10 @@ fn collect_projection_reads(expr: &Expr) -> Vec<IrProjectionRead> {
 fn collect_projection_reads_into(expr: &Expr, reads: &mut Vec<IrProjectionRead>) {
     match expr {
         Expr::Literal(_) | Expr::Path(_) => {}
+        Expr::Index { target, key } => {
+            collect_projection_reads_into(target, reads);
+            collect_projection_reads_into(key, reads);
+        }
         Expr::Array(items) => {
             for item in items {
                 collect_projection_reads_into(item, reads);
@@ -2017,6 +2033,37 @@ fn validate_expr_node(
                 });
             }
         }
+        Expr::Index { target, key } => {
+            validate_expr_node(
+                rule,
+                target,
+                semantic,
+                binding_types,
+                presence_proofs,
+                diagnostics,
+            );
+            validate_expr_node(
+                rule,
+                key,
+                semantic,
+                binding_types,
+                presence_proofs,
+                diagnostics,
+            );
+            let key_ty = infer_expr_type(rule, key, semantic, binding_types, diagnostics);
+            if !matches!(key_ty, ExprType::String | ExprType::Unknown) {
+                diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` indexes a map with a non-string key",
+                        rule.name.name
+                    ),
+                    suggestion: Some(
+                        "use a string literal or string expression as the map key".to_owned(),
+                    ),
+                });
+            }
+        }
         Expr::Array(items) => {
             for item in items {
                 validate_expr_node(
@@ -2212,6 +2259,14 @@ fn collect_presence_proofs(expr: &Expr, proofs: &mut BTreeSet<String>) {
 fn expr_path_key(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Path(path) if path.len() >= 2 => Some(path[1..].join(".")),
+        Expr::Index { target, key } => {
+            let target = expr_path_key(target)?;
+            let key = match key.as_ref() {
+                Expr::Literal(ExprLiteral::String(value) | ExprLiteral::Ident(value)) => value,
+                _ => return None,
+            };
+            Some(format!("{target}[{key:?}]"))
+        }
         _ => None,
     }
 }
@@ -2227,6 +2282,34 @@ fn infer_expr_type(
         Expr::Literal(literal) => expr_literal_type(literal),
         Expr::Path(path) => {
             expr_path_type(path, semantic, binding_types).unwrap_or(ExprType::Unknown)
+        }
+        Expr::Index { target, key } => {
+            let target_ty = infer_expr_type(rule, target, semantic, binding_types, diagnostics);
+            let key_ty = infer_expr_type(rule, key, semantic, binding_types, diagnostics);
+            if !matches!(key_ty, ExprType::String | ExprType::Unknown) {
+                diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` indexes a map with a non-string key",
+                        rule.name.name
+                    ),
+                    suggestion: Some(
+                        "use a string literal or string expression as the map key".to_owned(),
+                    ),
+                });
+            }
+            match target_ty {
+                ExprType::Map(inner) => *inner,
+                ExprType::Unknown => ExprType::Unknown,
+                _ => {
+                    diagnostics.push(Diagnostic {
+                        span: rule.body.span,
+                        message: format!("rule `{}` indexes a non-map expression", rule.name.name),
+                        suggestion: Some("use indexing only on map values".to_owned()),
+                    });
+                    ExprType::Unknown
+                }
+            }
         }
         Expr::Array(items) => infer_array_type(rule, items, semantic, binding_types, diagnostics),
         Expr::Unary {
@@ -2429,7 +2512,7 @@ fn expr_type_from_type_syntax(ty: &TypeSyntax) -> ExprType {
         TypeSyntax::Array { inner, .. } => {
             ExprType::Array(Box::new(expr_type_from_type_syntax(inner)))
         }
-        TypeSyntax::Map { .. } => ExprType::Unknown,
+        TypeSyntax::Map { inner, .. } => ExprType::Map(Box::new(expr_type_from_type_syntax(inner))),
         TypeSyntax::Union { variants, .. } => {
             let all_strings = variants
                 .iter()
@@ -3506,7 +3589,23 @@ impl<'a> ExprParser<'a> {
                 expr: Box::new(self.parse_unary()?),
             });
         }
-        self.parse_primary()
+        self.parse_postfix()
+    }
+
+    fn parse_postfix(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_primary()?;
+        loop {
+            if self.consume_symbol('[') {
+                let key = self.parse_or()?;
+                self.expect_symbol(']')?;
+                expr = Expr::Index {
+                    target: Box::new(expr),
+                    key: Box::new(key),
+                };
+                continue;
+            }
+            return Ok(expr);
+        }
     }
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
@@ -3542,7 +3641,7 @@ impl<'a> ExprParser<'a> {
                 Ok(Expr::Literal(ExprLiteral::Null))
             }
             Some(ExprTokenKind::Ident(value)) if value == "exists" && !self.at_symbol('(') => {
-                let arg = match self.parse_primary()? {
+                let arg = match self.parse_postfix()? {
                     Expr::Literal(ExprLiteral::Ident(path)) => Expr::Path(vec![path]),
                     expr => expr,
                 };
@@ -4298,7 +4397,7 @@ fn lex(source: &str) -> Lexed {
             continue;
         }
 
-        if b"{}[]()<>,?|.+!".contains(&byte) {
+        if b"{}[]()<>,?|.+!:".contains(&byte) {
             tokens.push(Token {
                 kind: TokenKind::Symbol(byte as char),
                 span: SourceSpan {
@@ -5396,6 +5495,7 @@ workflow BadExpressionTypes
 
 class Task {
   title string
+  labels map<string>
   priority int
   ready bool
 }
@@ -5424,6 +5524,11 @@ rule bad_array
   when Task as task where task.title in ["abc", 1]
 => {
 }
+
+rule bad_map_key
+  when Task as task where task.labels[1] == "urgent"
+=> {
+}
 "#;
 
         let compiled = compile_program(source);
@@ -5445,6 +5550,35 @@ rule bad_array
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message.contains("mixed-type array literal")));
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("non-string key")));
+    }
+
+    #[test]
+    fn accepts_map_index_expressions() {
+        let source = r#"
+workflow MapIndex
+
+class Task {
+  labels map<string>
+}
+
+rule route
+  when Task as task where task.labels["priority"] == "high"
+=> {
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("valid ir");
+        let guard = ir.rules[0].whens[0].guard.as_ref().expect("guard");
+        assert_eq!(
+            guard.expr.to_snapshot(),
+            "task.labels[\"priority\"] == \"high\""
+        );
     }
 
     #[test]

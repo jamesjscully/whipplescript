@@ -68,7 +68,7 @@ The expression kernel covers deterministic logic used by:
 | Parentheses and precedence | [x] | [x] | [~] | [x] | [ ] | [x] | Shared recursive-descent parser handles precedence. |
 | Array literals | [x] | [x] | [~] | [x] | [~] | [x] | Implemented for expression evaluation; compiler rejects obvious mixed scalar arrays. |
 | Object literals in expected schema contexts | [x] | [~] | [~] | [~] | [ ] | [x] | Record bodies exist; expression-level object literals are not general AST nodes. |
-| Map index `path["key"]` | [x] | [ ] | [ ] | [ ] | [ ] | [ ] | Field paths currently support dot access only in guard/assertion runtime. |
+| Map index `path["key"]` | [x] | [x] | [~] | [x] | [ ] | [x] | String-key map indexing works in guards/assertions; Maude coverage is still missing. |
 | Enum variant values | [x] | [~] | [~] | [~] | [~] | [~] | Enum schemas exist; expression values are currently strings at runtime. |
 | Literal-union values | [x] | [~] | [~] | [~] | [~] | [x] | Literal types exist; guards do not yet verify literal-domain membership. |
 | Typed finite-domain pattern branches | [x] | [~] | [~] | [x] | [x] | [x] | Concrete rule-body `case` branches work for enum/literal values in `whip dev`; branch guards use the shared expression evaluator. |
@@ -108,7 +108,7 @@ The expression kernel covers deterministic logic used by:
   and projection types.
 - [~] Track result type for every expression node.
 - [~] Reject non-boolean guard/assertion results.
-- [ ] Reject unknown fields and map indexes with non-string keys.
+- [~] Reject unknown fields and map indexes with non-string keys.
 - [x] Reject field access through optional values without an accepted presence
   proof.
 - [x] Implement presence proof tracking for:

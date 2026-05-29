@@ -1855,6 +1855,7 @@ fn eval_expr_value(expr: &Expr, scope: &EvalScope<'_>) -> EvalValue {
         Expr::Literal(ExprLiteral::Ident(value)) => eval_ident_literal(value, scope),
         Expr::Literal(literal) => EvalValue::Json(eval_expr_literal(literal)),
         Expr::Path(path) => eval_path(path, scope),
+        Expr::Index { target, key } => eval_index(target, key, scope),
         Expr::Array(items) => EvalValue::Json(Value::Array(
             items
                 .iter()
@@ -1869,6 +1870,25 @@ fn eval_expr_value(expr: &Expr, scope: &EvalScope<'_>) -> EvalValue {
         Expr::Query { .. } => eval_query_count(expr, scope)
             .map(|count| EvalValue::Json(Value::Number(count.into())))
             .unwrap_or(EvalValue::Error),
+    }
+}
+
+fn eval_index(target: &Expr, key: &Expr, scope: &EvalScope<'_>) -> EvalValue {
+    let target = eval_expr_value(target, scope);
+    let key = eval_expr_value(key, scope);
+    let key = match key {
+        EvalValue::Json(Value::String(value)) => value,
+        EvalValue::Missing => return EvalValue::Missing,
+        _ => return EvalValue::Error,
+    };
+    match target {
+        EvalValue::Json(Value::Object(object)) => object
+            .get(&key)
+            .cloned()
+            .map(EvalValue::Json)
+            .unwrap_or(EvalValue::Missing),
+        EvalValue::Missing => EvalValue::Missing,
+        _ => EvalValue::Error,
     }
 }
 
@@ -2944,6 +2964,11 @@ fn parse_field_value(value: &str, context: &RuleContext) -> Value {
     let value = value.trim();
     if let Some(unquoted) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
         return Value::String(interpolate_prompt(unquoted, context));
+    }
+    if matches!(value.as_bytes().first(), Some(b'{' | b'[')) {
+        if let Ok(parsed) = serde_json::from_str(value) {
+            return parsed;
+        }
     }
     if value == "true" {
         return Value::Bool(true);
