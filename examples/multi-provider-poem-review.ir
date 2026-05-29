@@ -1,0 +1,81 @@
+workflow MultiProviderPoemReview
+uses
+  skill baml-coerce-user
+schemas
+  class PoemTask
+    poet agentref<codex | claude | pi>
+    language string
+    topic string
+    expectedLineCount int
+    artifactPath string
+    status literal<"queued">
+  class PoemQualityReview
+    isTargetLanguage bool
+    isPoem bool
+    matchesTopic bool
+    hasExpectedLineCount bool
+    reason string
+    confidence float
+  class ReviewedPoem
+    provider string
+    language string
+    topic string
+    artifactPath string
+    turn ref<AgentTurn>
+    review ref<PoemQualityReview>
+    status literal<"reviewed">
+agents
+  agent codex profile=repo-writer capacity=1 skills=[] capabilities=[agent.tell]
+  agent claude profile=repo-writer capacity=1 skills=[] capabilities=[agent.tell]
+  agent pi profile=repo-writer capacity=1 skills=[] capabilities=[agent.tell]
+coerces
+  coerce reviewPoem(language string, topic string, expectedLineCount int, artifactPath string, turnSummary string) -> ref<PoemQualityReview>
+assertions
+  assert count(PoemTask where status == "queued") == 3
+    reads
+      fact:PoemTask where status == "queued"
+  assert count(ReviewedPoem where provider == "codex") == 1
+    reads
+      fact:ReviewedPoem where provider == "codex"
+  assert count(ReviewedPoem where provider == "claude") == 1
+    reads
+      fact:ReviewedPoem where provider == "claude"
+  assert count(ReviewedPoem where provider == "pi") == 1
+    reads
+      fact:ReviewedPoem where provider == "pi"
+  assert count(ReviewedPoem where status == "reviewed") == 3
+    reads
+      fact:ReviewedPoem where status == "reviewed"
+  assert count(ReviewedPoem where review.confidence >= 0.5) == 3
+    reads
+      fact:ReviewedPoem where review.confidence >= 0.5
+  assert count(effect kind agent.tell where status == completed) == 3
+    reads
+      effect:kind agent.tell where status == completed
+  assert count(effect kind baml.coerce where status == completed) == 3
+    reads
+      effect:kind baml.coerce where status == completed
+rules
+  rule seed_poem_tasks
+    when started
+    reads
+      pattern:started
+    writes
+      schema:PoemTask
+    body_hash a358007b6fbdf7d3
+  rule write_and_review_poem
+    when PoemTask as task where task.status == "queued"
+    when task.poet is available
+    reads
+      pattern:task.poet is available
+      schema:PoemTask
+    writes
+      schema:ReviewedPoem
+    effects
+      poemTurn kind=agent.tell binding=poemTurn key=c99af6aeb446d4ca
+      review kind=baml.coerce binding=review key=fadf644fc82dc8bf
+    dependencies
+      poemTurn --succeeds--> review
+    body_hash cb75c1fe979bbbed
+rule_dependencies
+  seed_poem_tasks --schema:PoemTask--> write_and_review_poem

@@ -21,6 +21,7 @@ fn checks_all_example_workflows() {
         "companion-skill-dogfood.whip",
         "human-review.whip",
         "implementation-plan-phase-review.whip",
+        "multi-provider-poem-review.whip",
         "multi-agent-bounded-concurrency.whip",
         "openclaw-lite.whip",
         "plugin-memory.whip",
