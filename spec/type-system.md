@@ -244,6 +244,12 @@ array count/empty checks
 append/remove for small workflow facts, if needed
 ```
 
+The same expression kernel is used for `when ... where ...` guards and
+workflow assertions. Guard and assertion expressions are pure: they can inspect
+matched facts and effect projections, but they cannot enqueue effects, call
+providers, invoke BAML, mutate facts, read files, perform network access, or
+run host-language code.
+
 Operation constraints:
 
 - ordering works on `int`, `float`, `duration`, and `time`
@@ -269,6 +275,53 @@ user-defined methods
 
 Nontrivial data reasoning belongs in BAML `coerce` functions or registered
 capabilities.
+
+## Routing-Friendly Types
+
+Literal unions and enums must be usable in guards because deterministic routing
+is a core workflow concern:
+
+```whippletree
+enum Provider {
+  Codex
+  Claude
+  Pi
+}
+
+class LanguageTask {
+  provider Provider
+  language string
+  expectedScript string
+}
+
+rule route_codex
+  when LanguageTask as task where task.provider == Codex
+  when codex is available
+=> {
+  tell codex """
+  {{ task.language }}
+  """
+}
+```
+
+The compiler must type-check the guard against the matched schema. Comparing an
+enum to an unknown variant, a literal union to a value outside the union, or a
+field to an incompatible scalar type is a compile-time error.
+
+Agent references are a distinct routing type, not arbitrary strings:
+
+```whippletree
+AgentRef<codex | claude | pi>
+```
+
+An `AgentRef` value may be matched, stored in facts, and used by `tell` only
+when every possible target is a declared agent and satisfies the rule's
+availability/profile constraints. A plain `string` must not be accepted as a
+dynamic `tell` target.
+
+Provider/model identity should normally be deterministic metadata. BAML output
+types should contain provider fields only when the model is reviewing observed
+provider evidence, not as a way to select or confirm orchestration routes.
 
 ## Optional And Null Rules
 

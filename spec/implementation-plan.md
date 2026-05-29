@@ -586,6 +586,9 @@ Goal: prove the language is ergonomic before we harden syntax.
     guard-expression grammar is designed.
   - Fixed during final audit: `as binding` after a multi-line string now
     receives a targeted diagnostic.
+  - Dogfood gap: provider-language e2e currently needs duplicate
+    provider-specific task classes because guarded fact matching and typed
+    dynamic agent targets are not implemented.
 
 Acceptance:
 
@@ -594,6 +597,38 @@ Acceptance:
 - [x] Repeated wrong guesses have either been paved or deliberately rejected
   with excellent diagnostics.
 - [x] Examples are included in parser, static-analysis, and e2e test fixtures.
+
+## Stage 10b: Deterministic Routing Language Features
+
+Goal: remove provider/model routing decisions from prompts and model outputs
+while keeping workflow source compact.
+
+- [ ] Add guarded fact matches:
+  `when LanguageTask as task where task.provider == "codex"`.
+- [ ] Type-check guard expressions against matched schemas, enum variants,
+  literal unions, optional presence proofs, and scalar comparison rules.
+- [ ] Add deterministic assertion syntax over fact/effect projections for e2e
+  checks.
+- [ ] Add static matrix seeding for small typed fixture tables.
+- [ ] Add rule-template/action-block expansion for repeated effect chains,
+  preserving source spans, idempotency keys, and compiled IR visibility.
+- [ ] Design `AgentRef<...>` or equivalent typed dynamic agent references.
+- [ ] Reject plain strings as dynamic `tell` targets.
+- [ ] Add a deterministic validation capability path for checks that should not
+  require BAML/model judgment.
+- [ ] Rewrite `examples/provider-language-e2e.whip` to use one shared
+  `LanguageTask` schema once guarded matching or typed agent refs exist.
+- [ ] Update the companion authoring skill to recommend deterministic routing
+  metadata and warn against asking models to identify providers/routes.
+
+Acceptance:
+
+- [ ] A single shared task schema can route six language tasks across Codex,
+  Claude, and Pi without duplicate provider-specific classes.
+- [ ] Provider counts, agent-turn counts, and BAML-review counts are asserted in
+  source or first-class assertion fixtures.
+- [ ] The BAML review output contains only reviewable artifact qualities unless
+  the workflow explicitly reviews provider evidence.
 
 ## Stage 11: E2E Test System
 

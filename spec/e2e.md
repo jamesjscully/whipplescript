@@ -25,6 +25,30 @@ language-generation tasks, then reviews every completed turn with a typed BAML
 dependencies, effect/fact projection, and BAML argument rehydration without
 requiring real provider credentials.
 
+This workflow is also a language-feature regression target. The intended
+source shape is one shared `LanguageTask` schema with deterministic routing
+guards such as `where task.provider == "codex"`, not one duplicate task class
+per provider. Until guarded `when` clauses and typed dynamic agent references
+exist, provider-specific classes are only a workaround for missing language
+features. The test should not ask BAML or any language model to decide provider
+identity, model identity, or route selection.
+
+The e2e suite should eventually encode these assertions in Whippletree source
+rather than only in Rust test code:
+
+```text
+count(LanguageE2EResult where provider == "codex") == 2
+count(LanguageE2EResult where provider == "claude") == 2
+count(LanguageE2EResult where provider == "pi") == 2
+count(agent.turn.completed) == 6
+count(baml.coerce.succeeded) == 6
+```
+
+Language/script quality may be reviewed by BAML for dogfooding, but exact
+script detection can also be tested through a deterministic validator
+capability. E2E coverage should include both paths: model-judged review for
+BAML integration and non-LLM validation for deterministic CI.
+
 ## Optional Real Providers
 
 Real-provider checks are opt-in:

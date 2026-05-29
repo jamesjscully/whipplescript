@@ -162,6 +162,13 @@ state, it should:
 `whip step` must never execute providers. It only creates durable facts and
 outbox effects.
 
+Rule readiness includes pure guard evaluation. For a rule with `when Class as
+binding where <expr>`, the stepper must bind candidate facts first, evaluate the
+typed expression against those bindings, and discard candidates whose guard is
+false before lowering the rule body. Guard evaluation is part of deterministic
+stepping and must not consult providers, BAML, plugins, the filesystem, the
+network, wall-clock time, or random sources.
+
 `whip worker` is nondeterministic at the provider boundary but durable at the
 kernel boundary. It should:
 
@@ -216,6 +223,9 @@ askHuman ...                -> human.ask effect
 call plugin.capability ...  -> capability.call effect
 emit event                  -> event.emit effect
 after effect succeeds       -> dependency edge
+matrix rows                 -> typed fact records
+action/template expansion   -> ordinary facts/effects before commit
+assert expression           -> read-only assertion result
 ```
 
 Lowering must resolve interpolation values from the matched facts/effect outputs
@@ -234,6 +244,17 @@ normalized input JSON
 stable idempotency key
 correlation id
 ```
+
+Dynamic agent targets, when supported, must lower to a concrete declared agent
+before the `agent.tell` effect is created. The lowered effect stores both the
+resolved agent and the source expression/provenance used to resolve it. A
+missing, ambiguous, or unauthorized dynamic target blocks or fails before any
+provider run starts.
+
+Workflow assertions are deterministic checks over projections. They may run as
+part of `whip check`, `whip step --assert`, `whip dev`, and e2e scripts. Failed
+assertions should be emitted as diagnostics/evidence tied to the assertion's
+source span; they must not mutate user facts or enqueue effects.
 
 Dogfood acceptance for this layer:
 

@@ -18,10 +18,12 @@ classifies them for v0.
 | G-007 | Control plane | Blocking for dogfood | Whippletree runtime maintainer | `whip run` starts an instance but does not drive ready rules into durable facts/effects. | Dogfood workflows can compile and record `external.started`, but no `PhaseReviewRequest` facts or `agent.tell` effects are materialized from source rules. Add an explicit `whip step` / `whip dev` driver that evaluates ready rules from IR and commits fact/effect rewrites before provider workers claim effects. |
 | G-008 | Agent harnesses | Blocking for real provider dogfood | Whippletree integration maintainer | Codex, Claude, and Pi real adapters are overspecified as simple command wrappers. | Codex should use Codex App Server or Codex SDK surfaces; the Codex desktop app's private app server should not be assumed externally reachable. Claude should use Claude Agent SDK with API/provider auth and explicit tool/profile mapping. Pi should use the Pi extension system, with conversation thread ids and snapshots recorded as first-class evidence. |
 | G-009 | Harness failures | Blocking for real provider dogfood | Whippletree runtime maintainer | Harness boundary failures are only partially implemented. | Once a run starts, mock/command harness failures are normalized into terminal effect events and `agent.turn.*` facts. The full system still needs explicit worker coverage for pre-run and boundary failures: provider config, credentials, workspace preparation, adapter resolution, launch, request submission, streaming, timeout/cancel, result validation, artifact capture, and terminal-event append recovery. |
+| G-010 | Language | Blocking for ergonomic dogfood | Whippletree language maintainer | Deterministic provider routing requires duplicate provider-specific schemas. | The provider-language e2e workflow exposes a language gap: one shared `LanguageTask` schema cannot currently be routed by `task.provider` without matching every provider rule. Add guarded `when` clauses, enum/literal matching in guards, typed dynamic agent references, static matrices, first-class assertions, and static action/template expansion. BAML/model outputs must not be used to select or confirm provider/model routes. |
 
 No blocking audit gaps are currently identified for the in-repo mock-provider
 v0 spine. G-007, G-008, and G-009 block real dogfooding with external coding
-agents.
+agents. G-010 blocks ergonomic dogfood workflows and should be addressed before
+the language is treated as comfortable for provider matrices.
 
 ## Security Boundaries
 

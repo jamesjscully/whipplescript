@@ -228,6 +228,41 @@ when ReviewedWork as reviewed
 when reviewed.review.status == Accept
 ```
 
+Rules may also attach pure guards to typed fact matches. Guards are evaluated by
+the deterministic stepper before any fact or effect is committed:
+
+```whippletree
+class LanguageTask {
+  provider "codex" | "claude" | "pi"
+  language string
+  expectedScript string
+  prompt string
+  artifactPath string
+  status "queued"
+}
+
+rule run_codex_language_task
+  when LanguageTask as task where task.provider == "codex"
+  when codex is available
+=> {
+  tell codex as turn """
+  Write {{ task.language }} text to {{ task.artifactPath }}.
+  """
+}
+```
+
+The guard language must stay small and deterministic. It may read matched fact
+fields, literals, enums, null, booleans, scalar comparisons, membership, and
+presence checks. It must not call providers, `coerce`, plugins, host-language
+functions, or string parsers. If a workflow needs semantic judgment, that
+judgment belongs in an explicit effect such as `coerce` or `call
+validator.checkScript`, and the resulting typed fact can be matched by a later
+rule.
+
+Guards are the preferred way to express routing over a shared schema. Authors
+should not need one schema per provider when the data shape is identical and
+only a literal or enum field selects the target.
+
 `record` is the source-level marker for durable fact production. It is not
 assignment and not an inline local variable. If a rule commits, recorded facts
 commit atomically with any effect graph nodes and dependency edges produced by
@@ -286,6 +321,112 @@ when worker completed turn for loft issue as turn
 ```
 
 without asking the compiler to infer meaning from prompt text.
+
+## Agent Routing
+
+Agent targets are workflow-owned routing decisions, not model outputs. A rule
+must identify the target agent deterministically through either:
+
+- a literal declared agent name, such as `tell codex`
+- a typed agent reference whose value is proven to be one of the workflow's
+  declared agents
+- a registered routing capability that returns a typed, auditable route before
+  any provider turn is enqueued
+
+The runtime must never ask a language model to decide which provider is being
+tested, which model is active, or which logical agent should receive a turn.
+Those values may be copied into result/audit facts by rule literals or typed
+metadata, but they should not be fields in BAML review output unless the review
+is explicitly about verifying observed provider evidence.
+
+A future dynamic-agent form should be typed:
+
+```whippletree
+class LanguageTask {
+  provider AgentRef<codex | claude | pi>
+  language string
+  expectedScript string
+  prompt string
+  artifactPath string
+  status "queued"
+}
+
+rule run_language_task
+  when LanguageTask as task
+  when task.provider is available
+=> {
+  tell task.provider as turn """
+  Write {{ task.language }} text to {{ task.artifactPath }}.
+  """
+}
+```
+
+If `AgentRef` is not implemented, use guarded rules with a shared task schema
+instead of duplicating identical schemas as provider tags.
+
+## Reuse And Matrices
+
+Dogfood workflows often need a deterministic matrix: providers x languages,
+phases x reviewers, or fixtures x validators. The language should provide a
+source-level way to seed small static matrices without hiding effects:
+
+```whippletree
+matrix language_tasks as LanguageTask [
+  { provider "codex", language "French", expectedScript "Latin" },
+  { provider "claude", language "Hindi", expectedScript "Devanagari" },
+  { provider "pi", language "Japanese", expectedScript "Kana and kanji" },
+]
+```
+
+Matrix rows lower to ordinary `record` writes during rule evaluation. They must
+be fully typed and deterministic; they are not loops over runtime collections.
+
+Repeated effect chains should be reusable without obscuring the durable graph.
+A rule template or action block may abstract identical `tell -> coerce ->
+record` shapes only if expansion is static and inspectable in the compiled IR:
+
+```whippletree
+action run_language_task(agent AgentRef, task LanguageTask, provider string) {
+  tell agent as turn """
+  Write {{ task.language }} text to {{ task.artifactPath }}.
+  """
+
+  after turn succeeds {
+    coerce reviewLanguageArtifact(task.language, task.expectedScript, task.artifactPath, turn.summary) as review
+  }
+
+  after review succeeds {
+    record LanguageE2EResult {
+      provider provider
+      language task.language
+      artifactPath task.artifactPath
+      turn turn
+      review review
+      status "reviewed"
+    }
+  }
+}
+```
+
+This is syntactic reuse, not a general function system. Expansion must preserve
+source spans, idempotency keys, dependencies, and effect/fact provenance.
+
+## Deterministic Assertions
+
+Workflows and e2e tests need first-class deterministic assertions over facts and
+effects so CI can check the intended orchestration without relying on provider
+wording:
+
+```whippletree
+assert count(LanguageE2EResult where provider == "codex") == 2
+assert exists(LanguageE2EResult where language == "Japanese")
+assert count(effect kind agent.tell where status == completed) == 6
+assert count(effect kind baml.coerce where status == completed) == 6
+```
+
+Assertions are read-only and run after stepping or at named checkpoints. Failed
+assertions should produce diagnostics and trace evidence, not partial workflow
+state.
 
 ## Dependent Effects
 
