@@ -22,6 +22,31 @@ search [1] in WHIPPLETREE-KERNEL :
   fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
   event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
 
+--- A lowered equality/boolean guard can make the same rule/effect graph fire.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact, andExpr(eqExpr(scalar(scalar1), scalar(scalar1)), emptyExpr(query(query1, qZero))))
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
+
+--- A lowered false guard cannot make the same rule/effect graph fire.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact, andExpr(boolTrue, existsExpr(query(query1, qZero))))
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) .
+
+--- A lowered error guard produces diagnostics without committing effects.
+search [1] in WHIPPLETREE-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact, countExpr(query(query1, qError)))
+  graph(g1, tellEff)
+  =>*
+  diagnostic(guardedRule) graphCommitted(g1) effect(tellEff, queued) .
+
 --- A finite enum/literal domain guard cannot match values outside its domain.
 search [1] in WHIPPLETREE-KERNEL :
   fact(issueFact) rule(guardedRule, issueFact, g1)

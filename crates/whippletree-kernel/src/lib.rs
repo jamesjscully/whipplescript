@@ -18,6 +18,7 @@ use whippletree_store::{
     EvidenceRecord, ExpiredLease, InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent,
     NewFact, NewInboxItem, NewInstance, NewProgramVersion, ProgramVersionRecord, RetryEffect,
     RuleCommit, RunStart, SkillEvidence, SqliteStore, StoreError, StoreResult, StoredEvent,
+    TerminalDiagnosticRecord,
 };
 
 pub struct RuntimeKernel {
@@ -90,6 +91,12 @@ pub struct HumanAskExecution<'a> {
     pub related_artifacts_json: &'a str,
 }
 
+#[derive(Debug, Default)]
+struct ProviderEvidence {
+    evidence_id: Option<String>,
+    artifact_ids: Vec<String>,
+}
+
 pub fn idempotency_key(parts: &[&str]) -> String {
     let mut input = String::new();
     for part in parts {
@@ -130,6 +137,29 @@ impl RuntimeKernel {
             declared_profiles_json: "[]",
             declared_skills_json: "[]",
             declared_schemas_json: "[]",
+            analysis_summary_json: "{}",
+            generated_artifacts_json: "[]",
+            artifact_root: None,
+        })
+    }
+
+    pub fn create_program_version_for_program(
+        &mut self,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+    ) -> StoreResult<ProgramVersionRecord> {
+        let declared_profiles_json = declared_profiles_json(program);
+        let declared_skills_json = declared_skills_json(program);
+        let declared_schemas_json = declared_schemas_json(program);
+        self.store.create_program_version(NewProgramVersion {
+            program_name: input.program_name,
+            source_hash: input.source_hash,
+            ir_hash: input.ir_hash,
+            compiler_version: input.compiler_version,
+            declared_capabilities_json: "[]",
+            declared_profiles_json: &declared_profiles_json,
+            declared_skills_json: &declared_skills_json,
+            declared_schemas_json: &declared_schemas_json,
             analysis_summary_json: "{}",
             generated_artifacts_json: "[]",
             artifact_root: None,
@@ -241,7 +271,8 @@ impl RuntimeKernel {
     pub fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
         let event = match self.store.start_run(run) {
             Ok(event) => event,
-            Err(StoreError::PolicyBlocked { effect_id, reason }) => {
+            Err(StoreError::PolicyBlocked { effect_id, reason })
+            | Err(StoreError::CapacityBlocked { effect_id, reason }) => {
                 self.emit(TraceEvent::EffectBlocked {
                     effect_id: effect_id.clone(),
                     reason: reason.clone(),
@@ -275,11 +306,21 @@ impl RuntimeKernel {
     }
 
     pub fn fail_run(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
+        self.fail_run_with_diagnostic(completion, None)
+    }
+
+    fn fail_run_with_diagnostic(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+    ) -> StoreResult<StoredEvent> {
         let completion = EffectCompletion {
             status: "failed",
             ..completion
         };
-        let event = self.store.complete_effect(completion)?;
+        let event = self
+            .store
+            .complete_effect_with_terminal_diagnostic(completion, diagnostic)?;
         self.emit(TraceEvent::EffectTerminal {
             run_id: completion.run_id.to_owned(),
             effect_id: completion.effect_id.to_owned(),
@@ -289,11 +330,21 @@ impl RuntimeKernel {
     }
 
     pub fn timeout_run(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
+        self.timeout_run_with_diagnostic(completion, None)
+    }
+
+    fn timeout_run_with_diagnostic(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+    ) -> StoreResult<StoredEvent> {
         let completion = EffectCompletion {
             status: "timed_out",
             ..completion
         };
-        let event = self.store.complete_effect(completion)?;
+        let event = self
+            .store
+            .complete_effect_with_terminal_diagnostic(completion, diagnostic)?;
         self.emit(TraceEvent::EffectTerminal {
             run_id: completion.run_id.to_owned(),
             effect_id: completion.effect_id.to_owned(),
@@ -423,7 +474,7 @@ impl RuntimeKernel {
                 .map(|skill| (*skill).to_owned())
                 .collect(),
         });
-        self.record_provider_result(execution, &result)?;
+        let evidence = self.record_provider_result(execution, &result)?;
         let metadata_json = provider_metadata(&result);
         self.emit_provider_diagnostic(
             execution.run_id,
@@ -449,11 +500,24 @@ impl RuntimeKernel {
                 "terminal",
             ])),
         };
+        let diagnostic = self.provider_terminal_diagnostic(
+            execution.instance_id,
+            execution.effect_id,
+            execution.run_id,
+            execution.provider,
+            provider_effect_status(&result.status),
+            &result.summary,
+            provider_failure_code(result.failure.as_ref(), provider_status(&result.status)),
+            &metadata_json,
+            &evidence,
+        );
 
         let event = match result.status {
             ProviderRunStatus::Completed => self.complete_run(completion)?,
-            ProviderRunStatus::Failed => self.fail_run(completion)?,
-            ProviderRunStatus::TimedOut => self.timeout_run(completion)?,
+            ProviderRunStatus::Failed => self.fail_run_with_diagnostic(completion, diagnostic)?,
+            ProviderRunStatus::TimedOut => {
+                self.timeout_run_with_diagnostic(completion, diagnostic)?
+            }
         };
         self.append_agent_turn_event_and_fact(execution, &result)?;
         Ok(event)
@@ -476,7 +540,7 @@ impl RuntimeKernel {
         })?;
 
         let result = client.coerce(execution.request);
-        self.record_baml_result(execution, &result)?;
+        let evidence = self.record_baml_result(execution, &result)?;
         let metadata_json = baml_metadata(&result);
         self.emit_provider_diagnostic(
             execution.run_id,
@@ -502,11 +566,28 @@ impl RuntimeKernel {
                 "baml-terminal",
             ])),
         };
+        let diagnostic = self.provider_terminal_diagnostic(
+            execution.instance_id,
+            execution.effect_id,
+            execution.run_id,
+            execution.provider,
+            baml_effect_status(&result.status),
+            &result.summary,
+            Some(match result.status {
+                BamlCoerceStatus::Succeeded => "baml.coerce.completed",
+                BamlCoerceStatus::Failed => "baml.coerce.failed",
+                BamlCoerceStatus::TimedOut => "baml.coerce.timed_out",
+            }),
+            &metadata_json,
+            &evidence,
+        );
 
         let event = match result.status {
             BamlCoerceStatus::Succeeded => self.complete_run(completion)?,
-            BamlCoerceStatus::Failed => self.fail_run(completion)?,
-            BamlCoerceStatus::TimedOut => self.timeout_run(completion)?,
+            BamlCoerceStatus::Failed => self.fail_run_with_diagnostic(completion, diagnostic)?,
+            BamlCoerceStatus::TimedOut => {
+                self.timeout_run_with_diagnostic(completion, diagnostic)?
+            }
         };
         self.append_baml_fact(execution, &result)?;
         Ok(event)
@@ -529,7 +610,7 @@ impl RuntimeKernel {
         })?;
 
         let result = client.execute(execution.request);
-        self.record_loft_result(execution, &result)?;
+        let evidence = self.record_loft_result(execution, &result)?;
         let metadata_json = loft_metadata(&result);
         self.emit_provider_diagnostic(
             execution.run_id,
@@ -555,11 +636,28 @@ impl RuntimeKernel {
                 "loft-terminal",
             ])),
         };
+        let diagnostic = self.provider_terminal_diagnostic(
+            execution.instance_id,
+            execution.effect_id,
+            execution.run_id,
+            execution.provider,
+            loft_effect_status(&result.status),
+            &result.summary,
+            Some(match result.status {
+                LoftEffectStatus::Succeeded => "loft.completed",
+                LoftEffectStatus::Failed => "loft.failed",
+                LoftEffectStatus::TimedOut => "loft.timed_out",
+            }),
+            &metadata_json,
+            &evidence,
+        );
 
         let event = match result.status {
             LoftEffectStatus::Succeeded => self.complete_run(completion)?,
-            LoftEffectStatus::Failed => self.fail_run(completion)?,
-            LoftEffectStatus::TimedOut => self.timeout_run(completion)?,
+            LoftEffectStatus::Failed => self.fail_run_with_diagnostic(completion, diagnostic)?,
+            LoftEffectStatus::TimedOut => {
+                self.timeout_run_with_diagnostic(completion, diagnostic)?
+            }
         };
         self.append_loft_fact(execution, &result)?;
         Ok(event)
@@ -696,7 +794,7 @@ impl RuntimeKernel {
         &self,
         execution: LoftEffectExecution<'_>,
         result: &LoftEffectResult,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<ProviderEvidence> {
         let metadata = json!({
             "effect_id": execution.effect_id,
             "action": execution.request.action.effect_kind(),
@@ -722,7 +820,7 @@ impl RuntimeKernel {
             "transcript": result.transcript,
         })
         .to_string();
-        self.store.record_evidence(EvidenceRecord {
+        let evidence_id = self.store.record_evidence(EvidenceRecord {
             instance_id: execution.instance_id,
             kind: &format!("{}.provider", execution.request.action.effect_kind()),
             subject_type: "run",
@@ -736,7 +834,10 @@ impl RuntimeKernel {
             summary: Some(&result.summary),
             metadata_json: &metadata,
         })?;
-        Ok(())
+        Ok(ProviderEvidence {
+            evidence_id: Some(evidence_id),
+            artifact_ids: Vec::new(),
+        })
     }
 
     fn append_loft_fact(
@@ -796,7 +897,7 @@ impl RuntimeKernel {
         &self,
         execution: BamlCoerceExecution<'_>,
         result: &BamlCoerceResult,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<ProviderEvidence> {
         let metadata = json!({
             "effect_id": execution.effect_id,
             "function_name": execution.request.function_name,
@@ -811,7 +912,7 @@ impl RuntimeKernel {
             "usage": json_from_str(&result.usage_json),
         })
         .to_string();
-        self.store.record_evidence(EvidenceRecord {
+        let evidence_id = self.store.record_evidence(EvidenceRecord {
             instance_id: execution.instance_id,
             kind: "baml.coerce.provider",
             subject_type: "run",
@@ -825,7 +926,10 @@ impl RuntimeKernel {
             summary: Some(&result.summary),
             metadata_json: &metadata,
         })?;
-        Ok(())
+        Ok(ProviderEvidence {
+            evidence_id: Some(evidence_id),
+            artifact_ids: Vec::new(),
+        })
     }
 
     fn append_baml_fact(
@@ -887,7 +991,7 @@ impl RuntimeKernel {
         &self,
         execution: AgentTurnExecution<'_>,
         result: &ProviderRunResult,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<ProviderEvidence> {
         let artifact_ids = result
             .artifacts
             .iter()
@@ -914,7 +1018,7 @@ impl RuntimeKernel {
             "failure": result.failure.as_ref().map(provider_failure_json),
         })
         .to_string();
-        self.store.record_evidence(EvidenceRecord {
+        let evidence_id = self.store.record_evidence(EvidenceRecord {
             instance_id: execution.instance_id,
             kind: "agent.turn.provider",
             subject_type: "run",
@@ -928,7 +1032,10 @@ impl RuntimeKernel {
             summary: Some(&result.summary),
             metadata_json: &metadata,
         })?;
-        Ok(())
+        Ok(ProviderEvidence {
+            evidence_id: Some(evidence_id),
+            artifact_ids,
+        })
     }
 
     fn append_agent_turn_event_and_fact(
@@ -1011,11 +1118,56 @@ impl RuntimeKernel {
             diagnostics_json: diagnostics_json.to_owned(),
         });
     }
+
+    fn provider_terminal_diagnostic(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+        run_id: &str,
+        provider: &str,
+        status: EffectStatus,
+        summary: &str,
+        code: Option<&str>,
+        diagnostics_json: &str,
+        evidence: &ProviderEvidence,
+    ) -> Option<TerminalDiagnosticRecord> {
+        if status == EffectStatus::Completed {
+            return None;
+        }
+        let evidence_ids_json = evidence
+            .evidence_id
+            .as_ref()
+            .map(|evidence_id| json!([evidence_id]).to_string())
+            .unwrap_or_else(|| "[]".to_owned());
+        let artifact_ids_json = json!(evidence.artifact_ids).to_string();
+        let message = provider_diagnostic_message(provider, summary, diagnostics_json);
+        let idempotency_key =
+            idempotency_key(&[instance_id, run_id, "provider-diagnostic", diagnostics_json]);
+        Some(TerminalDiagnosticRecord {
+            program_id: None,
+            program_version_id: None,
+            severity: "error".to_owned(),
+            code: code.map(str::to_owned),
+            message,
+            source_span_json: None,
+            subject_type: Some("effect".to_owned()),
+            subject_id: Some(effect_id.to_owned()),
+            assertion_id: None,
+            evidence_ids_json,
+            artifact_ids_json,
+            causation_id: Some(run_id.to_owned()),
+            correlation_id: Some(effect_id.to_owned()),
+            idempotency_key: Some(idempotency_key),
+        })
+    }
 }
 
 fn effect_status(status: &str) -> EffectStatus {
     match status {
-        "blocked_by_dependency" => EffectStatus::Blocked,
+        "blocked_by_dependency"
+        | "blocked_by_capability"
+        | "blocked_by_profile"
+        | "blocked_by_capacity" => EffectStatus::Blocked,
         "claimed" => EffectStatus::Claimed,
         "running" => EffectStatus::Running,
         "completed" => EffectStatus::Completed,
@@ -1024,6 +1176,48 @@ fn effect_status(status: &str) -> EffectStatus {
         "cancelled" => EffectStatus::Cancelled,
         _ => EffectStatus::Queued,
     }
+}
+
+fn declared_profiles_json(program: &IrProgram) -> String {
+    let agents = program
+        .agents
+        .iter()
+        .map(|agent| {
+            json!({
+                "name": agent.name,
+                "profile": agent.profile,
+                "capacity": agent.capacity,
+                "skills": agent.skills,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "agents": agents }).to_string()
+}
+
+fn declared_skills_json(program: &IrProgram) -> String {
+    let mut skills = program
+        .agents
+        .iter()
+        .flat_map(|agent| agent.skills.iter().cloned())
+        .collect::<Vec<_>>();
+    skills.sort();
+    skills.dedup();
+    json!(skills).to_string()
+}
+
+fn declared_schemas_json(program: &IrProgram) -> String {
+    let schemas = program
+        .schemas
+        .iter()
+        .map(|schema| {
+            let (name, kind) = match schema {
+                whippletree_parser::IrSchema::Class(class) => (&class.name, "class"),
+                whippletree_parser::IrSchema::Enum(enum_decl) => (&enum_decl.name, "enum"),
+            };
+            json!({ "name": name, "kind": kind })
+        })
+        .collect::<Vec<_>>();
+    json!(schemas).to_string()
 }
 
 fn dependency_edge(dependency: &NewEffectDependency<'_>) -> DependencyEdge {
@@ -1053,6 +1247,15 @@ fn provider_status(status: &ProviderRunStatus) -> &'static str {
         ProviderRunStatus::Failed => "failed",
         ProviderRunStatus::TimedOut => "timed_out",
     }
+}
+
+fn provider_failure_code<'a>(
+    failure: Option<&'a ProviderFailure>,
+    fallback_status: &'static str,
+) -> Option<&'a str> {
+    failure
+        .map(|failure| failure.error_kind.as_str())
+        .or(Some(fallback_status))
 }
 
 fn provider_effect_status(status: &ProviderRunStatus) -> EffectStatus {
@@ -1085,6 +1288,46 @@ fn provider_failure_json(failure: &ProviderFailure) -> serde_json::Value {
         "provider_thread_id": failure.provider_thread_id,
         "raw": failure.raw_json.as_deref().map(json_from_str),
     })
+}
+
+fn provider_diagnostic_message(provider: &str, summary: &str, diagnostics_json: &str) -> String {
+    let diagnostics = serde_json::from_str::<Value>(diagnostics_json).unwrap_or(Value::Null);
+    let primary_detail = diagnostics
+        .get("failure")
+        .and_then(|failure| failure.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            diagnostics
+                .get("error")
+                .and_then(|error| {
+                    error
+                        .get("message")
+                        .or_else(|| error.get("reason"))
+                        .or(Some(error))
+                })
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty());
+    let stderr_detail = diagnostics
+        .get("stderr")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty());
+    let mut message = format!("{provider} provider diagnostic: {summary}");
+    if let Some(detail) = primary_detail {
+        if !message.contains(detail) {
+            message.push_str(": ");
+            message.push_str(detail);
+        }
+    }
+    if let Some(stderr) = stderr_detail {
+        if !message.contains(stderr) {
+            message.push_str(": ");
+            message.push_str(stderr);
+        }
+    }
+    message
 }
 
 fn baml_status(status: &BamlCoerceStatus) -> &'static str {
@@ -1245,6 +1488,123 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(first, different);
         assert!(first.starts_with("key_"));
+    }
+
+    #[test]
+    fn program_agent_declarations_drive_capacity_blocks() {
+        let compiled = compile_program(
+            r#"
+workflow CapacityFromSource
+
+agent worker {
+  profile "repo-writer"
+  capacity 1
+}
+
+rule start
+  when started
+=> {
+  tell worker "one"
+  tell worker "two"
+}
+"#,
+        );
+        let program = compiled.ir.expect("program compiles");
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &program.workflow,
+                    source_hash: "source",
+                    ir_hash: "ir",
+                    compiler_version: "test",
+                },
+                &program,
+            )
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        let effects = [
+            NewEffect {
+                effect_id: "tell-one",
+                kind: "agent.tell",
+                target: Some("worker"),
+                input_json: r#"{"prompt":"one"}"#,
+                status: "queued",
+                idempotency_key: "rule=start;effect=tell-one",
+                required_capabilities_json: "[]",
+                profile: Some("repo-writer"),
+                correlation_id: None,
+            },
+            NewEffect {
+                effect_id: "tell-two",
+                kind: "agent.tell",
+                target: Some("worker"),
+                input_json: r#"{"prompt":"two"}"#,
+                status: "queued",
+                idempotency_key: "rule=start;effect=tell-two",
+                required_capabilities_json: "[]",
+                profile: Some("repo-writer"),
+                correlation_id: None,
+            },
+        ];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                effects: &effects,
+                dependencies: &[],
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commits");
+        kernel
+            .start_run(RunStart {
+                instance_id: &instance_id,
+                effect_id: "tell-one",
+                run_id: "run-one",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-one",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("first run starts");
+
+        let blocked = kernel.start_run(RunStart {
+            instance_id: &instance_id,
+            effect_id: "tell-two",
+            run_id: "run-two",
+            provider: "test",
+            worker_id: "worker-1",
+            lease_id: "lease-two",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        });
+
+        assert!(
+            matches!(blocked, Err(StoreError::PolicyBlocked { reason, .. }) if reason.contains("capacity exhausted"))
+        );
+        assert!(kernel.trace().iter().any(|record| matches!(
+            &record.event,
+            TraceEvent::EffectBlocked { effect_id, reason }
+                if effect_id == "tell-two" && reason.contains("capacity exhausted")
+        )));
+        let store = kernel.into_store();
+        let effects = store.list_effects(&instance_id).expect("effects load");
+        let second = effects
+            .iter()
+            .find(|effect| effect.effect_id == "tell-two")
+            .expect("second effect exists");
+        assert_eq!(second.status, "blocked_by_capacity");
+        assert!(second
+            .policy_block_reason
+            .as_deref()
+            .expect("capacity reason")
+            .contains("capacity exhausted"));
     }
 
     #[test]
@@ -1903,6 +2263,19 @@ rule wait
                     .metadata_json
                     .contains("\"phase\":\"provider.fixture.failed\"")));
 
+        let diagnostics = store
+            .list_diagnostics(Some(&instance_id))
+            .expect("diagnostics list");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code.as_deref(), Some("fixture_failure"));
+        assert_eq!(diagnostics[0].subject_type.as_deref(), Some("effect"));
+        assert_eq!(diagnostics[0].subject_id.as_deref(), Some("tell"));
+        assert_eq!(diagnostics[0].effect_id.as_deref(), Some("tell"));
+        assert_eq!(diagnostics[0].run_id.as_deref(), Some("run-tell"));
+        assert!(diagnostics[0].event_id.is_some());
+        assert!(diagnostics[0].message.contains("fixture exploded"));
+        assert_ne!(diagnostics[0].evidence_ids_json, "[]");
+
         let facts = store.list_facts(&instance_id).expect("facts list");
         assert!(facts.iter().any(|fact| fact.name == "agent.turn.failed"
             && fact.value_json.contains("\"recoverable\":false")));
@@ -2118,6 +2491,15 @@ rule wait
         )));
         check_trace(kernel.trace()).expect("kernel trace conforms");
         let store = kernel.into_store();
+        let diagnostics = store
+            .list_diagnostics(Some(&instance_id))
+            .expect("diagnostics list");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code.as_deref(), Some("baml.coerce.failed"));
+        assert_eq!(diagnostics[0].subject_id.as_deref(), Some("review"));
+        assert_eq!(diagnostics[0].run_id.as_deref(), Some("run-review"));
+        assert!(diagnostics[0].message.contains("invalid output"));
+
         let facts = store.list_facts(&instance_id).expect("facts list");
         assert!(facts
             .iter()
@@ -2311,6 +2693,15 @@ rule wait
         )));
         check_trace(kernel.trace()).expect("kernel trace conforms");
         let store = kernel.into_store();
+        let diagnostics = store
+            .list_diagnostics(Some(&instance_id))
+            .expect("diagnostics list");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code.as_deref(), Some("loft.failed"));
+        assert_eq!(diagnostics[0].subject_id.as_deref(), Some("claim"));
+        assert_eq!(diagnostics[0].run_id.as_deref(), Some("run-claim"));
+        assert!(diagnostics[0].message.contains("issue already leased"));
+
         let facts = store.list_facts(&instance_id).expect("facts list");
         assert!(facts.iter().any(|fact| fact.name == "loft.claim.failed"
             && fact.value_json.contains("issue already leased")));
@@ -2590,5 +2981,15 @@ rule wait
                     .metadata_json
                     .contains("\"phase\":\"provider.exit.failed\"")
                 && evidence.metadata_json.contains(expected_stderr)));
+
+        let diagnostics = store
+            .list_diagnostics(Some(&instance_id))
+            .expect("diagnostics list");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_deref() == Some("nonzero_exit")
+                && diagnostic.message.contains(expected_stderr)
+                && diagnostic.event_id.is_some()
+                && diagnostic.run_id.as_deref() == Some("run-tell")
+        }));
     }
 }

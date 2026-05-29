@@ -352,12 +352,56 @@ case task.provider {
 }
 ```
 
+`after <effect> completes` exposes the effect binding as a tagged terminal
+union for deterministic branching. The v0 source pattern follows the existing
+case-branch form and binds the variant payload:
+
+```whippletree
+after classification completes {
+  case classification {
+    Completed result => {
+      record Routed {
+        status "completed"
+        summary result.summary
+      }
+    }
+    Failed failure => {
+      record Routed {
+        status "failed"
+        summary failure.reason
+      }
+    }
+    TimedOut timeout => {
+      record Routed {
+        status "timed_out"
+        summary timeout.summary
+      }
+    }
+    Cancelled cancel => {
+      record Routed {
+        status "cancelled"
+        summary cancel.summary
+      }
+    }
+  }
+}
+```
+
+The compiler treats `Completed`, `Failed`, `TimedOut`, and `Cancelled` as the
+finite tag domain for a `completes` binding. Exhaustive cases must cover all
+four tags or use `_`/`default`. `Completed name` binds the success output
+payload. Failure-like tags bind the structured error/failure payload when
+available, falling back to the terminal payload if the provider did not expose a
+separate error object.
+
 Exact expression-level syntax may still change, but the semantics must stay
 restricted:
 
 - enum/literal patterns can match only variants in the declared domain
 - optional `Some` branches prove presence for the bound value
 - `None` branches do not permit reading fields through the missing value
+- tagged terminal-output branches can only be used for an active
+  `after <binding> completes` binding and must match a declared terminal tag
 - branch selection is deterministic and side-effect-free
 - non-matching branches do not commit facts or effects
 - exhaustive finite-domain misses produce diagnostics instead of hidden fallthrough

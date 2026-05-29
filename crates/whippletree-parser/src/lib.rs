@@ -426,9 +426,6 @@ enum BlockFrame {
         binding: String,
         predicate: DependencyPredicate,
     },
-    Record {
-        schema: String,
-    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -446,6 +443,8 @@ enum ExprType {
     Int,
     Float,
     String,
+    Duration,
+    Time,
     Null,
     Object,
     Optional(Box<ExprType>),
@@ -464,6 +463,7 @@ pub enum Expr {
         key: Box<Expr>,
     },
     Array(Vec<Expr>),
+    Object(Vec<ExprObjectField>),
     Unary {
         op: UnaryOp,
         expr: Box<Expr>,
@@ -482,6 +482,12 @@ pub enum Expr {
         head: String,
         guard: Option<Box<Expr>>,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExprObjectField {
+    pub key: String,
+    pub value: Expr,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -542,6 +548,14 @@ impl Expr {
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("[{items}]")
+            }
+            Self::Object(fields) => {
+                let fields = fields
+                    .iter()
+                    .map(|field| format!("{} {}", field.key, field.value.to_snapshot()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{{fields}}}")
             }
             Self::Unary { op, expr } => match op {
                 UnaryOp::Not => format!("!{}", expr.to_snapshot_with_parentheses()),
@@ -1041,6 +1055,11 @@ fn collect_projection_reads_into(expr: &Expr, reads: &mut Vec<IrProjectionRead>)
         Expr::Array(items) => {
             for item in items {
                 collect_projection_reads_into(item, reads);
+            }
+        }
+        Expr::Object(fields) => {
+            for field in fields {
+                collect_projection_reads_into(&field.value, reads);
             }
         }
         Expr::Unary { expr, .. } => collect_projection_reads_into(expr, reads),
@@ -1669,13 +1688,20 @@ fn analyze_rule(
         validate_availability_when(rule, &when.text, semantic, &binding_types, diagnostics);
     }
     validate_case_blocks(rule, semantic, &binding_types, diagnostics);
+    validate_record_blocks(rule, semantic, &binding_types, diagnostics);
     let mut block_stack: Vec<BlockFrame> = Vec::new();
     let mut misplaced_effect_bindings = BTreeSet::new();
     let mut anonymous_effects = 0usize;
+    let mut record_depth = 0i32;
 
     for raw_line in rule.body.text.lines() {
         let line = raw_line.trim();
         if line.is_empty() {
+            continue;
+        }
+
+        if record_depth > 0 {
+            record_depth += brace_delta(line);
             continue;
         }
 
@@ -1701,18 +1727,6 @@ fn analyze_rule(
 
         if line.starts_with("case ") || is_case_branch_start(line) {
             validate_known_field_paths(rule, line, semantic, &binding_types, diagnostics);
-            continue;
-        }
-
-        if let Some(record_schema) = active_record_schema(&block_stack) {
-            validate_record_field(
-                rule,
-                line,
-                record_schema,
-                semantic,
-                &binding_types,
-                diagnostics,
-            );
             continue;
         }
 
@@ -1768,7 +1782,7 @@ fn analyze_rule(
                 });
             }
             metadata.fact_writes.push(format!("schema:{schema}"));
-            block_stack.push(BlockFrame::Record { schema });
+            record_depth = brace_delta(line).max(1);
             continue;
         }
 
@@ -2171,6 +2185,18 @@ fn validate_expr_node(
         Expr::Array(items) => {
             for item in items {
                 validate_expr_node(item, semantic, scope, context, presence_proofs, diagnostics);
+            }
+        }
+        Expr::Object(fields) => {
+            for field in fields {
+                validate_expr_node(
+                    &field.value,
+                    semantic,
+                    scope,
+                    context,
+                    presence_proofs,
+                    diagnostics,
+                );
             }
         }
         Expr::Unary { expr, .. } => {
@@ -2640,6 +2666,12 @@ fn infer_expr_type(
             }
         }
         Expr::Array(items) => infer_array_type(items, semantic, scope, context, diagnostics),
+        Expr::Object(fields) => {
+            for field in fields {
+                infer_expr_type(&field.value, semantic, scope, context, diagnostics);
+            }
+            ExprType::Object
+        }
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
@@ -2731,11 +2763,13 @@ fn infer_binary_type(
             ExprType::Bool
         }
         BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
-            if !is_numeric_type(&left_ty) || !is_numeric_type(&right_ty) {
+            if !is_orderable_pair(&left_ty, &right_ty) {
                 diagnostics.push(Diagnostic {
                     span: context.span,
-                    message: format!("{} orders non-numeric expression values", context.subject),
-                    suggestion: Some("use ordering only with int or float values".to_owned()),
+                    message: format!("{} orders non-orderable expression values", context.subject),
+                    suggestion: Some(
+                        "use ordering only with int, float, duration, or time values".to_owned(),
+                    ),
                 });
             }
             ExprType::Bool
@@ -2846,7 +2880,9 @@ fn expr_type_from_type_syntax(ty: &TypeSyntax) -> ExprType {
             "bool" => ExprType::Bool,
             "int" => ExprType::Int,
             "float" => ExprType::Float,
-            "string" | "duration" | "time" => ExprType::String,
+            "string" => ExprType::String,
+            "duration" => ExprType::Duration,
+            "time" => ExprType::Time,
             _ => ExprType::Unknown,
         },
         TypeSyntax::LiteralString { .. } | TypeSyntax::AgentRef { .. } => ExprType::String,
@@ -2903,6 +2939,17 @@ fn is_numeric_type(ty: &ExprType) -> bool {
     matches!(ty, ExprType::Int | ExprType::Float)
 }
 
+fn is_orderable_pair(left: &ExprType, right: &ExprType) -> bool {
+    if matches!(left, ExprType::Unknown) || matches!(right, ExprType::Unknown) {
+        return true;
+    }
+    (is_numeric_type(left) && is_numeric_type(right))
+        || matches!(
+            (left, right),
+            (ExprType::Duration, ExprType::Duration) | (ExprType::Time, ExprType::Time)
+        )
+}
+
 fn is_countable_type(ty: &ExprType) -> bool {
     matches!(
         ty,
@@ -2940,6 +2987,8 @@ fn expr_type_label(ty: &ExprType) -> String {
         ExprType::Int => "int".to_owned(),
         ExprType::Float => "float".to_owned(),
         ExprType::String => "string".to_owned(),
+        ExprType::Duration => "duration".to_owned(),
+        ExprType::Time => "time".to_owned(),
         ExprType::Null => "null".to_owned(),
         ExprType::Object => "object".to_owned(),
         ExprType::Array(inner) => format!("{}[]", expr_type_label(inner)),
@@ -3074,7 +3123,9 @@ fn validate_case_blocks(
             continue;
         };
         let scrutinee_ty = expression_type(scrutinee, semantic, binding_types);
-        if scrutinee_ty.is_none() {
+        let terminal_case =
+            scrutinee_ty.is_none() && active_completes_binding_for_case(&lines, index, scrutinee);
+        if scrutinee_ty.is_none() && !terminal_case {
             diagnostics.push(Diagnostic {
                 span: rule.body.span,
                 message: format!(
@@ -3092,13 +3143,17 @@ fn validate_case_blocks(
             if depth == 1 {
                 if let Some(branch) = parse_case_branch_head(line) {
                     branches.push(branch);
-                    validate_case_pattern(
-                        rule,
-                        branch.pattern,
-                        scrutinee_ty.as_ref(),
-                        semantic,
-                        diagnostics,
-                    );
+                    if terminal_case {
+                        validate_terminal_case_pattern(rule, branch.pattern, diagnostics);
+                    } else {
+                        validate_case_pattern(
+                            rule,
+                            branch.pattern,
+                            scrutinee_ty.as_ref(),
+                            semantic,
+                            diagnostics,
+                        );
+                    }
                     if let Some(guard) = branch.guard {
                         validate_expression(
                             rule,
@@ -3121,15 +3176,38 @@ fn validate_case_blocks(
             depth += brace_delta(line);
             case_index += 1;
         }
-        validate_case_coverage(
-            rule,
-            scrutinee_ty.as_ref(),
-            &branches,
-            semantic,
-            diagnostics,
-        );
+        if terminal_case {
+            validate_terminal_case_coverage(rule, &branches, diagnostics);
+        } else {
+            validate_case_coverage(
+                rule,
+                scrutinee_ty.as_ref(),
+                &branches,
+                semantic,
+                diagnostics,
+            );
+        }
         index += 1;
     }
+}
+
+fn active_completes_binding_for_case(lines: &[&str], case_index: usize, scrutinee: &str) -> bool {
+    let mut scopes: Vec<(String, DependencyPredicate, i32)> = Vec::new();
+    for line in lines.iter().take(case_index) {
+        let trimmed = line.trim();
+        if let Some((binding, predicate)) = parse_after_line(trimmed) {
+            scopes.push((binding, predicate, brace_delta(trimmed).max(1)));
+        } else {
+            let delta = brace_delta(trimmed);
+            for (_, _, depth) in &mut scopes {
+                *depth += delta;
+            }
+            scopes.retain(|(_, _, depth)| *depth > 0);
+        }
+    }
+    scopes.iter().any(|(binding, predicate, _)| {
+        binding == scrutinee && predicate == &DependencyPredicate::Completes
+    })
 }
 
 fn brace_delta(line: &str) -> i32 {
@@ -3287,6 +3365,112 @@ fn validate_case_pattern(
     }
 }
 
+fn terminal_case_tags() -> [&'static str; 4] {
+    ["Completed", "Failed", "TimedOut", "Cancelled"]
+}
+
+fn validate_terminal_case_pattern(
+    rule: &RuleDecl,
+    pattern: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if is_fallback_pattern(pattern) {
+        return;
+    }
+    let mut parts = pattern.split_whitespace();
+    let Some(tag) = parts.next() else {
+        return;
+    };
+    let binding = parts.next();
+    if parts.next().is_some() || binding.is_none() {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!(
+                "rule `{}` has malformed terminal-output case pattern `{pattern}`",
+                rule.name.name
+            ),
+            suggestion: Some("write `Completed result`, `Failed failure`, `TimedOut timeout`, or `Cancelled cancel`".to_owned()),
+        });
+        return;
+    }
+    let tags = terminal_case_tags();
+    if !tags.contains(&tag) {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!(
+                "rule `{}` terminal-output case pattern cannot be `{tag}`",
+                rule.name.name
+            ),
+            suggestion: Some(format!("use one of: {}", tags.join(", "))),
+        });
+    }
+}
+
+fn validate_terminal_case_coverage(
+    rule: &RuleDecl,
+    branches: &[CaseBranchHead<'_>],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if branches.is_empty()
+        || branches
+            .iter()
+            .any(|branch| is_fallback_pattern(branch.pattern))
+    {
+        validate_duplicate_terminal_case_patterns(rule, branches, diagnostics);
+        return;
+    }
+    validate_duplicate_terminal_case_patterns(rule, branches, diagnostics);
+    let covered = branches
+        .iter()
+        .filter(|branch| branch.guard.is_none())
+        .filter_map(|branch| normalized_terminal_case_pattern(branch.pattern))
+        .collect::<BTreeSet<_>>();
+    let missing = terminal_case_tags()
+        .iter()
+        .filter(|tag| !covered.contains(**tag))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!(
+                "rule `{}` has non-exhaustive terminal-output case; missing {}",
+                rule.name.name,
+                missing.join(", ")
+            ),
+            suggestion: Some(
+                "add terminal branches for every value or add `_ => { ... }`".to_owned(),
+            ),
+        });
+    }
+}
+
+fn validate_duplicate_terminal_case_patterns(
+    rule: &RuleDecl,
+    branches: &[CaseBranchHead<'_>],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut seen = BTreeSet::new();
+    for branch in branches.iter().filter(|branch| branch.guard.is_none()) {
+        let Some(pattern) = normalized_terminal_case_pattern(branch.pattern) else {
+            continue;
+        };
+        if !seen.insert(pattern.to_owned()) {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` has duplicate unguarded terminal-output case pattern `{pattern}`",
+                    rule.name.name
+                ),
+                suggestion: Some(
+                    "remove the duplicate branch or add mutually exclusive `where` guards"
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+}
+
 fn validate_case_coverage(
     rule: &RuleDecl,
     scrutinee_ty: Option<&TypeSyntax>,
@@ -3400,6 +3584,13 @@ fn normalized_case_pattern(pattern: &str) -> Option<&str> {
     })
 }
 
+fn normalized_terminal_case_pattern(pattern: &str) -> Option<&str> {
+    if is_fallback_pattern(pattern) {
+        return None;
+    }
+    pattern.split_whitespace().next()
+}
+
 fn is_fallback_pattern(pattern: &str) -> bool {
     matches!(pattern, "_" | "default")
 }
@@ -3500,16 +3691,8 @@ fn after_scopes(block_stack: &[BlockFrame]) -> Vec<(String, DependencyPredicate)
         .iter()
         .filter_map(|frame| match frame {
             BlockFrame::After { binding, predicate } => Some((binding.clone(), predicate.clone())),
-            BlockFrame::Record { .. } => None,
         })
         .collect()
-}
-
-fn active_record_schema(block_stack: &[BlockFrame]) -> Option<&str> {
-    match block_stack.last() {
-        Some(BlockFrame::Record { schema }) => Some(schema),
-        _ => None,
-    }
 }
 
 fn binding_from_when(when: &str) -> Option<(String, String)> {
@@ -3571,8 +3754,40 @@ fn parse_coerce_arg_count(line: &str) -> Option<usize> {
     if args.is_empty() {
         Some(0)
     } else {
-        Some(args.split(',').count())
+        Some(split_expression_args(args).len())
     }
+}
+
+fn split_expression_args(args: &str) -> Vec<&str> {
+    let mut values = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut previous = '\0';
+    for (index, ch) in args.char_indices() {
+        if ch == '"' && previous != '\\' {
+            in_string = !in_string;
+        } else if !in_string {
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    let value = args[start..index].trim();
+                    if !value.is_empty() {
+                        values.push(value);
+                    }
+                    start = index + ch.len_utf8();
+                }
+                _ => {}
+            }
+        }
+        previous = ch;
+    }
+    let value = args[start..].trim();
+    if !value.is_empty() {
+        values.push(value);
+    }
+    values
 }
 
 fn validate_known_field_paths(
@@ -3769,91 +3984,73 @@ fn record_field_assignment(line: &str) -> Option<(&str, &str)> {
     (!field.is_empty() && !expr.is_empty()).then_some((field, expr))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ObjectLiteralField {
-    key: String,
-    value: String,
+fn validate_record_blocks(
+    rule: &RuleDecl,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (schema, body) in record_blocks(&rule.body.text) {
+        for (field, value) in collect_field_assignments(&body) {
+            let line = format!("{field} {value}");
+            validate_record_field(rule, &line, &schema, semantic, binding_types, diagnostics);
+        }
+    }
 }
 
-fn parse_object_literal(expr: &str) -> Result<Vec<ObjectLiteralField>, String> {
-    let tokens = lex_expr(expr);
-    let mut pos = 0usize;
-    if !matches!(
-        tokens.get(pos).map(|token| &token.kind),
-        Some(ExprTokenKind::Symbol('{'))
-    ) {
-        return Err("expected `{`".to_owned());
-    }
-    pos += 1;
-    let mut fields = Vec::new();
-    if matches!(
-        tokens.get(pos).map(|token| &token.kind),
-        Some(ExprTokenKind::Symbol('}'))
-    ) {
-        pos += 1;
-        if pos == tokens.len() {
-            return Ok(fields);
-        }
-        return Err("unexpected token after object literal".to_owned());
-    }
-
-    while pos < tokens.len() {
-        let key = match tokens.get(pos).map(|token| &token.kind) {
-            Some(ExprTokenKind::Ident(value) | ExprTokenKind::String(value)) => value.clone(),
-            _ => return Err("expected object field name".to_owned()),
+fn record_blocks(body: &str) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        let Some(schema) = parse_record_start(trimmed) else {
+            index += 1;
+            continue;
         };
-        pos += 1;
-
-        let value_start = pos;
-        let mut depth = 0i32;
-        while pos < tokens.len() {
-            match tokens.get(pos).map(|token| &token.kind) {
-                Some(ExprTokenKind::Symbol('{') | ExprTokenKind::Symbol('[')) => {
-                    depth += 1;
-                    pos += 1;
-                }
-                Some(ExprTokenKind::Symbol('}') | ExprTokenKind::Symbol(']')) if depth > 0 => {
-                    depth -= 1;
-                    pos += 1;
-                }
-                Some(ExprTokenKind::Symbol('}' | ',')) if depth == 0 => break,
-                Some(_) => pos += 1,
-                None => break,
+        let mut depth = brace_delta(trimmed);
+        let mut record_lines = Vec::new();
+        index += 1;
+        while index < lines.len() && depth > 0 {
+            let line = lines[index];
+            let before = depth;
+            depth += brace_delta(line);
+            if !(before == 1 && depth == 0 && line.trim() == "}") {
+                record_lines.push(line.to_owned());
             }
+            index += 1;
         }
-        if value_start == pos {
-            return Err(format!("field `{key}` is missing a value"));
-        }
-        let value = tokens[value_start..pos]
-            .iter()
-            .map(expr_token_text)
-            .collect::<Vec<_>>()
-            .join(" ");
-        fields.push(ObjectLiteralField { key, value });
-
-        match tokens.get(pos).map(|token| &token.kind) {
-            Some(ExprTokenKind::Symbol(',')) => pos += 1,
-            Some(ExprTokenKind::Symbol('}')) => {
-                pos += 1;
-                if pos == tokens.len() {
-                    return Ok(fields);
-                }
-                return Err("unexpected token after object literal".to_owned());
-            }
-            _ => return Err("expected `}`".to_owned()),
-        }
+        blocks.push((schema, record_lines.join("\n")));
     }
-
-    Err("unterminated object literal".to_owned())
+    blocks
 }
 
-fn expr_token_text(token: &ExprToken) -> String {
-    match &token.kind {
-        ExprTokenKind::Ident(value) | ExprTokenKind::Number(value) => value.clone(),
-        ExprTokenKind::String(value) => format!("{value:?}"),
-        ExprTokenKind::Symbol(value) => value.to_string(),
-        ExprTokenKind::Op(value) => value.to_string(),
+fn collect_field_assignments(body: &str) -> Vec<(String, String)> {
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut assignments = Vec::new();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let trimmed = lines[index].trim().trim_end_matches(',');
+        if trimmed.is_empty() || trimmed == "}" {
+            index += 1;
+            continue;
+        }
+        let Some((name, value)) = record_field_assignment(trimmed) else {
+            index += 1;
+            continue;
+        };
+        let mut value_lines = vec![value.to_owned()];
+        let mut depth = brace_delta(value);
+        index += 1;
+        while depth > 0 && index < lines.len() {
+            let next = lines[index].trim().trim_end_matches(',');
+            depth += brace_delta(next);
+            value_lines.push(next.to_owned());
+            index += 1;
+        }
+        assignments.push((name.to_owned(), value_lines.join(" ")));
     }
+    assignments
 }
 
 fn expression_path(expr: &str) -> Option<(String, Vec<String>)> {
@@ -3963,8 +4160,16 @@ fn validate_expr_source_against_type(
 ) {
     match expected_ty {
         TypeSyntax::Map { inner, .. } => {
-            let fields = match parse_object_literal(expr) {
-                Ok(fields) => fields,
+            let parsed = match parse_expression(expr) {
+                Ok(Expr::Object(fields)) => fields,
+                Ok(_) => {
+                    diagnostics.push(Diagnostic {
+                        span: rule.body.span,
+                        message: format!("field `{record_schema}.{field}` expects a map literal"),
+                        suggestion: Some(format!("record `{field} {{ key value }}`")),
+                    });
+                    return;
+                }
                 Err(message) => {
                     diagnostics.push(Diagnostic {
                         span: rule.body.span,
@@ -3976,8 +4181,8 @@ fn validate_expr_source_against_type(
                     return;
                 }
             };
-            for map_field in &fields {
-                validate_expr_source_against_type(
+            for map_field in &parsed {
+                validate_expr_against_type(
                     rule,
                     record_schema,
                     field,
@@ -4033,28 +4238,23 @@ fn validate_expr_source_against_type(
             }
         }
         TypeSyntax::Ref { name } if semantic.schemas.class_exists(&name.name) => {
-            let fields = match parse_object_literal(expr) {
-                Ok(fields) => fields,
-                Err(_) => {
-                    match parse_expression(expr) {
-                        Ok(expr) => validate_inferred_assignment_type(
-                            rule,
-                            record_schema,
-                            field,
-                            expected_ty,
-                            &expr,
-                            semantic,
-                            scope,
-                            diagnostics,
-                        ),
-                        Err(message) => push_invalid_assignment_expr(
-                            rule,
-                            record_schema,
-                            field,
-                            message,
-                            diagnostics,
-                        ),
-                    }
+            let parsed = match parse_expression(expr) {
+                Ok(Expr::Object(fields)) => fields,
+                Ok(expr) => {
+                    validate_inferred_assignment_type(
+                        rule,
+                        record_schema,
+                        field,
+                        expected_ty,
+                        &expr,
+                        semantic,
+                        scope,
+                        diagnostics,
+                    );
+                    return;
+                }
+                Err(message) => {
+                    push_invalid_assignment_expr(rule, record_schema, field, message, diagnostics);
                     return;
                 }
             };
@@ -4063,7 +4263,7 @@ fn validate_expr_source_against_type(
                 record_schema,
                 field,
                 &name.name,
-                &fields,
+                &parsed,
                 semantic,
                 scope,
                 diagnostics,
@@ -4114,6 +4314,44 @@ fn validate_expr_against_type(
                 }
             }
         }
+        Expr::Object(fields) => match expected_ty {
+            TypeSyntax::Map { inner, .. } => {
+                for field in fields {
+                    validate_expr_against_type(
+                        rule,
+                        record_schema,
+                        field.key.as_str(),
+                        inner,
+                        &field.value,
+                        semantic,
+                        scope,
+                        diagnostics,
+                    );
+                }
+            }
+            TypeSyntax::Ref { name } if semantic.schemas.class_exists(&name.name) => {
+                validate_object_literal_fields(
+                    rule,
+                    record_schema,
+                    field,
+                    &name.name,
+                    fields,
+                    semantic,
+                    scope,
+                    diagnostics,
+                );
+            }
+            _ => validate_inferred_assignment_type(
+                rule,
+                record_schema,
+                field,
+                expected_ty,
+                expr,
+                semantic,
+                scope,
+                diagnostics,
+            ),
+        },
         _ => validate_inferred_assignment_type(
             rule,
             record_schema,
@@ -4152,7 +4390,7 @@ fn validate_object_literal_fields(
     record_schema: &str,
     field: &str,
     object_schema: &str,
-    object_fields: &[ObjectLiteralField],
+    object_fields: &[ExprObjectField],
     semantic: &SemanticContext,
     scope: &ExprScope,
     diagnostics: &mut Vec<Diagnostic>,
@@ -4187,7 +4425,7 @@ fn validate_object_literal_fields(
             });
             continue;
         };
-        validate_expr_source_against_type(
+        validate_expr_against_type(
             rule,
             object_schema,
             &object_field.key,
@@ -4526,6 +4764,25 @@ impl<'a> ExprParser<'a> {
             }
             return Ok(Expr::Array(items));
         }
+        if self.consume_symbol('{') {
+            let mut fields = Vec::new();
+            if self.consume_symbol('}') {
+                return Ok(Expr::Object(fields));
+            }
+            loop {
+                let key = match self.advance().map(|token| token.kind.clone()) {
+                    Some(ExprTokenKind::Ident(value) | ExprTokenKind::String(value)) => value,
+                    _ => return Err("expected object field name".to_owned()),
+                };
+                let value = self.parse_or()?;
+                fields.push(ExprObjectField { key, value });
+                if self.consume_symbol('}') {
+                    break;
+                }
+                let _ = self.consume_symbol(',');
+            }
+            return Ok(Expr::Object(fields));
+        }
         match self.advance().map(|token| token.kind.clone()) {
             Some(ExprTokenKind::String(value)) => Ok(Expr::Literal(ExprLiteral::String(value))),
             Some(ExprTokenKind::Number(value)) => Ok(Expr::Literal(ExprLiteral::Number(value))),
@@ -4819,6 +5076,8 @@ fn validate_primitive_literal(
             | ("float", LiteralExpr::Number(_))
             | ("bool", LiteralExpr::Bool)
             | ("null", LiteralExpr::Null)
+            | ("duration", LiteralExpr::String(_))
+            | ("time", LiteralExpr::String(_))
     );
     if !valid {
         diagnostics.push(Diagnostic {
@@ -4826,6 +5085,26 @@ fn validate_primitive_literal(
             message: format!("field `{record_schema}.{field}` expects `{primitive}`"),
             suggestion: Some(format!("record a value compatible with `{primitive}`")),
         });
+        return;
+    }
+    match (primitive, literal) {
+        ("duration", LiteralExpr::String(value)) if parse_duration_seconds(value).is_none() => {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!("field `{record_schema}.{field}` has invalid duration literal"),
+                suggestion: Some("use an ISO-8601 duration such as `\"PT30M\"`".to_owned()),
+            });
+        }
+        ("time", LiteralExpr::String(value)) if parse_time_epoch_seconds(value).is_none() => {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!("field `{record_schema}.{field}` has invalid time literal"),
+                suggestion: Some(
+                    "use an RFC3339 timestamp such as `\"2026-05-29T10:00:00Z\"`".to_owned(),
+                ),
+            });
+        }
+        _ => {}
     }
 }
 
@@ -5001,6 +5280,134 @@ fn stable_hash(value: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+pub fn parse_duration_seconds(value: &str) -> Option<f64> {
+    let value = value.strip_prefix('P')?;
+    let mut rest = value;
+    let mut seconds = 0.0;
+    let mut consumed = false;
+    let mut in_time = false;
+
+    while !rest.is_empty() {
+        if let Some(next) = rest.strip_prefix('T') {
+            if in_time {
+                return None;
+            }
+            in_time = true;
+            rest = next;
+            continue;
+        }
+
+        let number_len = rest
+            .char_indices()
+            .take_while(|(_, ch)| ch.is_ascii_digit() || *ch == '.')
+            .map(|(index, ch)| index + ch.len_utf8())
+            .last()?;
+        let number = rest[..number_len].parse::<f64>().ok()?;
+        if !number.is_finite() {
+            return None;
+        }
+        let unit = rest[number_len..].chars().next()?;
+        rest = &rest[number_len + unit.len_utf8()..];
+        let multiplier = match (in_time, unit) {
+            (false, 'D') => 86_400.0,
+            (true, 'H') => 3_600.0,
+            (true, 'M') => 60.0,
+            (true, 'S') => 1.0,
+            _ => return None,
+        };
+        seconds += number * multiplier;
+        consumed = true;
+    }
+
+    consumed.then_some(seconds)
+}
+
+pub fn parse_time_epoch_seconds(value: &str) -> Option<i64> {
+    if value.len() < 20 {
+        return None;
+    }
+    let year = parse_fixed_i32(value, 0, 4)?;
+    require_byte(value, 4, b'-')?;
+    let month = parse_fixed_u32(value, 5, 2)?;
+    require_byte(value, 7, b'-')?;
+    let day = parse_fixed_u32(value, 8, 2)?;
+    require_byte(value, 10, b'T')?;
+    let hour = parse_fixed_u32(value, 11, 2)?;
+    require_byte(value, 13, b':')?;
+    let minute = parse_fixed_u32(value, 14, 2)?;
+    require_byte(value, 16, b':')?;
+    let second = parse_fixed_u32(value, 17, 2)?;
+    let offset_start = 19;
+    if !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+
+    let offset_seconds = match value.as_bytes().get(offset_start).copied()? {
+        b'Z' if value.len() == offset_start + 1 => 0,
+        b'+' | b'-' if value.len() == offset_start + 6 => {
+            let sign = if value.as_bytes()[offset_start] == b'+' {
+                1
+            } else {
+                -1
+            };
+            let offset_hour = parse_fixed_i32(value, offset_start + 1, 2)?;
+            require_byte(value, offset_start + 3, b':')?;
+            let offset_minute = parse_fixed_i32(value, offset_start + 4, 2)?;
+            if offset_hour > 23 || offset_minute > 59 {
+                return None;
+            }
+            sign * (offset_hour * 3_600 + offset_minute * 60)
+        }
+        _ => return None,
+    };
+
+    let days = days_from_civil(year, month, day);
+    let local_seconds = days * 86_400 + i64::from(hour * 3_600 + minute * 60 + second.min(59));
+    Some(local_seconds - i64::from(offset_seconds))
+}
+
+fn parse_fixed_i32(value: &str, start: usize, len: usize) -> Option<i32> {
+    value.get(start..start + len)?.parse::<i32>().ok()
+}
+
+fn parse_fixed_u32(value: &str, start: usize, len: usize) -> Option<u32> {
+    value.get(start..start + len)?.parse::<u32>().ok()
+}
+
+fn require_byte(value: &str, index: usize, expected: u8) -> Option<()> {
+    (value.as_bytes().get(index).copied()? == expected).then_some(())
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = month as i32;
+    let day = day as i32;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    i64::from(era * 146_097 + day_of_era - 719_468)
 }
 
 fn format_syntax(program: Program) -> String {
@@ -6403,6 +6810,10 @@ rule safe_not_null
                 "exists(issue.assignee) && (issue.assignee.name == \"Ada\")",
             ),
             (
+                "{title task.title, metadata {phase \"kernel\"}}",
+                "{title task.title, metadata {phase \"kernel\"}}",
+            ),
+            (
                 "count(effect agent.tell where target == \"worker\") >= 1",
                 "count(effect agent.tell where target == \"worker\") >= 1",
             ),
@@ -6439,10 +6850,21 @@ class Task {
 rule seed
   when started
 => {
-  record Task {
+    record Task {
     title "Implement object literals"
     metadata { phase "kernel" }
     owner { name "Ada" }
+  }
+
+  record Task {
+    title "Implement multiline object literals"
+    metadata {
+      phase "kernel"
+      owner "Ada"
+    }
+    owner {
+      name "Ada"
+    }
   }
 }
 "#;
@@ -6492,10 +6914,9 @@ rule bad_guard
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("missing required object field `Owner.name`")));
-        assert!(compiled
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("invalid guard expression")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("compares incompatible expression types")));
     }
 
     #[test]
@@ -6554,7 +6975,7 @@ rule bad_map_membership
             .any(|diagnostic| diagnostic.message.contains("non-boolean guard expression")));
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
-            .contains("orders non-numeric expression values")));
+            .contains("orders non-orderable expression values")));
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("uses membership against a non-array/non-map expression")));
@@ -6572,6 +6993,68 @@ rule bad_map_membership
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("map membership with a non-string key")));
+    }
+
+    #[test]
+    fn validates_duration_and_time_ordering_and_literals() {
+        let source = r#"
+workflow DurationTimeExpressions
+
+class Window {
+  elapsed duration
+  limit duration
+  opened_at time
+  due_at time
+}
+
+assert exists(Window where elapsed < limit)
+assert exists(Window where opened_at <= due_at)
+
+rule seed
+  when started
+=> {
+  record Window {
+    elapsed "PT30M"
+    limit "PT1H"
+    opened_at "2026-05-29T10:00:00Z"
+    due_at "2026-05-29T11:00:00Z"
+  }
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_duration_and_time_literals() {
+        let source = r#"
+workflow BadDurationTimeExpressions
+
+class Window {
+  elapsed duration
+  opened_at time
+}
+
+rule seed
+  when started
+=> {
+  record Window {
+    elapsed "thirty minutes"
+    opened_at "morning"
+  }
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("field `Window.elapsed` has invalid duration literal")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("field `Window.opened_at` has invalid time literal")));
     }
 
     #[test]
@@ -7010,6 +7493,110 @@ rule route
         let compiled = compile_program(source);
         assert_eq!(compiled.diagnostics, Vec::new());
         assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn accepts_terminal_output_case_branches_inside_completes_after() {
+        let source = r#"
+workflow TerminalCaseGuess
+
+class WorkItem {
+  title string
+}
+
+class MessageClassification {
+  summary string
+}
+
+class Routed {
+  branch string
+  detail string
+}
+
+coerce classifyMessage(title string) -> MessageClassification {
+  prompt "Classify"
+}
+
+rule classify
+  when WorkItem as item
+=> {
+  coerce classifyMessage(item.title) as classification
+
+  after classification completes {
+    case classification {
+      Completed result => {
+        record Routed {
+          branch "completed"
+          detail result.summary
+        }
+      }
+      Failed failure => {
+        record Routed {
+          branch "failed"
+          detail failure.reason
+        }
+      }
+      TimedOut timeout => {
+        record Routed {
+          branch "timed_out"
+          detail timeout.summary
+        }
+      }
+      Cancelled cancel => {
+        record Routed {
+          branch "cancelled"
+          detail cancel.summary
+        }
+      }
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_terminal_output_case_branches() {
+        let source = r#"
+workflow BadTerminalCaseGuess
+
+class WorkItem {
+  title string
+}
+
+class MessageClassification {
+  summary string
+}
+
+coerce classifyMessage(title string) -> MessageClassification {
+  prompt "Classify"
+}
+
+rule classify
+  when WorkItem as item
+=> {
+  coerce classifyMessage(item.title) as classification
+
+  after classification completes {
+    case classification {
+      Success result => {
+      }
+      Completed result => {
+      }
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("terminal-output case pattern cannot be `Success`")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("non-exhaustive terminal-output case; missing Failed, TimedOut, Cancelled")));
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub enum StoreError {
     Json(serde_json::Error),
     Conflict(String),
     PolicyBlocked { effect_id: String, reason: String },
+    CapacityBlocked { effect_id: String, reason: String },
 }
 
 impl From<std::io::Error> for StoreError {
@@ -322,6 +323,24 @@ pub struct DiagnosticRecord<'a> {
     pub causation_id: Option<&'a str>,
     pub correlation_id: Option<&'a str>,
     pub idempotency_key: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalDiagnosticRecord {
+    pub program_id: Option<String>,
+    pub program_version_id: Option<String>,
+    pub severity: String,
+    pub code: Option<String>,
+    pub message: String,
+    pub source_span_json: Option<String>,
+    pub subject_type: Option<String>,
+    pub subject_id: Option<String>,
+    pub assertion_id: Option<String>,
+    pub evidence_ids_json: String,
+    pub artifact_ids_json: String,
+    pub causation_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -846,6 +865,14 @@ impl SqliteStore {
         &mut self,
         completion: EffectCompletion<'_>,
     ) -> StoreResult<StoredEvent> {
+        self.complete_effect_with_terminal_diagnostic(completion, None)
+    }
+
+    pub fn complete_effect_with_terminal_diagnostic(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+    ) -> StoreResult<StoredEvent> {
         let payload = effect_completion_payload(completion);
         let tx = self.connection.transaction()?;
         let event = append_event_on(
@@ -960,6 +987,31 @@ impl SqliteStore {
             params![completion.status, completion.effect_id, completion.instance_id],
         )?;
         satisfy_dependencies_on(&tx, completion.instance_id)?;
+        if let Some(diagnostic) = diagnostic {
+            insert_diagnostic_on(
+                &tx,
+                DiagnosticRecord {
+                    instance_id: Some(completion.instance_id),
+                    program_id: diagnostic.program_id.as_deref(),
+                    program_version_id: diagnostic.program_version_id.as_deref(),
+                    severity: &diagnostic.severity,
+                    code: diagnostic.code.as_deref(),
+                    message: &diagnostic.message,
+                    source_span_json: diagnostic.source_span_json.as_deref(),
+                    subject_type: diagnostic.subject_type.as_deref(),
+                    subject_id: diagnostic.subject_id.as_deref(),
+                    event_id: Some(&event.event_id),
+                    effect_id: Some(completion.effect_id),
+                    run_id: Some(completion.run_id),
+                    assertion_id: diagnostic.assertion_id.as_deref(),
+                    evidence_ids_json: &diagnostic.evidence_ids_json,
+                    artifact_ids_json: &diagnostic.artifact_ids_json,
+                    causation_id: diagnostic.causation_id.as_deref(),
+                    correlation_id: diagnostic.correlation_id.as_deref(),
+                    idempotency_key: diagnostic.idempotency_key.as_deref(),
+                },
+            )?;
+        }
 
         tx.commit()?;
         Ok(event)
@@ -976,7 +1028,7 @@ impl SqliteStore {
             SELECT effect_id, kind, target, profile, input_json
             FROM effects AS candidate
             WHERE candidate.instance_id = ?1
-              AND candidate.status IN ('queued', 'blocked_by_dependency')
+              AND candidate.status IN ('queued', 'blocked_by_dependency', 'blocked_by_capacity')
               AND NOT EXISTS (
                   SELECT 1
                   FROM effect_dependencies AS dependency
@@ -2088,7 +2140,9 @@ impl SqliteStore {
             &self.connection,
             "effects",
             instance_id,
-            Some("status IN ('blocked_by_capability', 'blocked_by_profile')"),
+            Some(
+                "status IN ('blocked_by_capability', 'blocked_by_profile', 'blocked_by_capacity')",
+            ),
         )?;
         let active_run_count = count_where(
             &self.connection,
@@ -2162,7 +2216,7 @@ impl SqliteStore {
                     updated_at = CURRENT_TIMESTAMP
                 WHERE instance_id = ?3
                   AND effect_id = ?4
-                  AND status IN ('queued', 'blocked_by_dependency')
+                  AND status IN ('queued', 'blocked_by_dependency', 'blocked_by_capacity')
                 "#,
                 params![block.status, block.reason, run.instance_id, run.effect_id],
             )?;
@@ -2202,7 +2256,44 @@ impl SqliteStore {
             ));
         }
         if let Some(reason) = capacity_block_on(&tx, run.instance_id, run.effect_id)? {
-            return Err(StoreError::Conflict(reason));
+            let payload = json!({
+                "effect_id": run.effect_id,
+                "status": "blocked_by_capacity",
+                "reason": reason,
+            })
+            .to_string();
+            append_event_on(
+                &tx,
+                NewEvent {
+                    instance_id: run.instance_id,
+                    event_type: "effect.blocked",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(run.effect_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&format!(
+                        "capacity-block:{}:{}",
+                        run.effect_id, run.run_id
+                    )),
+                },
+            )?;
+            tx.execute(
+                r#"
+                UPDATE effects
+                SET status = 'blocked_by_capacity',
+                    policy_block_reason = ?1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE instance_id = ?2
+                  AND effect_id = ?3
+                  AND status IN ('queued', 'blocked_by_dependency', 'blocked_by_capacity')
+                "#,
+                params![reason, run.instance_id, run.effect_id],
+            )?;
+            tx.commit()?;
+            return Err(StoreError::CapacityBlocked {
+                effect_id: run.effect_id.to_owned(),
+                reason,
+            });
         }
 
         let event = append_event_on(
@@ -2225,7 +2316,7 @@ impl SqliteStore {
                 updated_at = CURRENT_TIMESTAMP
             WHERE instance_id = ?1
               AND effect_id = ?2
-              AND status IN ('queued', 'blocked_by_dependency')
+              AND status IN ('queued', 'blocked_by_dependency', 'blocked_by_capacity')
             "#,
             params![run.instance_id, run.effect_id],
         )?;
@@ -3048,10 +3139,12 @@ struct PolicyBlock {
 
 struct PolicyEffect {
     kind: String,
+    target: Option<String>,
     status: String,
     required_capabilities_json: String,
     profile: Option<String>,
     program_id: String,
+    declared_profiles_json: String,
 }
 
 fn policy_block_on(
@@ -3064,12 +3157,15 @@ fn policy_block_on(
             r#"
             SELECT
                 effects.kind,
+                effects.target,
                 effects.status,
                 effects.required_capabilities,
                 effects.profile,
-                instances.program_id
+                instances.program_id,
+                program_versions.declared_profiles
             FROM effects
             JOIN instances ON instances.instance_id = effects.instance_id
+            JOIN program_versions ON program_versions.version_id = instances.version_id
             WHERE effects.instance_id = ?1
               AND effects.effect_id = ?2
             "#,
@@ -3077,10 +3173,12 @@ fn policy_block_on(
             |row| {
                 Ok(PolicyEffect {
                     kind: row.get(0)?,
-                    status: row.get(1)?,
-                    required_capabilities_json: row.get(2)?,
-                    profile: row.get(3)?,
-                    program_id: row.get(4)?,
+                    target: row.get(1)?,
+                    status: row.get(2)?,
+                    required_capabilities_json: row.get(3)?,
+                    profile: row.get(4)?,
+                    program_id: row.get(5)?,
+                    declared_profiles_json: row.get(6)?,
                 })
             },
         )
@@ -3089,8 +3187,15 @@ fn policy_block_on(
         return Ok(None);
     };
 
-    if !matches!(effect.status.as_str(), "queued" | "blocked_by_dependency") {
+    if !matches!(
+        effect.status.as_str(),
+        "queued" | "blocked_by_dependency" | "blocked_by_capacity"
+    ) {
         return Ok(None);
+    }
+
+    if let Some(block) = agent_target_policy_block(&effect)? {
+        return Ok(Some(block));
     }
 
     if !effect_provider_exists(connection, &effect.kind)? {
@@ -3142,6 +3247,38 @@ fn policy_block_on(
     }
 
     Ok(None)
+}
+
+fn agent_target_policy_block(effect: &PolicyEffect) -> StoreResult<Option<PolicyBlock>> {
+    if effect.kind != "agent.tell" {
+        return Ok(None);
+    }
+    let Some(target) = effect.target.as_deref() else {
+        return Ok(None);
+    };
+    if !declared_agents_present(&effect.declared_profiles_json)? {
+        return Ok(None);
+    }
+    let Some(declared_profile) = declared_agent_profile(&effect.declared_profiles_json, target)?
+    else {
+        return Ok(Some(PolicyBlock {
+            status: "blocked_by_profile",
+            reason: format!("agent `{target}` is not declared by the program"),
+        }));
+    };
+    match (effect.profile.as_deref(), declared_profile.as_deref()) {
+        (Some(actual), Some(expected)) if actual != expected => Ok(Some(PolicyBlock {
+            status: "blocked_by_profile",
+            reason: format!(
+                "agent `{target}` uses profile `{actual}`, expected declared profile `{expected}`"
+            ),
+        })),
+        (None, Some(expected)) => Ok(Some(PolicyBlock {
+            status: "blocked_by_profile",
+            reason: format!("agent `{target}` requires declared profile `{expected}`"),
+        })),
+        _ => Ok(None),
+    }
 }
 
 fn capacity_block_on(
@@ -3201,6 +3338,67 @@ fn capacity_block_on(
         )))
     } else {
         Ok(None)
+    }
+}
+
+fn declared_agent_profile(
+    declared_profiles_json: &str,
+    agent: &str,
+) -> StoreResult<Option<Option<String>>> {
+    let parsed = serde_json::from_str::<Value>(declared_profiles_json)?;
+    Ok(agent_profile_in_value(&parsed, agent))
+}
+
+fn declared_agents_present(declared_profiles_json: &str) -> StoreResult<bool> {
+    let parsed = serde_json::from_str::<Value>(declared_profiles_json)?;
+    Ok(match &parsed {
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(object) => object
+            .get("agents")
+            .and_then(Value::as_array)
+            .is_some_and(|agents| !agents.is_empty()),
+        _ => false,
+    })
+}
+
+fn agent_profile_in_value(value: &Value, agent: &str) -> Option<Option<String>> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| agent_profile_in_value(item, agent)),
+        Value::Object(object) => {
+            if let Some(entry) = object.get(agent) {
+                return Some(
+                    entry
+                        .get("profile")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+            if let Some(profile) = object
+                .get("agents")
+                .and_then(|agents| agent_profile_in_value(agents, agent))
+            {
+                return Some(profile);
+            }
+            let declared_agent = object
+                .get("name")
+                .or_else(|| object.get("agent"))
+                .or_else(|| object.get("agent_name"))
+                .or_else(|| object.get("target"))
+                .and_then(Value::as_str);
+            if declared_agent == Some(agent) {
+                Some(
+                    object
+                        .get("profile")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                )
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -4921,9 +5119,21 @@ mod tests {
             })
             .expect_err("capacity blocks second run");
         assert!(
-            matches!(blocked, StoreError::Conflict(message) if message.contains("capacity exhausted"))
+            matches!(blocked, StoreError::CapacityBlocked { reason, .. } if reason.contains("capacity exhausted"))
         );
-        assert_eq!(effect_status(&store, "tell-two"), "queued");
+        assert_eq!(effect_status(&store, "tell-two"), "blocked_by_capacity");
+        let status = store
+            .status(&instance.instance_id)
+            .expect("status loads")
+            .expect("instance exists");
+        assert_eq!(status.blocked_effect_count, 1);
+        assert_eq!(
+            status
+                .recent_events
+                .last()
+                .map(|event| event.event_type.as_str()),
+            Some("effect.blocked")
+        );
 
         store
             .complete_effect(EffectCompletion {
@@ -4944,6 +5154,67 @@ mod tests {
             .expect("claimable effects after completion");
         assert_eq!(claimable.len(), 1);
         assert_eq!(claimable[0].effect_id, "tell-two");
+    }
+
+    #[test]
+    fn undeclared_agent_targets_are_durably_blocked() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(NewProgramVersion {
+                declared_profiles_json: r#"{"agents":[{"name":"worker","profile":"repo-writer","capacity":1}]}"#,
+                ..test_program_version("AgentRefs", "source-1", "ir-1")
+            })
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let effects = [NewEffect {
+            target: Some("rogue"),
+            ..test_effect("tell-rogue", "agent.tell", "rule=start;effect=tell-rogue")
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                effects: &effects,
+                dependencies: &[],
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commits");
+
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell-rogue",
+                run_id: "run-rogue",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-rogue",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("undeclared agent blocks run");
+
+        assert!(
+            matches!(blocked, StoreError::PolicyBlocked { reason, .. } if reason.contains("not declared"))
+        );
+        assert_eq!(effect_status(&store, "tell-rogue"), "blocked_by_profile");
+        let effect = store
+            .list_effects(&instance.instance_id)
+            .expect("effects load")
+            .pop()
+            .expect("effect exists");
+        assert!(effect
+            .policy_block_reason
+            .as_deref()
+            .expect("block reason")
+            .contains("not declared"));
     }
 
     #[test]

@@ -378,6 +378,31 @@ fn dev_fixture_failure_reaches_event_stream() {
                 .and_then(Value::as_str)
                 == Some("nonzero_exit")
     }));
+    let diagnostics = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "diagnostics",
+            instance_id,
+        ],
+    );
+    let diagnostics = diagnostics.as_array().expect("diagnostics array");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(Value::as_str) == Some("nonzero_exit")
+            && diagnostic.get("subject_type").and_then(Value::as_str) == Some("effect")
+            && diagnostic
+                .get("subject_id")
+                .and_then(Value::as_str)
+                .is_some()
+            && diagnostic.get("event_id").and_then(Value::as_str).is_some()
+            && diagnostic.get("run_id").and_then(Value::as_str).is_some()
+            && diagnostic
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("fixture failure"))
+    }));
 
     let _ = fs::remove_file(store_path);
 }
@@ -1227,6 +1252,111 @@ rule route
 }
 
 #[test]
+fn dev_branches_on_completed_terminal_union_payload() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("terminal-completed-branch");
+    fs::write(
+        &source_path,
+        r#"
+workflow TerminalCompletedBranch
+
+class WorkItem {
+  title string
+  body string
+}
+
+class MessageClassification {
+  priority string
+  summary string
+  confidence float
+}
+
+class TerminalRoute {
+  branch string
+  detail string
+}
+
+coerce classifyMessage(title string, body string) -> MessageClassification {
+  prompt "Classify"
+}
+
+assert count(TerminalRoute where branch == "completed") == 1
+assert count(TerminalRoute where detail == "Fixture classification") == 1
+
+rule seed
+  when started
+=> {
+  record WorkItem {
+    title "One"
+    body "Two"
+  }
+}
+
+rule classify_request
+  when WorkItem as request
+=> {
+  coerce classifyMessage(request.title, request.body) as classification
+
+  after classification completes {
+    case classification {
+      Completed result => {
+        record TerminalRoute {
+          branch "completed"
+          detail result.summary
+        }
+      }
+      Failed failure => {
+        record TerminalRoute {
+          branch "failed"
+          detail failure.reason
+        }
+      }
+      TimedOut timeout => {
+        record TerminalRoute {
+          branch "timed_out"
+          detail timeout.summary
+        }
+      }
+      Cancelled cancel => {
+        record TerminalRoute {
+          branch "cancelled"
+          detail cancel.summary
+        }
+      }
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    assert!(dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("assertions")
+        .iter()
+        .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
 fn dev_evaluates_shared_expression_kernel_for_guards_and_assertions() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
@@ -1310,7 +1440,7 @@ rule accept_task
 }
 
 #[test]
-fn check_reports_duration_and_time_ordering_as_non_numeric() {
+fn check_accepts_duration_and_time_ordering() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let source_path = temp_workflow_path("duration-time-ordering-check");
     fs::write(
@@ -1342,22 +1472,17 @@ rule time_guard
         .args(["check", source_path.to_str().expect("utf-8 source path")])
         .output()
         .expect("command runs");
-    assert!(!output.status.success());
     assert!(
-        output.stdout.is_empty(),
-        "static diagnostics should not emit check snapshots\nstdout:\n{}",
-        String::from_utf8_lossy(&output.stdout)
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("rule `duration_guard` orders non-numeric expression values"));
-    assert!(stderr.contains("rule `time_guard` orders non-numeric expression values"));
-    assert!(stderr.contains("use ordering only with int or float values"));
 
     let _ = fs::remove_file(source_path);
 }
 
 #[test]
-fn dev_cannot_yet_seed_duration_or_time_values_for_ordering() {
+fn dev_seeds_duration_and_time_values_for_ordering() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let source_path = temp_workflow_path("duration-time-ordering-literals");
@@ -1375,6 +1500,7 @@ class Window {
 
 assert exists(Window where elapsed < limit)
 assert exists(Window where opened_at < due_at)
+assert count(Window where elapsed <= limit && due_at > opened_at) == 1
 
 rule seed
   when started
@@ -1390,8 +1516,9 @@ rule seed
     )
     .expect("write source");
 
-    let output = Command::new(bin)
-        .args([
+    let dev = run_json(
+        bin,
+        &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
@@ -1401,28 +1528,76 @@ rule seed
             "fixture",
             "--until",
             "idle",
-        ])
+        ],
+    );
+    assert!(dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("assertions")
+        .iter()
+        .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    assert!(facts.as_array().expect("facts").iter().any(|fact| {
+        fact.get("name").and_then(Value::as_str) == Some("Window")
+            && fact
+                .get("value")
+                .and_then(|value| value.get("elapsed"))
+                .and_then(Value::as_str)
+                == Some("PT1H")
+    }));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn check_rejects_invalid_duration_and_time_literals() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let source_path = temp_workflow_path("duration-time-invalid-literals");
+    fs::write(
+        &source_path,
+        r#"
+workflow DurationTimeInvalidLiterals
+
+class Window {
+  elapsed duration
+  opened_at time
+}
+
+rule seed
+  when started
+=> {
+  record Window {
+    elapsed "one hour"
+    opened_at "noon"
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let output = Command::new(bin)
+        .args(["check", source_path.to_str().expect("utf-8 source path")])
         .output()
         .expect("command runs");
     assert!(!output.status.success());
-    assert!(
-        output.stdout.is_empty(),
-        "static diagnostics should not emit dev JSON\nstdout:\n{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    for expected in [
-        "field `Window.elapsed` expects `duration`",
-        "field `Window.limit` expects `duration`",
-        "field `Window.opened_at` expects `time`",
-        "field `Window.due_at` expects `time`",
-    ] {
-        assert!(stderr.contains(expected), "stderr:\n{stderr}");
-    }
-    assert!(stderr.contains("record a value compatible with `duration`"));
-    assert!(stderr.contains("record a value compatible with `time`"));
+    assert!(stderr.contains("field `Window.elapsed` has invalid duration literal"));
+    assert!(stderr.contains("field `Window.opened_at` has invalid time literal"));
 
-    let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(source_path);
 }
 
@@ -1719,6 +1894,163 @@ rule seed
 }
 
 #[test]
+fn dev_materializes_multiline_object_literals_and_coerce_object_args() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("object-literal-e2e");
+    fs::write(
+        &source_path,
+        r#"
+workflow ObjectLiteralE2E
+
+class Owner {
+  name string
+}
+
+class Payload {
+  title string
+  owner Owner
+  metadata map<string>
+  tags string[]
+}
+
+class Task {
+  title string
+  owner string
+  payload Payload
+  metadata map<string>
+}
+
+class Review {
+  accepted bool
+}
+
+coerce reviewPayload(payload Payload, metadata map<string>) -> Review {
+  Return whether the payload is valid.
+}
+
+rule seed
+  when started
+=> {
+  record Task {
+    title "Implement object literals"
+    owner "Ada"
+    payload {
+      title "Implement object literals"
+      owner {
+        name "Ada"
+      }
+      metadata {
+        phase "kernel"
+        owner "Ada"
+      }
+      tags ["object", "effect"]
+    }
+    metadata {
+      phase "kernel"
+      owner "Ada"
+    }
+  }
+}
+
+rule review
+  when Task as task where task.payload.owner.name == "Ada"
+=> {
+  coerce reviewPayload(
+    {
+      title task.title
+      owner { name task.owner }
+      metadata { phase task.metadata["phase"] owner task.owner }
+      tags ["object", task.metadata["phase"]]
+    },
+    { phase task.metadata["phase"], owner task.owner }
+  ) as review
+}
+"#,
+    )
+    .expect("write source");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let task = facts
+        .as_array()
+        .expect("facts array")
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("Task"))
+        .and_then(|fact| fact.get("value"))
+        .expect("Task fact value");
+    assert_eq!(
+        task.pointer("/payload/owner/name").and_then(Value::as_str),
+        Some("Ada")
+    );
+    assert_eq!(
+        task.pointer("/payload/metadata/phase")
+            .and_then(Value::as_str),
+        Some("kernel")
+    );
+
+    let evidence = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "evidence",
+            instance_id,
+        ],
+    );
+    let arguments = evidence
+        .get("evidence")
+        .and_then(Value::as_array)
+        .expect("evidence array")
+        .iter()
+        .find(|item| item.get("kind").and_then(Value::as_str) == Some("baml.coerce.provider"))
+        .and_then(|item| item.get("metadata"))
+        .and_then(|metadata| metadata.get("arguments"))
+        .expect("baml arguments");
+    assert_eq!(
+        arguments
+            .pointer("/arg0/owner/name")
+            .and_then(Value::as_str),
+        Some("Ada")
+    );
+    assert_eq!(
+        arguments.pointer("/arg1/phase").and_then(Value::as_str),
+        Some("kernel")
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
 fn dev_reports_failed_assertions_with_nonzero_exit() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
@@ -1798,6 +2130,29 @@ rule seed
             .count(),
         1
     );
+    let diagnostics = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "diagnostics",
+            instance_id,
+        ],
+    );
+    let diagnostics = diagnostics.as_array().expect("diagnostics array");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(Value::as_str) == Some("assertion.failed")
+            && diagnostic.get("subject_type").and_then(Value::as_str) == Some("assertion")
+            && diagnostic
+                .get("assertion_id")
+                .and_then(Value::as_str)
+                .is_some()
+            && diagnostic
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("count(Seen) == 2"))
+    }));
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(source_path);

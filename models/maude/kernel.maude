@@ -2,7 +2,8 @@ mod WHIPPLETREE-KERNEL is
   sorts
     EffectId FactId RunId EventId RuleId GraphId
     Predicate EffectStatus ProjectionStatus LeaseStatus GuardResult
-    AssertionId AssertionResult AgentTarget Path Presence Value Domain Cfg .
+    AssertionId AssertionResult AgentTarget Path Presence Value Domain
+    Scalar QueryId QueryCardinality Expr Cfg .
 
   --- Sample identifiers used by hand-written model tests.
   ops e1 e2 e3 : -> EffectId .
@@ -19,6 +20,8 @@ mod WHIPPLETREE-KERNEL is
   ops codexAgent claudeAgent piAgent missingAgent : -> AgentTarget .
   ops assigneePath providerPath : -> Path .
   ops codexValue claudeValue invalidProviderValue : -> Value .
+  ops scalar1 scalar2 : -> Scalar .
+  ops query1 : -> QueryId .
   op providerDomain : -> Domain .
 
   --- Effect lifecycle states.
@@ -47,6 +50,8 @@ mod WHIPPLETREE-KERNEL is
   ops gTrue gFalse gError : -> GuardResult .
   ops aPass aFail aError : -> AssertionResult .
   ops present missing : -> Presence .
+  ops qZero qOne qMany qError : -> QueryCardinality .
+  ops boolTrue boolFalse exprError countZero countOne countMany : -> Expr .
 
   --- Runtime configuration as a multiset.
   op none : -> Cfg .
@@ -79,6 +84,20 @@ mod WHIPPLETREE-KERNEL is
   op graphReady : GraphId -> Cfg .
   op graphCommitted : GraphId -> Cfg .
   op assertion : AssertionId AssertionResult -> Cfg .
+  op guardExpr : RuleId FactId Expr -> Cfg .
+  op assertionExpr : AssertionId Expr -> Cfg .
+  op scalar : Scalar -> Expr .
+  op query : QueryId QueryCardinality -> Expr .
+  op notExpr : Expr -> Expr .
+  op andExpr : Expr Expr -> Expr .
+  op orExpr : Expr Expr -> Expr .
+  op eqExpr : Expr Expr -> Expr .
+  op neExpr : Expr Expr -> Expr .
+  op countExpr : Expr -> Expr .
+  op existsExpr : Expr -> Expr .
+  op emptyExpr : Expr -> Expr .
+  op evalGuard : Expr -> GuardResult .
+  op evalAssertion : Expr -> AssertionResult .
   op declaredAgent : AgentTarget -> Cfg .
   op tellTarget : EffectId AgentTarget -> Cfg .
   op path : Path Presence -> Cfg .
@@ -104,6 +123,64 @@ mod WHIPPLETREE-KERNEL is
   vars Dm : Domain .
   vars P : Predicate .
   vars S : EffectStatus .
+  vars Sc : Scalar .
+  vars Q : QueryId .
+  vars Ex Ex1 Ex2 : Expr .
+
+  --- Deterministic expression-kernel subset used by generated per-program
+  --- checks. Generated models lower guards/assertions into these terms instead
+  --- of asserting symbolic true/false/error outcomes directly.
+  eq countExpr(query(Q, qZero)) = countZero .
+  eq countExpr(query(Q, qOne)) = countOne .
+  eq countExpr(query(Q, qMany)) = countMany .
+  eq countExpr(query(Q, qError)) = exprError .
+  eq existsExpr(query(Q, qZero)) = boolFalse .
+  eq existsExpr(query(Q, qOne)) = boolTrue .
+  eq existsExpr(query(Q, qMany)) = boolTrue .
+  eq existsExpr(query(Q, qError)) = exprError .
+  eq emptyExpr(query(Q, qZero)) = boolTrue .
+  eq emptyExpr(query(Q, qOne)) = boolFalse .
+  eq emptyExpr(query(Q, qMany)) = boolFalse .
+  eq emptyExpr(query(Q, qError)) = exprError .
+  eq notExpr(boolTrue) = boolFalse .
+  eq notExpr(boolFalse) = boolTrue .
+  eq notExpr(exprError) = exprError .
+  eq andExpr(boolFalse, Ex) = boolFalse .
+  eq andExpr(boolTrue, Ex) = Ex .
+  eq andExpr(exprError, Ex) = exprError .
+  eq orExpr(boolTrue, Ex) = boolTrue .
+  eq orExpr(boolFalse, Ex) = Ex .
+  eq orExpr(exprError, Ex) = exprError .
+  eq eqExpr(scalar(Sc), scalar(Sc)) = boolTrue .
+  eq neExpr(scalar(Sc), scalar(Sc)) = boolFalse .
+  eq eqExpr(boolTrue, boolTrue) = boolTrue .
+  eq eqExpr(boolTrue, boolFalse) = boolFalse .
+  eq eqExpr(boolFalse, boolTrue) = boolFalse .
+  eq eqExpr(boolFalse, boolFalse) = boolTrue .
+  eq neExpr(boolTrue, boolTrue) = boolFalse .
+  eq neExpr(boolTrue, boolFalse) = boolTrue .
+  eq neExpr(boolFalse, boolTrue) = boolTrue .
+  eq neExpr(boolFalse, boolFalse) = boolFalse .
+  eq eqExpr(countZero, countZero) = boolTrue .
+  eq eqExpr(countZero, countOne) = boolFalse .
+  eq eqExpr(countOne, countZero) = boolFalse .
+  eq eqExpr(countOne, countOne) = boolTrue .
+  eq eqExpr(countMany, countMany) = boolTrue .
+  eq eqExpr(countOne, countMany) = boolFalse .
+  eq eqExpr(countMany, countOne) = boolFalse .
+  eq neExpr(countZero, countZero) = boolFalse .
+  eq neExpr(countZero, countOne) = boolTrue .
+  eq neExpr(countOne, countZero) = boolTrue .
+  eq neExpr(countOne, countOne) = boolFalse .
+  eq neExpr(countMany, countMany) = boolFalse .
+  eq neExpr(countOne, countMany) = boolTrue .
+  eq neExpr(countMany, countOne) = boolTrue .
+  eq evalGuard(boolTrue) = gTrue .
+  eq evalGuard(boolFalse) = gFalse .
+  eq evalGuard(exprError) = gError .
+  eq evalAssertion(boolTrue) = aPass .
+  eq evalAssertion(boolFalse) = aFail .
+  eq evalAssertion(exprError) = aError .
 
   --- Event-log projection into typed facts.
   rl [derive-fact] :
@@ -124,6 +201,16 @@ mod WHIPPLETREE-KERNEL is
   rl [guard-error-diagnostic] :
     fact(F) rule(R, F, G) guard(R, F, gError)
     => fact(F) rule(R, F, G) diagnostic(R) .
+
+  crl [guard-expr-true-ready] :
+    fact(F) rule(R, F, G) guardExpr(R, F, Ex)
+    => fact(F) rule(R, F, G) ruleReady(R, F, G)
+    if evalGuard(Ex) == gTrue .
+
+  crl [guard-expr-error-diagnostic] :
+    fact(F) rule(R, F, G) guardExpr(R, F, Ex)
+    => fact(F) rule(R, F, G) diagnostic(R)
+    if evalGuard(Ex) == gError .
 
   rl [domain-guard-true] :
     fact(F) domainGuard(R, F, V, Dm) domainMember(V, Dm)
@@ -165,6 +252,16 @@ mod WHIPPLETREE-KERNEL is
   rl [assertion-error-diagnostic] :
     assertion(A, aError)
     => assertionDiagnostic(A) .
+
+  crl [assertion-expr-fail-diagnostic] :
+    assertionExpr(A, Ex)
+    => assertionDiagnostic(A)
+    if evalAssertion(Ex) == aFail .
+
+  crl [assertion-expr-error-diagnostic] :
+    assertionExpr(A, Ex)
+    => assertionDiagnostic(A)
+    if evalAssertion(Ex) == aError .
 
   --- Optional path reads are allowed only when presence is known.
   rl [read-present-path] :
