@@ -403,6 +403,70 @@ enum LiteralExpr<'a> {
     Ident(&'a str),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Expr {
+    Literal(ExprLiteral),
+    Path(Vec<String>),
+    Array(Vec<Expr>),
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
+    Query {
+        kind: QueryKind,
+        head: String,
+        guard: Option<Box<Expr>>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExprLiteral {
+    String(String),
+    Number(String),
+    Bool(bool),
+    Null,
+    Ident(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnaryOp {
+    Not,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BinaryOp {
+    Or,
+    And,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    In,
+    NotIn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryKind {
+    Fact,
+    Effect,
+}
+
+/// Parses a deterministic expression used by guards, assertions, and branch guards.
+pub fn parse_expression(expr: &str) -> Result<Expr, String> {
+    ExprParser::new(expr).parse()
+}
+
 /// Parses a source file into a recoverable AST plus diagnostics.
 pub fn parse_program(source: &str) -> ParseOutput {
     let lexed = lex(source);
@@ -734,7 +798,7 @@ fn lower_program(program: Program) -> CompileOutput {
                 &agent_names,
                 &mut diagnostics,
             ),
-            Item::Assert(assertion) => lower_assert(assertion, &mut ir),
+            Item::Assert(assertion) => lower_assert(assertion, &mut ir, &mut diagnostics),
             Item::Rule(rule) => lower_rule(rule, &semantic, &mut ir, &mut diagnostics),
         }
     }
@@ -747,7 +811,16 @@ fn lower_program(program: Program) -> CompileOutput {
     }
 }
 
-fn lower_assert(assertion: AssertDecl, ir: &mut IrProgram) {
+fn lower_assert(assertion: AssertDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    if let Err(message) = parse_expression(&assertion.expr) {
+        diagnostics.push(Diagnostic {
+            span: assertion.span,
+            message: format!("invalid assertion expression: {message}"),
+            suggestion: Some(
+                "use a deterministic expression such as `count(Fact) == 1`".to_owned(),
+            ),
+        });
+    }
     ir.assertions.push(IrAssertion {
         expr: assertion.expr,
     });
@@ -1318,6 +1391,7 @@ fn analyze_rule(
     }
     for when in &rule.whens {
         if let (_, Some(guard)) = split_when_guard(&when.text) {
+            validate_expression(rule, guard, semantic, &binding_types, "guard", diagnostics);
             validate_known_field_paths(rule, guard, semantic, &binding_types, diagnostics);
         }
         validate_availability_when(rule, &when.text, semantic, &binding_types, diagnostics);
@@ -1618,6 +1692,178 @@ fn validate_availability_when(
     }
 }
 
+fn validate_expression(
+    rule: &RuleDecl,
+    expr: &str,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    label: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match parse_expression(expr) {
+        Ok(expr) => validate_expr_node(rule, &expr, semantic, binding_types, diagnostics),
+        Err(message) => diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!("rule `{}` has invalid {label} expression: {message}", rule.name.name),
+            suggestion: Some("use deterministic field paths, literals, boolean operators, comparisons, membership, or count/exists/empty".to_owned()),
+        }),
+    }
+}
+
+fn validate_expr_node(
+    rule: &RuleDecl,
+    expr: &Expr,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match expr {
+        Expr::Path(path) => {
+            if path.len() < 2 {
+                return;
+            }
+            let root = &path[0];
+            let Some(schema) = binding_types.get(root) else {
+                return;
+            };
+            if let Err(message) = semantic.schemas.resolve_field_path(schema, &path[1..]) {
+                diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` has invalid expression path `{}`: {message}",
+                        rule.name.name,
+                        path.join(".")
+                    ),
+                    suggestion: Some("use a field declared on the bound schema".to_owned()),
+                });
+            }
+        }
+        Expr::Array(items) => {
+            for item in items {
+                validate_expr_node(rule, item, semantic, binding_types, diagnostics);
+            }
+        }
+        Expr::Unary { expr, .. } => {
+            validate_expr_node(rule, expr, semantic, binding_types, diagnostics)
+        }
+        Expr::Binary { op, left, right } => {
+            validate_expr_node(rule, left, semantic, binding_types, diagnostics);
+            validate_expr_node(rule, right, semantic, binding_types, diagnostics);
+            validate_finite_domain_expr(
+                rule,
+                *op,
+                left,
+                right,
+                semantic,
+                binding_types,
+                diagnostics,
+            );
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                validate_expr_node(rule, arg, semantic, binding_types, diagnostics);
+            }
+        }
+        Expr::Query { guard, .. } => {
+            if let Some(guard) = guard {
+                validate_expr_node(rule, guard, semantic, binding_types, diagnostics);
+            }
+        }
+        Expr::Literal(_) => {}
+    }
+}
+
+fn validate_finite_domain_expr(
+    rule: &RuleDecl,
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !matches!(
+        op,
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::In | BinaryOp::NotIn
+    ) {
+        return;
+    }
+    let Some(domain) = expr_domain(left, semantic, binding_types) else {
+        return;
+    };
+    let literals = match right {
+        Expr::Literal(literal) => vec![expr_literal_name(literal)],
+        Expr::Array(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                Expr::Literal(literal) => Some(expr_literal_name(literal)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for literal in literals.into_iter().flatten() {
+        if !domain.iter().any(|value| value == &literal) {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` compares finite-domain value to unknown `{literal}`",
+                    rule.name.name
+                ),
+                suggestion: Some(format!("use one of: {}", domain.join(", "))),
+            });
+        }
+    }
+}
+
+fn expr_domain(
+    expr: &Expr,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+) -> Option<Vec<String>> {
+    let Expr::Path(path) = expr else {
+        return None;
+    };
+    let root = path.first()?;
+    let schema = binding_types.get(root)?;
+    let ty = semantic
+        .schemas
+        .resolve_field_path(schema, path.get(1..)?)
+        .ok()?;
+    finite_expr_domain(&ty, semantic)
+}
+
+fn finite_expr_domain(ty: &TypeSyntax, semantic: &SemanticContext) -> Option<Vec<String>> {
+    match ty {
+        TypeSyntax::Ref { name } => semantic
+            .schemas
+            .enums
+            .get(&name.name)
+            .map(|variants| variants.iter().cloned().collect()),
+        TypeSyntax::Union { variants, .. } => {
+            let values = variants
+                .iter()
+                .filter_map(|variant| match variant {
+                    TypeSyntax::LiteralString { value, .. } => Some(value.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (!values.is_empty()).then_some(values)
+        }
+        TypeSyntax::AgentRef { agents, .. } => {
+            Some(agents.iter().map(|agent| agent.name.clone()).collect())
+        }
+        _ => None,
+    }
+}
+
+fn expr_literal_name(literal: &ExprLiteral) -> Option<String> {
+    match literal {
+        ExprLiteral::String(value) | ExprLiteral::Ident(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
 fn parse_tell_target(line: &str) -> Option<&str> {
     line.strip_prefix("tell ")?
         .split_whitespace()
@@ -1666,6 +1912,14 @@ fn validate_case_blocks(
                         diagnostics,
                     );
                     if let Some(guard) = branch.guard {
+                        validate_expression(
+                            rule,
+                            guard,
+                            semantic,
+                            binding_types,
+                            "case guard",
+                            diagnostics,
+                        );
                         validate_known_field_paths(
                             rule,
                             guard,
@@ -2440,6 +2694,412 @@ fn parse_literal_expr(expr: &str) -> Option<LiteralExpr<'_>> {
     }
 }
 
+struct ExprParser<'a> {
+    source: &'a str,
+    tokens: Vec<ExprToken>,
+    pos: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExprToken {
+    kind: ExprTokenKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExprTokenKind {
+    Ident(String),
+    String(String),
+    Number(String),
+    Symbol(char),
+    Op(&'static str),
+}
+
+impl<'a> ExprParser<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            tokens: lex_expr(source),
+            pos: 0,
+        }
+    }
+
+    fn parse(mut self) -> Result<Expr, String> {
+        let expr = self.parse_or()?;
+        if self.peek().is_some() {
+            return Err(format!(
+                "unexpected token in expression `{}`",
+                self.source.trim()
+            ));
+        }
+        Ok(expr)
+    }
+
+    fn parse_or(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_and()?;
+        while self.consume_op("||") {
+            let right = self.parse_and()?;
+            expr = Expr::Binary {
+                op: BinaryOp::Or,
+                left: Box::new(expr),
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_and(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_comparison()?;
+        while self.consume_op("&&") {
+            let right = self.parse_comparison()?;
+            expr = Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(expr),
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_comparison(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_unary()?;
+        loop {
+            let op = if self.consume_op("==") {
+                Some(BinaryOp::Eq)
+            } else if self.consume_op("!=") {
+                Some(BinaryOp::Ne)
+            } else if self.consume_op("<=") {
+                Some(BinaryOp::Le)
+            } else if self.consume_op(">=") {
+                Some(BinaryOp::Ge)
+            } else if self.consume_symbol('<') {
+                Some(BinaryOp::Lt)
+            } else if self.consume_symbol('>') {
+                Some(BinaryOp::Gt)
+            } else if self.consume_ident("not") {
+                if !self.consume_ident("in") {
+                    return Err("expected `in` after `not`".to_owned());
+                }
+                Some(BinaryOp::NotIn)
+            } else if self.consume_ident("in") {
+                Some(BinaryOp::In)
+            } else {
+                None
+            };
+            let Some(op) = op else {
+                return Ok(expr);
+            };
+            let right = self.parse_unary()?;
+            expr = Expr::Binary {
+                op,
+                left: Box::new(expr),
+                right: Box::new(right),
+            };
+        }
+    }
+
+    fn parse_unary(&mut self) -> Result<Expr, String> {
+        if self.consume_symbol('!') {
+            return Ok(Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(self.parse_unary()?),
+            });
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<Expr, String> {
+        if self.consume_symbol('(') {
+            let expr = self.parse_or()?;
+            self.expect_symbol(')')?;
+            return Ok(expr);
+        }
+        if self.consume_symbol('[') {
+            let mut items = Vec::new();
+            if self.consume_symbol(']') {
+                return Ok(Expr::Array(items));
+            }
+            loop {
+                items.push(self.parse_or()?);
+                if self.consume_symbol(']') {
+                    break;
+                }
+                self.expect_symbol(',')?;
+            }
+            return Ok(Expr::Array(items));
+        }
+        match self.advance().map(|token| token.kind.clone()) {
+            Some(ExprTokenKind::String(value)) => Ok(Expr::Literal(ExprLiteral::String(value))),
+            Some(ExprTokenKind::Number(value)) => Ok(Expr::Literal(ExprLiteral::Number(value))),
+            Some(ExprTokenKind::Ident(value)) if value == "true" => {
+                Ok(Expr::Literal(ExprLiteral::Bool(true)))
+            }
+            Some(ExprTokenKind::Ident(value)) if value == "false" => {
+                Ok(Expr::Literal(ExprLiteral::Bool(false)))
+            }
+            Some(ExprTokenKind::Ident(value)) if value == "null" => {
+                Ok(Expr::Literal(ExprLiteral::Null))
+            }
+            Some(ExprTokenKind::Ident(value)) if value == "exists" && !self.at_symbol('(') => {
+                Ok(Expr::Call {
+                    name: value,
+                    args: vec![self.parse_primary()?],
+                })
+            }
+            Some(ExprTokenKind::Ident(value))
+                if matches!(value.as_str(), "count" | "exists" | "empty")
+                    && self.at_symbol('(') =>
+            {
+                self.expect_symbol('(')?;
+                if let Some(query) = self.try_parse_query()? {
+                    self.expect_symbol(')')?;
+                    Ok(Expr::Call {
+                        name: value,
+                        args: vec![query],
+                    })
+                } else {
+                    let mut args = Vec::new();
+                    if self.consume_symbol(')') {
+                        return Ok(Expr::Call { name: value, args });
+                    }
+                    loop {
+                        args.push(self.parse_or()?);
+                        if self.consume_symbol(')') {
+                            break;
+                        }
+                        self.expect_symbol(',')?;
+                    }
+                    Ok(Expr::Call { name: value, args })
+                }
+            }
+            Some(ExprTokenKind::Ident(value)) => {
+                let mut path = vec![value];
+                while self.consume_symbol('.') {
+                    let Some(ExprTokenKind::Ident(field)) =
+                        self.advance().map(|token| token.kind.clone())
+                    else {
+                        return Err("expected field name after `.`".to_owned());
+                    };
+                    path.push(field);
+                }
+                if path.len() == 1 {
+                    Ok(Expr::Literal(ExprLiteral::Ident(path.remove(0))))
+                } else {
+                    Ok(Expr::Path(path))
+                }
+            }
+            _ => Err(format!("expected expression in `{}`", self.source.trim())),
+        }
+    }
+
+    fn try_parse_query(&mut self) -> Result<Option<Expr>, String> {
+        let checkpoint = self.pos;
+        let kind = if self.consume_ident("effect") {
+            QueryKind::Effect
+        } else if matches!(
+            self.peek().map(|token| &token.kind),
+            Some(ExprTokenKind::Ident(value)) if value.chars().next().is_some_and(char::is_uppercase)
+        ) {
+            QueryKind::Fact
+        } else {
+            return Ok(None);
+        };
+        let mut head = Vec::new();
+        while let Some(token) = self.peek() {
+            if self.at_symbol(')') || self.at_ident("where") {
+                break;
+            }
+            head.push(self.token_text(token));
+            self.pos += 1;
+        }
+        if head.is_empty() {
+            self.pos = checkpoint;
+            return Ok(None);
+        }
+        let guard = if self.consume_ident("where") {
+            Some(Box::new(self.parse_or()?))
+        } else {
+            None
+        };
+        Ok(Some(Expr::Query {
+            kind,
+            head: join_query_head(&head),
+            guard,
+        }))
+    }
+
+    fn token_text(&self, token: &ExprToken) -> String {
+        match &token.kind {
+            ExprTokenKind::Ident(value) | ExprTokenKind::Number(value) => value.clone(),
+            ExprTokenKind::String(value) => format!("{value:?}"),
+            ExprTokenKind::Symbol(value) => value.to_string(),
+            ExprTokenKind::Op(value) => value.to_string(),
+        }
+    }
+
+    fn peek(&self) -> Option<&ExprToken> {
+        self.tokens.get(self.pos)
+    }
+
+    fn advance(&mut self) -> Option<&ExprToken> {
+        let token = self.tokens.get(self.pos)?;
+        self.pos += 1;
+        Some(token)
+    }
+
+    fn at_symbol(&self, symbol: char) -> bool {
+        matches!(
+            self.peek().map(|token| &token.kind),
+            Some(ExprTokenKind::Symbol(value)) if *value == symbol
+        )
+    }
+
+    fn consume_symbol(&mut self, symbol: char) -> bool {
+        if self.at_symbol(symbol) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_symbol(&mut self, symbol: char) -> Result<(), String> {
+        if self.consume_symbol(symbol) {
+            Ok(())
+        } else {
+            Err(format!("expected `{symbol}`"))
+        }
+    }
+
+    fn at_ident(&self, ident: &str) -> bool {
+        matches!(
+            self.peek().map(|token| &token.kind),
+            Some(ExprTokenKind::Ident(value)) if value == ident
+        )
+    }
+
+    fn consume_ident(&mut self, ident: &str) -> bool {
+        if self.at_ident(ident) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn consume_op(&mut self, op: &'static str) -> bool {
+        if matches!(
+            self.peek().map(|token| &token.kind),
+            Some(ExprTokenKind::Op(value)) if *value == op
+        ) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn join_query_head(tokens: &[String]) -> String {
+    let mut head = String::new();
+    for token in tokens {
+        if token == "." {
+            head.push('.');
+        } else if head.ends_with('.') || head.is_empty() {
+            head.push_str(token);
+        } else {
+            head.push(' ');
+            head.push_str(token);
+        }
+    }
+    head
+}
+
+fn lex_expr(source: &str) -> Vec<ExprToken> {
+    let bytes = source.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if is_ident_start(byte) {
+            let start = index;
+            index += 1;
+            while index < bytes.len() && is_ident_continue(bytes[index]) {
+                index += 1;
+            }
+            tokens.push(ExprToken {
+                kind: ExprTokenKind::Ident(source[start..index].to_owned()),
+            });
+            continue;
+        }
+        if byte.is_ascii_digit() {
+            let start = index;
+            index += 1;
+            while index < bytes.len() && (bytes[index].is_ascii_digit() || bytes[index] == b'.') {
+                index += 1;
+            }
+            tokens.push(ExprToken {
+                kind: ExprTokenKind::Number(source[start..index].to_owned()),
+            });
+            continue;
+        }
+        if byte == b'"' {
+            let start = index + 1;
+            index += 1;
+            while index < bytes.len() && bytes[index] != b'"' {
+                index += 1;
+            }
+            let value = source[start..index.min(bytes.len())].to_owned();
+            index = (index + 1).min(bytes.len());
+            tokens.push(ExprToken {
+                kind: ExprTokenKind::String(value),
+            });
+            continue;
+        }
+        let rest = &source[index..];
+        if rest.starts_with("&&") {
+            tokens.push(ExprToken {
+                kind: ExprTokenKind::Op("&&"),
+            });
+            index += 2;
+        } else if rest.starts_with("||") {
+            tokens.push(ExprToken {
+                kind: ExprTokenKind::Op("||"),
+            });
+            index += 2;
+        } else if rest.starts_with("==") {
+            tokens.push(ExprToken {
+                kind: ExprTokenKind::Op("=="),
+            });
+            index += 2;
+        } else if rest.starts_with("!=") {
+            tokens.push(ExprToken {
+                kind: ExprTokenKind::Op("!="),
+            });
+            index += 2;
+        } else if rest.starts_with("<=") {
+            tokens.push(ExprToken {
+                kind: ExprTokenKind::Op("<="),
+            });
+            index += 2;
+        } else if rest.starts_with(">=") {
+            tokens.push(ExprToken {
+                kind: ExprTokenKind::Op(">="),
+            });
+            index += 2;
+        } else {
+            tokens.push(ExprToken {
+                kind: ExprTokenKind::Symbol(byte as char),
+            });
+            index += 1;
+        }
+    }
+    tokens
+}
+
 fn validate_primitive_literal(
     rule: &RuleDecl,
     record_schema: &str,
@@ -2910,6 +3570,16 @@ fn lex(source: &str) -> Lexed {
             continue;
         }
 
+        if matches!(byte, b'<' | b'>') && bytes.get(index + 1) == Some(&b'=') {
+            index += 2;
+            continue;
+        }
+
+        if matches!(byte, b'&' | b'|') && bytes.get(index + 1) == Some(&byte) {
+            index += 2;
+            continue;
+        }
+
         if byte == b'-' && bytes.get(index + 1) == Some(&b'>') {
             tokens.push(Token {
                 kind: TokenKind::ThinArrow,
@@ -2922,7 +3592,7 @@ fn lex(source: &str) -> Lexed {
             continue;
         }
 
-        if b"{}[]()<>,?|.+".contains(&byte) {
+        if b"{}[]()<>,?|.+!".contains(&byte) {
             tokens.push(Token {
                 kind: TokenKind::Symbol(byte as char),
                 span: SourceSpan {

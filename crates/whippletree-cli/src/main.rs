@@ -17,8 +17,9 @@ use whippletree_kernel::{
     ProgramVersionInput, RuntimeKernel,
 };
 use whippletree_parser::{
-    DependencyPredicate as IrDependencyPredicate, Diagnostic, IrEffectNode, IrPrimitiveType,
-    IrProgram, IrRule, IrType, SourceSpan,
+    parse_expression, BinaryOp, DependencyPredicate as IrDependencyPredicate, Diagnostic, Expr,
+    ExprLiteral, IrEffectNode, IrPrimitiveType, IrProgram, IrRule, IrType, QueryKind, SourceSpan,
+    UnaryOp,
 };
 use whippletree_store::{
     ClaimableEffect, EffectCompletion, EffectView, EventView, EvidenceLinkView, EvidenceView,
@@ -1535,26 +1536,9 @@ fn split_when_guard(when: &str) -> (&str, Option<&str>) {
 }
 
 fn eval_guard(guard: &str, context: &RuleContext) -> bool {
-    let guard = guard.trim();
-    if let Some((left, right)) = guard.split_once("==") {
-        return guard_value(left, context) == guard_literal(right);
-    }
-    if let Some((left, right)) = guard.split_once("!=") {
-        return guard_value(left, context) != guard_literal(right);
-    }
-    false
-}
-
-fn guard_value(expr: &str, context: &RuleContext) -> Value {
-    let expr = expr.trim();
-    if let Some((binding, path)) = expr.split_once('.') {
-        return context_path_value(context, binding.trim(), path.trim()).unwrap_or(Value::Null);
-    }
-    parse_guard_literal(expr)
-}
-
-fn guard_literal(expr: &str) -> Value {
-    parse_guard_literal(expr.trim())
+    parse_expression(guard).ok().is_some_and(|expr| {
+        eval_expr(&expr, &EvalScope::rule(context, &[], &[])).as_bool() == Some(true)
+    })
 }
 
 fn parse_guard_literal(expr: &str) -> Value {
@@ -1589,18 +1573,10 @@ fn eval_assertions(
 
 fn eval_assertion(expr: &str, facts: &[FactView], effects: &[EffectView]) -> AssertionReport {
     let expr = expr.trim();
-    let (passed, actual) = if let Some((left, op, right)) = split_top_level_comparison(expr) {
-        let actual = eval_projection_expr(left, facts, effects);
-        let expected = parse_guard_literal(right);
-        match op {
-            "==" => (actual == expected, actual),
-            "!=" => (actual != expected, actual),
-            _ => (false, actual),
-        }
-    } else {
-        let actual = eval_projection_expr(expr, facts, effects);
-        (actual == Value::Bool(true), actual)
-    };
+    let actual = parse_expression(expr)
+        .map(|parsed| eval_expr(&parsed, &EvalScope::assertions(facts, effects)))
+        .unwrap_or(Value::Bool(false));
+    let passed = actual.as_bool() == Some(true);
     AssertionReport {
         expr: expr.to_owned(),
         passed,
@@ -1608,125 +1584,242 @@ fn eval_assertion(expr: &str, facts: &[FactView], effects: &[EffectView]) -> Ass
     }
 }
 
-fn split_top_level_comparison(expr: &str) -> Option<(&str, &'static str, &str)> {
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (index, ch) in expr.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
+struct EvalScope<'a> {
+    context: Option<&'a RuleContext>,
+    facts: &'a [FactView],
+    effects: &'a [EffectView],
+    projection: Option<&'a Value>,
+}
+
+impl<'a> EvalScope<'a> {
+    fn rule(context: &'a RuleContext, facts: &'a [FactView], effects: &'a [EffectView]) -> Self {
+        Self {
+            context: Some(context),
+            facts,
+            effects,
+            projection: None,
         }
-        match ch {
-            '"' => in_string = true,
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            '=' if depth == 0 && expr[index..].starts_with("==") => {
-                return Some((expr[..index].trim(), "==", expr[index + 2..].trim()));
-            }
-            '!' if depth == 0 && expr[index..].starts_with("!=") => {
-                return Some((expr[..index].trim(), "!=", expr[index + 2..].trim()));
-            }
-            _ => {}
+    }
+
+    fn assertions(facts: &'a [FactView], effects: &'a [EffectView]) -> Self {
+        Self {
+            context: None,
+            facts,
+            effects,
+            projection: None,
         }
+    }
+
+    fn projection(&self, projection: &'a Value) -> Self {
+        Self {
+            context: self.context,
+            facts: self.facts,
+            effects: self.effects,
+            projection: Some(projection),
+        }
+    }
+}
+
+fn eval_expr(expr: &Expr, scope: &EvalScope<'_>) -> Value {
+    match expr {
+        Expr::Literal(ExprLiteral::Ident(value)) => eval_ident_literal(value, scope),
+        Expr::Literal(literal) => eval_expr_literal(literal),
+        Expr::Path(path) => eval_path(path, scope).unwrap_or(Value::Null),
+        Expr::Array(items) => {
+            Value::Array(items.iter().map(|item| eval_expr(item, scope)).collect())
+        }
+        Expr::Unary { op, expr } => match op {
+            UnaryOp::Not => Value::Bool(!truthy(&eval_expr(expr, scope))),
+        },
+        Expr::Binary { op, left, right } => eval_binary(*op, left, right, scope),
+        Expr::Call { name, args } => eval_call(name, args, scope),
+        Expr::Query { .. } => Value::Number(count_query(expr, scope).into()),
+    }
+}
+
+fn eval_ident_literal(value: &str, scope: &EvalScope<'_>) -> Value {
+    if let Some(projection) = scope.projection {
+        if let Some(value) = projection.get(value) {
+            return value.clone();
+        }
+    }
+    eval_expr_literal(&ExprLiteral::Ident(value.to_owned()))
+}
+
+fn eval_expr_literal(literal: &ExprLiteral) -> Value {
+    match literal {
+        ExprLiteral::String(value) | ExprLiteral::Ident(value) => Value::String(value.clone()),
+        ExprLiteral::Number(value) => value
+            .parse::<i64>()
+            .map(|number| Value::Number(number.into()))
+            .or_else(|_| {
+                value
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(Value::Number)
+                    .ok_or(())
+            })
+            .unwrap_or_else(|_| Value::String(value.clone())),
+        ExprLiteral::Bool(value) => Value::Bool(*value),
+        ExprLiteral::Null => Value::Null,
+    }
+}
+
+fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, scope: &EvalScope<'_>) -> Value {
+    match op {
+        BinaryOp::Or => {
+            let left = eval_expr(left, scope);
+            if truthy(&left) {
+                Value::Bool(true)
+            } else {
+                Value::Bool(truthy(&eval_expr(right, scope)))
+            }
+        }
+        BinaryOp::And => {
+            let left = eval_expr(left, scope);
+            if !truthy(&left) {
+                Value::Bool(false)
+            } else {
+                Value::Bool(truthy(&eval_expr(right, scope)))
+            }
+        }
+        BinaryOp::Eq => Value::Bool(eval_expr(left, scope) == eval_expr(right, scope)),
+        BinaryOp::Ne => Value::Bool(eval_expr(left, scope) != eval_expr(right, scope)),
+        BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+            let left = eval_expr(left, scope);
+            let right = eval_expr(right, scope);
+            let result = match (number_value(&left), number_value(&right)) {
+                (Some(left), Some(right)) => match op {
+                    BinaryOp::Lt => left < right,
+                    BinaryOp::Le => left <= right,
+                    BinaryOp::Gt => left > right,
+                    BinaryOp::Ge => left >= right,
+                    _ => false,
+                },
+                _ => false,
+            };
+            Value::Bool(result)
+        }
+        BinaryOp::In | BinaryOp::NotIn => {
+            let needle = eval_expr(left, scope);
+            let haystack = eval_expr(right, scope);
+            let contains = haystack
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item == &needle));
+            Value::Bool(if op == BinaryOp::In {
+                contains
+            } else {
+                !contains
+            })
+        }
+    }
+}
+
+fn eval_call(name: &str, args: &[Expr], scope: &EvalScope<'_>) -> Value {
+    match (name, args) {
+        ("count", [query @ Expr::Query { .. }]) => Value::Number(count_query(query, scope).into()),
+        ("exists", [query @ Expr::Query { .. }]) => Value::Bool(count_query(query, scope) > 0),
+        ("exists", [expr]) => Value::Bool(!eval_expr(expr, scope).is_null()),
+        ("empty", [query @ Expr::Query { .. }]) => Value::Bool(count_query(query, scope) == 0),
+        ("empty", [expr]) => Value::Bool(is_empty_value(&eval_expr(expr, scope))),
+        _ => Value::Null,
+    }
+}
+
+fn count_query(query: &Expr, scope: &EvalScope<'_>) -> i64 {
+    let Expr::Query { kind, head, guard } = query else {
+        return 0;
+    };
+    match kind {
+        QueryKind::Fact => scope
+            .facts
+            .iter()
+            .filter(|fact| fact.name == head.trim())
+            .filter(|fact| {
+                guard.as_ref().is_none_or(|guard| {
+                    let value = json_from_str(&fact.value_json);
+                    eval_expr(guard, &scope.projection(&value)).as_bool() == Some(true)
+                })
+            })
+            .count() as i64,
+        QueryKind::Effect => {
+            let kind = head
+                .trim()
+                .strip_prefix("kind ")
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            scope
+                .effects
+                .iter()
+                .filter(|effect| kind.is_none_or(|kind| effect.kind == kind))
+                .filter(|effect| {
+                    guard.as_ref().is_none_or(|guard| {
+                        let value = json!({
+                            "kind": effect.kind,
+                            "target": effect.target,
+                            "status": effect.status,
+                            "profile": effect.profile,
+                        });
+                        eval_expr(guard, &scope.projection(&value)).as_bool() == Some(true)
+                    })
+                })
+                .count() as i64
+        }
+    }
+}
+
+fn eval_path(path: &[String], scope: &EvalScope<'_>) -> Option<Value> {
+    if path.is_empty() {
+        return None;
+    }
+    if let Some(context) = scope.context {
+        if let Some(first) = path.first() {
+            if let Some(rest) = path.get(1..) {
+                if rest.is_empty() {
+                    return context.bindings.iter().find_map(|(binding, fact)| {
+                        (binding == first).then(|| json_from_str(&fact.value_json))
+                    });
+                }
+                if let Some(value) = context_path_value(context, first, &rest.join(".")) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    if let Some(projection) = scope.projection {
+        let mut current = projection;
+        for field in path {
+            current = current.get(field)?;
+        }
+        return Some(current.clone());
     }
     None
 }
 
-fn eval_projection_expr(expr: &str, facts: &[FactView], effects: &[EffectView]) -> Value {
-    let expr = expr.trim();
-    if let Some(inner) = expr
-        .strip_prefix("count(")
-        .and_then(|value| value.strip_suffix(')'))
-    {
-        return Value::Number(count_projection_query(inner, facts, effects).into());
-    }
-    if let Some(inner) = expr
-        .strip_prefix("exists(")
-        .and_then(|value| value.strip_suffix(')'))
-    {
-        return Value::Bool(count_projection_query(inner, facts, effects) > 0);
-    }
-    parse_guard_literal(expr)
-}
-
-fn count_projection_query(query: &str, facts: &[FactView], effects: &[EffectView]) -> i64 {
-    let query = query.trim();
-    if let Some(rest) = query.strip_prefix("effect") {
-        return count_effect_query(rest.trim(), effects);
-    }
-    count_fact_query(query, facts)
-}
-
-fn count_fact_query(query: &str, facts: &[FactView]) -> i64 {
-    let (name, guard) = split_query_guard(query);
-    facts
-        .iter()
-        .filter(|fact| fact.name == name)
-        .filter(|fact| {
-            guard.is_none_or(|guard| {
-                let value = json_from_str(&fact.value_json);
-                eval_projection_guard(guard, &value)
-            })
-        })
-        .count() as i64
-}
-
-fn count_effect_query(query: &str, effects: &[EffectView]) -> i64 {
-    let (head, guard) = split_query_guard(query);
-    let kind = head
-        .strip_prefix("kind ")
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    effects
-        .iter()
-        .filter(|effect| kind.is_none_or(|kind| effect.kind == kind))
-        .filter(|effect| {
-            guard.is_none_or(|guard| {
-                let value = json!({
-                    "kind": effect.kind,
-                    "target": effect.target,
-                    "status": effect.status,
-                    "profile": effect.profile,
-                });
-                eval_projection_guard(guard, &value)
-            })
-        })
-        .count() as i64
-}
-
-fn split_query_guard(query: &str) -> (&str, Option<&str>) {
-    match query.split_once(" where ") {
-        Some((head, guard)) => (head.trim(), Some(guard.trim())),
-        None => (query.trim(), None),
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Bool(value) => *value,
+        Value::Null => false,
+        Value::Array(values) => !values.is_empty(),
+        Value::String(value) => !value.is_empty(),
+        Value::Number(value) => value.as_i64().unwrap_or(0) != 0,
+        Value::Object(value) => !value.is_empty(),
     }
 }
 
-fn eval_projection_guard(guard: &str, value: &Value) -> bool {
-    let guard = guard.trim();
-    if let Some((left, right)) = guard.split_once("==") {
-        return projection_path_value(value, left.trim())
-            == Some(parse_guard_literal(right.trim()));
-    }
-    if let Some((left, right)) = guard.split_once("!=") {
-        return projection_path_value(value, left.trim())
-            != Some(parse_guard_literal(right.trim()));
-    }
-    false
+fn number_value(value: &Value) -> Option<f64> {
+    value.as_f64()
 }
 
-fn projection_path_value(value: &Value, path: &str) -> Option<Value> {
-    let mut current = value;
-    for field in path.split('.') {
-        current = current.get(field.trim())?;
+fn is_empty_value(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(value) => value.is_empty(),
+        Value::Array(value) => value.is_empty(),
+        Value::Object(value) => value.is_empty(),
+        _ => false,
     }
-    Some(current.clone())
 }
 
 fn lower_rule(

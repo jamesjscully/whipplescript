@@ -1153,6 +1153,89 @@ rule route
     let _ = fs::remove_file(source_path);
 }
 
+#[test]
+fn dev_evaluates_shared_expression_kernel_for_guards_and_assertions() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("expression-kernel");
+    fs::write(
+        &source_path,
+        r#"
+workflow ExpressionKernelE2E
+
+class ExprTask {
+  provider "codex" | "claude" | "pi"
+  priority int
+  status "queued" | "blocked"
+}
+
+class ExprResult {
+  provider string
+  priority int
+  status "accepted"
+}
+
+assert count(ExprResult) == 1
+assert exists(ExprResult where provider == codex && priority >= 3)
+assert empty(ExprResult where provider == pi)
+assert count(ExprResult where priority > 1 && provider in ["codex", "claude"]) == 1
+assert ("codex" in ["codex", "claude"]) && !("pi" in ["codex"])
+assert empty([])
+
+rule seed
+  when started
+=> {
+  record ExprTask {
+    provider "codex"
+    priority 5
+    status "queued"
+  }
+
+  record ExprTask {
+    provider "pi"
+    priority 1
+    status "blocked"
+  }
+}
+
+rule accept_task
+  when ExprTask as task where (task.priority >= 3 && task.provider in ["codex", "claude"]) && !(task.status == "blocked")
+=> {
+  record ExprResult {
+    provider task.provider
+    priority task.priority
+    status "accepted"
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    assert!(dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("assertions")
+        .iter()
+        .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
 fn run_json(bin: &str, args: &[&str]) -> Value {
     let text = run_text(bin, args);
     serde_json::from_str(&text).expect("valid JSON output")

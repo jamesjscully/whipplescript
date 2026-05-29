@@ -50,28 +50,28 @@ The expression kernel covers deterministic logic used by:
 
 | Feature | Spec | Parser | Type Check | Runtime Eval | Maude | Tests | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Guarded fact match `when X as x where expr` | [x] | [x] | [~] | [~] | [~] | [x] | Guards are raw text; only known field paths and simple equality are checked/evaluated. |
-| Top-level `assert expr` | [x] | [x] | [ ] | [x] | [~] | [x] | Assertions run after `dev`; not yet typed before runtime. |
-| Fact projection query `Class where expr` | [x] | [~] | [ ] | [~] | [ ] | [x] | Currently parsed inside assertion strings, not as a real AST node. |
-| Effect projection query `effect kind K where expr` | [x] | [~] | [ ] | [~] | [ ] | [x] | Supports effect kind plus simple `where` equality/inequality over effect fields. |
-| `count(collection)` | [x] | [~] | [ ] | [x] | [ ] | [x] | Implemented for fact/effect projection assertions. |
-| `exists(collection)` | [x] | [~] | [ ] | [x] | [ ] | [ ] | Implemented for assertion projection counts, but lacks focused tests and guard support. |
-| `exists path` presence proof | [x] | [ ] | [ ] | [ ] | [~] | [ ] | Needed for optional field access in guards. |
-| `empty(collection)` / `empty(expr)` | [x] | [ ] | [ ] | [ ] | [ ] | [ ] | Not implemented. |
-| Equality `==` | [x] | [~] | [ ] | [~] | [~] | [x] | Runtime supports JSON scalar equality; compiler does not type-check comparability. |
-| Inequality `!=` | [x] | [~] | [ ] | [~] | [~] | [ ] | Implemented with same limitations as equality; needs explicit tests. |
-| Boolean `&&` | [x] | [ ] | [ ] | [ ] | [ ] | [ ] | Must short-circuit and carry presence proofs forward. |
-| Boolean `||` | [x] | [ ] | [ ] | [ ] | [ ] | [ ] | Must short-circuit; presence proof behavior should stay conservative. |
-| Boolean `!` | [x] | [ ] | [ ] | [ ] | [ ] | [ ] | Needed for `!(x == null)` proof form. |
-| Ordering `< <= > >=` | [x] | [ ] | [ ] | [ ] | [ ] | [ ] | Only int, float, duration, time; string ordering remains disabled unless explicitly enabled. |
-| Membership `in` / `not in` | [x] | [ ] | [ ] | [ ] | [ ] | [ ] | Arrays require item compatibility; maps require string key lookup. |
-| Parentheses and precedence | [x] | [ ] | [ ] | [~] | [ ] | [ ] | Assertion splitter ignores comparisons inside parentheses, but there is no general parser. |
-| Array literals | [x] | [ ] | [ ] | [ ] | [ ] | [ ] | Required for membership examples like `provider in ["codex", "claude"]`. |
+| Guarded fact match `when X as x where expr` | [x] | [x] | [~] | [x] | [~] | [x] | Guards now use the shared expression parser/evaluator; static typing remains partial. |
+| Top-level `assert expr` | [x] | [x] | [~] | [x] | [~] | [x] | Assertions parse through the shared expression parser and run after `dev`; typed assertion scopes remain partial. |
+| Fact projection query `Class where expr` | [x] | [x] | [~] | [x] | [ ] | [x] | Parsed as expression query nodes and evaluated in assertions. |
+| Effect projection query `effect kind K where expr` | [x] | [x] | [~] | [x] | [ ] | [x] | Parsed as expression query nodes and evaluated in assertions. |
+| `count(collection)` | [x] | [x] | [~] | [x] | [ ] | [x] | Implemented over fact/effect projection queries. |
+| `exists(collection)` | [x] | [x] | [~] | [x] | [ ] | [x] | Implemented over projection queries. |
+| `exists path` presence proof | [x] | [x] | [~] | [x] | [~] | [ ] | Runtime checks non-null; proof tracking is not implemented. |
+| `empty(collection)` / `empty(expr)` | [x] | [x] | [~] | [x] | [ ] | [x] | Implemented for projections, arrays, objects, strings, and null. |
+| Equality `==` | [x] | [x] | [~] | [x] | [~] | [x] | Runtime supports JSON scalar equality; compiler has finite-domain typo diagnostics but not full comparability typing. |
+| Inequality `!=` | [x] | [x] | [~] | [x] | [~] | [x] | Implemented with same limitations as equality. |
+| Boolean `&&` | [x] | [x] | [~] | [x] | [ ] | [x] | Runtime short-circuits; presence-proof tracking remains future work. |
+| Boolean `||` | [x] | [x] | [~] | [x] | [ ] | [x] | Runtime short-circuits; presence-proof behavior remains conservative. |
+| Boolean `!` | [x] | [x] | [~] | [x] | [ ] | [x] | Implemented in shared expression parser/evaluator. |
+| Ordering `< <= > >=` | [x] | [x] | [~] | [x] | [ ] | [x] | Runtime supports numeric ordering; static type rejection is still partial. |
+| Membership `in` / `not in` | [x] | [x] | [~] | [x] | [~] | [x] | Runtime supports array membership; finite-domain typos are diagnosed for path-vs-literal/array forms. |
+| Parentheses and precedence | [x] | [x] | [~] | [x] | [ ] | [x] | Shared recursive-descent parser handles precedence. |
+| Array literals | [x] | [x] | [~] | [x] | [~] | [x] | Implemented for expression evaluation; common-element typing is not complete. |
 | Object literals in expected schema contexts | [x] | [~] | [~] | [~] | [ ] | [x] | Record bodies exist; expression-level object literals are not general AST nodes. |
 | Map index `path["key"]` | [x] | [ ] | [ ] | [ ] | [ ] | [ ] | Field paths currently support dot access only in guard/assertion runtime. |
 | Enum variant values | [x] | [~] | [~] | [~] | [~] | [~] | Enum schemas exist; expression values are currently strings at runtime. |
 | Literal-union values | [x] | [~] | [~] | [~] | [~] | [x] | Literal types exist; guards do not yet verify literal-domain membership. |
-| Typed finite-domain pattern branches | [x] | [~] | [~] | [~] | [x] | [x] | Concrete rule-body `case` branches work for enum/literal values in `whip dev`; no typed expression AST yet. |
+| Typed finite-domain pattern branches | [x] | [~] | [~] | [x] | [x] | [x] | Concrete rule-body `case` branches work for enum/literal values in `whip dev`; branch guards use the shared expression evaluator. |
 | Exhaustiveness checks for finite patterns | [x] | [~] | [~] | [ ] | [x] | [x] | Parser diagnostics cover enum/literal/optional rule-body cases without fallback; not yet expression-level or source-span precise. |
 | Optional Some/None pattern branches | [x] | [~] | [~] | [~] | [x] | [x] | Rule-body `Some name` binds a present runtime value; static presence proof is still local to case validation. |
 | Optional presence proofs | [x] | [ ] | [ ] | [ ] | [~] | [ ] | Must reject unsafe optional field access unless proven present. |
@@ -84,27 +84,27 @@ The expression kernel covers deterministic logic used by:
 
 ### 1. Expression AST And Parser
 
-- [ ] Add expression AST nodes for literals, paths, unary ops, binary ops,
+- [~] Add expression AST nodes for literals, paths, unary ops, binary ops,
   calls, array literals, object literals, fact queries, effect queries, and
   map indexing.
 - [ ] Replace raw guard strings in the typed IR with parsed expression nodes
   while preserving source spans.
 - [ ] Replace raw assertion strings in the typed IR with parsed expression nodes
   while preserving source spans.
-- [ ] Implement precedence and associativity exactly as specified:
+- [x] Implement precedence and associativity exactly as specified:
   path/indexing, unary/calls, ordering/membership, equality, `&&`, `||`.
-- [ ] Parse `exists path` separately from `exists(collection)`.
-- [ ] Parse `not in` as one membership operator, not as `not` plus identifier.
+- [x] Parse `exists path` separately from `exists(collection)`.
+- [x] Parse `not in` as one membership operator, not as `not` plus identifier.
 - [ ] Keep formatter output stable and parenthesize when precedence could be
   surprising.
-- [ ] Add invalid syntax diagnostics for dangling operators, unclosed
+- [~] Add invalid syntax diagnostics for dangling operators, unclosed
   parentheses, malformed queries, and unsupported function names.
 
 ### 2. Type Checker
 
-- [ ] Compute expression free bindings and verify each binding exists in the
+- [~] Compute expression free bindings and verify each binding exists in the
   current rule/assertion scope.
-- [ ] Resolve every field/index path against class, array, map, optional, ref,
+- [~] Resolve every field/index path against class, array, map, optional, ref,
   and projection types.
 - [ ] Track result type for every expression node.
 - [ ] Reject non-boolean guard/assertion results.
@@ -117,28 +117,28 @@ The expression kernel covers deterministic logic used by:
 - [ ] Reject incompatible equality comparisons.
 - [ ] Reject ordering on unsupported types and incompatible numeric/time types.
 - [ ] Reject string ordering unless a later spec explicitly enables it.
-- [ ] Reject enum variants outside their enum domain.
-- [ ] Reject literal values outside literal unions.
+- [~] Reject enum variants outside their enum domain.
+- [~] Reject literal values outside literal unions.
 - [ ] Reject membership against non-array and non-map operands.
 - [ ] Reject array literals whose elements do not share a valid common type.
 - [ ] Reject object literals outside an expected schema context.
 - [ ] Reject plain strings where `AgentRef<...>` is required.
-- [ ] Emit statically unsatisfiable finite-domain guard diagnostics when useful,
+- [~] Emit statically unsatisfiable finite-domain guard diagnostics when useful,
   for example `task.provider == "gpt5"` against `"codex" | "claude" | "pi"`.
 
 ### 3. Runtime Evaluator
 
-- [ ] Replace ad hoc guard and assertion string evaluators with one typed
+- [x] Replace ad hoc guard and assertion string evaluators with one typed
   expression evaluator.
 - [ ] Preserve a strict `Missing` result distinct from `Null`.
-- [ ] Implement short-circuiting `&&` and `||`.
-- [ ] Implement `!`.
-- [ ] Implement scalar equality and inequality over typed values.
-- [ ] Implement ordering over int, float, duration, and time.
-- [ ] Implement membership for arrays and map keys.
-- [ ] Implement `exists path`, `exists(collection)`, `empty(...)`, and
+- [x] Implement short-circuiting `&&` and `||`.
+- [x] Implement `!`.
+- [x] Implement scalar equality and inequality over typed values.
+- [~] Implement ordering over int, float, duration, and time.
+- [~] Implement membership for arrays and map keys.
+- [x] Implement `exists path`, `exists(collection)`, `empty(...)`, and
   `count(...)`.
-- [ ] Implement fact and effect projection reads over typed query filters.
+- [x] Implement fact and effect projection reads over typed query filters.
 - [ ] Ensure guard `false` means non-match and guard `Error` means no rule
   commit plus diagnostic.
 - [ ] Ensure assertion `false` or `Error` cannot mutate facts/effects and
@@ -205,7 +205,7 @@ The expression kernel covers deterministic logic used by:
 - [~] Parser/type-checker tests for enum, literal, optional, and tagged-union
   pattern branches.
 - [x] Exhaustiveness diagnostic tests for finite pattern domains.
-- [ ] E2E test showing `&&`, `||`, `!`, ordering, `in`, `exists`, `empty`, and
+- [x] E2E test showing `&&`, `||`, `!`, ordering, `in`, `exists`, `empty`, and
   `count` in source.
 - [ ] E2E test showing assertion failures reach JSON output and nonzero exit.
 - [ ] E2E test showing failed guards do not enqueue effects.
@@ -235,9 +235,9 @@ The expression kernel covers deterministic logic used by:
 
 - [x] A shared task schema can route work across Codex, Claude, and Pi using
   deterministic source metadata without duplicate provider-specific classes.
-- [ ] Guards using enum/literal fields are type-checked and finite-domain typos
+- [~] Guards using enum/literal fields are type-checked and finite-domain typos
   are rejected or diagnosed before runtime.
-- [ ] Boolean, ordering, membership, presence, count, empty, and exists
+- [~] Boolean, ordering, membership, presence, count, empty, and exists
   expressions work in both guards and assertions where semantically valid.
 - [ ] Enum/literal, optional, and tagged-union pattern branches are typed,
   deterministic, and exhaustiveness-checked where the domain is finite.
