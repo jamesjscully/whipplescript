@@ -582,13 +582,14 @@ Goal: prove the language is ergonomic before we harden syntax.
   - Generated Maude model search passes for examples with effect dependencies.
   - Dogfood guesses are recorded in `spec/examples.md`; companion authoring
     guidance is updated in `spec/companion-skill.md`.
-  - Final-audit gap: equality guards remain intentionally unsupported until the
-    guard-expression grammar is designed.
+  - Follow-up: guarded fact matches and source assertions now exist, but the
+    full expression kernel is still tracked separately in
+    `spec/expression-kernel-tracker.md`.
   - Fixed during final audit: `as binding` after a multi-line string now
     receives a targeted diagnostic.
-  - Dogfood gap: provider-language e2e currently needs duplicate
-    provider-specific task classes because guarded fact matching and typed
-    dynamic agent targets are not implemented.
+  - Dogfood gap: provider-language e2e now uses one shared task schema, but
+    typed dynamic agent targets, static matrices, and action/template expansion
+    are not implemented.
 
 Acceptance:
 
@@ -603,16 +604,27 @@ Acceptance:
 Goal: remove provider/model routing decisions from prompts and model outputs
 while keeping workflow source compact.
 
+Detailed guard/assertion expression coverage is tracked in
+[expression-kernel-tracker.md](expression-kernel-tracker.md). Stage 10b should
+not be considered complete until that tracker reaches its acceptance gates.
+
 - [x] Add guarded fact matches:
   `when LanguageTask as task where task.provider == "codex"`.
 - [ ] Type-check guard expressions against matched schemas, enum variants,
   literal unions, optional presence proofs, and scalar comparison rules.
+- [ ] Add full expression parser/AST support for boolean logic, ordering,
+  membership, count/empty/exists, query filters, array literals, map indexing,
+  parentheses, and precedence.
 - [x] Add a finite Maude expression-kernel model for guard true/false/error,
   optional presence, enum/literal domains, assertions, and AgentRef validity.
 - [ ] Extend generated per-program Maude checks so rule firing is gated by
   lowered guard predicates before effect graphs can commit.
-- [ ] Add deterministic assertion syntax over fact/effect projections for e2e
+- [x] Add deterministic assertion syntax over fact/effect projections for e2e
   checks.
+- [ ] Replace ad hoc guard/assertion string evaluators with a shared typed
+  expression evaluator.
+- [ ] Preserve `Missing` separately from `Null` and reject unsafe optional field
+  access unless a presence proof exists.
 - [ ] Add static matrix seeding for small typed fixture tables.
 - [ ] Add rule-template/action-block expansion for repeated effect chains,
   preserving source spans, idempotency keys, and compiled IR visibility.
@@ -627,12 +639,14 @@ while keeping workflow source compact.
 
 Acceptance:
 
-- [ ] A single shared task schema can route six language tasks across Codex,
+- [x] A single shared task schema can route six language tasks across Codex,
   Claude, and Pi without duplicate provider-specific classes.
-- [ ] Provider counts, agent-turn counts, and BAML-review counts are asserted in
+- [x] Provider counts, agent-turn counts, and BAML-review counts are asserted in
   source or first-class assertion fixtures.
 - [ ] The BAML review output contains only reviewable artifact qualities unless
   the workflow explicitly reviews provider evidence.
+- [ ] Guard expressions are parsed, typed, and evaluated through the expression
+  kernel rather than raw string splitting.
 
 ## Stage 11: E2E Test System
 

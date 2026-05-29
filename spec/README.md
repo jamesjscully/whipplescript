@@ -33,6 +33,7 @@ timeouts, and replay. The language owns policy.
 - [effects-and-capabilities.md](effects-and-capabilities.md): outbox effects, provider bindings, profiles
 - [type-system.md](type-system.md): boundary types, schemas, validation, and BAML lowering
 - [expression-kernel.md](expression-kernel.md): pure guard/assertion expression semantics
+- [expression-kernel-tracker.md](expression-kernel-tracker.md): implementation checklist for guard/assertion expression coverage
 - [capability-registry.md](capability-registry.md): runtime authority bindings and enforcement modes
 - [plugin-system.md](plugin-system.md): Pi-inspired package, plugin, and resource model
 - [skills.md](skills.md): deterministic skill registry and attachment model
