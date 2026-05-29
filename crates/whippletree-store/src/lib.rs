@@ -303,6 +303,52 @@ pub struct ArtifactView {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiagnosticRecord<'a> {
+    pub instance_id: Option<&'a str>,
+    pub program_id: Option<&'a str>,
+    pub program_version_id: Option<&'a str>,
+    pub severity: &'a str,
+    pub code: Option<&'a str>,
+    pub message: &'a str,
+    pub source_span_json: Option<&'a str>,
+    pub subject_type: Option<&'a str>,
+    pub subject_id: Option<&'a str>,
+    pub event_id: Option<&'a str>,
+    pub effect_id: Option<&'a str>,
+    pub run_id: Option<&'a str>,
+    pub assertion_id: Option<&'a str>,
+    pub evidence_ids_json: &'a str,
+    pub artifact_ids_json: &'a str,
+    pub causation_id: Option<&'a str>,
+    pub correlation_id: Option<&'a str>,
+    pub idempotency_key: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticView {
+    pub diagnostic_id: String,
+    pub instance_id: Option<String>,
+    pub program_id: Option<String>,
+    pub program_version_id: Option<String>,
+    pub severity: String,
+    pub code: Option<String>,
+    pub message: String,
+    pub source_span_json: Option<String>,
+    pub subject_type: Option<String>,
+    pub subject_id: Option<String>,
+    pub event_id: Option<String>,
+    pub effect_id: Option<String>,
+    pub run_id: Option<String>,
+    pub assertion_id: Option<String>,
+    pub evidence_ids_json: String,
+    pub artifact_ids_json: String,
+    pub causation_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NewInboxItem<'a> {
     pub inbox_item_id: &'a str,
     pub instance_id: &'a str,
@@ -1453,6 +1499,78 @@ impl SqliteStore {
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn record_diagnostic(&self, diagnostic: DiagnosticRecord<'_>) -> StoreResult<String> {
+        insert_diagnostic_on(&self.connection, diagnostic)
+    }
+
+    pub fn list_diagnostics(&self, instance_id: Option<&str>) -> StoreResult<Vec<DiagnosticView>> {
+        let mut sql = r#"
+            SELECT
+                diagnostic_id,
+                instance_id,
+                program_id,
+                program_version_id,
+                severity,
+                code,
+                message,
+                source_span_json,
+                subject_type,
+                subject_id,
+                event_id,
+                effect_id,
+                run_id,
+                assertion_id,
+                evidence_ids_json,
+                artifact_ids_json,
+                causation_id,
+                correlation_id,
+                idempotency_key,
+                created_at
+            FROM diagnostics
+        "#
+        .to_owned();
+        if instance_id.is_some() {
+            sql.push_str(" WHERE instance_id = ?1");
+        }
+        sql.push_str(" ORDER BY created_at, diagnostic_id");
+
+        let mut statement = self.connection.prepare(&sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(DiagnosticView {
+                diagnostic_id: row.get(0)?,
+                instance_id: row.get(1)?,
+                program_id: row.get(2)?,
+                program_version_id: row.get(3)?,
+                severity: row.get(4)?,
+                code: row.get(5)?,
+                message: row.get(6)?,
+                source_span_json: row.get(7)?,
+                subject_type: row.get(8)?,
+                subject_id: row.get(9)?,
+                event_id: row.get(10)?,
+                effect_id: row.get(11)?,
+                run_id: row.get(12)?,
+                assertion_id: row.get(13)?,
+                evidence_ids_json: row.get(14)?,
+                artifact_ids_json: row.get(15)?,
+                causation_id: row.get(16)?,
+                correlation_id: row.get(17)?,
+                idempotency_key: row.get(18)?,
+                created_at: row.get(19)?,
+            })
+        };
+        let rows = if let Some(instance_id) = instance_id {
+            statement
+                .query_map([instance_id], map_row)?
+                .collect::<result::Result<Vec<_>, _>>()?
+        } else {
+            statement
+                .query_map([], map_row)?
+                .collect::<result::Result<Vec<_>, _>>()?
+        };
         Ok(rows)
     }
 
@@ -2725,6 +2843,157 @@ fn insert_evidence_link_on(connection: &Connection, link: EvidenceLink<'_>) -> S
     Ok(())
 }
 
+fn insert_diagnostic_on(
+    connection: &Connection,
+    diagnostic: DiagnosticRecord<'_>,
+) -> StoreResult<String> {
+    if let Some(source_span_json) = diagnostic.source_span_json {
+        serde_json::from_str::<Value>(source_span_json)?;
+    }
+    parse_json_array(diagnostic.evidence_ids_json)?;
+    parse_json_array(diagnostic.artifact_ids_json)?;
+
+    if let Some(existing_id) = existing_diagnostic_id_on(connection, &diagnostic)? {
+        return Ok(existing_id);
+    }
+
+    connection
+        .query_row(
+            r#"
+            INSERT INTO diagnostics (
+                diagnostic_id,
+                instance_id,
+                program_id,
+                program_version_id,
+                severity,
+                code,
+                message,
+                source_span_json,
+                subject_type,
+                subject_id,
+                event_id,
+                effect_id,
+                run_id,
+                assertion_id,
+                evidence_ids_json,
+                artifact_ids_json,
+                causation_id,
+                correlation_id,
+                idempotency_key
+            )
+            VALUES (
+                'dia_' || lower(hex(randomblob(16))),
+                ?1,
+                ?2,
+                ?3,
+                ?4,
+                ?5,
+                ?6,
+                ?7,
+                ?8,
+                ?9,
+                ?10,
+                ?11,
+                ?12,
+                ?13,
+                ?14,
+                ?15,
+                ?16,
+                ?17,
+                ?18
+            )
+            RETURNING diagnostic_id
+            "#,
+            params![
+                diagnostic.instance_id,
+                diagnostic.program_id,
+                diagnostic.program_version_id,
+                diagnostic.severity,
+                diagnostic.code,
+                diagnostic.message,
+                diagnostic.source_span_json,
+                diagnostic.subject_type,
+                diagnostic.subject_id,
+                diagnostic.event_id,
+                diagnostic.effect_id,
+                diagnostic.run_id,
+                diagnostic.assertion_id,
+                diagnostic.evidence_ids_json,
+                diagnostic.artifact_ids_json,
+                diagnostic.causation_id,
+                diagnostic.correlation_id,
+                diagnostic.idempotency_key,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(Into::into)
+}
+
+fn existing_diagnostic_id_on(
+    connection: &Connection,
+    diagnostic: &DiagnosticRecord<'_>,
+) -> StoreResult<Option<String>> {
+    let Some(idempotency_key) = diagnostic.idempotency_key else {
+        return Ok(None);
+    };
+    if let Some(instance_id) = diagnostic.instance_id {
+        return connection
+            .query_row(
+                r#"
+                SELECT diagnostic_id
+                FROM diagnostics
+                WHERE instance_id = ?1 AND idempotency_key = ?2
+                "#,
+                params![instance_id, idempotency_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into);
+    }
+    if let Some(program_version_id) = diagnostic.program_version_id {
+        return connection
+            .query_row(
+                r#"
+                SELECT diagnostic_id
+                FROM diagnostics
+                WHERE instance_id IS NULL
+                  AND program_version_id = ?1
+                  AND idempotency_key = ?2
+                "#,
+                params![program_version_id, idempotency_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into);
+    }
+    if let Some(program_id) = diagnostic.program_id {
+        return connection
+            .query_row(
+                r#"
+                SELECT diagnostic_id
+                FROM diagnostics
+                WHERE instance_id IS NULL
+                  AND program_id = ?1
+                  AND idempotency_key = ?2
+                "#,
+                params![program_id, idempotency_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into);
+    }
+    Ok(None)
+}
+
+fn parse_json_array(json: &str) -> StoreResult<()> {
+    let value = serde_json::from_str::<Value>(json)?;
+    if value.is_array() {
+        Ok(())
+    } else {
+        Err(StoreError::Conflict("expected JSON array".to_owned()))
+    }
+}
+
 fn satisfy_dependencies_on(connection: &Connection, instance_id: &str) -> StoreResult<usize> {
     connection
         .execute(
@@ -3258,7 +3527,61 @@ fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
         )?;
     }
     transaction.commit()?;
+    ensure_diagnostics_schema(connection)?;
     Ok(())
+}
+
+fn ensure_diagnostics_schema(connection: &Connection) -> StoreResult<()> {
+    for (column, definition) in [
+        ("program_id", "TEXT"),
+        ("program_version_id", "TEXT"),
+        ("subject_type", "TEXT"),
+        ("subject_id", "TEXT"),
+        ("event_id", "TEXT"),
+        ("effect_id", "TEXT"),
+        ("run_id", "TEXT"),
+        ("assertion_id", "TEXT"),
+        ("evidence_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("artifact_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("causation_id", "TEXT"),
+        ("correlation_id", "TEXT"),
+        ("idempotency_key", "TEXT"),
+    ] {
+        if !column_exists(connection, "diagnostics", column)? {
+            connection.execute(
+                &format!("ALTER TABLE diagnostics ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+
+    connection.execute_batch(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS diagnostics_instance_idempotency_key_idx
+            ON diagnostics(instance_id, idempotency_key)
+            WHERE instance_id IS NOT NULL AND idempotency_key IS NOT NULL;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS diagnostics_program_idempotency_key_idx
+            ON diagnostics(program_id, idempotency_key)
+            WHERE instance_id IS NULL
+              AND program_id IS NOT NULL
+              AND program_version_id IS NULL
+              AND idempotency_key IS NOT NULL;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS diagnostics_version_idempotency_key_idx
+            ON diagnostics(program_version_id, idempotency_key)
+            WHERE instance_id IS NULL AND program_version_id IS NOT NULL AND idempotency_key IS NOT NULL;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> StoreResult<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<result::Result<Vec<_>, _>>()?;
+    Ok(columns.iter().any(|name| name == column))
 }
 
 #[cfg(test)]
@@ -4021,6 +4344,215 @@ mod tests {
         assert!(facts.iter().any(
             |fact| fact.name == "human.answer.received" && fact.value_json.contains("approve")
         ));
+    }
+
+    #[test]
+    fn records_lists_and_deduplicates_diagnostics_with_links() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Diagnostics", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                effects: &[test_effect("tell", "agent.tell", "rule=start;effect=tell")],
+                dependencies: &[],
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commits");
+        let run_event = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-tell",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        let artifact_id = store
+            .record_artifact(ArtifactRecord {
+                run_id: "run-tell",
+                kind: "transcript",
+                path: "artifacts/run-tell.txt",
+                content_hash: Some("sha256:abc"),
+                mime_type: Some("text/plain"),
+            })
+            .expect("artifact records");
+        let evidence_id = store
+            .record_evidence(EvidenceRecord {
+                instance_id: &instance.instance_id,
+                kind: "provider_failure",
+                subject_type: "run",
+                subject_id: "run-tell",
+                causation_id: Some("tell"),
+                correlation_id: Some("corr-tell"),
+                summary: Some("provider failed"),
+                metadata_json: r#"{"stderr":"boom"}"#,
+            })
+            .expect("evidence records");
+        let evidence_ids_json = format!(r#"["{evidence_id}"]"#);
+        let artifact_ids_json = format!(r#"["{artifact_id}"]"#);
+
+        let diagnostic_id = store
+            .record_diagnostic(DiagnosticRecord {
+                instance_id: Some(&instance.instance_id),
+                program_id: Some(&version.program_id),
+                program_version_id: Some(&version.version_id),
+                severity: "error",
+                code: Some("provider.transport"),
+                message: "provider transport failed",
+                source_span_json: Some(
+                    r#"{"path":"workflow.whip","start":{"line":3,"column":5},"end":{"line":3,"column":18},"construct":"effect"}"#,
+                ),
+                subject_type: Some("effect"),
+                subject_id: Some("tell"),
+                event_id: Some(&run_event.event_id),
+                effect_id: Some("tell"),
+                run_id: Some("run-tell"),
+                assertion_id: None,
+                evidence_ids_json: &evidence_ids_json,
+                artifact_ids_json: &artifact_ids_json,
+                causation_id: Some("tell"),
+                correlation_id: Some("corr-tell"),
+                idempotency_key: Some("diagnostic:run-tell"),
+            })
+            .expect("diagnostic records");
+        let duplicate_id = store
+            .record_diagnostic(DiagnosticRecord {
+                message: "different retry message",
+                ..DiagnosticRecord {
+                    instance_id: Some(&instance.instance_id),
+                    program_id: Some(&version.program_id),
+                    program_version_id: Some(&version.version_id),
+                    severity: "error",
+                    code: Some("provider.transport"),
+                    message: "provider transport failed",
+                    source_span_json: None,
+                    subject_type: Some("effect"),
+                    subject_id: Some("tell"),
+                    event_id: Some(&run_event.event_id),
+                    effect_id: Some("tell"),
+                    run_id: Some("run-tell"),
+                    assertion_id: None,
+                    evidence_ids_json: &evidence_ids_json,
+                    artifact_ids_json: &artifact_ids_json,
+                    causation_id: Some("tell"),
+                    correlation_id: Some("corr-tell"),
+                    idempotency_key: Some("diagnostic:run-tell"),
+                }
+            })
+            .expect("duplicate diagnostic returns existing row");
+
+        assert_eq!(diagnostic_id, duplicate_id);
+        let diagnostics = store
+            .list_diagnostics(Some(&instance.instance_id))
+            .expect("diagnostics list");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].diagnostic_id, diagnostic_id);
+        assert_eq!(diagnostics[0].severity, "error");
+        assert_eq!(diagnostics[0].code.as_deref(), Some("provider.transport"));
+        assert_eq!(diagnostics[0].subject_type.as_deref(), Some("effect"));
+        assert_eq!(diagnostics[0].subject_id.as_deref(), Some("tell"));
+        assert_eq!(
+            diagnostics[0].event_id.as_deref(),
+            Some(run_event.event_id.as_str())
+        );
+        assert_eq!(diagnostics[0].effect_id.as_deref(), Some("tell"));
+        assert_eq!(diagnostics[0].run_id.as_deref(), Some("run-tell"));
+        assert_eq!(diagnostics[0].evidence_ids_json, evidence_ids_json);
+        assert_eq!(diagnostics[0].artifact_ids_json, artifact_ids_json);
+        assert_eq!(diagnostics[0].correlation_id.as_deref(), Some("corr-tell"));
+        assert!(diagnostics[0]
+            .source_span_json
+            .as_deref()
+            .expect("source span")
+            .contains("workflow.whip"));
+    }
+
+    #[test]
+    fn opening_legacy_v1_store_adds_diagnostic_columns() {
+        let path = std::env::temp_dir().join(format!(
+            "whippletree-store-legacy-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        {
+            let connection = Connection::open(&path).expect("legacy db opens");
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO schema_migrations (version, name)
+                    VALUES (1, 'runtime-store-schema');
+                    CREATE TABLE diagnostics (
+                        diagnostic_id TEXT PRIMARY KEY,
+                        instance_id TEXT,
+                        severity TEXT NOT NULL,
+                        code TEXT,
+                        message TEXT NOT NULL,
+                        source_span_json TEXT,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    "#,
+                )
+                .expect("legacy schema creates");
+        }
+
+        let store = SqliteStore::open(&path).expect("store opens legacy schema");
+        let diagnostic_id = store
+            .record_diagnostic(DiagnosticRecord {
+                instance_id: None,
+                program_id: Some("program-legacy"),
+                program_version_id: Some("version-legacy"),
+                severity: "warning",
+                code: Some("compile.unused"),
+                message: "unused binding",
+                source_span_json: None,
+                subject_type: Some("program_version"),
+                subject_id: Some("version-legacy"),
+                event_id: None,
+                effect_id: None,
+                run_id: None,
+                assertion_id: None,
+                evidence_ids_json: "[]",
+                artifact_ids_json: "[]",
+                causation_id: None,
+                correlation_id: Some("compile"),
+                idempotency_key: Some("diag:compile:unused"),
+            })
+            .expect("diagnostic records on upgraded schema");
+
+        let diagnostics = store.list_diagnostics(None).expect("diagnostics list");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].diagnostic_id, diagnostic_id);
+        assert_eq!(diagnostics[0].program_id.as_deref(), Some("program-legacy"));
+        assert_eq!(
+            diagnostics[0].program_version_id.as_deref(),
+            Some("version-legacy")
+        );
+
+        fs::remove_file(path).expect("legacy db removes");
     }
 
     #[test]

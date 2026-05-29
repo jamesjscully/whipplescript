@@ -170,12 +170,40 @@ CREATE TABLE evidence_links (
 CREATE TABLE diagnostics (
     diagnostic_id TEXT PRIMARY KEY,
     instance_id TEXT,
+    program_id TEXT,
+    program_version_id TEXT,
     severity TEXT NOT NULL,
     code TEXT,
     message TEXT NOT NULL,
     source_span_json TEXT,
+    subject_type TEXT,
+    subject_id TEXT,
+    event_id TEXT,
+    effect_id TEXT,
+    run_id TEXT,
+    assertion_id TEXT,
+    evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+    artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+    causation_id TEXT,
+    correlation_id TEXT,
+    idempotency_key TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX diagnostics_instance_idempotency_key_idx
+    ON diagnostics(instance_id, idempotency_key)
+    WHERE instance_id IS NOT NULL AND idempotency_key IS NOT NULL;
+
+CREATE UNIQUE INDEX diagnostics_program_idempotency_key_idx
+    ON diagnostics(program_id, idempotency_key)
+    WHERE instance_id IS NULL
+      AND program_id IS NOT NULL
+      AND program_version_id IS NULL
+      AND idempotency_key IS NOT NULL;
+
+CREATE UNIQUE INDEX diagnostics_version_idempotency_key_idx
+    ON diagnostics(program_version_id, idempotency_key)
+    WHERE instance_id IS NULL AND program_version_id IS NOT NULL AND idempotency_key IS NOT NULL;
 
 CREATE TABLE plugin_registrations (
     plugin_id TEXT PRIMARY KEY,

@@ -964,7 +964,9 @@ fn lower_program(program: Program) -> CompileOutput {
                 &agent_names,
                 &mut diagnostics,
             ),
-            Item::Assert(assertion) => lower_assert(assertion, &mut ir, &mut diagnostics),
+            Item::Assert(assertion) => {
+                lower_assert(assertion, &semantic, &mut ir, &mut diagnostics)
+            }
             Item::Rule(rule) => lower_rule(rule, &semantic, &mut ir, &mut diagnostics),
         }
     }
@@ -977,9 +979,22 @@ fn lower_program(program: Program) -> CompileOutput {
     }
 }
 
-fn lower_assert(assertion: AssertDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+fn lower_assert(
+    assertion: AssertDecl,
+    semantic: &SemanticContext,
+    ir: &mut IrProgram,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     match parse_expression(&assertion.expr) {
         Ok(expr) => {
+            validate_parsed_expression(
+                &expr,
+                semantic,
+                &ExprScope::default(),
+                &ExprValidationContext::assertion(assertion.span),
+                "assertion",
+                diagnostics,
+            );
             let mut projection_reads = collect_projection_reads(&expr);
             sort_projection_reads(&mut projection_reads);
             ir.assertions.push(IrAssertion {
@@ -1949,6 +1964,49 @@ fn validate_availability_when(
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct ExprScope {
+    binding_types: BTreeMap<String, String>,
+    implicit_schema: Option<String>,
+}
+
+impl ExprScope {
+    fn from_bindings(binding_types: &BTreeMap<String, String>) -> Self {
+        Self {
+            binding_types: binding_types.clone(),
+            implicit_schema: None,
+        }
+    }
+
+    fn with_implicit_schema(&self, schema: String) -> Self {
+        let mut scope = self.clone();
+        scope.implicit_schema = Some(schema);
+        scope
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ExprValidationContext {
+    subject: String,
+    span: SourceSpan,
+}
+
+impl ExprValidationContext {
+    fn rule(rule: &RuleDecl) -> Self {
+        Self {
+            subject: format!("rule `{}`", rule.name.name),
+            span: rule.body.span,
+        }
+    }
+
+    fn assertion(span: SourceSpan) -> Self {
+        Self {
+            subject: "assertion".to_owned(),
+            span,
+        }
+    }
+}
+
 fn validate_expression(
     rule: &RuleDecl,
     expr: &str,
@@ -1959,26 +2017,14 @@ fn validate_expression(
 ) {
     match parse_expression(expr) {
         Ok(expr) => {
-            let presence_proofs = BTreeSet::new();
-            validate_expr_node(
-                rule,
+            validate_parsed_expression(
                 &expr,
                 semantic,
-                binding_types,
-                &presence_proofs,
+                &ExprScope::from_bindings(binding_types),
+                &ExprValidationContext::rule(rule),
+                label,
                 diagnostics,
             );
-            let ty = infer_expr_type(rule, &expr, semantic, binding_types, diagnostics);
-            if ty != ExprType::Bool && ty != ExprType::Unknown {
-                diagnostics.push(Diagnostic {
-                    span: rule.body.span,
-                    message: format!(
-                        "rule `{}` has non-boolean {label} expression",
-                        rule.name.name
-                    ),
-                    suggestion: Some(format!("{label} expressions must evaluate to bool")),
-                });
-            }
         }
         Err(message) => diagnostics.push(Diagnostic {
             span: rule.body.span,
@@ -1988,11 +2034,38 @@ fn validate_expression(
     }
 }
 
-fn validate_expr_node(
-    rule: &RuleDecl,
+fn validate_parsed_expression(
     expr: &Expr,
     semantic: &SemanticContext,
-    binding_types: &BTreeMap<String, String>,
+    scope: &ExprScope,
+    context: &ExprValidationContext,
+    label: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let presence_proofs = BTreeSet::new();
+    validate_expr_node(
+        expr,
+        semantic,
+        scope,
+        context,
+        &presence_proofs,
+        diagnostics,
+    );
+    let ty = infer_expr_type(expr, semantic, scope, context, diagnostics);
+    if ty != ExprType::Bool && ty != ExprType::Unknown {
+        diagnostics.push(Diagnostic {
+            span: context.span,
+            message: format!("{} has non-boolean {label} expression", context.subject),
+            suggestion: Some(format!("{label} expressions must evaluate to bool")),
+        });
+    }
+}
+
+fn validate_expr_node(
+    expr: &Expr,
+    semantic: &SemanticContext,
+    scope: &ExprScope,
+    context: &ExprValidationContext,
     presence_proofs: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -2002,17 +2075,24 @@ fn validate_expr_node(
                 return;
             }
             let root = &path[0];
-            let Some(schema) = binding_types.get(root) else {
+            let Some(schema) = scope.binding_types.get(root) else {
+                diagnostics.push(Diagnostic {
+                    span: context.span,
+                    message: format!("{} has unknown expression root `{root}`", context.subject),
+                    suggestion: Some(
+                        "use a binding introduced by a `when ... as name` clause".to_owned(),
+                    ),
+                });
                 return;
             };
             if let Err(message) =
                 validate_optional_path_access(schema, &path[1..], semantic, presence_proofs)
             {
                 diagnostics.push(Diagnostic {
-                    span: rule.body.span,
+                    span: context.span,
                     message: format!(
-                        "rule `{}` has unsafe optional path `{}`: {message}",
-                        rule.name.name,
+                        "{} has unsafe optional path `{}`: {message}",
+                        context.subject,
                         path.join(".")
                     ),
                     suggestion: Some(
@@ -2023,10 +2103,10 @@ fn validate_expr_node(
             }
             if let Err(message) = semantic.schemas.resolve_field_path(schema, &path[1..]) {
                 diagnostics.push(Diagnostic {
-                    span: rule.body.span,
+                    span: context.span,
                     message: format!(
-                        "rule `{}` has invalid expression path `{}`: {message}",
-                        rule.name.name,
+                        "{} has invalid expression path `{}`: {message}",
+                        context.subject,
                         path.join(".")
                     ),
                     suggestion: Some("use a field declared on the bound schema".to_owned()),
@@ -2035,29 +2115,19 @@ fn validate_expr_node(
         }
         Expr::Index { target, key } => {
             validate_expr_node(
-                rule,
                 target,
                 semantic,
-                binding_types,
+                scope,
+                context,
                 presence_proofs,
                 diagnostics,
             );
-            validate_expr_node(
-                rule,
-                key,
-                semantic,
-                binding_types,
-                presence_proofs,
-                diagnostics,
-            );
-            let key_ty = infer_expr_type(rule, key, semantic, binding_types, diagnostics);
+            validate_expr_node(key, semantic, scope, context, presence_proofs, diagnostics);
+            let key_ty = infer_expr_type(key, semantic, scope, context, diagnostics);
             if !matches!(key_ty, ExprType::String | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
-                    span: rule.body.span,
-                    message: format!(
-                        "rule `{}` indexes a map with a non-string key",
-                        rule.name.name
-                    ),
+                    span: context.span,
+                    message: format!("{} indexes a map with a non-string key", context.subject),
                     suggestion: Some(
                         "use a string literal or string expression as the map key".to_owned(),
                     ),
@@ -2066,94 +2136,47 @@ fn validate_expr_node(
         }
         Expr::Array(items) => {
             for item in items {
-                validate_expr_node(
-                    rule,
-                    item,
-                    semantic,
-                    binding_types,
-                    presence_proofs,
-                    diagnostics,
-                );
+                validate_expr_node(item, semantic, scope, context, presence_proofs, diagnostics);
             }
         }
-        Expr::Unary { expr, .. } => validate_expr_node(
-            rule,
-            expr,
-            semantic,
-            binding_types,
-            presence_proofs,
-            diagnostics,
-        ),
+        Expr::Unary { expr, .. } => {
+            validate_expr_node(expr, semantic, scope, context, presence_proofs, diagnostics)
+        }
         Expr::Binary {
             op: BinaryOp::And,
             left,
             right,
         } => {
-            validate_expr_node(
-                rule,
-                left,
-                semantic,
-                binding_types,
-                presence_proofs,
-                diagnostics,
-            );
+            validate_expr_node(left, semantic, scope, context, presence_proofs, diagnostics);
             let mut right_proofs = presence_proofs.clone();
             collect_presence_proofs(left, &mut right_proofs);
-            validate_expr_node(
-                rule,
-                right,
-                semantic,
-                binding_types,
-                &right_proofs,
-                diagnostics,
-            );
+            validate_expr_node(right, semantic, scope, context, &right_proofs, diagnostics);
         }
         Expr::Binary { op, left, right } => {
+            validate_expr_node(left, semantic, scope, context, presence_proofs, diagnostics);
             validate_expr_node(
-                rule,
-                left,
+                right,
                 semantic,
-                binding_types,
+                scope,
+                context,
                 presence_proofs,
                 diagnostics,
             );
-            validate_expr_node(
-                rule,
-                right,
-                semantic,
-                binding_types,
-                presence_proofs,
-                diagnostics,
-            );
-            validate_finite_domain_expr(
-                rule,
-                *op,
-                left,
-                right,
-                semantic,
-                binding_types,
-                diagnostics,
-            );
+            validate_finite_domain_expr(*op, left, right, semantic, scope, context, diagnostics);
         }
         Expr::Call { args, .. } => {
             for arg in args {
-                validate_expr_node(
-                    rule,
-                    arg,
-                    semantic,
-                    binding_types,
-                    presence_proofs,
-                    diagnostics,
-                );
+                validate_expr_node(arg, semantic, scope, context, presence_proofs, diagnostics);
             }
         }
         Expr::Query { guard, .. } => {
             if let Some(guard) = guard {
+                let guard_scope = query_guard_scope(expr, semantic, scope);
                 validate_expr_node(
-                    rule,
                     guard,
                     semantic,
-                    binding_types,
+                    &guard_scope,
+                    context,
                     presence_proofs,
                     diagnostics,
                 );
@@ -2271,28 +2294,60 @@ fn expr_path_key(expr: &Expr) -> Option<String> {
     }
 }
 
+fn query_guard_scope(expr: &Expr, semantic: &SemanticContext, scope: &ExprScope) -> ExprScope {
+    let Expr::Query {
+        kind: QueryKind::Fact,
+        head,
+        ..
+    } = expr
+    else {
+        return scope.clone();
+    };
+    query_head_schema(head, semantic)
+        .map(|schema| scope.with_implicit_schema(schema))
+        .unwrap_or_else(|| scope.clone())
+}
+
+fn query_head_schema(head: &str, semantic: &SemanticContext) -> Option<String> {
+    let schema = head.split_whitespace().next()?;
+    semantic
+        .schemas
+        .class_exists(schema)
+        .then(|| schema.to_owned())
+}
+
+fn implicit_field_type(
+    name: &str,
+    semantic: &SemanticContext,
+    scope: &ExprScope,
+) -> Option<TypeSyntax> {
+    let schema = scope.implicit_schema.as_ref()?;
+    semantic
+        .schemas
+        .resolve_field_path(schema, &[name.to_owned()])
+        .ok()
+}
+
 fn infer_expr_type(
-    rule: &RuleDecl,
     expr: &Expr,
     semantic: &SemanticContext,
-    binding_types: &BTreeMap<String, String>,
+    scope: &ExprScope,
+    context: &ExprValidationContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> ExprType {
     match expr {
+        Expr::Literal(ExprLiteral::Ident(name)) => implicit_field_type(name, semantic, scope)
+            .map(|ty| expr_type_from_type_syntax(&ty))
+            .unwrap_or_else(|| expr_literal_type(&ExprLiteral::Ident(name.clone()))),
         Expr::Literal(literal) => expr_literal_type(literal),
-        Expr::Path(path) => {
-            expr_path_type(path, semantic, binding_types).unwrap_or(ExprType::Unknown)
-        }
+        Expr::Path(path) => expr_path_type(path, semantic, scope).unwrap_or(ExprType::Unknown),
         Expr::Index { target, key } => {
-            let target_ty = infer_expr_type(rule, target, semantic, binding_types, diagnostics);
-            let key_ty = infer_expr_type(rule, key, semantic, binding_types, diagnostics);
+            let target_ty = infer_expr_type(target, semantic, scope, context, diagnostics);
+            let key_ty = infer_expr_type(key, semantic, scope, context, diagnostics);
             if !matches!(key_ty, ExprType::String | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
-                    span: rule.body.span,
-                    message: format!(
-                        "rule `{}` indexes a map with a non-string key",
-                        rule.name.name
-                    ),
+                    span: context.span,
+                    message: format!("{} indexes a map with a non-string key", context.subject),
                     suggestion: Some(
                         "use a string literal or string expression as the map key".to_owned(),
                     ),
@@ -2303,26 +2358,26 @@ fn infer_expr_type(
                 ExprType::Unknown => ExprType::Unknown,
                 _ => {
                     diagnostics.push(Diagnostic {
-                        span: rule.body.span,
-                        message: format!("rule `{}` indexes a non-map expression", rule.name.name),
+                        span: context.span,
+                        message: format!("{} indexes a non-map expression", context.subject),
                         suggestion: Some("use indexing only on map values".to_owned()),
                     });
                     ExprType::Unknown
                 }
             }
         }
-        Expr::Array(items) => infer_array_type(rule, items, semantic, binding_types, diagnostics),
+        Expr::Array(items) => infer_array_type(items, semantic, scope, context, diagnostics),
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
         } => {
-            let inner = infer_expr_type(rule, expr, semantic, binding_types, diagnostics);
+            let inner = infer_expr_type(expr, semantic, scope, context, diagnostics);
             if !matches!(inner, ExprType::Bool | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
-                    span: rule.body.span,
+                    span: context.span,
                     message: format!(
-                        "rule `{}` applies `!` to a non-boolean expression",
-                        rule.name.name
+                        "{} applies `!` to a non-boolean expression",
+                        context.subject
                     ),
                     suggestion: Some("use `!` only with boolean expressions".to_owned()),
                 });
@@ -2330,29 +2385,30 @@ fn infer_expr_type(
             ExprType::Bool
         }
         Expr::Binary { op, left, right } => {
-            infer_binary_type(rule, *op, left, right, semantic, binding_types, diagnostics)
+            infer_binary_type(*op, left, right, semantic, scope, context, diagnostics)
         }
         Expr::Call { name, args } => match name.as_str() {
             "count" => ExprType::Int,
             "exists" | "empty" => ExprType::Bool,
             _ => {
                 diagnostics.push(Diagnostic {
-                    span: rule.body.span,
+                    span: context.span,
                     message: format!(
-                        "rule `{}` calls unsupported expression function `{name}`",
-                        rule.name.name
+                        "{} calls unsupported expression function `{name}`",
+                        context.subject
                     ),
                     suggestion: Some("use `count`, `exists`, or `empty`".to_owned()),
                 });
                 for arg in args {
-                    infer_expr_type(rule, arg, semantic, binding_types, diagnostics);
+                    infer_expr_type(arg, semantic, scope, context, diagnostics);
                 }
                 ExprType::Unknown
             }
         },
         Expr::Query { guard, .. } => {
             if let Some(guard) = guard {
-                infer_expr_type(rule, guard, semantic, binding_types, diagnostics);
+                let guard_scope = query_guard_scope(expr, semantic, scope);
+                infer_expr_type(guard, semantic, &guard_scope, context, diagnostics);
             }
             ExprType::Collection
         }
@@ -2360,25 +2416,25 @@ fn infer_expr_type(
 }
 
 fn infer_binary_type(
-    rule: &RuleDecl,
     op: BinaryOp,
     left: &Expr,
     right: &Expr,
     semantic: &SemanticContext,
-    binding_types: &BTreeMap<String, String>,
+    scope: &ExprScope,
+    context: &ExprValidationContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> ExprType {
-    let left_ty = infer_expr_type(rule, left, semantic, binding_types, diagnostics);
-    let right_ty = infer_expr_type(rule, right, semantic, binding_types, diagnostics);
+    let left_ty = infer_expr_type(left, semantic, scope, context, diagnostics);
+    let right_ty = infer_expr_type(right, semantic, scope, context, diagnostics);
     match op {
         BinaryOp::And | BinaryOp::Or => {
             for ty in [&left_ty, &right_ty] {
                 if !matches!(ty, ExprType::Bool | ExprType::Unknown) {
                     diagnostics.push(Diagnostic {
-                        span: rule.body.span,
+                        span: context.span,
                         message: format!(
-                            "rule `{}` uses boolean operator with non-boolean operand",
-                            rule.name.name
+                            "{} uses boolean operator with non-boolean operand",
+                            context.subject
                         ),
                         suggestion: Some(
                             "use `&&` and `||` only with boolean expressions".to_owned(),
@@ -2392,11 +2448,8 @@ fn infer_binary_type(
         BinaryOp::Eq | BinaryOp::Ne => {
             if !types_comparable(&left_ty, &right_ty) {
                 diagnostics.push(Diagnostic {
-                    span: rule.body.span,
-                    message: format!(
-                        "rule `{}` compares incompatible expression types",
-                        rule.name.name
-                    ),
+                    span: context.span,
+                    message: format!("{} compares incompatible expression types", context.subject),
                     suggestion: Some(
                         "compare values with compatible scalar or finite-domain types".to_owned(),
                     ),
@@ -2407,11 +2460,8 @@ fn infer_binary_type(
         BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
             if !is_numeric_type(&left_ty) || !is_numeric_type(&right_ty) {
                 diagnostics.push(Diagnostic {
-                    span: rule.body.span,
-                    message: format!(
-                        "rule `{}` orders non-numeric expression values",
-                        rule.name.name
-                    ),
+                    span: context.span,
+                    message: format!("{} orders non-numeric expression values", context.subject),
                     suggestion: Some("use ordering only with int or float values".to_owned()),
                 });
             }
@@ -2422,10 +2472,10 @@ fn infer_binary_type(
                 ExprType::Array(item_ty) => {
                     if !types_comparable(&left_ty, item_ty) {
                         diagnostics.push(Diagnostic {
-                            span: rule.body.span,
+                            span: context.span,
                             message: format!(
-                                "rule `{}` uses membership with incompatible item type",
-                                rule.name.name
+                                "{} uses membership with incompatible item type",
+                                context.subject
                             ),
                             suggestion: Some(
                                 "make the left value compatible with the array item type"
@@ -2437,10 +2487,10 @@ fn infer_binary_type(
                 ExprType::Map(_) => {
                     if !matches!(left_ty, ExprType::String | ExprType::Unknown) {
                         diagnostics.push(Diagnostic {
-                            span: rule.body.span,
+                            span: context.span,
                             message: format!(
-                                "rule `{}` uses map membership with a non-string key",
-                                rule.name.name
+                                "{} uses map membership with a non-string key",
+                                context.subject
                             ),
                             suggestion: Some(
                                 "use a string value on the left side of map membership".to_owned(),
@@ -2450,10 +2500,10 @@ fn infer_binary_type(
                 }
                 ExprType::Unknown => {}
                 _ => diagnostics.push(Diagnostic {
-                    span: rule.body.span,
+                    span: context.span,
                     message: format!(
-                        "rule `{}` uses membership against a non-array/non-map expression",
-                        rule.name.name
+                        "{} uses membership against a non-array/non-map expression",
+                        context.subject
                     ),
                     suggestion: Some(
                         "use `in` with an array literal, array value, or map value".to_owned(),
@@ -2466,15 +2516,15 @@ fn infer_binary_type(
 }
 
 fn infer_array_type(
-    rule: &RuleDecl,
     items: &[Expr],
     semantic: &SemanticContext,
-    binding_types: &BTreeMap<String, String>,
+    scope: &ExprScope,
+    context: &ExprValidationContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> ExprType {
     let mut item_ty: Option<ExprType> = None;
     for item in items {
-        let ty = infer_expr_type(rule, item, semantic, binding_types, diagnostics);
+        let ty = infer_expr_type(item, semantic, scope, context, diagnostics);
         if matches!(ty, ExprType::Unknown) {
             continue;
         }
@@ -2483,8 +2533,8 @@ fn infer_array_type(
             Some(existing) if types_comparable(existing, &ty) => {}
             Some(_) => {
                 diagnostics.push(Diagnostic {
-                    span: rule.body.span,
-                    message: format!("rule `{}` has mixed-type array literal", rule.name.name),
+                    span: context.span,
+                    message: format!("{} has mixed-type array literal", context.subject),
                     suggestion: Some("use array literals whose elements share one type".to_owned()),
                 });
                 return ExprType::Array(Box::new(ExprType::Unknown));
@@ -2497,12 +2547,12 @@ fn infer_array_type(
 fn expr_path_type(
     path: &[String],
     semantic: &SemanticContext,
-    binding_types: &BTreeMap<String, String>,
+    scope: &ExprScope,
 ) -> Option<ExprType> {
     if path.len() < 2 {
         return None;
     }
-    let schema = binding_types.get(&path[0])?;
+    let schema = scope.binding_types.get(&path[0])?;
     semantic
         .schemas
         .resolve_field_path(schema, &path[1..])
@@ -2575,12 +2625,12 @@ fn is_numeric_type(ty: &ExprType) -> bool {
 }
 
 fn validate_finite_domain_expr(
-    rule: &RuleDecl,
     op: BinaryOp,
     left: &Expr,
     right: &Expr,
     semantic: &SemanticContext,
-    binding_types: &BTreeMap<String, String>,
+    scope: &ExprScope,
+    context: &ExprValidationContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if !matches!(
@@ -2589,10 +2639,33 @@ fn validate_finite_domain_expr(
     ) {
         return;
     }
-    let Some(domain) = expr_domain(left, semantic, binding_types) else {
+    let Some((domain, literals)) = finite_domain_comparison(left, right, semantic, scope)
+        .or_else(|| finite_domain_comparison(right, left, semantic, scope))
+    else {
         return;
     };
-    let literals = match right {
+    for literal in literals.into_iter().flatten() {
+        if !domain.iter().any(|value| value == &literal) {
+            diagnostics.push(Diagnostic {
+                span: context.span,
+                message: format!(
+                    "{} compares finite-domain value to unknown `{literal}`",
+                    context.subject
+                ),
+                suggestion: Some(format!("use one of: {}", domain.join(", "))),
+            });
+        }
+    }
+}
+
+fn finite_domain_comparison(
+    domain_expr: &Expr,
+    literal_expr: &Expr,
+    semantic: &SemanticContext,
+    scope: &ExprScope,
+) -> Option<(Vec<String>, Vec<Option<String>>)> {
+    let domain = expr_domain(domain_expr, semantic, scope)?;
+    let literals = match literal_expr {
         Expr::Literal(literal) => vec![expr_literal_name(literal)],
         Expr::Array(items) => items
             .iter()
@@ -2603,34 +2676,22 @@ fn validate_finite_domain_expr(
             .collect(),
         _ => Vec::new(),
     };
-    for literal in literals.into_iter().flatten() {
-        if !domain.iter().any(|value| value == &literal) {
-            diagnostics.push(Diagnostic {
-                span: rule.body.span,
-                message: format!(
-                    "rule `{}` compares finite-domain value to unknown `{literal}`",
-                    rule.name.name
-                ),
-                suggestion: Some(format!("use one of: {}", domain.join(", "))),
-            });
-        }
-    }
+    Some((domain, literals))
 }
 
-fn expr_domain(
-    expr: &Expr,
-    semantic: &SemanticContext,
-    binding_types: &BTreeMap<String, String>,
-) -> Option<Vec<String>> {
-    let Expr::Path(path) = expr else {
-        return None;
+fn expr_domain(expr: &Expr, semantic: &SemanticContext, scope: &ExprScope) -> Option<Vec<String>> {
+    let ty = match expr {
+        Expr::Path(path) => {
+            let root = path.first()?;
+            let schema = scope.binding_types.get(root)?;
+            semantic
+                .schemas
+                .resolve_field_path(schema, path.get(1..)?)
+                .ok()?
+        }
+        Expr::Literal(ExprLiteral::Ident(name)) => implicit_field_type(name, semantic, scope)?,
+        _ => return None,
     };
-    let root = path.first()?;
-    let schema = binding_types.get(root)?;
-    let ty = semantic
-        .schemas
-        .resolve_field_path(schema, path.get(1..)?)
-        .ok()?;
     finite_expr_domain(&ty, semantic)
 }
 
@@ -5505,6 +5566,41 @@ rule safe_not_null
     }
 
     #[test]
+    fn parses_expression_kernel_surface() {
+        let cases = [
+            ("true || false && !ready", "true || (false && !ready)"),
+            (
+                "empty(task.labels) || exists(Result where status == \"done\")",
+                "empty(task.labels) || exists(Result where status == \"done\")",
+            ),
+            (
+                "task.labels[\"priority\"] == [\"high\", \"urgent\"][0]",
+                "task.labels[\"priority\"] == [\"high\", \"urgent\"][0]",
+            ),
+            (
+                "exists issue.assignee && issue.assignee.name == \"Ada\"",
+                "exists(issue.assignee) && (issue.assignee.name == \"Ada\")",
+            ),
+            (
+                "count(effect agent.tell where target == \"worker\") >= 1",
+                "count(effect agent.tell where target == \"worker\") >= 1",
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let expr = parse_expression(source).expect(source);
+            assert_eq!(expr.to_snapshot(), expected);
+        }
+
+        for source in ["task.labels[", "count(Result where)", "[1,,2]"] {
+            assert!(
+                parse_expression(source).is_err(),
+                "{source} unexpectedly parsed"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_invalid_expression_types() {
         let source = r#"
 workflow BadExpressionTypes
@@ -5578,6 +5674,64 @@ rule bad_map_membership
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("map membership with a non-string key")));
+    }
+
+    #[test]
+    fn validates_assertion_expression_types_and_paths() {
+        let source = r#"
+workflow BadAssertions
+
+class Task {
+  provider "codex" | "claude"
+  priority int
+}
+
+assert count(Task where provider == "bad") == 0
+assert count(Task)
+assert missing.root == "value"
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("assertion compares finite-domain value to unknown `bad`")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("assertion has non-boolean assertion expression")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("assertion has unknown expression root `missing`")));
+    }
+
+    #[test]
+    fn validates_symmetric_finite_domain_literals_and_unknown_guard_roots() {
+        let source = r#"
+workflow SymmetricFiniteDomain
+
+class Task {
+  provider "codex" | "claude"
+}
+
+rule symmetric_literal
+  when Task as task where "bad" == task.provider
+=> {
+}
+
+rule unknown_root
+  when Task as task where other.provider == "codex"
+=> {
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("finite-domain value to unknown `bad`")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("unknown expression root `other`")));
     }
 
     #[test]

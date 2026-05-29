@@ -1,0 +1,84 @@
+workflow ExpressionKernelDogfood
+schemas
+  class KernelOwner
+    name string
+  class KernelTask
+    provider agentref<codex | claude | pi>
+    title string
+    status union<literal<"queued"> | literal<"blocked"> | literal<"done">>
+    route string
+    tags array<string>
+    metadata map<string>
+    owner optional<ref<KernelOwner>>
+    attempts int
+    priority int
+  class KernelRoute
+    provider string
+    title string
+    owner optional<ref<KernelOwner>>
+    status literal<"routed">
+agents
+  agent codex profile=repo-writer capacity=1 skills=[]
+  agent claude profile=repo-writer capacity=1 skills=[]
+  agent pi profile=repo-reader capacity=1 skills=[]
+assertions
+  assert count(KernelTask where status == "queued") == 3
+    reads
+      fact:KernelTask where status == "queued"
+  assert count(KernelRoute where provider in ["codex", "claude", "pi"]) == 3
+    reads
+      fact:KernelRoute where provider in ["codex", "claude", "pi"]
+  assert exists(KernelTask where (route == "docs") && ("expression-kernel" in tags))
+    reads
+      fact:KernelTask where (route == "docs") && ("expression-kernel" in tags)
+  assert empty(KernelTask where (status == "blocked") || (priority > 9))
+    reads
+      fact:KernelTask where (status == "blocked") || (priority > 9)
+  assert count(KernelTask where ("phase" in metadata) && (metadata["phase"] == "kernel")) >= 1
+    reads
+      fact:KernelTask where ("phase" in metadata) && (metadata["phase"] == "kernel")
+  assert exists(KernelTask where (owner != null) && (owner.name == "Ada"))
+    reads
+      fact:KernelTask where (owner != null) && (owner.name == "Ada")
+  assert count(effect kind agent.tell where status == completed) == 3
+    reads
+      effect:kind agent.tell where status == completed
+rules
+  rule seed_expression_kernel_tasks
+    when started
+    reads
+      pattern:started
+    writes
+      schema:KernelTask
+    body_hash 7c137273acced3db
+  rule route_expression_kernel_task
+    when KernelTask as task where ((((((task.status == "queued") && (task.route in ["code", "review", "docs"])) && ("expression-kernel" in task.tags)) && ("phase" in task.metadata)) && (task.metadata["phase"] == "kernel")) && ((task.owner == null) || exists(task.owner))) && !(task.priority > 5)
+    when task.provider is available
+    reads
+      pattern:task.provider is available
+      schema:KernelTask
+    writes
+      schema:KernelRoute
+    effects
+      turn kind=agent.tell binding=turn key=8b0505583760d0ec
+    body_hash 574f1f70f4528e8d
+  rule route_owned_expression_kernel_task
+    when KernelTask as task where (exists(task.owner) && (task.owner.name == "Ada")) && (task.metadata["phase"] not in ["deferred", "blocked"])
+    when task.provider is available
+    reads
+      pattern:task.provider is available
+      schema:KernelTask
+    effects
+      effect1 kind=agent.tell binding=- key=564d1660c459070d
+    body_hash 32bbfb2ddb9100b3
+  rule notice_routed_codex_task
+    when KernelTask as task where (task.provider == "codex") && exists(KernelRoute where provider == "codex")
+    reads
+      schema:KernelTask
+    projection_reads
+      fact:KernelRoute where provider == "codex"
+    body_hash cbf29ce484222325
+rule_dependencies
+  seed_expression_kernel_tasks --schema:KernelTask--> notice_routed_codex_task
+  seed_expression_kernel_tasks --schema:KernelTask--> route_expression_kernel_task
+  seed_expression_kernel_tasks --schema:KernelTask--> route_owned_expression_kernel_task

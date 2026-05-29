@@ -319,7 +319,7 @@ fn check(options: &CliOptions) -> ExitCode {
                 if check_options.model_search {
                     match run_model_search(&path, &source, &ir) {
                         Ok(report) if report.searches == 0 => {
-                            println!("model search: no effect dependency checks generated");
+                            println!("model search: no generated checks");
                         }
                         Ok(report) => {
                             println!(
@@ -4061,8 +4061,7 @@ fn run_model_search(path: &str, source: &str, ir: &IrProgram) -> Result<ModelSea
                 expected.len()
             ),
             suggestion: Some(
-                "inspect the generated effect dependency checks or rerun with Maude available"
-                    .to_owned(),
+                "inspect the generated model checks or rerun with Maude available".to_owned(),
             ),
         });
         return Err(format_model_search_error(
@@ -4082,7 +4081,7 @@ fn run_model_search(path: &str, source: &str, ir: &IrProgram) -> Result<ModelSea
                 span: expected.span,
                 message: format!("model-search counterexample for {}", expected.description),
                 suggestion: Some(format!(
-                    "expected {}, got {}; inspect dependency {} --{}--> {}",
+                    "expected {}, got {}; inspect generated check {} {} {}",
                     expected.outcome.label(),
                     actual.label(),
                     expected.upstream,
@@ -4176,7 +4175,24 @@ fn generate_maude_model_search(
     kernel_path: &Path,
 ) -> (String, Vec<ExpectedSearch>) {
     let mut effect_symbols = std::collections::BTreeMap::<String, String>::new();
+    let mut rule_symbols = std::collections::BTreeMap::<String, String>::new();
+    let mut fact_symbols = std::collections::BTreeMap::<String, String>::new();
+    let mut graph_symbols = std::collections::BTreeMap::<String, String>::new();
+    let mut assertion_symbols = std::collections::BTreeMap::<usize, String>::new();
     for rule in &ir.rules {
+        rule_symbols
+            .entry(rule.name.clone())
+            .or_insert_with(|| maude_symbol("rule", &rule.name));
+        for (when_index, when) in rule.whens.iter().enumerate() {
+            let fact_key = rule_fact_key(&rule.name, when_index, &when.pattern);
+            fact_symbols
+                .entry(fact_key.clone())
+                .or_insert_with(|| maude_symbol("fact", &fact_key));
+            let graph_key = rule_graph_key(&rule.name, when_index);
+            graph_symbols
+                .entry(graph_key.clone())
+                .or_insert_with(|| maude_symbol("graph", &graph_key));
+        }
         for effect in &rule.metadata.effects {
             let key = effect_key(&rule.name, &effect.id);
             effect_symbols
@@ -4184,24 +4200,105 @@ fn generate_maude_model_search(
                 .or_insert_with(|| maude_symbol("eff", &key));
         }
     }
+    for (index, assertion) in ir.assertions.iter().enumerate() {
+        assertion_symbols
+            .entry(index)
+            .or_insert_with(|| maude_symbol("assertion", &assertion_key(index, assertion)));
+    }
 
     let mut output = String::new();
     let mut expected = Vec::new();
     output.push_str(&format!("load {}\n\n", kernel_path.display()));
     output.push_str("mod WHIPPLETREE-GENERATED-CHECK is\n");
     output.push_str("  including WHIPPLETREE-KERNEL .\n");
-    if !effect_symbols.is_empty() {
-        output.push_str("  ops\n");
-        for symbol in effect_symbols.values() {
-            output.push_str("    ");
-            output.push_str(symbol);
-            output.push('\n');
-        }
-        output.push_str("    : -> EffectId .\n");
-    }
+    append_maude_ops(&mut output, effect_symbols.values(), "EffectId");
+    append_maude_ops(&mut output, rule_symbols.values(), "RuleId");
+    append_maude_ops(&mut output, fact_symbols.values(), "FactId");
+    append_maude_ops(&mut output, graph_symbols.values(), "GraphId");
+    append_maude_ops(&mut output, assertion_symbols.values(), "AssertionId");
     output.push_str("endm\n\n");
 
     for rule in &ir.rules {
+        for (when_index, when) in rule.whens.iter().enumerate() {
+            let Some(guard) = &when.guard else {
+                continue;
+            };
+            let Some(rule_symbol) = rule_symbols.get(&rule.name) else {
+                continue;
+            };
+            let fact_key = rule_fact_key(&rule.name, when_index, &when.pattern);
+            let Some(fact_symbol) = fact_symbols.get(&fact_key) else {
+                continue;
+            };
+            let graph_key = rule_graph_key(&rule.name, when_index);
+            let Some(graph_symbol) = graph_symbols.get(&graph_key) else {
+                continue;
+            };
+            output.push_str(&format!(
+                "--- {}: true guard permits rule commit for `{}`.\n",
+                rule.name, guard.source
+            ));
+            output.push_str(&format!(
+                "search [1] in WHIPPLETREE-GENERATED-CHECK :\n  fact({fact_symbol}) rule({rule_symbol}, {fact_symbol}, {graph_symbol}) guard({rule_symbol}, {fact_symbol}, gTrue)\n  =>*\n  fact({fact_symbol}) rule({rule_symbol}, {fact_symbol}, {graph_symbol}) guard({rule_symbol}, {fact_symbol}, gTrue) ruleFired({rule_symbol}, {fact_symbol}, {graph_symbol}) graphReady({graph_symbol}) event(ruleCommitEvt) .\n\n"
+            ));
+            expected.push(ExpectedSearch {
+                outcome: ExpectedSearchResult::Solution,
+                span: guard.span,
+                description: format!("{} true guard commits rule", rule.name),
+                upstream: rule.name.clone(),
+                predicate: "guard-true",
+                downstream: "ruleCommitEvt".to_owned(),
+            });
+
+            output.push_str(&format!(
+                "--- {}: false guard cannot commit rule for `{}`.\n",
+                rule.name, guard.source
+            ));
+            output.push_str(&format!(
+                "search [1] in WHIPPLETREE-GENERATED-CHECK :\n  fact({fact_symbol}) rule({rule_symbol}, {fact_symbol}, {graph_symbol}) guard({rule_symbol}, {fact_symbol}, gFalse)\n  =>*\n  event(ruleCommitEvt) .\n\n"
+            ));
+            expected.push(ExpectedSearch {
+                outcome: ExpectedSearchResult::NoSolution,
+                span: guard.span,
+                description: format!("{} false guard cannot commit rule", rule.name),
+                upstream: rule.name.clone(),
+                predicate: "guard-false",
+                downstream: "ruleCommitEvt".to_owned(),
+            });
+
+            output.push_str(&format!(
+                "--- {}: guard error emits a diagnostic and cannot commit rule for `{}`.\n",
+                rule.name, guard.source
+            ));
+            output.push_str(&format!(
+                "search [1] in WHIPPLETREE-GENERATED-CHECK :\n  fact({fact_symbol}) rule({rule_symbol}, {fact_symbol}, {graph_symbol}) guard({rule_symbol}, {fact_symbol}, gError)\n  =>*\n  fact({fact_symbol}) rule({rule_symbol}, {fact_symbol}, {graph_symbol}) diagnostic({rule_symbol}) .\n\n"
+            ));
+            expected.push(ExpectedSearch {
+                outcome: ExpectedSearchResult::Solution,
+                span: guard.span,
+                description: format!("{} guard error emits diagnostic", rule.name),
+                upstream: rule.name.clone(),
+                predicate: "guard-error",
+                downstream: "diagnostic".to_owned(),
+            });
+
+            output.push_str(&format!(
+                "--- {}: guard error cannot commit rule for `{}`.\n",
+                rule.name, guard.source
+            ));
+            output.push_str(&format!(
+                "search [1] in WHIPPLETREE-GENERATED-CHECK :\n  fact({fact_symbol}) rule({rule_symbol}, {fact_symbol}, {graph_symbol}) guard({rule_symbol}, {fact_symbol}, gError)\n  =>*\n  event(ruleCommitEvt) .\n\n"
+            ));
+            expected.push(ExpectedSearch {
+                outcome: ExpectedSearchResult::NoSolution,
+                span: guard.span,
+                description: format!("{} guard error cannot commit rule", rule.name),
+                upstream: rule.name.clone(),
+                predicate: "guard-error",
+                downstream: "ruleCommitEvt".to_owned(),
+            });
+        }
+
         for dependency in &rule.metadata.dependencies {
             let upstream_key = effect_key(&rule.name, &dependency.upstream);
             let downstream_key = effect_key(&rule.name, &dependency.downstream);
@@ -4275,7 +4372,51 @@ fn generate_maude_model_search(
         }
     }
 
+    for (index, assertion) in ir.assertions.iter().enumerate() {
+        let Some(assertion_symbol) = assertion_symbols.get(&index) else {
+            continue;
+        };
+        for result in ["aPass", "aFail", "aError"] {
+            output.push_str(&format!(
+                "--- assertion {}: {result} cannot mutate runtime state.\n",
+                index + 1
+            ));
+            output.push_str(&format!(
+                "search [1] in WHIPPLETREE-GENERATED-CHECK :\n  assertion({assertion_symbol}, {result})\n  =>*\n  event(ruleCommitEvt) .\n\n"
+            ));
+            expected.push(ExpectedSearch {
+                outcome: ExpectedSearchResult::NoSolution,
+                span: assertion.expr.span,
+                description: format!(
+                    "assertion {} {result} cannot mutate runtime state",
+                    index + 1
+                ),
+                upstream: format!("assertion{}", index + 1),
+                predicate: "assertion-read-only",
+                downstream: "ruleCommitEvt".to_owned(),
+            });
+        }
+    }
+
     (output, expected)
+}
+
+fn append_maude_ops<'a>(
+    output: &mut String,
+    symbols: impl IntoIterator<Item = &'a String>,
+    sort: &str,
+) {
+    let symbols = symbols.into_iter().collect::<Vec<_>>();
+    if symbols.is_empty() {
+        return;
+    }
+    output.push_str("  ops\n");
+    for symbol in symbols {
+        output.push_str("    ");
+        output.push_str(symbol);
+        output.push('\n');
+    }
+    output.push_str(&format!("    : -> {sort} .\n"));
 }
 
 fn extract_maude_search_results(output: &str) -> Vec<ExpectedSearchResult> {
@@ -4317,6 +4458,18 @@ fn dependency_source_span(source: &str, upstream: &str, predicate: &str) -> Sour
 
 fn effect_key(rule_name: &str, effect_id: &str) -> String {
     format!("{rule_name}:{effect_id}")
+}
+
+fn rule_fact_key(rule_name: &str, when_index: usize, pattern: &str) -> String {
+    format!("{rule_name}:when{when_index}:{pattern}")
+}
+
+fn rule_graph_key(rule_name: &str, when_index: usize) -> String {
+    format!("{rule_name}:when{when_index}:graph")
+}
+
+fn assertion_key(index: usize, assertion: &whippletree_parser::IrAssertion) -> String {
+    format!("{index}:{}", assertion.expr.source)
 }
 
 fn maude_symbol(prefix: &str, value: &str) -> String {
@@ -4874,6 +5027,80 @@ mod tests {
                 .filter(|result| result.outcome == ExpectedSearchResult::Solution)
                 .count(),
             2
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|result| result.predicate == "succeeds")
+                .count(),
+            3
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|result| result.predicate == "fails")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn generates_model_searches_for_guards_and_assertions() {
+        let source = r#"
+workflow GeneratedChecks
+
+class Task {
+  priority int
+  status string
+}
+
+class Result {
+  status string
+}
+
+assert empty(Result)
+
+rule accept
+  when Task as task where task.priority > 1
+=> {
+  record Result {
+    status "accepted"
+  }
+}
+"#;
+        let compiled = whippletree_parser::compile_program(source);
+        let ir = compiled.ir.expect("source compiles");
+        let (maude, expected) =
+            generate_maude_model_search(source, &ir, Path::new("/tmp/kernel.maude"));
+
+        assert_eq!(expected.len(), 7);
+        assert!(maude.contains("guard("));
+        assert!(maude.contains("gTrue"));
+        assert!(maude.contains("gFalse"));
+        assert!(maude.contains("gError"));
+        assert!(maude.contains("assertion("));
+        assert!(maude.contains("aPass"));
+        assert!(maude.contains("aFail"));
+        assert!(maude.contains("aError"));
+        assert!(expected.iter().any(|result| {
+            result.description == "accept true guard commits rule"
+                && result.outcome == ExpectedSearchResult::Solution
+        }));
+        assert!(expected.iter().any(|result| {
+            result.description == "accept false guard cannot commit rule"
+                && result.outcome == ExpectedSearchResult::NoSolution
+        }));
+        assert!(expected.iter().any(|result| {
+            result.description == "accept guard error emits diagnostic"
+                && result.outcome == ExpectedSearchResult::Solution
+        }));
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|result| result.predicate == "assertion-read-only"
+                    && result.outcome == ExpectedSearchResult::NoSolution)
+                .count(),
+            3
         );
     }
 

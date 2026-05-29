@@ -1645,7 +1645,7 @@ rule seed
 }
 
 #[test]
-fn dev_reports_assertion_errors_with_nonzero_exit() {
+fn dev_reports_static_assertion_errors_with_nonzero_exit() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let source_path = temp_workflow_path("assertion-error");
@@ -1674,19 +1674,19 @@ assert missing.value
         .output()
         .expect("command runs");
     assert!(!output.status.success());
-    let dev: Value = serde_json::from_slice(&output.stdout).expect("json stdout");
-    let assertion = dev
-        .get("assertions")
-        .and_then(Value::as_array)
-        .and_then(|assertions| assertions.first())
-        .expect("assertion");
-    assert_eq!(
-        assertion.get("status").and_then(Value::as_str),
-        Some("error")
+    assert!(
+        output.stdout.is_empty(),
+        "static assertion diagnostics should not emit dev JSON\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
     );
-    assert_eq!(
-        assertion.get("error").and_then(Value::as_str),
-        Some("assertion expression evaluated to Missing")
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("assertion has unknown expression root `missing`"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("use a binding introduced by a `when ... as name` clause"),
+        "stderr:\n{stderr}"
     );
 
     let _ = fs::remove_file(store_path);
