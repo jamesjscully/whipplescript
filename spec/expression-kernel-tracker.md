@@ -141,9 +141,9 @@ The expression kernel covers deterministic logic used by:
 - [x] Implement fact and effect projection reads over typed query filters.
 - [ ] Ensure guard `false` means non-match and guard `Error` means no rule
   commit plus diagnostic.
-- [ ] Ensure assertion `false` or `Error` cannot mutate facts/effects and
+- [x] Ensure assertion `false` or `Error` cannot mutate facts/effects and
   produces structured failure output.
-- [ ] Add deterministic JSON output for assertion actual/expected values and
+- [~] Add deterministic JSON output for assertion actual/expected values and
   failure reasons.
 
 ### 4. IR, Lowering, And Generated Checks
@@ -201,13 +201,13 @@ The expression kernel covers deterministic logic used by:
   misuse, invalid enums, invalid literal values, bad membership, bad ordering,
   bad array literals, and bad `AgentRef` targets.
 - [ ] Runtime tests for guard true, false, and error paths.
-- [ ] Runtime tests for assertion pass, fail, and error paths.
+- [x] Runtime tests for assertion pass, fail, and error paths.
 - [~] Parser/type-checker tests for enum, literal, optional, and tagged-union
   pattern branches.
 - [x] Exhaustiveness diagnostic tests for finite pattern domains.
 - [x] E2E test showing `&&`, `||`, `!`, ordering, `in`, `exists`, `empty`, and
   `count` in source.
-- [ ] E2E test showing assertion failures reach JSON output and nonzero exit.
+- [x] E2E test showing assertion failures reach JSON output and nonzero exit.
 - [ ] E2E test showing failed guards do not enqueue effects.
 - [x] E2E test showing rule-body `case` branches select literal and optional
   patterns before recording facts.
@@ -244,7 +244,7 @@ The expression kernel covers deterministic logic used by:
 - [x] Optional field access is rejected unless presence is proven.
 - [x] Dynamic agent routing is typed as `AgentRef` or equivalent, and plain
   strings cannot target `tell`.
-- [ ] Assertion failures are visible in CLI JSON/human output, event or
+- [~] Assertion failures are visible in CLI JSON/human output, event or
   diagnostic surfaces, and CI exit status without mutating workflow state.
 - [ ] Generated Maude checks include guard-gated rule commits and assertion
   non-mutation cases.

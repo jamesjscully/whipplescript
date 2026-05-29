@@ -1293,6 +1293,140 @@ rule seed
     let _ = fs::remove_file(source_path);
 }
 
+#[test]
+fn dev_reports_failed_assertions_with_nonzero_exit() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("assertion-failure");
+    fs::write(
+        &source_path,
+        r#"
+workflow AssertionFailure
+
+class Seen {
+  status "ok"
+}
+
+assert count(Seen) == 2
+
+rule seed
+  when started
+=> {
+  record Seen {
+    status "ok"
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success());
+    let dev: Value = serde_json::from_slice(&output.stdout).expect("json stdout");
+    let assertion = dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .and_then(|assertions| assertions.first())
+        .expect("assertion");
+    assert_eq!(
+        assertion.get("status").and_then(Value::as_str),
+        Some("failed")
+    );
+    assert_eq!(
+        assertion.get("passed").and_then(Value::as_bool),
+        Some(false)
+    );
+
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    assert_eq!(
+        facts
+            .as_array()
+            .expect("facts")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("Seen"))
+            .count(),
+        1
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn dev_reports_assertion_errors_with_nonzero_exit() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("assertion-error");
+    fs::write(
+        &source_path,
+        r#"
+workflow AssertionError
+
+assert missing.value
+"#,
+    )
+    .expect("write source");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success());
+    let dev: Value = serde_json::from_slice(&output.stdout).expect("json stdout");
+    let assertion = dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .and_then(|assertions| assertions.first())
+        .expect("assertion");
+    assert_eq!(
+        assertion.get("status").and_then(Value::as_str),
+        Some("error")
+    );
+    assert_eq!(
+        assertion.get("error").and_then(Value::as_str),
+        Some("assertion expression evaluated to Missing")
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
 fn run_json(bin: &str, args: &[&str]) -> Value {
     let text = run_text(bin, args);
     serde_json::from_str(&text).expect("valid JSON output")

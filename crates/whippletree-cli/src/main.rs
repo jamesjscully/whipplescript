@@ -585,8 +585,27 @@ struct StepReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AssertionReport {
     expr: String,
+    status: AssertionStatus,
     passed: bool,
     actual: Value,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AssertionStatus {
+    Passed,
+    Failed,
+    Error,
+}
+
+impl AssertionStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Error => "error",
+        }
+    }
 }
 
 fn step_instance(
@@ -1309,7 +1328,19 @@ fn dev(options: &CliOptions) -> ExitCode {
         }
     } else if !failed_assertions.is_empty() {
         for assertion in failed_assertions {
-            eprintln!("assertion failed: {}", assertion.expr);
+            match assertion.status {
+                AssertionStatus::Failed => eprintln!("assertion failed: {}", assertion.expr),
+                AssertionStatus::Error => eprintln!(
+                    "assertion error: {}{}",
+                    assertion.expr,
+                    assertion
+                        .error
+                        .as_deref()
+                        .map(|error| format!(" ({error})"))
+                        .unwrap_or_default()
+                ),
+                AssertionStatus::Passed => {}
+            }
         }
         ExitCode::from(1)
     } else {
@@ -1573,14 +1604,46 @@ fn eval_assertions(
 
 fn eval_assertion(expr: &str, facts: &[FactView], effects: &[EffectView]) -> AssertionReport {
     let expr = expr.trim();
-    let actual = parse_expression(expr)
-        .map(|parsed| eval_expr_value(&parsed, &EvalScope::assertions(facts, effects)).into_json())
-        .unwrap_or(Value::Bool(false));
-    let passed = actual.as_bool() == Some(true);
+    let (status, actual, error) = match parse_expression(expr) {
+        Ok(parsed) => assertion_result(eval_expr_value(
+            &parsed,
+            &EvalScope::assertions(facts, effects),
+        )),
+        Err(message) => (
+            AssertionStatus::Error,
+            Value::Null,
+            Some(format!("invalid assertion expression: {message}")),
+        ),
+    };
+    let passed = status == AssertionStatus::Passed;
     AssertionReport {
         expr: expr.to_owned(),
+        status,
         passed,
         actual,
+        error,
+    }
+}
+
+fn assertion_result(value: EvalValue) -> (AssertionStatus, Value, Option<String>) {
+    match value {
+        EvalValue::Json(Value::Bool(true)) => (AssertionStatus::Passed, Value::Bool(true), None),
+        EvalValue::Json(Value::Bool(false)) => (AssertionStatus::Failed, Value::Bool(false), None),
+        EvalValue::Json(value) => (
+            AssertionStatus::Error,
+            value,
+            Some("assertion expression did not evaluate to bool".to_owned()),
+        ),
+        EvalValue::Missing => (
+            AssertionStatus::Error,
+            json!({"internal": "Missing"}),
+            Some("assertion expression evaluated to Missing".to_owned()),
+        ),
+        EvalValue::Error => (
+            AssertionStatus::Error,
+            json!({"internal": "Error"}),
+            Some("assertion expression evaluation failed".to_owned()),
+        ),
     }
 }
 
@@ -2818,11 +2881,18 @@ fn step_report_to_json(report: &StepReport) -> Value {
 }
 
 fn assertion_report_to_json(report: &AssertionReport) -> Value {
-    json!({
+    let mut value = json!({
         "expr": report.expr,
+        "status": report.status.as_str(),
         "passed": report.passed,
         "actual": report.actual,
-    })
+    });
+    if let Some(error) = &report.error {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("error".to_owned(), Value::String(error.clone()));
+        }
+    }
+    value
 }
 
 fn worker_report_to_json(report: &WorkerReport) -> Value {
