@@ -232,6 +232,43 @@ upstream dependency is still queued, that satisfying terminal states release the
 downstream effect, and that non-satisfying terminal states do not release
 success/failure-specific branches.
 
+Generated per-program checks must keep those dependency searches and add
+expression-kernel searches from the same lowered typed IR. The generator should
+emit one finite Maude program module per checked Whippletree program, with
+symbols for the program's rules, facts, effects, dependency edges, guard
+outcomes, assertion checkpoints, and source-span anchors. Validation must use
+generated searches over that module, not only hand-written abstract examples.
+
+For every guarded rule, generated searches should assert:
+
+- a `ruleCommitted(<rule>)` state is reachable only from a matching fact set
+  where the lowered guard predicate evaluates to `true`
+- no fact write, consume, or effect graph commit for that rule is reachable
+  from the same matching fact set when the guard evaluates to `false`
+- no fact write, consume, or effect graph commit for that rule is reachable
+  when guard evaluation produces `error`
+- an error guard may reach a diagnostic/evidence state, but that state must
+  preserve the pre-rule user facts and effect queue
+
+For every assertion checkpoint, generated searches should assert:
+
+- assertion `pass` preserves the normal reachable state space
+- assertion `fail` cannot create, consume, or mutate user facts
+- assertion `fail` cannot enqueue, release, claim, or complete effects
+- assertion `error` has the same non-mutation guarantees as `fail`
+- failure/error diagnostics or evidence are allowed only on diagnostic/evidence
+  surfaces, not as workflow-state commits
+
+For effect dependencies, generated expression-kernel checks must preserve the
+existing generated searches:
+
+- downstream effects cannot run while an upstream dependency is still queued
+- satisfying terminal states release matching downstream branches
+- non-satisfying terminal states do not release success/failure-specific
+  branches
+- dependency checks still run for effect graphs committed through a true guard
+  and are not weakened by adding guard/assertion searches
+
 When a generated search returns an unexpected result, the CLI reports a
 source-span diagnostic at the matching `after <effect> <predicate>` dependency
 anchor and includes the expected and actual Maude result.
@@ -275,11 +312,18 @@ as a typed success/failure/timeout/cancel event.
 
 Initial expression-kernel searches:
 
-- no `ruleFired` state is reachable from a false guard
-- no `graphCommitted` state is reachable from an error guard
+- no `ruleCommitted(<rule>)`, fact mutation, consume, or `graphCommitted`
+  state is reachable from a false guard
+- no `ruleCommitted(<rule>)`, fact mutation, consume, or `graphCommitted`
+  state is reachable from an error guard
+- a guard error can produce a diagnostic/evidence state while preserving the
+  previous facts and effect queue
 - a true guard permits the same effect graph checks already used by dependency
   searches
-- an assertion failure cannot create new user facts or effects
+- an assertion failure cannot create, consume, or mutate user facts or enqueue,
+  release, claim, or complete effects
+- an assertion error has the same workflow-state non-mutation guarantee as
+  assertion failure
 - an undeclared dynamic agent target cannot create an `agent.tell` effect
 - two evaluations over the same projection cannot produce different guard
   results

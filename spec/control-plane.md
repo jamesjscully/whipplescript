@@ -197,11 +197,63 @@ terminal event append
 fact derivation
 ```
 
-Failures before claim should leave a blocked effect with explainable status.
-Failures after claim should append `effect.failed`, `effect.timed_out`, or
-`effect.cancelled` with structured error metadata and evidence. If the store
+Failures before claim should leave a blocked effect with explainable status and
+diagnostics. Failures after claim should append a durable event, update the run,
+and link evidence/artifacts before the worker reports completion. If the store
 cannot append a terminal event, the worker must leave the lease/run recoverable
 instead of reporting success out of band.
+
+Provider and harness failures use these event types:
+
+```text
+provider.startup_failed
+provider.auth_failed
+provider.tool_failed
+provider.transport_failed
+provider.timed_out
+effect.failed
+effect.timed_out
+effect.cancelled
+```
+
+Provider failure event payloads must include:
+
+```text
+effect_id
+run_id?
+provider
+stage                 # binding | auth | workspace | startup | submit | stream | tool | transport | timeout | artifact | terminal_append
+error_code
+message
+retryable
+attempt
+max_attempts
+next_retry_at?
+idempotency_key
+correlation_id
+diagnostic_ids
+evidence_ids
+artifact_ids
+source_span?
+```
+
+`provider.startup_failed` covers adapter/session launch and harness bootstrap
+failures. `provider.auth_failed` covers missing, expired, denied, or
+mis-scoped credentials. `provider.tool_failed` covers provider-reported tool or
+command failures after a request was accepted. `provider.transport_failed`
+covers network, IPC, protocol, broken stream, and malformed provider response
+failures. `provider.timed_out` covers queue, startup, request, stream, tool, and
+overall run deadlines; its payload must name the timeout boundary and elapsed
+duration.
+
+Retry decisions are policy decisions, not hidden worker behavior. A retryable
+failure keeps or returns the effect to a retry-pending/queued state with the
+same effect id and idempotency key, creates a new run for each attempt, and
+links every attempt through shared correlation/evidence. A non-retryable or
+exhausted failure appends a terminal event exactly once. Replaying recovery must
+be idempotent: the same terminal event idempotency key cannot create duplicate
+terminal events, duplicate completion facts, or duplicate external side-effect
+acknowledgements.
 
 `whip dev` composes `step` and `worker` for one local dogfood session. It should
 stream status, stop at idle/blocked/terminal states, and make every provider
@@ -255,6 +307,43 @@ Workflow assertions are deterministic checks over projections. They may run as
 part of `whip check`, `whip step --assert`, `whip dev`, and e2e scripts. Failed
 assertions should be emitted as diagnostics/evidence tied to the assertion's
 source span; they must not mutate user facts or enqueue effects.
+
+Assertion evaluation is a durable observation surface. Each evaluated assertion
+must append one of:
+
+```text
+assertion.passed
+assertion.failed
+assertion.errored
+```
+
+Assertion event payloads must include:
+
+```text
+assertion_id
+assertion_text
+result                # pass | fail | error
+program_version_id
+rule_name?
+source_span
+read_set              # fact/effect/event ids or projection descriptors
+actual_json?
+expected_json?
+error_code?
+message?
+diagnostic_ids
+evidence_ids
+correlation_id
+idempotency_key
+```
+
+`assertion.failed` means the expression evaluated deterministically to false.
+`assertion.errored` means evaluation could not produce a boolean result because
+of missing data, type errors, unsupported operators, or runtime evaluator
+errors. Both are non-mutating: no facts, effects, dependencies, or provider runs
+may be committed by the assertion. Re-running the same assertion against the
+same program version, instance sequence, and read set must produce the same
+idempotency key so recovery does not duplicate assertion diagnostics.
 
 Dogfood acceptance for this layer:
 

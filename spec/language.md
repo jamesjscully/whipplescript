@@ -263,6 +263,31 @@ Guards are the preferred way to express routing over a shared schema. Authors
 should not need one schema per provider when the data shape is identical and
 only a literal or enum field selects the target.
 
+### Expression Parser Coverage
+
+The source expression parser covers guards, assertions, projection filters,
+matrix rows, typed effect arguments, interpolation paths, and branch guards with
+one deterministic expression kernel. Each surface must parse to the same typed
+IR nodes so validation, snapshots, Maude checks, and runtime evaluation do not
+grow separate dialects.
+
+| Surface | Accepted expression forms | Notes |
+| --- | --- | --- |
+| `when Fact as x where <expr>` | paths, literals, `null`, booleans, `!`, `&&`, `||`, comparisons, membership, `exists path`, `empty(expr)`, `count(query)`, arrays, map indexes | Result must be boolean. Guard `false` means non-match; guard `Error` is diagnostic and no commit. |
+| Top-level `assert <expr>` | all guard forms plus fact/effect projection queries | Result must be boolean. Assertions are read-only checkpoints over committed facts/effects. |
+| `Class where <expr>` | field paths rooted at the projected class alias, comparisons, booleans, membership, presence, map indexes | Projection filters are pure reads and cannot enqueue effects or call providers. |
+| `effect kind K where <expr>` | effect status/kind/profile/output paths, comparisons, booleans, membership, presence, map indexes | Output paths must respect completion status and terminal-output union tags. |
+| Static matrix rows | typed literals, arrays, records in schema context, enum/literal values, `AgentRef` values | Matrix rows are compile-time seed data, not runtime loops. |
+| Effect and `record` arguments | typed paths, literals, arrays, records in expected schema context, `AgentRef` values | Arguments must satisfy the declared payload or fact schema before lowering. |
+| Interpolation paths | field paths, optional-present paths after proof, map indexes | Interpolation is path-oriented; it does not admit arbitrary provider calls or string parsing. |
+| `case expr` scrutinees and branch guards | finite-domain enum/literal/optional/tagged-union values and ordinary boolean branch guards | Branch guards reuse the same parser and evaluator as `where` guards. |
+
+Golden IR fixtures should exercise every row with stable snapshots for source
+span preservation, precedence, query reads, dynamic `AgentRef` values, and
+runtime-visible `Missing` versus `null` behavior. The fixtures should include
+both concise examples and one provider-language dogfood workflow that routes
+through deterministic metadata instead of model judgment.
+
 ## Pattern Branches
 
 Whippletree supports only typed finite-domain pattern matching. The feature is
@@ -313,12 +338,32 @@ case issue.assignee {
 }
 ```
 
+Example tagged terminal-output branch:
+
+```whippletree
+case turn.output {
+  Completed result where exists result.artifactPath => record LanguageArtifact {
+    path result.artifactPath
+    summary result.summary
+  }
+  Failed failure => record ProviderFailure {
+    reason failure.reason
+  }
+  Blocked block => askHuman """
+    Provider run was blocked:
+    {{ block.reason }}
+  """
+}
+```
+
 The concrete branch syntax may still change as implementation lands. The
 semantic requirements are fixed:
 
 - variants must belong to the scrutinee's enum or literal-union domain
 - optional `Some` branches bind a proven-present value
 - `None` branches cannot read fields through the missing value
+- tagged terminal-output branches must match declared completion tags and expose
+  only fields valid for that tag
 - finite domains are exhaustiveness-checked when a total result is required
 - non-matching branches do not commit facts or effects
 - exhaustive finite-domain misses produce diagnostics, not hidden fallthrough

@@ -146,6 +146,23 @@ they are not plain strings: each listed agent must be declared, record literals
 must belong to the allowed domain, and dynamic `tell` targets must have an
 `AgentRef` type.
 
+Declared agents carry typed static metadata that is visible to the compiler:
+
+```whippletree
+agent codex {
+  profile "code"
+  capacity "high"
+  capabilities ["edit", "test", "review"]
+}
+```
+
+The exact declaration syntax may evolve, but the type-system contract is fixed:
+each declared agent has a stable name, one profile, one capacity class, and a
+finite set of capabilities. `AgentRef<A | B>` is valid only when `A` and `B`
+are declared agents. Guards and effect targets may further constrain the domain
+by profile, capacity, and required capabilities; every remaining possible
+target must satisfy those static constraints before the rule is accepted.
+
 Union types are limited in v0. The compiler may produce tagged unions for
 effect terminal outputs, but user-authored arbitrary unions should wait until
 we need them.
@@ -167,7 +184,19 @@ IR should represent types structurally:
 { "type": "map", "values": { "type": "int" } }
 { "type": "ref", "name": "WorkReview" }
 { "type": "literal", "value": "accepted" }
-{ "type": "agent_ref", "agents": ["codex", "claude", "pi"] }
+{
+  "type": "agent_ref",
+  "agents": ["codex", "claude", "pi"],
+  "constraints": {
+    "profiles": ["code"],
+    "capacities": ["medium", "high"],
+    "capabilities": ["edit", "test"]
+  },
+  "provenance": {
+    "declared_at": "workflow.whippletree:3:1",
+    "refined_by": ["workflow.whippletree:18:27"]
+  }
+}
 { "type": "media", "kind": "image" }
 ```
 
@@ -343,9 +372,52 @@ AgentRef<codex | claude | pi>
 ```
 
 An `AgentRef` value may be matched, stored in facts, and used by `tell` only
-when every possible target is a declared agent and satisfies the rule's
-availability/profile constraints. A plain `string` must not be accepted as a
-dynamic `tell` target.
+when every possible target is a declared agent and satisfies the rule's static
+profile, capacity, and capability constraints. A plain `string` must not be
+accepted as a dynamic `tell` target.
+
+Static checking rules:
+
+- each named agent in `AgentRef<...>` must exist in the workflow's declared
+  agent table
+- the compiler records each declared agent's profile, capacity class, and
+  capabilities in the typed environment
+- assigning `"codex"` to an `AgentRef<codex | claude>` field is allowed only
+  because the literal is in the finite agent domain
+- assigning a `string` expression, interpolated string, model output, plugin
+  output, or untyped JSON value to an `AgentRef` field is rejected unless it
+  passes through an explicit typed boundary that validates it as `AgentRef`
+- narrowing an `AgentRef<A | B | C>` with guards or patterns may only remove
+  agents from the finite domain; it must not widen to undeclared names
+- `tell task.provider` is accepted only when `task.provider` has an
+  `AgentRef<...>` type and the current refined domain satisfies the target
+  effect's declared constraints
+
+Dynamic target checking still runs after static checking. When a rule fires,
+the runtime validates that the selected JSON string is one of the IR
+`agent_ref.agents`, that the selected agent still has the required profile,
+capacity, and capabilities, and that the caller is authorized to address or
+claim that agent. Runtime failure to authorize or claim a target is a typed
+effect failure; it must not silently fall back to another agent or reinterpret
+the value as a plain string.
+
+Runtime authorization and claimability are separate from type membership:
+
+- authorization answers "may this workflow/rule/session address this declared
+  agent?"
+- claimability answers "may this rule instance reserve work for this agent now,
+  given current capacity, leases, and availability?"
+- both checks must run before enqueueing `tell`, assignment, or other agent
+  work-claiming effects
+- failed checks preserve the original target value and diagnostic metadata in
+  evidence records
+
+AgentRef IR must carry enough metadata for audit and replay. Besides the finite
+agent domain and constraint set, IR should preserve provenance for declared
+agent definitions, source spans for refinements, and whether the value came from
+a source literal, fact field, validated boundary input, or previous runtime
+selection. Provenance is not used to decide type equality, but it is required
+for diagnostics, evidence records, and runtime authorization logs.
 
 Provider/model identity should normally be deterministic metadata. BAML output
 types should contain provider fields only when the model is reviewing observed

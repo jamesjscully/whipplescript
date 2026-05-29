@@ -24,6 +24,37 @@ The expression kernel covers deterministic logic used by:
 - [~] Partially implemented or modeled, with known gaps.
 - [ ] Not implemented.
 
+## Development Pipeline Backlog
+
+Every remaining feature must move through the same gates before it is treated
+as complete:
+
+1. **Spec**: source syntax, static semantics, runtime semantics, IR/event
+   shape, and compatibility rules are explicit enough to implement.
+2. **Validation**: Maude model/search, parser/type-checker matrices, golden IR,
+   runtime fixtures, or harness failure fixtures define the expected behavior.
+3. **Implementation**: parser, lowering, evaluator, runtime/store, CLI, or
+   harness code implements the specified behavior.
+4. **Tests**: unit, snapshot, fixture, e2e, or generated-model tests cover pass,
+   fail, and error paths.
+
+| Feature | Spec | Validation | Implementation | Tests | Owner / Notes |
+| --- | --- | --- | --- | --- | --- |
+| Full guard/assertion type checking | [x] | [~] | [~] | [~] | Spec now requires one shared typed checker for guards, assertions, and projection filters. Assertions still need implementation parity with guards. |
+| Expression object literals | [x] | [ ] | [~] | [~] | Spec now requires expected-schema-only expression object literals. Record-body JSON exists, but expression-level object AST and schema-directed validation are missing. |
+| Duration/time ordering | [x] | [ ] | [~] | [ ] | Spec now defines allowed ordered pairs and normalization. Primitive type names exist, but expression typing/evaluation still treats them mostly as strings/numbers. |
+| Enum/literal finite-domain typing | [x] | [~] | [~] | [~] | Spec now requires precise finite-domain types, symmetric comparison checks, and contradiction diagnostics. Typed query heads remain partial. |
+| Generated per-program Maude checks | [x] | [ ] | [ ] | [ ] | Spec now requires generated guard/assertion searches while preserving dependency checks. Current generated searches cover effect dependencies only. |
+| AgentRef profile/capacity/capability constraints | [x] | [~] | [~] | [~] | Spec now defines declared-agent metadata, static constraints, runtime authorization, claimability, and IR provenance. Implementation is incomplete. |
+| Tagged terminal-output union branch matching | [x] | [~] | [ ] | [~] | Docs now define tagged terminal-output branch semantics. `after ... completes` still lacks a typed terminal union payload. |
+| Branch pattern spans and typed lowering | [~] | [ ] | [~] | [~] | Main/parser+CLI. Case validation exists, but diagnostics point at coarse rule-body spans and CLI lowering duplicates parser heuristics. |
+| Assertion diagnostics and event surfaces | [x] | [~] | [~] | [~] | Specs now define durable assertion pass/fail/error events, diagnostics, evidence, source spans, and trace exposure. Store/CLI implementation remains partial. |
+| Provider/harness failure capture | [x] | [~] | [~] | [~] | Specs now define startup/auth/tool/transport/timeout failure events and idempotent retry behavior. Codex/Claude/Pi harness implementations remain partial. |
+| Parser-only expression matrix | [x] | [ ] | [~] | [ ] | Docs now require direct expression parser tests for every grammar form and invalid syntax category. Test implementation remains missing. |
+| Golden IR expression fixture | [x] | [ ] | [ ] | [ ] | Docs now require a dedicated fixture that exercises guards, assertions, projection reads, paths, arrays, maps, and future object literals. |
+| Static-analysis diagnostic matrix | [x] | [ ] | [~] | [~] | Docs now enumerate diagnostic categories. Need explicit tests for unknown binding/field/query field, optional misuse, enum/literal typos, bad membership, bad ordering, mixed arrays, and AgentRef misuse. |
+| Companion-skill dogfood cleanup | [x] | [ ] | [~] | [ ] | Docs now define companion-skill dogfood expectations. Need deterministic routing workflows authored through the companion skill without LLM provider/model classification. |
+
 ## Current Implementation Summary
 
 - [x] Source accepts guarded fact matches such as

@@ -47,6 +47,72 @@ script detection can also be tested through a deterministic validator
 capability. E2E coverage should include both paths: model-judged review for
 BAML integration and non-LLM validation for deterministic CI.
 
+## Expression Kernel Coverage
+
+The e2e suite is the integration gate for the expression kernel after parser,
+validation, and unit-level runtime tests have landed. It should not duplicate
+every parser fixture, but it must prove the compiled source path works end to
+end for the language forms authors are expected to use.
+
+Required deterministic coverage:
+
+| Area | E2E expectation |
+| --- | --- |
+| Guard routing | One shared `LanguageTask` schema routes `codex`, `claude`, and `pi` with deterministic `where` guards or typed `AgentRef` fields. |
+| Boolean and comparison operators | Source includes `&&`, `||`, `!`, equality, inequality, and numeric ordering in guards or assertions. |
+| Membership and presence | Source includes `in`, `not in`, `exists path`, optional-present access, and null/missing-sensitive checks. |
+| Projection functions | Source assertions use `count`, `exists(collection)`, and `empty` over fact and effect projections. |
+| Map/index paths | At least one guard or assertion reads a string-keyed map index. |
+| Pattern branches | Rule-body `case` selects enum/literal, optional `Some`/`None`, and tagged terminal-output union branches before recording facts or effects. |
+| Assertion output | Failed assertions produce structured JSON output, nonzero exit, and no state mutation after the failed checkpoint. |
+| Guard failure | A false guard does not enqueue effects; a guard error is diagnosable and does not commit a partial rule. |
+| Dynamic routing | Dynamic `tell` targets use `AgentRef<...>` values and reject plain strings before provider execution. |
+
+Golden IR fixtures are the validation bridge between parser coverage and e2e
+behavior. They should snapshot guards, assertions, projection queries, branch
+guards, matrix rows, typed `record`/effect arguments, dynamic `AgentRef`
+targets, map indexes, arrays, and `Missing` versus `null` preserving nodes. The
+fixtures should be small, source-stable, and reviewed alongside runtime e2e
+changes so implementation cannot silently create a second expression dialect.
+
+## Companion-Skill Dogfood
+
+The companion-skill dogfood test should author deterministic routing and
+validation metadata directly in Whippletree source:
+
+- provider/model identity is represented by literals, enums, or `AgentRef`
+  values supplied by the workflow, not by a BAML classifier or model answer
+- provider-language tasks are seeded from a typed matrix or equivalent typed
+  facts with one shared task schema
+- companion instructions encourage agents to emit artifacts and trace evidence,
+  while source assertions check counts, route coverage, and terminal effect
+  states
+- a deterministic validator capability checks exact script/fixture properties
+  in CI, with BAML review kept as a separate integration path
+- assertions prove that all expected provider/language pairs completed and that
+  no duplicate provider-specific task classes were needed
+
+This test is considered stale if it asks an LLM to infer provider identity,
+duplicates the task schema per provider, or validates exact script membership
+only through model judgment.
+
+## Stale E2E Cleanup
+
+As expression-kernel coverage lands, remove or rewrite e2e cases that encode
+pre-kernel behavior:
+
+- provider-language fixtures with one task class per provider should become a
+  shared schema plus guard or `AgentRef` routing
+- Rust-only assertions for provider counts, turn counts, and BAML counts should
+  move into source assertions where practical, leaving Rust to check CLI exit
+  status and JSON shape
+- tests that inspect prompt text to recover route identity should use typed
+  correlation metadata, effect projections, or recorded result facts
+- legacy guard string tests should be replaced by typed expression parser,
+  golden IR, validation, and runtime/e2e coverage
+- model-judged exact-script checks should be paired with deterministic
+  validator-capability coverage before being treated as CI signal
+
 ## Optional Real Providers
 
 Real-provider checks are opt-in:

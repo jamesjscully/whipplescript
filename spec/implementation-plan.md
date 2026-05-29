@@ -91,6 +91,32 @@ Goal: validate the core execution model before and during implementation.
 - [x] Add a Ralph loop model with an explicit external-event boundary.
 - [x] Add a coerce classification model with success/failure branches.
 - [x] Add generated Maude checks from typed IR once the compiler exists.
+- [ ] Extend the generated per-program Maude spec from effect dependencies to
+  expression-kernel behavior:
+  - [ ] For every guarded rule, generate a search showing
+    `ruleCommitted(<rule>)` is reachable only when the lowered guard predicate
+    is true.
+  - [ ] For every guarded rule, generate false-guard searches showing no fact
+    write, consume, or effect graph commit is reachable.
+  - [ ] For every guarded rule, generate error-guard searches showing no fact
+    write, consume, or effect graph commit is reachable, while allowing only
+    diagnostic/evidence output.
+  - [ ] For every assertion checkpoint, generate failure and error searches
+    showing no user fact mutation and no effect enqueue/release/claim/complete
+    transition is reachable.
+  - [ ] Preserve the existing generated effect dependency searches for queued
+    upstream dependencies, satisfying terminal release, and non-satisfying
+    terminal non-release.
+- [ ] Validate generated checks against compiled `.whip` fixtures, not only
+  hand-authored Maude modules.
+  - [ ] Include a true-guard fixture whose committed effect graph still runs
+    the existing dependency-release searches.
+  - [ ] Include false-guard and error-guard fixtures where generated searches
+    prove the rule does not commit.
+  - [ ] Include assertion failure and assertion error fixtures where generated
+    searches prove facts/effects are unchanged.
+  - [ ] Include expected-failure fixtures that inject unsafe generated rewrites
+    and prove Maude finds counterexamples when `maude` is available.
 
 ### TLA+/Apalache Runtime Lifecycle
 
@@ -143,6 +169,12 @@ Acceptance:
 - [x] Formal checks fail on intentionally broken dependency-release behavior.
 - [x] Runtime trace fixtures catch impossible lifecycle transitions.
 - [x] Generated Maude checks can be run optionally from the CLI.
+- [ ] Generated Maude checks catch intentionally broken guard-gated rule commit
+  behavior from compiled Whippletree fixtures.
+- [ ] Generated Maude checks catch intentionally broken assertion
+  non-mutation behavior from compiled Whippletree fixtures.
+- [ ] Adding guard/assertion searches does not remove or weaken the existing
+  generated effect dependency checks.
 
 ## Stage 2: Source Language, Parser, And Typed IR
 

@@ -28,9 +28,13 @@ diagnostic
 human answer
 capability decision
 skill/context injection
+assertion result
+provider failure
 ```
 
 Every external effect should produce an evidence trail even when it fails.
+Every assertion evaluation should produce an evidence trail even when it passes,
+because passing assertions are part of reproducible validation.
 
 Evidence records should be stable enough to support:
 
@@ -63,6 +67,9 @@ memory_result
 patch
 test_output
 human_answer
+failure_transcript
+assertion_read_set
+trace_json
 ```
 
 Artifact retention is policy-controlled. Sensitive artifacts may be redacted or
@@ -80,8 +87,12 @@ instance
       effect queued
       dependency edge
         provider run
+          provider startup/auth/tool/transport/timeout event
           artifact capture
           completion event
+    assertion evaluation
+      assertion pass/fail/error event
+      diagnostic
 ```
 
 Required correlation fields:
@@ -96,6 +107,11 @@ run_id
 capability_id
 agent
 provider
+assertion_id
+diagnostic_id
+artifact_id
+idempotency_key
+source_span
 ```
 
 Evidence should be emitted for kernel transitions, not merely provider outputs:
@@ -111,9 +127,45 @@ effect blocked
 effect claimed
 run started
 run completed
+provider startup failed
+provider auth failed
+provider tool failed
+provider transport failed
+provider timed out
+assertion evaluated
+assertion passed
+assertion failed
+assertion errored
 terminal event appended
 projection advanced
 ```
+
+Provider failure evidence must identify the failed boundary:
+
+```text
+binding
+auth
+workspace
+startup
+submit
+stream
+tool
+transport
+timeout
+artifact
+terminal_append
+```
+
+Provider failure evidence links the effect, run, failure event, diagnostic,
+source span when available, and artifacts such as stderr, provider metadata, or
+failure transcript. Timeout evidence must include the timeout boundary, elapsed
+duration, configured deadline, and whether retry is allowed.
+
+Assertion evidence links the assertion source span, expression text, projection
+read set, result event, diagnostic, and optional compact actual/expected JSON.
+`assertion.failed` records a deterministic false result. `assertion.errored`
+records evaluator/type/missing-data errors. Neither result may be represented
+only as process exit status or stderr.
 
 ## Export Shape
 
@@ -145,6 +197,34 @@ whip evidence <instance> --json
 The export includes events, facts, effects, runs, evidence records, and typed
 evidence links. This is the stable local trace shape that a later OpenTelemetry
 or hosted exporter should consume.
+
+The JSON trace must also expose diagnostics and artifacts as first-class
+sections:
+
+```text
+schema
+instance
+program_version
+events
+facts
+effects
+runs
+artifacts
+diagnostics
+evidence
+links
+```
+
+Event, diagnostic, artifact, and evidence records in the export must preserve
+`correlation_id`, `causation_id`, `idempotency_key`, and `source_span` when
+present. Provider failure records must expose structured startup/auth/tool/
+transport/timeout details rather than flattening them into a message string.
+Assertion pass/fail/error records must expose assertion id, source span, read
+set, result, diagnostics, and evidence links.
+
+Trace export is read-only and idempotent. Re-running `whip trace <instance>
+--json` over an unchanged store must produce the same logical records and stable
+ids, aside from allowed formatting/order normalization documented by the CLI.
 
 ## Status UX
 
