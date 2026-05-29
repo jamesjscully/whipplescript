@@ -137,6 +137,10 @@ pub enum TypeSyntax {
     Ref {
         name: Ident,
     },
+    AgentRef {
+        agents: Vec<Ident>,
+        span: SourceSpan,
+    },
     Optional {
         inner: Box<TypeSyntax>,
         span: SourceSpan,
@@ -163,7 +167,8 @@ impl TypeSyntax {
             | Self::Optional { span, .. }
             | Self::Array { span, .. }
             | Self::Map { span, .. }
-            | Self::Union { span, .. } => *span,
+            | Self::Union { span, .. }
+            | Self::AgentRef { span, .. } => *span,
             Self::Ref { name } => name.span,
         }
     }
@@ -265,6 +270,7 @@ pub enum IrType {
     Primitive(IrPrimitiveType),
     LiteralString(String),
     Ref(String),
+    AgentRef(Vec<String>),
     Optional(Box<IrType>),
     Array(Box<IrType>),
     Map(Box<IrType>),
@@ -366,6 +372,7 @@ pub enum DependencyPredicate {
 #[derive(Clone, Debug)]
 struct SemanticContext {
     schemas: SchemaIndex,
+    agents: BTreeSet<String>,
     coerce_outputs: BTreeMap<String, TypeSyntax>,
     coerce_param_counts: BTreeMap<String, usize>,
 }
@@ -646,6 +653,7 @@ impl IrType {
             Self::Primitive(primitive) => primitive.as_str().to_owned(),
             Self::LiteralString(value) => format!("literal<{value:?}>"),
             Self::Ref(name) => format!("ref<{name}>"),
+            Self::AgentRef(agents) => format!("agentref<{}>", agents.join(" | ")),
             Self::Optional(inner) => format!("optional<{}>", inner.to_snapshot()),
             Self::Array(inner) => format!("array<{}>", inner.to_snapshot()),
             Self::Map(inner) => format!("map<{}>", inner.to_snapshot()),
@@ -682,6 +690,7 @@ impl IrPrimitiveType {
 fn lower_program(program: Program) -> CompileOutput {
     let mut diagnostics = Vec::new();
     let schema_names = collect_schema_names(&program, &mut diagnostics);
+    let agent_names = collect_agent_names(&program, &mut diagnostics);
     let semantic = SemanticContext::from_program(&program);
     let workflow = match program.workflow {
         Some(workflow) => workflow.name,
@@ -711,10 +720,20 @@ fn lower_program(program: Program) -> CompileOutput {
             Item::Use(use_decl) => lower_use(use_decl, &mut ir, &mut diagnostics),
             Item::Agent(agent) => lower_agent(agent, &mut ir, &mut diagnostics),
             Item::Enum(enum_decl) => lower_enum(enum_decl, &mut ir, &mut diagnostics),
-            Item::Class(class_decl) => {
-                lower_class(class_decl, &mut ir, &schema_names, &mut diagnostics)
-            }
-            Item::Coerce(coerce) => lower_coerce(coerce, &mut ir, &schema_names, &mut diagnostics),
+            Item::Class(class_decl) => lower_class(
+                class_decl,
+                &mut ir,
+                &schema_names,
+                &agent_names,
+                &mut diagnostics,
+            ),
+            Item::Coerce(coerce) => lower_coerce(
+                coerce,
+                &mut ir,
+                &schema_names,
+                &agent_names,
+                &mut diagnostics,
+            ),
             Item::Assert(assertion) => lower_assert(assertion, &mut ir),
             Item::Rule(rule) => lower_rule(rule, &semantic, &mut ir, &mut diagnostics),
         }
@@ -755,9 +774,27 @@ fn collect_schema_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) ->
     names
 }
 
+fn collect_agent_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for item in &program.items {
+        let Item::Agent(agent) = item else {
+            continue;
+        };
+        if !names.insert(agent.name.name.clone()) {
+            diagnostics.push(Diagnostic {
+                span: agent.name.span,
+                message: format!("agent `{}` is declared more than once", agent.name.name),
+                suggestion: Some("rename one agent declaration or merge the settings".to_owned()),
+            });
+        }
+    }
+    names
+}
+
 impl SemanticContext {
     fn from_program(program: &Program) -> Self {
         let mut schemas = SchemaIndex::with_builtins();
+        let mut agents = BTreeSet::new();
         let mut coerce_outputs = BTreeMap::new();
         let mut coerce_param_counts = BTreeMap::new();
 
@@ -783,6 +820,9 @@ impl SemanticContext {
                             .collect(),
                     );
                 }
+                Item::Agent(agent) => {
+                    agents.insert(agent.name.name.clone());
+                }
                 Item::Coerce(coerce) => {
                     coerce_outputs.insert(coerce.name.name.clone(), coerce.output.clone());
                     coerce_param_counts.insert(coerce.name.name.clone(), coerce.params.len());
@@ -793,6 +833,7 @@ impl SemanticContext {
 
         Self {
             schemas,
+            agents,
             coerce_outputs,
             coerce_param_counts,
         }
@@ -1051,6 +1092,7 @@ fn lower_class(
     class_decl: ClassDecl,
     ir: &mut IrProgram,
     schema_names: &BTreeSet<String>,
+    agent_names: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut fields = BTreeSet::new();
@@ -1067,7 +1109,7 @@ fn lower_class(
                 ),
             });
         }
-        validate_type_refs(&field.ty, schema_names, diagnostics);
+        validate_type_refs(&field.ty, schema_names, agent_names, diagnostics);
     }
 
     ir.schemas.push(IrSchema::Class(IrClass {
@@ -1087,6 +1129,7 @@ fn lower_coerce(
     coerce: CoerceDecl,
     ir: &mut IrProgram,
     schema_names: &BTreeSet<String>,
+    agent_names: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut params = BTreeSet::new();
@@ -1103,9 +1146,9 @@ fn lower_coerce(
                 ),
             });
         }
-        validate_type_refs(&param.ty, schema_names, diagnostics);
+        validate_type_refs(&param.ty, schema_names, agent_names, diagnostics);
     }
-    validate_type_refs(&coerce.output, schema_names, diagnostics);
+    validate_type_refs(&coerce.output, schema_names, agent_names, diagnostics);
 
     ir.coerces.push(IrCoerce {
         name: coerce.name.name,
@@ -1125,6 +1168,7 @@ fn lower_coerce(
 fn validate_type_refs(
     ty: &TypeSyntax,
     schema_names: &BTreeSet<String>,
+    agent_names: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match ty {
@@ -1141,12 +1185,38 @@ fn validate_type_refs(
                 });
             }
         }
+        TypeSyntax::AgentRef { agents, .. } => {
+            let mut seen = BTreeSet::new();
+            for agent in agents {
+                if !seen.insert(agent.name.clone()) {
+                    diagnostics.push(Diagnostic {
+                        span: agent.span,
+                        message: format!("AgentRef lists agent `{}` more than once", agent.name),
+                        suggestion: Some(
+                            "remove the duplicate agent from the AgentRef domain".to_owned(),
+                        ),
+                    });
+                }
+                if !agent_names.contains(&agent.name) {
+                    diagnostics.push(Diagnostic {
+                        span: agent.span,
+                        message: format!("AgentRef references unknown agent `{}`", agent.name),
+                        suggestion: Some(format!(
+                            "declare `agent {}` before using it in AgentRef",
+                            agent.name
+                        )),
+                    });
+                }
+            }
+        }
         TypeSyntax::Optional { inner, .. }
         | TypeSyntax::Array { inner, .. }
-        | TypeSyntax::Map { inner, .. } => validate_type_refs(inner, schema_names, diagnostics),
+        | TypeSyntax::Map { inner, .. } => {
+            validate_type_refs(inner, schema_names, agent_names, diagnostics)
+        }
         TypeSyntax::Union { variants, .. } => {
             for variant in variants {
-                validate_type_refs(variant, schema_names, diagnostics);
+                validate_type_refs(variant, schema_names, agent_names, diagnostics);
             }
         }
     }
@@ -1250,6 +1320,7 @@ fn analyze_rule(
         if let (_, Some(guard)) = split_when_guard(&when.text) {
             validate_known_field_paths(rule, guard, semantic, &binding_types, diagnostics);
         }
+        validate_availability_when(rule, &when.text, semantic, &binding_types, diagnostics);
     }
     validate_case_blocks(rule, semantic, &binding_types, diagnostics);
     let mut block_stack: Vec<BlockFrame> = Vec::new();
@@ -1357,6 +1428,7 @@ fn analyze_rule(
 
         if let Some((kind, binding)) = parse_effect_line(line) {
             validate_coerce_call(rule, line, &kind, semantic, diagnostics);
+            validate_agent_tell_target(rule, line, &kind, semantic, &binding_types, diagnostics);
             anonymous_effects += 1;
             let id = binding
                 .clone()
@@ -1447,6 +1519,110 @@ fn validate_coerce_call(
             });
         }
     }
+}
+
+fn validate_agent_tell_target(
+    rule: &RuleDecl,
+    line: &str,
+    kind: &IrEffectKind,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if kind != &IrEffectKind::AgentTell {
+        return;
+    }
+    let Some(target) = parse_tell_target(line) else {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!("rule `{}` has malformed tell target", rule.name.name),
+            suggestion: Some("write `tell agentName ...` or `tell task.agentRef ...`".to_owned()),
+        });
+        return;
+    };
+    if target.starts_with('"') {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!(
+                "rule `{}` uses a string literal as a tell target",
+                rule.name.name
+            ),
+            suggestion: Some("use a declared agent name or an AgentRef field".to_owned()),
+        });
+        return;
+    }
+    if target.contains('.') {
+        let Some(ty) = expression_type(target, semantic, binding_types) else {
+            return;
+        };
+        if !matches!(ty, TypeSyntax::AgentRef { .. }) {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` uses non-AgentRef dynamic tell target `{target}`",
+                    rule.name.name
+                ),
+                suggestion: Some(
+                    "declare the field as `AgentRef<...>` before using it as a tell target"
+                        .to_owned(),
+                ),
+            });
+        }
+        return;
+    }
+    if !semantic.agents.contains(target) {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!("rule `{}` tells unknown agent `{target}`", rule.name.name),
+            suggestion: Some("declare the target agent before telling it".to_owned()),
+        });
+    }
+}
+
+fn validate_availability_when(
+    rule: &RuleDecl,
+    when: &str,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let (pattern, _) = split_when_guard(when);
+    let Some(target) = pattern.strip_suffix(" is available").map(str::trim) else {
+        return;
+    };
+    if target.contains('.') {
+        let Some(ty) = expression_type(target, semantic, binding_types) else {
+            return;
+        };
+        if !matches!(ty, TypeSyntax::AgentRef { .. }) {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` checks availability for non-AgentRef `{target}`",
+                    rule.name.name
+                ),
+                suggestion: Some(
+                    "availability checks must name a declared agent or an AgentRef field"
+                        .to_owned(),
+                ),
+            });
+        }
+        return;
+    }
+    if !semantic.agents.contains(target) {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!("rule `{}` checks unknown agent `{target}`", rule.name.name),
+            suggestion: Some("declare the target agent before checking availability".to_owned()),
+        });
+    }
+}
+
+fn parse_tell_target(line: &str) -> Option<&str> {
+    line.strip_prefix("tell ")?
+        .split_whitespace()
+        .next()
+        .filter(|target| !target.is_empty())
 }
 
 fn validate_case_blocks(
@@ -1635,6 +1811,22 @@ fn validate_case_pattern(
             };
             validate_union_case_pattern(rule, variants, &literal, diagnostics);
         }
+        TypeSyntax::AgentRef { agents, .. } => {
+            let Some(literal) = parse_literal_expr(pattern) else {
+                diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` has unsupported AgentRef case pattern `{pattern}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some(
+                        "use a declared agent name, a string literal, or `_`".to_owned(),
+                    ),
+                });
+                return;
+            };
+            validate_agent_ref_case_pattern(rule, agents, &literal, diagnostics);
+        }
         TypeSyntax::Optional { inner, .. } => {
             validate_case_pattern(rule, pattern, Some(inner), semantic, diagnostics);
         }
@@ -1743,6 +1935,9 @@ fn finite_case_domain(
             (!values.is_empty()).then_some(values)
         }
         TypeSyntax::Optional { .. } => Some(vec!["Some".to_owned(), "None".to_owned()]),
+        TypeSyntax::AgentRef { agents, .. } => {
+            Some(agents.iter().map(|agent| agent.name.clone()).collect())
+        }
         _ => None,
     }
 }
@@ -1798,6 +1993,33 @@ fn validate_union_case_pattern(
         diagnostics.push(Diagnostic {
             span: rule.body.span,
             message: format!("rule `{}` case pattern cannot be `{value}`", rule.name.name),
+            suggestion: Some(format!("use one of: {}", allowed.join(", "))),
+        });
+    }
+}
+
+fn validate_agent_ref_case_pattern(
+    rule: &RuleDecl,
+    agents: &[Ident],
+    literal: &LiteralExpr<'_>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let allowed = agents
+        .iter()
+        .map(|agent| agent.name.as_str())
+        .collect::<Vec<_>>();
+    let (LiteralExpr::String(value) | LiteralExpr::Ident(value)) = literal else {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!("rule `{}` has non-agent case pattern", rule.name.name),
+            suggestion: Some(format!("use one of: {}", allowed.join(", "))),
+        });
+        return;
+    };
+    if !allowed.contains(value) {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!("AgentRef has no agent `{value}`"),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
         });
     }
@@ -2145,6 +2367,9 @@ fn validate_literal_assignment(
         TypeSyntax::Union { variants, .. } => {
             validate_union_literal(rule, record_schema, field, variants, &literal, diagnostics);
         }
+        TypeSyntax::AgentRef { agents, .. } => {
+            validate_agent_ref_literal(rule, record_schema, field, agents, &literal, diagnostics);
+        }
         TypeSyntax::Optional { inner, .. } => {
             if literal != LiteralExpr::Null {
                 validate_literal_assignment(
@@ -2159,6 +2384,35 @@ fn validate_literal_assignment(
             }
         }
         TypeSyntax::Array { .. } | TypeSyntax::Map { .. } => {}
+    }
+}
+
+fn validate_agent_ref_literal(
+    rule: &RuleDecl,
+    record_schema: &str,
+    field: &str,
+    agents: &[Ident],
+    literal: &LiteralExpr<'_>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let allowed = agents
+        .iter()
+        .map(|agent| agent.name.as_str())
+        .collect::<Vec<_>>();
+    let (LiteralExpr::String(value) | LiteralExpr::Ident(value)) = literal else {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!("field `{record_schema}.{field}` expects an AgentRef value"),
+            suggestion: Some(format!("use one of: {}", allowed.join(", "))),
+        });
+        return;
+    };
+    if !allowed.contains(value) {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!("field `{record_schema}.{field}` cannot reference agent `{value}`"),
+            suggestion: Some(format!("use one of: {}", allowed.join(", "))),
+        });
     }
 }
 
@@ -2343,6 +2597,9 @@ fn lower_type(ty: TypeSyntax) -> IrType {
         TypeSyntax::Primitive { name, .. } => IrType::Primitive(lower_primitive_type(&name)),
         TypeSyntax::LiteralString { value, .. } => IrType::LiteralString(value),
         TypeSyntax::Ref { name } => IrType::Ref(name.name),
+        TypeSyntax::AgentRef { agents, .. } => {
+            IrType::AgentRef(agents.into_iter().map(|agent| agent.name).collect())
+        }
         TypeSyntax::Optional { inner, .. } => IrType::Optional(Box::new(lower_type(*inner))),
         TypeSyntax::Array { inner, .. } => IrType::Array(Box::new(lower_type(*inner))),
         TypeSyntax::Map { inner, .. } => IrType::Map(Box::new(lower_type(*inner))),
@@ -2512,6 +2769,14 @@ impl TypeSyntax {
             Self::Primitive { name, .. } => name.clone(),
             Self::LiteralString { value, .. } => format!("{value:?}"),
             Self::Ref { name } => name.name.clone(),
+            Self::AgentRef { agents, .. } => {
+                let agents = agents
+                    .iter()
+                    .map(|agent| agent.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                format!("AgentRef<{agents}>")
+            }
             Self::Optional { inner, .. } => format!("{}?", inner.to_source()),
             Self::Array { inner, .. } => format!("{}[]", inner.to_source()),
             Self::Map { inner, .. } => format!("map<{}>", inner.to_source()),
@@ -3157,7 +3422,26 @@ impl Parser<'_> {
     }
 
     fn parse_type_atom(&mut self) -> Option<TypeSyntax> {
-        Some(if self.at_ident("map") {
+        Some(if self.at_ident("AgentRef") {
+            let agent_ref = self.advance().clone();
+            self.expect_symbol('<')?;
+            let mut agents = Vec::new();
+            while !self.is_at_end() && !self.at_symbol('>') {
+                if self.at_symbol('|') {
+                    self.advance();
+                    continue;
+                }
+                let Some(agent) = self.expect_ident("agent reference") else {
+                    break;
+                };
+                agents.push(agent);
+            }
+            let close = self.expect_symbol('>')?;
+            TypeSyntax::AgentRef {
+                agents,
+                span: agent_ref.span.join(close.span),
+            }
+        } else if self.at_ident("map") {
             let map = self.advance().clone();
             self.expect_symbol('<')?;
             let inner = self.parse_type()?;
@@ -3555,6 +3839,100 @@ rule missing_body
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message.contains("`{`")));
+    }
+
+    #[test]
+    fn accepts_agent_ref_dynamic_tell_targets() {
+        let source = r#"
+workflow AgentRefRouting
+
+agent codex {
+  profile "repo-writer"
+  capacity 1
+}
+
+agent claude {
+  profile "repo-writer"
+  capacity 1
+}
+
+class LanguageTask {
+  provider AgentRef<codex | claude>
+  prompt string
+}
+
+rule run_task
+  when LanguageTask as task
+  when task.provider is available
+=> {
+  tell task.provider as turn "{{ task.prompt }}"
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn rejects_plain_string_dynamic_tell_targets() {
+        let source = r#"
+workflow BadAgentRefRouting
+
+agent codex {
+  profile "repo-writer"
+  capacity 1
+}
+
+class LanguageTask {
+  provider string
+}
+
+rule run_task
+  when LanguageTask as task
+=> {
+  tell task.provider "bad"
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("non-AgentRef dynamic tell target `task.provider`")));
+    }
+
+    #[test]
+    fn rejects_unknown_agent_ref_domain_values() {
+        let source = r#"
+workflow BadAgentRefDomain
+
+agent codex {
+  profile "repo-writer"
+  capacity 1
+}
+
+class LanguageTask {
+  provider AgentRef<codex | pi>
+}
+
+rule seed
+  when started
+=> {
+  record LanguageTask {
+    provider "claude"
+  }
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("AgentRef references unknown agent `pi`")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("field `LanguageTask.provider` cannot reference agent `claude`")));
     }
 
     #[test]

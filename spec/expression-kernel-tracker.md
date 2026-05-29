@@ -77,7 +77,7 @@ The expression kernel covers deterministic logic used by:
 | Optional presence proofs | [x] | [ ] | [ ] | [ ] | [~] | [ ] | Must reject unsafe optional field access unless proven present. |
 | Missing vs null distinction | [x] | [ ] | [ ] | [~] | [~] | [ ] | Runtime currently collapses missing path lookup to `null` in guards. |
 | Type-directed interpolation paths | [x] | [~] | [ ] | [~] | [ ] | [x] | Existing interpolation is path-oriented but not fully expression-kernel typed. |
-| Dynamic `AgentRef<...>` | [x] | [ ] | [ ] | [ ] | [~] | [ ] | Needed before plain strings can be rejected as dynamic `tell` targets. |
+| Dynamic `AgentRef<...>` | [x] | [~] | [~] | [~] | [~] | [~] | Source/IR support typed agent domains for record values and dynamic `tell`; still needs shared expression evaluator coverage. |
 | Deterministic validation capability | [~] | [ ] | [ ] | [ ] | [ ] | [ ] | Still design-level; should handle checks that do not need BAML/model judgment. |
 
 ## Implementation Work Queue
@@ -160,15 +160,15 @@ The expression kernel covers deterministic logic used by:
 
 ### 5. AgentRef And Deterministic Routing
 
-- [ ] Specify source syntax for `AgentRef<codex | claude | pi>` or its chosen
+- [x] Specify source syntax for `AgentRef<codex | claude | pi>` or its chosen
   equivalent in [type-system.md](type-system.md) and
   [language.md](language.md).
-- [ ] Represent `AgentRef` structurally in IR.
-- [ ] Type-check every possible agent target against declared agents.
+- [x] Represent `AgentRef` structurally in IR.
+- [x] Type-check every possible agent target against declared agents.
 - [ ] Type-check target profile, capacity, and capability constraints.
-- [ ] Reject dynamic `tell` targets that are plain strings.
-- [ ] Evaluate dynamic target expressions deterministically at rule commit.
-- [ ] Add provider-language dogfood coverage that routes through typed
+- [x] Reject dynamic `tell` targets that are plain strings.
+- [x] Evaluate dynamic target expressions deterministically at rule commit.
+- [x] Add provider-language dogfood coverage that routes through typed
   `AgentRef` once available.
 
 ### 6. Pattern Matching And Branching
@@ -223,9 +223,9 @@ The expression kernel covers deterministic logic used by:
   AST parser lands.
 - [ ] Update [static-analysis.md](static-analysis.md) with the implemented
   finite-domain and presence-proof diagnostics.
-- [ ] Update [type-system.md](type-system.md) with final `AgentRef` syntax and
+- [x] Update [type-system.md](type-system.md) with final `AgentRef` syntax and
   JSON/IR representation.
-- [ ] Update [companion-skill.md](companion-skill.md) to recommend deterministic
+- [x] Update [companion-skill.md](companion-skill.md) to recommend deterministic
   routing metadata, `AgentRef`, source assertions, and projection checks.
 - [ ] Update [e2e.md](e2e.md) with expression-kernel dogfood coverage.
 - [ ] Keep this tracker and [implementation-plan.md](implementation-plan.md)
@@ -233,7 +233,7 @@ The expression kernel covers deterministic logic used by:
 
 ## Acceptance Gates
 
-- [ ] A shared task schema can route work across Codex, Claude, and Pi using
+- [x] A shared task schema can route work across Codex, Claude, and Pi using
   deterministic source metadata without duplicate provider-specific classes.
 - [ ] Guards using enum/literal fields are type-checked and finite-domain typos
   are rejected or diagnosed before runtime.
@@ -242,11 +242,11 @@ The expression kernel covers deterministic logic used by:
 - [ ] Enum/literal, optional, and tagged-union pattern branches are typed,
   deterministic, and exhaustiveness-checked where the domain is finite.
 - [ ] Optional field access is rejected unless presence is proven.
-- [ ] Dynamic agent routing is typed as `AgentRef` or equivalent, and plain
+- [x] Dynamic agent routing is typed as `AgentRef` or equivalent, and plain
   strings cannot target `tell`.
 - [ ] Assertion failures are visible in CLI JSON/human output, event or
   diagnostic surfaces, and CI exit status without mutating workflow state.
 - [ ] Generated Maude checks include guard-gated rule commits and assertion
   non-mutation cases.
-- [ ] Companion-skill-authored workflows use deterministic routing and source
+- [x] Companion-skill-authored workflows use deterministic routing and source
   assertions without prompt-level provider/model decisions.

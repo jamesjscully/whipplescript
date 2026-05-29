@@ -629,13 +629,13 @@ not be considered complete until that tracker reaches its acceptance gates.
 - [ ] Add static matrix seeding for small typed fixture tables.
 - [ ] Add rule-template/action-block expansion for repeated effect chains,
   preserving source spans, idempotency keys, and compiled IR visibility.
-- [ ] Design `AgentRef<...>` or equivalent typed dynamic agent references.
-- [ ] Reject plain strings as dynamic `tell` targets.
+- [x] Design `AgentRef<...>` or equivalent typed dynamic agent references.
+- [x] Reject plain strings as dynamic `tell` targets.
 - [ ] Add a deterministic validation capability path for checks that should not
   require BAML/model judgment.
 - [x] Rewrite `examples/provider-language-e2e.whip` to use one shared
-  `LanguageTask` schema once guarded matching or typed agent refs exist.
-- [ ] Update the companion authoring skill to recommend deterministic routing
+  `LanguageTask` schema routed by typed `AgentRef`.
+- [x] Update the companion authoring skill to recommend deterministic routing
   metadata and warn against asking models to identify providers/routes.
 
 Acceptance:

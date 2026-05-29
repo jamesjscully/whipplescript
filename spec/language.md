@@ -409,7 +409,7 @@ Those values may be copied into result/audit facts by rule literals or typed
 metadata, but they should not be fields in BAML review output unless the review
 is explicitly about verifying observed provider evidence.
 
-A future dynamic-agent form should be typed:
+Dynamic agent routing is typed:
 
 ```whippletree
 class LanguageTask {
@@ -431,8 +431,10 @@ rule run_language_task
 }
 ```
 
-If `AgentRef` is not implemented, use guarded rules with a shared task schema
-instead of duplicating identical schemas as provider tags.
+The compiler rejects `tell` targets that are plain strings or non-`AgentRef`
+dynamic fields. Runtime lowering resolves the `AgentRef` value from the matched
+fact before enqueuing the `agent.tell` effect, so effect targets and profiles are
+chosen deterministically before any provider starts.
 
 ## Reuse And Matrices
 

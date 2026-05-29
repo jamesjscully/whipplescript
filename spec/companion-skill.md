@@ -51,9 +51,14 @@ evidence/status inspection guidance
 
 Current authoring guidance from dogfood:
 
-- Do not write equality guards in `when` clauses yet. Route branches through
-  explicit facts or BAML `coerce` classifications until guard expressions are
-  implemented.
+- Use guarded fact matches for deterministic routing over typed fields, for
+  example `when LanguageTask as task where task.provider == "codex"`.
+- Prefer `AgentRef<codex | claude | pi>` for dynamic agent routing. `tell`
+  targets should be literal declared agents or `AgentRef` fields such as
+  `tell task.provider`; never ask a model or BAML output to decide the route.
+- Keep provider/model identity as source metadata or observed evidence. Do not
+  make language models identify which provider is active unless the task is
+  explicitly reviewing provider evidence.
 - Put `as binding` on the same line as the effect keyword. Multi-line strings
   may follow, but the binding must be visible on the effect line for the current
   parser.

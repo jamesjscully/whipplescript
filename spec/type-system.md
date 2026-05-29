@@ -48,6 +48,7 @@ array<T>
 map<V>
 enum
 class
+AgentRef<A | B | ...>
 ```
 
 Opaque multimodal boundary types:
@@ -131,6 +132,20 @@ class StatusEvent {
 }
 ```
 
+Agent references name workflow-declared logical agents and are used for
+deterministic routing:
+
+```whippletree
+class LanguageTask {
+  provider AgentRef<codex | claude | pi>
+}
+```
+
+`AgentRef` values are represented as JSON strings at runtime, but statically
+they are not plain strings: each listed agent must be declared, record literals
+must belong to the allowed domain, and dynamic `tell` targets must have an
+`AgentRef` type.
+
 Union types are limited in v0. The compiler may produce tagged unions for
 effect terminal outputs, but user-authored arbitrary unions should wait until
 we need them.
@@ -152,6 +167,7 @@ IR should represent types structurally:
 { "type": "map", "values": { "type": "int" } }
 { "type": "ref", "name": "WorkReview" }
 { "type": "literal", "value": "accepted" }
+{ "type": "agent_ref", "agents": ["codex", "claude", "pi"] }
 { "type": "media", "kind": "image" }
 ```
 
@@ -193,6 +209,7 @@ null      JSON null
 array     JSON array
 map       JSON object with string keys
 enum      JSON string containing enum variant
+AgentRef JSON string containing a declared agent name
 class     JSON object with closed fields
 literal   exact JSON literal value
 optional  missing field or null, depending on containing schema

@@ -3,7 +3,7 @@ workflow ProviderLanguageE2E
 use skill "baml-coerce-user"
 
 class LanguageTask {
-  provider "codex" | "claude" | "pi"
+  provider AgentRef<codex | claude | pi>
   language string
   expectedScript string
   prompt string
@@ -130,11 +130,11 @@ rule seed_language_matrix
   }
 }
 
-rule run_codex_language_task
-  when LanguageTask as task where task.provider == "codex"
-  when codex is available
+rule run_language_task
+  when LanguageTask as task
+  when task.provider is available
 => {
-  tell codex as turn """
+  tell task.provider as turn """
   Complete this language e2e task.
 
   Target language:
@@ -158,83 +158,7 @@ rule run_codex_language_task
 
   after review succeeds {
     record LanguageE2EResult {
-      provider "codex"
-      language task.language
-      artifactPath task.artifactPath
-      turn turn
-      review review
-      status "reviewed"
-    }
-  }
-}
-
-rule run_claude_language_task
-  when LanguageTask as task where task.provider == "claude"
-  when claude is available
-=> {
-  tell claude as turn """
-  Complete this language e2e task.
-
-  Target language:
-  {{ task.language }}
-
-  Expected script:
-  {{ task.expectedScript }}
-
-  Task:
-  {{ task.prompt }}
-
-  Write only the requested text to {{ task.artifactPath }}.
-  Do not edit files outside target/dogfood/language.
-
-  Finish your turn with a concise summary that includes the artifact path.
-  """
-
-  after turn succeeds {
-    coerce reviewLanguageArtifact(task.language, task.expectedScript, task.artifactPath, turn.summary) as review
-  }
-
-  after review succeeds {
-    record LanguageE2EResult {
-      provider "claude"
-      language task.language
-      artifactPath task.artifactPath
-      turn turn
-      review review
-      status "reviewed"
-    }
-  }
-}
-
-rule run_pi_language_task
-  when LanguageTask as task where task.provider == "pi"
-  when pi is available
-=> {
-  tell pi as turn """
-  Complete this language e2e task.
-
-  Target language:
-  {{ task.language }}
-
-  Expected script:
-  {{ task.expectedScript }}
-
-  Task:
-  {{ task.prompt }}
-
-  Write only the requested text to {{ task.artifactPath }}.
-  Do not edit files outside target/dogfood/language.
-
-  Finish your turn with a concise summary that includes the artifact path.
-  """
-
-  after turn succeeds {
-    coerce reviewLanguageArtifact(task.language, task.expectedScript, task.artifactPath, turn.summary) as review
-  }
-
-  after review succeeds {
-    record LanguageE2EResult {
-      provider "pi"
+      provider task.provider
       language task.language
       artifactPath task.artifactPath
       turn turn

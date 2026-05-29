@@ -2147,11 +2147,11 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
         }
         let current_after = after_scopes.last().map(|scope| scope.scope.clone());
         if let Some(rest) = trimmed.strip_prefix("tell ") {
-            let agent = rest.split_whitespace().next().unwrap_or("agent").to_owned();
+            let target_expr = rest.split_whitespace().next().unwrap_or("agent");
             let (prompt, next_index) = parse_prompt_from_lines(&lines, index, trimmed);
             effects.push(ParsedEffect {
                 kind: "agent.tell".to_owned(),
-                target: Some(agent),
+                target: Some(resolve_tell_target(target_expr, context)),
                 name: None,
                 binding: binding_after_as(trimmed),
                 args: Vec::new(),
@@ -2222,6 +2222,13 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
         index += 1;
     }
     effects
+}
+
+fn resolve_tell_target(target_expr: &str, context: &RuleContext) -> String {
+    parse_field_value(target_expr, context)
+        .as_str()
+        .unwrap_or(target_expr)
+        .to_owned()
 }
 
 fn parsed_effect_input_json(
@@ -2385,6 +2392,7 @@ fn ir_type_name(ty: &IrType) -> String {
         }
         .to_owned(),
         IrType::LiteralString(value) | IrType::Ref(value) => value.clone(),
+        IrType::AgentRef(agents) => format!("AgentRef<{}>", agents.join(" | ")),
         IrType::Optional(inner) => ir_type_name(inner),
         IrType::Array(inner) => format!("{}[]", ir_type_name(inner)),
         IrType::Map(inner) => format!("map<{}>", ir_type_name(inner)),

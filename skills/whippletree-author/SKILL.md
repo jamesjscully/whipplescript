@@ -94,6 +94,31 @@ rule recall_before_work
 }
 ```
 
+Typed dynamic agent routing:
+
+```whippletree
+class LanguageTask {
+  provider AgentRef<codex | claude | pi>
+  language string
+  artifactPath string
+  status "queued"
+}
+
+rule run_language_task
+  when LanguageTask as task
+  when task.provider is available
+=> {
+  tell task.provider as turn """
+  Write {{ task.language }} text to {{ task.artifactPath }}.
+  """
+}
+```
+
+Use `AgentRef<...>` when the workflow data selects a logical agent. The value is
+source metadata, not a model decision. Do not ask BAML or a provider prompt to
+choose the provider, model, or route; only include provider fields in model
+outputs when reviewing observed provider evidence.
+
 Fan-out with a visible tracker:
 
 ```whippletree
@@ -166,14 +191,14 @@ and capacity.
 
 ## Current Grammar Limits
 
-Do not write equality guards yet:
+Guards are supported for simple deterministic routing:
 
 ```whippletree
-when review.status == Accept
+when Review as review where review.status == Accept
 ```
 
-Use typed facts or BAML classification branches until guard expressions are
-implemented.
+Keep guards over typed facts and deterministic values. Use BAML or a registered
+capability only when semantic judgment is required.
 
 Put `as binding` on the effect line:
 

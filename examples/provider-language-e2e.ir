@@ -3,7 +3,7 @@ uses
   skill baml-coerce-user
 schemas
   class LanguageTask
-    provider union<literal<"codex"> | literal<"claude"> | literal<"pi">>
+    provider agentref<codex | claude | pi>
     language string
     expectedScript string
     prompt string
@@ -42,49 +42,19 @@ rules
     writes
       schema:LanguageTask
     body_hash 0b4d6b76ae7919da
-  rule run_codex_language_task
-    when LanguageTask as task where task.provider == "codex"
-    when codex is available
+  rule run_language_task
+    when LanguageTask as task
+    when task.provider is available
     reads
-      pattern:codex is available
+      pattern:task.provider is available
       schema:LanguageTask
     writes
       schema:LanguageE2EResult
     effects
-      turn kind=agent.tell binding=turn key=e34f3e7758319a38
-      review kind=baml.coerce binding=review key=188ef005f89cad9f
+      turn kind=agent.tell binding=turn key=dcc419597b331e20
+      review kind=baml.coerce binding=review key=2ffc7caad53c6757
     dependencies
       turn --succeeds--> review
-    body_hash 16613845fcc333da
-  rule run_claude_language_task
-    when LanguageTask as task where task.provider == "claude"
-    when claude is available
-    reads
-      pattern:claude is available
-      schema:LanguageTask
-    writes
-      schema:LanguageE2EResult
-    effects
-      turn kind=agent.tell binding=turn key=b02a27e18358cc3b
-      review kind=baml.coerce binding=review key=df9a333314166a16
-    dependencies
-      turn --succeeds--> review
-    body_hash a5a68ce414e15f98
-  rule run_pi_language_task
-    when LanguageTask as task where task.provider == "pi"
-    when pi is available
-    reads
-      pattern:pi is available
-      schema:LanguageTask
-    writes
-      schema:LanguageE2EResult
-    effects
-      turn kind=agent.tell binding=turn key=409d40e57a436994
-      review kind=baml.coerce binding=review key=ec93804fca41a4ab
-    dependencies
-      turn --succeeds--> review
-    body_hash 447742abf091d1aa
+    body_hash d507a020c0856e0e
 rule_dependencies
-  seed_language_matrix --schema:LanguageTask--> run_claude_language_task
-  seed_language_matrix --schema:LanguageTask--> run_codex_language_task
-  seed_language_matrix --schema:LanguageTask--> run_pi_language_task
+  seed_language_matrix --schema:LanguageTask--> run_language_task
