@@ -1087,6 +1087,13 @@ rule route
         owner "unassigned"
       }
     }
+    _ => {
+      record Routed {
+        provider task.provider
+        target "unexpected"
+        owner "unassigned"
+      }
+    }
   }
 }
 "#,

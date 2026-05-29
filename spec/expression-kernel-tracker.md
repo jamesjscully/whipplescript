@@ -72,7 +72,7 @@ The expression kernel covers deterministic logic used by:
 | Enum variant values | [x] | [~] | [~] | [~] | [~] | [~] | Enum schemas exist; expression values are currently strings at runtime. |
 | Literal-union values | [x] | [~] | [~] | [~] | [~] | [x] | Literal types exist; guards do not yet verify literal-domain membership. |
 | Typed finite-domain pattern branches | [x] | [~] | [~] | [~] | [x] | [x] | Concrete rule-body `case` branches work for enum/literal values in `whip dev`; no typed expression AST yet. |
-| Exhaustiveness checks for finite patterns | [x] | [ ] | [ ] | [ ] | [x] | [x] | Abstract model covers diagnostic on missing enum/literal branch; compiler support is not implemented. |
+| Exhaustiveness checks for finite patterns | [x] | [~] | [~] | [ ] | [x] | [x] | Parser diagnostics cover enum/literal/optional rule-body cases without fallback; not yet expression-level or source-span precise. |
 | Optional Some/None pattern branches | [x] | [~] | [~] | [~] | [x] | [x] | Rule-body `Some name` binds a present runtime value; static presence proof is still local to case validation. |
 | Optional presence proofs | [x] | [ ] | [ ] | [ ] | [~] | [ ] | Must reject unsafe optional field access unless proven present. |
 | Missing vs null distinction | [x] | [ ] | [ ] | [~] | [~] | [ ] | Runtime currently collapses missing path lookup to `null` in guards. |
@@ -182,7 +182,7 @@ The expression kernel covers deterministic logic used by:
   completion facts.
 - [x] Allow branch guards that reuse the current deterministic guard evaluator.
 - [x] Reject unknown enum/literal variants in patterns.
-- [ ] Emit exhaustiveness diagnostics for finite domains where the branch result
+- [x] Emit exhaustiveness diagnostics for finite domains where the branch result
   must be total.
 - [~] Preserve source spans for branch alternatives in diagnostics.
 - [~] Lower matching pattern branches before effect graph commit in `whip dev`.
@@ -204,7 +204,7 @@ The expression kernel covers deterministic logic used by:
 - [ ] Runtime tests for assertion pass, fail, and error paths.
 - [~] Parser/type-checker tests for enum, literal, optional, and tagged-union
   pattern branches.
-- [ ] Exhaustiveness diagnostic tests for finite pattern domains.
+- [x] Exhaustiveness diagnostic tests for finite pattern domains.
 - [ ] E2E test showing `&&`, `||`, `!`, ordering, `in`, `exists`, `empty`, and
   `count` in source.
 - [ ] E2E test showing assertion failures reach JSON output and nonzero exit.

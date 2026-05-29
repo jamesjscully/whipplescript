@@ -1476,10 +1476,12 @@ fn validate_case_blocks(
         }
         let mut depth = brace_delta(trimmed).max(1);
         let mut case_index = index + 1;
+        let mut branches = Vec::new();
         while case_index < lines.len() && depth > 0 {
             let line = lines[case_index].trim();
             if depth == 1 {
                 if let Some(branch) = parse_case_branch_head(line) {
+                    branches.push(branch);
                     validate_case_pattern(
                         rule,
                         branch.pattern,
@@ -1501,6 +1503,13 @@ fn validate_case_blocks(
             depth += brace_delta(line);
             case_index += 1;
         }
+        validate_case_coverage(
+            rule,
+            scrutinee_ty.as_ref(),
+            &branches,
+            semantic,
+            diagnostics,
+        );
         index += 1;
     }
 }
@@ -1523,6 +1532,7 @@ fn is_case_branch_start(line: &str) -> bool {
     line.contains("=>")
 }
 
+#[derive(Clone, Copy)]
 struct CaseBranchHead<'a> {
     pattern: &'a str,
     guard: Option<&'a str>,
@@ -1641,6 +1651,120 @@ fn validate_case_pattern(
             });
         }
     }
+}
+
+fn validate_case_coverage(
+    rule: &RuleDecl,
+    scrutinee_ty: Option<&TypeSyntax>,
+    branches: &[CaseBranchHead<'_>],
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if branches.is_empty()
+        || branches
+            .iter()
+            .any(|branch| is_fallback_pattern(branch.pattern))
+    {
+        validate_duplicate_case_patterns(rule, branches, diagnostics);
+        return;
+    }
+    validate_duplicate_case_patterns(rule, branches, diagnostics);
+
+    let Some(domain) = finite_case_domain(scrutinee_ty, semantic) else {
+        return;
+    };
+    let covered = branches
+        .iter()
+        .filter(|branch| branch.guard.is_none())
+        .filter_map(|branch| normalized_case_pattern(branch.pattern))
+        .collect::<BTreeSet<_>>();
+    let missing = domain
+        .iter()
+        .filter(|value| !covered.contains(value.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        diagnostics.push(Diagnostic {
+            span: rule.body.span,
+            message: format!(
+                "rule `{}` has non-exhaustive case; missing {}",
+                rule.name.name,
+                missing.join(", ")
+            ),
+            suggestion: Some("add branches for every value or add `_ => { ... }`".to_owned()),
+        });
+    }
+}
+
+fn validate_duplicate_case_patterns(
+    rule: &RuleDecl,
+    branches: &[CaseBranchHead<'_>],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut seen = BTreeSet::new();
+    for branch in branches.iter().filter(|branch| branch.guard.is_none()) {
+        let Some(pattern) = normalized_case_pattern(branch.pattern) else {
+            continue;
+        };
+        if !seen.insert(pattern.to_owned()) {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` has duplicate unguarded case pattern `{pattern}`",
+                    rule.name.name
+                ),
+                suggestion: Some(
+                    "remove the duplicate branch or add mutually exclusive `where` guards"
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+}
+
+fn finite_case_domain(
+    scrutinee_ty: Option<&TypeSyntax>,
+    semantic: &SemanticContext,
+) -> Option<Vec<String>> {
+    match scrutinee_ty? {
+        TypeSyntax::Ref { name } => semantic
+            .schemas
+            .enums
+            .get(&name.name)
+            .map(|variants| variants.iter().cloned().collect()),
+        TypeSyntax::Union { variants, .. } => {
+            let values = variants
+                .iter()
+                .filter_map(|variant| match variant {
+                    TypeSyntax::LiteralString { value, .. } => Some(value.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (!values.is_empty()).then_some(values)
+        }
+        TypeSyntax::Optional { .. } => Some(vec!["Some".to_owned(), "None".to_owned()]),
+        _ => None,
+    }
+}
+
+fn normalized_case_pattern(pattern: &str) -> Option<&str> {
+    if is_fallback_pattern(pattern) {
+        return None;
+    }
+    if pattern.starts_with("Some ") {
+        return Some("Some");
+    }
+    if pattern == "None" {
+        return Some("None");
+    }
+    parse_literal_expr(pattern).and_then(|literal| match literal {
+        LiteralExpr::String(value) | LiteralExpr::Ident(value) => Some(value),
+        _ => None,
+    })
+}
+
+fn is_fallback_pattern(pattern: &str) -> bool {
+    matches!(pattern, "_" | "default")
 }
 
 fn validate_union_case_pattern(
@@ -3676,7 +3800,7 @@ rule route
   when Review as review
 => {
   case review.status {
-    Accept where review.assignee != null => {
+    Accept => {
       record Routed {
         status Accept
       }
@@ -3749,6 +3873,98 @@ rule route
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("uses `Some` for a non-optional case")));
+    }
+
+    #[test]
+    fn diagnoses_non_exhaustive_and_duplicate_case_branches() {
+        let source = r#"
+workflow CaseCoverageGuess
+
+enum ReviewStatus {
+  Accept
+  Revise
+  Blocked
+}
+
+class Review {
+  status ReviewStatus
+  provider "codex" | "claude" | "pi"
+  owner string?
+}
+
+rule route
+  when Review as review
+=> {
+  case review.status {
+    Accept => {
+    }
+    Accept => {
+    }
+    Revise => {
+    }
+  }
+
+  case review.provider {
+    "codex" => {
+    }
+    "claude" => {
+    }
+  }
+
+  case review.owner {
+    Some owner => {
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("duplicate unguarded case pattern `Accept`")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("non-exhaustive case; missing Blocked")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("non-exhaustive case; missing pi")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("non-exhaustive case; missing None")));
+    }
+
+    #[test]
+    fn accepts_fallback_and_guarded_duplicate_case_branches() {
+        let source = r#"
+workflow CaseFallbackGuess
+
+enum ReviewStatus {
+  Accept
+  Revise
+  Blocked
+}
+
+class Review {
+  status ReviewStatus
+  owner string?
+}
+
+rule route
+  when Review as review
+=> {
+  case review.status {
+    Accept where review.owner != null => {
+    }
+    Accept where review.owner == null => {
+    }
+    _ => {
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        assert!(compiled.ir.is_some());
     }
 
     #[test]
