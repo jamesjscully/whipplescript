@@ -58,15 +58,15 @@ The expression kernel covers deterministic logic used by:
 | `exists(collection)` | [x] | [x] | [~] | [x] | [ ] | [x] | Implemented over projection queries. |
 | `exists path` presence proof | [x] | [x] | [~] | [x] | [~] | [x] | Runtime checks non-missing/non-null; local parser proof tracking accepts `exists x` before optional field access. |
 | `empty(collection)` / `empty(expr)` | [x] | [x] | [~] | [x] | [ ] | [x] | Implemented for projections, arrays, objects, strings, and null. |
-| Equality `==` | [x] | [x] | [~] | [x] | [~] | [x] | Runtime supports JSON scalar equality; compiler has finite-domain typo diagnostics but not full comparability typing. |
-| Inequality `!=` | [x] | [x] | [~] | [x] | [~] | [x] | Implemented with same limitations as equality. |
+| Equality `==` | [x] | [x] | [~] | [x] | [~] | [x] | Runtime supports JSON scalar equality; compiler rejects obvious incompatible scalar comparisons and finite-domain typos. |
+| Inequality `!=` | [x] | [x] | [~] | [x] | [~] | [x] | Implemented with same static limitations as equality. |
 | Boolean `&&` | [x] | [x] | [~] | [x] | [ ] | [x] | Runtime short-circuits; parser carries presence proofs left-to-right. |
 | Boolean `||` | [x] | [x] | [~] | [x] | [ ] | [x] | Runtime short-circuits; presence-proof behavior remains conservative. |
 | Boolean `!` | [x] | [x] | [~] | [x] | [ ] | [x] | Implemented in shared expression parser/evaluator. |
-| Ordering `< <= > >=` | [x] | [x] | [~] | [x] | [ ] | [x] | Runtime supports numeric ordering; static type rejection is still partial. |
-| Membership `in` / `not in` | [x] | [x] | [~] | [x] | [~] | [x] | Runtime supports array membership; finite-domain typos are diagnosed for path-vs-literal/array forms. |
+| Ordering `< <= > >=` | [x] | [x] | [~] | [x] | [ ] | [x] | Runtime supports numeric ordering; compiler rejects obvious non-numeric ordering. |
+| Membership `in` / `not in` | [x] | [x] | [~] | [x] | [~] | [x] | Runtime supports array membership; compiler rejects obvious non-array membership and incompatible array item types. |
 | Parentheses and precedence | [x] | [x] | [~] | [x] | [ ] | [x] | Shared recursive-descent parser handles precedence. |
-| Array literals | [x] | [x] | [~] | [x] | [~] | [x] | Implemented for expression evaluation; common-element typing is not complete. |
+| Array literals | [x] | [x] | [~] | [x] | [~] | [x] | Implemented for expression evaluation; compiler rejects obvious mixed scalar arrays. |
 | Object literals in expected schema contexts | [x] | [~] | [~] | [~] | [ ] | [x] | Record bodies exist; expression-level object literals are not general AST nodes. |
 | Map index `path["key"]` | [x] | [ ] | [ ] | [ ] | [ ] | [ ] | Field paths currently support dot access only in guard/assertion runtime. |
 | Enum variant values | [x] | [~] | [~] | [~] | [~] | [~] | Enum schemas exist; expression values are currently strings at runtime. |
@@ -106,21 +106,21 @@ The expression kernel covers deterministic logic used by:
   current rule/assertion scope.
 - [~] Resolve every field/index path against class, array, map, optional, ref,
   and projection types.
-- [ ] Track result type for every expression node.
-- [ ] Reject non-boolean guard/assertion results.
+- [~] Track result type for every expression node.
+- [~] Reject non-boolean guard/assertion results.
 - [ ] Reject unknown fields and map indexes with non-string keys.
 - [x] Reject field access through optional values without an accepted presence
   proof.
 - [x] Implement presence proof tracking for:
   `x != null`, `null != x`, `exists x`, `!(x == null)`, and left-to-right
   `a && b`.
-- [ ] Reject incompatible equality comparisons.
-- [ ] Reject ordering on unsupported types and incompatible numeric/time types.
-- [ ] Reject string ordering unless a later spec explicitly enables it.
+- [~] Reject incompatible equality comparisons.
+- [~] Reject ordering on unsupported types and incompatible numeric/time types.
+- [x] Reject string ordering unless a later spec explicitly enables it.
 - [~] Reject enum variants outside their enum domain.
 - [~] Reject literal values outside literal unions.
-- [ ] Reject membership against non-array and non-map operands.
-- [ ] Reject array literals whose elements do not share a valid common type.
+- [~] Reject membership against non-array and non-map operands.
+- [~] Reject array literals whose elements do not share a valid common type.
 - [ ] Reject object literals outside an expected schema context.
 - [ ] Reject plain strings where `AgentRef<...>` is required.
 - [~] Emit statically unsatisfiable finite-domain guard diagnostics when useful,

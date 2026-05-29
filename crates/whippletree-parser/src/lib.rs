@@ -404,6 +404,19 @@ enum LiteralExpr<'a> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum ExprType {
+    Bool,
+    Int,
+    Float,
+    String,
+    Null,
+    Optional(Box<ExprType>),
+    Array(Box<ExprType>),
+    Collection,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Expr {
     Literal(ExprLiteral),
     Path(Vec<String>),
@@ -1711,6 +1724,17 @@ fn validate_expression(
                 &presence_proofs,
                 diagnostics,
             );
+            let ty = infer_expr_type(rule, &expr, semantic, binding_types, diagnostics);
+            if ty != ExprType::Bool && ty != ExprType::Unknown {
+                diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` has non-boolean {label} expression",
+                        rule.name.name
+                    ),
+                    suggestion: Some(format!("{label} expressions must evaluate to bool")),
+                });
+            }
         }
         Err(message) => diagnostics.push(Diagnostic {
             span: rule.body.span,
@@ -1962,6 +1986,265 @@ fn expr_path_key(expr: &Expr) -> Option<String> {
         Expr::Path(path) if path.len() >= 2 => Some(path[1..].join(".")),
         _ => None,
     }
+}
+
+fn infer_expr_type(
+    rule: &RuleDecl,
+    expr: &Expr,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> ExprType {
+    match expr {
+        Expr::Literal(literal) => expr_literal_type(literal),
+        Expr::Path(path) => {
+            expr_path_type(path, semantic, binding_types).unwrap_or(ExprType::Unknown)
+        }
+        Expr::Array(items) => infer_array_type(rule, items, semantic, binding_types, diagnostics),
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => {
+            let inner = infer_expr_type(rule, expr, semantic, binding_types, diagnostics);
+            if !matches!(inner, ExprType::Bool | ExprType::Unknown) {
+                diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` applies `!` to a non-boolean expression",
+                        rule.name.name
+                    ),
+                    suggestion: Some("use `!` only with boolean expressions".to_owned()),
+                });
+            }
+            ExprType::Bool
+        }
+        Expr::Binary { op, left, right } => {
+            infer_binary_type(rule, *op, left, right, semantic, binding_types, diagnostics)
+        }
+        Expr::Call { name, args } => match name.as_str() {
+            "count" => ExprType::Int,
+            "exists" | "empty" => ExprType::Bool,
+            _ => {
+                diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` calls unsupported expression function `{name}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some("use `count`, `exists`, or `empty`".to_owned()),
+                });
+                for arg in args {
+                    infer_expr_type(rule, arg, semantic, binding_types, diagnostics);
+                }
+                ExprType::Unknown
+            }
+        },
+        Expr::Query { guard, .. } => {
+            if let Some(guard) = guard {
+                infer_expr_type(rule, guard, semantic, binding_types, diagnostics);
+            }
+            ExprType::Collection
+        }
+    }
+}
+
+fn infer_binary_type(
+    rule: &RuleDecl,
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> ExprType {
+    let left_ty = infer_expr_type(rule, left, semantic, binding_types, diagnostics);
+    let right_ty = infer_expr_type(rule, right, semantic, binding_types, diagnostics);
+    match op {
+        BinaryOp::And | BinaryOp::Or => {
+            for ty in [&left_ty, &right_ty] {
+                if !matches!(ty, ExprType::Bool | ExprType::Unknown) {
+                    diagnostics.push(Diagnostic {
+                        span: rule.body.span,
+                        message: format!(
+                            "rule `{}` uses boolean operator with non-boolean operand",
+                            rule.name.name
+                        ),
+                        suggestion: Some(
+                            "use `&&` and `||` only with boolean expressions".to_owned(),
+                        ),
+                    });
+                    break;
+                }
+            }
+            ExprType::Bool
+        }
+        BinaryOp::Eq | BinaryOp::Ne => {
+            if !types_comparable(&left_ty, &right_ty) {
+                diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` compares incompatible expression types",
+                        rule.name.name
+                    ),
+                    suggestion: Some(
+                        "compare values with compatible scalar or finite-domain types".to_owned(),
+                    ),
+                });
+            }
+            ExprType::Bool
+        }
+        BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+            if !is_numeric_type(&left_ty) || !is_numeric_type(&right_ty) {
+                diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` orders non-numeric expression values",
+                        rule.name.name
+                    ),
+                    suggestion: Some("use ordering only with int or float values".to_owned()),
+                });
+            }
+            ExprType::Bool
+        }
+        BinaryOp::In | BinaryOp::NotIn => {
+            match &right_ty {
+                ExprType::Array(item_ty) => {
+                    if !types_comparable(&left_ty, item_ty) {
+                        diagnostics.push(Diagnostic {
+                            span: rule.body.span,
+                            message: format!(
+                                "rule `{}` uses membership with incompatible item type",
+                                rule.name.name
+                            ),
+                            suggestion: Some(
+                                "make the left value compatible with the array item type"
+                                    .to_owned(),
+                            ),
+                        });
+                    }
+                }
+                ExprType::Unknown => {}
+                _ => diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` uses membership against a non-array expression",
+                        rule.name.name
+                    ),
+                    suggestion: Some("use `in` with an array literal or array value".to_owned()),
+                }),
+            }
+            ExprType::Bool
+        }
+    }
+}
+
+fn infer_array_type(
+    rule: &RuleDecl,
+    items: &[Expr],
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> ExprType {
+    let mut item_ty: Option<ExprType> = None;
+    for item in items {
+        let ty = infer_expr_type(rule, item, semantic, binding_types, diagnostics);
+        if matches!(ty, ExprType::Unknown) {
+            continue;
+        }
+        match &item_ty {
+            None => item_ty = Some(ty),
+            Some(existing) if types_comparable(existing, &ty) => {}
+            Some(_) => {
+                diagnostics.push(Diagnostic {
+                    span: rule.body.span,
+                    message: format!("rule `{}` has mixed-type array literal", rule.name.name),
+                    suggestion: Some("use array literals whose elements share one type".to_owned()),
+                });
+                return ExprType::Array(Box::new(ExprType::Unknown));
+            }
+        }
+    }
+    ExprType::Array(Box::new(item_ty.unwrap_or(ExprType::Unknown)))
+}
+
+fn expr_path_type(
+    path: &[String],
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+) -> Option<ExprType> {
+    if path.len() < 2 {
+        return None;
+    }
+    let schema = binding_types.get(&path[0])?;
+    semantic
+        .schemas
+        .resolve_field_path(schema, &path[1..])
+        .ok()
+        .map(|ty| expr_type_from_type_syntax(&ty))
+}
+
+fn expr_type_from_type_syntax(ty: &TypeSyntax) -> ExprType {
+    match ty {
+        TypeSyntax::Primitive { name, .. } => match name.as_str() {
+            "bool" => ExprType::Bool,
+            "int" => ExprType::Int,
+            "float" => ExprType::Float,
+            "string" | "duration" | "time" => ExprType::String,
+            _ => ExprType::Unknown,
+        },
+        TypeSyntax::LiteralString { .. } | TypeSyntax::Ref { .. } | TypeSyntax::AgentRef { .. } => {
+            ExprType::String
+        }
+        TypeSyntax::Optional { inner, .. } => {
+            ExprType::Optional(Box::new(expr_type_from_type_syntax(inner)))
+        }
+        TypeSyntax::Array { inner, .. } => {
+            ExprType::Array(Box::new(expr_type_from_type_syntax(inner)))
+        }
+        TypeSyntax::Map { .. } => ExprType::Unknown,
+        TypeSyntax::Union { variants, .. } => {
+            let all_strings = variants
+                .iter()
+                .all(|variant| matches!(variant, TypeSyntax::LiteralString { .. }));
+            if all_strings {
+                ExprType::String
+            } else {
+                ExprType::Unknown
+            }
+        }
+    }
+}
+
+fn expr_literal_type(literal: &ExprLiteral) -> ExprType {
+    match literal {
+        ExprLiteral::String(_) | ExprLiteral::Ident(_) => ExprType::String,
+        ExprLiteral::Number(value) if value.contains('.') => ExprType::Float,
+        ExprLiteral::Number(_) => ExprType::Int,
+        ExprLiteral::Bool(_) => ExprType::Bool,
+        ExprLiteral::Null => ExprType::Null,
+    }
+}
+
+fn types_comparable(left: &ExprType, right: &ExprType) -> bool {
+    if matches!(left, ExprType::Unknown) || matches!(right, ExprType::Unknown) {
+        return true;
+    }
+    if matches!(left, ExprType::Null) || matches!(right, ExprType::Null) {
+        return true;
+    }
+    if is_numeric_type(left) && is_numeric_type(right) {
+        return true;
+    }
+    match (left, right) {
+        (ExprType::Optional(left), right) | (right, ExprType::Optional(left)) => {
+            types_comparable(left, right)
+        }
+        _ => left == right,
+    }
+}
+
+fn is_numeric_type(ty: &ExprType) -> bool {
+    matches!(ty, ExprType::Int | ExprType::Float)
 }
 
 fn validate_finite_domain_expr(
@@ -4858,6 +5141,64 @@ rule safe_not_null
         let compiled = compile_program(source);
         assert_eq!(compiled.diagnostics, Vec::new());
         assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_expression_types() {
+        let source = r#"
+workflow BadExpressionTypes
+
+class Task {
+  title string
+  priority int
+  ready bool
+}
+
+rule non_bool_guard
+  when Task as task where task.priority
+=> {
+}
+
+rule bad_ordering
+  when Task as task where task.title > "abc"
+=> {
+}
+
+rule bad_membership
+  when Task as task where task.title in task.priority
+=> {
+}
+
+rule bad_equality
+  when Task as task where task.ready == "yes"
+=> {
+}
+
+rule bad_array
+  when Task as task where task.title in ["abc", 1]
+=> {
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("non-boolean guard expression")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("orders non-numeric expression values")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("uses membership against a non-array expression")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("compares incompatible expression types")));
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("mixed-type array literal")));
     }
 
     #[test]
