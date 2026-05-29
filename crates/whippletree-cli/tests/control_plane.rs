@@ -974,6 +974,38 @@ fn dev_provider_language_e2e_runs_agent_matrix_and_baml_reviews() {
             .map(str::to_owned)
             .collect::<std::collections::BTreeSet<_>>()
     );
+    let result_providers = facts
+        .iter()
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("LanguageE2EResult"))
+        .map(|fact| {
+            fact.get("value")
+                .and_then(|value| value.get("provider"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        result_providers
+            .iter()
+            .filter(|provider| provider.as_str() == "codex")
+            .count(),
+        2
+    );
+    assert_eq!(
+        result_providers
+            .iter()
+            .filter(|provider| provider.as_str() == "claude")
+            .count(),
+        2
+    );
+    assert_eq!(
+        result_providers
+            .iter()
+            .filter(|provider| provider.as_str() == "pi")
+            .count(),
+        2
+    );
 
     let _ = fs::remove_file(store_path);
 }

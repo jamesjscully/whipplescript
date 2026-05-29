@@ -3,7 +3,6 @@ workflow ProviderLanguageE2E
 use skill "baml-coerce-user"
 
 class CodexLanguageTask {
-  provider string
   language string
   expectedScript string
   prompt string
@@ -12,7 +11,6 @@ class CodexLanguageTask {
 }
 
 class ClaudeLanguageTask {
-  provider string
   language string
   expectedScript string
   prompt string
@@ -21,7 +19,6 @@ class ClaudeLanguageTask {
 }
 
 class PiLanguageTask {
-  provider string
   language string
   expectedScript string
   prompt string
@@ -30,8 +27,6 @@ class PiLanguageTask {
 }
 
 class LanguageQualityReview {
-  provider string
-  language string
   isTargetLanguage bool
   usesExpectedScript bool
   isWellFormed bool
@@ -48,12 +43,9 @@ class LanguageE2EResult {
   status "reviewed"
 }
 
-coerce reviewLanguageArtifact(provider string, language string, expectedScript string, artifactPath string, turnSummary string) -> LanguageQualityReview {
+coerce reviewLanguageArtifact(language string, expectedScript string, artifactPath string, turnSummary string) -> LanguageQualityReview {
   prompt """
-  Review the completed provider language task.
-
-  Provider:
-  {{ provider }}
+  Review the completed language artifact.
 
   Language:
   {{ language }}
@@ -93,7 +85,6 @@ rule seed_language_matrix
   when started
 => {
   record CodexLanguageTask {
-    provider "codex"
     language "French"
     expectedScript "Latin"
     prompt "Write a four-line original poem about rain over a city at night."
@@ -102,7 +93,6 @@ rule seed_language_matrix
   }
 
   record CodexLanguageTask {
-    provider "codex"
     language "Arabic"
     expectedScript "Arabic"
     prompt "Write a four-line original poem about a desert sunrise."
@@ -111,7 +101,6 @@ rule seed_language_matrix
   }
 
   record ClaudeLanguageTask {
-    provider "claude"
     language "Spanish"
     expectedScript "Latin"
     prompt "Write a four-line original poem about a harbor at dawn."
@@ -120,7 +109,6 @@ rule seed_language_matrix
   }
 
   record ClaudeLanguageTask {
-    provider "claude"
     language "Hindi"
     expectedScript "Devanagari"
     prompt "Write a four-line original poem about monsoon clouds."
@@ -129,7 +117,6 @@ rule seed_language_matrix
   }
 
   record PiLanguageTask {
-    provider "pi"
     language "Japanese"
     expectedScript "Kana and kanji"
     prompt "Write a four-line original poem about a quiet train station."
@@ -138,7 +125,6 @@ rule seed_language_matrix
   }
 
   record PiLanguageTask {
-    provider "pi"
     language "German"
     expectedScript "Latin"
     prompt "Write a four-line original poem about snow on rooftops."
@@ -153,9 +139,6 @@ rule run_codex_language_task
 => {
   tell codex as turn """
   Complete this language e2e task.
-
-  Provider under test:
-  {{ task.provider }}
 
   Target language:
   {{ task.language }}
@@ -173,12 +156,12 @@ rule run_codex_language_task
   """
 
   after turn succeeds {
-    coerce reviewLanguageArtifact(task.provider, task.language, task.expectedScript, task.artifactPath, turn.summary) as review
+    coerce reviewLanguageArtifact(task.language, task.expectedScript, task.artifactPath, turn.summary) as review
   }
 
   after review succeeds {
     record LanguageE2EResult {
-      provider task.provider
+      provider "codex"
       language task.language
       artifactPath task.artifactPath
       turn turn
@@ -195,9 +178,6 @@ rule run_claude_language_task
   tell claude as turn """
   Complete this language e2e task.
 
-  Provider under test:
-  {{ task.provider }}
-
   Target language:
   {{ task.language }}
 
@@ -214,12 +194,12 @@ rule run_claude_language_task
   """
 
   after turn succeeds {
-    coerce reviewLanguageArtifact(task.provider, task.language, task.expectedScript, task.artifactPath, turn.summary) as review
+    coerce reviewLanguageArtifact(task.language, task.expectedScript, task.artifactPath, turn.summary) as review
   }
 
   after review succeeds {
     record LanguageE2EResult {
-      provider task.provider
+      provider "claude"
       language task.language
       artifactPath task.artifactPath
       turn turn
@@ -236,9 +216,6 @@ rule run_pi_language_task
   tell pi as turn """
   Complete this language e2e task.
 
-  Provider under test:
-  {{ task.provider }}
-
   Target language:
   {{ task.language }}
 
@@ -255,12 +232,12 @@ rule run_pi_language_task
   """
 
   after turn succeeds {
-    coerce reviewLanguageArtifact(task.provider, task.language, task.expectedScript, task.artifactPath, turn.summary) as review
+    coerce reviewLanguageArtifact(task.language, task.expectedScript, task.artifactPath, turn.summary) as review
   }
 
   after review succeeds {
     record LanguageE2EResult {
-      provider task.provider
+      provider "pi"
       language task.language
       artifactPath task.artifactPath
       turn turn
