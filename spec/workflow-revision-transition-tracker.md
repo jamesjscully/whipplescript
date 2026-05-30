@@ -316,7 +316,7 @@ version for a running instance.
   - [x] old effects keep old attribution
   - [x] `after ... completes` still handles cancellation branches after
     revision
-- [ ] Audit Stage 3 against compatibility diagnostics, generated checks, and
+- [x] Audit Stage 3 against compatibility diagnostics, generated checks, and
   current language-reference examples; record cases deferred to future explicit
   fact migration.
 
@@ -351,6 +351,15 @@ Stage 3 partial audit notes:
 - Compatibility diagnostics for changed/added/removed workflow contracts and
   active fact schema breaks now carry source-span metadata from the lowered
   program analysis summary.
+- Stage 3 audit result: complete for the current language-reference surface.
+  The implemented checks cover root workflow identity, workflow input/output/
+  failure contracts, active fact schema compatibility, generated declarations,
+  revision-scoped generated Maude searches, and old-effect attribution.
+- Deferred to future explicit fact migration: transforming live facts across
+  field renames, type conversions, removed required fields, new required fields
+  without defaults, enum variant remapping, and facts whose schema cannot be
+  identified from stored schema metadata. These remain incompatible or
+  unverified until the source bundle supplies an explicit migration plan.
 
 Acceptance:
 
