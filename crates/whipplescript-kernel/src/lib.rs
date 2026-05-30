@@ -151,7 +151,7 @@ impl RuntimeKernel {
         let declared_profiles_json = declared_profiles_json(program);
         let declared_skills_json = declared_skills_json(program);
         let declared_schemas_json = declared_schemas_json(program);
-        let analysis_summary_json = analysis_summary_json(program);
+        let analysis_summary_json = program_analysis_summary_json(program);
         self.store.create_program_version(NewProgramVersion {
             program_name: input.program_name,
             source_hash: input.source_hash,
@@ -1241,7 +1241,7 @@ fn declared_schemas_json(program: &IrProgram) -> String {
     json!(schemas).to_string()
 }
 
-fn analysis_summary_json(program: &IrProgram) -> String {
+pub fn program_analysis_summary_json(program: &IrProgram) -> String {
     let workflow_contracts = program
         .workflow_contracts
         .iter()

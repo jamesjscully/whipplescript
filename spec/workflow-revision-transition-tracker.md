@@ -330,12 +330,12 @@ Stage 3 partial audit notes:
   changes, input contract additions/changes/removals, output/failure removals,
   and output/failure type changes with structured diagnostic codes.
 - Active fact schema compatibility, agent/profile/capability impact analysis,
-  generated declaration hashes, generated Maude checks, and CLI dry-run
-  rendering remain open Stage 3/4 work.
+  generated declaration hashes, and generated Maude checks remain open Stage 3
+  work.
 
 Acceptance:
 
-- [ ] Compatible additive revisions pass dry-run.
+- [x] Compatible additive revisions pass dry-run.
 - [ ] Breaking contract/schema revisions fail with source-span diagnostics.
 - [ ] Generated checks cover at least one revision-aware compiled fixture.
 
@@ -343,38 +343,50 @@ Acceptance:
 
 Goal: expose revision as an explicit operator action with a safe dry-run path.
 
-- [ ] Add CLI syntax:
-  - [ ] `whip revise <instance> <workflow.whip> --root <name> --dry-run`
-  - [ ] `whip revise <instance> <workflow.whip> --root <name>`
-  - [ ] `whip revise <instance> <workflow.whip> --root <name> --cancel keep`
-  - [ ] `whip revise <instance> <workflow.whip> --root <name> --cancel queued`
-  - [ ] `whip revise <instance> <workflow.whip> --root <name> --cancel running`
-- [ ] Make `keep` the default cancellation policy.
+- [x] Add CLI syntax:
+  - [x] `whip revise <instance> <workflow.whip> --root <name> --dry-run`
+  - [x] `whip revise <instance> <workflow.whip> --root <name>`
+  - [x] `whip revise <instance> <workflow.whip> --root <name> --cancel keep`
+  - [x] `whip revise <instance> <workflow.whip> --root <name> --cancel queued`
+  - [x] `whip revise <instance> <workflow.whip> --root <name> --cancel running`
+- [x] Make `keep` the default cancellation policy.
 - [ ] Make dry-run report:
-  - [ ] active version/epoch
-  - [ ] candidate version hash
-  - [ ] compatibility status
-  - [ ] impacted effects by status and version
-  - [ ] cancellation actions that would be taken
+  - [x] active version/epoch
+  - [x] candidate version hash
+  - [x] compatibility status
+  - [x] impacted effects by status and version
+  - [x] cancellation actions that would be taken
   - [ ] diagnostics/evidence that would be created
-- [ ] Make activation report:
-  - [ ] revision id/epoch
-  - [ ] old/new version ids
-  - [ ] cancellation summary
-  - [ ] next recommended command
+- [x] Make activation report:
+  - [x] revision id/epoch
+  - [x] old/new version ids
+  - [x] cancellation summary
+  - [x] next recommended command
 - [ ] Require explicit confirmation flags for future destructive policies if
   additional policy levels are introduced.
-- [ ] Update `whip status --json` with active revision and revision history.
+- [x] Update `whip status --json` with active revision and revision history.
 - [ ] Update `whip trace` with revision activation and cancellation-request
   records.
 - [ ] Audit Stage 4 against CLI UX, JSON stability, status readability, and
   operator failure modes; record missing surfaces.
 
+Stage 4 partial audit notes:
+
+- `whip revise` now compiles the candidate source bundle, runs compatibility
+  analysis against the active instance, reports cancellation impact, and keeps
+  `--dry-run` non-mutating.
+- Activation reuses the same compatibility path, persists the candidate program
+  version only after compatibility passes, and calls the store's atomic revision
+  activation operation.
+- JSON output includes compatibility diagnostics, active version/epoch,
+  candidate hashes, terminal-cancel/request-cancel effect lists, and activation
+  details. Trace-specific revision projection remains open Stage 4/6 work.
+
 Acceptance:
 
-- [ ] `whip revise --dry-run` never mutates the store.
-- [ ] `whip revise` mutates the store through one atomic activation path.
-- [ ] Status makes revision and cancellation state visible without opening
+- [x] `whip revise --dry-run` never mutates the store.
+- [x] `whip revise` mutates the store through one atomic activation path.
+- [x] Status makes revision and cancellation state visible without opening
   SQLite.
 
 ## Stage 5: Runtime Stepper And Worker Semantics

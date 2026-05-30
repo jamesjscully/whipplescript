@@ -621,6 +621,13 @@ pub struct RevisionCompatibilityReport {
     pub diagnostics: Vec<RevisionCompatibilityDiagnostic>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RevisionCandidate<'a> {
+    pub candidate_version_id: &'a str,
+    pub program_name: &'a str,
+    pub analysis_summary_json: &'a str,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RevisionCompatibilityDiagnostic {
     pub code: String,
@@ -969,39 +976,15 @@ impl SqliteStore {
         instance_id: &str,
         candidate_version_id: &str,
     ) -> StoreResult<RevisionCompatibilityReport> {
-        let (program_id, active_version_id, status) = self
-            .connection
-            .query_row(
-                r#"
-                SELECT program_id, version_id, status
-                FROM instances
-                WHERE instance_id = ?1
-                "#,
-                [instance_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))?;
+        let context = revision_instance_context_on(&self.connection, instance_id)?;
         let (active_program_id, active_summary) =
-            program_version_analysis_on(&self.connection, &active_version_id)?;
+            program_version_analysis_on(&self.connection, &context.active_version_id)?;
         let (candidate_program_id, candidate_summary) =
             program_version_analysis_on(&self.connection, candidate_version_id)?;
 
         let mut diagnostics = Vec::new();
-        if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
-            diagnostics.push(revision_compatibility_diagnostic(
-                "revision.terminal_instance",
-                format!("instance is {status}; revisions require a non-terminal instance"),
-                Some(instance_id),
-            ));
-        }
-        if active_program_id != program_id || candidate_program_id != program_id {
+        add_instance_revision_diagnostics(&context, &mut diagnostics);
+        if active_program_id != context.program_id || candidate_program_id != context.program_id {
             diagnostics.push(revision_compatibility_diagnostic(
                 "revision.program_mismatch",
                 "candidate version belongs to a different program".to_owned(),
@@ -1012,8 +995,41 @@ impl SqliteStore {
 
         Ok(RevisionCompatibilityReport {
             instance_id: instance_id.to_owned(),
-            active_version_id,
+            active_version_id: context.active_version_id,
             candidate_version_id: candidate_version_id.to_owned(),
+            compatible: diagnostics.is_empty(),
+            diagnostics,
+        })
+    }
+
+    pub fn analyze_revision_candidate(
+        &self,
+        instance_id: &str,
+        candidate: RevisionCandidate<'_>,
+    ) -> StoreResult<RevisionCompatibilityReport> {
+        let context = revision_instance_context_on(&self.connection, instance_id)?;
+        let (_active_program_id, active_summary) =
+            program_version_analysis_on(&self.connection, &context.active_version_id)?;
+        let candidate_summary = serde_json::from_str::<Value>(candidate.analysis_summary_json)?;
+
+        let mut diagnostics = Vec::new();
+        add_instance_revision_diagnostics(&context, &mut diagnostics);
+        if candidate.program_name != context.program_name {
+            diagnostics.push(revision_compatibility_diagnostic(
+                "revision.program_mismatch",
+                format!(
+                    "candidate program `{}` does not match active program `{}`",
+                    candidate.program_name, context.program_name
+                ),
+                Some(candidate.program_name),
+            ));
+        }
+        compare_revision_summaries(&active_summary, &candidate_summary, &mut diagnostics);
+
+        Ok(RevisionCompatibilityReport {
+            instance_id: instance_id.to_owned(),
+            active_version_id: context.active_version_id,
+            candidate_version_id: candidate.candidate_version_id.to_owned(),
             compatible: diagnostics.is_empty(),
             diagnostics,
         })
@@ -4741,6 +4757,58 @@ fn active_revision_on(
         .optional()
         .map(|row| row.unwrap_or((None, 0)))
         .map_err(Into::into)
+}
+
+struct RevisionInstanceContext {
+    program_id: String,
+    program_name: String,
+    active_version_id: String,
+    status: String,
+}
+
+fn revision_instance_context_on(
+    connection: &Connection,
+    instance_id: &str,
+) -> StoreResult<RevisionInstanceContext> {
+    connection
+        .query_row(
+            r#"
+            SELECT instances.program_id, programs.name, instances.version_id, instances.status
+            FROM instances
+            JOIN programs ON programs.program_id = instances.program_id
+            WHERE instances.instance_id = ?1
+            "#,
+            [instance_id],
+            |row| {
+                Ok(RevisionInstanceContext {
+                    program_id: row.get(0)?,
+                    program_name: row.get(1)?,
+                    active_version_id: row.get(2)?,
+                    status: row.get(3)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))
+}
+
+fn add_instance_revision_diagnostics(
+    context: &RevisionInstanceContext,
+    diagnostics: &mut Vec<RevisionCompatibilityDiagnostic>,
+) {
+    if matches!(
+        context.status.as_str(),
+        "completed" | "failed" | "cancelled"
+    ) {
+        diagnostics.push(revision_compatibility_diagnostic(
+            "revision.terminal_instance",
+            format!(
+                "instance is {}; revisions require a non-terminal instance",
+                context.status
+            ),
+            None,
+        ));
+    }
 }
 
 fn program_version_analysis_on(

@@ -389,6 +389,308 @@ fn starts_and_inspects_two_instances_independently() {
 }
 
 #[test]
+fn revise_dry_run_reports_compatibility_without_mutating_instance() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("revise-dry-run-v1");
+    let v2 = temp_workflow_path("revise-dry-run-v2");
+    fs::write(
+        &v1,
+        r#"
+workflow ReviseDemo
+
+rule noop
+  when started
+=> {
+}
+"#,
+    )
+    .expect("write v1 workflow");
+    fs::write(
+        &v2,
+        r#"
+workflow ReviseDemo
+
+rule noop_v2
+  when started
+=> {
+}
+"#,
+    )
+    .expect("write v2 workflow");
+
+    let started = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "run",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let original_version = started
+        .get("version_id")
+        .and_then(Value::as_str)
+        .expect("version id")
+        .to_owned();
+
+    let report = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "revise",
+            instance_id,
+            v2.to_str().expect("utf-8 workflow path"),
+            "--dry-run",
+            "--cancel",
+            "queued",
+            "--json",
+        ],
+    );
+    assert_eq!(report.get("dry_run").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        report
+            .get("compatibility")
+            .and_then(|value| value.get("compatible"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let status = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "status",
+            instance_id,
+            "--json",
+        ],
+    );
+    assert_eq!(
+        status
+            .get("instance")
+            .and_then(|instance| instance.get("version_id"))
+            .and_then(Value::as_str),
+        Some(original_version.as_str())
+    );
+    assert_eq!(
+        status
+            .get("revisions")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(v1);
+    let _ = fs::remove_file(v2);
+}
+
+#[test]
+fn revise_activation_updates_active_version_and_status_history() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("revise-activate-v1");
+    let v2 = temp_workflow_path("revise-activate-v2");
+    fs::write(
+        &v1,
+        r#"
+workflow ReviseActivate
+
+rule noop
+  when started
+=> {
+}
+"#,
+    )
+    .expect("write v1 workflow");
+    fs::write(
+        &v2,
+        r#"
+workflow ReviseActivate
+
+rule noop_v2
+  when started
+=> {
+}
+"#,
+    )
+    .expect("write v2 workflow");
+
+    let started = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "run",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let activation = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "revise",
+            instance_id,
+            v2.to_str().expect("utf-8 workflow path"),
+            "--cancel",
+            "keep",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        activation.get("dry_run").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        activation
+            .get("revision")
+            .and_then(|revision| revision.get("epoch"))
+            .and_then(Value::as_i64),
+        Some(1)
+    );
+
+    let status = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "status",
+            instance_id,
+            "--json",
+        ],
+    );
+    assert_eq!(
+        status
+            .get("instance")
+            .and_then(|instance| instance.get("revision_epoch"))
+            .and_then(Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        status
+            .get("revisions")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(v1);
+    let _ = fs::remove_file(v2);
+}
+
+#[test]
+fn revise_dry_run_reports_incompatible_root_without_mutating() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("revise-incompatible-v1");
+    let v2 = temp_workflow_path("revise-incompatible-v2");
+    fs::write(
+        &v1,
+        r#"
+workflow OriginalRoot
+
+rule noop
+  when started
+=> {
+}
+"#,
+    )
+    .expect("write v1 workflow");
+    fs::write(
+        &v2,
+        r#"
+workflow OtherRoot
+
+rule noop
+  when started
+=> {
+}
+"#,
+    )
+    .expect("write v2 workflow");
+
+    let started = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "run",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let report = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "revise",
+            instance_id,
+            v2.to_str().expect("utf-8 workflow path"),
+            "--dry-run",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        report
+            .get("compatibility")
+            .and_then(|value| value.get("compatible"))
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    let diagnostics = report
+        .get("compatibility")
+        .and_then(|value| value.get("diagnostics"))
+        .and_then(Value::as_array)
+        .expect("diagnostics");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(Value::as_str) == Some("revision.root_workflow_changed")
+    }));
+
+    let status = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "status",
+            instance_id,
+            "--json",
+        ],
+    );
+    assert_eq!(
+        status
+            .get("revisions")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(v1);
+    let _ = fs::remove_file(v2);
+}
+
+#[test]
 fn step_materializes_minimal_noop_fact() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();

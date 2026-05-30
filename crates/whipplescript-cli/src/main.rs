@@ -11,6 +11,7 @@ use whipplescript_kernel::{
     harness::{CommandAgentHarness, CommandLaunchPlan},
     idempotency_key,
     loft::{FakeLoftClient, LoftAction, LoftEffectRequest},
+    program_analysis_summary_json,
     trace::{
         check_trace, DependencyEdge, DependencyPredicate, EffectStatus, TraceEvent, TraceRecord,
     },
@@ -27,8 +28,10 @@ use whipplescript_store::{
     ClaimableEffect, DiagnosticRecord, DiagnosticView, EffectCancellation, EffectCompletion,
     EffectView, EventView, EvidenceLinkView, EvidenceView, FactView, HumanAnswer, InboxItemView,
     InstanceView, NewEffect, NewEffectDependency, NewFact, NewWorkflowInvocation, RetryEffect,
-    RuleCommit, RunStart, RunView, SqliteStore, StatusView, StoreError, WorkflowInvocationView,
-    WorkflowRevisionView, WorkflowTerminal, WorkflowTerminalKind,
+    RevisionActivation, RevisionCancellationImpact, RevisionCandidate,
+    RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RuleCommit, RunStart, RunView,
+    SqliteStore, StatusView, StoreError, WorkflowInvocationView, WorkflowRevisionView,
+    WorkflowTerminal, WorkflowTerminalKind,
 };
 
 fn main() -> ExitCode {
@@ -54,6 +57,7 @@ fn main() -> ExitCode {
         Some("check") => check(&options),
         Some("compile") => compile(&options),
         Some("run") => run(&options),
+        Some("revise") => revise(&options),
         Some("step") => step(&options),
         Some("worker") => worker(&options),
         Some("dev") => dev(&options),
@@ -140,7 +144,7 @@ impl CliOptions {
 fn print_usage() {
     println!("whipplescript {}", whipplescript_core::IMPLEMENTATION_STAGE);
     println!("usage: whip [--store path] [--json] <command> [args]");
-    println!("commands: check, compile, run, step, worker, dev, instances, status, log, facts, effects, runs");
+    println!("commands: check, compile, run, revise, step, worker, dev, instances, status, log, facts, effects, runs");
     println!("          inbox, evidence, diagnostics, trace, pause, resume, cancel, retry, doctor");
 }
 
@@ -465,6 +469,217 @@ impl CompileOptions {
         };
         Ok(Self { program_path, root })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReviseOptions {
+    instance_id: String,
+    program_path: String,
+    root: Option<String>,
+    dry_run: bool,
+    cancellation_policy: String,
+}
+
+impl ReviseOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut instance_id = None;
+        let mut program_path = None;
+        let mut root = None;
+        let mut dry_run = false;
+        let mut cancellation_policy = "keep".to_owned();
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--root" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected workflow name after `--root`".to_owned());
+                    };
+                    root = Some(value.clone());
+                }
+                "--dry-run" => dry_run = true,
+                "--cancel" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected policy after `--cancel`".to_owned());
+                    };
+                    cancellation_policy = match value.as_str() {
+                        "keep" => "keep".to_owned(),
+                        "queued" | "cancel_queued" | "cancel-queued" => "queued".to_owned(),
+                        "running" | "request_running" | "request-running" => "running".to_owned(),
+                        other => {
+                            return Err(format!(
+                                "unknown revision cancellation policy `{other}`; expected keep, queued, or running"
+                            ));
+                        }
+                    };
+                }
+                other if other.starts_with('-') => {
+                    return Err(format!("unknown revise option `{other}`"));
+                }
+                value if instance_id.is_none() => instance_id = Some(value.to_owned()),
+                value if program_path.is_none() => program_path = Some(value.to_owned()),
+                _ => {
+                    return Err(
+                        "usage: whip revise <instance> <workflow.whip> [--root Workflow] [--dry-run] [--cancel keep|queued|running]"
+                            .to_owned(),
+                    );
+                }
+            }
+            index += 1;
+        }
+        let Some(instance_id) = instance_id else {
+            return Err(
+                "usage: whip revise <instance> <workflow.whip> [--root Workflow] [--dry-run] [--cancel keep|queued|running]"
+                    .to_owned(),
+            );
+        };
+        let Some(program_path) = program_path else {
+            return Err(
+                "usage: whip revise <instance> <workflow.whip> [--root Workflow] [--dry-run] [--cancel keep|queued|running]"
+                    .to_owned(),
+            );
+        };
+        Ok(Self {
+            instance_id,
+            program_path,
+            root,
+            dry_run,
+            cancellation_policy,
+        })
+    }
+}
+
+fn revise(options: &CliOptions) -> ExitCode {
+    let revise_options = match ReviseOptions::parse(&options.args) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
+    let (source, ir) = match compile_source_path_with_root(
+        &revise_options.program_path,
+        revise_options.root.as_deref(),
+    ) {
+        Ok(compiled) => compiled,
+        Err(error) => return report_compile_failure(&revise_options.program_path, error),
+    };
+    let snapshot = ir.to_snapshot();
+    let source_hash = stable_hash_hex(&source);
+    let ir_hash = stable_hash_hex(&snapshot);
+    let analysis_summary_json = program_analysis_summary_json(&ir);
+    let candidate_label = format!("candidate:{ir_hash}");
+
+    let store = match open_store(&options.store_path) {
+        Ok(store) => store,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let compatibility = match store.analyze_revision_candidate(
+        &revise_options.instance_id,
+        RevisionCandidate {
+            candidate_version_id: &candidate_label,
+            program_name: &ir.workflow,
+            analysis_summary_json: &analysis_summary_json,
+        },
+    ) {
+        Ok(report) => report,
+        Err(error) => return report_store_error("failed to analyze revision", error),
+    };
+    let impact = match store.revision_cancellation_impact(
+        &revise_options.instance_id,
+        &revise_options.cancellation_policy,
+    ) {
+        Ok(impact) => impact,
+        Err(error) => return report_store_error("failed to analyze cancellation impact", error),
+    };
+
+    if revise_options.dry_run {
+        return emit_revision_dry_run(
+            options,
+            &revise_options,
+            &ir,
+            &source_hash,
+            &ir_hash,
+            &compatibility,
+            &impact,
+        );
+    }
+
+    if !compatibility.compatible {
+        emit_revision_report(
+            options,
+            &revise_options,
+            &ir,
+            &source_hash,
+            &ir_hash,
+            &compatibility,
+            &impact,
+            None,
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let mut kernel = RuntimeKernel::new(store);
+    let version = match kernel.create_program_version_for_program(
+        ProgramVersionInput {
+            program_name: &ir.workflow,
+            source_hash: &source_hash,
+            ir_hash: &ir_hash,
+            compiler_version: whipplescript_core::version(),
+        },
+        &ir,
+    ) {
+        Ok(version) => version,
+        Err(error) => {
+            eprintln!(
+                "failed to create candidate program version: {}",
+                store_error(error)
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut store = kernel.into_store();
+    let activation_policy = json!({
+        "source_path": display_path(&revise_options.program_path),
+        "root_workflow": &ir.workflow,
+        "source_hash": &source_hash,
+        "ir_hash": &ir_hash,
+        "compatibility": revision_compatibility_to_json(&compatibility),
+        "cancellation": revision_cancellation_impact_to_json(&impact),
+    })
+    .to_string();
+    let activation = match store.activate_revision(RevisionActivation {
+        instance_id: &revise_options.instance_id,
+        from_version_id: &compatibility.active_version_id,
+        to_version_id: &version.version_id,
+        activation_policy_json: &activation_policy,
+        cancellation_policy: &revise_options.cancellation_policy,
+        idempotency_key: Some(&idempotency_key(&[
+            &revise_options.instance_id,
+            "revision",
+            &compatibility.active_version_id,
+            &version.version_id,
+        ])),
+    }) {
+        Ok(revision) => revision,
+        Err(error) => return report_store_error("failed to activate revision", error),
+    };
+
+    emit_revision_report(
+        options,
+        &revise_options,
+        &ir,
+        &source_hash,
+        &ir_hash,
+        &compatibility,
+        &impact,
+        Some(&activation),
+    );
+    ExitCode::SUCCESS
 }
 
 fn run(options: &CliOptions) -> ExitCode {
@@ -7955,6 +8170,145 @@ fn workflow_revision_to_json(revision: &WorkflowRevisionView) -> Value {
         "created_at": revision.created_at,
         "activated_at": revision.activated_at,
     })
+}
+
+fn revision_compatibility_to_json(report: &RevisionCompatibilityReport) -> Value {
+    json!({
+        "instance_id": report.instance_id,
+        "active_version_id": report.active_version_id,
+        "candidate_version_id": report.candidate_version_id,
+        "compatible": report.compatible,
+        "diagnostics": report
+            .diagnostics
+            .iter()
+            .map(revision_compatibility_diagnostic_to_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn revision_compatibility_diagnostic_to_json(
+    diagnostic: &RevisionCompatibilityDiagnostic,
+) -> Value {
+    json!({
+        "code": diagnostic.code,
+        "message": diagnostic.message,
+        "subject": diagnostic.subject,
+    })
+}
+
+fn revision_cancellation_impact_to_json(impact: &RevisionCancellationImpact) -> Value {
+    json!({
+        "instance_id": impact.instance_id,
+        "active_version_id": impact.active_version_id,
+        "active_revision_epoch": impact.active_revision_epoch,
+        "cancellation_policy": impact.cancellation_policy,
+        "terminal_cancel_effects": impact.terminal_cancel_effects,
+        "request_cancel_effects": impact.request_cancel_effects,
+    })
+}
+
+fn revision_report_json(
+    dry_run: bool,
+    revise_options: &ReviseOptions,
+    ir: &IrProgram,
+    source_hash: &str,
+    ir_hash: &str,
+    compatibility: &RevisionCompatibilityReport,
+    impact: &RevisionCancellationImpact,
+    revision: Option<&WorkflowRevisionView>,
+) -> Value {
+    json!({
+        "dry_run": dry_run,
+        "instance_id": revise_options.instance_id,
+        "source_path": display_path(&revise_options.program_path),
+        "root_workflow": ir.workflow,
+        "candidate_source_hash": source_hash,
+        "candidate_version_hash": ir_hash,
+        "compatibility": revision_compatibility_to_json(compatibility),
+        "cancellation": revision_cancellation_impact_to_json(impact),
+        "would_activate": dry_run && compatibility.compatible,
+        "revision": revision.map(workflow_revision_to_json),
+        "next": revision.map(|revision| {
+            format!("whip status {} --json", revision.instance_id)
+        }),
+    })
+}
+
+fn emit_revision_dry_run(
+    options: &CliOptions,
+    revise_options: &ReviseOptions,
+    ir: &IrProgram,
+    source_hash: &str,
+    ir_hash: &str,
+    compatibility: &RevisionCompatibilityReport,
+    impact: &RevisionCancellationImpact,
+) -> ExitCode {
+    emit_revision_report(
+        options,
+        revise_options,
+        ir,
+        source_hash,
+        ir_hash,
+        compatibility,
+        impact,
+        None,
+    )
+}
+
+fn emit_revision_report(
+    options: &CliOptions,
+    revise_options: &ReviseOptions,
+    ir: &IrProgram,
+    source_hash: &str,
+    ir_hash: &str,
+    compatibility: &RevisionCompatibilityReport,
+    impact: &RevisionCancellationImpact,
+    revision: Option<&WorkflowRevisionView>,
+) -> ExitCode {
+    let dry_run = revise_options.dry_run;
+    if options.json {
+        return emit_json(revision_report_json(
+            dry_run,
+            revise_options,
+            ir,
+            source_hash,
+            ir_hash,
+            compatibility,
+            impact,
+            revision,
+        ));
+    }
+
+    if let Some(revision) = revision {
+        println!(
+            "revision {} activated epoch={} from={} to={}",
+            revision.revision_id, revision.epoch, revision.from_version_id, revision.to_version_id
+        );
+        println!("next: whip status {} --json", revision.instance_id);
+    } else {
+        println!(
+            "revision dry-run: {}",
+            if compatibility.compatible {
+                "compatible"
+            } else {
+                "blocked"
+            }
+        );
+        println!(
+            "active_version={} active_epoch={} candidate_hash={}",
+            compatibility.active_version_id, impact.active_revision_epoch, ir_hash
+        );
+    }
+    println!(
+        "cancel_policy={} terminal_cancel={} request_cancel={}",
+        impact.cancellation_policy,
+        impact.terminal_cancel_effects.len(),
+        impact.request_cancel_effects.len()
+    );
+    for diagnostic in &compatibility.diagnostics {
+        println!("diagnostic {}: {}", diagnostic.code, diagnostic.message);
+    }
+    ExitCode::SUCCESS
 }
 
 fn inbox_item_to_json(item: &InboxItemView) -> Value {
