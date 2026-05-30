@@ -6390,6 +6390,78 @@ fn reconstruct_trace_records(events: &[EventView]) -> Vec<TraceRecord> {
                     },
                 );
             }
+            "workflow.revision_activated" => {
+                let Some(revision_id) = payload.get("revision_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(from_version_id) = payload.get("from_version_id").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(to_version_id) = payload.get("to_version_id").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(from_epoch) = payload.get("from_epoch").and_then(Value::as_i64) else {
+                    continue;
+                };
+                let Some(to_epoch) = payload.get("to_epoch").and_then(Value::as_i64) else {
+                    continue;
+                };
+                let Some(cancellation_policy) =
+                    payload.get("cancellation_policy").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                push_trace_record(
+                    &mut records,
+                    TraceEvent::RevisionActivated {
+                        revision_id: revision_id.to_owned(),
+                        from_version_id: from_version_id.to_owned(),
+                        to_version_id: to_version_id.to_owned(),
+                        from_epoch,
+                        to_epoch,
+                        cancellation_policy: cancellation_policy.to_owned(),
+                        terminal_cancel_effects: trace_string_array(
+                            payload.get("terminal_cancel_effects"),
+                        ),
+                        request_cancel_effects: trace_string_array(
+                            payload.get("request_cancel_effects"),
+                        ),
+                    },
+                );
+            }
+            "effect.cancellation_requested" => {
+                let Some(effect_id) = payload.get("effect_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let revision_id = match payload.get("revision_id") {
+                    Some(Value::Null) | None => None,
+                    Some(value) => match value.as_str() {
+                        Some(revision_id) => Some(revision_id.to_owned()),
+                        None => continue,
+                    },
+                };
+                let reason = match payload.get("reason") {
+                    Some(Value::Null) | None => None,
+                    Some(value) => match value.as_str() {
+                        Some(reason) => Some(reason.to_owned()),
+                        None => continue,
+                    },
+                };
+                let Some(requested_by) = payload.get("requested_by").and_then(Value::as_str) else {
+                    continue;
+                };
+                push_trace_record(
+                    &mut records,
+                    TraceEvent::EffectCancellationRequested {
+                        effect_id: effect_id.to_owned(),
+                        revision_id,
+                        reason,
+                        requested_by: requested_by.to_owned(),
+                    },
+                );
+            }
             "lease.expired" => {
                 let Some(effect_id) = payload.get("effect_id").and_then(Value::as_str) else {
                     continue;
@@ -6416,6 +6488,16 @@ fn reconstruct_trace_records(events: &[EventView]) -> Vec<TraceRecord> {
     }
 
     records
+}
+
+fn trace_string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
 }
 
 fn push_trace_record(records: &mut Vec<TraceRecord>, event: TraceEvent) {
@@ -8069,6 +8151,38 @@ fn trace_event_to_json(event: &TraceEvent) -> Value {
             "type": "effect_cancelled",
             "effect_id": effect_id,
         }),
+        TraceEvent::RevisionActivated {
+            revision_id,
+            from_version_id,
+            to_version_id,
+            from_epoch,
+            to_epoch,
+            cancellation_policy,
+            terminal_cancel_effects,
+            request_cancel_effects,
+        } => json!({
+            "type": "revision_activated",
+            "revision_id": revision_id,
+            "from_version_id": from_version_id,
+            "to_version_id": to_version_id,
+            "from_epoch": from_epoch,
+            "to_epoch": to_epoch,
+            "cancellation_policy": cancellation_policy,
+            "terminal_cancel_effects": terminal_cancel_effects,
+            "request_cancel_effects": request_cancel_effects,
+        }),
+        TraceEvent::EffectCancellationRequested {
+            effect_id,
+            revision_id,
+            reason,
+            requested_by,
+        } => json!({
+            "type": "effect_cancellation_requested",
+            "effect_id": effect_id,
+            "revision_id": revision_id,
+            "reason": reason,
+            "requested_by": requested_by,
+        }),
         TraceEvent::InstancePaused => json!({"type": "instance_paused"}),
         TraceEvent::InstanceResumed => json!({"type": "instance_resumed"}),
         TraceEvent::InstanceCancelled => json!({"type": "instance_cancelled"}),
@@ -8941,6 +9055,92 @@ case classification {
 
         assert_eq!(records.len(), 9);
         check_trace(&records).expect("reconstructed trace conforms");
+    }
+
+    #[test]
+    fn reconstructs_revision_trace_records_from_store_events() {
+        let events = vec![
+            event_view(
+                1,
+                "rule.committed",
+                json!({
+                    "rule": "dispatch",
+                    "facts": [],
+                    "effects": [{"effect_id": "running", "status": "queued"}],
+                    "dependencies": []
+                }),
+            ),
+            event_view(
+                2,
+                "effect.run_started",
+                json!({"effect_id": "running", "run_id": "run_running"}),
+            ),
+            event_view(
+                3,
+                "workflow.revision_activated",
+                json!({
+                    "revision_id": "rev_1",
+                    "instance_id": "ins_1",
+                    "from_version_id": "ver_old",
+                    "to_version_id": "ver_new",
+                    "from_epoch": 0,
+                    "to_epoch": 1,
+                    "activation_policy": {},
+                    "cancellation_policy": "request_running",
+                    "terminal_cancel_effects": [],
+                    "request_cancel_effects": ["running"]
+                }),
+            ),
+            event_view(
+                4,
+                "effect.cancellation_requested",
+                json!({
+                    "request_id": "ecr_1",
+                    "effect_id": "running",
+                    "revision_id": "rev_1",
+                    "reason": "workflow revision",
+                    "requested_by": "workflow.revision"
+                }),
+            ),
+            event_view(
+                5,
+                "effect.terminal",
+                json!({
+                    "effect_id": "running",
+                    "run_id": "run_running",
+                    "status": "completed"
+                }),
+            ),
+        ];
+
+        let records = reconstruct_trace_records(&events);
+
+        assert_eq!(records.len(), 6);
+        check_trace(&records).expect("revision trace conforms");
+        match &records[3].event {
+            TraceEvent::RevisionActivated {
+                revision_id,
+                to_epoch,
+                request_cancel_effects,
+                ..
+            } => {
+                assert_eq!(revision_id, "rev_1");
+                assert_eq!(*to_epoch, 1);
+                assert_eq!(request_cancel_effects, &vec!["running".to_owned()]);
+            }
+            event => panic!("expected revision activation record, got {event:?}"),
+        }
+
+        let rendered = trace_record_to_json(&records[4]);
+        let event = rendered.get("event").expect("event");
+        assert_eq!(
+            event.get("type").and_then(Value::as_str),
+            Some("effect_cancellation_requested")
+        );
+        assert_eq!(
+            event.get("requested_by").and_then(Value::as_str),
+            Some("workflow.revision")
+        );
     }
 
     #[test]

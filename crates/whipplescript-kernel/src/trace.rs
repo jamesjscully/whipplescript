@@ -75,6 +75,22 @@ pub enum TraceEvent {
     EffectCancelled {
         effect_id: String,
     },
+    RevisionActivated {
+        revision_id: String,
+        from_version_id: String,
+        to_version_id: String,
+        from_epoch: i64,
+        to_epoch: i64,
+        cancellation_policy: String,
+        terminal_cancel_effects: Vec<String>,
+        request_cancel_effects: Vec<String>,
+    },
+    EffectCancellationRequested {
+        effect_id: String,
+        revision_id: Option<String>,
+        reason: Option<String>,
+        requested_by: String,
+    },
     InstancePaused,
     InstanceResumed,
     InstanceCancelled,
@@ -99,7 +115,9 @@ struct TraceState {
     live_runs: BTreeSet<String>,
     stale_runs: BTreeSet<String>,
     terminal_effects: BTreeSet<String>,
+    cancel_requested_effects: BTreeSet<String>,
     dependencies: Vec<DependencyEdge>,
+    revision_epoch: i64,
     cancelled: bool,
     paused: bool,
 }
@@ -166,6 +184,12 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
                 return violation(
                     record,
                     format!("effect {effect_id} claimed from non-queued status {status:?}"),
+                );
+            }
+            if state.cancel_requested_effects.contains(effect_id) {
+                return violation(
+                    record,
+                    format!("effect {effect_id} claimed after cancellation request"),
                 );
             }
             if let Some(edge) = first_unsatisfied_dependency(state, effect_id) {
@@ -275,6 +299,7 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
                 return violation(record, format!("terminal event for non-live run {run_id}"));
             }
             state.terminal_effects.insert(effect_id.clone());
+            state.cancel_requested_effects.remove(effect_id);
             state.effects.insert(effect_id.clone(), status.clone());
         }
         TraceEvent::ProviderDiagnostic {
@@ -357,9 +382,77 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
                 );
             }
             state.terminal_effects.insert(effect_id.clone());
+            state.cancel_requested_effects.remove(effect_id);
             state
                 .effects
                 .insert(effect_id.clone(), EffectStatus::Cancelled);
+        }
+        TraceEvent::RevisionActivated {
+            revision_id,
+            from_epoch,
+            to_epoch,
+            cancellation_policy,
+            ..
+        } => {
+            if revision_id.is_empty() {
+                return violation(record, "revision activation has empty revision id");
+            }
+            if *from_epoch != state.revision_epoch {
+                return violation(
+                    record,
+                    format!(
+                        "revision activation from epoch {from_epoch} but trace is at epoch {}",
+                        state.revision_epoch
+                    ),
+                );
+            }
+            if *to_epoch <= *from_epoch {
+                return violation(
+                    record,
+                    format!("revision activation did not advance epoch {from_epoch}->{to_epoch}"),
+                );
+            }
+            if !matches!(
+                cancellation_policy.as_str(),
+                "keep" | "cancel_queued" | "request_running"
+            ) {
+                return violation(
+                    record,
+                    format!("unknown revision cancellation policy {cancellation_policy}"),
+                );
+            }
+            state.revision_epoch = *to_epoch;
+        }
+        TraceEvent::EffectCancellationRequested {
+            effect_id,
+            revision_id,
+            requested_by,
+            ..
+        } => {
+            if revision_id.as_deref() == Some("") {
+                return violation(record, "cancellation request has empty revision id");
+            }
+            if requested_by.is_empty() {
+                return violation(record, "cancellation request has empty requester");
+            }
+            let Some(status) = state.effects.get(effect_id) else {
+                return violation(
+                    record,
+                    format!("cancellation requested for unknown effect {effect_id}"),
+                );
+            };
+            if *status != EffectStatus::Running {
+                return violation(
+                    record,
+                    format!("cancellation requested for effect {effect_id} in status {status:?}"),
+                );
+            }
+            if !state.cancel_requested_effects.insert(effect_id.clone()) {
+                return violation(
+                    record,
+                    format!("duplicate cancellation request for effect {effect_id}"),
+                );
+            }
         }
         TraceEvent::InstancePaused => {
             state.paused = true;
@@ -465,6 +558,34 @@ mod tests {
         }
     }
 
+    fn cancellation_request(sequence: u64, effect_id: &str) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::EffectCancellationRequested {
+                effect_id: effect_id.to_owned(),
+                revision_id: Some("rev-a".to_owned()),
+                reason: Some("workflow revision".to_owned()),
+                requested_by: "workflow.revision".to_owned(),
+            },
+        }
+    }
+
+    fn revision_activated(sequence: u64, from_epoch: i64, to_epoch: i64) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::RevisionActivated {
+                revision_id: format!("rev-{to_epoch}"),
+                from_version_id: format!("version-{from_epoch}"),
+                to_version_id: format!("version-{to_epoch}"),
+                from_epoch,
+                to_epoch,
+                cancellation_policy: "request_running".to_owned(),
+                terminal_cancel_effects: Vec::new(),
+                request_cancel_effects: Vec::new(),
+            },
+        }
+    }
+
     fn diagnostic(sequence: u64, effect_id: &str, status: EffectStatus) -> TraceRecord {
         TraceRecord {
             sequence,
@@ -511,6 +632,26 @@ mod tests {
             diagnostic(4, "a", EffectStatus::Failed),
             terminal(5, "a", EffectStatus::Failed),
         ];
+
+        assert_eq!(check_trace(&trace), Ok(()));
+    }
+
+    #[test]
+    fn accepts_cancellation_request_before_terminal_event() {
+        let trace = vec![
+            effect_created(1, "a"),
+            claim(2, "a"),
+            start(3, "a"),
+            cancellation_request(4, "a"),
+            terminal(5, "a", EffectStatus::Completed),
+        ];
+
+        assert_eq!(check_trace(&trace), Ok(()));
+    }
+
+    #[test]
+    fn accepts_monotonic_revision_activation() {
+        let trace = vec![revision_activated(1, 0, 1), revision_activated(2, 1, 2)];
 
         assert_eq!(check_trace(&trace), Ok(()));
     }
@@ -606,6 +747,52 @@ mod tests {
 
         let violation = check_trace(&trace).expect_err("invalid diagnostic JSON should fail");
         assert!(violation.message.contains("valid JSON"));
+    }
+
+    #[test]
+    fn rejects_cancellation_request_for_non_running_effect() {
+        let trace = vec![effect_created(1, "a"), cancellation_request(2, "a")];
+
+        let violation =
+            check_trace(&trace).expect_err("cancellation request before running should fail");
+        assert!(violation.message.contains("in status Queued"));
+    }
+
+    #[test]
+    fn rejects_duplicate_cancellation_request() {
+        let trace = vec![
+            effect_created(1, "a"),
+            claim(2, "a"),
+            start(3, "a"),
+            cancellation_request(4, "a"),
+            cancellation_request(5, "a"),
+        ];
+
+        let violation = check_trace(&trace).expect_err("duplicate cancellation request fails");
+        assert!(violation.message.contains("duplicate cancellation request"));
+    }
+
+    #[test]
+    fn rejects_claim_after_cancellation_request_and_lease_expiry() {
+        let trace = vec![
+            effect_created(1, "a"),
+            claim(2, "a"),
+            start(3, "a"),
+            cancellation_request(4, "a"),
+            expire_lease(5, "a"),
+            claim(6, "a"),
+        ];
+
+        let violation = check_trace(&trace).expect_err("cancel-requested effect claim fails");
+        assert!(violation.message.contains("after cancellation request"));
+    }
+
+    #[test]
+    fn rejects_revision_activation_with_stale_epoch() {
+        let trace = vec![revision_activated(1, 1, 2)];
+
+        let violation = check_trace(&trace).expect_err("stale revision epoch should fail");
+        assert!(violation.message.contains("trace is at epoch 0"));
     }
 
     #[test]

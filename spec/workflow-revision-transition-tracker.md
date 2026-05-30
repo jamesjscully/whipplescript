@@ -27,8 +27,8 @@ without changing the source-level meaning of `pattern`, `apply`, `workflow`,
 | --- | --- | --- |
 | Conceptual spec | [x] | Stage 0 landed revision epochs, activation policy, cancellation policy, compatibility rules, store objects, transaction boundaries, and observability requirements in the core specs. |
 | Formal model | [x] | Stage 1 added Maude revision searches and TLA+ revision/cancel-request actions and invariants; the bounded formal suite passes. |
-| Store/runtime implementation | [ ] | Runtime still needs `instance_revisions`, active-epoch caching, and per-effect version attribution. |
-| CLI/control plane | [ ] | No `whip revise` or dry-run compatibility surface exists yet. |
+| Store/runtime implementation | [ ] | Revision rows, active-epoch caching, per-effect version attribution, replay, and cancellation requests are in place; active-version stepper/worker semantics remain open. |
+| CLI/control plane | [ ] | `whip revise`, dry-run compatibility reports, activation reports, status revision history, and trace revision projection are in place; evidence/diagnostic previews and final UX audit remain open. |
 | Generated checks | [ ] | Per-program checks do not yet assert active-version rule firing or old-effect attribution. |
 | Examples/e2e | [ ] | No revision example exercises keep/cancel behavior for queued/running effects or child workflows. |
 
@@ -246,7 +246,7 @@ Goal: persist revisions and version attribution without losing replayability.
   - [x] request reason, requester, revision id, causation event, idempotency key
   - [x] terminal outcome still uses the normal effect terminal lifecycle
 - [ ] Add kernel/store operations:
-  - [ ] create revision candidate/dry-run report
+  - [x] create revision candidate/dry-run report
   - [x] activate revision atomically
   - [x] list active revision for instance
   - [x] list effects impacted by a cancellation policy
@@ -365,7 +365,7 @@ Goal: expose revision as an explicit operator action with a safe dry-run path.
 - [ ] Require explicit confirmation flags for future destructive policies if
   additional policy levels are introduced.
 - [x] Update `whip status --json` with active revision and revision history.
-- [ ] Update `whip trace` with revision activation and cancellation-request
+- [x] Update `whip trace` with revision activation and cancellation-request
   records.
 - [ ] Audit Stage 4 against CLI UX, JSON stability, status readability, and
   operator failure modes; record missing surfaces.
@@ -380,7 +380,10 @@ Stage 4 partial audit notes:
   activation operation.
 - JSON output includes compatibility diagnostics, active version/epoch,
   candidate hashes, terminal-cancel/request-cancel effect lists, and activation
-  details. Trace-specific revision projection remains open Stage 4/6 work.
+  details.
+- `whip trace --check --json` now reconstructs abstract revision activation and
+  cancellation-request records from the event log, including revision ids,
+  version ids, epoch transitions, cancellation policy, and requested effects.
 
 Acceptance:
 
@@ -428,8 +431,8 @@ Acceptance:
 Goal: make revision understandable from the normal inspection surfaces.
 
 - [ ] Add revision events to `whip log`.
-- [ ] Add active revision and history to `whip status`.
-- [ ] Add per-effect version/epoch to `whip effects --json`.
+- [x] Add active revision and history to `whip status`.
+- [x] Add per-effect version/epoch to `whip effects --json`.
 - [ ] Add cancellation request state to `whip effects` and `whip runs`.
 - [ ] Add evidence links:
   - [ ] revision event -> old/new program versions
@@ -442,7 +445,7 @@ Goal: make revision understandable from the normal inspection surfaces.
   - [ ] active fact schema mismatch
   - [ ] unsupported running cancellation provider
   - [ ] stale program path or missing source bundle during revision
-- [ ] Update trace conformance to understand revision and cancel-request
+- [x] Update trace conformance to understand revision and cancel-request
   records.
 - [ ] Audit Stage 6 against operator debugging workflows, trace JSON, evidence
   links, and diagnostic source spans; record remaining explainability gaps.
@@ -453,7 +456,7 @@ Acceptance:
   output.
 - [ ] An operator can answer "what did revision cancel or request to cancel?"
   from CLI output.
-- [ ] Trace conformance rejects impossible revision/cancellation sequences.
+- [x] Trace conformance rejects impossible revision/cancellation sequences.
 
 ## Stage 7: Tests And E2E
 
