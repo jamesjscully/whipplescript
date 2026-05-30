@@ -2,7 +2,7 @@
 EXTENDS Naturals, Sequences, FiniteSets
 
 \* This model captures the durable control-plane lifecycle independently of
-\* any particular Whippletree source program. Maude models local rule/effect
+\* any particular WhippleScript source program. Maude models local rule/effect
 \* rewrites; this TLA+ model tracks asynchronous runtime actions, leases,
 \* recovery, pause/resume, cancellation, and event-log ordering.
 
@@ -13,6 +13,8 @@ CONSTANTS
   Runs,
   \* @type: Set(Str);
   Events,
+  \* @type: Set(Str);
+  Versions,
   \* @type: Set(<<Str, Str, Str>>);
   Dependencies
 
@@ -38,21 +40,42 @@ VARIABLES
   \* @type: Bool;
   cancelled,
   \* @type: Bool;
-  recovering
+  completed,
+  \* @type: Bool;
+  failed,
+  \* @type: Bool;
+  recovering,
+  \* @type: Str;
+  activeVersion,
+  \* @type: Int;
+  revisionEpoch,
+  \* @type: Str -> Str;
+  effectVersion,
+  \* @type: Set(Str);
+  cancelRequested,
+  \* @type: Seq(Str);
+  revisionEvents
 
 vars ==
   << eventLog, recoveryLog, effects, runs, runEffect, leases, terminalEffects,
-     projectionCursor, paused, cancelled, recovering >>
+     projectionCursor, paused, cancelled, completed, failed, recovering,
+     activeVersion, revisionEpoch, effectVersion, cancelRequested,
+     revisionEvents >>
+
+RevisionVars ==
+  << activeVersion, revisionEpoch, effectVersion, cancelRequested,
+     revisionEvents >>
 
 EffectStatuses ==
   {"queued", "blocked", "claimed", "running", "completed",
    "failed", "timed_out", "cancelled"}
 
 RunStatuses ==
-  {"none", "claimed", "running", "completed", "failed", "timed_out"}
+  {"none", "claimed", "running", "completed", "failed", "timed_out",
+   "cancelled", "lease_expired"}
 
 LeaseStatuses ==
-  {"none", "active", "expired"}
+  {"none", "active", "released", "expired"}
 
 Init ==
   /\ eventLog = << >>
@@ -60,19 +83,33 @@ Init ==
   /\ effects = [e \in Effects |-> "queued"]
   /\ runs = [r \in Runs |-> "none"]
   /\ runEffect = [r \in Runs |-> CHOOSE e \in Effects : TRUE]
-  /\ leases = [e \in Effects |-> "none"]
+  /\ leases = [r \in Runs |-> "none"]
   /\ terminalEffects = {}
   /\ projectionCursor = 0
   /\ paused = FALSE
   /\ cancelled = FALSE
+  /\ completed = FALSE
+  /\ failed = FALSE
   /\ recovering = FALSE
+  /\ activeVersion = "version1"
+  /\ revisionEpoch = 0
+  /\ effectVersion = [e \in Effects |-> "version1"]
+  /\ cancelRequested = {}
+  /\ revisionEvents = << >>
+
+InstanceRunning ==
+  /\ ~paused
+  /\ ~cancelled
+  /\ ~completed
+  /\ ~failed
 
 AppendEvent(ev) ==
   /\ ev \in Events
   /\ ~recovering
   /\ eventLog' = Append(eventLog, ev)
   /\ UNCHANGED << effects, runs, runEffect, leases, terminalEffects,
-                  projectionCursor, paused, cancelled, recoveryLog, recovering >>
+                  projectionCursor, paused, cancelled, completed, failed,
+                  recoveryLog, recovering, RevisionVars >>
 
 \* @type: (<<Str, Str, Str>>) => Str;
 DepUpstream(d) == d[1]
@@ -97,9 +134,9 @@ EffectHasUnsatisfiedDeps(e) ==
     /\ ~PredicateSatisfied(d)
 
 Claimable(e) ==
-  /\ ~paused
-  /\ ~cancelled
+  /\ InstanceRunning
   /\ effects[e] = "queued"
+  /\ e \notin cancelRequested
   /\ ~EffectHasUnsatisfiedDeps(e)
 
 ClaimEffect(e, r) ==
@@ -112,18 +149,21 @@ ClaimEffect(e, r) ==
   /\ runs' = [runs EXCEPT ![r] = "claimed"]
   /\ runEffect' = [runEffect EXCEPT ![r] = e]
   /\ UNCHANGED << eventLog, recoveryLog, leases, terminalEffects, projectionCursor,
-                  paused, cancelled >>
+                  paused, cancelled, completed, failed, recovering,
+                  RevisionVars >>
 
 StartRun(r) ==
   /\ r \in Runs
   /\ ~recovering
+  /\ InstanceRunning
   /\ runs[r] = "claimed"
   /\ effects[runEffect[r]] = "claimed"
   /\ effects' = [effects EXCEPT ![runEffect[r]] = "running"]
   /\ runs' = [runs EXCEPT ![r] = "running"]
-  /\ leases' = [leases EXCEPT ![runEffect[r]] = "active"]
+  /\ leases' = [leases EXCEPT ![r] = "active"]
   /\ UNCHANGED << eventLog, recoveryLog, runEffect, terminalEffects, projectionCursor,
-                  paused, cancelled >>
+                  paused, cancelled, completed, failed, recovering,
+                  RevisionVars >>
 
 CompleteRun(r, ev) ==
   /\ r \in Runs
@@ -133,10 +173,12 @@ CompleteRun(r, ev) ==
   /\ runEffect[r] \notin terminalEffects
   /\ effects' = [effects EXCEPT ![runEffect[r]] = "completed"]
   /\ runs' = [runs EXCEPT ![r] = "completed"]
-  /\ leases' = [leases EXCEPT ![runEffect[r]] = "none"]
+  /\ leases' = [leases EXCEPT ![r] = "released"]
   /\ terminalEffects' = terminalEffects \cup {runEffect[r]}
   /\ eventLog' = Append(eventLog, ev)
-  /\ UNCHANGED << recoveryLog, runEffect, projectionCursor, paused, cancelled, recovering >>
+  /\ UNCHANGED << recoveryLog, runEffect, projectionCursor, paused, cancelled,
+                  completed, failed, recovering, activeVersion, revisionEpoch,
+                  effectVersion, cancelRequested, revisionEvents >>
 
 FailRun(r, ev) ==
   /\ r \in Runs
@@ -146,68 +188,215 @@ FailRun(r, ev) ==
   /\ runEffect[r] \notin terminalEffects
   /\ effects' = [effects EXCEPT ![runEffect[r]] = "failed"]
   /\ runs' = [runs EXCEPT ![r] = "failed"]
-  /\ leases' = [leases EXCEPT ![runEffect[r]] = "none"]
+  /\ leases' = [leases EXCEPT ![r] = "released"]
   /\ terminalEffects' = terminalEffects \cup {runEffect[r]}
   /\ eventLog' = Append(eventLog, ev)
-  /\ UNCHANGED << recoveryLog, runEffect, projectionCursor, paused, cancelled, recovering >>
+  /\ UNCHANGED << recoveryLog, runEffect, projectionCursor, paused, cancelled,
+                  completed, failed, recovering, activeVersion, revisionEpoch,
+                  effectVersion, cancelRequested, revisionEvents >>
 
-ExpireLease(e, ev) ==
+CancelRun(r, ev) ==
+  /\ r \in Runs
+  /\ ev \in Events
+  /\ ~recovering
+  /\ runs[r] = "running"
+  /\ runEffect[r] \notin terminalEffects
+  /\ effects' = [effects EXCEPT ![runEffect[r]] = "cancelled"]
+  /\ runs' = [runs EXCEPT ![r] = "cancelled"]
+  /\ leases' = [leases EXCEPT ![r] = "released"]
+  /\ terminalEffects' = terminalEffects \cup {runEffect[r]}
+  /\ eventLog' = Append(eventLog, ev)
+  /\ UNCHANGED << recoveryLog, runEffect, projectionCursor, paused, cancelled,
+                  completed, failed, recovering, activeVersion, revisionEpoch,
+                  effectVersion, cancelRequested, revisionEvents >>
+
+TimeoutRun(r, ev) ==
+  /\ r \in Runs
+  /\ ev \in Events
+  /\ ~recovering
+  /\ runs[r] = "running"
+  /\ runEffect[r] \notin terminalEffects
+  /\ effects' = [effects EXCEPT ![runEffect[r]] = "timed_out"]
+  /\ runs' = [runs EXCEPT ![r] = "timed_out"]
+  /\ leases' = [leases EXCEPT ![r] = "released"]
+  /\ terminalEffects' = terminalEffects \cup {runEffect[r]}
+  /\ eventLog' = Append(eventLog, ev)
+  /\ UNCHANGED << recoveryLog, runEffect, projectionCursor, paused, cancelled,
+                  completed, failed, recovering, activeVersion, revisionEpoch,
+                  effectVersion, cancelRequested, revisionEvents >>
+
+ExpireLease(r, ev) ==
+  /\ r \in Runs
+  /\ ev \in Events
+  /\ ~recovering
+  /\ runs[r] = "running"
+  /\ effects[runEffect[r]] = "running"
+  /\ leases[r] = "active"
+  /\ runEffect[r] \notin terminalEffects
+  /\ effects' = [effects EXCEPT ![runEffect[r]] = "queued"]
+  /\ runs' = [runs EXCEPT ![r] = "lease_expired"]
+  /\ leases' = [leases EXCEPT ![r] = "expired"]
+  /\ eventLog' = Append(eventLog, ev)
+  /\ UNCHANGED << recoveryLog, runEffect, terminalEffects, projectionCursor,
+                  paused, cancelled, completed, failed, recovering,
+                  RevisionVars >>
+
+RetryEffect(e, ev) ==
   /\ e \in Effects
   /\ ev \in Events
   /\ ~recovering
-  /\ effects[e] = "running"
-  /\ leases[e] = "active"
-  /\ e \notin terminalEffects
+  /\ InstanceRunning
+  /\ effects[e] \in {"failed", "timed_out"}
   /\ effects' = [effects EXCEPT ![e] = "queued"]
-  /\ leases' = [leases EXCEPT ![e] = "expired"]
+  /\ terminalEffects' = terminalEffects \ {e}
   /\ eventLog' = Append(eventLog, ev)
-  /\ UNCHANGED << recoveryLog, runs, runEffect, terminalEffects, projectionCursor,
-                  paused, cancelled >>
+  /\ UNCHANGED << recoveryLog, runs, runEffect, leases, projectionCursor,
+                  paused, cancelled, completed, failed, recovering,
+                  activeVersion, revisionEpoch, effectVersion, cancelRequested,
+                  revisionEvents >>
 
 DeriveProjection ==
   /\ ~recovering
   /\ projectionCursor < Len(eventLog)
   /\ projectionCursor' = projectionCursor + 1
   /\ UNCHANGED << eventLog, recoveryLog, effects, runs, runEffect, leases, terminalEffects,
-                  paused, cancelled, recovering >>
+                  paused, cancelled, completed, failed, recovering,
+                  RevisionVars >>
 
 PauseInstance ==
   /\ ~recovering
+  /\ InstanceRunning
   /\ ~paused
   /\ paused' = TRUE
   /\ UNCHANGED << eventLog, recoveryLog, effects, runs, runEffect, leases, terminalEffects,
-                  projectionCursor, cancelled, recovering >>
+                  projectionCursor, cancelled, completed, failed, recovering,
+                  RevisionVars >>
 
 ResumeInstance ==
   /\ ~recovering
   /\ paused
   /\ ~cancelled
+  /\ ~completed
+  /\ ~failed
   /\ paused' = FALSE
   /\ UNCHANGED << eventLog, recoveryLog, effects, runs, runEffect, leases, terminalEffects,
-                  projectionCursor, cancelled, recovering >>
+                  projectionCursor, cancelled, completed, failed, recovering,
+                  RevisionVars >>
 
 CancelInstance(ev) ==
   /\ ev \in Events
   /\ ~recovering
+  /\ ~completed
+  /\ ~failed
   /\ ~cancelled
   /\ cancelled' = TRUE
   /\ paused' = TRUE
   /\ eventLog' = Append(eventLog, ev)
-  /\ effects' =
-       [e \in Effects |->
-         IF effects[e] \in {"queued", "blocked", "claimed"}
-         THEN "cancelled"
-         ELSE effects[e]]
-  /\ terminalEffects' =
-       terminalEffects \cup {e \in Effects : effects[e] \in {"queued", "blocked", "claimed"}}
-  /\ UNCHANGED << recoveryLog, runs, runEffect, leases, projectionCursor, recovering >>
+  /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
+                  projectionCursor, completed, failed, recovering,
+                  RevisionVars >>
+
+CompleteWorkflow(ev) ==
+  /\ ev \in Events
+  /\ ~recovering
+  /\ InstanceRunning
+  /\ completed' = TRUE
+  /\ eventLog' = Append(eventLog, ev)
+  /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
+                  projectionCursor, paused, cancelled, failed, recovering,
+                  RevisionVars >>
+
+FailWorkflow(ev) ==
+  /\ ev \in Events
+  /\ ~recovering
+  /\ InstanceRunning
+  /\ failed' = TRUE
+  /\ eventLog' = Append(eventLog, ev)
+  /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
+                  projectionCursor, paused, cancelled, completed, recovering,
+                  RevisionVars >>
+
+OldVersionEffect(e) ==
+  effectVersion[e] # activeVersion
+
+ActivateRevision(newVersion, ev) ==
+  /\ newVersion \in Versions
+  /\ ev \in Events
+  /\ ~recovering
+  /\ InstanceRunning
+  /\ newVersion # activeVersion
+  /\ activeVersion' = newVersion
+  /\ revisionEpoch' = revisionEpoch + 1
+  /\ revisionEvents' = Append(revisionEvents, ev)
+  /\ eventLog' = Append(eventLog, ev)
+  /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
+                  projectionCursor, paused, cancelled, completed, failed,
+                  recovering, effectVersion, cancelRequested >>
+
+TerminalCancelQueuedRevisionEffect(e, ev) ==
+  /\ e \in Effects
+  /\ ev \in Events
+  /\ ~recovering
+  /\ InstanceRunning
+  /\ OldVersionEffect(e)
+  /\ effects[e] \in {"queued", "blocked"}
+  /\ e \notin terminalEffects
+  /\ effects' = [effects EXCEPT ![e] = "cancelled"]
+  /\ terminalEffects' = terminalEffects \cup {e}
+  /\ eventLog' = Append(eventLog, ev)
+  /\ UNCHANGED << recoveryLog, runs, runEffect, leases, projectionCursor,
+                  paused, cancelled, completed, failed, recovering,
+                  activeVersion, revisionEpoch, effectVersion, cancelRequested,
+                  revisionEvents >>
+
+RequestCancelEffect(e, ev) ==
+  /\ e \in Effects
+  /\ ev \in Events
+  /\ ~recovering
+  /\ InstanceRunning
+  /\ OldVersionEffect(e)
+  /\ effects[e] \in {"claimed", "running"}
+  /\ e \notin terminalEffects
+  /\ cancelRequested' = cancelRequested \cup {e}
+  /\ eventLog' = Append(eventLog, ev)
+  /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
+                  projectionCursor, paused, cancelled, completed, failed,
+                  recovering, activeVersion, revisionEpoch, effectVersion,
+                  revisionEvents >>
+
+AcknowledgeCancelRun(r, ev) ==
+  /\ r \in Runs
+  /\ ev \in Events
+  /\ ~recovering
+  /\ runs[r] = "running"
+  /\ runEffect[r] \in cancelRequested
+  /\ runEffect[r] \notin terminalEffects
+  /\ effects' = [effects EXCEPT ![runEffect[r]] = "cancelled"]
+  /\ runs' = [runs EXCEPT ![r] = "cancelled"]
+  /\ leases' = [leases EXCEPT ![r] = "released"]
+  /\ terminalEffects' = terminalEffects \cup {runEffect[r]}
+  /\ eventLog' = Append(eventLog, ev)
+  /\ UNCHANGED << recoveryLog, runEffect, projectionCursor, paused, cancelled,
+                  completed, failed, recovering, activeVersion, revisionEpoch,
+                  effectVersion, cancelRequested, revisionEvents >>
+
+IgnoreLateCancelAfterTerminal(e) ==
+  /\ e \in Effects
+  /\ e \in terminalEffects
+  /\ e \in cancelRequested
+  /\ cancelRequested' = cancelRequested \ {e}
+  /\ UNCHANGED << eventLog, recoveryLog, effects, runs, runEffect, leases,
+                  terminalEffects, projectionCursor, paused, cancelled,
+                  completed, failed, recovering, activeVersion, revisionEpoch,
+                  effectVersion, revisionEvents >>
 
 StartRecovery ==
   /\ ~recovering
   /\ recovering' = TRUE
   /\ recoveryLog' = eventLog
   /\ UNCHANGED << eventLog, effects, runs, runEffect, leases, terminalEffects,
-                  projectionCursor, paused, cancelled >>
+                  projectionCursor, paused, cancelled, completed, failed,
+                  RevisionVars >>
 
 FinishRecovery ==
   /\ recovering
@@ -215,7 +404,7 @@ FinishRecovery ==
   /\ projectionCursor' = Len(recoveryLog)
   /\ recovering' = FALSE
   /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
-                  paused, cancelled >>
+                  paused, cancelled, completed, failed, RevisionVars >>
 
 Next ==
   \/ \E ev \in Events : AppendEvent(ev)
@@ -223,11 +412,21 @@ Next ==
   \/ \E r \in Runs : StartRun(r)
   \/ \E r \in Runs, ev \in Events : CompleteRun(r, ev)
   \/ \E r \in Runs, ev \in Events : FailRun(r, ev)
-  \/ \E e \in Effects, ev \in Events : ExpireLease(e, ev)
+  \/ \E r \in Runs, ev \in Events : CancelRun(r, ev)
+  \/ \E r \in Runs, ev \in Events : TimeoutRun(r, ev)
+  \/ \E r \in Runs, ev \in Events : ExpireLease(r, ev)
+  \/ \E e \in Effects, ev \in Events : RetryEffect(e, ev)
   \/ DeriveProjection
   \/ PauseInstance
   \/ ResumeInstance
   \/ \E ev \in Events : CancelInstance(ev)
+  \/ \E ev \in Events : CompleteWorkflow(ev)
+  \/ \E ev \in Events : FailWorkflow(ev)
+  \/ \E newVersion \in Versions, ev \in Events : ActivateRevision(newVersion, ev)
+  \/ \E e \in Effects, ev \in Events : TerminalCancelQueuedRevisionEffect(e, ev)
+  \/ \E e \in Effects, ev \in Events : RequestCancelEffect(e, ev)
+  \/ \E r \in Runs, ev \in Events : AcknowledgeCancelRun(r, ev)
+  \/ \E e \in Effects : IgnoreLateCancelAfterTerminal(e)
   \/ StartRecovery
   \/ FinishRecovery
 
@@ -247,7 +446,10 @@ ProviderTerminalOrRecovered(e) ==
     /\ runEffect[r] = e
     /\ \/ CompleteRun(r, ev)
        \/ FailRun(r, ev)
-       \/ ExpireLease(e, ev)
+       \/ CancelRun(r, ev)
+       \/ TimeoutRun(r, ev)
+       \/ ExpireLease(r, ev)
+       \/ AcknowledgeCancelRun(r, ev)
 
 FairSpec ==
   /\ Spec
@@ -276,9 +478,9 @@ NoClaimableEffectHasUnsatisfiedDeps ==
 NoNewEffectfulWorkWhilePaused ==
   paused => \A e \in Effects : ~Claimable(e)
 
-NoTerminalEffectLeavesTerminalSet ==
-  \A e \in terminalEffects :
-    effects[e] \in {"completed", "failed", "timed_out", "cancelled"}
+TerminalEffectSetMatchesCurrentStatus ==
+  \A e \in Effects :
+    (e \in terminalEffects) <=> effects[e] \in {"completed", "failed", "timed_out", "cancelled"}
 
 ProjectionCursorWithinLog ==
   projectionCursor <= Len(eventLog)
@@ -286,19 +488,46 @@ ProjectionCursorWithinLog ==
 RecoveryDoesNotReorderEventLog ==
   recovering => eventLog = recoveryLog
 
+NoActiveLeaseWithoutRunningRun ==
+  \A r \in Runs :
+    leases[r] = "active" => /\ runs[r] = "running"
+                             /\ effects[runEffect[r]] = "running"
+
+NoRunningRunWithoutActiveLease ==
+  \A r \in Runs :
+    runs[r] = "running" => /\ leases[r] = "active"
+                            /\ effects[runEffect[r]] = "running"
+
+NoTerminalRunHasActiveLease ==
+  \A r \in Runs :
+    runs[r] \in {"completed", "failed", "timed_out", "cancelled", "lease_expired"}
+      => leases[r] # "active"
+
+NoReleasedLeaseWithoutTerminalRun ==
+  \A r \in Runs :
+    leases[r] = "released" => runs[r] \in {"completed", "failed", "timed_out", "cancelled"}
+
+ActiveLeaseForEffect(e) ==
+  \E r \in Runs :
+    /\ runEffect[r] = e
+    /\ runs[r] = "running"
+    /\ leases[r] = "active"
+
 EffectTerminalOrNotRunning(e) ==
   \/ effects[e] \in {"blocked", "claimed"}
   \/ e \in terminalEffects
   \/ paused
   \/ cancelled
+  \/ completed
+  \/ failed
   \/ recovering
 
 ClaimableEffectEventuallyRunsOrStops(e) ==
   [](Claimable(e) => <>(effects[e] = "running" \/ EffectTerminalOrNotRunning(e)))
 
 RunningEffectEventuallyTerminalsOrRecovers(e) ==
-  [](effects[e] = "running" /\ leases[e] = "active" =>
-      <>(e \in terminalEffects \/ effects[e] = "queued" \/ cancelled \/ recovering))
+  [](effects[e] = "running" /\ ActiveLeaseForEffect(e) =>
+      <>(e \in terminalEffects \/ effects[e] = "queued" \/ cancelled \/ completed \/ failed \/ recovering))
 
 ProjectionEventuallyCatchesUp ==
   [](~recovering /\ projectionCursor < Len(eventLog) =>
@@ -313,17 +542,72 @@ LivenessGoals ==
   /\ ProjectionEventuallyCatchesUp
   /\ RecoveryEventuallyFinishes
 
+EventSeqOk(seq) ==
+  \A i \in 1..Len(seq) : seq[i] \in Events
+
 TypeOk ==
-  /\ eventLog \in Seq(Events)
-  /\ recoveryLog \in Seq(Events)
+  /\ EventSeqOk(eventLog)
+  /\ EventSeqOk(recoveryLog)
+  /\ EventSeqOk(revisionEvents)
   /\ effects \in [Effects -> EffectStatuses]
   /\ runs \in [Runs -> RunStatuses]
   /\ runEffect \in [Runs -> Effects]
-  /\ leases \in [Effects -> LeaseStatuses]
+  /\ leases \in [Runs -> LeaseStatuses]
   /\ terminalEffects \subseteq Effects
   /\ projectionCursor \in Nat
   /\ paused \in BOOLEAN
   /\ cancelled \in BOOLEAN
+  /\ completed \in BOOLEAN
+  /\ failed \in BOOLEAN
   /\ recovering \in BOOLEAN
+  /\ activeVersion \in Versions
+  /\ revisionEpoch \in Nat
+  /\ effectVersion \in [Effects -> Versions]
+  /\ cancelRequested \subseteq Effects
+
+RevisionEpochMatchesEvents ==
+  revisionEpoch = Len(revisionEvents)
+
+CancelRequestIsNotTerminalByItself ==
+  \A e \in cancelRequested :
+    effects[e] = "cancelled" => e \in terminalEffects
+
+NoConflictingInstanceTerminalStates ==
+  /\ ~(cancelled /\ completed)
+  /\ ~(cancelled /\ failed)
+  /\ ~(completed /\ failed)
+
+NoNewEffectfulWorkAfterTerminalInstance ==
+  (cancelled \/ completed \/ failed) => \A e \in Effects : ~Claimable(e)
+
+ConstInit ==
+  /\ Effects = {"effectA", "effectB"}
+  /\ Runs = {"runA", "runB"}
+  /\ Events = {"eventA", "eventB"}
+  /\ Versions = {"version1", "version2"}
+  /\ Dependencies = {
+       <<"effectA", "succeeds", "effectB">>,
+       <<"effectA", "fails", "effectB">>,
+       <<"effectA", "completes", "effectB">>
+     }
+
+SafetyInvariants ==
+  /\ TypeOk
+  /\ EveryRunReferencesEffect
+  /\ NoRunWithoutRunningEffect
+  /\ NoClaimedRunWithoutClaimedEffect
+  /\ NoClaimableEffectHasUnsatisfiedDeps
+  /\ NoNewEffectfulWorkWhilePaused
+  /\ NoNewEffectfulWorkAfterTerminalInstance
+  /\ NoConflictingInstanceTerminalStates
+  /\ TerminalEffectSetMatchesCurrentStatus
+  /\ ProjectionCursorWithinLog
+  /\ RecoveryDoesNotReorderEventLog
+  /\ RevisionEpochMatchesEvents
+  /\ CancelRequestIsNotTerminalByItself
+  /\ NoActiveLeaseWithoutRunningRun
+  /\ NoRunningRunWithoutActiveLease
+  /\ NoTerminalRunHasActiveLease
+  /\ NoReleasedLeaseWithoutTerminalRun
 
 ====

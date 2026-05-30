@@ -1,6 +1,8 @@
-mod WHIPPLETREE-KERNEL is
+mod WHIPPLESCRIPT-KERNEL is
   sorts
     EffectId FactId RunId EventId RuleId GraphId
+    WorkflowId InstanceId PatternId ApplicationId OutputId FailureId InstanceStatus
+    ProgramVersion RevisionEpoch CancellationPolicy
     Predicate EffectStatus ProjectionStatus LeaseStatus GuardResult
     AssertionId AssertionResult AgentTarget Path Presence Value Domain
     Scalar QueryId QueryCardinality Expr ExprList Entry EntryList TerminalTag Cfg .
@@ -13,8 +15,19 @@ mod WHIPPLETREE-KERNEL is
   ops run1 : -> RunId .
   ops event1 initEvt turnCompletedEvt coerceCompletedEvt coerceFailedEvt : -> EventId .
   ops ruleCommitEvt leaseExpiredEvt : -> EventId .
+  ops workflowCompletedEvt workflowFailedEvt : -> EventId .
+  op revisionActivatedEvt : -> EventId .
   ops ralphRule coerceRule : -> RuleId .
   ops guardedRule agentRule : -> RuleId .
+  ops rootWorkflow reviewWorkflow : -> WorkflowId .
+  ops version1 version2 : -> ProgramVersion .
+  ops epoch0 epoch1 epoch2 : -> RevisionEpoch .
+  ops keep cancelQueued requestRunning : -> CancellationPolicy .
+  ops rootInstance childInstance : -> InstanceId .
+  op reviewPattern : -> PatternId .
+  op phaseReviewApplication : -> ApplicationId .
+  ops reviewOutput reviewFailure : -> OutputId .
+  op blockedFailure : -> FailureId .
   ops g1 g2 g3 : -> GraphId .
   ops assertion1 : -> AssertionId .
   ops codexAgent claudeAgent piAgent missingAgent : -> AgentTarget .
@@ -41,6 +54,7 @@ mod WHIPPLETREE-KERNEL is
   --- Projection and lease states.
   ops pending projected : -> ProjectionStatus .
   ops leaseActive leaseExpired : -> LeaseStatus .
+  ops instRunning instCompleted instFailed instCancelled : -> InstanceStatus .
 
   --- Dependency predicates. These correspond to source-level
   --- `after effect succeeds|fails|completes` edges.
@@ -61,14 +75,26 @@ mod WHIPPLETREE-KERNEL is
 
   --- Kernel projections.
   op effect : EffectId EffectStatus -> Cfg .
+  op instance : InstanceId WorkflowId InstanceStatus -> Cfg .
+  op activeRevision : InstanceId ProgramVersion RevisionEpoch -> Cfg .
+  op nextEpoch : RevisionEpoch RevisionEpoch -> Cfg .
+  op activateRevision : InstanceId ProgramVersion ProgramVersion RevisionEpoch RevisionEpoch CancellationPolicy -> Cfg .
+  op revisionActivated : InstanceId ProgramVersion ProgramVersion RevisionEpoch CancellationPolicy -> Cfg .
+  op revisionCancellationPolicy : InstanceId ProgramVersion RevisionEpoch CancellationPolicy -> Cfg .
   op dep : EffectId Predicate EffectId -> Cfg .
   op fact : FactId -> Cfg .
   op event : EventId -> Cfg .
   op run : RunId EffectId -> Cfg .
+  op providerRun : EffectId -> Cfg .
+  op effectVersion : EffectId ProgramVersion RevisionEpoch -> Cfg .
+  op requestable : EffectId -> Cfg .
+  op cancellationRequested : EffectId -> Cfg .
   op correlates : EffectId FactId -> Cfg .
   op projection : EventId FactId ProjectionStatus -> Cfg .
   op completionProjection : EffectId EffectStatus FactId ProjectionStatus -> Cfg .
   op rule : RuleId FactId GraphId -> Cfg .
+  op scopedRule : InstanceId RuleId FactId GraphId -> Cfg .
+  op scopedRuleV : InstanceId ProgramVersion RevisionEpoch RuleId FactId GraphId -> Cfg .
   op guard : RuleId FactId GuardResult -> Cfg .
   op domainGuard : RuleId FactId Value Domain -> Cfg .
   op domainMember : Value Domain -> Cfg .
@@ -80,7 +106,9 @@ mod WHIPPLETREE-KERNEL is
   op boundPresent : Path -> Cfg .
   op ruleReady : RuleId FactId GraphId -> Cfg .
   op ruleFired : RuleId FactId GraphId -> Cfg .
+  op scopedRuleFired : InstanceId RuleId FactId GraphId -> Cfg .
   op graph : GraphId EffectId -> Cfg .
+  op graphV : GraphId ProgramVersion RevisionEpoch EffectId -> Cfg .
   op graph2 : GraphId EffectId Predicate EffectId -> Cfg .
   op graphAgent : GraphId EffectId AgentTarget -> Cfg .
   op graphReady : GraphId -> Cfg .
@@ -141,9 +169,31 @@ mod WHIPPLETREE-KERNEL is
   op lease : EffectId LeaseStatus -> Cfg .
   op retryAllowed : EffectId -> Cfg .
   op retryUsed : EffectId -> Cfg .
+  op patternApp : PatternId ApplicationId RuleId FactId GraphId -> Cfg .
+  op patternElaborated : PatternId ApplicationId RuleId FactId GraphId -> Cfg .
+  op ruleProvenance : RuleId PatternId ApplicationId -> Cfg .
+  op workflowOutput : WorkflowId OutputId -> Cfg .
+  op workflowFailure : WorkflowId FailureId -> Cfg .
+  op completeWorkflow : InstanceId OutputId FactId -> Cfg .
+  op failWorkflow : InstanceId FailureId FactId -> Cfg .
+  op terminalPayload : InstanceId FactId -> Cfg .
+  op invokeWorkflow : EffectId InstanceId WorkflowId InstanceId -> Cfg .
+  op childOf : InstanceId EffectId -> Cfg .
+  op invocationOutput : EffectId FactId -> Cfg .
+  op invocationFailure : EffectId FactId -> Cfg .
+  op invocationCancellation : EffectId -> Cfg .
 
   vars U D E : EffectId .
   vars F : FactId .
+  vars I CI : InstanceId .
+  vars W : WorkflowId .
+  vars PV PV2 : ProgramVersion .
+  vars Ep Ep2 : RevisionEpoch .
+  vars CP : CancellationPolicy .
+  vars Pat : PatternId .
+  vars App : ApplicationId .
+  vars O : OutputId .
+  vars Fail : FailureId .
   vars Ev : EventId .
   vars R : RuleId .
   vars G : GraphId .
@@ -162,6 +212,7 @@ mod WHIPPLETREE-KERNEL is
   vars EN EN2 EN3 : Entry .
   var KL : EntryList .
   vars Tag Tag2 : TerminalTag .
+  vars Rest Rest2 : Cfg .
 
   --- Deterministic expression-kernel subset used by generated per-program
   --- checks. Generated models lower guards/assertions into these terms instead
@@ -499,6 +550,13 @@ mod WHIPPLETREE-KERNEL is
     effect(E, S) completionProjection(E, S, F, pending)
     => effect(E, S) completionProjection(E, S, F, projected) fact(F) .
 
+  --- Pattern applications are compile-time source elaboration. The runtime
+  --- kernel only sees the generated first-order rule plus provenance; no
+  --- instance, event, or effect is created by applying a pattern.
+  rl [elaborate-pattern] :
+    patternApp(Pat, App, R, F, G)
+    => patternElaborated(Pat, App, R, F, G) rule(R, F, G) ruleProvenance(R, Pat, App) .
+
   --- Rules are one-shot rewrites over facts. The graph is committed later by
   --- the kernel; provider execution never happens during rule firing.
   rl [guard-true-ready] :
@@ -572,6 +630,39 @@ mod WHIPPLETREE-KERNEL is
     fact(F) rule(R, F, G) ruleReady(R, F, G)
     => fact(F) rule(R, F, G) ruleFired(R, F, G) graphReady(G) event(ruleCommitEvt) .
 
+  --- Instance-scoped rules can fire only while their workflow instance is
+  --- running. Terminal workflow instances do not commit additional effectful
+  --- rewrites.
+  rl [fire-scoped-rule] :
+    instance(I, W, instRunning) fact(F) scopedRule(I, R, F, G) ruleReady(R, F, G)
+    => instance(I, W, instRunning) fact(F) scopedRule(I, R, F, G)
+       scopedRuleFired(I, R, F, G) graphReady(G) event(ruleCommitEvt) .
+
+  --- Version-scoped rules can fire only when the instance is still on the
+  --- active program version and revision epoch used during rule evaluation.
+  --- After a revision activates, stale old-version rules have no matching
+  --- activeRevision term and therefore cannot create new effects.
+  rl [fire-versioned-scoped-rule] :
+    instance(I, W, instRunning) activeRevision(I, PV, Ep)
+    fact(F) scopedRuleV(I, PV, Ep, R, F, G) ruleReady(R, F, G)
+    => instance(I, W, instRunning) activeRevision(I, PV, Ep)
+       fact(F) scopedRuleV(I, PV, Ep, R, F, G)
+       scopedRuleFired(I, R, F, G) graphReady(G) event(ruleCommitEvt) .
+
+  --- Workflow completion is explicit and terminal. A `complete` or `fail`
+  --- action must name a declared output/failure contract for the current
+  --- workflow. The terminal payload is projected for parent invocation
+  --- resolution without exposing child-local facts.
+  rl [complete-workflow] :
+    instance(I, W, instRunning) workflowOutput(W, O) completeWorkflow(I, O, F) fact(F)
+    => instance(I, W, instCompleted) workflowOutput(W, O) terminalPayload(I, F)
+       fact(F) event(workflowCompletedEvt) .
+
+  rl [fail-workflow] :
+    instance(I, W, instRunning) workflowFailure(W, Fail) failWorkflow(I, Fail, F) fact(F)
+    => instance(I, W, instFailed) workflowFailure(W, Fail) terminalPayload(I, F)
+       fact(F) event(workflowFailedEvt) .
+
   --- Assertions are read-only checks over projected state.
   rl [assertion-fail-diagnostic] :
     assertion(A, aFail)
@@ -605,6 +696,10 @@ mod WHIPPLETREE-KERNEL is
     graph(G, U) graphReady(G)
     => graphCommitted(G) effect(U, queued) .
 
+  rl [commit-versioned-effect-graph] :
+    graphV(G, PV, Ep, U) graphReady(G)
+    => graphCommitted(G) effect(U, queued) effectVersion(U, PV, Ep) .
+
   rl [commit-dependent-effect-graph] :
     graph2(G, U, P, D) graphReady(G)
     => graphCommitted(G) effect(U, queued) dep(U, P, D) effect(D, blocked) .
@@ -613,19 +708,94 @@ mod WHIPPLETREE-KERNEL is
     graphAgent(G, U, T) graphReady(G) declaredAgent(T)
     => graphCommitted(G) effect(U, queued) tellTarget(U, T) declaredAgent(T) .
 
+  --- Invoking a workflow is runtime composition. It creates a child instance
+  --- behind an invocation effect; it does not inline the child rules into the
+  --- parent. The invocation effect resolves only when the child reaches an
+  --- explicit terminal workflow event.
+  rl [start-workflow-invocation] :
+    effect(E, running) invokeWorkflow(E, I, W, CI)
+    => effect(E, running) instance(CI, W, instRunning) childOf(CI, E) .
+
+  rl [complete-workflow-invocation] :
+    effect(E, running) childOf(CI, E) instance(CI, W, instCompleted) terminalPayload(CI, F)
+    => effect(E, completed) childOf(CI, E) instance(CI, W, instCompleted)
+       terminalPayload(CI, F) invocationOutput(E, F) .
+
+  rl [fail-workflow-invocation] :
+    effect(E, running) childOf(CI, E) instance(CI, W, instFailed) terminalPayload(CI, F)
+    => effect(E, failed) childOf(CI, E) instance(CI, W, instFailed)
+       terminalPayload(CI, F) invocationFailure(E, F) .
+
+  rl [cancel-workflow-invocation] :
+    effect(E, running) childOf(CI, E) instance(CI, W, instCancelled)
+    => effect(E, cancelled) childOf(CI, E) instance(CI, W, instCancelled)
+       invocationCancellation(E) .
+
   --- A queued effect can be claimed and then started by an external worker.
   rl [claim-effect] : effect(E, queued) => effect(E, claimed) .
   rl [start-run] : effect(E, claimed) => effect(E, running) .
 
-  --- Terminal outcomes are recorded by the kernel from worker completion events.
-  rl [complete-run] : effect(E, running) => effect(E, completed) .
-  rl [fail-run] : effect(E, running) => effect(E, failed) .
-  rl [timeout-run] : effect(E, running) => effect(E, timedOut) .
+  --- Terminal provider outcomes are recorded by the kernel from worker
+  --- completion events. Invocation effects do not receive providerRun markers;
+  --- they resolve only from child workflow terminal state above.
+  rl [complete-run] : effect(E, running) providerRun(E) => effect(E, completed) providerRun(E) .
+  rl [fail-run] : effect(E, running) providerRun(E) => effect(E, failed) providerRun(E) .
+  rl [timeout-run] : effect(E, running) providerRun(E) => effect(E, timedOut) providerRun(E) .
 
   --- Cancellation is available before an effect starts running.
   rl [cancel-queued] : effect(E, queued) => effect(E, cancelled) .
   rl [cancel-blocked] : effect(E, blocked) => effect(E, cancelled) .
   rl [cancel-claimed] : effect(E, claimed) => effect(E, cancelled) .
+
+  --- Revision activation is an explicit control-plane transition, not a source
+  --- rule. It advances the active revision for a running instance and records
+  --- the policy that will later be applied to old-version effects.
+  rl [activate-revision] :
+    instance(I, W, instRunning) activeRevision(I, PV, Ep)
+    nextEpoch(Ep, Ep2) activateRevision(I, PV, PV2, Ep, Ep2, CP)
+    => instance(I, W, instRunning) activeRevision(I, PV2, Ep2)
+       nextEpoch(Ep, Ep2)
+       revisionActivated(I, PV, PV2, Ep2, CP)
+       revisionCancellationPolicy(I, PV, Ep, CP)
+       event(revisionActivatedEvt) .
+
+  rl [revision-cancel-queued] :
+    effect(E, queued) effectVersion(E, PV, Ep)
+    revisionCancellationPolicy(I, PV, Ep, cancelQueued)
+    => effect(E, cancelled) effectVersion(E, PV, Ep)
+       revisionCancellationPolicy(I, PV, Ep, cancelQueued) .
+
+  rl [revision-cancel-blocked] :
+    effect(E, blocked) effectVersion(E, PV, Ep)
+    revisionCancellationPolicy(I, PV, Ep, cancelQueued)
+    => effect(E, cancelled) effectVersion(E, PV, Ep)
+       revisionCancellationPolicy(I, PV, Ep, cancelQueued) .
+
+  rl [revision-request-cancel-queued] :
+    effect(E, queued) effectVersion(E, PV, Ep)
+    revisionCancellationPolicy(I, PV, Ep, requestRunning)
+    => effect(E, cancelled) effectVersion(E, PV, Ep)
+       revisionCancellationPolicy(I, PV, Ep, requestRunning) .
+
+  rl [revision-request-cancel-blocked] :
+    effect(E, blocked) effectVersion(E, PV, Ep)
+    revisionCancellationPolicy(I, PV, Ep, requestRunning)
+    => effect(E, cancelled) effectVersion(E, PV, Ep)
+       revisionCancellationPolicy(I, PV, Ep, requestRunning) .
+
+  rl [revision-request-cancel-claimed] :
+    effect(E, claimed) effectVersion(E, PV, Ep) requestable(E)
+    revisionCancellationPolicy(I, PV, Ep, requestRunning)
+    => effect(E, claimed) effectVersion(E, PV, Ep)
+       revisionCancellationPolicy(I, PV, Ep, requestRunning)
+       cancellationRequested(E) .
+
+  rl [revision-request-cancel-running] :
+    effect(E, running) effectVersion(E, PV, Ep) requestable(E)
+    revisionCancellationPolicy(I, PV, Ep, requestRunning)
+    => effect(E, running) effectVersion(E, PV, Ep)
+       revisionCancellationPolicy(I, PV, Ep, requestRunning)
+       cancellationRequested(E) .
 
   --- Policy and capacity are modeled separately from dependency blocking so
   --- status and diagnostics can explain why work did not start.

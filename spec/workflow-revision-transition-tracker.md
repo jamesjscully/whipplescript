@@ -26,7 +26,7 @@ without changing the source-level meaning of `pattern`, `apply`, `workflow`,
 | Area | Status | Notes |
 | --- | --- | --- |
 | Conceptual spec | [x] | Stage 0 landed revision epochs, activation policy, cancellation policy, compatibility rules, store objects, transaction boundaries, and observability requirements in the core specs. |
-| Formal model | [ ] | Maude and TLA+ both need explicit revision/cancel-request behavior before implementation. |
+| Formal model | [x] | Stage 1 added Maude revision searches and TLA+ revision/cancel-request actions and invariants; the bounded formal suite passes. |
 | Store/runtime implementation | [ ] | Runtime still needs `instance_revisions`, active-epoch caching, and per-effect version attribution. |
 | CLI/control plane | [ ] | No `whip revise` or dry-run compatibility surface exists yet. |
 | Generated checks | [ ] | Per-program checks do not yet assert active-version rule firing or old-effect attribution. |
@@ -145,57 +145,78 @@ Goal: prove the revision/cancellation lifecycle before changing the runtime.
 
 ### Maude
 
-- [ ] Add revision terms to `models/maude/kernel.maude`:
-  - [ ] active revision/version for an instance
-  - [ ] rule/effect version attribution
-  - [ ] revision activation command
-  - [ ] cancellation request marker
-- [ ] Add `models/maude/tests/workflow-revision.maude`.
-- [ ] Add positive Maude searches:
-  - [ ] activating a revision advances the active epoch
-  - [ ] a new-version scoped rule can fire after activation
-  - [ ] old queued effects keep attribution and may cancel under policy
-  - [ ] running effects can move to cancel-requested and later terminal
-- [ ] Add negative Maude searches:
-  - [ ] terminal instances cannot revise
-  - [ ] old-version scoped rules cannot fire after activation
-  - [ ] revision activation does not mutate old effect attribution
-  - [ ] running effects do not become cancelled solely because cancellation was
+- [x] Add revision terms to `models/maude/kernel.maude`:
+  - [x] active revision/version for an instance
+  - [x] rule/effect version attribution
+  - [x] revision activation command
+  - [x] cancellation request marker
+- [x] Add `models/maude/tests/workflow-revision.maude`.
+- [x] Add positive Maude searches:
+  - [x] activating a revision advances the active epoch
+  - [x] a new-version scoped rule can fire after activation
+  - [x] old queued effects keep attribution and may cancel under policy
+  - [x] running effects can move to cancel-requested and later terminal
+- [x] Add negative Maude searches:
+  - [x] terminal instances cannot revise
+  - [x] old-version scoped rules cannot fire after activation
+  - [x] revision activation does not mutate old effect attribution
+  - [x] running effects do not become cancelled solely because cancellation was
     requested
-  - [ ] invocation effects cannot complete from parent revision alone
-- [ ] Update `scripts/check-formal-models.sh` expected solution counts.
+  - [x] invocation effects cannot complete from parent revision alone
+- [x] Update `scripts/check-formal-models.sh` expected solution counts.
 
 ### TLA+/Apalache
 
-- [ ] Extend `models/tla/ControlPlaneLifecycle.tla` with:
-  - [ ] `activeVersion`
-  - [ ] `revisionEpoch`
-  - [ ] `effectVersion`
-  - [ ] `cancelRequested`
-  - [ ] revision activation events
-- [ ] Add actions:
-  - [ ] `ActivateRevision`
-  - [ ] `RequestCancelEffect`
-  - [ ] `AcknowledgeCancelRun`
-  - [ ] `IgnoreLateCancelAfterTerminal`
-- [ ] Add safety invariants:
-  - [ ] revision epochs are monotonic
-  - [ ] a terminal instance has no revision activation
-  - [ ] claim/start use effects valid for their original version
-  - [ ] no effect has more than one terminal outcome across revision/recovery
-  - [ ] active revision is preserved by recovery
-  - [ ] cancel request is not equivalent to terminal cancellation
-- [ ] Add bounded Apalache checks for keep, queued-cancel, and request-running
+- [x] Extend `models/tla/ControlPlaneLifecycle.tla` with:
+  - [x] `activeVersion`
+  - [x] `revisionEpoch`
+  - [x] `effectVersion`
+  - [x] `cancelRequested`
+  - [x] revision activation events
+- [x] Add actions:
+  - [x] `ActivateRevision`
+  - [x] `RequestCancelEffect`
+  - [x] `AcknowledgeCancelRun`
+  - [x] `IgnoreLateCancelAfterTerminal`
+- [x] Add safety invariants:
+  - [x] revision epochs are monotonic
+  - [x] a terminal instance has no revision activation
+  - [x] claim/start use effects valid for their original version
+  - [x] no effect has more than one terminal outcome across revision/recovery
+  - [x] active revision is preserved by recovery
+  - [x] cancel request is not equivalent to terminal cancellation
+- [x] Add bounded Apalache checks for keep, queued-cancel, and request-running
   policies.
-- [ ] Audit Stage 1 against the new semantics, failed-search coverage, TLA+
+- [x] Audit Stage 1 against the new semantics, failed-search coverage, TLA+
   invariants, and CI scripts; record model gaps before runtime coding starts.
 
 Acceptance:
 
-- [ ] `scripts/check-formal-models.sh` covers workflow revision.
-- [ ] TLA+ safety checks pass with revision enabled.
-- [ ] At least one intentionally unsafe revision behavior is caught by each
+- [x] `scripts/check-formal-models.sh` covers workflow revision.
+- [x] TLA+ safety checks pass with revision enabled.
+- [x] At least one intentionally unsafe revision behavior is caught by each
   model family.
+
+Stage 1 audit notes:
+
+- [models/maude/kernel.maude](../models/maude/kernel.maude) now models active
+  revision epochs, version-scoped rule firing, versioned effect attribution,
+  explicit revision activation, and cancel-request markers.
+- [models/maude/tests/workflow-revision.maude](../models/maude/tests/workflow-revision.maude)
+  covers 4 positive searches and 5 negative searches, including stale-rule
+  rejection and cancel-request-not-terminal behavior.
+- [models/tla/ControlPlaneLifecycle.tla](../models/tla/ControlPlaneLifecycle.tla)
+  now tracks active version, revision epoch, per-effect version, cancellation
+  requests, revision events, terminal instance states, and lease/run consistency.
+- TLA+ caught one unsafe revision behavior during modeling: a requested-cancel
+  running effect could expire its lease back to queued and become claimable
+  again. `Claimable` now rejects cancel-requested effects, and the invariant was
+  narrowed to assert that a cancel request is not a fake terminal cancellation.
+- The bounded TLA+ model covers `keep`, queued cancellation, and
+  request-running behavior as separate transition modes in one model rather than
+  as separate policy-specific constants.
+- `scripts/check-formal-models.sh` now runs the revision Maude test and the
+  TLA+ lifecycle check.
 
 ## Stage 2: Store Schema And Kernel Contracts
 

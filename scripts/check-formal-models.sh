@@ -12,18 +12,22 @@ declare -A EXPECTED_NO_SOLUTION=(
   ["coerce-branches.maude"]=1
   ["loft-claim-turn.maude"]=2
   ["effect-dependencies.maude"]=2
-  ["expression-kernel.maude"]=9
+  ["expression-kernel.maude"]=15
   ["policy-capacity-retry.maude"]=2
   ["ralph-loop.maude"]=1
+  ["workflow-composition.maude"]=5
+  ["workflow-revision.maude"]=5
 )
 
 declare -A EXPECTED_SOLUTION=(
   ["coerce-branches.maude"]=3
   ["loft-claim-turn.maude"]=2
   ["effect-dependencies.maude"]=4
-  ["expression-kernel.maude"]=9
+  ["expression-kernel.maude"]=16
   ["policy-capacity-retry.maude"]=4
   ["ralph-loop.maude"]=2
+  ["workflow-composition.maude"]=7
+  ["workflow-revision.maude"]=4
 )
 
 for test_file in "$ROOT"/models/maude/tests/*.maude; do
@@ -45,3 +49,6 @@ for test_file in "$ROOT"/models/maude/tests/*.maude; do
     exit 1
   fi
 done
+
+echo "== tla models/tla/ControlPlaneLifecycle.tla"
+"$ROOT/scripts/check-tla-models.sh"
