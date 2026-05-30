@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use trace::{DependencyEdge, EffectStatus, TraceEvent, TraceRecord};
 use whipplescript_parser::{
     DependencyPredicate, IrEffectKind, IrPrimitiveType, IrProgram, IrSchema, IrType,
-    IrWorkflowContractKind,
+    IrWorkflowContractKind, SourceSpan,
 };
 use whipplescript_store::{
     ArtifactRecord, ClaimableEffect, DerivedFact, EffectCancellation, EffectCompletion,
@@ -1253,6 +1253,7 @@ pub fn program_analysis_summary_json(program: &IrProgram) -> String {
                 "kind": workflow_contract_kind_name(&contract.kind),
                 "name": contract.name,
                 "type": ir_type_signature(&contract.ty),
+                "source_span": source_span_summary(contract.span, "workflow_contract"),
             })
         })
         .collect::<Vec<_>>();
@@ -1301,7 +1302,7 @@ pub fn program_analysis_summary_json(program: &IrProgram) -> String {
     let schemas = program
         .schemas
         .iter()
-        .map(schema_summary)
+        .map(|schema| schema_summary(schema, true))
         .collect::<Vec<_>>();
 
     json!({
@@ -1324,25 +1325,51 @@ fn workflow_contract_kind_name(kind: &IrWorkflowContractKind) -> &'static str {
     }
 }
 
-fn schema_summary(schema: &IrSchema) -> Value {
+fn source_span_summary(span: SourceSpan, construct: &str) -> Value {
+    json!({
+        "start": span.start,
+        "end": span.end,
+        "construct": construct,
+    })
+}
+
+fn schema_summary(schema: &IrSchema, include_source_spans: bool) -> Value {
     match schema {
-        IrSchema::Class(class) => json!({
+        IrSchema::Class(class) => {
+            let mut value = json!({
             "kind": "class",
             "name": class.name,
             "fields": class
                 .fields
                 .iter()
-                .map(|field| json!({
-                    "name": field.name,
-                    "type": ir_type_signature(&field.ty),
-                }))
+                .map(|field| {
+                    let mut value = json!({
+                        "name": field.name,
+                        "type": ir_type_signature(&field.ty),
+                    });
+                    if include_source_spans {
+                        value["source_span"] = source_span_summary(field.span, "class_field");
+                    }
+                    value
+                })
                 .collect::<Vec<_>>(),
-        }),
-        IrSchema::Enum(enum_decl) => json!({
+            });
+            if include_source_spans {
+                value["source_span"] = source_span_summary(class.span, "class");
+            }
+            value
+        }
+        IrSchema::Enum(enum_decl) => {
+            let mut value = json!({
             "kind": "enum",
             "name": enum_decl.name,
             "variants": enum_decl.variants,
-        }),
+            });
+            if include_source_spans {
+                value["source_span"] = source_span_summary(enum_decl.span, "enum");
+            }
+            value
+        }
     }
 }
 
@@ -1399,7 +1426,7 @@ fn generated_declaration_payload(program: &IrProgram, declaration: &str) -> Opti
             _ => None,
         }),
         "class" => program.schemas.iter().find_map(|schema| match schema {
-            IrSchema::Class(class) if class.name == name => Some(schema_summary(schema)),
+            IrSchema::Class(class) if class.name == name => Some(schema_summary(schema, false)),
             _ => None,
         }),
         "coerce" => program
@@ -1867,6 +1894,18 @@ workflow Root {
 
         let summary = serde_json::from_str::<Value>(&program_analysis_summary_json(&program))
             .expect("analysis summary is valid JSON");
+        assert!(summary
+            .get("schemas")
+            .and_then(Value::as_array)
+            .expect("schemas")
+            .iter()
+            .any(|schema| {
+                schema.get("name").and_then(Value::as_str) == Some("Task")
+                    && schema
+                        .pointer("/source_span/construct")
+                        .and_then(Value::as_str)
+                        == Some("class")
+            }));
         let hashes = summary
             .get("generated_declaration_hashes")
             .and_then(Value::as_array)

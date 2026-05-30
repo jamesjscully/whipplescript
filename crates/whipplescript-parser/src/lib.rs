@@ -308,6 +308,7 @@ pub struct IrWorkflowContract {
     pub kind: IrWorkflowContractKind,
     pub name: String,
     pub ty: IrType,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -367,18 +368,21 @@ pub enum IrSchema {
 pub struct IrEnum {
     pub name: String,
     pub variants: Vec<String>,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrClass {
     pub name: String,
     pub fields: Vec<IrClassField>,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrClassField {
     pub name: String,
     pub ty: IrType,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2359,6 +2363,7 @@ fn lower_workflow_contract(
         kind,
         name: contract.name.name,
         ty: lower_type(contract.ty),
+        span: contract.span,
     });
 }
 
@@ -2485,6 +2490,7 @@ fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Dia
             .into_iter()
             .map(|variant| variant.name)
             .collect(),
+        span: enum_decl.span,
     }));
 }
 
@@ -2514,12 +2520,14 @@ fn lower_class(
 
     ir.schemas.push(IrSchema::Class(IrClass {
         name: class_decl.name.name,
+        span: class_decl.span,
         fields: class_decl
             .fields
             .into_iter()
             .map(|field| IrClassField {
                 name: field.name.name,
                 ty: lower_type(field.ty),
+                span: field.span,
             })
             .collect(),
     }));
@@ -3641,6 +3649,7 @@ fn ir_field(name: &str, ty: IrType) -> IrClassField {
     IrClassField {
         name: name.to_owned(),
         ty,
+        span: SourceSpan { start: 0, end: 0 },
     }
 }
 

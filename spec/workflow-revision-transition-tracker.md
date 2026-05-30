@@ -348,11 +348,14 @@ Stage 3 partial audit notes:
   rejection after activation, old-effect attribution preservation, and
   `after ... completes` release after revision cancellation. The generated
   fixture runs through Maude as part of CLI unit coverage.
+- Compatibility diagnostics for changed/added/removed workflow contracts and
+  active fact schema breaks now carry source-span metadata from the lowered
+  program analysis summary.
 
 Acceptance:
 
 - [x] Compatible additive revisions pass dry-run.
-- [ ] Breaking contract/schema revisions fail with source-span diagnostics.
+- [x] Breaking contract/schema revisions fail with source-span diagnostics.
 - [x] Generated checks cover at least one revision-aware compiled fixture.
 
 ## Stage 4: Control Plane And CLI

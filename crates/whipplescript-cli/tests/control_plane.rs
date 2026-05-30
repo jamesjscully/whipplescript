@@ -1410,6 +1410,136 @@ rule noop
 }
 
 #[test]
+fn revise_dry_run_reports_contract_and_schema_source_spans() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("revise-span-v1");
+    let v2 = temp_workflow_path("revise-span-v2");
+    fs::write(
+        &v1,
+        r#"
+workflow RevisionSpan {
+  output done Result
+
+  class Result {
+    title string
+  }
+
+  class WorkItem {
+    title string
+  }
+
+  rule seed
+    when started
+  => {
+    record WorkItem {
+      title "task"
+    }
+  }
+}
+"#,
+    )
+    .expect("write v1 workflow");
+    let v2_source = r#"
+workflow RevisionSpan {
+  output done ChangedResult
+
+  class ChangedResult {
+    title string
+  }
+
+  class WorkItem {
+    title int
+    status string
+  }
+}
+"#;
+    fs::write(&v2, v2_source).expect("write v2 workflow");
+
+    let started = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "run",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let stepped = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "step",
+            instance_id,
+            "--program",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+    assert_eq!(
+        stepped.get("facts_created").and_then(Value::as_u64),
+        Some(1)
+    );
+
+    let report = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "revise",
+            instance_id,
+            v2.to_str().expect("utf-8 workflow path"),
+            "--dry-run",
+            "--json",
+        ],
+    );
+    let diagnostics = report
+        .pointer("/compatibility/diagnostics")
+        .and_then(Value::as_array)
+        .expect("diagnostics");
+    let contract = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.get("code").and_then(Value::as_str) == Some("revision.contract_changed")
+        })
+        .expect("contract diagnostic");
+    assert_eq!(
+        contract
+            .pointer("/source_span/construct")
+            .and_then(Value::as_str),
+        Some("workflow_contract")
+    );
+    let schema = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.get("code").and_then(Value::as_str)
+                == Some("revision.active_fact_incompatible")
+                && diagnostic.get("subject").and_then(Value::as_str) == Some("WorkItem")
+        })
+        .expect("schema diagnostic");
+    assert_eq!(
+        schema
+            .pointer("/source_span/construct")
+            .and_then(Value::as_str),
+        Some("class")
+    );
+    assert_eq!(
+        schema.pointer("/source_span/start").and_then(Value::as_u64),
+        Some(v2_source.find("class WorkItem").expect("class offset") as u64)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(v1);
+    let _ = fs::remove_file(v2);
+}
+
+#[test]
 fn step_materializes_minimal_noop_fact() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();

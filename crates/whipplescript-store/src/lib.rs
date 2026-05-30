@@ -645,6 +645,7 @@ pub struct RevisionCompatibilityDiagnostic {
     pub code: String,
     pub message: String,
     pub subject: Option<String>,
+    pub source_span_json: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4959,35 +4960,48 @@ fn compare_contracts(
     let candidate_contracts = contracts_by_name(candidate, kind);
     for (name, active_ty) in &active_contracts {
         match candidate_contracts.get(name) {
-            Some(candidate_ty) if candidate_ty == active_ty => {}
-            Some(candidate_ty) => diagnostics.push(revision_compatibility_diagnostic(
+            Some(candidate_ty) if candidate_ty.ty == active_ty.ty => {}
+            Some(candidate_ty) => diagnostics.push(revision_compatibility_diagnostic_with_span(
                 "revision.contract_changed",
-                format!("{kind} contract `{name}` changed from `{active_ty}` to `{candidate_ty}`"),
+                format!(
+                    "{kind} contract `{name}` changed from `{}` to `{}`",
+                    active_ty.ty, candidate_ty.ty
+                ),
                 Some(name.as_str()),
+                candidate_ty.source_span_json.clone(),
             )),
-            None => diagnostics.push(revision_compatibility_diagnostic(
+            None => diagnostics.push(revision_compatibility_diagnostic_with_span(
                 "revision.contract_removed",
                 format!("{kind} contract `{name}` is missing from the candidate version"),
                 Some(name.as_str()),
+                active_ty.source_span_json.clone(),
             )),
         }
     }
     if reject_candidate_additions {
         for (name, candidate_ty) in candidate_contracts {
             if !active_contracts.contains_key(&name) {
-                diagnostics.push(revision_compatibility_diagnostic(
+                diagnostics.push(revision_compatibility_diagnostic_with_span(
                     "revision.input_contract_added",
                     format!(
-                        "candidate adds input contract `{name}` with type `{candidate_ty}` to an already-started instance"
+                        "candidate adds input contract `{name}` with type `{}` to an already-started instance",
+                        candidate_ty.ty
                     ),
                     Some(name.as_str()),
+                    candidate_ty.source_span_json,
                 ));
             }
         }
     }
 }
 
-fn contracts_by_name(summary: &Value, kind: &str) -> BTreeMap<String, String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ContractSummary {
+    ty: String,
+    source_span_json: Option<String>,
+}
+
+fn contracts_by_name(summary: &Value, kind: &str) -> BTreeMap<String, ContractSummary> {
     summary
         .get("workflow_contracts")
         .and_then(Value::as_array)
@@ -4997,7 +5011,10 @@ fn contracts_by_name(summary: &Value, kind: &str) -> BTreeMap<String, String> {
         .filter_map(|contract| {
             Some((
                 contract.get("name")?.as_str()?.to_owned(),
-                contract.get("type")?.as_str()?.to_owned(),
+                ContractSummary {
+                    ty: contract.get("type")?.as_str()?.to_owned(),
+                    source_span_json: summary_source_span_json(contract),
+                },
             ))
         })
         .collect()
@@ -5046,10 +5063,14 @@ fn add_active_fact_schema_diagnostics(
             continue;
         };
         let Some(candidate_schema) = candidate_schemas.get(schema_name) else {
-            diagnostics.push(revision_compatibility_diagnostic(
+            let source_span_json = active_schemas
+                .get(schema_name)
+                .and_then(summary_source_span_json);
+            diagnostics.push(revision_compatibility_diagnostic_with_span(
                 "revision.active_fact_schema_removed",
                 format!("active fact `{fact_id}` uses schema `{schema_name}` missing from candidate version"),
                 Some(schema_name),
+                source_span_json,
             ));
             continue;
         };
@@ -5065,13 +5086,14 @@ fn add_active_fact_schema_diagnostics(
             0,
         );
         if !errors.is_empty() {
-            diagnostics.push(revision_compatibility_diagnostic(
+            diagnostics.push(revision_compatibility_diagnostic_with_span(
                 "revision.active_fact_incompatible",
                 format!(
                     "active fact `{fact_id}` no longer typechecks as `{schema_name}`: {}",
                     errors.join("; ")
                 ),
                 Some(schema_name),
+                summary_source_span_json(candidate_schema),
             ));
         }
     }
@@ -5087,6 +5109,10 @@ fn schemas_by_name(summary: &Value) -> BTreeMap<String, Value> {
         .flatten()
         .filter_map(|schema| Some((schema.get("name")?.as_str()?.to_owned(), schema.clone())))
         .collect()
+}
+
+fn summary_source_span_json(summary: &Value) -> Option<String> {
+    summary.get("source_span").map(Value::to_string)
 }
 
 fn fact_schema_name<'a>(
@@ -5399,10 +5425,20 @@ fn revision_compatibility_diagnostic(
     message: String,
     subject: Option<&str>,
 ) -> RevisionCompatibilityDiagnostic {
+    revision_compatibility_diagnostic_with_span(code, message, subject, None)
+}
+
+fn revision_compatibility_diagnostic_with_span(
+    code: &str,
+    message: String,
+    subject: Option<&str>,
+    source_span_json: Option<String>,
+) -> RevisionCompatibilityDiagnostic {
     RevisionCompatibilityDiagnostic {
         code: code.to_owned(),
         message,
         subject: subject.map(str::to_owned),
+        source_span_json,
     }
 }
 
@@ -7793,18 +7829,18 @@ mod tests {
         let active_summary = json!({
             "workflow": "Compat",
             "workflow_contracts": [
-                {"kind": "input", "name": "request", "type": "ref<Request>"},
-                {"kind": "output", "name": "done", "type": "ref<Result>"},
-                {"kind": "failure", "name": "failed", "type": "ref<Failure>"}
+                {"kind": "input", "name": "request", "type": "ref<Request>", "source_span": {"start": 1, "end": 10, "construct": "workflow_contract"}},
+                {"kind": "output", "name": "done", "type": "ref<Result>", "source_span": {"start": 11, "end": 20, "construct": "workflow_contract"}},
+                {"kind": "failure", "name": "failed", "type": "ref<Failure>", "source_span": {"start": 21, "end": 30, "construct": "workflow_contract"}}
             ]
         })
         .to_string();
         let candidate_summary = json!({
             "workflow": "Other",
             "workflow_contracts": [
-                {"kind": "input", "name": "request", "type": "ref<ChangedRequest>"},
-                {"kind": "input", "name": "extra", "type": "string"},
-                {"kind": "failure", "name": "failed", "type": "ref<Failure>"}
+                {"kind": "input", "name": "request", "type": "ref<ChangedRequest>", "source_span": {"start": 31, "end": 40, "construct": "workflow_contract"}},
+                {"kind": "input", "name": "extra", "type": "string", "source_span": {"start": 41, "end": 50, "construct": "workflow_contract"}},
+                {"kind": "failure", "name": "failed", "type": "ref<Failure>", "source_span": {"start": 51, "end": 60, "construct": "workflow_contract"}}
             ]
         })
         .to_string();
@@ -7841,6 +7877,32 @@ mod tests {
         assert!(codes.contains("revision.contract_changed"));
         assert!(codes.contains("revision.input_contract_added"));
         assert!(codes.contains("revision.contract_removed"));
+        let changed = report
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "revision.contract_changed")
+            .expect("contract change diagnostic");
+        assert_eq!(
+            changed
+                .source_span_json
+                .as_deref()
+                .and_then(|span| serde_json::from_str::<Value>(span).ok())
+                .and_then(|span| span.get("start").and_then(Value::as_u64).map(|start| start)),
+            Some(31)
+        );
+        let removed = report
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "revision.contract_removed")
+            .expect("contract removed diagnostic");
+        assert_eq!(
+            removed
+                .source_span_json
+                .as_deref()
+                .and_then(|span| serde_json::from_str::<Value>(span).ok())
+                .and_then(|span| span.get("start").and_then(Value::as_u64).map(|start| start)),
+            Some(11)
+        );
     }
 
     #[test]

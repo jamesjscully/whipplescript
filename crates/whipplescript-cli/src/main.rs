@@ -8552,6 +8552,7 @@ fn revision_compatibility_diagnostic_to_json(
         "code": diagnostic.code,
         "message": diagnostic.message,
         "subject": diagnostic.subject,
+        "source_span": diagnostic.source_span_json.as_deref().map(json_from_str),
     })
 }
 
