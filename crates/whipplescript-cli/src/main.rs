@@ -5790,13 +5790,60 @@ fn log(options: &CliOptions) -> ExitCode {
         ))
     } else {
         for event in events {
+            let details = log_event_details(&event)
+                .map(|details| format!(" {details}"))
+                .unwrap_or_default();
             println!(
-                "#{:04} {} {} source={}",
-                event.sequence, event.occurred_at, event.event_type, event.source
+                "#{:04} {} {} source={}{}",
+                event.sequence, event.occurred_at, event.event_type, event.source, details
             );
         }
         ExitCode::SUCCESS
     }
+}
+
+fn log_event_details(event: &EventView) -> Option<String> {
+    let payload = json_from_str(&event.payload_json);
+    match event.event_type.as_str() {
+        "workflow.revision_activated" => Some(format!(
+            "revision={} epoch={}->{} from={} to={} cancel={} terminal_cancel={} request_cancel={}",
+            payload_str(&payload, "revision_id"),
+            payload_i64(&payload, "from_epoch"),
+            payload_i64(&payload, "to_epoch"),
+            payload_str(&payload, "from_version_id"),
+            payload_str(&payload, "to_version_id"),
+            payload_str(&payload, "cancellation_policy"),
+            payload_array_len(&payload, "terminal_cancel_effects"),
+            payload_array_len(&payload, "request_cancel_effects"),
+        )),
+        "effect.cancellation_requested" => Some(format!(
+            "effect={} revision={} by={} reason={}",
+            payload_str(&payload, "effect_id"),
+            payload_str(&payload, "revision_id"),
+            payload_str(&payload, "requested_by"),
+            payload_str(&payload, "reason"),
+        )),
+        _ => None,
+    }
+}
+
+fn payload_str<'a>(payload: &'a Value, field: &str) -> &'a str {
+    payload.get(field).and_then(Value::as_str).unwrap_or("-")
+}
+
+fn payload_i64(payload: &Value, field: &str) -> String {
+    payload
+        .get(field)
+        .and_then(Value::as_i64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn payload_array_len(payload: &Value, field: &str) -> usize {
+    payload
+        .get(field)
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
 }
 
 fn facts(options: &CliOptions) -> ExitCode {
@@ -5844,12 +5891,15 @@ fn effects(options: &CliOptions) -> ExitCode {
     } else {
         for effect in effects {
             println!(
-                "{} {} status={} target={} profile={} reason={}",
+                "{} {} status={} target={} profile={} version={} epoch={} cancel_requested={} reason={}",
                 effect.effect_id,
                 effect.kind,
                 effect.status,
                 effect.target.as_deref().unwrap_or("-"),
                 effect.profile.as_deref().unwrap_or("-"),
+                effect.program_version_id.as_deref().unwrap_or("-"),
+                effect.revision_epoch,
+                effect.cancel_requested,
                 effect.policy_block_reason.as_deref().unwrap_or("-")
             );
         }
@@ -5877,8 +5927,13 @@ fn runs(options: &CliOptions) -> ExitCode {
     } else {
         for run in runs {
             println!(
-                "{} effect={} status={} worker={} started={}",
-                run.run_id, run.effect_id, run.status, run.worker_id, run.started_at
+                "{} effect={} status={} worker={} started={} cancel_requested={}",
+                run.run_id,
+                run.effect_id,
+                run.status,
+                run.worker_id,
+                run.started_at,
+                run.cancel_requested
             );
         }
         ExitCode::SUCCESS
@@ -8246,6 +8301,7 @@ fn run_to_json(run: &RunView) -> Value {
         "status": run.status,
         "started_at": run.started_at,
         "completed_at": run.completed_at,
+        "cancel_requested": run.cancel_requested,
     })
 }
 
@@ -9140,6 +9196,71 @@ case classification {
         assert_eq!(
             event.get("requested_by").and_then(Value::as_str),
             Some("workflow.revision")
+        );
+    }
+
+    #[test]
+    fn renders_revision_log_event_details() {
+        let event = event_view(
+            1,
+            "workflow.revision_activated",
+            json!({
+                "revision_id": "rev_1",
+                "from_version_id": "ver_old",
+                "to_version_id": "ver_new",
+                "from_epoch": 0,
+                "to_epoch": 1,
+                "cancellation_policy": "request_running",
+                "terminal_cancel_effects": ["queued"],
+                "request_cancel_effects": ["running"]
+            }),
+        );
+
+        assert_eq!(
+            log_event_details(&event).as_deref(),
+            Some(
+                "revision=rev_1 epoch=0->1 from=ver_old to=ver_new cancel=request_running terminal_cancel=1 request_cancel=1"
+            )
+        );
+    }
+
+    #[test]
+    fn renders_cancellation_request_log_event_details() {
+        let event = event_view(
+            2,
+            "effect.cancellation_requested",
+            json!({
+                "request_id": "ecr_1",
+                "effect_id": "running",
+                "revision_id": "rev_1",
+                "reason": "workflow revision",
+                "requested_by": "workflow.revision"
+            }),
+        );
+
+        assert_eq!(
+            log_event_details(&event).as_deref(),
+            Some("effect=running revision=rev_1 by=workflow.revision reason=workflow revision")
+        );
+    }
+
+    #[test]
+    fn renders_run_cancellation_request_json() {
+        let run = RunView {
+            run_id: "run-1".to_owned(),
+            effect_id: "effect-1".to_owned(),
+            provider: "fixture".to_owned(),
+            worker_id: "worker-1".to_owned(),
+            status: "running".to_owned(),
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
+            completed_at: None,
+            cancel_requested: true,
+        };
+
+        let rendered = run_to_json(&run);
+        assert_eq!(
+            rendered.get("cancel_requested").and_then(Value::as_bool),
+            Some(true)
         );
     }
 

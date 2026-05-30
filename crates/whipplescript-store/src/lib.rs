@@ -559,6 +559,7 @@ pub struct RunView {
     pub status: String,
     pub started_at: String,
     pub completed_at: Option<String>,
+    pub cancel_requested: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3088,9 +3089,23 @@ impl SqliteStore {
     pub fn list_runs(&self, instance_id: &str) -> StoreResult<Vec<RunView>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT run_id, effect_id, provider, worker_id, status, started_at, completed_at
+            SELECT
+                run_id,
+                effect_id,
+                provider,
+                worker_id,
+                status,
+                started_at,
+                completed_at,
+                EXISTS (
+                    SELECT 1
+                    FROM effect_cancellation_requests AS request
+                    WHERE request.instance_id = runs.instance_id
+                      AND request.effect_id = runs.effect_id
+                      AND request.status = 'requested'
+                ) AS cancel_requested
             FROM runs
-            WHERE instance_id = ?1
+            WHERE runs.instance_id = ?1
             ORDER BY started_at, run_id
             "#,
         )?;
@@ -3104,6 +3119,7 @@ impl SqliteStore {
                     status: row.get(4)?,
                     started_at: row.get(5)?,
                     completed_at: row.get(6)?,
+                    cancel_requested: row.get(7)?,
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
@@ -6953,6 +6969,11 @@ mod tests {
             effect_revision(&store, "running-effect"),
             (Some(version1.version_id.clone()), 0, true)
         );
+        let runs = store
+            .list_runs(&instance.instance_id)
+            .expect("runs include request state");
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].cancel_requested);
 
         store
             .expire_leases(&instance.instance_id, "2030-01-02T00:00:00Z")
@@ -7753,6 +7774,7 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].run_id, "run-tell");
         assert_eq!(runs[0].status, "running");
+        assert!(!runs[0].cancel_requested);
 
         let events = store.list_events(&instance_id).expect("events list");
         assert_eq!(events.len(), 3);

@@ -430,10 +430,10 @@ Acceptance:
 
 Goal: make revision understandable from the normal inspection surfaces.
 
-- [ ] Add revision events to `whip log`.
+- [x] Add revision events to `whip log`.
 - [x] Add active revision and history to `whip status`.
 - [x] Add per-effect version/epoch to `whip effects --json`.
-- [ ] Add cancellation request state to `whip effects` and `whip runs`.
+- [x] Add cancellation request state to `whip effects` and `whip runs`.
 - [ ] Add evidence links:
   - [ ] revision event -> old/new program versions
   - [ ] revision event -> compatibility diagnostics
@@ -452,9 +452,9 @@ Goal: make revision understandable from the normal inspection surfaces.
 
 Acceptance:
 
-- [ ] An operator can answer "which version created this effect?" from CLI
+- [x] An operator can answer "which version created this effect?" from CLI
   output.
-- [ ] An operator can answer "what did revision cancel or request to cancel?"
+- [x] An operator can answer "what did revision cancel or request to cancel?"
   from CLI output.
 - [x] Trace conformance rejects impossible revision/cancellation sequences.
 
