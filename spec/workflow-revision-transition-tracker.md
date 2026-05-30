@@ -425,7 +425,7 @@ Acceptance:
 
 - [x] Old rules cannot create new effects after revision.
 - [x] Old effects can finish after revision with old attribution.
-- [ ] Running cancel requests do not fabricate terminal cancellation.
+- [x] Running cancel requests do not fabricate terminal cancellation.
 
 Stage 5 partial audit notes:
 
@@ -442,6 +442,10 @@ Stage 5 partial audit notes:
 - A keep-policy revision leaves existing old-version effects claimable; fixture
   worker completion preserves the old effect's original program version and
   revision epoch attribution.
+- A request-running revision now has CLI coverage showing that running effects
+  stay `running`, expose `cancel_requested` on effects/runs, and produce a
+  conforming trace cancellation-request record without a fabricated terminal
+  cancellation.
 
 ## Stage 6: Observability, Evidence, And Diagnostics
 
@@ -490,12 +494,12 @@ validation.
   - [ ] running cancellation request is idempotent
   - [ ] recovery preserves active revision
 - [ ] Add CLI tests:
-  - [ ] dry-run compatible
-  - [ ] dry-run incompatible
-  - [ ] activation with `--cancel keep`
+  - [x] dry-run compatible
+  - [x] dry-run incompatible
+  - [x] activation with `--cancel keep`
   - [ ] activation with `--cancel queued`
-  - [ ] activation with `--cancel running`
-  - [ ] status/trace JSON after revision
+  - [x] activation with `--cancel running`
+  - [x] status/trace JSON after revision
 - [ ] Add e2e workflows:
   - [ ] v1 starts an agent turn, v2 changes future dispatch
   - [ ] v1 queued effect is cancelled during revision

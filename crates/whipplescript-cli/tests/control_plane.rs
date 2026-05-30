@@ -6,7 +6,7 @@ use std::{
 };
 
 use serde_json::Value;
-use whipplescript_store::{NewFact, RuleCommit, SqliteStore};
+use whipplescript_store::{NewFact, RuleCommit, RunStart, SqliteStore};
 
 #[test]
 fn checks_all_example_workflows() {
@@ -857,6 +857,218 @@ rule noop_v2
         old_effect.get("revision_epoch").and_then(Value::as_i64),
         Some(0)
     );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(v1);
+    let _ = fs::remove_file(v2);
+}
+
+#[test]
+fn running_cancel_revision_requests_without_terminal_cancellation() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("running-cancel-v1");
+    let v2 = temp_workflow_path("running-cancel-v2");
+    fs::write(
+        &v1,
+        r#"
+workflow RunningCancelRevision
+
+agent worker {
+  profile "repo-writer"
+  capacity 1
+}
+
+rule start_work
+  when started
+  when worker is available
+=> {
+  tell worker "running work"
+}
+"#,
+    )
+    .expect("write v1 workflow");
+    fs::write(
+        &v2,
+        r#"
+workflow RunningCancelRevision
+
+rule noop_v2
+  when started
+=> {
+}
+"#,
+    )
+    .expect("write v2 workflow");
+
+    let started = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "run",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "step",
+            instance_id,
+            "--program",
+            v1.to_str().expect("utf-8 workflow path"),
+        ],
+    );
+    let effects = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "effects",
+            instance_id,
+        ],
+    );
+    let effect_id = effects
+        .as_array()
+        .expect("effects array")
+        .iter()
+        .find(|effect| effect.get("kind").and_then(Value::as_str) == Some("agent.tell"))
+        .and_then(|effect| effect.get("effect_id"))
+        .and_then(Value::as_str)
+        .expect("agent effect id")
+        .to_owned();
+
+    let mut store = SqliteStore::open(&store_path).expect("open store");
+    store
+        .start_run(RunStart {
+            instance_id,
+            effect_id: &effect_id,
+            run_id: "run-running-cancel",
+            provider: "fixture",
+            worker_id: "worker-1",
+            lease_id: "lease-running-cancel",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        })
+        .expect("run starts");
+
+    let activation = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "revise",
+            instance_id,
+            v2.to_str().expect("utf-8 workflow path"),
+            "--cancel",
+            "running",
+            "--json",
+        ],
+    );
+    let requested = activation
+        .get("cancellation")
+        .and_then(|cancellation| cancellation.get("request_cancel_effects"))
+        .and_then(Value::as_array)
+        .expect("request cancel effects");
+    assert!(requested
+        .iter()
+        .any(|effect| effect.as_str() == Some(effect_id.as_str())));
+
+    let effects = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "effects",
+            instance_id,
+        ],
+    );
+    let running_effect = effects
+        .as_array()
+        .expect("effects array")
+        .iter()
+        .find(|effect| effect.get("effect_id").and_then(Value::as_str) == Some(effect_id.as_str()))
+        .expect("running effect");
+    assert_eq!(
+        running_effect.get("status").and_then(Value::as_str),
+        Some("running")
+    );
+    assert_eq!(
+        running_effect
+            .get("cancel_requested")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let runs = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "runs",
+            instance_id,
+        ],
+    );
+    let run = runs
+        .as_array()
+        .expect("runs array")
+        .iter()
+        .find(|run| run.get("effect_id").and_then(Value::as_str) == Some(effect_id.as_str()))
+        .expect("running run");
+    assert_eq!(run.get("status").and_then(Value::as_str), Some("running"));
+    assert_eq!(
+        run.get("cancel_requested").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let trace = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "trace",
+            instance_id,
+            "--check",
+        ],
+    );
+    assert_eq!(
+        trace
+            .get("conformance")
+            .and_then(|conformance| conformance.get("ok"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let abstract_trace = trace
+        .get("abstract_trace")
+        .and_then(Value::as_array)
+        .expect("abstract trace");
+    assert!(abstract_trace.iter().any(|record| {
+        record
+            .get("event")
+            .and_then(|event| event.get("type"))
+            .and_then(Value::as_str)
+            == Some("effect_cancellation_requested")
+    }));
+    assert!(!abstract_trace.iter().any(|record| {
+        record
+            .get("event")
+            .and_then(|event| event.get("type"))
+            .and_then(Value::as_str)
+            == Some("effect_cancelled")
+    }));
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(v1);
