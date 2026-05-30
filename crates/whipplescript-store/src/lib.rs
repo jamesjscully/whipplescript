@@ -4348,11 +4348,14 @@ fn policy_block_on(
                 effects.status,
                 effects.required_capabilities,
                 effects.profile,
-                instances.program_id,
-                program_versions.declared_profiles
+                COALESCE(effect_versions.program_id, instances.program_id),
+                COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles)
             FROM effects
             JOIN instances ON instances.instance_id = effects.instance_id
-            JOIN program_versions ON program_versions.version_id = instances.version_id
+            JOIN program_versions AS active_versions
+              ON active_versions.version_id = instances.version_id
+            LEFT JOIN program_versions AS effect_versions
+              ON effect_versions.version_id = effects.program_version_id
             WHERE effects.instance_id = ?1
               AND effects.effect_id = ?2
             "#,
@@ -4493,10 +4496,13 @@ fn capacity_block_on(
             r#"
             SELECT effects.kind,
                    effects.target,
-                   program_versions.declared_profiles
+                   COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles)
             FROM effects
             JOIN instances ON instances.instance_id = effects.instance_id
-            JOIN program_versions ON program_versions.version_id = instances.version_id
+            JOIN program_versions AS active_versions
+              ON active_versions.version_id = instances.version_id
+            LEFT JOIN program_versions AS effect_versions
+              ON effect_versions.version_id = effects.program_version_id
             WHERE effects.instance_id = ?1
               AND effects.effect_id = ?2
             "#,
@@ -7335,6 +7341,112 @@ mod tests {
             .expect("idempotent revision returns existing row");
         assert_eq!(duplicate.revision_id, revision.revision_id);
         assert_eq!(row_count(&store, "instance_revisions"), 1);
+    }
+
+    #[test]
+    fn old_effect_policy_checks_use_effect_version_after_revision() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version1 = store
+            .create_program_version(NewProgramVersion {
+                declared_profiles_json: r#"{"agents":[{"name":"worker","profile":"repo-writer","capacity":1,"capabilities":["agent.tell"]}]}"#,
+                ..test_program_version("RevisionAgents", "source-1", "ir-1")
+            })
+            .expect("first program version creates");
+        let version2 = store
+            .create_program_version(NewProgramVersion {
+                declared_profiles_json: r#"{"agents":[{"name":"other","profile":"repo-writer","capacity":1,"capabilities":["agent.tell"]}]}"#,
+                ..test_program_version("RevisionAgents", "source-2", "ir-2")
+            })
+            .expect("second program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version1.program_id,
+                version_id: &version1.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "old-rule",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("old-effect", "agent.tell", "old-effect-key")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-old"),
+            })
+            .expect("old rule commits");
+        store
+            .activate_revision(RevisionActivation {
+                instance_id: &instance.instance_id,
+                from_version_id: &version1.version_id,
+                to_version_id: &version2.version_id,
+                activation_policy_json: "{}",
+                cancellation_policy: "keep",
+                idempotency_key: Some("revise-agent-removal"),
+            })
+            .expect("revision activates");
+
+        store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "old-effect",
+                run_id: "run-old",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-old",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("old effect uses old version declarations");
+        store
+            .complete_effect(EffectCompletion {
+                instance_id: &instance.instance_id,
+                effect_id: "old-effect",
+                run_id: "run-old",
+                provider: "test",
+                worker_id: "worker-1",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some("old done"),
+                metadata_json: "{}",
+                idempotency_key: Some("complete-old"),
+            })
+            .expect("old run completes");
+
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "new-rule",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("new-effect", "agent.tell", "new-effect-key")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-new"),
+            })
+            .expect("new rule commits");
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "new-effect",
+                run_id: "run-new",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-new",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("new effect uses candidate declarations");
+
+        assert!(
+            matches!(blocked, StoreError::PolicyBlocked { reason, .. } if reason.contains("not declared"))
+        );
+        assert_eq!(effect_status(&store, "new-effect"), "blocked_by_profile");
     }
 
     #[test]
