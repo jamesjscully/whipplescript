@@ -405,7 +405,7 @@ state.
 - [x] Ensure deterministic stepping uses only rules from the active revision.
 - [x] Ensure idempotency keys include program version/revision epoch where
   required by the execution contract.
-- [ ] Ensure existing old-version effects remain claimable/runnable unless
+- [x] Ensure existing old-version effects remain claimable/runnable unless
   cancellation policy blocks them.
 - [ ] Implement queued/blocked/claimable terminal cancellation for revision
   policies.
@@ -424,7 +424,7 @@ state.
 Acceptance:
 
 - [x] Old rules cannot create new effects after revision.
-- [ ] Old effects can finish after revision with old attribution.
+- [x] Old effects can finish after revision with old attribution.
 - [ ] Running cancel requests do not fabricate terminal cancellation.
 
 Stage 5 partial audit notes:
@@ -439,6 +439,9 @@ Stage 5 partial audit notes:
 - `whip dev` and child-invocation stepping remain explicit development paths
   that pass an in-memory IR; their revision behavior still needs the broader
   Stage 5 worker/child audit.
+- A keep-policy revision leaves existing old-version effects claimable; fixture
+  worker completion preserves the old effect's original program version and
+  revision epoch attribution.
 
 ## Stage 6: Observability, Evidence, And Diagnostics
 

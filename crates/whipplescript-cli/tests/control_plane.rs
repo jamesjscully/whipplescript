@@ -728,6 +728,142 @@ rule seed_v2
 }
 
 #[test]
+fn old_effect_runs_after_keep_revision_with_old_attribution() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("old-effect-keep-v1");
+    let v2 = temp_workflow_path("old-effect-keep-v2");
+    fs::write(
+        &v1,
+        r#"
+workflow OldEffectKeep
+
+agent worker {
+  profile "repo-writer"
+  capacity 1
+}
+
+rule start_old_work
+  when started
+  when worker is available
+=> {
+  tell worker "old work"
+}
+"#,
+    )
+    .expect("write v1 workflow");
+    fs::write(
+        &v2,
+        r#"
+workflow OldEffectKeep
+
+rule noop_v2
+  when started
+=> {
+}
+"#,
+    )
+    .expect("write v2 workflow");
+
+    let started = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "run",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let original_version = started
+        .get("version_id")
+        .and_then(Value::as_str)
+        .expect("version id");
+
+    let first_step = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "step",
+            instance_id,
+            "--program",
+            v1.to_str().expect("utf-8 workflow path"),
+        ],
+    );
+    assert_eq!(
+        first_step.get("effects_created").and_then(Value::as_u64),
+        Some(1)
+    );
+
+    run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "revise",
+            instance_id,
+            v2.to_str().expect("utf-8 workflow path"),
+            "--cancel",
+            "keep",
+            "--json",
+        ],
+    );
+
+    let worker = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "worker",
+            instance_id,
+            "--provider",
+            "fixture",
+        ],
+    );
+    assert_eq!(worker.get("ran_effects").and_then(Value::as_u64), Some(1));
+
+    let effects = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "effects",
+            instance_id,
+        ],
+    );
+    let old_effect = effects
+        .as_array()
+        .expect("effects array")
+        .iter()
+        .find(|effect| effect.get("kind").and_then(Value::as_str) == Some("agent.tell"))
+        .expect("old agent effect");
+    assert_eq!(
+        old_effect.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert_eq!(
+        old_effect.get("program_version_id").and_then(Value::as_str),
+        Some(original_version)
+    );
+    assert_eq!(
+        old_effect.get("revision_epoch").and_then(Value::as_i64),
+        Some(0)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(v1);
+    let _ = fs::remove_file(v2);
+}
+
+#[test]
 fn revise_dry_run_reports_incompatible_root_without_mutating() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
