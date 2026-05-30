@@ -533,10 +533,10 @@ Goal: make revision understandable from the normal inspection surfaces.
   - [x] revision event -> cancelled/requested effects
   - [x] cancellation request -> provider/run evidence
 - [ ] Add diagnostics for:
-  - [ ] incompatible root workflow
-  - [ ] incompatible input/output/failure contract
-  - [ ] active fact schema mismatch
-  - [ ] unsupported running cancellation provider
+  - [x] incompatible root workflow
+  - [x] incompatible input/output/failure contract
+  - [x] active fact schema mismatch
+  - [x] unsupported running cancellation provider
   - [ ] stale program path or missing source bundle during revision
 - [x] Update trace conformance to understand revision and cancel-request
   records.
@@ -559,6 +559,13 @@ Stage 6 partial audit notes:
 - Cancellation request creation now records `effect.cancellation.requested`
   evidence linked to the request event, requested effect, active run, and
   workflow revision when the request came from revision activation.
+- Blocked non-dry-run revision attempts now persist revision compatibility
+  diagnostics for incompatible root workflow, changed contracts, and active
+  fact schema mismatches. Dry-run remains non-mutating but previews the same
+  diagnostics and source spans.
+- Unsupported running cancellation providers now surface as idempotent
+  `provider.cancellation.unsupported` diagnostics from the worker while leaving
+  the effect and lease recoverable.
 
 ## Stage 7: Tests And E2E
 

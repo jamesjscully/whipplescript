@@ -1632,6 +1632,44 @@ rule noop
         diagnostic.get("code").and_then(Value::as_str) == Some("revision.root_workflow_changed")
     }));
 
+    let blocked = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "revise",
+            instance_id,
+            v2.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(!blocked.status.success());
+    let blocked_report: Value =
+        serde_json::from_slice(&blocked.stdout).expect("blocked report is json");
+    assert_eq!(
+        blocked_report
+            .get("compatibility")
+            .and_then(|value| value.get("compatible"))
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    let persisted = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "diagnostics",
+            instance_id,
+        ],
+    );
+    let persisted = persisted.as_array().expect("diagnostics array");
+    assert!(persisted.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(Value::as_str) == Some("revision.root_workflow_changed")
+            && diagnostic.get("subject_type").and_then(Value::as_str)
+                == Some("revision_compatibility")
+    }));
+
     let status = run_json(
         bin,
         &[
@@ -1796,6 +1834,49 @@ workflow RevisionSpan {
             .and_then(Value::as_bool),
         Some(false)
     );
+
+    let blocked = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "revise",
+            instance_id,
+            v2.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(!blocked.status.success());
+
+    let persisted = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "diagnostics",
+            instance_id,
+        ],
+    );
+    let persisted = persisted.as_array().expect("diagnostics array");
+    assert!(persisted.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(Value::as_str) == Some("revision.contract_changed")
+            && diagnostic.get("subject_type").and_then(Value::as_str)
+                == Some("revision_compatibility")
+            && diagnostic
+                .pointer("/source_span/construct")
+                .and_then(Value::as_str)
+                == Some("workflow_contract")
+    }));
+    assert!(persisted.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(Value::as_str) == Some("revision.active_fact_incompatible")
+            && diagnostic.get("subject_type").and_then(Value::as_str)
+                == Some("revision_compatibility")
+            && diagnostic
+                .pointer("/source_span/construct")
+                .and_then(Value::as_str)
+                == Some("class")
+    }));
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(v1);

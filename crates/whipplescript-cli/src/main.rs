@@ -615,6 +615,14 @@ fn revise(options: &CliOptions) -> ExitCode {
     }
 
     if !compatibility.compatible {
+        if let Err(error) = persist_revision_compatibility_diagnostics(
+            &store,
+            &revise_options.instance_id,
+            &candidate_label,
+            &compatibility.diagnostics,
+        ) {
+            return report_store_error("failed to record revision diagnostics", error);
+        }
         emit_revision_report(
             options,
             &revise_options,
@@ -688,6 +696,49 @@ fn revise(options: &CliOptions) -> ExitCode {
         Some(&activation),
     );
     ExitCode::SUCCESS
+}
+
+fn persist_revision_compatibility_diagnostics(
+    store: &SqliteStore,
+    instance_id: &str,
+    candidate_version_id: &str,
+    diagnostics: &[RevisionCompatibilityDiagnostic],
+) -> Result<(), StoreError> {
+    for diagnostic in diagnostics {
+        let subject_id = diagnostic
+            .subject
+            .as_deref()
+            .unwrap_or(candidate_version_id)
+            .to_owned();
+        let idempotency_key = idempotency_key(&[
+            instance_id,
+            "revision-compatibility",
+            candidate_version_id,
+            &diagnostic.code,
+            &subject_id,
+        ]);
+        store.record_diagnostic(DiagnosticRecord {
+            instance_id: Some(instance_id),
+            program_id: None,
+            program_version_id: None,
+            severity: "error",
+            code: Some(&diagnostic.code),
+            message: &diagnostic.message,
+            source_span_json: diagnostic.source_span_json.as_deref(),
+            subject_type: Some("revision_compatibility"),
+            subject_id: Some(&subject_id),
+            event_id: None,
+            effect_id: None,
+            run_id: None,
+            assertion_id: None,
+            evidence_ids_json: "[]",
+            artifact_ids_json: "[]",
+            causation_id: None,
+            correlation_id: Some(candidate_version_id),
+            idempotency_key: Some(&idempotency_key),
+        })?;
+    }
+    Ok(())
 }
 
 fn run(options: &CliOptions) -> ExitCode {
