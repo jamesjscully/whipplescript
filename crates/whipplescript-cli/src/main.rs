@@ -7317,7 +7317,7 @@ fn generate_maude_model_search(
                 rule.name
             ));
             output.push_str(&format!(
-                "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  effect({upstream}, queued) dep({upstream}, {predicate}, {downstream}) effect({downstream}, blocked)\n  =>*\n  effect({upstream}, {terminal}) dep({upstream}, {predicate}, {downstream}) effect({downstream}, running) .\n\n"
+                "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  effect({upstream}, {terminal}) dep({upstream}, {predicate}, {downstream}) effect({downstream}, blocked)\n  =>*\n  effect({upstream}, {terminal}) dep({upstream}, {predicate}, {downstream}) effect({downstream}, running) .\n\n"
             ));
             expected.push(ExpectedSearch {
                 outcome: ExpectedSearchResult::Solution,
@@ -7337,7 +7337,7 @@ fn generate_maude_model_search(
                     rule.name
                 ));
                 output.push_str(&format!(
-                    "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  effect({upstream}, queued) dep({upstream}, {predicate}, {downstream}) effect({downstream}, blocked)\n  =>*\n  effect({upstream}, {non_terminal}) dep({upstream}, {predicate}, {downstream}) effect({downstream}, running) .\n\n"
+                    "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  effect({upstream}, {non_terminal}) dep({upstream}, {predicate}, {downstream}) effect({downstream}, blocked)\n  =>*\n  effect({upstream}, {non_terminal}) dep({upstream}, {predicate}, {downstream}) effect({downstream}, running) .\n\n"
                 ));
                 expected.push(ExpectedSearch {
                     outcome: ExpectedSearchResult::NoSolution,
@@ -7352,6 +7352,16 @@ fn generate_maude_model_search(
                 });
             }
         }
+        append_revision_model_searches(
+            source,
+            &mut output,
+            &mut expected,
+            rule,
+            &rule_symbols,
+            &fact_symbols,
+            &graph_symbols,
+            &effect_symbols,
+        );
         for branch in &rule.metadata.terminal_branches {
             let Some(tag) = branch.tag.as_deref() else {
                 continue;
@@ -7500,6 +7510,120 @@ fn generate_maude_model_search(
     }
 
     (output, expected)
+}
+
+fn append_revision_model_searches(
+    source: &str,
+    output: &mut String,
+    expected: &mut Vec<ExpectedSearch>,
+    rule: &IrRule,
+    rule_symbols: &BTreeMap<String, String>,
+    fact_symbols: &BTreeMap<String, String>,
+    graph_symbols: &BTreeMap<String, String>,
+    effect_symbols: &BTreeMap<String, String>,
+) {
+    let Some(first_when) = rule.whens.first() else {
+        return;
+    };
+    let Some(first_effect) = rule.metadata.effects.first() else {
+        return;
+    };
+    let Some(rule_symbol) = rule_symbols.get(&rule.name) else {
+        return;
+    };
+    let fact_key = rule_fact_key(&rule.name, 0, &first_when.pattern);
+    let Some(fact_symbol) = fact_symbols.get(&fact_key) else {
+        return;
+    };
+    let graph_key = rule_graph_key(&rule.name, 0);
+    let Some(graph_symbol) = graph_symbols.get(&graph_key) else {
+        return;
+    };
+    let first_effect_key = effect_key(&rule.name, &first_effect.id);
+    let Some(effect_symbol) = effect_symbols.get(&first_effect_key) else {
+        return;
+    };
+
+    output.push_str(&format!(
+        "--- {}: revision-scoped rule commits after activation on the active revision.\n",
+        rule.name
+    ));
+    output.push_str(&format!(
+        "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  instance(rootInstance, rootWorkflow, instRunning) activeRevision(rootInstance, version1, epoch0) nextEpoch(epoch0, epoch1) activateRevision(rootInstance, version1, version2, epoch0, epoch1, keep) fact({fact_symbol}) scopedRuleV(rootInstance, version2, epoch1, {rule_symbol}, {fact_symbol}, {graph_symbol}) ruleReady({rule_symbol}, {fact_symbol}, {graph_symbol}) graphV({graph_symbol}, version2, epoch1, {effect_symbol})\n  =>*\n  instance(rootInstance, rootWorkflow, instRunning) activeRevision(rootInstance, version2, epoch1) nextEpoch(epoch0, epoch1) revisionActivated(rootInstance, version1, version2, epoch1, keep) revisionCancellationPolicy(rootInstance, version1, epoch0, keep) event(revisionActivatedEvt) fact({fact_symbol}) scopedRuleV(rootInstance, version2, epoch1, {rule_symbol}, {fact_symbol}, {graph_symbol}) scopedRuleFired(rootInstance, {rule_symbol}, {fact_symbol}, {graph_symbol}) event(ruleCommitEvt) graphCommitted({graph_symbol}) effect({effect_symbol}, queued) effectVersion({effect_symbol}, version2, epoch1) .\n\n"
+    ));
+    expected.push(ExpectedSearch {
+        outcome: ExpectedSearchResult::Solution,
+        span: first_when.span,
+        description: format!("{} active revision scoped rule commits", rule.name),
+        upstream: rule.name.clone(),
+        predicate: "revision-active-rule",
+        downstream: first_effect.id.clone(),
+    });
+
+    output.push_str(&format!(
+        "--- {}: stale revision-scoped rule cannot commit after a newer revision is active.\n",
+        rule.name
+    ));
+    output.push_str(&format!(
+        "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  instance(rootInstance, rootWorkflow, instRunning) activeRevision(rootInstance, version2, epoch1) fact({fact_symbol}) scopedRuleV(rootInstance, version1, epoch0, {rule_symbol}, {fact_symbol}, {graph_symbol}) ruleReady({rule_symbol}, {fact_symbol}, {graph_symbol}) graphV({graph_symbol}, version1, epoch0, {effect_symbol})\n  =>*\n  instance(rootInstance, rootWorkflow, instRunning) activeRevision(rootInstance, version2, epoch1) fact({fact_symbol}) scopedRuleV(rootInstance, version1, epoch0, {rule_symbol}, {fact_symbol}, {graph_symbol}) scopedRuleFired(rootInstance, {rule_symbol}, {fact_symbol}, {graph_symbol}) event(ruleCommitEvt) graphCommitted({graph_symbol}) effect({effect_symbol}, queued) effectVersion({effect_symbol}, version1, epoch0) .\n\n"
+    ));
+    expected.push(ExpectedSearch {
+        outcome: ExpectedSearchResult::NoSolution,
+        span: first_when.span,
+        description: format!("{} stale revision scoped rule cannot commit", rule.name),
+        upstream: rule.name.clone(),
+        predicate: "revision-stale-rule",
+        downstream: first_effect.id.clone(),
+    });
+
+    output.push_str(&format!(
+        "--- {}: revision activation does not rewrite old effect attribution.\n",
+        rule.name
+    ));
+    output.push_str(&format!(
+        "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  instance(rootInstance, rootWorkflow, instRunning) activeRevision(rootInstance, version1, epoch0) nextEpoch(epoch0, epoch1) activateRevision(rootInstance, version1, version2, epoch0, epoch1, keep) effect({effect_symbol}, queued) effectVersion({effect_symbol}, version1, epoch0)\n  =>*\n  instance(rootInstance, rootWorkflow, instRunning) activeRevision(rootInstance, version2, epoch1) nextEpoch(epoch0, epoch1) revisionActivated(rootInstance, version1, version2, epoch1, keep) revisionCancellationPolicy(rootInstance, version1, epoch0, keep) event(revisionActivatedEvt) effect({effect_symbol}, queued) effectVersion({effect_symbol}, version2, epoch1) .\n\n"
+    ));
+    expected.push(ExpectedSearch {
+        outcome: ExpectedSearchResult::NoSolution,
+        span: first_effect.span,
+        description: format!("{} old effect keeps revision attribution", first_effect.id),
+        upstream: first_effect.id.clone(),
+        predicate: "revision-effect-attribution",
+        downstream: "effectVersion".to_owned(),
+    });
+
+    for dependency in &rule.metadata.dependencies {
+        if !matches!(&dependency.predicate, IrDependencyPredicate::Completes) {
+            continue;
+        }
+        let upstream_key = effect_key(&rule.name, &dependency.upstream);
+        let downstream_key = effect_key(&rule.name, &dependency.downstream);
+        let Some(upstream) = effect_symbols.get(&upstream_key) else {
+            continue;
+        };
+        let Some(downstream) = effect_symbols.get(&downstream_key) else {
+            continue;
+        };
+        let span = dependency_source_span(source, &dependency.upstream, "completes");
+        output.push_str(&format!(
+            "--- {}: revision-cancelled upstream releases `completes` dependencies.\n",
+            rule.name
+        ));
+        output.push_str(&format!(
+            "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  instance(rootInstance, rootWorkflow, instRunning) activeRevision(rootInstance, version1, epoch0) nextEpoch(epoch0, epoch1) activateRevision(rootInstance, version1, version2, epoch0, epoch1, cancelQueued) effect({upstream}, queued) effectVersion({upstream}, version1, epoch0) dep({upstream}, completes, {downstream}) effect({downstream}, blocked) effectVersion({downstream}, version1, epoch0)\n  =>*\n  instance(rootInstance, rootWorkflow, instRunning) activeRevision(rootInstance, version2, epoch1) nextEpoch(epoch0, epoch1) revisionActivated(rootInstance, version1, version2, epoch1, cancelQueued) revisionCancellationPolicy(rootInstance, version1, epoch0, cancelQueued) event(revisionActivatedEvt) effect({upstream}, cancelled) effectVersion({upstream}, version1, epoch0) dep({upstream}, completes, {downstream}) effect({downstream}, queued) effectVersion({downstream}, version1, epoch0) .\n\n"
+        ));
+        expected.push(ExpectedSearch {
+            outcome: ExpectedSearchResult::Solution,
+            span,
+            description: format!(
+                "{} --completes--> {} releases after revision cancellation",
+                dependency.upstream, dependency.downstream
+            ),
+            upstream: dependency.upstream.clone(),
+            predicate: "revision-completes-cancelled",
+            downstream: dependency.downstream.clone(),
+        });
+    }
 }
 
 fn maude_bool_cases(expr: &Expr, context: &mut MaudeExprContext) -> MaudeBoolCases {
@@ -9452,6 +9576,39 @@ case classification {
         );
     }
 
+    fn revision_generated_checks_source() -> &'static str {
+        r#"
+workflow RevisionGeneratedChecks
+
+class Task {
+  title string
+}
+
+class Classification {
+  summary string
+}
+
+coerce classify(title string) -> Classification {
+  prompt "Classify"
+}
+
+agent worker {
+  profile "repo-writer"
+  capacity 1
+}
+
+rule classify
+  when Task as task
+=> {
+  coerce classify(task.title) as classification
+
+  after classification completes {
+    tell worker "summarize" as notify
+  }
+}
+"#
+    }
+
     #[test]
     fn generates_model_searches_for_effect_dependencies() {
         let source = include_str!("../../../examples/loft-worker-with-review.whip");
@@ -9460,13 +9617,13 @@ case classification {
         let (_maude, expected) =
             generate_maude_model_search(source, &ir, Path::new("/tmp/kernel.maude"));
 
-        assert_eq!(expected.len(), 6);
+        assert_eq!(expected.len(), 12);
         assert_eq!(
             expected
                 .iter()
                 .filter(|result| result.outcome == ExpectedSearchResult::Solution)
                 .count(),
-            2
+            4
         );
         assert_eq!(
             expected
@@ -9482,6 +9639,59 @@ case classification {
                 .count(),
             3
         );
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|result| result.predicate == "revision-active-rule")
+                .count(),
+            2
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|result| result.predicate == "revision-stale-rule")
+                .count(),
+            2
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|result| result.predicate == "revision-effect-attribution")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn generates_revision_model_searches_for_effects_and_completes_dependencies() {
+        let source = revision_generated_checks_source();
+        let compiled = whipplescript_parser::compile_program(source);
+        let ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("source compiles: {:?}", compiled.diagnostics));
+        let (maude, expected) =
+            generate_maude_model_search(source, &ir, Path::new("/tmp/kernel.maude"));
+
+        assert!(maude.contains("scopedRuleV("));
+        assert!(maude.contains("activeRevision("));
+        assert!(maude.contains("effectVersion("));
+        assert!(maude.contains("revisionCancellationPolicy("));
+        assert!(expected.iter().any(|result| {
+            result.predicate == "revision-active-rule"
+                && result.outcome == ExpectedSearchResult::Solution
+        }));
+        assert!(expected.iter().any(|result| {
+            result.predicate == "revision-stale-rule"
+                && result.outcome == ExpectedSearchResult::NoSolution
+        }));
+        assert!(expected.iter().any(|result| {
+            result.predicate == "revision-effect-attribution"
+                && result.outcome == ExpectedSearchResult::NoSolution
+        }));
+        assert!(expected.iter().any(|result| {
+            result.predicate == "revision-completes-cancelled"
+                && result.outcome == ExpectedSearchResult::Solution
+        }));
     }
 
     #[test]
@@ -9708,6 +9918,40 @@ rule accept
 
         let output = run_maude_source("generated-expression-check-fixture", &maude)
             .expect("generated expression Maude fixture runs");
+        let actual = extract_maude_search_results(&output.stdout);
+        assert_eq!(
+            actual,
+            expected
+                .iter()
+                .map(|expected| expected.outcome)
+                .collect::<Vec<_>>(),
+            "{}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn generated_model_search_runs_revision_fixture() {
+        if find_executable_in_path(&["maude"], &path_value()).is_none() {
+            return;
+        }
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let kernel_path =
+            fs::canonicalize(root.join("models/maude/kernel.maude")).expect("kernel path resolves");
+        let source = revision_generated_checks_source();
+        let compiled = whipplescript_parser::compile_program(source);
+        let ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("source compiles: {:?}", compiled.diagnostics));
+        let (maude, expected) = generate_maude_model_search(source, &ir, &kernel_path);
+        assert!(expected.iter().any(|result| {
+            result.predicate == "revision-completes-cancelled"
+                && result.outcome == ExpectedSearchResult::Solution
+        }));
+
+        let output =
+            run_maude_source("generated-revision-check-fixture", &maude).expect("runs Maude");
         let actual = extract_maude_search_results(&output.stdout);
         assert_eq!(
             actual,

@@ -29,7 +29,7 @@ without changing the source-level meaning of `pattern`, `apply`, `workflow`,
 | Formal model | [x] | Stage 1 added Maude revision searches and TLA+ revision/cancel-request actions and invariants; the bounded formal suite passes. |
 | Store/runtime implementation | [ ] | Revision rows, active-epoch caching, per-effect version attribution, replay, and cancellation requests are in place; active-version stepper/worker semantics remain open. |
 | CLI/control plane | [ ] | `whip revise`, dry-run compatibility reports, activation reports, status revision history, and trace revision projection are in place; evidence/diagnostic previews and final UX audit remain open. |
-| Generated checks | [ ] | Per-program checks do not yet assert active-version rule firing or old-effect attribution. |
+| Generated checks | [x] | Per-program Maude checks assert active-version rule firing, stale-rule rejection, old-effect attribution, and revision-cancelled `completes` release. |
 | Examples/e2e | [ ] | No revision example exercises keep/cancel behavior for queued/running effects or child workflows. |
 
 ## Product Target
@@ -311,10 +311,10 @@ version for a running instance.
   - [x] pattern application provenance
   - [x] generated declaration hashes
 - [x] Produce structured diagnostics for incompatible revisions.
-- [ ] Add generated Maude checks that assert:
-  - [ ] rules commit only when their version equals active revision
-  - [ ] old effects keep old attribution
-  - [ ] `after ... completes` still handles cancellation branches after
+- [x] Add generated Maude checks that assert:
+  - [x] rules commit only when their version equals active revision
+  - [x] old effects keep old attribution
+  - [x] `after ... completes` still handles cancellation branches after
     revision
 - [ ] Audit Stage 3 against compatibility diagnostics, generated checks, and
   current language-reference examples; record cases deferred to future explicit
@@ -344,13 +344,16 @@ Stage 3 partial audit notes:
 - Revision reports now include non-blocking agent impact for removed candidate
   agents that still have non-terminal effects, so operators can see old work
   that will continue under stored old-version attribution.
-- Generated Maude checks remain open Stage 3 work.
+- Generated Maude checks now cover revision-scoped rule commits, stale-rule
+  rejection after activation, old-effect attribution preservation, and
+  `after ... completes` release after revision cancellation. The generated
+  fixture runs through Maude as part of CLI unit coverage.
 
 Acceptance:
 
 - [x] Compatible additive revisions pass dry-run.
 - [ ] Breaking contract/schema revisions fail with source-span diagnostics.
-- [ ] Generated checks cover at least one revision-aware compiled fixture.
+- [x] Generated checks cover at least one revision-aware compiled fixture.
 
 ## Stage 4: Control Plane And CLI
 
@@ -528,7 +531,7 @@ validation.
   - [ ] v1 running effect receives cancel request and later completes/fails
   - [ ] parent invokes child, parent revises while child is running
   - [ ] child revises independently and parent observes terminal output
-- [ ] Add generated Maude fixture from a revision-aware compiled example.
+- [x] Add generated Maude fixture from a revision-aware compiled example.
 - [ ] Audit Stage 7 against formal model coverage, unit coverage, CLI coverage,
   and deterministic e2e; record flaky or provider-dependent gaps.
 
