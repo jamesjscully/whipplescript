@@ -5859,7 +5859,7 @@ fn insert_effect_cancellation_request_on(
         "requested_by": request.requested_by,
     })
     .to_string();
-    append_event_on(
+    let event = append_event_on(
         connection,
         NewEvent {
             instance_id: request.instance_id,
@@ -5897,8 +5897,99 @@ fn insert_effect_cancellation_request_on(
             request.idempotency_key,
         ],
     )?;
+    let active_run_ids =
+        running_run_ids_for_effect_on(connection, request.instance_id, request.effect_id)?;
+    let evidence_metadata = json!({
+        "request_id": &request_id,
+        "effect_id": request.effect_id,
+        "revision_id": request.revision_id,
+        "reason": request.reason,
+        "requested_by": request.requested_by,
+        "event_id": event.event_id,
+        "active_run_ids": &active_run_ids,
+    })
+    .to_string();
+    let evidence_id = insert_evidence_on(
+        connection,
+        EvidenceRecord {
+            instance_id: request.instance_id,
+            kind: "effect.cancellation.requested",
+            subject_type: "effect_cancellation_request",
+            subject_id: &request_id,
+            causation_id: Some(&event.event_id),
+            correlation_id: request.revision_id,
+            summary: Some("effect cancellation requested"),
+            metadata_json: &evidence_metadata,
+        },
+    )?;
+    insert_evidence_link_on(
+        connection,
+        EvidenceLink {
+            evidence_id: &evidence_id,
+            instance_id: request.instance_id,
+            target_type: "event",
+            target_id: &event.event_id,
+            relation: "requested",
+        },
+    )?;
+    insert_evidence_link_on(
+        connection,
+        EvidenceLink {
+            evidence_id: &evidence_id,
+            instance_id: request.instance_id,
+            target_type: "effect",
+            target_id: request.effect_id,
+            relation: "requested_cancellation",
+        },
+    )?;
+    if let Some(revision_id) = request.revision_id {
+        insert_evidence_link_on(
+            connection,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: request.instance_id,
+                target_type: "workflow_revision",
+                target_id: revision_id,
+                relation: "requested_by",
+            },
+        )?;
+    }
+    for run_id in &active_run_ids {
+        insert_evidence_link_on(
+            connection,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: request.instance_id,
+                target_type: "run",
+                target_id: run_id,
+                relation: "active_run",
+            },
+        )?;
+    }
     cancellation_request_by_id_on(connection, &request_id)?
         .ok_or_else(|| StoreError::Conflict("cancellation request was not recorded".to_owned()))
+}
+
+fn running_run_ids_for_effect_on(
+    connection: &Connection,
+    instance_id: &str,
+    effect_id: &str,
+) -> StoreResult<Vec<String>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT run_id
+        FROM runs
+        WHERE instance_id = ?1
+          AND effect_id = ?2
+          AND status = 'running'
+        ORDER BY started_at, run_id
+        "#,
+    )?;
+    let run_ids = statement
+        .query_map(params![instance_id, effect_id], |row| row.get(0))?
+        .collect::<result::Result<Vec<_>, _>>()
+        .map_err(StoreError::from)?;
+    Ok(run_ids)
 }
 
 fn mark_cancellation_requests_terminal_on(
@@ -7731,7 +7822,12 @@ mod tests {
             .iter()
             .find(|evidence| evidence.kind == "workflow.revision.activated")
             .expect("revision evidence exists");
+        let cancellation_evidence = evidence
+            .iter()
+            .find(|evidence| evidence.kind == "effect.cancellation.requested")
+            .expect("cancellation request evidence exists");
         assert_eq!(revision_evidence.subject_id, revision.revision_id);
+        assert_eq!(cancellation_evidence.subject_id, requests[0].request_id);
         let metadata =
             serde_json::from_str::<Value>(&revision_evidence.metadata_json).expect("metadata json");
         assert_eq!(
@@ -7757,6 +7853,17 @@ mod tests {
                 .and_then(|requests| requests.first())
                 .and_then(Value::as_str),
             Some(requests[0].request_id.as_str())
+        );
+        let cancellation_metadata =
+            serde_json::from_str::<Value>(&cancellation_evidence.metadata_json)
+                .expect("cancellation metadata json");
+        assert_eq!(
+            cancellation_metadata
+                .get("active_run_ids")
+                .and_then(Value::as_array)
+                .and_then(|runs| runs.first())
+                .and_then(Value::as_str),
+            Some("run-running")
         );
         let links = store
             .list_evidence_links(&instance.instance_id)
@@ -7790,6 +7897,24 @@ mod tests {
                 && link.target_type == "effect_cancellation_request"
                 && link.target_id == requests[0].request_id.as_str()
                 && link.relation == "created"
+        }));
+        assert!(links.iter().any(|link| {
+            link.evidence_id == cancellation_evidence.evidence_id
+                && link.target_type == "effect"
+                && link.target_id == "running-effect"
+                && link.relation == "requested_cancellation"
+        }));
+        assert!(links.iter().any(|link| {
+            link.evidence_id == cancellation_evidence.evidence_id
+                && link.target_type == "run"
+                && link.target_id == "run-running"
+                && link.relation == "active_run"
+        }));
+        assert!(links.iter().any(|link| {
+            link.evidence_id == cancellation_evidence.evidence_id
+                && link.target_type == "workflow_revision"
+                && link.target_id == revision.revision_id.as_str()
+                && link.relation == "requested_by"
         }));
 
         store

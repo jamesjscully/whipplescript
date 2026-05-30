@@ -531,7 +531,7 @@ Goal: make revision understandable from the normal inspection surfaces.
   - [x] revision event -> old/new program versions
   - [ ] revision event -> compatibility diagnostics
   - [x] revision event -> cancelled/requested effects
-  - [ ] cancellation request -> provider/run evidence
+  - [x] cancellation request -> provider/run evidence
 - [ ] Add diagnostics for:
   - [ ] incompatible root workflow
   - [ ] incompatible input/output/failure contract
@@ -556,6 +556,9 @@ Stage 6 partial audit notes:
 - Revision activation now records `workflow.revision.activated` evidence linked
   to the activation event, old/new program versions, terminal-cancelled
   effects, cancellation-requested effects, and cancellation request records.
+- Cancellation request creation now records `effect.cancellation.requested`
+  evidence linked to the request event, requested effect, active run, and
+  workflow revision when the request came from revision activation.
 
 ## Stage 7: Tests And E2E
 
