@@ -458,7 +458,7 @@ state.
     lease state
   - [x] late provider completion after cancel-request records the real terminal
     outcome
-- [ ] Update child workflow invocation handling so parent and child revisions
+- [x] Update child workflow invocation handling so parent and child revisions
   are explicit and cancellation projection remains single-shot.
 - [ ] Audit Stage 5 against rule attribution, worker cancellation, lease
   recovery, and child invocation behavior; record edge cases for e2e.
@@ -501,6 +501,11 @@ Stage 5 partial audit notes:
 - A queued-cancel revision now has CLI coverage showing that queued old-version
   effects become terminal `cancelled` effects and produce a conforming trace
   cancellation record.
+- Workflow invocation status now reports both creation-time parent/child
+  version attribution and current active parent/child revisions. CLI coverage
+  revises a parent while a child invocation is running, resumes the old child
+  invocation through its original bundle, and verifies the parent observes one
+  terminal child projection.
 
 ## Stage 6: Observability, Evidence, And Diagnostics
 

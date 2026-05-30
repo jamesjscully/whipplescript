@@ -3028,6 +3028,318 @@ workflow Child {
 }
 
 #[test]
+fn worker_preserves_child_invocation_links_after_parent_revision() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("workflow-invoke-parent-revision-v1");
+    let v2 = temp_workflow_path("workflow-invoke-parent-revision-v2");
+    fs::write(
+        &v1,
+        r#"
+workflow Parent {
+  input task Task
+
+  class Task {
+    title string
+  }
+
+  class ParentDone {
+    title string
+  }
+
+  rule dispatch
+    when Task as task
+  => {
+    invoke Child { task { title task.title } } as child
+
+    after child succeeds as result {
+      record ParentDone {
+        title result.title
+      }
+    }
+  }
+}
+
+workflow Child {
+  input task Task
+  output result ChildResult
+
+  class Task {
+    title string
+  }
+
+  class ChildResult {
+    title string
+  }
+
+  rule complete_child
+    when Task as task
+  => {
+    complete result {
+      title task.title
+    }
+  }
+}
+"#,
+    )
+    .expect("v1 workflow writes");
+    fs::write(
+        &v2,
+        r#"
+workflow Parent {
+  input task Task
+
+  class Task {
+    title string
+  }
+
+  class ParentDone {
+    title string
+  }
+
+  class RevisionMarker {
+    version string
+  }
+
+  rule dispatch
+    when Task as task
+  => {
+    invoke Child { task { title task.title } } as child
+
+    after child succeeds as result {
+      record ParentDone {
+        title result.title
+      }
+    }
+  }
+}
+
+workflow Child {
+  input task Task
+  output result ChildResult
+
+  class Task {
+    title string
+  }
+
+  class ChildResult {
+    title string
+  }
+
+  rule complete_child
+    when Task as task
+  => {
+    complete result {
+      title task.title
+    }
+  }
+}
+"#,
+    )
+    .expect("v2 workflow writes");
+
+    let started = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--input",
+            r#"{"task":{"title":"Revision link"}}"#,
+            "--json",
+            "run",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--root",
+            "Parent",
+        ],
+    );
+    let parent_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("parent instance id");
+    run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "step",
+            parent_id,
+            "--program",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--root",
+            "Parent",
+        ],
+    );
+    run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "worker",
+            parent_id,
+            "--program",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--root",
+            "Parent",
+            "--max-child-iterations",
+            "0",
+        ],
+    );
+    let instances = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "instances",
+        ],
+    );
+    let child_id = instances
+        .as_array()
+        .expect("instances")
+        .iter()
+        .filter_map(|instance| instance.get("instance_id").and_then(Value::as_str))
+        .find(|candidate| *candidate != parent_id)
+        .expect("child instance id")
+        .to_owned();
+
+    run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "revise",
+            parent_id,
+            v2.to_str().expect("utf-8 workflow path"),
+            "--root",
+            "Parent",
+            "--json",
+        ],
+    );
+
+    let parent_status = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "status",
+            parent_id,
+        ],
+    );
+    let invocation = parent_status
+        .pointer("/workflow_invocations/children/0")
+        .expect("parent invocation link");
+    assert_eq!(
+        invocation.get("child_instance_id").and_then(Value::as_str),
+        Some(child_id.as_str())
+    );
+    assert_eq!(
+        invocation
+            .get("parent_revision_epoch")
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        invocation
+            .get("parent_active_revision_epoch")
+            .and_then(Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        invocation
+            .get("child_revision_epoch")
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        invocation
+            .get("child_active_revision_epoch")
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        invocation.get("status").and_then(Value::as_str),
+        Some("running")
+    );
+
+    let worker = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "worker",
+            parent_id,
+            "--program",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--root",
+            "Parent",
+        ],
+    );
+    assert_eq!(worker.get("ran_effects").and_then(Value::as_u64), Some(1));
+    let repeat_worker = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "worker",
+            parent_id,
+            "--program",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--root",
+            "Parent",
+        ],
+    );
+    assert_eq!(
+        repeat_worker.get("ran_effects").and_then(Value::as_u64),
+        Some(0)
+    );
+
+    let parent_status = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "status",
+            parent_id,
+        ],
+    );
+    assert_eq!(
+        parent_status
+            .pointer("/workflow_invocations/children/0/status")
+            .and_then(Value::as_str),
+        Some("completed")
+    );
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            parent_id,
+        ],
+    );
+    let success_count = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .filter(|fact| {
+            fact.get("name").and_then(Value::as_str) == Some("workflow.invoke.succeeded")
+        })
+        .count();
+    assert_eq!(success_count, 1);
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(v1);
+    let _ = fs::remove_file(v2);
+}
+
+#[test]
 fn worker_projects_cancelled_child_workflow_invocation() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();

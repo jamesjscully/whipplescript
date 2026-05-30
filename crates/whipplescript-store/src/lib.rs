@@ -491,9 +491,13 @@ pub struct WorkflowInvocationView {
     pub parent_effect_id: String,
     pub parent_program_version_id: Option<String>,
     pub parent_revision_epoch: i64,
+    pub parent_active_program_version_id: Option<String>,
+    pub parent_active_revision_epoch: Option<i64>,
     pub child_instance_id: String,
     pub child_program_version_id: Option<String>,
     pub child_revision_epoch: Option<i64>,
+    pub child_active_program_version_id: Option<String>,
+    pub child_active_revision_epoch: Option<i64>,
     pub target_workflow: String,
     pub input_json: String,
     pub status: String,
@@ -1464,20 +1468,35 @@ impl SqliteStore {
                     parent_effect_id,
                     parent_program_version_id,
                     parent_revision_epoch,
+                    parent_instance.version_id,
+                    parent_instance.revision_epoch,
                     child_instance_id,
                     child_program_version_id,
                     child_revision_epoch,
-                    target_workflow,
-                    input_json,
-                    status,
-                    terminal_event_id,
-                    source_span_json,
-                    created_at,
-                    COALESCE(updated_at, created_at)
+                    child_instance.version_id,
+                    child_instance.revision_epoch,
+                    workflow_invocations.target_workflow,
+                    workflow_invocations.input_json,
+                    CASE
+                        WHEN parent_effect.status IN ('completed', 'failed', 'timed_out', 'cancelled')
+                        THEN parent_effect.status
+                        ELSE workflow_invocations.status
+                    END,
+                    workflow_invocations.terminal_event_id,
+                    workflow_invocations.source_span_json,
+                    workflow_invocations.created_at,
+                    COALESCE(workflow_invocations.updated_at, workflow_invocations.created_at)
                 FROM workflow_invocations
-                WHERE parent_instance_id = ?1
-                  AND parent_effect_id = ?2
-                ORDER BY created_at DESC, invocation_id DESC
+                LEFT JOIN instances AS parent_instance
+                  ON parent_instance.instance_id = workflow_invocations.parent_instance_id
+                LEFT JOIN instances AS child_instance
+                  ON child_instance.instance_id = workflow_invocations.child_instance_id
+                LEFT JOIN effects AS parent_effect
+                  ON parent_effect.instance_id = workflow_invocations.parent_instance_id
+                 AND parent_effect.effect_id = workflow_invocations.parent_effect_id
+                WHERE workflow_invocations.parent_instance_id = ?1
+                  AND workflow_invocations.parent_effect_id = ?2
+                ORDER BY workflow_invocations.created_at DESC, invocation_id DESC
                 LIMIT 1
                 "#,
                 params![parent_instance_id, parent_effect_id],
@@ -1499,19 +1518,34 @@ impl SqliteStore {
                 parent_effect_id,
                 parent_program_version_id,
                 parent_revision_epoch,
+                parent_instance.version_id,
+                parent_instance.revision_epoch,
                 child_instance_id,
                 child_program_version_id,
                 child_revision_epoch,
-                target_workflow,
-                input_json,
-                status,
-                terminal_event_id,
-                source_span_json,
-                created_at,
-                COALESCE(updated_at, created_at)
+                child_instance.version_id,
+                child_instance.revision_epoch,
+                workflow_invocations.target_workflow,
+                workflow_invocations.input_json,
+                CASE
+                    WHEN parent_effect.status IN ('completed', 'failed', 'timed_out', 'cancelled')
+                    THEN parent_effect.status
+                    ELSE workflow_invocations.status
+                END,
+                workflow_invocations.terminal_event_id,
+                workflow_invocations.source_span_json,
+                workflow_invocations.created_at,
+                COALESCE(workflow_invocations.updated_at, workflow_invocations.created_at)
             FROM workflow_invocations
-            WHERE parent_instance_id = ?1
-            ORDER BY created_at, invocation_id
+            LEFT JOIN instances AS parent_instance
+              ON parent_instance.instance_id = workflow_invocations.parent_instance_id
+            LEFT JOIN instances AS child_instance
+              ON child_instance.instance_id = workflow_invocations.child_instance_id
+            LEFT JOIN effects AS parent_effect
+              ON parent_effect.instance_id = workflow_invocations.parent_instance_id
+             AND parent_effect.effect_id = workflow_invocations.parent_effect_id
+            WHERE workflow_invocations.parent_instance_id = ?1
+            ORDER BY workflow_invocations.created_at, invocation_id
             "#,
         )?;
         let rows = statement
@@ -1533,19 +1567,34 @@ impl SqliteStore {
                     parent_effect_id,
                     parent_program_version_id,
                     parent_revision_epoch,
+                    parent_instance.version_id,
+                    parent_instance.revision_epoch,
                     child_instance_id,
                     child_program_version_id,
                     child_revision_epoch,
-                    target_workflow,
-                    input_json,
-                    status,
-                    terminal_event_id,
-                    source_span_json,
-                    created_at,
-                    COALESCE(updated_at, created_at)
+                    child_instance.version_id,
+                    child_instance.revision_epoch,
+                    workflow_invocations.target_workflow,
+                    workflow_invocations.input_json,
+                    CASE
+                        WHEN parent_effect.status IN ('completed', 'failed', 'timed_out', 'cancelled')
+                        THEN parent_effect.status
+                        ELSE workflow_invocations.status
+                    END,
+                    workflow_invocations.terminal_event_id,
+                    workflow_invocations.source_span_json,
+                    workflow_invocations.created_at,
+                    COALESCE(workflow_invocations.updated_at, workflow_invocations.created_at)
                 FROM workflow_invocations
-                WHERE child_instance_id = ?1
-                ORDER BY created_at DESC, invocation_id DESC
+                LEFT JOIN instances AS parent_instance
+                  ON parent_instance.instance_id = workflow_invocations.parent_instance_id
+                LEFT JOIN instances AS child_instance
+                  ON child_instance.instance_id = workflow_invocations.child_instance_id
+                LEFT JOIN effects AS parent_effect
+                  ON parent_effect.instance_id = workflow_invocations.parent_instance_id
+                 AND parent_effect.effect_id = workflow_invocations.parent_effect_id
+                WHERE workflow_invocations.child_instance_id = ?1
+                ORDER BY workflow_invocations.created_at DESC, invocation_id DESC
                 LIMIT 1
                 "#,
                 [child_instance_id],
@@ -5847,16 +5896,20 @@ fn workflow_invocation_from_row(
         parent_effect_id: row.get(2)?,
         parent_program_version_id: row.get(3)?,
         parent_revision_epoch: row.get(4)?,
-        child_instance_id: row.get(5)?,
-        child_program_version_id: row.get(6)?,
-        child_revision_epoch: row.get(7)?,
-        target_workflow: row.get(8)?,
-        input_json: row.get(9)?,
-        status: row.get(10)?,
-        terminal_event_id: row.get(11)?,
-        source_span_json: row.get(12)?,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
+        parent_active_program_version_id: row.get(5)?,
+        parent_active_revision_epoch: row.get(6)?,
+        child_instance_id: row.get(7)?,
+        child_program_version_id: row.get(8)?,
+        child_revision_epoch: row.get(9)?,
+        child_active_program_version_id: row.get(10)?,
+        child_active_revision_epoch: row.get(11)?,
+        target_workflow: row.get(12)?,
+        input_json: row.get(13)?,
+        status: row.get(14)?,
+        terminal_event_id: row.get(15)?,
+        source_span_json: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
     })
 }
 
@@ -7688,6 +7741,9 @@ mod tests {
         let revised_parent_version = store
             .create_program_version(test_program_version("InvokeRevision", "source-3", "ir-3"))
             .expect("revised parent program version creates");
+        let revised_child_version = store
+            .create_program_version(test_program_version("InvokeRevision", "source-4", "ir-4"))
+            .expect("revised child program version creates");
         let parent = store
             .create_instance(NewInstance {
                 program_id: &parent_version.program_id,
@@ -7743,10 +7799,20 @@ mod tests {
         );
         assert_eq!(invocation.parent_revision_epoch, 0);
         assert_eq!(
+            invocation.parent_active_program_version_id.as_deref(),
+            Some(parent_version.version_id.as_str())
+        );
+        assert_eq!(invocation.parent_active_revision_epoch, Some(0));
+        assert_eq!(
             invocation.child_program_version_id.as_deref(),
             Some(child_version.version_id.as_str())
         );
         assert_eq!(invocation.child_revision_epoch, Some(0));
+        assert_eq!(
+            invocation.child_active_program_version_id.as_deref(),
+            Some(child_version.version_id.as_str())
+        );
+        assert_eq!(invocation.child_active_revision_epoch, Some(0));
 
         store
             .activate_revision(RevisionActivation {
@@ -7768,10 +7834,59 @@ mod tests {
         );
         assert_eq!(after_revision.parent_revision_epoch, 0);
         assert_eq!(
+            after_revision.parent_active_program_version_id.as_deref(),
+            Some(revised_parent_version.version_id.as_str())
+        );
+        assert_eq!(after_revision.parent_active_revision_epoch, Some(1));
+        assert_eq!(
             after_revision.child_program_version_id.as_deref(),
             Some(child_version.version_id.as_str())
         );
         assert_eq!(after_revision.child_revision_epoch, Some(0));
+        assert_eq!(
+            after_revision.child_active_program_version_id.as_deref(),
+            Some(child_version.version_id.as_str())
+        );
+        assert_eq!(after_revision.child_active_revision_epoch, Some(0));
+
+        store
+            .activate_revision(RevisionActivation {
+                instance_id: &child.instance_id,
+                from_version_id: &child_version.version_id,
+                to_version_id: &revised_child_version.version_id,
+                activation_policy_json: "{}",
+                cancellation_policy: "keep",
+                idempotency_key: Some("revise-child-after-invoke"),
+            })
+            .expect("child revision activates");
+        let after_child_revision = store
+            .get_workflow_invocation(&parent.instance_id, "invoke-child")
+            .expect("invocation reloads after child revision")
+            .expect("invocation still exists after child revision");
+        assert_eq!(
+            after_child_revision.parent_program_version_id.as_deref(),
+            Some(parent_version.version_id.as_str())
+        );
+        assert_eq!(after_child_revision.parent_revision_epoch, 0);
+        assert_eq!(
+            after_child_revision
+                .parent_active_program_version_id
+                .as_deref(),
+            Some(revised_parent_version.version_id.as_str())
+        );
+        assert_eq!(after_child_revision.parent_active_revision_epoch, Some(1));
+        assert_eq!(
+            after_child_revision.child_program_version_id.as_deref(),
+            Some(child_version.version_id.as_str())
+        );
+        assert_eq!(after_child_revision.child_revision_epoch, Some(0));
+        assert_eq!(
+            after_child_revision
+                .child_active_program_version_id
+                .as_deref(),
+            Some(revised_child_version.version_id.as_str())
+        );
+        assert_eq!(after_child_revision.child_active_revision_epoch, Some(1));
     }
 
     #[test]
