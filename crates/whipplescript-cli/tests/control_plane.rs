@@ -6,7 +6,7 @@ use std::{
 };
 
 use serde_json::Value;
-use whipplescript_store::{NewFact, RuleCommit, RunStart, SqliteStore};
+use whipplescript_store::{EffectCompletion, NewFact, RuleCommit, RunStart, SqliteStore};
 
 #[test]
 fn checks_all_example_workflows() {
@@ -1069,6 +1069,55 @@ rule noop_v2
             .and_then(Value::as_str)
             == Some("effect_cancelled")
     }));
+
+    let mut store = SqliteStore::open(&store_path).expect("open store");
+    store
+        .complete_effect(EffectCompletion {
+            instance_id,
+            effect_id: &effect_id,
+            run_id: "run-running-cancel",
+            provider: "fixture",
+            worker_id: "worker-1",
+            status: "completed",
+            exit_code: Some(0),
+            summary: Some("late provider completion"),
+            metadata_json: "{}",
+            idempotency_key: Some("late-provider-completion-after-cancel-request"),
+        })
+        .expect("late completion succeeds");
+    let requests = store
+        .list_effect_cancellation_requests(instance_id)
+        .expect("requests list");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].status, "terminal");
+    drop(store);
+
+    let effects = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "effects",
+            instance_id,
+        ],
+    );
+    let completed_effect = effects
+        .as_array()
+        .expect("effects array")
+        .iter()
+        .find(|effect| effect.get("effect_id").and_then(Value::as_str) == Some(effect_id.as_str()))
+        .expect("completed effect");
+    assert_eq!(
+        completed_effect.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert_eq!(
+        completed_effect
+            .get("cancel_requested")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(v1);

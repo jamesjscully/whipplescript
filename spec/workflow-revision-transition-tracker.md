@@ -414,7 +414,7 @@ state.
   - [ ] long-running providers can be asked to stop where supported
   - [ ] unsupported providers leave visible diagnostics and keep recoverable
     lease state
-  - [ ] late provider completion after cancel-request records the real terminal
+  - [x] late provider completion after cancel-request records the real terminal
     outcome
 - [ ] Update child workflow invocation handling so parent and child revisions
   are explicit and cancellation projection remains single-shot.
@@ -446,6 +446,9 @@ Stage 5 partial audit notes:
   stay `running`, expose `cancel_requested` on effects/runs, and produce a
   conforming trace cancellation-request record without a fabricated terminal
   cancellation.
+- The same request-running coverage now completes the requested effect with a
+  late real provider success and verifies that the cancellation request resolves
+  to `terminal` while the effect records `completed`.
 - A queued-cancel revision now has CLI coverage showing that queued old-version
   effects become terminal `cancelled` effects and produce a conforming trace
   cancellation record.
