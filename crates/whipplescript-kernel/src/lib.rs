@@ -20,9 +20,9 @@ use whipplescript_store::{
     ArtifactRecord, ClaimableEffect, DerivedFact, EffectCancellation, EffectCompletion,
     EvidenceRecord, ExpiredLease, InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent,
     NewFact, NewInboxItem, NewInstance, NewProgramVersion, NewWorkflowInvocation,
-    ProgramVersionRecord, RetryEffect, RevisionActivation, RuleCommit, RunStart, SkillEvidence,
-    SqliteStore, StoreError, StoreResult, StoredEvent, TerminalDiagnosticRecord,
-    WorkflowInvocationView, WorkflowRevisionView,
+    ProgramVersionRecord, RetryEffect, RevisionActivation, RuleCommit, RuleCommitRevisionGuard,
+    RunStart, SkillEvidence, SqliteStore, StoreError, StoreResult, StoredEvent,
+    TerminalDiagnosticRecord, WorkflowInvocationView, WorkflowRevisionView,
 };
 
 pub struct RuntimeKernel {
@@ -253,6 +253,21 @@ impl RuntimeKernel {
 
     pub fn commit_rule(&mut self, commit: RuleCommit<'_>) -> StoreResult<StoredEvent> {
         let event = self.store.commit_rule(commit)?;
+        self.emit_rule_commit_trace(commit);
+        Ok(event)
+    }
+
+    pub fn commit_rule_with_revision_guard(
+        &mut self,
+        commit: RuleCommit<'_>,
+        guard: RuleCommitRevisionGuard<'_>,
+    ) -> StoreResult<StoredEvent> {
+        let event = self.store.commit_rule_with_revision_guard(commit, guard)?;
+        self.emit_rule_commit_trace(commit);
+        Ok(event)
+    }
+
+    fn emit_rule_commit_trace(&mut self, commit: RuleCommit<'_>) {
         for effect in commit.effects {
             self.emit(TraceEvent::EffectCreated {
                 effect_id: effect.effect_id.to_owned(),
@@ -262,7 +277,6 @@ impl RuntimeKernel {
         for dependency in commit.dependencies {
             self.emit(TraceEvent::DependencyCreated(dependency_edge(dependency)));
         }
-        Ok(event)
     }
 
     pub fn activate_revision(

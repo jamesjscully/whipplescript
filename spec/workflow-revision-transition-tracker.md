@@ -1,6 +1,6 @@
 # Workflow Revision Transition Tracker
 
-Status: final audit complete
+Status: post-audit hardening complete
 
 This tracker covers dynamic workflow revision for running instances:
 
@@ -27,10 +27,57 @@ without changing the source-level meaning of `pattern`, `apply`, `workflow`,
 | --- | --- | --- |
 | Conceptual spec | [x] | Stage 0 landed revision epochs, activation policy, cancellation policy, compatibility rules, store objects, transaction boundaries, and observability requirements in the core specs. |
 | Formal model | [x] | Stage 1 added Maude revision searches and TLA+ revision/cancel-request actions and invariants; the bounded formal suite passes. |
-| Store/runtime implementation | [x] | Revision rows, active-epoch caching, per-effect version attribution, replay, active-version stepper/worker semantics, cancellation requests, and child invocation revision projection are implemented and covered by tests. |
-| CLI/control plane | [x] | `whip revise`, dry-run compatibility reports, activation reports, status revision history, trace revision projection, evidence, and diagnostics are implemented. |
-| Generated checks | [x] | Per-program Maude checks assert active-version rule firing, stale-rule rejection, old-effect attribution, and revision-cancelled `completes` release. |
+| Store/runtime implementation | [x] | Revision rows, active-epoch caching, guarded rule commits, activation-time compatibility, per-effect version attribution, replay, active-version stepper/worker semantics, cancellation requests, projection rebuild, and child invocation revision projection are implemented and covered by tests. |
+| CLI/control plane | [x] | `whip revise`, dry-run compatibility reports, activation reports, status revision history, trace revision projection, evidence, diagnostics, stale-step rejection, and compensating workflow-invocation startup are implemented. |
+| Generated checks | [x] | Per-program Maude checks assert active-version rule firing, stale-rule rejection, old-effect attribution, revision-cancelled `completes` release, and corrected `!=` operand lowering. |
 | Examples/e2e | [x] | Deterministic e2e covers keep, queued cancel, running cancel request, and parent/child revision; Stage 8 examples document the operator-facing flows. |
+
+## Stage 10: Post-Audit Hardening
+
+Goal: close code-level safety gaps found by the implementation audit before
+calling workflow revision stable.
+
+- [x] Add a transactional rule-commit guard so evaluated program version and
+  revision epoch must still match the active instance revision at commit time.
+- [x] Recheck revision compatibility inside the activation transaction, not
+  only in the CLI preflight path.
+- [x] Treat all existing non-terminal effects as old work during each revision
+  activation, including effects kept across earlier revisions.
+- [x] Make projection rebuild safe for instances with runs, leases, terminal
+  events, and cancellation requests.
+- [x] Make workflow invocation startup atomic or compensating so a child
+  instance cannot be orphaned if the parent invoke effect is cancelled or
+  revised mid-start.
+- [x] Fix generated Maude lowering for `!=` so the false branch compares left
+  against right, not left against itself.
+
+Stage 10 audit notes:
+
+- Finding 1: [crates/whipplescript-cli/src/main.rs](../crates/whipplescript-cli/src/main.rs)
+  reads active version/epoch before lowering, while
+  [crates/whipplescript-store/src/lib.rs](../crates/whipplescript-store/src/lib.rs)
+  attributes rule commits to whatever revision is active when the transaction
+  runs. A revision race can let old IR commit as the new revision.
+- Finding 2: compatibility currently runs before activation through CLI
+  preflight. `activate_revision` must re-run compatibility in the same store
+  transaction to protect direct callers and fact-changing races.
+- Finding 3: cancellation impact currently selects effects matching the
+  immediate `from_version_id`/epoch. Later revisions must also see older kept
+  non-terminal effects.
+- Finding 4: projection rebuild deletes revision/effect projections but does
+  not rebuild run/lease/terminal state, so recovery can fail or leave
+  cancellation requests unresolved.
+- Finding 5: workflow invocation worker startup opens several independent store
+  transactions while creating the child, invocation link, and parent run.
+- Finding 6: generated Maude expression lowering emits `neExpr(left, left)` for
+  part of `!=` handling.
+- Stage 10 verification passed on May 30, 2026:
+  `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace`, `scripts/check-formal-models.sh`,
+  `scripts/check-tla-models.sh`, and `scripts/check-e2e.sh`.
+- Release status is stable again for the in-repo v0 runtime and CLI after the
+  Stage 10 code hardening pass.
 
 ## Product Target
 
@@ -747,7 +794,8 @@ Stage 9 audit notes:
   `cargo test -p whipplescript-kernel --test e2e revision`, and
   `cargo test -p whipplescript -- reconstructs_revision_trace_records_from_store_events renders_revision_log_event_details`.
 - Release status: stable for the in-repo v0 runtime and CLI. Revision is not
-  behind a feature flag and no workflow-revision release blockers remain.
+  behind a feature flag; the May 30, 2026 post-audit hardening pass closed the
+  reopened code-level blockers in Stage 10.
 - Remaining non-blocking follow-ups are recorded in
   [final-audit.md](final-audit.md): explicit root retargeting, source-declared
   live fact migration, provider-specific out-of-band cancellation depth, and

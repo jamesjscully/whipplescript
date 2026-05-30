@@ -30,8 +30,8 @@ use whipplescript_store::{
     HumanAnswer, InboxItemView, InstanceView, NewEffect, NewEffectDependency, NewEvent, NewFact,
     NewWorkflowInvocation, RetryEffect, RevisionActivation, RevisionCancellationImpact,
     RevisionCandidate, RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RuleCommit,
-    RunStart, RunView, SqliteStore, StatusView, StoreError, WorkflowInvocationView,
-    WorkflowRevisionView, WorkflowTerminal, WorkflowTerminalKind,
+    RuleCommitRevisionGuard, RunStart, RunView, SqliteStore, StatusView, StoreError,
+    WorkflowInvocationView, WorkflowRevisionView, WorkflowTerminal, WorkflowTerminalKind,
 };
 
 fn main() -> ExitCode {
@@ -1571,7 +1571,8 @@ fn step_instance(
             }
         }
         let active_version_id = status.instance.version_id;
-        let active_revision_epoch = status.instance.revision_epoch.to_string();
+        let active_revision_epoch = status.instance.revision_epoch;
+        let active_revision_epoch_key = active_revision_epoch.to_string();
         let events = store.list_events(instance_id)?;
         let facts = store.list_facts(instance_id)?;
         let all_facts = store.list_facts_including_consumed(instance_id)?;
@@ -1627,22 +1628,28 @@ fn step_instance(
                 let commit_key = idempotency_key(&[
                     instance_id,
                     &active_version_id,
-                    &active_revision_epoch,
+                    &active_revision_epoch_key,
                     &rule.name,
                     context.identity.as_deref().unwrap_or("started"),
                     &lowering_key,
                 ]);
-                let event = kernel.commit_rule(RuleCommit {
-                    instance_id,
-                    rule: &rule.name,
-                    trigger_event_id: context.trigger_event_id.as_deref(),
-                    facts: &new_facts,
-                    consumed_fact_ids: &consumed_fact_ids,
-                    effects: &new_effects,
-                    dependencies: &new_dependencies,
-                    terminal,
-                    idempotency_key: Some(&commit_key),
-                });
+                let event = kernel.commit_rule_with_revision_guard(
+                    RuleCommit {
+                        instance_id,
+                        rule: &rule.name,
+                        trigger_event_id: context.trigger_event_id.as_deref(),
+                        facts: &new_facts,
+                        consumed_fact_ids: &consumed_fact_ids,
+                        effects: &new_effects,
+                        dependencies: &new_dependencies,
+                        terminal,
+                        idempotency_key: Some(&commit_key),
+                    },
+                    RuleCommitRevisionGuard {
+                        program_version_id: &active_version_id,
+                        revision_epoch: active_revision_epoch,
+                    },
+                );
                 store = kernel.into_store();
                 drop(store);
                 match event {
@@ -2580,33 +2587,8 @@ fn run_workflow_invoke_effect(
             (invocation.child_instance_id, child_ir, None)
         }
         None => {
-            let (child_started, child_ir) = start_child_workflow_instance(
-                store_path,
-                program_path,
-                target_workflow,
-                &child_input.to_string(),
-            )?;
-            let child_instance_id = child_started.instance_id.clone();
-            let invocation_id = idempotency_key(&[
-                instance_id,
-                &effect.effect_id,
-                "invokes",
-                &child_instance_id,
-            ]);
-            let invocation_key =
-                idempotency_key(&[instance_id, &effect.effect_id, target_workflow]);
             let source_span_json =
                 invocation_store.effect_source_span_json(instance_id, &effect.effect_id)?;
-            invocation_store.record_workflow_invocation(NewWorkflowInvocation {
-                invocation_id: &invocation_id,
-                parent_instance_id: instance_id,
-                parent_effect_id: &effect.effect_id,
-                child_instance_id: &child_instance_id,
-                target_workflow,
-                input_json: &child_input.to_string(),
-                source_span_json: source_span_json.as_deref(),
-                idempotency_key: &invocation_key,
-            })?;
             let store = SqliteStore::open(store_path)?;
             let mut kernel = RuntimeKernel::new(store);
             let started_run = kernel.start_run(RunStart {
@@ -2619,10 +2601,85 @@ fn run_workflow_invoke_effect(
                 lease_expires_at: "2030-01-01T00:00:00Z",
                 metadata_json: &json!({
                     "input": input,
-                    "child_instance_id": child_instance_id,
+                    "target_workflow": target_workflow,
                 })
                 .to_string(),
             })?;
+            let (child_started, child_ir) = match start_child_workflow_instance(
+                store_path,
+                program_path,
+                target_workflow,
+                &child_input.to_string(),
+            ) {
+                Ok(started) => started,
+                Err(error) => {
+                    let metadata_json = json!({
+                        "input": input,
+                        "target_workflow": target_workflow,
+                        "error": format!("{error:?}"),
+                    })
+                    .to_string();
+                    return kernel.fail_run(EffectCompletion {
+                        instance_id,
+                        effect_id: &effect.effect_id,
+                        run_id: &run_id,
+                        provider: &options.provider,
+                        worker_id: "whip-worker",
+                        status: "failed",
+                        exit_code: Some(2),
+                        summary: Some("child workflow failed to start"),
+                        metadata_json: &metadata_json,
+                        idempotency_key: Some(&idempotency_key(&[
+                            instance_id,
+                            &effect.effect_id,
+                            "terminal",
+                        ])),
+                    });
+                }
+            };
+            let child_instance_id = child_started.instance_id.clone();
+            let invocation_id = idempotency_key(&[
+                instance_id,
+                &effect.effect_id,
+                "invokes",
+                &child_instance_id,
+            ]);
+            let invocation_key =
+                idempotency_key(&[instance_id, &effect.effect_id, target_workflow]);
+            if let Err(error) = invocation_store.record_workflow_invocation(NewWorkflowInvocation {
+                invocation_id: &invocation_id,
+                parent_instance_id: instance_id,
+                parent_effect_id: &effect.effect_id,
+                child_instance_id: &child_instance_id,
+                target_workflow,
+                input_json: &child_input.to_string(),
+                source_span_json: source_span_json.as_deref(),
+                idempotency_key: &invocation_key,
+            }) {
+                let metadata_json = json!({
+                    "input": input,
+                    "target_workflow": target_workflow,
+                    "child_instance_id": child_instance_id,
+                    "error": format!("{error:?}"),
+                })
+                .to_string();
+                return kernel.fail_run(EffectCompletion {
+                    instance_id,
+                    effect_id: &effect.effect_id,
+                    run_id: &run_id,
+                    provider: &options.provider,
+                    worker_id: "whip-worker",
+                    status: "failed",
+                    exit_code: Some(2),
+                    summary: Some("child workflow invocation link failed"),
+                    metadata_json: &metadata_json,
+                    idempotency_key: Some(&idempotency_key(&[
+                        instance_id,
+                        &effect.effect_id,
+                        "terminal",
+                    ])),
+                });
+            }
             (child_instance_id, child_ir, Some(started_run))
         }
     };
@@ -8019,7 +8076,7 @@ fn maude_bool_cases(expr: &Expr, context: &mut MaudeExprContext) -> MaudeBoolCas
             false_expr: format!(
                 "neExpr({}, {})",
                 maude_scalar_expr(left, context),
-                maude_scalar_expr(left, context)
+                maude_scalar_expr(right, context)
             ),
             error_expr: "exprError".to_owned(),
         },
@@ -10096,6 +10153,36 @@ rule classify
             result.predicate == "revision-completes-cancelled"
                 && result.outcome == ExpectedSearchResult::Solution
         }));
+    }
+
+    #[test]
+    fn generated_ne_false_case_compares_left_and_right_operands() {
+        let left = Expr::Literal(ExprLiteral::String("left".to_owned()));
+        let right = Expr::Literal(ExprLiteral::String("right".to_owned()));
+        let left_key = left.to_snapshot();
+        let right_key = right.to_snapshot();
+        let expr = Expr::Binary {
+            op: BinaryOp::Ne,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+        let mut context = MaudeExprContext::default();
+
+        let cases = maude_bool_cases(&expr, &mut context);
+
+        let left_symbol = context
+            .scalar_symbols
+            .get(&left_key)
+            .expect("left symbol exists");
+        let right_symbol = context
+            .scalar_symbols
+            .get(&right_key)
+            .expect("right symbol exists");
+        assert_ne!(left_symbol, right_symbol);
+        assert_eq!(
+            cases.false_expr,
+            format!("neExpr(scalar({left_symbol}), scalar({right_symbol}))")
+        );
     }
 
     #[test]

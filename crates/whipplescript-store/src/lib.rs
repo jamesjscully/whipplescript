@@ -132,6 +132,12 @@ pub struct RuleCommit<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuleCommitRevisionGuard<'a> {
+    pub program_version_id: &'a str,
+    pub revision_epoch: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkflowTerminal<'a> {
     pub kind: WorkflowTerminalKind,
     pub name: &'a str,
@@ -991,22 +997,10 @@ impl SqliteStore {
         let terminal_cancel_effects = if cancellation_policy == "keep" {
             Vec::new()
         } else {
-            old_revision_effects_on(
-                &self.connection,
-                instance_id,
-                &active_version_id,
-                active_revision_epoch,
-                false,
-            )?
+            revision_policy_effects_on(&self.connection, instance_id, false)?
         };
         let request_cancel_effects = if cancellation_policy == "request_running" {
-            old_revision_effects_on(
-                &self.connection,
-                instance_id,
-                &active_version_id,
-                active_revision_epoch,
-                true,
-            )?
+            revision_policy_effects_on(&self.connection, instance_id, true)?
         } else {
             Vec::new()
         };
@@ -1115,20 +1109,22 @@ impl SqliteStore {
             }
         }
 
-        let (program_id, current_version_id, current_epoch, status) = tx
+        let (program_id, program_name, current_version_id, current_epoch, status) = tx
             .query_row(
                 r#"
-                SELECT program_id, version_id, revision_epoch, status
+                SELECT instances.program_id, programs.name, instances.version_id, instances.revision_epoch, instances.status
                 FROM instances
-                WHERE instance_id = ?1
+                JOIN programs ON programs.program_id = instances.program_id
+                WHERE instances.instance_id = ?1
                 "#,
                 [activation.instance_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
@@ -1160,23 +1156,45 @@ impl SqliteStore {
                 "target version belongs to a different program".to_owned(),
             ));
         }
+        let (_active_program_id, active_summary) =
+            program_version_analysis_on(&tx, &current_version_id)?;
+        let (_candidate_program_id, candidate_summary) =
+            program_version_analysis_on(&tx, activation.to_version_id)?;
+        let mut compatibility_diagnostics = Vec::new();
+        let context = RevisionInstanceContext {
+            program_id: program_id.clone(),
+            program_name,
+            active_version_id: current_version_id.clone(),
+            status: status.clone(),
+        };
+        add_instance_revision_diagnostics(&context, &mut compatibility_diagnostics);
+        compare_revision_summaries(
+            &active_summary,
+            &candidate_summary,
+            &mut compatibility_diagnostics,
+        );
+        add_active_fact_schema_diagnostics(
+            &tx,
+            activation.instance_id,
+            &active_summary,
+            &candidate_summary,
+            &mut compatibility_diagnostics,
+        )?;
+        if !compatibility_diagnostics.is_empty() {
+            let codes = compatibility_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(StoreError::Conflict(format!(
+                "revision candidate is incompatible: {codes}"
+            )));
+        }
 
         let next_epoch = current_epoch + 1;
         let revision_id = random_id_on(&tx, "rev")?;
-        let queued_effects = old_revision_effects_on(
-            &tx,
-            activation.instance_id,
-            activation.from_version_id,
-            current_epoch,
-            false,
-        )?;
-        let running_effects = old_revision_effects_on(
-            &tx,
-            activation.instance_id,
-            activation.from_version_id,
-            current_epoch,
-            true,
-        )?;
+        let queued_effects = revision_policy_effects_on(&tx, activation.instance_id, false)?;
+        let running_effects = revision_policy_effects_on(&tx, activation.instance_id, true)?;
         let queued_effects_for_policy = if cancellation_policy == "keep" {
             Vec::new()
         } else {
@@ -1708,6 +1726,22 @@ impl SqliteStore {
     }
 
     pub fn commit_rule(&mut self, commit: RuleCommit<'_>) -> StoreResult<StoredEvent> {
+        self.commit_rule_inner(commit, None)
+    }
+
+    pub fn commit_rule_with_revision_guard(
+        &mut self,
+        commit: RuleCommit<'_>,
+        guard: RuleCommitRevisionGuard<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.commit_rule_inner(commit, Some(guard))
+    }
+
+    fn commit_rule_inner(
+        &mut self,
+        commit: RuleCommit<'_>,
+        guard: Option<RuleCommitRevisionGuard<'_>>,
+    ) -> StoreResult<StoredEvent> {
         let tx = self.connection.transaction()?;
         if let Some(status) = instance_status_on(&tx, commit.instance_id)? {
             if status != "running" {
@@ -1717,6 +1751,19 @@ impl SqliteStore {
             }
         }
         let (program_version_id, revision_epoch) = active_revision_on(&tx, commit.instance_id)?;
+        if let Some(guard) = guard {
+            if program_version_id.as_deref() != Some(guard.program_version_id)
+                || revision_epoch != guard.revision_epoch
+            {
+                return Err(StoreError::Conflict(format!(
+                    "active revision changed before rule commit (expected version {} epoch {}, got version {} epoch {})",
+                    guard.program_version_id,
+                    guard.revision_epoch,
+                    program_version_id.as_deref().unwrap_or("<none>"),
+                    revision_epoch
+                )));
+            }
+        }
         let payload = rule_commit_payload(commit, program_version_id.as_deref(), revision_epoch)?;
         let event = append_event_on(
             &tx,
@@ -3884,10 +3931,36 @@ impl SqliteStore {
 
     pub fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
         let tx = self.connection.transaction()?;
+        let artifact_run_links = {
+            let mut statement = tx.prepare(
+                r#"
+                SELECT artifact_id, run_id
+                FROM artifacts
+                WHERE run_id IN (
+                    SELECT run_id FROM runs WHERE instance_id = ?1
+                )
+                ORDER BY artifact_id
+                "#,
+            )?;
+            let rows = statement
+                .query_map([instance_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (artifact_id, _) in &artifact_run_links {
+            tx.execute(
+                "UPDATE artifacts SET run_id = NULL WHERE artifact_id = ?1",
+                [artifact_id],
+            )?;
+        }
         tx.execute(
             "DELETE FROM effect_cancellation_requests WHERE instance_id = ?1",
             [instance_id],
         )?;
+        tx.execute("DELETE FROM leases WHERE instance_id = ?1", [instance_id])?;
+        tx.execute("DELETE FROM runs WHERE instance_id = ?1", [instance_id])?;
         tx.execute(
             "DELETE FROM instance_revisions WHERE instance_id = ?1",
             [instance_id],
@@ -3907,9 +3980,15 @@ impl SqliteStore {
                 WHERE instance_id = ?1
                   AND event_type IN (
                       'rule.committed',
+                      'workflow.completed',
+                      'workflow.failed',
+                      'instance.transitioned',
                       'workflow.revision_activated',
+                      'effect.run_started',
+                      'effect.terminal',
                       'effect.cancelled',
-                      'effect.cancellation_requested'
+                      'effect.cancellation_requested',
+                      'lease.expired'
                   )
                 ORDER BY sequence
                 "#,
@@ -3931,6 +4010,16 @@ impl SqliteStore {
         for (event_id, event_type, payload_json, idempotency_key, causation_id) in events {
             match event_type.as_str() {
                 "rule.committed" => replay_rule_commit(&tx, instance_id, &event_id, &payload_json)?,
+                "workflow.completed" | "workflow.failed" => replay_workflow_terminal(
+                    &tx,
+                    instance_id,
+                    &event_id,
+                    &event_type,
+                    &payload_json,
+                )?,
+                "instance.transitioned" => {
+                    replay_instance_transition(&tx, instance_id, &event_id, &payload_json)?
+                }
                 "workflow.revision_activated" => replay_revision_activation(
                     &tx,
                     instance_id,
@@ -3938,6 +4027,10 @@ impl SqliteStore {
                     &payload_json,
                     idempotency_key.as_deref(),
                 )?,
+                "effect.run_started" => replay_run_started(&tx, instance_id, &payload_json)?,
+                "effect.terminal" => {
+                    replay_effect_terminal(&tx, instance_id, &event_id, &payload_json)?
+                }
                 "effect.cancelled" => {
                     replay_effect_cancelled(&tx, instance_id, &event_id, &payload_json)?
                 }
@@ -3949,7 +4042,25 @@ impl SqliteStore {
                     idempotency_key.as_deref(),
                     causation_id.as_deref(),
                 )?,
+                "lease.expired" => replay_lease_expired(&tx, instance_id, &payload_json)?,
                 _ => {}
+            }
+        }
+
+        for (artifact_id, run_id) in artifact_run_links {
+            let run_exists = tx
+                .query_row(
+                    "SELECT 1 FROM runs WHERE run_id = ?1",
+                    [&run_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if run_exists {
+                tx.execute(
+                    "UPDATE artifacts SET run_id = ?1 WHERE artifact_id = ?2",
+                    params![run_id, artifact_id],
+                )?;
             }
         }
 
@@ -5694,11 +5805,9 @@ fn revision_by_idempotency_on(
         .map_err(Into::into)
 }
 
-fn old_revision_effects_on(
+fn revision_policy_effects_on(
     connection: &Connection,
     instance_id: &str,
-    program_version_id: &str,
-    revision_epoch: i64,
     running: bool,
 ) -> StoreResult<Vec<String>> {
     let predicate = if running {
@@ -5711,17 +5820,12 @@ fn old_revision_effects_on(
         SELECT effect_id
         FROM effects
         WHERE instance_id = ?1
-          AND program_version_id = ?2
-          AND revision_epoch = ?3
           AND {predicate}
         ORDER BY created_at, effect_id
         "#
     ))?;
     let rows = statement
-        .query_map(
-            params![instance_id, program_version_id, revision_epoch],
-            |row| row.get(0),
-        )?
+        .query_map([instance_id], |row| row.get(0))?
         .collect::<result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -6401,6 +6505,77 @@ fn replay_rule_commit(
     Ok(())
 }
 
+fn replay_workflow_terminal(
+    connection: &Connection,
+    instance_id: &str,
+    event_id: &str,
+    event_type: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let status = payload
+        .get("workflow_status")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            if event_type == "workflow.failed" {
+                "failed"
+            } else {
+                "completed"
+            }
+        });
+    let terminal_name = payload
+        .get("terminal_name")
+        .and_then(Value::as_str)
+        .unwrap_or(event_type);
+    connection.execute(
+        r#"
+        UPDATE instances
+        SET status = ?1,
+            last_event_id = ?2,
+            last_error = CASE WHEN ?1 = 'failed' THEN ?3 ELSE last_error END,
+            updated_at = CURRENT_TIMESTAMP,
+            completed_at = CURRENT_TIMESTAMP
+        WHERE instance_id = ?4
+        "#,
+        params![status, event_id, terminal_name, instance_id],
+    )?;
+    Ok(())
+}
+
+fn replay_instance_transition(
+    connection: &Connection,
+    instance_id: &str,
+    event_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let status = payload.get("status").and_then(Value::as_str).unwrap_or("");
+    if status.is_empty() {
+        return Ok(());
+    }
+    connection.execute(
+        r#"
+        UPDATE instances
+        SET status = ?1,
+            last_event_id = ?2,
+            last_error = ?3,
+            updated_at = CURRENT_TIMESTAMP,
+            completed_at = CASE
+                WHEN ?1 IN ('completed', 'cancelled') THEN CURRENT_TIMESTAMP
+                ELSE completed_at
+            END
+        WHERE instance_id = ?4
+        "#,
+        params![
+            status,
+            event_id,
+            payload.get("reason").and_then(Value::as_str),
+            instance_id,
+        ],
+    )?;
+    Ok(())
+}
+
 fn replay_revision_activation(
     connection: &Connection,
     instance_id: &str,
@@ -6480,6 +6655,214 @@ fn replay_revision_activation(
     Ok(())
 }
 
+fn replay_run_started(
+    connection: &Connection,
+    instance_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let effect_id = payload
+        .get("effect_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let run_id = payload.get("run_id").and_then(Value::as_str).unwrap_or("");
+    let lease_id = payload
+        .get("lease_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if effect_id.is_empty() || run_id.is_empty() || lease_id.is_empty() {
+        return Ok(());
+    }
+    let provider = payload
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("replay");
+    let worker_id = payload
+        .get("worker_id")
+        .and_then(Value::as_str)
+        .unwrap_or("replay");
+    let lease_expires_at = payload
+        .get("lease_expires_at")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let metadata_json = payload
+        .get("metadata")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "{}".to_owned());
+
+    connection.execute(
+        r#"
+        UPDATE effects
+        SET status = 'running',
+            policy_block_reason = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE instance_id = ?1
+          AND effect_id = ?2
+          AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')
+        "#,
+        params![instance_id, effect_id],
+    )?;
+    connection.execute(
+        r#"
+        INSERT INTO runs (
+            run_id,
+            effect_id,
+            instance_id,
+            provider,
+            worker_id,
+            status,
+            metadata_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6)
+        ON CONFLICT(run_id) DO UPDATE SET
+            effect_id = excluded.effect_id,
+            instance_id = excluded.instance_id,
+            provider = excluded.provider,
+            worker_id = excluded.worker_id,
+            status = 'running',
+            completed_at = NULL,
+            exit_code = NULL,
+            summary = NULL,
+            metadata_json = excluded.metadata_json
+        "#,
+        params![
+            run_id,
+            effect_id,
+            instance_id,
+            provider,
+            worker_id,
+            metadata_json,
+        ],
+    )?;
+    connection.execute(
+        r#"
+        INSERT INTO leases (
+            lease_id,
+            run_id,
+            effect_id,
+            instance_id,
+            worker_id,
+            status,
+            expires_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)
+        ON CONFLICT(lease_id) DO UPDATE SET
+            run_id = excluded.run_id,
+            effect_id = excluded.effect_id,
+            instance_id = excluded.instance_id,
+            worker_id = excluded.worker_id,
+            status = 'active',
+            expires_at = excluded.expires_at,
+            released_at = NULL
+        "#,
+        params![
+            lease_id,
+            run_id,
+            effect_id,
+            instance_id,
+            worker_id,
+            lease_expires_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn replay_effect_terminal(
+    connection: &Connection,
+    instance_id: &str,
+    event_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let effect_id = payload
+        .get("effect_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let run_id = payload.get("run_id").and_then(Value::as_str).unwrap_or("");
+    if effect_id.is_empty() || run_id.is_empty() {
+        return Ok(());
+    }
+    let status = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let provider = payload
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("replay");
+    let worker_id = payload
+        .get("worker_id")
+        .and_then(Value::as_str)
+        .unwrap_or("replay");
+    let metadata_json = payload
+        .get("metadata")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "{}".to_owned());
+    connection.execute(
+        r#"
+        INSERT INTO runs (
+            run_id,
+            effect_id,
+            instance_id,
+            provider,
+            worker_id,
+            status,
+            completed_at,
+            exit_code,
+            summary,
+            metadata_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP, ?7, ?8, ?9)
+        ON CONFLICT(run_id) DO UPDATE SET
+            effect_id = excluded.effect_id,
+            instance_id = excluded.instance_id,
+            provider = excluded.provider,
+            worker_id = excluded.worker_id,
+            status = excluded.status,
+            completed_at = CURRENT_TIMESTAMP,
+            exit_code = excluded.exit_code,
+            summary = excluded.summary,
+            metadata_json = excluded.metadata_json
+        "#,
+        params![
+            run_id,
+            effect_id,
+            instance_id,
+            provider,
+            worker_id,
+            status,
+            payload.get("exit_code").and_then(Value::as_i64),
+            payload.get("summary").and_then(Value::as_str),
+            metadata_json,
+        ],
+    )?;
+    connection.execute(
+        r#"
+        UPDATE leases
+        SET status = 'released',
+            released_at = CURRENT_TIMESTAMP
+        WHERE run_id = ?1
+          AND effect_id = ?2
+          AND instance_id = ?3
+          AND status = 'active'
+        "#,
+        params![run_id, effect_id, instance_id],
+    )?;
+    connection.execute(
+        r#"
+        UPDATE effects
+        SET status = ?1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE effect_id = ?2
+          AND instance_id = ?3
+        "#,
+        params![status, effect_id, instance_id],
+    )?;
+    mark_cancellation_requests_terminal_on(connection, instance_id, effect_id, event_id)?;
+    satisfy_dependencies_on(connection, instance_id)?;
+    Ok(())
+}
+
 fn replay_effect_cancelled(
     connection: &Connection,
     instance_id: &str,
@@ -6509,6 +6892,57 @@ fn replay_effect_cancelled(
     Ok(())
 }
 
+fn replay_lease_expired(
+    connection: &Connection,
+    instance_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let lease_id = payload
+        .get("lease_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let run_id = payload.get("run_id").and_then(Value::as_str).unwrap_or("");
+    let effect_id = payload
+        .get("effect_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if lease_id.is_empty() || run_id.is_empty() || effect_id.is_empty() {
+        return Ok(());
+    }
+    connection.execute(
+        r#"
+        UPDATE leases
+        SET status = 'expired',
+            released_at = CURRENT_TIMESTAMP
+        WHERE lease_id = ?1
+        "#,
+        [lease_id],
+    )?;
+    connection.execute(
+        r#"
+        UPDATE runs
+        SET status = 'lease_expired',
+            completed_at = CURRENT_TIMESTAMP
+        WHERE run_id = ?1
+          AND status = 'running'
+        "#,
+        [run_id],
+    )?;
+    connection.execute(
+        r#"
+        UPDATE effects
+        SET status = 'queued',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE instance_id = ?1
+          AND effect_id = ?2
+          AND status = 'running'
+        "#,
+        params![instance_id, effect_id],
+    )?;
+    Ok(())
+}
+
 fn replay_cancellation_request(
     connection: &Connection,
     instance_id: &str,
@@ -6529,6 +6963,21 @@ fn replay_cancellation_request(
     if request_id.is_empty() || effect_id.is_empty() {
         return Ok(());
     }
+    let causation_event_id = match causation_event_id {
+        Some(candidate)
+            if connection
+                .query_row(
+                    "SELECT 1 FROM events WHERE instance_id = ?1 AND event_id = ?2",
+                    params![instance_id, candidate],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some() =>
+        {
+            Some(candidate)
+        }
+        _ => Some(event_id),
+    };
     connection.execute(
         r#"
         INSERT INTO effect_cancellation_requests (
@@ -6555,7 +7004,7 @@ fn replay_cancellation_request(
                 .get("requested_by")
                 .and_then(Value::as_str)
                 .unwrap_or("replay"),
-            causation_event_id.unwrap_or(event_id),
+            causation_event_id,
             idempotency_key,
         ],
     )?;
@@ -7631,6 +8080,112 @@ mod tests {
     }
 
     #[test]
+    fn guarded_rule_commit_rejects_stale_revision_epoch() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version1 = store
+            .create_program_version(test_program_version("RevisionGuard", "source-1", "ir-1"))
+            .expect("first program version creates");
+        let version2 = store
+            .create_program_version(test_program_version("RevisionGuard", "source-2", "ir-2"))
+            .expect("second program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version1.program_id,
+                version_id: &version1.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        store
+            .activate_revision(RevisionActivation {
+                instance_id: &instance.instance_id,
+                from_version_id: &version1.version_id,
+                to_version_id: &version2.version_id,
+                activation_policy_json: "{}",
+                cancellation_policy: "keep",
+                idempotency_key: Some("revise-before-stale-commit"),
+            })
+            .expect("revision activates");
+
+        let stale = store.commit_rule_with_revision_guard(
+            RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "old-rule",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect(
+                    "stale-effect",
+                    "agent.tell",
+                    "stale-effect-key",
+                )],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-stale"),
+            },
+            RuleCommitRevisionGuard {
+                program_version_id: &version1.version_id,
+                revision_epoch: 0,
+            },
+        );
+
+        assert!(matches!(
+            stale,
+            Err(StoreError::Conflict(message))
+                if message.contains("active revision changed before rule commit")
+        ));
+        assert_eq!(row_count(&store, "effects"), 0);
+    }
+
+    #[test]
+    fn activate_revision_rechecks_compatibility_in_transaction() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version1 = store
+            .create_program_version(test_program_version(
+                "RevisionCompatTxn",
+                "source-1",
+                "ir-1",
+            ))
+            .expect("first program version creates");
+        let incompatible_summary =
+            r#"{"workflow":"OtherWorkflow","workflow_contracts":[],"schemas":[]}"#;
+        let version2 = store
+            .create_program_version(NewProgramVersion {
+                analysis_summary_json: incompatible_summary,
+                ..test_program_version("RevisionCompatTxn", "source-2", "ir-2")
+            })
+            .expect("second program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version1.program_id,
+                version_id: &version1.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        let result = store.activate_revision(RevisionActivation {
+            instance_id: &instance.instance_id,
+            from_version_id: &version1.version_id,
+            to_version_id: &version2.version_id,
+            activation_policy_json: "{}",
+            cancellation_policy: "keep",
+            idempotency_key: Some("revise-incompatible-direct"),
+        });
+
+        assert!(matches!(
+            result,
+            Err(StoreError::Conflict(message))
+                if message.contains("revision.root_workflow_changed")
+        ));
+        let active = store
+            .get_instance(&instance.instance_id)
+            .expect("instance loads")
+            .expect("instance exists");
+        assert_eq!(active.version_id, version1.version_id);
+        assert_eq!(row_count(&store, "instance_revisions"), 0);
+    }
+
+    #[test]
     fn old_effect_policy_checks_use_effect_version_after_revision() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let version1 = store
@@ -7931,6 +8486,104 @@ mod tests {
                 .expect("claimable effects")
                 .is_empty(),
             "cancel-requested effects must not become claimable after lease expiry"
+        );
+    }
+
+    #[test]
+    fn later_revision_policy_includes_effects_kept_across_prior_revisions() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version1 = store
+            .create_program_version(test_program_version(
+                "RevisionPolicyAll",
+                "source-1",
+                "ir-1",
+            ))
+            .expect("first program version creates");
+        let version2 = store
+            .create_program_version(test_program_version(
+                "RevisionPolicyAll",
+                "source-2",
+                "ir-2",
+            ))
+            .expect("second program version creates");
+        let version3 = store
+            .create_program_version(test_program_version(
+                "RevisionPolicyAll",
+                "source-3",
+                "ir-3",
+            ))
+            .expect("third program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version1.program_id,
+                version_id: &version1.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        let effects = [
+            test_effect("kept-queued", "agent.tell", "kept-queued-key"),
+            test_effect("kept-running", "agent.tell", "kept-running-key"),
+        ];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "old-rule",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-kept-effects"),
+            })
+            .expect("old effects commit");
+        store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "kept-running",
+                run_id: "run-kept-running",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-kept-running",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        store
+            .activate_revision(RevisionActivation {
+                instance_id: &instance.instance_id,
+                from_version_id: &version1.version_id,
+                to_version_id: &version2.version_id,
+                activation_policy_json: "{}",
+                cancellation_policy: "keep",
+                idempotency_key: Some("revise-keep-old-effects"),
+            })
+            .expect("first revision keeps existing work");
+
+        let impact = store
+            .revision_cancellation_impact(&instance.instance_id, "running")
+            .expect("later revision impact reports");
+        assert_eq!(impact.active_version_id, version2.version_id.as_str());
+        assert_eq!(impact.terminal_cancel_effects, vec!["kept-queued"]);
+        assert_eq!(impact.request_cancel_effects, vec!["kept-running"]);
+
+        store
+            .activate_revision(RevisionActivation {
+                instance_id: &instance.instance_id,
+                from_version_id: &version2.version_id,
+                to_version_id: &version3.version_id,
+                activation_policy_json: "{}",
+                cancellation_policy: "running",
+                idempotency_key: Some("revise-request-kept-effects"),
+            })
+            .expect("second revision applies policy to all existing old work");
+
+        assert_eq!(effect_status(&store, "kept-queued"), "cancelled");
+        assert_eq!(effect_status(&store, "kept-running"), "running");
+        assert_eq!(
+            effect_revision(&store, "kept-running"),
+            (Some(version1.version_id.clone()), 0, true)
         );
     }
 
@@ -8676,6 +9329,179 @@ mod tests {
                 .expect("requests list")
                 .len(),
             1
+        );
+        let runs = store
+            .list_runs(&instance.instance_id)
+            .expect("runs rebuild from run-start event");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "running");
+        assert!(runs[0].cancel_requested);
+        assert_eq!(lease_status(&store, "lease-replay-running"), "active");
+    }
+
+    #[test]
+    fn replay_reconstructs_terminal_runs_leases_and_resolved_cancel_requests() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version(
+                "RevisionReplayTerminal",
+                "source-1",
+                "ir-1",
+            ))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("tell", "agent.tell", "terminal-replay-key")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-terminal-replay"),
+            })
+            .expect("effect commits");
+        store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                run_id: "run-terminal-replay",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-terminal-replay",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        store
+            .request_effect_cancellation(EffectCancellationRequest {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                revision_id: None,
+                reason: Some("operator"),
+                requested_by: "operator",
+                causation_event_id: None,
+                idempotency_key: Some("request-terminal-replay"),
+            })
+            .expect("cancellation requests");
+        store
+            .complete_effect(EffectCompletion {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                run_id: "run-terminal-replay",
+                provider: "test",
+                worker_id: "worker-1",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some("done"),
+                metadata_json: r#"{"ok":true}"#,
+                idempotency_key: Some("complete-terminal-replay"),
+            })
+            .expect("effect completes");
+
+        store
+            .rebuild_projections(&instance.instance_id)
+            .expect("live projections rebuild");
+
+        assert_eq!(effect_status(&store, "tell"), "completed");
+        let runs = store
+            .list_runs(&instance.instance_id)
+            .expect("runs list after replay");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "completed");
+        assert!(!runs[0].cancel_requested);
+        assert_eq!(lease_status(&store, "lease-terminal-replay"), "released");
+        let requests = store
+            .list_effect_cancellation_requests(&instance.instance_id)
+            .expect("requests replay");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].status, "terminal");
+        assert!(requests[0].resolved_by_event_id.is_some());
+    }
+
+    #[test]
+    fn replay_reconstructs_expired_leases_without_reclaiming_cancel_requested_effects() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version(
+                "RevisionReplayLeaseExpired",
+                "source-1",
+                "ir-1",
+            ))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("tell", "agent.tell", "lease-replay-key")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-lease-replay"),
+            })
+            .expect("effect commits");
+        store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                run_id: "run-lease-replay",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-lease-replay",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        store
+            .request_effect_cancellation(EffectCancellationRequest {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                revision_id: None,
+                reason: Some("operator"),
+                requested_by: "operator",
+                causation_event_id: None,
+                idempotency_key: Some("request-lease-replay"),
+            })
+            .expect("cancellation requests");
+        store
+            .expire_leases(&instance.instance_id, "2030-01-02T00:00:00Z")
+            .expect("lease expires");
+
+        store
+            .rebuild_projections(&instance.instance_id)
+            .expect("live projections rebuild");
+
+        assert_eq!(effect_status(&store, "tell"), "queued");
+        assert_eq!(lease_status(&store, "lease-lease-replay"), "expired");
+        let runs = store
+            .list_runs(&instance.instance_id)
+            .expect("runs list after replay");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "lease_expired");
+        assert!(runs[0].cancel_requested);
+        assert!(
+            store
+                .claimable_effects(&instance.instance_id)
+                .expect("claimable effects")
+                .is_empty(),
+            "cancel-requested effects must not become claimable after replayed lease expiry"
         );
     }
 
@@ -10014,6 +10840,15 @@ mod tests {
         source_hash: &'a str,
         ir_hash: &'a str,
     ) -> NewProgramVersion<'a> {
+        let analysis_summary_json = Box::leak(
+            json!({
+                "workflow": program_name,
+                "workflow_contracts": [],
+                "schemas": [],
+            })
+            .to_string()
+            .into_boxed_str(),
+        );
         NewProgramVersion {
             program_name,
             source_hash,
@@ -10023,7 +10858,7 @@ mod tests {
             declared_profiles_json: "[]",
             declared_skills_json: "[]",
             declared_schemas_json: "[]",
-            analysis_summary_json: "{}",
+            analysis_summary_json,
             generated_artifacts_json: "[]",
             artifact_root: None,
         }
