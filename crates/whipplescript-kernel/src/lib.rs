@@ -12,7 +12,10 @@ use harness::{
 use loft::{LoftAction, LoftClient, LoftEffectRequest, LoftEffectResult, LoftEffectStatus};
 use serde_json::{json, Value};
 use trace::{DependencyEdge, EffectStatus, TraceEvent, TraceRecord};
-use whipplescript_parser::{IrPrimitiveType, IrProgram, IrSchema, IrType, IrWorkflowContractKind};
+use whipplescript_parser::{
+    DependencyPredicate, IrEffectKind, IrPrimitiveType, IrProgram, IrSchema, IrType,
+    IrWorkflowContractKind,
+};
 use whipplescript_store::{
     ArtifactRecord, ClaimableEffect, DerivedFact, EffectCancellation, EffectCompletion,
     EvidenceRecord, ExpiredLease, InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent,
@@ -1294,6 +1297,7 @@ pub fn program_analysis_summary_json(program: &IrProgram) -> String {
         .collect::<Vec<_>>();
     generated_declarations.sort();
     generated_declarations.dedup();
+    let generated_declaration_hashes = generated_declaration_hashes(program);
     let schemas = program
         .schemas
         .iter()
@@ -1306,6 +1310,7 @@ pub fn program_analysis_summary_json(program: &IrProgram) -> String {
         "include_closure": include_closure,
         "pattern_applications": pattern_applications,
         "generated_declarations": generated_declarations,
+        "generated_declaration_hashes": generated_declaration_hashes,
         "schemas": schemas,
     })
     .to_string()
@@ -1341,6 +1346,159 @@ fn schema_summary(schema: &IrSchema) -> Value {
     }
 }
 
+fn generated_declaration_hashes(program: &IrProgram) -> Vec<Value> {
+    let mut generated_declarations = program
+        .pattern_applications
+        .iter()
+        .flat_map(|application| application.generated.iter().cloned())
+        .collect::<Vec<_>>();
+    generated_declarations.sort();
+    generated_declarations.dedup();
+
+    generated_declarations
+        .into_iter()
+        .map(
+            |declaration| match generated_declaration_payload(program, &declaration) {
+                Some(payload) => json!({
+                    "declaration": declaration,
+                    "hash": stable_hash_hex(&payload.to_string()),
+                }),
+                None => json!({
+                    "declaration": declaration,
+                    "hash": stable_hash_hex("missing-generated-declaration"),
+                    "missing": true,
+                }),
+            },
+        )
+        .collect()
+}
+
+fn generated_declaration_payload(program: &IrProgram, declaration: &str) -> Option<Value> {
+    let (kind, name) = declaration.split_once(':')?;
+    match kind {
+        "agent" => program
+            .agents
+            .iter()
+            .find(|agent| agent.name == name)
+            .map(|agent| {
+                json!({
+                    "kind": "agent",
+                    "name": agent.name,
+                    "profile": agent.profile,
+                    "capacity": agent.capacity,
+                    "skills": agent.skills,
+                    "capabilities": agent.capabilities,
+                })
+            }),
+        "enum" => program.schemas.iter().find_map(|schema| match schema {
+            IrSchema::Enum(enum_decl) if enum_decl.name == name => Some(json!({
+                "kind": "enum",
+                "name": enum_decl.name,
+                "variants": enum_decl.variants,
+            })),
+            _ => None,
+        }),
+        "class" => program.schemas.iter().find_map(|schema| match schema {
+            IrSchema::Class(class) if class.name == name => Some(schema_summary(schema)),
+            _ => None,
+        }),
+        "coerce" => program
+            .coerces
+            .iter()
+            .find(|coerce| coerce.name == name)
+            .map(|coerce| {
+                json!({
+                    "kind": "coerce",
+                    "name": coerce.name,
+                    "params": coerce
+                        .params
+                        .iter()
+                        .map(|param| json!({
+                            "name": param.name,
+                            "type": ir_type_signature(&param.ty),
+                        }))
+                        .collect::<Vec<_>>(),
+                    "output": ir_type_signature(&coerce.output),
+                    "body": coerce.body,
+                })
+            }),
+        "rule" => program
+            .rules
+            .iter()
+            .find(|rule| rule.name == name)
+            .map(|rule| {
+                json!({
+                    "kind": "rule",
+                    "name": rule.name,
+                    "whens": rule
+                        .whens
+                        .iter()
+                        .map(|when| json!({
+                            "source": when.source,
+                            "pattern": when.pattern,
+                            "guard": when.guard.as_ref().map(|guard| guard.source.as_str()),
+                        }))
+                        .collect::<Vec<_>>(),
+                    "body": rule.body,
+                    "metadata": {
+                        "fact_reads": rule.metadata.fact_reads,
+                        "projection_reads": rule
+                            .metadata
+                            .projection_reads
+                            .iter()
+                            .map(|read| json!({
+                                "kind": format!("{:?}", read.kind),
+                                "head": read.head,
+                                "guard": read.guard,
+                            }))
+                            .collect::<Vec<_>>(),
+                        "fact_writes": rule.metadata.fact_writes,
+                        "fact_consumes": rule.metadata.fact_consumes,
+                        "effects": rule
+                            .metadata
+                            .effects
+                            .iter()
+                            .map(|effect| json!({
+                                "id": effect.id,
+                                "kind": effect_kind_name(&effect.kind),
+                                "binding": effect.binding,
+                                "required_capabilities": effect.required_capabilities,
+                                "idempotency_key": effect.idempotency_key,
+                            }))
+                            .collect::<Vec<_>>(),
+                        "dependencies": rule
+                            .metadata
+                            .dependencies
+                            .iter()
+                            .map(|dependency| json!({
+                                "upstream": dependency.upstream,
+                                "predicate": dependency_predicate_name(&dependency.predicate),
+                                "downstream": dependency.downstream,
+                            }))
+                            .collect::<Vec<_>>(),
+                        "terminal_outputs": rule
+                            .metadata
+                            .terminal_outputs
+                            .iter()
+                            .map(|terminal| json!({
+                                "binding": terminal.binding,
+                                "alternatives": terminal
+                                    .alternatives
+                                    .iter()
+                                    .map(|alternative| json!({
+                                        "tag": alternative.tag,
+                                        "payload_type": ir_type_signature(&alternative.payload_type),
+                                    }))
+                                    .collect::<Vec<_>>(),
+                            }))
+                            .collect::<Vec<_>>(),
+                    },
+                })
+            }),
+        _ => None,
+    }
+}
+
 fn ir_type_signature(ty: &IrType) -> String {
     match ty {
         IrType::Primitive(primitive) => primitive_type_name(primitive).to_owned(),
@@ -1366,6 +1524,26 @@ fn ir_type_signature(ty: &IrType) -> String {
                 .join(" | ");
             format!("union<{variants}>")
         }
+    }
+}
+
+fn effect_kind_name(kind: &IrEffectKind) -> &'static str {
+    match kind {
+        IrEffectKind::AgentTell => "agent.tell",
+        IrEffectKind::BamlCoerce => "baml.coerce",
+        IrEffectKind::LoftClaim => "loft.claim",
+        IrEffectKind::HumanAsk => "human.ask",
+        IrEffectKind::CapabilityCall => "capability.call",
+        IrEffectKind::EventEmit => "event.emit",
+        IrEffectKind::WorkflowInvoke => "workflow.invoke",
+    }
+}
+
+fn dependency_predicate_name(predicate: &DependencyPredicate) -> &'static str {
+    match predicate {
+        DependencyPredicate::Succeeds => "succeeds",
+        DependencyPredicate::Fails => "fails",
+        DependencyPredicate::Completes => "completes",
     }
 }
 
@@ -1404,6 +1582,10 @@ fn stable_hash(value: &str) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+fn stable_hash_hex(value: &str) -> String {
+    format!("{:016x}", stable_hash(value))
 }
 
 fn provider_status(status: &ProviderRunStatus) -> &'static str {
@@ -1653,6 +1835,64 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(first, different);
         assert!(first.starts_with("key_"));
+    }
+
+    #[test]
+    fn analysis_summary_hashes_generated_declarations() {
+        let compiled = compile_program(
+            r#"
+pattern Review<Input> {
+  class Result {
+    item Input
+  }
+
+  rule dispatch
+    when Input as item
+  => {
+  }
+}
+
+workflow Root {
+  class Task {
+    title string
+  }
+
+  apply Review<Task> as taskReview {
+  }
+}
+"#,
+        );
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let program = compiled.ir.expect("program compiles");
+
+        let summary = serde_json::from_str::<Value>(&program_analysis_summary_json(&program))
+            .expect("analysis summary is valid JSON");
+        let hashes = summary
+            .get("generated_declaration_hashes")
+            .and_then(Value::as_array)
+            .expect("generated declaration hashes are present");
+        let class_hash = hashes
+            .iter()
+            .find(|entry| {
+                entry.get("declaration").and_then(Value::as_str) == Some("class:taskReview_Result")
+            })
+            .expect("generated class hash is present");
+        let rule_hash = hashes
+            .iter()
+            .find(|entry| {
+                entry.get("declaration").and_then(Value::as_str) == Some("rule:taskReview_dispatch")
+            })
+            .expect("generated rule hash is present");
+
+        for entry in [class_hash, rule_hash] {
+            let hash = entry
+                .get("hash")
+                .and_then(Value::as_str)
+                .expect("hash is a string");
+            assert_eq!(hash.len(), 16);
+            assert!(hash.chars().all(|ch| ch.is_ascii_hexdigit()));
+            assert_ne!(entry.get("missing").and_then(Value::as_bool), Some(true));
+        }
     }
 
     #[test]
