@@ -283,24 +283,61 @@ impl RuntimeKernel {
         &mut self,
         activation: RevisionActivation<'_>,
     ) -> StoreResult<WorkflowRevisionView> {
-        let impact = self
-            .store
-            .revision_cancellation_impact(activation.instance_id, activation.cancellation_policy)?;
         let revision = self.store.activate_revision(activation)?;
+        self.emit_revision_activation_trace(&revision)?;
+        Ok(revision)
+    }
+
+    fn emit_revision_activation_trace(
+        &mut self,
+        revision: &WorkflowRevisionView,
+    ) -> StoreResult<()> {
+        if self.trace.iter().any(|record| {
+            matches!(
+                &record.event,
+                TraceEvent::RevisionActivated { revision_id, .. }
+                    if revision_id == &revision.revision_id
+            )
+        }) {
+            return Ok(());
+        }
+        let event = self
+            .store
+            .list_events(&revision.instance_id)?
+            .into_iter()
+            .find(|event| event.event_id == revision.activated_by_event_id)
+            .ok_or_else(|| {
+                StoreError::Conflict(format!(
+                    "revision event {} was not found",
+                    revision.activated_by_event_id
+                ))
+            })?;
+        let payload: Value = serde_json::from_str(&event.payload_json)?;
+        let terminal_cancel_effects =
+            string_array_field(&payload, "terminal_cancel_effects").unwrap_or_default();
+        let request_cancel_effects =
+            string_array_field(&payload, "request_cancel_effects").unwrap_or_default();
         self.emit(TraceEvent::RevisionActivated {
             revision_id: revision.revision_id.clone(),
             from_version_id: revision.from_version_id.clone(),
             to_version_id: revision.to_version_id.clone(),
-            from_epoch: impact.active_revision_epoch,
+            from_epoch: payload
+                .get("from_epoch")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(|| revision.epoch.saturating_sub(1)),
             to_epoch: revision.epoch,
-            cancellation_policy: impact.cancellation_policy,
-            terminal_cancel_effects: impact.terminal_cancel_effects.clone(),
-            request_cancel_effects: impact.request_cancel_effects.clone(),
+            cancellation_policy: payload
+                .get("cancellation_policy")
+                .and_then(Value::as_str)
+                .unwrap_or(&revision.cancellation_policy)
+                .to_owned(),
+            terminal_cancel_effects: terminal_cancel_effects.clone(),
+            request_cancel_effects: request_cancel_effects.clone(),
         });
-        for effect_id in impact.terminal_cancel_effects {
+        for effect_id in terminal_cancel_effects {
             self.emit(TraceEvent::EffectCancelled { effect_id });
         }
-        for effect_id in impact.request_cancel_effects {
+        for effect_id in request_cancel_effects {
             self.emit(TraceEvent::EffectCancellationRequested {
                 effect_id,
                 revision_id: Some(revision.revision_id.clone()),
@@ -308,7 +345,7 @@ impl RuntimeKernel {
                 requested_by: "workflow.revision".to_owned(),
             });
         }
-        Ok(revision)
+        Ok(())
     }
 
     pub fn record_workflow_invocation(
@@ -1916,6 +1953,16 @@ fn json_from_str(source: &str) -> Value {
     serde_json::from_str(source).unwrap_or_else(|_| Value::String(source.to_owned()))
 }
 
+fn string_array_field(value: &Value, field: &str) -> Option<Vec<String>> {
+    value.get(field)?.as_array().map(|items| {
+        items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
 /// Placeholder kernel entry point.
 ///
 /// The real kernel will own rule commits, effect graph enqueueing, dependency
@@ -1938,7 +1985,7 @@ mod tests {
     use whipplescript_parser::compile_program;
     use whipplescript_store::{
         EffectCancellation, EffectCancellationRequest, EffectCompletion, LeaseRenewal, NewEffect,
-        NewFact, RetryEffect, RuleCommit, RunStart, SkillRegistration,
+        NewFact, RetryEffect, RevisionActivation, RuleCommit, RunStart, SkillRegistration,
     };
 
     #[test]
@@ -2025,6 +2072,79 @@ workflow Root {
             assert!(hash.chars().all(|ch| ch.is_ascii_hexdigit()));
             assert_ne!(entry.get("missing").and_then(Value::as_bool), Some(true));
         }
+    }
+
+    #[test]
+    fn idempotent_revision_activation_emits_trace_once_from_stored_event() {
+        let compiled = compile_program(
+            r#"
+workflow RevisionTrace
+
+rule noop
+  when started
+=> {
+}
+"#,
+        );
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let program = compiled.ir.expect("program compiles");
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version1 = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &program.workflow,
+                    source_hash: "source-1",
+                    ir_hash: "ir-1",
+                    compiler_version: "test",
+                },
+                &program,
+            )
+            .expect("first version creates");
+        let version2 = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &program.workflow,
+                    source_hash: "source-2",
+                    ir_hash: "ir-2",
+                    compiler_version: "test",
+                },
+                &program,
+            )
+            .expect("second version creates");
+        let instance_id = kernel
+            .create_instance(&version1, "{}")
+            .expect("instance creates");
+
+        let first = kernel
+            .activate_revision(RevisionActivation {
+                instance_id: &instance_id,
+                from_version_id: &version1.version_id,
+                to_version_id: &version2.version_id,
+                activation_policy_json: "{}",
+                cancellation_policy: "keep",
+                idempotency_key: Some("revise-once"),
+            })
+            .expect("revision activates");
+        let retry = kernel
+            .activate_revision(RevisionActivation {
+                instance_id: &instance_id,
+                from_version_id: &version1.version_id,
+                to_version_id: &version2.version_id,
+                activation_policy_json: "{}",
+                cancellation_policy: "keep",
+                idempotency_key: Some("revise-once"),
+            })
+            .expect("idempotent retry returns existing revision");
+
+        assert_eq!(retry.revision_id, first.revision_id);
+        let activation_records = kernel
+            .trace()
+            .iter()
+            .filter(|record| matches!(record.event, TraceEvent::RevisionActivated { .. }))
+            .count();
+        assert_eq!(activation_records, 1);
+        check_trace(kernel.trace()).expect("revision trace remains conformant");
     }
 
     #[test]

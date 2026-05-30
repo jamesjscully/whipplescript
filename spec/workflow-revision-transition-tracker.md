@@ -50,6 +50,12 @@ calling workflow revision stable.
   revised mid-start.
 - [x] Fix generated Maude lowering for `!=` so the false branch compares left
   against right, not left against itself.
+- [x] Emit kernel revision traces from the stored activation event so
+  idempotent activation retries do not duplicate or recompute stale cancellation
+  trace records.
+- [x] Bind revision activation idempotency keys to the original activation
+  input so key reuse with a different target, policy, or activation payload is
+  rejected instead of returning an unrelated revision.
 
 Stage 10 audit notes:
 
@@ -71,6 +77,14 @@ Stage 10 audit notes:
   transactions while creating the child, invocation link, and parent run.
 - Finding 6: generated Maude expression lowering emits `neExpr(left, left)` for
   part of `!=` handling.
+- Finding 7: kernel activation tracing recomputed cancellation impact before
+  the durable activation transaction and emitted trace records again for an
+  idempotent retry. Trace emission now reads the stored revision event payload
+  and skips already-emitted revision activations.
+- Finding 8: `activate_revision` returned the existing revision for any reused
+  idempotency key on the same instance, even when the new request changed the
+  target version, cancellation policy, or activation policy payload. Reuse now
+  succeeds only when those inputs match the stored activation.
 - Stage 10 verification passed on May 30, 2026:
   `cargo fmt --all -- --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`,

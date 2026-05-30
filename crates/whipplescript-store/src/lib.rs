@@ -1098,13 +1098,19 @@ impl SqliteStore {
         activation: RevisionActivation<'_>,
     ) -> StoreResult<WorkflowRevisionView> {
         let cancellation_policy = normalize_cancellation_policy(activation.cancellation_policy)?;
-        serde_json::from_str::<Value>(activation.activation_policy_json)?;
+        let activation_policy: Value = serde_json::from_str(activation.activation_policy_json)?;
 
         let tx = self.connection.transaction()?;
         if let Some(idempotency_key) = activation.idempotency_key {
             if let Some(existing) =
                 revision_by_idempotency_on(&tx, activation.instance_id, idempotency_key)?
             {
+                ensure_revision_idempotency_matches(
+                    &existing,
+                    &activation,
+                    &activation_policy,
+                    cancellation_policy,
+                )?;
                 return Ok(existing);
             }
         }
@@ -1212,7 +1218,7 @@ impl SqliteStore {
             "to_version_id": activation.to_version_id,
             "from_epoch": current_epoch,
             "to_epoch": next_epoch,
-            "activation_policy": serde_json::from_str::<Value>(activation.activation_policy_json)?,
+            "activation_policy": activation_policy,
             "cancellation_policy": cancellation_policy,
             "terminal_cancel_effects": &queued_effects_for_policy,
             "request_cancel_effects": &running_effects_for_policy,
@@ -5805,6 +5811,26 @@ fn revision_by_idempotency_on(
         .map_err(Into::into)
 }
 
+fn ensure_revision_idempotency_matches(
+    existing: &WorkflowRevisionView,
+    activation: &RevisionActivation<'_>,
+    activation_policy: &Value,
+    cancellation_policy: &str,
+) -> StoreResult<()> {
+    let existing_activation_policy: Value = serde_json::from_str(&existing.activation_policy_json)?;
+    if existing.instance_id.as_str() == activation.instance_id
+        && existing.from_version_id.as_str() == activation.from_version_id
+        && existing.to_version_id.as_str() == activation.to_version_id
+        && existing.cancellation_policy.as_str() == cancellation_policy
+        && &existing_activation_policy == activation_policy
+    {
+        return Ok(());
+    }
+    Err(StoreError::Conflict(
+        "revision idempotency key was reused with different activation input".to_owned(),
+    ))
+}
+
 fn revision_policy_effects_on(
     connection: &Connection,
     instance_id: &str,
@@ -8076,6 +8102,21 @@ mod tests {
             })
             .expect("idempotent revision returns existing row");
         assert_eq!(duplicate.revision_id, revision.revision_id);
+        assert_eq!(row_count(&store, "instance_revisions"), 1);
+
+        let reused_key = store.activate_revision(RevisionActivation {
+            instance_id: &instance.instance_id,
+            from_version_id: &version1.version_id,
+            to_version_id: &version2.version_id,
+            activation_policy_json: r#"{"changed":true}"#,
+            cancellation_policy: "keep",
+            idempotency_key: Some("revise-keep"),
+        });
+        assert!(matches!(
+            reused_key,
+            Err(StoreError::Conflict(message))
+                if message.contains("idempotency key was reused")
+        ));
         assert_eq!(row_count(&store, "instance_revisions"), 1);
     }
 
