@@ -299,7 +299,7 @@ version for a running instance.
   candidate program versions.
 - [x] Validate selected root workflow compatibility.
 - [x] Validate workflow input/output/failure contracts.
-- [ ] Validate active fact compatibility against candidate schemas where
+- [x] Validate active fact compatibility against candidate schemas where
   possible.
 - [ ] Validate agent/profile/capability changes:
   - [ ] new effects use candidate declarations and policies
@@ -329,9 +329,13 @@ Stage 3 partial audit notes:
   instance's active version with a candidate version. It rejects root workflow
   changes, input contract additions/changes/removals, output/failure removals,
   and output/failure type changes with structured diagnostic codes.
-- Active fact schema compatibility, agent/profile/capability impact analysis,
-  generated declaration hashes, and generated Maude checks remain open Stage 3
-  work.
+- Active fact compatibility now validates live unconsumed facts against
+  candidate schema summaries when the fact schema can be identified. Optional
+  additive class fields are accepted; removed schemas, required-field additions,
+  type changes, and removed enum variants produce structured compatibility
+  diagnostics.
+- Agent/profile/capability impact analysis, generated declaration hashes, and
+  generated Maude checks remain open Stage 3 work.
 
 Acceptance:
 

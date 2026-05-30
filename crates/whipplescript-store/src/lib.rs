@@ -1037,6 +1037,13 @@ impl SqliteStore {
             ));
         }
         compare_revision_summaries(&active_summary, &candidate_summary, &mut diagnostics);
+        add_active_fact_schema_diagnostics(
+            &self.connection,
+            instance_id,
+            &active_summary,
+            &candidate_summary,
+            &mut diagnostics,
+        )?;
 
         Ok(RevisionCompatibilityReport {
             instance_id: instance_id.to_owned(),
@@ -1070,6 +1077,13 @@ impl SqliteStore {
             ));
         }
         compare_revision_summaries(&active_summary, &candidate_summary, &mut diagnostics);
+        add_active_fact_schema_diagnostics(
+            &self.connection,
+            instance_id,
+            &active_summary,
+            &candidate_summary,
+            &mut diagnostics,
+        )?;
 
         Ok(RevisionCompatibilityReport {
             instance_id: instance_id.to_owned(),
@@ -4983,6 +4997,397 @@ fn contracts_by_name(summary: &Value, kind: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn add_active_fact_schema_diagnostics(
+    connection: &Connection,
+    instance_id: &str,
+    active_summary: &Value,
+    candidate_summary: &Value,
+    diagnostics: &mut Vec<RevisionCompatibilityDiagnostic>,
+) -> StoreResult<()> {
+    let active_schemas = schemas_by_name(active_summary);
+    let candidate_schemas = schemas_by_name(candidate_summary);
+    if active_schemas.is_empty() && candidate_schemas.is_empty() {
+        return Ok(());
+    }
+
+    let mut statement = connection.prepare(
+        r#"
+        SELECT fact_id, name, schema_id, value_json
+        FROM facts
+        WHERE instance_id = ?1
+          AND consumed_at IS NULL
+        ORDER BY fact_id
+        "#,
+    )?;
+    let rows = statement.query_map([instance_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (fact_id, name, schema_id, value_json) = row?;
+        let schema_name = fact_schema_name(
+            &name,
+            schema_id.as_deref(),
+            &active_schemas,
+            &candidate_schemas,
+        );
+        let Some(schema_name) = schema_name else {
+            continue;
+        };
+        let Some(candidate_schema) = candidate_schemas.get(schema_name) else {
+            diagnostics.push(revision_compatibility_diagnostic(
+                "revision.active_fact_schema_removed",
+                format!("active fact `{fact_id}` uses schema `{schema_name}` missing from candidate version"),
+                Some(schema_name),
+            ));
+            continue;
+        };
+
+        let value = serde_json::from_str::<Value>(&value_json)?;
+        let mut errors = Vec::new();
+        validate_fact_value_against_schema(
+            &value,
+            candidate_schema,
+            &candidate_schemas,
+            "$",
+            &mut errors,
+            0,
+        );
+        if !errors.is_empty() {
+            diagnostics.push(revision_compatibility_diagnostic(
+                "revision.active_fact_incompatible",
+                format!(
+                    "active fact `{fact_id}` no longer typechecks as `{schema_name}`: {}",
+                    errors.join("; ")
+                ),
+                Some(schema_name),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn schemas_by_name(summary: &Value) -> BTreeMap<String, Value> {
+    summary
+        .get("schemas")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|schema| Some((schema.get("name")?.as_str()?.to_owned(), schema.clone())))
+        .collect()
+}
+
+fn fact_schema_name<'a>(
+    fact_name: &'a str,
+    schema_id: Option<&'a str>,
+    active_schemas: &BTreeMap<String, Value>,
+    candidate_schemas: &BTreeMap<String, Value>,
+) -> Option<&'a str> {
+    if let Some(schema_id) = schema_id {
+        if active_schemas.contains_key(schema_id) || candidate_schemas.contains_key(schema_id) {
+            return Some(schema_id);
+        }
+    }
+    if active_schemas.contains_key(fact_name) || candidate_schemas.contains_key(fact_name) {
+        return Some(fact_name);
+    }
+    None
+}
+
+fn validate_fact_value_against_schema(
+    value: &Value,
+    schema: &Value,
+    schemas: &BTreeMap<String, Value>,
+    path: &str,
+    errors: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > 32 {
+        errors.push(format!("{path} exceeded schema recursion limit"));
+        return;
+    }
+    match schema.get("kind").and_then(Value::as_str) {
+        Some("class") => validate_value_against_fields(
+            value,
+            schema.get("fields").and_then(Value::as_array),
+            schemas,
+            path,
+            errors,
+            depth,
+        ),
+        Some("enum") => {
+            let variants = schema
+                .get("variants")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            match value.as_str() {
+                Some(variant) if variants.contains(&variant) => {}
+                Some(variant) => errors.push(format!(
+                    "{path} has enum variant `{variant}` not declared by candidate"
+                )),
+                None => errors.push(format!("{path} must be a string enum variant")),
+            }
+        }
+        Some(kind) => errors.push(format!("{path} uses unsupported schema kind `{kind}`")),
+        None => errors.push(format!("{path} uses schema without a kind")),
+    }
+}
+
+fn validate_value_against_fields(
+    value: &Value,
+    fields: Option<&Vec<Value>>,
+    schemas: &BTreeMap<String, Value>,
+    path: &str,
+    errors: &mut Vec<String>,
+    depth: usize,
+) {
+    let Some(object) = value.as_object() else {
+        errors.push(format!("{path} must be an object"));
+        return;
+    };
+    let fields = fields.map(Vec::as_slice).unwrap_or(&[]);
+    let declared = fields
+        .iter()
+        .filter_map(|field| Some((field.get("name")?.as_str()?, field.get("type")?.as_str()?)))
+        .collect::<BTreeMap<_, _>>();
+    for key in object.keys() {
+        if !declared.contains_key(key.as_str()) {
+            errors.push(format!("{path}.{key} is not declared by candidate"));
+        }
+    }
+    for (name, signature) in declared {
+        let field_path = format!("{path}.{name}");
+        match object.get(name) {
+            Some(value) => {
+                validate_value_against_type_signature(
+                    value,
+                    signature,
+                    schemas,
+                    &field_path,
+                    errors,
+                    depth + 1,
+                );
+            }
+            None if is_optional_signature(signature) => {}
+            None => errors.push(format!("{field_path} is required by candidate")),
+        }
+    }
+}
+
+fn validate_value_against_type_signature(
+    value: &Value,
+    signature: &str,
+    schemas: &BTreeMap<String, Value>,
+    path: &str,
+    errors: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > 32 {
+        errors.push(format!("{path} exceeded schema recursion limit"));
+        return;
+    }
+    match signature {
+        "string" | "duration" | "time" | "image" | "audio" | "pdf" | "video" => {
+            if !value.is_string() {
+                errors.push(format!("{path} must be {signature}"));
+            }
+        }
+        "int" => {
+            if value.as_i64().is_none() {
+                errors.push(format!("{path} must be int"));
+            }
+        }
+        "float" => {
+            if value.as_f64().is_none() {
+                errors.push(format!("{path} must be float"));
+            }
+        }
+        "bool" => {
+            if !value.is_boolean() {
+                errors.push(format!("{path} must be bool"));
+            }
+        }
+        "null" => {
+            if !value.is_null() {
+                errors.push(format!("{path} must be null"));
+            }
+        }
+        _ => {
+            if let Some(expected) = signature_envelope(signature, "literal") {
+                let expected = serde_json::from_str::<String>(expected)
+                    .unwrap_or_else(|_| expected.to_owned());
+                if value.as_str() != Some(expected.as_str()) {
+                    errors.push(format!("{path} must be literal {expected:?}"));
+                }
+            } else if let Some(schema_name) = signature_envelope(signature, "ref") {
+                match schemas.get(schema_name) {
+                    Some(schema) => validate_fact_value_against_schema(
+                        value,
+                        schema,
+                        schemas,
+                        path,
+                        errors,
+                        depth + 1,
+                    ),
+                    None => errors.push(format!(
+                        "{path} references schema `{schema_name}` missing from candidate"
+                    )),
+                }
+            } else if let Some(inner) = signature_envelope(signature, "optional") {
+                if !value.is_null() {
+                    validate_value_against_type_signature(
+                        value,
+                        inner,
+                        schemas,
+                        path,
+                        errors,
+                        depth + 1,
+                    );
+                }
+            } else if let Some(inner) = signature_envelope(signature, "array") {
+                match value.as_array() {
+                    Some(items) => {
+                        for (index, item) in items.iter().enumerate() {
+                            validate_value_against_type_signature(
+                                item,
+                                inner,
+                                schemas,
+                                &format!("{path}[{index}]"),
+                                errors,
+                                depth + 1,
+                            );
+                        }
+                    }
+                    None => errors.push(format!("{path} must be an array")),
+                }
+            } else if let Some(inner) = signature_envelope(signature, "map") {
+                match value.as_object() {
+                    Some(map) => {
+                        for (key, item) in map {
+                            validate_value_against_type_signature(
+                                item,
+                                inner,
+                                schemas,
+                                &format!("{path}.{key}"),
+                                errors,
+                                depth + 1,
+                            );
+                        }
+                    }
+                    None => errors.push(format!("{path} must be an object map")),
+                }
+            } else if let Some(inner) = signature_envelope(signature, "union") {
+                let variants = split_top_level(inner, " | ");
+                if !variants.iter().any(|variant| {
+                    let mut candidate_errors = Vec::new();
+                    validate_value_against_type_signature(
+                        value,
+                        variant,
+                        schemas,
+                        path,
+                        &mut candidate_errors,
+                        depth + 1,
+                    );
+                    candidate_errors.is_empty()
+                }) {
+                    errors.push(format!(
+                        "{path} must match one of: {}",
+                        variants.join(" | ")
+                    ));
+                }
+            } else if let Some(inner) = signature_envelope(signature, "object") {
+                validate_value_against_object_signature(value, inner, schemas, path, errors, depth);
+            } else if let Some(inner) = signature_envelope(signature, "agentref") {
+                let agents = split_top_level(inner, " | ");
+                match value.as_str() {
+                    Some(agent) if agents.iter().any(|candidate| candidate == agent) => {}
+                    Some(_) => errors.push(format!(
+                        "{path} must name one of these agents: {}",
+                        agents.join(", ")
+                    )),
+                    None => errors.push(format!("{path} must be an agent name string")),
+                }
+            } else {
+                errors.push(format!("{path} uses unsupported type `{signature}`"));
+            }
+        }
+    }
+}
+
+fn validate_value_against_object_signature(
+    value: &Value,
+    inner: &str,
+    schemas: &BTreeMap<String, Value>,
+    path: &str,
+    errors: &mut Vec<String>,
+    depth: usize,
+) {
+    let Some(fields) = inner
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        errors.push(format!("{path} uses malformed object type"));
+        return;
+    };
+    let fields = split_top_level(fields, ", ")
+        .into_iter()
+        .filter_map(|field| {
+            let (name, signature) = field.split_once(' ')?;
+            Some(json!({ "name": name, "type": signature }))
+        })
+        .collect::<Vec<_>>();
+    validate_value_against_fields(value, Some(&fields), schemas, path, errors, depth + 1);
+}
+
+fn is_optional_signature(signature: &str) -> bool {
+    signature_envelope(signature, "optional").is_some()
+}
+
+fn signature_envelope<'a>(signature: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}<");
+    signature
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix('>'))
+}
+
+fn split_top_level(input: &str, separator: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < input.len() {
+        let rest = &input[index..];
+        if depth == 0 && rest.starts_with(separator) {
+            parts.push(input[start..index].trim().to_owned());
+            index += separator.len();
+            start = index;
+            continue;
+        }
+        if let Some(ch) = rest.chars().next() {
+            match ch {
+                '<' => depth += 1,
+                '>' => depth -= 1,
+                _ => {}
+            }
+            index += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    parts.push(input[start..].trim().to_owned());
+    parts.retain(|part| !part.is_empty());
+    parts
+}
+
 fn revision_compatibility_diagnostic(
     code: &str,
     message: String,
@@ -7324,6 +7729,205 @@ mod tests {
         assert!(codes.contains("revision.contract_changed"));
         assert!(codes.contains("revision.input_contract_added"));
         assert!(codes.contains("revision.contract_removed"));
+    }
+
+    #[test]
+    fn revision_compatibility_accepts_optional_schema_additions_for_active_facts() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let active_summary = json!({
+            "workflow": "FactCompat",
+            "schemas": [
+                {
+                    "kind": "class",
+                    "name": "WorkItem",
+                    "fields": [
+                        {"name": "title", "type": "string"}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+        let candidate_summary = json!({
+            "workflow": "FactCompat",
+            "schemas": [
+                {
+                    "kind": "class",
+                    "name": "WorkItem",
+                    "fields": [
+                        {"name": "title", "type": "string"},
+                        {"name": "notes", "type": "optional<string>"}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+        let active_version = store
+            .create_program_version(NewProgramVersion {
+                analysis_summary_json: &active_summary,
+                ..test_program_version("FactCompat", "source-1", "ir-1")
+            })
+            .expect("active version creates");
+        let candidate_version = store
+            .create_program_version(NewProgramVersion {
+                analysis_summary_json: &candidate_summary,
+                ..test_program_version("FactCompat", "source-2", "ir-2")
+            })
+            .expect("candidate version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &active_version.program_id,
+                version_id: &active_version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "seed",
+                trigger_event_id: None,
+                facts: &[test_fact("fact-work", "WorkItem", "work-1")],
+                consumed_fact_ids: &[],
+                effects: &[],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-work"),
+            })
+            .expect("fact commits");
+
+        let report = store
+            .analyze_revision_compatibility(&instance.instance_id, &candidate_version.version_id)
+            .expect("compatibility report");
+
+        assert!(report.compatible, "{:#?}", report.diagnostics);
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn revision_compatibility_reports_active_fact_schema_breaks() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let active_summary = json!({
+            "workflow": "FactBreak",
+            "schemas": [
+                {
+                    "kind": "class",
+                    "name": "WorkItem",
+                    "fields": [
+                        {"name": "title", "type": "string"}
+                    ]
+                },
+                {
+                    "kind": "enum",
+                    "name": "State",
+                    "variants": ["open", "closed"]
+                }
+            ]
+        })
+        .to_string();
+        let changed_summary = json!({
+            "workflow": "FactBreak",
+            "schemas": [
+                {
+                    "kind": "class",
+                    "name": "WorkItem",
+                    "fields": [
+                        {"name": "title", "type": "int"},
+                        {"name": "status", "type": "string"}
+                    ]
+                },
+                {
+                    "kind": "enum",
+                    "name": "State",
+                    "variants": ["closed"]
+                }
+            ]
+        })
+        .to_string();
+        let removed_summary = json!({
+            "workflow": "FactBreak",
+            "schemas": []
+        })
+        .to_string();
+        let active_version = store
+            .create_program_version(NewProgramVersion {
+                analysis_summary_json: &active_summary,
+                ..test_program_version("FactBreak", "source-1", "ir-1")
+            })
+            .expect("active version creates");
+        let changed_version = store
+            .create_program_version(NewProgramVersion {
+                analysis_summary_json: &changed_summary,
+                ..test_program_version("FactBreak", "source-2", "ir-2")
+            })
+            .expect("changed candidate version creates");
+        let removed_version = store
+            .create_program_version(NewProgramVersion {
+                analysis_summary_json: &removed_summary,
+                ..test_program_version("FactBreak", "source-3", "ir-3")
+            })
+            .expect("removed candidate version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &active_version.program_id,
+                version_id: &active_version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "seed",
+                trigger_event_id: None,
+                facts: &[
+                    test_fact("fact-work", "WorkItem", "work-1"),
+                    NewFact {
+                        fact_id: "fact-state",
+                        name: "State",
+                        key: "state-1",
+                        value_json: r#""open""#,
+                        schema_id: Some("State"),
+                        provenance_class: "derived",
+                        correlation_id: None,
+                    },
+                ],
+                consumed_fact_ids: &[],
+                effects: &[],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-work"),
+            })
+            .expect("fact commits");
+
+        let changed_report = store
+            .analyze_revision_compatibility(&instance.instance_id, &changed_version.version_id)
+            .expect("changed compatibility report");
+        assert!(!changed_report.compatible);
+        let changed = changed_report
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "revision.active_fact_incompatible"
+                    && diagnostic.subject.as_deref() == Some("WorkItem")
+            })
+            .expect("active fact incompatibility diagnostic");
+        assert_eq!(changed.subject.as_deref(), Some("WorkItem"));
+        assert!(changed.message.contains("$.title must be int"));
+        assert!(changed.message.contains("$.status is required"));
+        assert!(changed_report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "revision.active_fact_incompatible"
+                && diagnostic.subject.as_deref() == Some("State")
+                && diagnostic
+                    .message
+                    .contains("enum variant `open` not declared")
+        }));
+
+        let removed_report = store
+            .analyze_revision_compatibility(&instance.instance_id, &removed_version.version_id)
+            .expect("removed compatibility report");
+        assert!(!removed_report.compatible);
+        assert!(removed_report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "revision.active_fact_schema_removed"
+                && diagnostic.subject.as_deref() == Some("WorkItem")
+        }));
     }
 
     #[test]
