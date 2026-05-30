@@ -233,12 +233,12 @@ Goal: persist revisions and version attribution without losing replayability.
   - [x] `cancellation_policy`
   - [x] `status`
   - [x] timestamps
-- [ ] Add attribution fields where needed:
+- [x] Add attribution fields where needed:
   - [x] rule commit event payload includes `program_version_id` and
     `revision_epoch`
   - [x] effects record `program_version_id` and `revision_epoch`
-  - [ ] workflow invocations record parent/child version and parent epoch
-  - [ ] evidence/diagnostics can link to a revision id or epoch
+  - [x] workflow invocations record parent/child version and parent epoch
+  - [x] evidence/diagnostics can link to a revision id or epoch
 - [x] Add cancel-request persistence:
   - [x] `effect_cancellation_requests` table
   - [x] optional `cancel_requested` status view without making request state a
@@ -249,10 +249,10 @@ Goal: persist revisions and version attribution without losing replayability.
   - [ ] create revision candidate/dry-run report
   - [x] activate revision atomically
   - [x] list active revision for instance
-  - [ ] list effects impacted by a cancellation policy
+  - [x] list effects impacted by a cancellation policy
   - [x] request cancellation for running effects idempotently
   - [x] terminal-cancel queued/blocked/claimable effects idempotently
-- [ ] Ensure projection rebuild replays revision events and effect attribution.
+- [x] Ensure projection rebuild replays revision events and effect attribution.
 - [x] Add store tests for duplicate activation, idempotent cancellation,
   terminal instance rejection, and recovery replay.
 - [ ] Audit Stage 2 against schema replay, transaction boundaries, idempotency,
@@ -262,7 +262,7 @@ Acceptance:
 
 - [x] A fresh store can activate and inspect multiple revisions for one
   instance.
-- [ ] Replay reconstructs active revision and effect cancellation requests.
+- [x] Replay reconstructs active revision and effect cancellation requests.
 - [x] Existing tests using one `instances.version_id` still pass or have an
   explicit migration path.
 
@@ -270,7 +270,8 @@ Stage 2 partial audit notes:
 
 - [crates/whipplescript-store/migrations/0001_runtime_store.sql](../crates/whipplescript-store/migrations/0001_runtime_store.sql)
   now creates `instance_revisions`, `effect_cancellation_requests`,
-  `instances.revision_epoch`, and effect version/epoch attribution columns.
+  `instances.revision_epoch`, workflow invocation revision attribution, and
+  effect version/epoch attribution columns.
 - [crates/whipplescript-store/src/lib.rs](../crates/whipplescript-store/src/lib.rs)
   now activates revisions atomically, updates the active instance version/epoch,
   stores revision rows, attributes rule-created effects to the active revision,
@@ -279,10 +280,15 @@ Stage 2 partial audit notes:
   status.
 - Claimability now excludes effects with open cancellation requests, including
   effects that return to `queued` after lease expiry.
-- Projection rebuild currently replays rule-commit effect attribution and
-  cancellation request events. Full active-revision reconstruction from the
-  revision event log and revision-aware workflow invocation attribution remain
-  open Stage 2 work.
+- Workflow invocation rows now preserve the parent effect's original program
+  version and revision epoch plus the child instance's starting version and
+  epoch, even when either side later revises independently.
+- Projection rebuild now replays revision activation events, revision-triggered
+  terminal cancellations, rule-commit effect attribution, and cancellation
+  request events so the active revision cache and request rows can be rebuilt
+  from the event log.
+- Stage 2 still leaves the full candidate/dry-run report open because it
+  depends on the Stage 3 compatibility analysis.
 
 ## Stage 3: Compiler And Compatibility Analysis
 

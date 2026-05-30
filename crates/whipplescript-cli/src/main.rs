@@ -28,7 +28,7 @@ use whipplescript_store::{
     EffectView, EventView, EvidenceLinkView, EvidenceView, FactView, HumanAnswer, InboxItemView,
     InstanceView, NewEffect, NewEffectDependency, NewFact, NewWorkflowInvocation, RetryEffect,
     RuleCommit, RunStart, RunView, SqliteStore, StatusView, StoreError, WorkflowInvocationView,
-    WorkflowTerminal, WorkflowTerminalKind,
+    WorkflowRevisionView, WorkflowTerminal, WorkflowTerminalKind,
 };
 
 fn main() -> ExitCode {
@@ -5510,6 +5510,15 @@ fn status(options: &CliOptions) -> ExitCode {
             "workflow_version={} epoch={}",
             status.instance.version_id, status.instance.revision_epoch
         );
+        if let Some(revision) = status.revisions.last() {
+            println!(
+                "active_revision={} from={} to={} policy={}",
+                revision.revision_id,
+                revision.from_version_id,
+                revision.to_version_id,
+                revision.cancellation_policy
+            );
+        }
         if let Some(terminal) = workflow_terminal_summary(&status.recent_events) {
             println!(
                 "workflow terminal: {} {}",
@@ -7916,11 +7925,35 @@ fn workflow_invocation_to_json(invocation: &WorkflowInvocationView) -> Value {
         "invocation_id": invocation.invocation_id,
         "parent_instance_id": invocation.parent_instance_id,
         "parent_effect_id": invocation.parent_effect_id,
+        "parent_program_version_id": invocation.parent_program_version_id,
+        "parent_revision_epoch": invocation.parent_revision_epoch,
         "child_instance_id": invocation.child_instance_id,
+        "child_program_version_id": invocation.child_program_version_id,
+        "child_revision_epoch": invocation.child_revision_epoch,
         "target_workflow": invocation.target_workflow,
         "input": json_from_str(&invocation.input_json),
+        "status": invocation.status,
+        "terminal_event_id": invocation.terminal_event_id,
         "source_span": invocation.source_span_json.as_deref().map(json_from_str),
         "created_at": invocation.created_at,
+        "updated_at": invocation.updated_at,
+    })
+}
+
+fn workflow_revision_to_json(revision: &WorkflowRevisionView) -> Value {
+    json!({
+        "revision_id": revision.revision_id,
+        "instance_id": revision.instance_id,
+        "epoch": revision.epoch,
+        "from_version_id": revision.from_version_id,
+        "to_version_id": revision.to_version_id,
+        "activated_by_event_id": revision.activated_by_event_id,
+        "activation_policy": json_from_str(&revision.activation_policy_json),
+        "cancellation_policy": revision.cancellation_policy,
+        "status": revision.status,
+        "idempotency_key": revision.idempotency_key,
+        "created_at": revision.created_at,
+        "activated_at": revision.activated_at,
     })
 }
 
@@ -8015,6 +8048,7 @@ fn status_to_json(status: &StatusView) -> Value {
         "active_run_count": status.active_run_count,
         "failure_count": status.failure_count,
         "cancellation_request_count": status.cancellation_request_count,
+        "revisions": status.revisions.iter().map(workflow_revision_to_json).collect::<Vec<_>>(),
         "workflow_invocations": {
             "parent": status.parent_invocation.as_ref().map(workflow_invocation_to_json),
             "children": status.child_invocations.iter().map(workflow_invocation_to_json).collect::<Vec<_>>(),

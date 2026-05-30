@@ -147,6 +147,25 @@ CREATE TABLE effect_dependencies (
     UNIQUE(instance_id, upstream_effect_id, downstream_effect_id, predicate)
 );
 
+CREATE TABLE workflow_invocations (
+    invocation_id TEXT PRIMARY KEY,
+    parent_instance_id TEXT NOT NULL,
+    parent_effect_id TEXT NOT NULL,
+    parent_program_version_id TEXT REFERENCES program_versions(version_id),
+    parent_revision_epoch INTEGER NOT NULL DEFAULT 0,
+    child_instance_id TEXT NOT NULL,
+    child_program_version_id TEXT REFERENCES program_versions(version_id),
+    child_revision_epoch INTEGER,
+    target_workflow TEXT NOT NULL,
+    input_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'running',
+    terminal_event_id TEXT,
+    source_span_json TEXT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE runs (
     run_id TEXT PRIMARY KEY,
     effect_id TEXT NOT NULL REFERENCES effects(effect_id),

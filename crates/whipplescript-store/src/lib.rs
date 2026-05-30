@@ -473,11 +473,18 @@ pub struct WorkflowInvocationView {
     pub invocation_id: String,
     pub parent_instance_id: String,
     pub parent_effect_id: String,
+    pub parent_program_version_id: Option<String>,
+    pub parent_revision_epoch: i64,
     pub child_instance_id: String,
+    pub child_program_version_id: Option<String>,
+    pub child_revision_epoch: Option<i64>,
     pub target_workflow: String,
     pub input_json: String,
+    pub status: String,
+    pub terminal_event_id: Option<String>,
     pub source_span_json: Option<String>,
     pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -558,6 +565,7 @@ pub struct StatusView {
     pub active_run_count: i64,
     pub failure_count: i64,
     pub cancellation_request_count: i64,
+    pub revisions: Vec<WorkflowRevisionView>,
     pub parent_invocation: Option<WorkflowInvocationView>,
     pub child_invocations: Vec<WorkflowInvocationView>,
     pub recent_events: Vec<EventView>,
@@ -587,6 +595,16 @@ pub struct WorkflowRevisionView {
     pub idempotency_key: Option<String>,
     pub created_at: String,
     pub activated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevisionCancellationImpact {
+    pub instance_id: String,
+    pub active_version_id: String,
+    pub active_revision_epoch: i64,
+    pub cancellation_policy: String,
+    pub terminal_cancel_effects: Vec<String>,
+    pub request_cancel_effects: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -860,6 +878,69 @@ impl SqliteStore {
             .query_map([instance_id], workflow_revision_from_row)?
             .collect::<result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn revision_cancellation_impact(
+        &self,
+        instance_id: &str,
+        cancellation_policy: &str,
+    ) -> StoreResult<RevisionCancellationImpact> {
+        let cancellation_policy = normalize_cancellation_policy(cancellation_policy)?;
+        let (active_version_id, active_revision_epoch, status) = self
+            .connection
+            .query_row(
+                r#"
+                SELECT version_id, revision_epoch, status
+                FROM instances
+                WHERE instance_id = ?1
+                "#,
+                [instance_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))?;
+        if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+            return Err(StoreError::Conflict(format!(
+                "instance is {status}; revision impact requires a non-terminal instance"
+            )));
+        }
+        let terminal_cancel_effects = if cancellation_policy == "keep" {
+            Vec::new()
+        } else {
+            old_revision_effects_on(
+                &self.connection,
+                instance_id,
+                &active_version_id,
+                active_revision_epoch,
+                false,
+            )?
+        };
+        let request_cancel_effects = if cancellation_policy == "request_running" {
+            old_revision_effects_on(
+                &self.connection,
+                instance_id,
+                &active_version_id,
+                active_revision_epoch,
+                true,
+            )?
+        } else {
+            Vec::new()
+        };
+
+        Ok(RevisionCancellationImpact {
+            instance_id: instance_id.to_owned(),
+            active_version_id,
+            active_revision_epoch,
+            cancellation_policy: cancellation_policy.to_owned(),
+            terminal_cancel_effects,
+            request_cancel_effects,
+        })
     }
 
     pub fn activate_revision(
@@ -1148,26 +1229,66 @@ impl SqliteStore {
         &self,
         invocation: NewWorkflowInvocation<'_>,
     ) -> StoreResult<()> {
+        serde_json::from_str::<Value>(invocation.input_json)?;
+        let (parent_program_version_id, parent_revision_epoch) = self
+            .connection
+            .query_row(
+                r#"
+                SELECT program_version_id, revision_epoch
+                FROM effects
+                WHERE instance_id = ?1
+                  AND effect_id = ?2
+                "#,
+                params![invocation.parent_instance_id, invocation.parent_effect_id],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::Conflict("parent workflow invoke effect does not exist".to_owned())
+            })?;
+        let (child_program_version_id, child_revision_epoch) = self
+            .connection
+            .query_row(
+                r#"
+                SELECT version_id, revision_epoch
+                FROM instances
+                WHERE instance_id = ?1
+                "#,
+                [invocation.child_instance_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::Conflict("child workflow instance does not exist".to_owned())
+            })?;
         self.connection.execute(
             r#"
             INSERT INTO workflow_invocations (
                 invocation_id,
                 parent_instance_id,
                 parent_effect_id,
+                parent_program_version_id,
+                parent_revision_epoch,
                 child_instance_id,
+                child_program_version_id,
+                child_revision_epoch,
                 target_workflow,
                 input_json,
                 source_span_json,
                 idempotency_key
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(idempotency_key) DO NOTHING
             "#,
             params![
                 invocation.invocation_id,
                 invocation.parent_instance_id,
                 invocation.parent_effect_id,
+                parent_program_version_id,
+                parent_revision_epoch,
                 invocation.child_instance_id,
+                child_program_version_id,
+                child_revision_epoch,
                 invocation.target_workflow,
                 invocation.input_json,
                 invocation.source_span_json,
@@ -1189,11 +1310,18 @@ impl SqliteStore {
                     invocation_id,
                     parent_instance_id,
                     parent_effect_id,
+                    parent_program_version_id,
+                    parent_revision_epoch,
                     child_instance_id,
+                    child_program_version_id,
+                    child_revision_epoch,
                     target_workflow,
                     input_json,
+                    status,
+                    terminal_event_id,
                     source_span_json,
-                    created_at
+                    created_at,
+                    COALESCE(updated_at, created_at)
                 FROM workflow_invocations
                 WHERE parent_instance_id = ?1
                   AND parent_effect_id = ?2
@@ -1217,11 +1345,18 @@ impl SqliteStore {
                 invocation_id,
                 parent_instance_id,
                 parent_effect_id,
+                parent_program_version_id,
+                parent_revision_epoch,
                 child_instance_id,
+                child_program_version_id,
+                child_revision_epoch,
                 target_workflow,
                 input_json,
+                status,
+                terminal_event_id,
                 source_span_json,
-                created_at
+                created_at,
+                COALESCE(updated_at, created_at)
             FROM workflow_invocations
             WHERE parent_instance_id = ?1
             ORDER BY created_at, invocation_id
@@ -1244,11 +1379,18 @@ impl SqliteStore {
                     invocation_id,
                     parent_instance_id,
                     parent_effect_id,
+                    parent_program_version_id,
+                    parent_revision_epoch,
                     child_instance_id,
+                    child_program_version_id,
+                    child_revision_epoch,
                     target_workflow,
                     input_json,
+                    status,
+                    terminal_event_id,
                     source_span_json,
-                    created_at
+                    created_at,
+                    COALESCE(updated_at, created_at)
                 FROM workflow_invocations
                 WHERE child_instance_id = ?1
                 ORDER BY created_at DESC, invocation_id DESC
@@ -2917,6 +3059,7 @@ impl SqliteStore {
         if recent_events.len() > 5 {
             recent_events = recent_events.split_off(recent_events.len() - 5);
         }
+        let revisions = self.list_instance_revisions(instance_id)?;
         let parent_invocation = self.get_parent_workflow_invocation(instance_id)?;
         let child_invocations = self.list_child_workflow_invocations(instance_id)?;
 
@@ -2928,6 +3071,7 @@ impl SqliteStore {
             active_run_count,
             failure_count,
             cancellation_request_count,
+            revisions,
             parent_invocation,
             child_invocations,
             recent_events,
@@ -3426,6 +3570,10 @@ impl SqliteStore {
             [instance_id],
         )?;
         tx.execute(
+            "DELETE FROM instance_revisions WHERE instance_id = ?1",
+            [instance_id],
+        )?;
+        tx.execute(
             "DELETE FROM effect_dependencies WHERE instance_id = ?1",
             [instance_id],
         )?;
@@ -3435,10 +3583,15 @@ impl SqliteStore {
         let events = {
             let mut statement = tx.prepare(
                 r#"
-                SELECT event_id, event_type, payload_json, idempotency_key
+                SELECT event_id, event_type, payload_json, idempotency_key, causation_id
                 FROM events
                 WHERE instance_id = ?1
-                  AND event_type IN ('rule.committed', 'effect.cancellation_requested')
+                  AND event_type IN (
+                      'rule.committed',
+                      'workflow.revision_activated',
+                      'effect.cancelled',
+                      'effect.cancellation_requested'
+                  )
                 ORDER BY sequence
                 "#,
             )?;
@@ -3449,21 +3602,33 @@ impl SqliteStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 })?
                 .collect::<result::Result<Vec<_>, _>>()?;
             rows
         };
 
-        for (event_id, event_type, payload_json, idempotency_key) in events {
+        for (event_id, event_type, payload_json, idempotency_key, causation_id) in events {
             match event_type.as_str() {
                 "rule.committed" => replay_rule_commit(&tx, instance_id, &event_id, &payload_json)?,
+                "workflow.revision_activated" => replay_revision_activation(
+                    &tx,
+                    instance_id,
+                    &event_id,
+                    &payload_json,
+                    idempotency_key.as_deref(),
+                )?,
+                "effect.cancelled" => {
+                    replay_effect_cancelled(&tx, instance_id, &event_id, &payload_json)?
+                }
                 "effect.cancellation_requested" => replay_cancellation_request(
                     &tx,
                     instance_id,
                     &event_id,
                     &payload_json,
                     idempotency_key.as_deref(),
+                    causation_id.as_deref(),
                 )?,
                 _ => {}
             }
@@ -4905,11 +5070,18 @@ fn workflow_invocation_from_row(
         invocation_id: row.get(0)?,
         parent_instance_id: row.get(1)?,
         parent_effect_id: row.get(2)?,
-        child_instance_id: row.get(3)?,
-        target_workflow: row.get(4)?,
-        input_json: row.get(5)?,
-        source_span_json: row.get(6)?,
-        created_at: row.get(7)?,
+        parent_program_version_id: row.get(3)?,
+        parent_revision_epoch: row.get(4)?,
+        child_instance_id: row.get(5)?,
+        child_program_version_id: row.get(6)?,
+        child_revision_epoch: row.get(7)?,
+        target_workflow: row.get(8)?,
+        input_json: row.get(9)?,
+        status: row.get(10)?,
+        terminal_event_id: row.get(11)?,
+        source_span_json: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -5203,12 +5375,121 @@ fn replay_rule_commit(
     Ok(())
 }
 
+fn replay_revision_activation(
+    connection: &Connection,
+    instance_id: &str,
+    event_id: &str,
+    payload_json: &str,
+    idempotency_key: Option<&str>,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let revision_id = payload
+        .get("revision_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let from_version_id = payload
+        .get("from_version_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let to_version_id = payload
+        .get("to_version_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let epoch = payload
+        .get("to_epoch")
+        .and_then(Value::as_i64)
+        .or_else(|| payload.get("revision_epoch").and_then(Value::as_i64))
+        .unwrap_or(0);
+    if revision_id.is_empty() || from_version_id.is_empty() || to_version_id.is_empty() {
+        return Ok(());
+    }
+    let activation_policy_json = payload
+        .get("activation_policy")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "{}".to_owned());
+    let cancellation_policy = payload
+        .get("cancellation_policy")
+        .and_then(Value::as_str)
+        .unwrap_or("keep");
+    connection.execute(
+        r#"
+        INSERT INTO instance_revisions (
+            revision_id,
+            instance_id,
+            epoch,
+            from_version_id,
+            to_version_id,
+            activated_by_event_id,
+            activation_policy_json,
+            cancellation_policy,
+            status,
+            idempotency_key
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9)
+        ON CONFLICT(revision_id) DO NOTHING
+        "#,
+        params![
+            revision_id,
+            instance_id,
+            epoch,
+            from_version_id,
+            to_version_id,
+            event_id,
+            activation_policy_json,
+            cancellation_policy,
+            idempotency_key,
+        ],
+    )?;
+    connection.execute(
+        r#"
+        UPDATE instances
+        SET version_id = ?1,
+            revision_epoch = ?2,
+            last_event_id = ?3,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE instance_id = ?4
+        "#,
+        params![to_version_id, epoch, event_id, instance_id],
+    )?;
+    Ok(())
+}
+
+fn replay_effect_cancelled(
+    connection: &Connection,
+    instance_id: &str,
+    event_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let effect_id = payload
+        .get("effect_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if effect_id.is_empty() {
+        return Ok(());
+    }
+    connection.execute(
+        r#"
+        UPDATE effects
+        SET status = 'cancelled',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE instance_id = ?1
+          AND effect_id = ?2
+          AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')
+        "#,
+        params![instance_id, effect_id],
+    )?;
+    mark_cancellation_requests_terminal_on(connection, instance_id, effect_id, event_id)?;
+    Ok(())
+}
+
 fn replay_cancellation_request(
     connection: &Connection,
     instance_id: &str,
     event_id: &str,
     payload_json: &str,
     idempotency_key: Option<&str>,
+    causation_event_id: Option<&str>,
 ) -> StoreResult<()> {
     let payload: Value = serde_json::from_str(payload_json)?;
     let request_id = payload
@@ -5248,7 +5529,7 @@ fn replay_cancellation_request(
                 .get("requested_by")
                 .and_then(Value::as_str)
                 .unwrap_or("replay"),
-            event_id,
+            causation_event_id.unwrap_or(event_id),
             idempotency_key,
         ],
     )?;
@@ -5384,20 +5665,38 @@ fn ensure_workflow_invocation_schema(connection: &Connection) -> StoreResult<()>
             invocation_id TEXT PRIMARY KEY,
             parent_instance_id TEXT NOT NULL,
             parent_effect_id TEXT NOT NULL,
+            parent_program_version_id TEXT,
+            parent_revision_epoch INTEGER NOT NULL DEFAULT 0,
             child_instance_id TEXT NOT NULL,
+            child_program_version_id TEXT,
+            child_revision_epoch INTEGER,
             target_workflow TEXT NOT NULL,
             input_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'running',
+            terminal_event_id TEXT,
             source_span_json TEXT,
             idempotency_key TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         "#,
     )?;
-    if !column_exists(connection, "workflow_invocations", "source_span_json")? {
-        connection.execute(
-            "ALTER TABLE workflow_invocations ADD COLUMN source_span_json TEXT",
-            [],
-        )?;
+    for (column, definition) in [
+        ("parent_program_version_id", "TEXT"),
+        ("parent_revision_epoch", "INTEGER NOT NULL DEFAULT 0"),
+        ("child_program_version_id", "TEXT"),
+        ("child_revision_epoch", "INTEGER"),
+        ("status", "TEXT NOT NULL DEFAULT 'running'"),
+        ("terminal_event_id", "TEXT"),
+        ("source_span_json", "TEXT"),
+        ("updated_at", "TEXT"),
+    ] {
+        if !column_exists(connection, "workflow_invocations", column)? {
+            connection.execute(
+                &format!("ALTER TABLE workflow_invocations ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
     }
     Ok(())
 }
@@ -6352,6 +6651,15 @@ mod tests {
             })
             .expect("run starts");
 
+        let impact = store
+            .revision_cancellation_impact(&instance.instance_id, "running")
+            .expect("revision impact reports");
+        assert_eq!(impact.active_version_id, version1.version_id.as_str());
+        assert_eq!(impact.active_revision_epoch, 0);
+        assert_eq!(impact.cancellation_policy, "request_running");
+        assert_eq!(impact.terminal_cancel_effects, vec!["queued-effect"]);
+        assert_eq!(impact.request_cancel_effects, vec!["running-effect"]);
+
         let revision = store
             .activate_revision(RevisionActivation {
                 instance_id: &instance.instance_id,
@@ -6483,6 +6791,104 @@ mod tests {
     }
 
     #[test]
+    fn workflow_invocations_preserve_parent_and_child_revision_attribution() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let parent_version = store
+            .create_program_version(test_program_version("InvokeRevision", "source-1", "ir-1"))
+            .expect("parent program version creates");
+        let child_version = store
+            .create_program_version(test_program_version("InvokeRevision", "source-2", "ir-2"))
+            .expect("child program version creates");
+        let revised_parent_version = store
+            .create_program_version(test_program_version("InvokeRevision", "source-3", "ir-3"))
+            .expect("revised parent program version creates");
+        let parent = store
+            .create_instance(NewInstance {
+                program_id: &parent_version.program_id,
+                version_id: &parent_version.version_id,
+                input_json: "{}",
+            })
+            .expect("parent instance creates");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &parent.instance_id,
+                rule: "invoke-child",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect(
+                    "invoke-child",
+                    "workflow.invoke",
+                    "invoke-child-key",
+                )],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-invoke-child"),
+            })
+            .expect("parent invoke rule commits");
+        let child = store
+            .create_instance(NewInstance {
+                program_id: &child_version.program_id,
+                version_id: &child_version.version_id,
+                input_json: r#"{"task":"child"}"#,
+            })
+            .expect("child instance creates");
+
+        store
+            .record_workflow_invocation(NewWorkflowInvocation {
+                invocation_id: "inv-parent-child",
+                parent_instance_id: &parent.instance_id,
+                parent_effect_id: "invoke-child",
+                child_instance_id: &child.instance_id,
+                target_workflow: "Child",
+                input_json: r#"{"task":"child"}"#,
+                source_span_json: Some(r#"{"start":1,"end":6}"#),
+                idempotency_key: "invoke-parent-child",
+            })
+            .expect("invocation records");
+
+        let invocation = store
+            .get_workflow_invocation(&parent.instance_id, "invoke-child")
+            .expect("invocation loads")
+            .expect("invocation exists");
+        assert_eq!(
+            invocation.parent_program_version_id.as_deref(),
+            Some(parent_version.version_id.as_str())
+        );
+        assert_eq!(invocation.parent_revision_epoch, 0);
+        assert_eq!(
+            invocation.child_program_version_id.as_deref(),
+            Some(child_version.version_id.as_str())
+        );
+        assert_eq!(invocation.child_revision_epoch, Some(0));
+
+        store
+            .activate_revision(RevisionActivation {
+                instance_id: &parent.instance_id,
+                from_version_id: &parent_version.version_id,
+                to_version_id: &revised_parent_version.version_id,
+                activation_policy_json: "{}",
+                cancellation_policy: "keep",
+                idempotency_key: Some("revise-parent-after-invoke"),
+            })
+            .expect("parent revision activates");
+        let after_revision = store
+            .get_workflow_invocation(&parent.instance_id, "invoke-child")
+            .expect("invocation reloads")
+            .expect("invocation still exists");
+        assert_eq!(
+            after_revision.parent_program_version_id.as_deref(),
+            Some(parent_version.version_id.as_str())
+        );
+        assert_eq!(after_revision.parent_revision_epoch, 0);
+        assert_eq!(
+            after_revision.child_program_version_id.as_deref(),
+            Some(child_version.version_id.as_str())
+        );
+        assert_eq!(after_revision.child_revision_epoch, Some(0));
+    }
+
+    #[test]
     fn terminal_instances_cannot_activate_revisions() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let version1 = store
@@ -6521,6 +6927,129 @@ mod tests {
             Err(StoreError::Conflict(message)) if message.contains("cancelled")
         ));
         assert_eq!(row_count(&store, "instance_revisions"), 0);
+    }
+
+    #[test]
+    fn replay_reconstructs_active_revision_cancelled_effects_and_requests() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version1 = store
+            .create_program_version(test_program_version(
+                "RevisionReplayFull",
+                "source-1",
+                "ir-1",
+            ))
+            .expect("first program version creates");
+        let version2 = store
+            .create_program_version(test_program_version(
+                "RevisionReplayFull",
+                "source-2",
+                "ir-2",
+            ))
+            .expect("second program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version1.program_id,
+                version_id: &version1.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let effects = [
+            test_effect("queued-effect", "agent.tell", "replay-queued-key"),
+            test_effect("running-effect", "agent.tell", "replay-running-key"),
+        ];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "old-rule",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-replay-full-old"),
+            })
+            .expect("old rule commits");
+        store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "running-effect",
+                run_id: "run-replay-running",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-replay-running",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        store
+            .activate_revision(RevisionActivation {
+                instance_id: &instance.instance_id,
+                from_version_id: &version1.version_id,
+                to_version_id: &version2.version_id,
+                activation_policy_json: "{}",
+                cancellation_policy: "request_running",
+                idempotency_key: Some("revise-replay-full"),
+            })
+            .expect("revision activates");
+
+        store
+            .connection
+            .execute("DELETE FROM effect_cancellation_requests", [])
+            .expect("requests clear");
+        store
+            .connection
+            .execute("DELETE FROM instance_revisions", [])
+            .expect("revisions clear");
+        store
+            .connection
+            .execute("DELETE FROM leases", [])
+            .expect("leases clear");
+        store
+            .connection
+            .execute("DELETE FROM runs", [])
+            .expect("runs clear");
+        store
+            .connection
+            .execute("DELETE FROM effects", [])
+            .expect("effects clear");
+        store
+            .connection
+            .execute(
+                "UPDATE instances SET version_id = ?1, revision_epoch = 0 WHERE instance_id = ?2",
+                params![&version1.version_id, &instance.instance_id],
+            )
+            .expect("active revision cache corrupts");
+
+        store
+            .rebuild_projections(&instance.instance_id)
+            .expect("projections rebuild");
+
+        let active = store
+            .get_instance(&instance.instance_id)
+            .expect("instance loads")
+            .expect("instance exists");
+        assert_eq!(active.version_id, version2.version_id);
+        assert_eq!(active.revision_epoch, 1);
+        assert_eq!(
+            store
+                .list_instance_revisions(&instance.instance_id)
+                .expect("revisions list")
+                .len(),
+            1
+        );
+        assert_eq!(effect_status(&store, "queued-effect"), "cancelled");
+        assert_eq!(
+            effect_revision(&store, "running-effect"),
+            (Some(version1.version_id), 0, true)
+        );
+        assert_eq!(
+            store
+                .list_effect_cancellation_requests(&instance.instance_id)
+                .expect("requests list")
+                .len(),
+            1
+        );
     }
 
     #[test]
