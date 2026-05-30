@@ -1303,10 +1303,11 @@ impl SqliteStore {
                 &cancel_event.event_id,
             )?;
         }
+        let mut cancellation_request_ids = Vec::new();
         for effect_id in &running_effects_for_policy {
             let request_idempotency_key =
                 format!("revision-request-cancel:{revision_id}:{effect_id}");
-            insert_effect_cancellation_request_on(
+            let request = insert_effect_cancellation_request_on(
                 &tx,
                 EffectCancellationRequest {
                     instance_id: activation.instance_id,
@@ -1318,9 +1319,103 @@ impl SqliteStore {
                     idempotency_key: Some(&request_idempotency_key),
                 },
             )?;
+            cancellation_request_ids.push((effect_id.clone(), request.request_id));
         }
         if !queued_effects_for_policy.is_empty() {
             satisfy_dependencies_on(&tx, activation.instance_id)?;
+        }
+        let revision_evidence_metadata = json!({
+            "revision_id": &revision_id,
+            "event_id": event.event_id,
+            "from_version_id": activation.from_version_id,
+            "to_version_id": activation.to_version_id,
+            "from_epoch": current_epoch,
+            "to_epoch": next_epoch,
+            "cancellation_policy": cancellation_policy,
+            "terminal_cancel_effects": &queued_effects_for_policy,
+            "request_cancel_effects": &running_effects_for_policy,
+            "cancellation_request_ids": cancellation_request_ids
+                .iter()
+                .map(|(_, request_id)| request_id.as_str())
+                .collect::<Vec<_>>(),
+        })
+        .to_string();
+        let revision_evidence_id = insert_evidence_on(
+            &tx,
+            EvidenceRecord {
+                instance_id: activation.instance_id,
+                kind: "workflow.revision.activated",
+                subject_type: "workflow_revision",
+                subject_id: &revision_id,
+                causation_id: Some(&event.event_id),
+                correlation_id: Some(&revision_id),
+                summary: Some("workflow revision activated"),
+                metadata_json: &revision_evidence_metadata,
+            },
+        )?;
+        insert_evidence_link_on(
+            &tx,
+            EvidenceLink {
+                evidence_id: &revision_evidence_id,
+                instance_id: activation.instance_id,
+                target_type: "event",
+                target_id: &event.event_id,
+                relation: "activated",
+            },
+        )?;
+        insert_evidence_link_on(
+            &tx,
+            EvidenceLink {
+                evidence_id: &revision_evidence_id,
+                instance_id: activation.instance_id,
+                target_type: "program_version",
+                target_id: activation.from_version_id,
+                relation: "from_version",
+            },
+        )?;
+        insert_evidence_link_on(
+            &tx,
+            EvidenceLink {
+                evidence_id: &revision_evidence_id,
+                instance_id: activation.instance_id,
+                target_type: "program_version",
+                target_id: activation.to_version_id,
+                relation: "to_version",
+            },
+        )?;
+        for effect_id in &queued_effects_for_policy {
+            insert_evidence_link_on(
+                &tx,
+                EvidenceLink {
+                    evidence_id: &revision_evidence_id,
+                    instance_id: activation.instance_id,
+                    target_type: "effect",
+                    target_id: effect_id,
+                    relation: "terminal_cancelled",
+                },
+            )?;
+        }
+        for (effect_id, request_id) in &cancellation_request_ids {
+            insert_evidence_link_on(
+                &tx,
+                EvidenceLink {
+                    evidence_id: &revision_evidence_id,
+                    instance_id: activation.instance_id,
+                    target_type: "effect",
+                    target_id: effect_id,
+                    relation: "cancellation_requested",
+                },
+            )?;
+            insert_evidence_link_on(
+                &tx,
+                EvidenceLink {
+                    evidence_id: &revision_evidence_id,
+                    instance_id: activation.instance_id,
+                    target_type: "effect_cancellation_request",
+                    target_id: request_id,
+                    relation: "created",
+                },
+            )?;
         }
         let view = revision_by_id_on(&tx, &revision_id)?
             .ok_or_else(|| StoreError::Conflict("revision was not recorded".to_owned()))?;
@@ -7616,13 +7711,10 @@ mod tests {
         assert_eq!(revision.epoch, 1);
         assert_eq!(effect_status(&store, "queued-effect"), "cancelled");
         assert_eq!(effect_status(&store, "running-effect"), "running");
-        assert_eq!(
-            store
-                .list_effect_cancellation_requests(&instance.instance_id)
-                .expect("requests list")
-                .len(),
-            1
-        );
+        let requests = store
+            .list_effect_cancellation_requests(&instance.instance_id)
+            .expect("requests list");
+        assert_eq!(requests.len(), 1);
         assert_eq!(
             effect_revision(&store, "running-effect"),
             (Some(version1.version_id.clone()), 0, true)
@@ -7632,6 +7724,73 @@ mod tests {
             .expect("runs include request state");
         assert_eq!(runs.len(), 1);
         assert!(runs[0].cancel_requested);
+        let evidence = store
+            .list_evidence(&instance.instance_id)
+            .expect("evidence lists");
+        let revision_evidence = evidence
+            .iter()
+            .find(|evidence| evidence.kind == "workflow.revision.activated")
+            .expect("revision evidence exists");
+        assert_eq!(revision_evidence.subject_id, revision.revision_id);
+        let metadata =
+            serde_json::from_str::<Value>(&revision_evidence.metadata_json).expect("metadata json");
+        assert_eq!(
+            metadata.get("from_version_id").and_then(Value::as_str),
+            Some(version1.version_id.as_str())
+        );
+        assert_eq!(
+            metadata.get("to_version_id").and_then(Value::as_str),
+            Some(version2.version_id.as_str())
+        );
+        assert_eq!(
+            metadata
+                .get("terminal_cancel_effects")
+                .and_then(Value::as_array)
+                .and_then(|effects| effects.first())
+                .and_then(Value::as_str),
+            Some("queued-effect")
+        );
+        assert_eq!(
+            metadata
+                .get("cancellation_request_ids")
+                .and_then(Value::as_array)
+                .and_then(|requests| requests.first())
+                .and_then(Value::as_str),
+            Some(requests[0].request_id.as_str())
+        );
+        let links = store
+            .list_evidence_links(&instance.instance_id)
+            .expect("evidence links list");
+        assert!(links.iter().any(|link| {
+            link.evidence_id == revision_evidence.evidence_id
+                && link.target_type == "program_version"
+                && link.target_id == version1.version_id.as_str()
+                && link.relation == "from_version"
+        }));
+        assert!(links.iter().any(|link| {
+            link.evidence_id == revision_evidence.evidence_id
+                && link.target_type == "program_version"
+                && link.target_id == version2.version_id.as_str()
+                && link.relation == "to_version"
+        }));
+        assert!(links.iter().any(|link| {
+            link.evidence_id == revision_evidence.evidence_id
+                && link.target_type == "effect"
+                && link.target_id == "queued-effect"
+                && link.relation == "terminal_cancelled"
+        }));
+        assert!(links.iter().any(|link| {
+            link.evidence_id == revision_evidence.evidence_id
+                && link.target_type == "effect"
+                && link.target_id == "running-effect"
+                && link.relation == "cancellation_requested"
+        }));
+        assert!(links.iter().any(|link| {
+            link.evidence_id == revision_evidence.evidence_id
+                && link.target_type == "effect_cancellation_request"
+                && link.target_id == requests[0].request_id.as_str()
+                && link.relation == "created"
+        }));
 
         store
             .expire_leases(&instance.instance_id, "2030-01-02T00:00:00Z")

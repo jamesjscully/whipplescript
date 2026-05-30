@@ -528,9 +528,9 @@ Goal: make revision understandable from the normal inspection surfaces.
 - [x] Add per-effect version/epoch to `whip effects --json`.
 - [x] Add cancellation request state to `whip effects` and `whip runs`.
 - [ ] Add evidence links:
-  - [ ] revision event -> old/new program versions
+  - [x] revision event -> old/new program versions
   - [ ] revision event -> compatibility diagnostics
-  - [ ] revision event -> cancelled/requested effects
+  - [x] revision event -> cancelled/requested effects
   - [ ] cancellation request -> provider/run evidence
 - [ ] Add diagnostics for:
   - [ ] incompatible root workflow
@@ -550,6 +550,12 @@ Acceptance:
 - [x] An operator can answer "what did revision cancel or request to cancel?"
   from CLI output.
 - [x] Trace conformance rejects impossible revision/cancellation sequences.
+
+Stage 6 partial audit notes:
+
+- Revision activation now records `workflow.revision.activated` evidence linked
+  to the activation event, old/new program versions, terminal-cancelled
+  effects, cancellation-requested effects, and cancellation request records.
 
 ## Stage 7: Tests And E2E
 
