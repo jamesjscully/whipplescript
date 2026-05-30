@@ -2,7 +2,7 @@
 
 Status: design proposal
 
-Whippletree is an orchestration language, not a general-purpose data programming
+WhippleScript is an orchestration language, not a general-purpose data programming
 language. Its expression system exists to route workflow events, update small
 durable workflow data, prepare effect payloads, and branch on typed decisions.
 
@@ -13,7 +13,7 @@ a declared typed function or adapter capability.
 
 ## Design Rule
 
-Whippletree-compatible types are schemas. They do not imply that the workflow
+WhippleScript-compatible types are schemas. They do not imply that the workflow
 language supports every possible operation over that type.
 
 For example:
@@ -28,13 +28,13 @@ For example:
 
 If a workflow needs to "find the best next task", it should call:
 
-```whippletree
+```whipplescript
 let next = coerce chooseNextStep(planText)
 ```
 
 or:
 
-```whippletree
+```whipplescript
 let next = plan.nextReadyItem()
 ```
 
@@ -63,7 +63,7 @@ object literal
 
 Examples:
 
-```whippletree
+```whipplescript
 let count = 1
 let threshold = 0.75
 let retryAfter = 2m
@@ -135,7 +135,7 @@ Rules:
 
 Examples:
 
-```whippletree
+```whipplescript
 guard run.status == "succeeded"
 guard run.exitCode != nil
 guard elapsedSince(data.lastIdleNudgeAt) >= 2m
@@ -159,7 +159,7 @@ Rules:
 
 Example:
 
-```whippletree
+```whipplescript
 guard activeRuns() == 0 && plan.unfinishedItems() > 0
 ```
 
@@ -179,7 +179,7 @@ Rules:
 
 Example:
 
-```whippletree
+```whipplescript
 guard !(run.id in data.seenRuns)
 ```
 
@@ -203,7 +203,7 @@ Rules:
 
 Examples:
 
-```whippletree
+```whipplescript
 case next.action {
   StartWorker -> { ... }
   Wait -> { ... }
@@ -224,14 +224,14 @@ List literals are used for small literal collections and initial data.
 
 Rules:
 
-- object fields use Whippletree field syntax: `field expr`
+- object fields use WhippleScript field syntax: `field expr`
 - records are closed when validated against a `class`/record schema
 - optional fields may be omitted or set to `nil`
 - list item values must satisfy the declared item schema where known
 
 Example:
 
-```whippletree
+```whipplescript
 let summary = {
   id run.id
   name run.name
@@ -244,7 +244,7 @@ let summary = {
 
 ### 8. String Interpolation
 
-String interpolation is supported in Whippletree strings outside `prompt` blocks.
+String interpolation is supported in WhippleScript strings outside `prompt` blocks.
 
 Rules:
 
@@ -254,7 +254,7 @@ Rules:
 
 Example:
 
-```whippletree
+```whipplescript
 send director """
 Worker failed: {{ classification.reason }}
 """
@@ -285,7 +285,7 @@ Rules:
 
 Examples:
 
-```whippletree
+```whipplescript
 assign data.seenRuns = data.seenRuns.append(run.id)
 guard list.length(data.activeItems) < 4
 ```
@@ -344,7 +344,7 @@ Rules:
 
 Example:
 
-```whippletree
+```whipplescript
 guard elapsedSince(data.lastIdleNudgeAt) >= 2m
 assign data.lastIdleNudgeAt = now()
 ```
@@ -370,7 +370,7 @@ Rules:
 
 Example:
 
-```whippletree
+```whipplescript
 let planText = plan.snapshot()
 let next = coerce chooseNextStep(planText)
 ```
@@ -404,7 +404,7 @@ surface.
 ## Multimodal Values
 
 BAML supports multimodal values such as `image`, `audio`, `pdf`, and `video`.
-Whippletree reserves those names for opaque boundary values, but they are enabled
+WhippleScript reserves those names for opaque boundary values, but they are enabled
 only when the schema layer and policy layer explicitly support them.
 
 Allowed operations:
@@ -413,7 +413,7 @@ Allowed operations:
 - pass to `coerce`
 - pass to adapter operations
 - compare to `nil`
-- inspect declared metadata fields if the value is represented by an Whippletree
+- inspect declared metadata fields if the value is represented by an WhippleScript
   `class`
 
 Disallowed operations:

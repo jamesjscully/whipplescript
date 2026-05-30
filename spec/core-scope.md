@@ -2,7 +2,7 @@
 
 Status: draft
 
-Whippletree should keep a small core in the Pi style: enough stable machinery to
+WhippleScript should keep a small core in the Pi style: enough stable machinery to
 compose serious agent systems, without baking every useful integration into the
 language or daemon.
 
@@ -65,7 +65,7 @@ Everything else should begin as a plugin.
 ## OpenClaw-Lite
 
 "OpenClaw-lite" is an example capability composition, not a separate product
-mode and not a language feature. A small Whippletree script plus core registries
+mode and not a language feature. A small WhippleScript script plus core registries
 should be able to provide:
 
 ```text

@@ -2,10 +2,10 @@
 
 Status: draft
 
-Whippletree needs two related but separate verification tracks:
+WhippleScript needs two related but separate verification tracks:
 
 1. Validate the architecture before and after implementation.
-2. Statically analyze user Whippletree programs as a product feature.
+2. Statically analyze user WhippleScript programs as a product feature.
 
 The same semantics should feed both tracks, but the tools should not be forced
 into one shape.
@@ -14,9 +14,9 @@ into one shape.
 
 ### Maude: Rule Kernel And Program Semantics
 
-Maude is the primary tool for the Whippletree language kernel. Maude system modules
+Maude is the primary tool for the WhippleScript language kernel. Maude system modules
 specify rewrite theories, and rewrite rules represent local state transitions.
-That matches Whippletree's core model:
+That matches WhippleScript's core model:
 
 ```text
 facts + events + effect queue + dependency edges + rewrite rules
@@ -35,7 +35,7 @@ bounded searches for bad rule cycles
 generated per-program counterexample checks
 ```
 
-Maude should be the first formal target generated from typed Whippletree IR.
+Maude should be the first formal target generated from typed WhippleScript IR.
 
 ### TLA+/Apalache: Durable Runtime Lifecycles
 
@@ -95,7 +95,7 @@ Represent runtime state as a Maude configuration:
   control : RuntimeMeta >
 ```
 
-Each Whippletree rule lowers to one or more Maude rewrite rules. External systems
+Each WhippleScript rule lowers to one or more Maude rewrite rules. External systems
 are modeled nondeterministically:
 
 ```text
@@ -193,7 +193,7 @@ Trace conformance should reject:
 
 This is the bridge between formal specs and the Rust implementation.
 
-## Static Analysis Of Whippletree Programs
+## Static Analysis Of WhippleScript Programs
 
 Compiler checks should be fast, local, and explainable:
 
@@ -234,7 +234,7 @@ success/failure-specific branches.
 
 Generated per-program checks must keep those dependency searches and add
 expression-kernel searches from the same lowered typed IR. The generator should
-emit one finite Maude program module per checked Whippletree program, with
+emit one finite Maude program module per checked WhippleScript program, with
 symbols for the program's rules, facts, effects, dependency edges, guard
 outcomes, assertion checkpoints, and source-span anchors. Validation must use
 generated searches over that module, not only hand-written abstract examples.
@@ -274,7 +274,7 @@ source-span diagnostic at the matching `after <effect> <predicate>` dependency
 anchor and includes the expected and actual Maude result.
 
 The CLI test suite includes an expected-failure generated-check fixture: it
-compiles a real Whippletree example, injects one unsafe dependency-release rewrite
+compiles a real WhippleScript example, injects one unsafe dependency-release rewrite
 into the generated Maude module, and asserts that Maude finds the resulting
 counterexample when `maude` is available on `PATH`.
 

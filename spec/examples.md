@@ -2,6 +2,10 @@
 
 Status: sketchpad
 
+For canonical terminology and the current language reference, start with
+[`../docs/language-reference.md`](../docs/language-reference.md). This file
+remains a design sketchpad for example shapes.
+
 These examples are intentionally small. The goal is to feel the authoring model
 before committing to syntax.
 
@@ -9,11 +13,9 @@ before committing to syntax.
 
 This is the best current v0 candidate for the smallest useful real workflow:
 
-```whippletree
+```whipplescript
 workflow SimpleLoftWorker
 
-use skill "loft-user"
-use skill "human-review-user"
 
 agent worker {
   profile "repo-writer"
@@ -41,7 +43,7 @@ rule start_ready_issue
 
   after claim fails {
     askHuman """
-    Whippletree could not claim this Loft issue:
+    WhippleScript could not claim this Loft issue:
 
     {{ claim.issue_id }}
 
@@ -59,7 +61,7 @@ rule recover_idle
   when no claimable effects
 => {
   askHuman """
-  There is unfinished Loft work, but Whippletree has no active turns or
+  There is unfinished Loft work, but WhippleScript has no active turns or
   claimable effects. Inspect status and decide whether to resume, split, or
   block the work.
   """
@@ -80,12 +82,9 @@ Why this script is important:
 This example adds a typed model decision. It uses BAML-shaped `enum`, `class`,
 and `coerce` declarations, but keeps ordinary data operations small and pure.
 
-```whippletree
+```whipplescript
 workflow LoftWorkerWithReview
 
-use skill "loft-user"
-use skill "baml-coerce-user"
-use skill "human-review-user"
 
 enum ReviewStatus {
   Accept
@@ -228,14 +227,14 @@ What changes:
 - `after review succeeds` narrows `review` to the typed success payload.
 - `record ReviewedWork` creates a durable typed workflow fact.
 - Nontrivial data reasoning should happen in BAML or a capability, not inside
-  Whippletree.
+  WhippleScript.
 
 ## Ralph Loop
 
 An infinite loop that waits for the agent to finish before asking for another
 small step:
 
-```whippletree
+```whipplescript
 workflow Ralph
 
 agent ralph {
@@ -279,7 +278,7 @@ rule again enqueues the next agent.tell
 
 ## Bounded Implementation Workers
 
-```whippletree
+```whipplescript
 workflow ImplementSpec
 
 agent worker {
@@ -317,7 +316,10 @@ rule review_successful_work
 rule accept
   when reviewer accepted work as item
 => {
-  complete item
+  done item -> record AcceptedWork {
+    id item.id
+    status "accepted"
+  }
 }
 
 rule retry
@@ -332,7 +334,7 @@ is a pool. It is a runtime invariant over turn effects for that role.
 
 ## Research Fan-Out
 
-```whippletree
+```whipplescript
 workflow Research
 
 agent researcher {
@@ -383,59 +385,126 @@ right but needs semantic discipline.
 OpenClaw-lite is an example composition, not a special mode. It combines core
 registries with a few plugins:
 
-```whippletree
+```whipplescript
 workflow OpenClawLite
 
-use skill "whippletree-author"
-use skill "loft-user"
-use skill "human-review-user"
-use plugin "memory"
+use memory
+
+class OpenClawCronTick {
+  job string
+  interval string
+  firedAt string
+  status "ready"
+}
+
+class OpenClawHeartbeat {
+  job string
+  interval string
+  firedAt string
+  status "observed"
+}
+
+class WorkItem {
+  title string
+  body string
+  status "ready"
+}
+
+class PlannedWork {
+  title string
+  body string
+  context MemoryContext
+  turn AgentTurn
+  status "planned"
+}
+
+class MemoryContext {
+  summary string
+  target string
+}
+
+agent planner {
+  profile "repo-reader"
+  capacity 1
+  skills ["whipplescript-author", "human-review-user"]
+}
 
 agent worker {
   profile "repo-writer"
-  capacity 3
-  skills ["loft-user", "memory-user"]
+  capacity 2
+  skills ["whipplescript-author", "loft-user"]
 }
 
-rule heartbeat
-  when every 15m
+rule seed_fixture_tick
+  when started
 => {
-  emit heartbeat
+  record OpenClawCronTick {
+    job "openclaw-heartbeat"
+    interval "15m"
+    firedAt "fixture-now"
+    status "ready"
+  }
+
+  record WorkItem {
+    title "Try the OpenClaw-lite composition"
+    body "Use a heartbeat, explicit memory recall, skill-guided planning, and human-visible escalation without an OpenClaw gateway."
+    status "ready"
+  }
 }
 
-rule start_ready_issue
-  when heartbeat
-  when loft has ready issue as issue
-  when worker is available
+rule emit_heartbeat
+  when OpenClawCronTick as tick where tick.status == "ready"
 => {
-  claim issue with loft as claim
+  emit openclaw.heartbeat as heartbeat
 
-  after claim succeeds {
-    memory.query claim.issue.summary as memory
-
-    after memory succeeds {
-      tell worker """
-      Implement this Loft issue:
-
-      {{ claim.issue.title }}
-
-      Relevant memory:
-      {{ memory.results }}
-
-      Update the issue with evidence when done.
-      """
+  after heartbeat succeeds {
+    done tick -> record OpenClawHeartbeat from tick {
+      job
+      interval
+      firedAt
+      status "observed"
     }
   }
 }
 
-rule ask_when_idle
-  when heartbeat
-  when loft has unfinished issues
-  when no active agent turns
+rule plan_ready_work
+  when OpenClawHeartbeat as beat where beat.status == "observed"
+  when WorkItem as item where item.status == "ready"
+  when planner is available
+=> {
+  call memory.query for item as context
+
+  after context succeeds as memory => {
+    tell planner as plan """
+    Use the attached skills and recalled memory to produce a short plan.
+
+    Work:
+    {{ item.title }}
+
+    {{ item.body }}
+
+    Memory:
+    {{ memory.summary }}
+    """
+  }
+
+  after plan succeeds {
+    done item -> record PlannedWork from item {
+      title
+      body
+      context context
+      turn plan
+      status "planned"
+    }
+  }
+}
+
+rule request_human_trace_review
+  when OpenClawHeartbeat as beat where beat.status == "observed"
 => {
   askHuman """
-  Whippletree is idle but Loft still has unfinished work.
-  Inspect the trace and decide whether to resume, split, or block the work.
+  OpenClaw-lite heartbeat {{ beat.job }} fired at {{ beat.firedAt }}.
+  Review the trace if the plan or memory context needs human attention.
   """
 }
 ```
@@ -444,6 +513,11 @@ The important part is not the name. The important part is that skills,
 heartbeat scheduling, agent turns, Loft work claims, memory access, human
 review, and evidence tracing are composed through the same small rule/effect
 kernel.
+
+In production, cron belongs at the control-plane boundary: the scheduler appends
+a durable tick/event, and the workflow reacts to that observation. The checked
+fixture seeds one `OpenClawCronTick` from `started` so validation runs are
+deterministic; it does not add an OpenClaw gateway or a hidden scheduler loop.
 
 ## Current Checked Fixtures
 
@@ -455,8 +529,8 @@ The checked example fixtures in `examples/` are:
   review, and human fallback.
 - `coerce-branch.whip`: typed model classification followed by explicit
   routing.
-- `codex-french-poem-dogfood.whip`: Codex writes a French poem artifact, then
-  a second Codex turn judges whether it is a real French poem.
+- Codex French poem fixture: Codex writes a French poem artifact, then a second
+  Codex turn judges whether it is a real French poem.
 - `codex-poem-coerce-review.whip`: Codex writes a French poem artifact, then a
   typed BAML `coerce` reviews the completed turn.
 - `human-review.whip`: manual review request and answer recording.
@@ -472,7 +546,7 @@ The checked example fixtures in `examples/` are:
 
 Each checked source has a matching `.ir` snapshot consumed by parser tests.
 
-## Dogfood Notes
+## Validation Notes
 
 First authoring pass guesses:
 

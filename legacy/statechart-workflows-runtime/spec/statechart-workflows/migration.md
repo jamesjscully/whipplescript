@@ -1,6 +1,6 @@
-# Migration From Legacy Whippletree
+# Migration From Legacy WhippleScript
 
-Legacy Whippletree centered on scheduled tasks, event triggers, and arbitrary
+Legacy WhippleScript centered on scheduled tasks, event triggers, and arbitrary
 TypeScript or shell scripts. The statechart workflow track keeps the useful
 runtime lessons but changes the product surface.
 
@@ -57,14 +57,14 @@ as trusted runtime code, not as workflow source.
 Acceptable script use:
 
 - a narrow provider command run by the native harness
-- a bridge that writes a typed event into Whippletree
+- a bridge that writes a typed event into WhippleScript
 - a repo-specific plan adapter hidden behind a manifest capability
 
 Avoid:
 
 - scripts that own the workflow loop
 - scripts that parse logs to decide lifecycle state
-- scripts that mutate Whippletree SQLite state directly
+- scripts that mutate WhippleScript SQLite state directly
 - scripts that bypass capability policy
 
 ## Migration Checklist

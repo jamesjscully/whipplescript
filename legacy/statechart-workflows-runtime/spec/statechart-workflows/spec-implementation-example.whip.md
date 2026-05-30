@@ -7,7 +7,7 @@ This file mirrors the live example at
 director scripts with a constrained hierarchical statechart, BAML-shaped typed
 coercions, and explicit capability boundaries.
 
-```whippletree
+```whipplescript
 machine specImplementation
 initial running
 

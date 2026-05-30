@@ -1,8 +1,5 @@
 workflow LoftWorkerWithReview
 
-use skill "loft-user"
-use skill "baml-coerce-user"
-use skill "human-review-user"
 
 enum ReviewStatus {
   Accept

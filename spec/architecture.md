@@ -2,7 +2,7 @@
 
 Status: draft
 
-Whippletree has six conceptual layers:
+WhippleScript has six conceptual layers:
 
 ```text
 source rule language
@@ -161,6 +161,6 @@ The architecture depends on these supporting specs:
   coding-agent turns.
 - [coerce.md](coerce.md) defines BAML-backed model calls as durable effects.
 - [loft-integration.md](loft-integration.md) defines the separate work
-  kernel Whippletree relies on for serious repo execution.
+  kernel WhippleScript relies on for serious repo execution.
 - [human-review.md](human-review.md) defines human inbox semantics.
 - [observability.md](observability.md) defines evidence and trace UX.

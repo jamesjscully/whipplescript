@@ -49,7 +49,7 @@ Default project layout:
 
 ```text
 workflow.whip
-.whippletree/
+.whipplescript/
   build/
     ir.json
     baml_src/
@@ -70,7 +70,7 @@ Larger projects may use multiple workflows:
 workflows/
   spec-implementation.whip
   nightly-maintenance.whip
-.whippletree/
+.whipplescript/
   state/
     spec-implementation/
     nightly-maintenance/
@@ -103,9 +103,9 @@ valid `.whip` identifier.
 
 ```text
 workflow.whip
-.whippletree/policy.json
-.whippletree/state/
-.whippletree/workflows/
+.whipplescript/policy.json
+.whipplescript/state/
+.whipplescript/workflows/
 ```
 
 It should ask as few questions as possible. Defaults are permissive for local
@@ -235,14 +235,14 @@ stdout/stderr artifacts, records a durable completion, and enqueues the typed
 workflow completion event. This command is the deterministic testable unit of
 the local harness.
 
-Provider config maps declared Whippletree agents to provider runners:
+Provider config maps declared WhippleScript agents to provider runners:
 
 ```json
 {
   "agents": {
     "worker": {
       "provider": "command",
-      "command": ["sh", "-c", "printf '%s\n' \"$WHIPPLETREE_PROMPT\""],
+      "command": ["sh", "-c", "printf '%s\n' \"$WHIPPLESCRIPT_PROMPT\""],
       "cwd": ".",
       "timeoutSeconds": 1800
     }
@@ -257,7 +257,7 @@ also receive an explicit `command` override and extra `args`.
 Governed environments should pass `--profile-policy` and use source-level agent
 profiles instead of exposing raw command/provider choices in workflow logic:
 
-```whippletree
+```whipplescript
 agent researcher = codingAgent() {
   profile "research"
   maxActive 2

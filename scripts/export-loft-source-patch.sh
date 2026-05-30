@@ -6,7 +6,7 @@ source "$ROOT/scripts/loft-fixtures-lib.sh"
 
 LOFT_REPO="${1:-}"
 PATCH_PATH="${2:-$ROOT/target/loft-source-fixtures.patch}"
-OVERWRITE="${WHIPPLETREE_OVERWRITE_LOFT_PATCH:-0}"
+OVERWRITE="${WHIPPLESCRIPT_OVERWRITE_LOFT_PATCH:-0}"
 
 if [[ -z "$LOFT_REPO" ]]; then
   echo "usage: scripts/export-loft-source-patch.sh <local-loft-repo> [patch-path]" >&2
@@ -19,7 +19,7 @@ if [[ ! -d "$LOFT_REPO/.git" ]]; then
 fi
 
 if [[ -e "$PATCH_PATH" && "$OVERWRITE" != "1" ]]; then
-  echo "patch already exists; set WHIPPLETREE_OVERWRITE_LOFT_PATCH=1 to replace: $PATCH_PATH" >&2
+  echo "patch already exists; set WHIPPLESCRIPT_OVERWRITE_LOFT_PATCH=1 to replace: $PATCH_PATH" >&2
   exit 2
 fi
 

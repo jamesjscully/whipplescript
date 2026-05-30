@@ -2,7 +2,7 @@
 
 Status: draft
 
-Whippletree previously had two legacy tracks:
+WhippleScript previously had two legacy tracks:
 
 - `legacy/statechart-workflows-runtime/`
 - `legacy/v0.3-runtime/`
@@ -31,7 +31,7 @@ design history.
 For a legacy workflow:
 
 1. Identify durable facts and external effects.
-2. Move provider calls into Whippletree effects.
+2. Move provider calls into WhippleScript effects.
 3. Replace source-order sequencing with explicit `after` dependencies.
 4. Choose least-privilege profiles for each agent/effect.
 5. Use Loft for work tracking instead of local ad hoc queues.

@@ -1,6 +1,5 @@
 workflow ImplementationPlanPhaseReview
 
-use skill "whippletree-author"
 
 class PhaseReviewRequest {
   number int
@@ -21,7 +20,7 @@ class PhaseReviewDispatch {
 agent codex {
   profile "repo-reader"
   capacity 4
-  skills ["whippletree-author"]
+  skills ["whipplescript-author"]
 }
 
 assert count(PhaseReviewRequest where status == "queued") == 0
@@ -148,7 +147,7 @@ rule dispatch_phase_review
   when codex is available
 => {
   tell codex as turn """
-  Review phase {{ phase.number }} of the Whippletree implementation plan.
+  Review phase {{ phase.number }} of the WhippleScript implementation plan.
 
   Phase title:
   {{ phase.title }}

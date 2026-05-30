@@ -2,8 +2,8 @@
 
 Status: design proposal
 
-Statechart workflows should be implemented as the new primary Whippletree product
-surface for this track. The old Whippletree daemon/task implementation may be
+Statechart workflows should be implemented as the new primary WhippleScript product
+surface for this track. The old WhippleScript daemon/task implementation may be
 reused opportunistically, but it should not define the conceptual model.
 
 The new core is:
@@ -69,7 +69,7 @@ validator, and durable interpreter.
 Strengths:
 
 - fastest path to a usable workflow runtime
-- tight fit with Whippletree's existing runtime objects
+- tight fit with WhippleScript's existing runtime objects
 - small number of moving parts
 - easy to run locally
 
@@ -154,7 +154,7 @@ far down a path with ambiguous semantics.
 
 ## System Components
 
-### 1. Whippletree Source Parser
+### 1. WhippleScript Source Parser
 
 The parser reads one workflow source file and produces a lossless rowan syntax
 tree plus typed lowering diagnostics. This follows the newer BAML language
@@ -186,7 +186,7 @@ action normalization, and invariants lower according to
 
 ### 2. BAML Artifact Generator
 
-The generator turns Whippletree `class`, `enum`, and `coerce` declarations into
+The generator turns WhippleScript `class`, `enum`, and `coerce` declarations into
 normal generated BAML artifacts.
 
 Responsibilities:
@@ -290,7 +290,7 @@ registered by adapters. They are not free-form workflow code.
 `coerce` and adapter value operations are synchronous typed value calls, not
 workflow control-flow authority. They produce values that the statechart may
 branch on. Any resulting `start`, `send`, `askHuman`, `raise`, or adapter write
-is still an explicit Whippletree effect with its own schema and capability checks.
+is still an explicit WhippleScript effect with its own schema and capability checks.
 For local agents, `start`/`send` are native ledger writes rather than adapter
 dispatch.
 The v1 `coerce` backend is BAML HTTP via `baml-cli serve`; TypeScript codegen is
@@ -337,7 +337,7 @@ un-tie thread/session adapter
 human review adapter
 filesystem state adapter, scoped to declared files
 external process adapter, if explicitly enabled
-legacy Whippletree adapter, if compatibility is needed
+legacy WhippleScript adapter, if compatibility is needed
 ```
 
 Harness providers and adapters should be narrow and capability-checked. They

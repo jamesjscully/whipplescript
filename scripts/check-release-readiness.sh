@@ -2,9 +2,9 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPORT="${WHIPPLETREE_RELEASE_READINESS_REPORT:-$ROOT/target/release-readiness-report.md}"
-FULL="${WHIPPLETREE_RELEASE_READINESS_FULL:-0}"
-STRICT_EXTERNAL="${WHIPPLETREE_RELEASE_STRICT_EXTERNAL:-0}"
+REPORT="${WHIPPLESCRIPT_RELEASE_READINESS_REPORT:-$ROOT/target/release-readiness-report.md}"
+FULL="${WHIPPLESCRIPT_RELEASE_READINESS_FULL:-0}"
+STRICT_EXTERNAL="${WHIPPLESCRIPT_RELEASE_STRICT_EXTERNAL:-0}"
 LOG_DIR="$(mktemp -d)"
 overall_status=0
 required_failed=0
@@ -63,9 +63,9 @@ run_check required "format check" "cd '$ROOT' && cargo fmt --all -- --check"
 run_check required "diff whitespace check" "cd '$ROOT' && git diff --check"
 run_check required "Loft compatibility fixtures" "cd '$ROOT' && scripts/check-loft-fixtures.sh"
 run_check required "Loft source patch export" \
-  "cd '$ROOT' && tmp=\$(mktemp -d) && patch=\$(mktemp) && rm -f \"\$patch\" && git -C \"\$tmp\" init -q && mkdir -p \"\$tmp/spec\" && printf '# Loft v0.1 Specification\n' >\"\$tmp/spec/loft-v0.1.md\" && scripts/export-loft-source-patch.sh \"\$tmp\" \"\$patch\" && grep -q 'fixtures/whippletree/v0.1/manifest.json' \"\$patch\"; status=\$?; rm -rf \"\$tmp\" \"\$patch\"; exit \$status"
+  "cd '$ROOT' && tmp=\$(mktemp -d) && patch=\$(mktemp) && rm -f \"\$patch\" && git -C \"\$tmp\" init -q && mkdir -p \"\$tmp/spec\" && printf '# Loft v0.1 Specification\n' >\"\$tmp/spec/loft-v0.1.md\" && scripts/export-loft-source-patch.sh \"\$tmp\" \"\$patch\" && grep -q 'fixtures/whipplescript/v0.1/manifest.json' \"\$patch\"; status=\$?; rm -rf \"\$tmp\" \"\$patch\"; exit \$status"
 run_check required "Loft source repo preflight" \
-  "cd '$ROOT' && tmp=\$(mktemp -d) && git -C \"\$tmp\" init -q && mkdir -p \"\$tmp/spec\" && printf '# Loft v0.1 Specification\n' >\"\$tmp/spec/loft-v0.1.md\" && scripts/stage-loft-fixtures.sh \"\$tmp\" >/dev/null && git -C \"\$tmp\" add spec/loft-v0.1.md fixtures/whippletree/v0.1 && git -C \"\$tmp\" -c user.name=Whippletree -c user.email=whippletree@example.invalid commit -q -m 'Add Loft spec fixtures' && scripts/check-loft-source-repo.sh \"\$tmp\"; status=\$?; rm -rf \"\$tmp\"; exit \$status"
+  "cd '$ROOT' && tmp=\$(mktemp -d) && git -C \"\$tmp\" init -q && mkdir -p \"\$tmp/spec\" && printf '# Loft v0.1 Specification\n' >\"\$tmp/spec/loft-v0.1.md\" && scripts/stage-loft-fixtures.sh \"\$tmp\" >/dev/null && git -C \"\$tmp\" add spec/loft-v0.1.md fixtures/whipplescript/v0.1 && git -C \"\$tmp\" -c user.name=WhippleScript -c user.email=whipplescript@example.invalid commit -q -m 'Add Loft spec fixtures' && scripts/check-loft-source-repo.sh \"\$tmp\"; status=\$?; rm -rf \"\$tmp\"; exit \$status"
 run_check required "Loft handoff report" "cd '$ROOT' && scripts/loft-handoff-report.sh"
 run_check required "real-provider smoke report" "cd '$ROOT' && scripts/check-real-providers-report.sh"
 
@@ -78,7 +78,7 @@ if [[ "$FULL" == "1" ]]; then
 fi
 
 run_check external "strict Loft submodule fixtures" \
-  "cd '$ROOT' && WHIPPLETREE_REQUIRE_LOFT_SUBMODULE_FIXTURES=1 scripts/check-loft-fixtures.sh"
+  "cd '$ROOT' && WHIPPLESCRIPT_REQUIRE_LOFT_SUBMODULE_FIXTURES=1 scripts/check-loft-fixtures.sh"
 run_check external "Loft submodule readiness" \
   "cd '$ROOT' && scripts/check-loft-submodule-readiness.sh"
 

@@ -2,7 +2,7 @@
 
 Status: draft
 
-Plugins extend Whippletree by registering capabilities, providers, profiles, and
+Plugins extend WhippleScript by registering capabilities, providers, profiles, and
 bindings. They do not add new control-flow semantics.
 
 ## Manifest Shape
@@ -43,7 +43,7 @@ not mutate workflow state directly from plugin code.
 
 Use generic capability calls first:
 
-```whippletree
+```whipplescript
 call memory.query for item as context
 
 after context succeeds {

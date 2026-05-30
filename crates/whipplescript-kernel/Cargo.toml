@@ -1,0 +1,17 @@
+[package]
+name = "whipplescript-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+whipplescript-core = { path = "../whipplescript-core" }
+whipplescript-parser = { path = "../whipplescript-parser" }
+whipplescript-store = { path = "../whipplescript-store" }
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

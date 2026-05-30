@@ -1,57 +1,135 @@
 workflow OpenClawLite
 
-use skill "human-review-user"
+use memory
 
-class PlanReview {
-  subject string
-  decision string
-  reason string
+class OpenClawCronTick {
+  job string
+  interval string
+  firedAt string
+  status "ready"
+}
+
+class OpenClawHeartbeat {
+  job string
+  interval string
+  firedAt string
+  status "observed"
+}
+
+class WorkItem {
+  title string
+  body string
+  status "ready"
+}
+
+class PlannedWork {
+  title string
+  body string
+  context MemoryContext
+  turn AgentTurn
+  status "planned"
+}
+
+class MemoryContext {
+  summary string
+  target string
 }
 
 agent planner {
   profile "repo-reader"
   capacity 1
+  skills ["whipplescript-author", "human-review-user"]
 }
 
-agent implementer {
+agent worker {
   profile "repo-writer"
   capacity 2
+  skills ["whipplescript-author", "loft-user"]
 }
 
-agent verifier {
-  profile "repo-reader"
+agent reviewer {
+  profile "human-review"
   capacity 1
+  skills ["human-review-user"]
 }
 
-rule plan_open_work
-  when WorkItem as item
-  when planner is available
-=> {
-  tell planner "Break this work into a short implementation plan for {{ item.title }}: {{ item.body }}" as plan
+assert none(OpenClawCronTick where status == "ready")
+assert one(OpenClawHeartbeat where status == "observed")
+assert one(PlannedWork where status == "planned")
+assert one(effect kind event.emit where status == completed)
+assert one(effect kind capability.call where status == completed)
+assert one(effect kind agent.tell where status == completed)
 
-  after plan succeeds {
-    askHuman "Review the proposed plan for {{ item.title }}. Accept, revise, or block it before implementation starts." as approval
+rule seed_fixture_tick
+  when started
+=> {
+  record OpenClawCronTick {
+    job "openclaw-heartbeat"
+    interval "15m"
+    firedAt "fixture-now"
+    status "ready"
+  }
+
+  record WorkItem {
+    title "Try the OpenClaw-lite composition"
+    body "Use a heartbeat, explicit memory recall, skill-guided planning, and human-visible escalation without an OpenClaw gateway."
+    status "ready"
   }
 }
 
-rule implement_accepted_plan
-  when human answered review as approval
-  when implementer is available
+rule emit_heartbeat
+  when OpenClawCronTick as tick where tick.status == "ready"
 => {
-  tell implementer """
-  Implement the accepted plan:
+  emit openclaw.heartbeat as heartbeat
 
-  {{ approval.reason }}
-  """
+  after heartbeat succeeds {
+    done tick -> record OpenClawHeartbeat from tick {
+      job
+      interval
+      firedAt
+      status "observed"
+    }
+  }
 }
 
-rule verify_completed_work
-  when worker completed turn for loft issue as turn
-  when verifier is available
+rule plan_ready_work
+  when OpenClawHeartbeat as beat where beat.status == "observed"
+  when WorkItem as item where item.status == "ready"
+  when planner is available
 => {
-  tell verifier """
-  Verify correctness, tests, and scope for:
+  call memory.query for item as context
 
-  {{ turn.summary }}
+  after context succeeds as memory => {
+    tell planner as plan """
+    Use the attached skills and recalled memory to produce a short plan.
+
+    Work:
+    {{ item.title }}
+
+    {{ item.body }}
+
+    Memory:
+    {{ memory.summary }}
+    """
+  }
+
+  after plan succeeds {
+    done item -> record PlannedWork from item {
+      title
+      body
+      context context
+      turn plan
+      status "planned"
+    }
+  }
+}
+
+rule request_human_trace_review
+  when OpenClawHeartbeat as beat where beat.status == "observed"
+  when reviewer is available
+=> {
+  askHuman """
+  OpenClaw-lite heartbeat {{ beat.job }} fired at {{ beat.firedAt }}.
+  Review the trace if the plan or memory context needs human attention.
   """
 }

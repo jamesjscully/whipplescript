@@ -4,7 +4,7 @@ Status: design proposal
 
 `.whip` files use a small native statechart DSL. The language borrows BAML's
 declaration style for structured data and model coercion, but the workflow
-control model is Whippletree-owned and statechart-first.
+control model is WhippleScript-owned and statechart-first.
 
 The source file defines exactly one machine. The top-level `machine` declaration
 names that machine; it does not wrap the file in braces.
@@ -35,7 +35,7 @@ The format must avoid:
 
 ## Example
 
-```whippletree
+```whipplescript
 machine implementationLoop
 initial running
 
@@ -289,7 +289,7 @@ send
 assign
 ```
 
-Whippletree-specific orchestration terms are reserved for domain effects:
+WhippleScript-specific orchestration terms are reserved for domain effects:
 
 ```text
 agent
@@ -304,7 +304,7 @@ snapshot-style adapter calls
 
 A source file defines one machine:
 
-```whippletree
+```whipplescript
 machine simpleSupervisor
 initial watching
 ```
@@ -319,7 +319,7 @@ change runtime behavior.
 
 Workflow-local durable data is declared with `data`:
 
-```whippletree
+```whipplescript
 data {
   seenRuns string[] = []
   lastIdleNudgeAt time? = nil
@@ -333,7 +333,7 @@ as `now()` are not valid data initializers in v0.
 
 Durable writes must use `assign`:
 
-```whippletree
+```whipplescript
 assign data.seenRuns = data.seenRuns.append(run.id)
 assign data.lastIdleNudgeAt = now()
 ```
@@ -341,7 +341,7 @@ assign data.lastIdleNudgeAt = now()
 `let` bindings are ephemeral and exist only for the current event-processing
 turn:
 
-```whippletree
+```whipplescript
 let planText = plan.snapshot()
 ```
 
@@ -349,7 +349,7 @@ let planText = plan.snapshot()
 
 Agents are named targets. They are not pattern groups.
 
-```whippletree
+```whipplescript
 agent director = thread("director")
 agent worker = codingAgent() {
   maxActive 2
@@ -381,7 +381,7 @@ overlap, the longest matching started-agent prefix wins.
 
 Group-like behavior is expressed in guards or pattern matching over event data:
 
-```whippletree
+```whipplescript
 case run.name {
   matches "worker-*" -> { ... }
   matches "quality-*" -> { ... }
@@ -395,13 +395,13 @@ This keeps agent declarations simple and avoids hidden polymorphism.
 
 Capabilities declare adapter-backed authority:
 
-```whippletree
+```whipplescript
 capability plan = adapter("implementationPlan")
 ```
 
 The workflow may call approved operations on the capability:
 
-```whippletree
+```whipplescript
 let planText = plan.snapshot()
 plan.markBlocked(workItemId, reason)
 ```
@@ -418,7 +418,7 @@ updating databases, or running approved scripts.
 
 User-defined structured types are only `enum` and `class`.
 
-```whippletree
+```whipplescript
 enum RunKind {
   WorkerComplete
   WorkerFailed
@@ -461,7 +461,7 @@ boundary intentionally accepts arbitrary keys.
 
 `coerce` declares a typed model interpretation function:
 
-```whippletree
+```whipplescript
 coerce classifyRun(run RunSummary) -> RunClassification {
   model "gpt-4o-mini"
 
@@ -481,7 +481,7 @@ types must be BAML-compatible.
 
 Both call forms are accepted:
 
-```whippletree
+```whipplescript
 let classification = coerce classifyRun(summary)
 let classification = classifyRun(summary)
 ```
@@ -495,7 +495,7 @@ as a coerce function.
 
 Event handlers use `on`:
 
-```whippletree
+```whipplescript
 on finished as run
   guard !(run.id in data.seenRuns)
 {
@@ -512,7 +512,7 @@ Guards are pure expressions. Multiple `guard` lines are ANDed.
 
 States may contain child states:
 
-```whippletree
+```whipplescript
 state running {
   initial watching
 
@@ -543,7 +543,7 @@ a validation error.
 
 Every `on`, `entry`, and `always` block may use an explicit outcome:
 
-```whippletree
+```whipplescript
 stay
 goto someState
 ```
@@ -593,7 +593,7 @@ coerce     run typed model interpretation
 Adapter-backed capability calls are also effects, but they must be declared and
 approved:
 
-```whippletree
+```whipplescript
 plan.markDone(workItemId)
 scripts.run("sync-plan")
 ```
@@ -604,7 +604,7 @@ Unknown effect names fail validation.
 
 The DSL avoids colons across declarations and object literals:
 
-```whippletree
+```whipplescript
 class RunSummary {
   id string
   exitCode int?
@@ -616,5 +616,5 @@ let summary = {
 }
 ```
 
-This keeps Whippletree close to BAML where BAML already has good syntax, while
+This keeps WhippleScript close to BAML where BAML already has good syntax, while
 statechart constructs remain explicit and standard.

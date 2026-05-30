@@ -9,7 +9,7 @@ upgrade important workflow stores.
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo build -p whippletree-cli
+cargo build -p whipplescript-cli
 scripts/check-docs.sh
 scripts/check-e2e.sh
 scripts/check-formal-models.sh
@@ -28,7 +28,7 @@ git diff --check
 ## Product Checks
 
 - README command examples still run or are clearly marked as illustrative.
-- `skills/whippletree-statechart/SKILL.md` reflects the current CLI surface.
+- `skills/whipplescript-statechart/SKILL.md` reflects the current CLI surface.
 - At least one template validates, builds, runs, processes a typed completion,
   reaches settled status, and the local human-review response bridge is checked
   through `scripts/check-docs.sh`.
@@ -58,5 +58,5 @@ cp workflow.sqlite workflow.sqlite.backup
 whip status workflow.whip --store workflow.sqlite --json
 ```
 
-If the binary rejects a newer schema version, use the matching newer Whippletree
+If the binary rejects a newer schema version, use the matching newer WhippleScript
 binary. Do not edit schema metadata manually.

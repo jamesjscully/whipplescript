@@ -223,44 +223,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "whippletree-cli"
+name = "whipplescript-cli"
 version = "0.1.0"
 dependencies = [
  "serde_json",
- "whippletree-core",
- "whippletree-kernel",
- "whippletree-parser",
- "whippletree-store",
+ "whipplescript-core",
+ "whipplescript-kernel",
+ "whipplescript-parser",
+ "whipplescript-store",
 ]
 
 [[package]]
-name = "whippletree-core"
+name = "whipplescript-core"
 version = "0.1.0"
 
 [[package]]
-name = "whippletree-kernel"
+name = "whipplescript-kernel"
 version = "0.1.0"
 dependencies = [
  "serde_json",
- "whippletree-core",
- "whippletree-parser",
- "whippletree-store",
+ "whipplescript-core",
+ "whipplescript-parser",
+ "whipplescript-store",
 ]
 
 [[package]]
-name = "whippletree-parser"
+name = "whipplescript-parser"
 version = "0.1.0"
 dependencies = [
- "whippletree-core",
+ "whipplescript-core",
 ]
 
 [[package]]
-name = "whippletree-store"
+name = "whipplescript-store"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
  "serde_json",
- "whippletree-core",
+ "whipplescript-core",
 ]
 
 [[package]]

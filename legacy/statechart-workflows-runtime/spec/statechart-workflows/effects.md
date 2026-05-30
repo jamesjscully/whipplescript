@@ -39,7 +39,7 @@ the transition commit and are replayable from the transition log.
 
 Examples:
 
-```whippletree
+```whipplescript
 assign data.classification = classification
 assign data.seenRuns = data.seenRuns.append(run.id)
 assign data.activeItems = data.activeItems.remove(itemId)
@@ -262,7 +262,7 @@ capabilities.
 
 Example source:
 
-```whippletree
+```whipplescript
 capability plan = adapter("implementationPlan")
 
 let planText = plan.snapshot()

@@ -8,50 +8,50 @@ typed data contracts, not direct calls into each other's internals.
 ## Component Graph
 
 ```text
-whippletree-cli
-  -> whippletree-workflow
-  -> whippletree-engine
-  -> whippletree-adapters
-  -> whippletree-modelgen
+whipplescript-cli
+  -> whipplescript-workflow
+  -> whipplescript-engine
+  -> whipplescript-adapters
+  -> whipplescript-modelgen
 
-whippletree-engine
-  -> whippletree-workflow
+whipplescript-engine
+  -> whipplescript-workflow
 
-whippletree-adapters
-  -> whippletree-engine effect contracts
-  -> whippletree-workflow schema types
+whipplescript-adapters
+  -> whipplescript-engine effect contracts
+  -> whipplescript-workflow schema types
 
-whippletree-modelgen
-  -> whippletree-workflow
+whipplescript-modelgen
+  -> whipplescript-workflow
 ```
 
 Allowed dependencies:
 
 ```text
-whippletree-workflow:
+whipplescript-workflow:
   no dependencies on engine, adapters, CLI, or modelgen
 
-whippletree-engine:
-  depends on whippletree-workflow IR/types
+whipplescript-engine:
+  depends on whipplescript-workflow IR/types
   depends on adapter traits, not adapter implementations
   owns SQLite-backed queue/log/state storage
 
-whippletree-adapters:
+whipplescript-adapters:
   depends on engine effect contracts and workflow schema types
   does not depend on CLI
 
-whippletree-modelgen:
+whipplescript-modelgen:
   depends on workflow IR only
   does not depend on engine runtime state
 
-whippletree-cli:
+whipplescript-cli:
   composes parser, validator, engine, adapters, and model generation behind
   product commands
 ```
 
-If `whippletree-engine` and `whippletree-adapters` begin to pull implementation code
-from each other, shared DTOs should move into a small `whippletree-api` or
-`whippletree-contracts` crate. The important boundary is that adapters depend on
+If `whipplescript-engine` and `whipplescript-adapters` begin to pull implementation code
+from each other, shared DTOs should move into a small `whipplescript-api` or
+`whipplescript-contracts` crate. The important boundary is that adapters depend on
 effect contracts, not interpreter internals.
 
 ## Boundary Principle

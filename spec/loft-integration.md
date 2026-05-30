@@ -13,7 +13,7 @@ Git-friendly immutable transaction history
 local issue leases
 ```
 
-Whippletree owns orchestration truth:
+WhippleScript owns orchestration truth:
 
 ```text
 programs
@@ -25,12 +25,12 @@ provider runs
 agent lifecycle
 ```
 
-Loft is core integration for Whippletree because local issue/work coordination is
-the default serious use case. It should remain usable without Whippletree.
+Loft is core integration for WhippleScript because local issue/work coordination is
+the default serious use case. It should remain usable without WhippleScript.
 
 ## Capability Surface
 
-Whippletree talks to Loft through a registered capability:
+WhippleScript talks to Loft through a registered capability:
 
 ```text
 loft.ready
@@ -54,7 +54,7 @@ Loft spec. A daemon or library API may follow.
 
 Author-facing sketch:
 
-```whippletree
+```whipplescript
 requires capability loft
 
 rule implement_ready_issue
@@ -88,7 +88,7 @@ The agent turn should not start unless the Loft claim succeeds.
 
 Source syntax:
 
-```whippletree
+```whipplescript
 claim issue with loft as claim
 ```
 
@@ -151,7 +151,7 @@ LoftClaimTimedOut {
 
 Typing rules:
 
-```whippletree
+```whipplescript
 after claim succeeds {
   // claim : LoftClaimSucceeded
 }
@@ -172,7 +172,7 @@ failure fields such as `claim.issue_id`, `claim.reason`, and `claim.conflicts`.
 
 ```text
 Loft lease = this actor is working on issue X
-Whippletree effect lease = this worker claimed effect Y
+WhippleScript effect lease = this worker claimed effect Y
 Thoth lease = this actor may write governed resource Z
 ```
 
@@ -180,8 +180,8 @@ These are different leases. Do not collapse them.
 
 ## Idempotency
 
-Whippletree effect IDs should map to Loft `command_id` values. Retrying an
-Whippletree effect must not create duplicate Loft transactions.
+WhippleScript effect IDs should map to Loft `command_id` values. Retrying an
+WhippleScript effect must not create duplicate Loft transactions.
 
 ## Failure Semantics
 
@@ -189,12 +189,12 @@ Whippletree effect must not create duplicate Loft transactions.
 - If the agent turn fails, policy decides whether to release the issue, renew
   the lease, add a note, or ask a human.
 - If Loft has semantic conflicts, ready work excludes conflicted issues and
-  Whippletree may pause or ask for human resolution.
+  WhippleScript may pause or ask for human resolution.
 - Expired Loft leases do not imply durable issue failure.
 
 ## CLI Contract
 
-The v0 Whippletree adapter follows the Loft v0.1 agent-facing CLI:
+The v0 WhippleScript adapter follows the Loft v0.1 agent-facing CLI:
 
 ```bash
 loft show iss_abc --json
@@ -204,22 +204,22 @@ loft renew lea_abc --ttl 1800s --json
 loft release lea_abc --json
 loft note iss_abc "message" --lease-id lea_abc --json
 loft set iss_abc status in_progress --lease-id lea_abc --json
-loft evidence add iss_abc --lease-id lea_abc --kind whippletree.trace --artifact REF --json-data trace-summary.json --json
+loft evidence add iss_abc --lease-id lea_abc --kind whipplescript.trace --artifact REF --json-data trace-summary.json --json
 loft set iss_abc resource_intent '{"reads":[],"writes":[]}' --lease-id lea_abc --json
 loft complete lea_abc --reason done --json
 loft fail lea_abc --note "tests failed" --release --json
 ```
 
-Whippletree keeps a command ID on the provider request for durable evidence and
+WhippleScript keeps a command ID on the provider request for durable evidence and
 future idempotency. The current Loft CLI does not accept `--command-id`, so
 the command adapter omits it by default; `CommandLoftClient::pass_command_id`
 exists for later Loft builds or alternate providers that support that flag.
 
 ## Fixture Source Of Truth
 
-Whippletree should add the Loft repository as `vendor/loft` once the Loft
+WhippleScript should add the Loft repository as `vendor/loft` once the Loft
 v0.1 spec and conformance fixtures are tracked in that repository. Until then,
-`scripts/check-real-providers.sh` accepts `WHIPPLETREE_LOFT_REPO=/path/to/loft`
+`scripts/check-real-providers.sh` accepts `WHIPPLESCRIPT_LOFT_REPO=/path/to/loft`
 and verifies that `spec/loft-v0.1.md` is tracked and the repo is clean before
 claiming real-provider readiness.
 
@@ -230,17 +230,17 @@ scripts/add-loft-submodule.sh /path/to/loft vendor/loft
 ```
 
 The helper refuses to add a local repo unless `spec/loft-v0.1.md`,
-`fixtures/whippletree/v0.1/manifest.json`, and every manifest-listed fixture are
+`fixtures/whipplescript/v0.1/manifest.json`, and every manifest-listed fixture are
 tracked and the Loft worktree is clean.
 
-To stage Whippletree's local compatibility fixtures into a local Loft repo for
+To stage WhippleScript's local compatibility fixtures into a local Loft repo for
 review, use:
 
 ```sh
 scripts/stage-loft-fixtures.sh /path/to/loft
 ```
 
-That helper writes `fixtures/whippletree/v0.1/manifest.json` plus every
+That helper writes `fixtures/whipplescript/v0.1/manifest.json` plus every
 manifest-listed fixture into the Loft repo and prints the Loft-side status.
 It does not commit those files.
 
@@ -253,11 +253,11 @@ scripts/export-loft-source-patch.sh /path/to/loft
 
 The default patch path is `target/loft-source-fixtures.patch`. The exporter
 stages compatibility fixtures first, refuses to overwrite an existing patch
-unless `WHIPPLETREE_OVERWRITE_LOFT_PATCH=1` is set, and refuses to disturb staged
+unless `WHIPPLESCRIPT_OVERWRITE_LOFT_PATCH=1` is set, and refuses to disturb staged
 Loft changes under the spec or fixture paths.
 
 `scripts/check-loft-fixtures.sh` validates the manifest and fixture files
-from `WHIPPLETREE_LOFT_FIXTURE_DIR`, `vendor/loft`, or the local compatibility
+from `WHIPPLESCRIPT_LOFT_FIXTURE_DIR`, `vendor/loft`, or the local compatibility
 copy under `examples/loft-fixtures/v0.1`. The Rust fixture test asserts the
 coverage tags in the Loft manifest, including rich issue shape,
 `issue_status`, lease-scoped mutations, structured evidence, resource intent,
@@ -270,10 +270,10 @@ To summarize the current Loft handoff state and next commands, run:
 scripts/loft-handoff-report.sh /path/to/loft
 ```
 
-The default Loft repo path is `WHIPPLETREE_LOFT_REPO` or `../loft`. The default
+The default Loft repo path is `WHIPPLESCRIPT_LOFT_REPO` or `../loft`. The default
 report path is `target/loft-handoff-report.md`.
 
-For local dogfooding before Loft is installed globally, run:
+For local validation before Loft is installed globally, run:
 
 ```sh
 scripts/check-local-loft-cli.sh ../loft
@@ -281,16 +281,16 @@ scripts/check-local-loft-cli.sh ../loft
 
 That command installs the local Loft checkout into `target/loft-cli-venv`,
 uses an isolated temporary Loft workspace, exercises the CLI lifecycle, and
-then runs Whippletree's real Loft smoke with an `WHIPPLETREE_LOFT_CLI` wrapper
+then runs WhippleScript's real Loft smoke with an `WHIPPLESCRIPT_LOFT_CLI` wrapper
 pointing at that workspace.
 
-Whippletree expects source-of-truth Loft conformance fixtures at:
+WhippleScript expects source-of-truth Loft conformance fixtures at:
 
 ```text
-vendor/loft/fixtures/whippletree/v0.1/
+vendor/loft/fixtures/whipplescript/v0.1/
 ```
 
-Until the Loft submodule publishes those fixtures, Whippletree carries local
+Until the Loft submodule publishes those fixtures, WhippleScript carries local
 compatibility fixtures at:
 
 ```text
@@ -327,11 +327,11 @@ Run fixture conformance with:
 scripts/check-loft-fixtures.sh
 ```
 
-The script prefers `WHIPPLETREE_LOFT_FIXTURE_DIR`, then submodule fixtures, then
-the local compatibility fixtures. Set `WHIPPLETREE_LOFT_FIXTURE_DIR` to force a
-specific fixture source. Set `WHIPPLETREE_REQUIRE_LOFT_FIXTURES=1` in CI to fail
+The script prefers `WHIPPLESCRIPT_LOFT_FIXTURE_DIR`, then submodule fixtures, then
+the local compatibility fixtures. Set `WHIPPLESCRIPT_LOFT_FIXTURE_DIR` to force a
+specific fixture source. Set `WHIPPLESCRIPT_REQUIRE_LOFT_FIXTURES=1` in CI to fail
 when no fixture source is available. Set
-`WHIPPLETREE_REQUIRE_LOFT_SUBMODULE_FIXTURES=1` when CI must prove the
+`WHIPPLESCRIPT_REQUIRE_LOFT_SUBMODULE_FIXTURES=1` when CI must prove the
 source-of-truth `vendor/loft` fixture path exists instead of using local
 compatibility fixtures.
 

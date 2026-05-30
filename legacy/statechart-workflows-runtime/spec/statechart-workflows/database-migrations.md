@@ -1,11 +1,11 @@
 # Database Migration Story
 
-Whippletree stores runtime state in SQLite. The database is durable workflow
+WhippleScript stores runtime state in SQLite. The database is durable workflow
 infrastructure, not the authoring surface.
 
 ## Current Contract
 
-- The store records schema version `4` in `whippletree_meta`.
+- The store records schema version `4` in `whipplescript_meta`.
 - Startup creates missing tables for the current version.
 - Startup rejects newer schema versions instead of trying to run against an
   unknown layout.
@@ -52,7 +52,7 @@ Every schema migration should include:
 
 ## Operational Guidance
 
-Before running a new Whippletree version against important workflow state:
+Before running a new WhippleScript version against important workflow state:
 
 ```sh
 cp workflow.sqlite workflow.sqlite.backup
@@ -60,7 +60,7 @@ whip status workflow.whip --store workflow.sqlite --json
 ```
 
 If opening the store fails due to a newer schema version, use the matching
-Whippletree binary for that store. Do not downgrade by editing metadata.
+WhippleScript binary for that store. Do not downgrade by editing metadata.
 
 ## Non-Goals
 

@@ -1,7 +1,5 @@
 workflow CoerceBranch
 
-use skill "baml-coerce-user"
-use skill "human-review-user"
 
 enum Priority {
   Low

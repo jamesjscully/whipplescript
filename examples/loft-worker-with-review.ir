@@ -1,8 +1,4 @@
 workflow LoftWorkerWithReview
-uses
-  skill loft-user
-  skill baml-coerce-user
-  skill human-review-user
 schemas
   enum ReviewStatus { Accept, Revise, Blocked }
   class WorkReview

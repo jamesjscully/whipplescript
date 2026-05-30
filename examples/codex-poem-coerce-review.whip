@@ -1,6 +1,5 @@
 workflow CodexPoemCoerceReview
 
-use skill "baml-coerce-user"
 
 class PoemRequest {
   topic string

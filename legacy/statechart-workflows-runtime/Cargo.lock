@@ -65,70 +65,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "whippletree-adapters"
-version = "0.1.0"
-dependencies = [
- "whippletree-engine",
- "whippletree-workflow",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "whippletree-cli"
-version = "0.1.0"
-dependencies = [
- "whippletree-adapters",
- "whippletree-engine",
- "whippletree-modelgen",
- "whippletree-workflow",
- "clap",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "ulid",
-]
-
-[[package]]
-name = "whippletree-engine"
-version = "0.1.0"
-dependencies = [
- "whippletree-workflow",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror",
- "ulid",
-]
-
-[[package]]
-name = "whippletree-modelgen"
-version = "0.1.0"
-dependencies = [
- "whippletree-workflow",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "whippletree-workflow"
-version = "0.1.0"
-dependencies = [
- "logos",
- "rowan",
- "serde",
- "serde_json",
- "text-size",
- "thiserror",
-]
-
-[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1575,6 +1511,70 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "whipplescript-adapters"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "whipplescript-engine",
+ "whipplescript-workflow",
+]
+
+[[package]]
+name = "whipplescript-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "ulid",
+ "whipplescript-adapters",
+ "whipplescript-engine",
+ "whipplescript-modelgen",
+ "whipplescript-workflow",
+]
+
+[[package]]
+name = "whipplescript-engine"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ulid",
+ "whipplescript-workflow",
+]
+
+[[package]]
+name = "whipplescript-modelgen"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+ "whipplescript-workflow",
+]
+
+[[package]]
+name = "whipplescript-workflow"
+version = "0.1.0"
+dependencies = [
+ "logos",
+ "rowan",
+ "serde",
+ "serde_json",
+ "text-size",
+ "thiserror",
 ]
 
 [[package]]

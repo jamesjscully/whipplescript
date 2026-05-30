@@ -1,7 +1,7 @@
 # Managed Spec Orchestration Example
 
 This example sketches the target shape for orchestrating coding agents across a
-large spec implementation. It assumes a future managed Whippletree/un-tie adapter
+large spec implementation. It assumes a future managed WhippleScript/un-tie adapter
 exists. The goal is to show the contracts and control-flow shape, not today's
 SDK surface.
 
@@ -42,7 +42,7 @@ run = "bash scripts/supervisor.sh"
 ```
 
 Under the hood, the managed loop runs the supervisor with narrow capabilities:
-read Whippletree status/runs, read the ledger, and send a message to the director.
+read WhippleScript status/runs, read the ledger, and send a message to the director.
 Worker threads still run through the same agent/session sandbox and
 `.agent-config.json` policy used by un-tie.
 
@@ -55,7 +55,7 @@ the contract and ledger.
 
 - `whip`
 - `jq`
-- Either `untie thread send <thread-id> --stdin` or an Whippletree task listening
+- Either `untie thread send <thread-id> --stdin` or an WhippleScript task listening
   for `director.message`
 
 Useful environment variables:

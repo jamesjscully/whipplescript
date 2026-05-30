@@ -1,8 +1,8 @@
-# Existing Whippletree Reuse Boundary
+# Existing WhippleScript Reuse Boundary
 
 Status: design guardrail
 
-This document prevents accidental baggage from the existing Whippletree
+This document prevents accidental baggage from the existing WhippleScript
 script-runner design from shaping the new workflow system.
 
 The new product surface is:
@@ -59,7 +59,7 @@ arbitrary shell/TypeScript scripts own semantics
 scripts are expected to manage durable state
 scripts implement their own polling/event loops
 process runs are the only important runtime records
-Whippletree is only cron + watcher + process supervisor
+WhippleScript is only cron + watcher + process supervisor
 ```
 
 The workflow system may still invoke external processes through declared
@@ -140,7 +140,7 @@ narrow.
 
 ## Compatibility Posture
 
-Compatibility with old Whippletree configs is optional and should be treated as a
+Compatibility with old WhippleScript configs is optional and should be treated as a
 separate adapter or migration tool.
 
 Examples:

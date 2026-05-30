@@ -4,7 +4,7 @@ Status: draft
 
 The harness layer turns durable `agent.tell` effects into real agent turns.
 
-Whippletree must not pretend an agent turn exists until this layer can claim an
+WhippleScript must not pretend an agent turn exists until this layer can claim an
 effect, run a provider, capture evidence, and append a completion event.
 
 ## Harness Player
@@ -107,7 +107,7 @@ and provider evidence, appends the terminal effect completion, and then emits an
 handles or mutate kernel state directly.
 
 The real provider adapters are not interchangeable command wrappers. Each one
-must map Whippletree's durable turn contract onto the provider's native session
+must map WhippleScript's durable turn contract onto the provider's native session
 surface, authentication model, persistence model, and artifact semantics.
 
 ### Codex Provider
@@ -130,9 +130,9 @@ The Codex adapter therefore needs:
 - Artifact capture for transcript, changed files, diffs, command output,
   approvals, and final summary.
 
-The Codex desktop app runs its own app server for its UI. Whippletree should not
+The Codex desktop app runs its own app server for its UI. WhippleScript should not
 assume that private desktop app server is externally reachable. For local
-automation, Whippletree should launch or connect to a dedicated Codex App Server
+automation, WhippleScript should launch or connect to a dedicated Codex App Server
 or supported SDK surface under explicit operator configuration.
 
 ### Claude Provider
@@ -148,7 +148,7 @@ The Claude adapter therefore needs:
 
 - TypeScript or Python Agent SDK host process.
 - API-key/provider authentication configuration.
-- Tool permission mapping from Whippletree profiles to Claude SDK allowed
+- Tool permission mapping from WhippleScript profiles to Claude SDK allowed
   tools, hooks, and working directories.
 - Streaming message handling and final result extraction.
 - Artifact capture for transcript, tool calls, edits, command output, and usage.
@@ -156,16 +156,16 @@ The Claude adapter therefore needs:
 ### Pi Provider
 
 Pi should integrate through the Pi extension system. That is the primary surface
-for Whippletree, not a fallback. Compared with Codex App Server and Claude Agent
-SDK, Pi's integration shape is expected to be more extension-native: Whippletree
+for WhippleScript, not a fallback. Compared with Codex App Server and Claude Agent
+SDK, Pi's integration shape is expected to be more extension-native: WhippleScript
 will likely provide an extension that receives durable turn requests, submits or
 routes them through Pi, observes conversation-thread updates, and reports
 structured completion metadata back to the harness.
 
 The Pi adapter therefore needs:
 
-- A Pi extension that can receive Whippletree turn requests.
-- A way to correlate Whippletree `effect_id` / `run_id` with Pi conversation
+- A Pi extension that can receive WhippleScript turn requests.
+- A way to correlate WhippleScript `effect_id` / `run_id` with Pi conversation
   thread ids.
 - Thread observation or export plumbing for transcripts and evidence.
 - Completion detection and summary extraction from Pi conversations.
@@ -183,7 +183,7 @@ an enterprise broker, or a test fixture.
 ## Control Plane Bridge
 
 The harness cannot run until the control plane has materialized ready rule
-commits into durable outbox effects. A complete local dogfood loop needs both:
+commits into durable outbox effects. A complete local validation loop needs both:
 
 ```text
 source + instance event -> ready rule evaluation -> rule commit -> effect outbox
@@ -191,7 +191,7 @@ effect outbox -> harness claim -> provider run -> completion event
 completion event -> derived facts -> next ready rules
 ```
 
-`whip run` may remain a "start an instance" command, but dogfooding needs an
+`whip run` may remain a "start an instance" command, but local validation needs an
 explicit driver such as `whip step`, `whip worker`, or `whip dev` that advances
 ready rules and runs configured local providers until idle, stopped, or blocked.
 
@@ -326,7 +326,7 @@ codex:
 claude:
   sdk language/host
   ANTHROPIC_API_KEY or cloud-provider credential ref
-  allowed_tools mapped from Whippletree profile
+  allowed_tools mapped from WhippleScript profile
   hooks and cwd policy
 
 pi:

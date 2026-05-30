@@ -5,7 +5,7 @@ Status: draft
 Skills are deterministic context bundles for agents. They teach an agent how to
 use a capability, workflow, tool, or project convention.
 
-Skills are core because almost every practical Whippletree workflow needs to give
+Skills are core because almost every practical WhippleScript workflow needs to give
 agents operational instructions without bloating every prompt.
 
 ## Skill Object
@@ -40,8 +40,8 @@ skills/
 The skill registry loads skills from:
 
 ```text
-project .whippletree/skills/
-installed Whippletree packages
+project .whipplescript/skills/
+installed WhippleScript packages
 first-party bundled skills
 explicit CLI/config paths
 plugin resource discovery
@@ -69,16 +69,19 @@ version, path, and hash.
 
 Skills may be attached to agents:
 
-```whippletree
+```whipplescript
 agent worker {
   profile "repo-writer"
   skills ["repo-worker", "loft", "thoth"]
 }
 ```
 
+There is no top-level `use skill` form. Top-level `use` imports plugins; skills
+enter provider context only through explicit agent or turn attachment.
+
 Or to individual turns:
 
-```whippletree
+```whipplescript
 tell worker with skills ["loft"] """
 Claim one ready issue and implement it.
 """
@@ -95,14 +98,15 @@ The harness resolves skills into context before the provider turn starts.
   available.
 - Skills should be small and operational, not giant hidden manuals.
 
-## Core Skills
+## First-Party Skills
 
-First-party core skills:
+First-party skills are Claude-style agent context bundles. They are attached to
+agents or individual turns; they do not extend WhippleScript syntax and do not
+grant capabilities.
 
 ```text
-whippletree-author
+whipplescript-author
 loft-user
-baml-coerce-user
 human-review-user
 ```
 

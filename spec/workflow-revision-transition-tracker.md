@@ -222,49 +222,67 @@ Stage 1 audit notes:
 
 Goal: persist revisions and version attribution without losing replayability.
 
-- [ ] Add `instance_revisions`:
-  - [ ] `revision_id`
-  - [ ] `instance_id`
-  - [ ] `epoch`
-  - [ ] `from_version_id`
-  - [ ] `to_version_id`
-  - [ ] `activated_by_event_id`
-  - [ ] `activation_policy_json`
-  - [ ] `cancellation_policy`
-  - [ ] `status`
-  - [ ] timestamps
+- [x] Add `instance_revisions`:
+  - [x] `revision_id`
+  - [x] `instance_id`
+  - [x] `epoch`
+  - [x] `from_version_id`
+  - [x] `to_version_id`
+  - [x] `activated_by_event_id`
+  - [x] `activation_policy_json`
+  - [x] `cancellation_policy`
+  - [x] `status`
+  - [x] timestamps
 - [ ] Add attribution fields where needed:
-  - [ ] rule commit event payload includes `program_version_id` and
+  - [x] rule commit event payload includes `program_version_id` and
     `revision_epoch`
-  - [ ] effects record `program_version_id` and `revision_epoch`
+  - [x] effects record `program_version_id` and `revision_epoch`
   - [ ] workflow invocations record parent/child version and parent epoch
   - [ ] evidence/diagnostics can link to a revision id or epoch
-- [ ] Add cancel-request persistence:
-  - [ ] `effect_cancellation_requests` table
-  - [ ] optional `cancel_requested` status view without making request state a
+- [x] Add cancel-request persistence:
+  - [x] `effect_cancellation_requests` table
+  - [x] optional `cancel_requested` status view without making request state a
     terminal effect status
-  - [ ] request reason, requester, revision id, causation event, idempotency key
-  - [ ] terminal outcome still uses the normal effect terminal lifecycle
+  - [x] request reason, requester, revision id, causation event, idempotency key
+  - [x] terminal outcome still uses the normal effect terminal lifecycle
 - [ ] Add kernel/store operations:
   - [ ] create revision candidate/dry-run report
-  - [ ] activate revision atomically
-  - [ ] list active revision for instance
+  - [x] activate revision atomically
+  - [x] list active revision for instance
   - [ ] list effects impacted by a cancellation policy
-  - [ ] request cancellation for running effects idempotently
-  - [ ] terminal-cancel queued/blocked/claimable effects idempotently
+  - [x] request cancellation for running effects idempotently
+  - [x] terminal-cancel queued/blocked/claimable effects idempotently
 - [ ] Ensure projection rebuild replays revision events and effect attribution.
-- [ ] Add store tests for duplicate activation, idempotent cancellation,
+- [x] Add store tests for duplicate activation, idempotent cancellation,
   terminal instance rejection, and recovery replay.
 - [ ] Audit Stage 2 against schema replay, transaction boundaries, idempotency,
   and migration needs; record any store compatibility gaps.
 
 Acceptance:
 
-- [ ] A fresh store can activate and inspect multiple revisions for one
+- [x] A fresh store can activate and inspect multiple revisions for one
   instance.
 - [ ] Replay reconstructs active revision and effect cancellation requests.
-- [ ] Existing tests using one `instances.version_id` still pass or have an
+- [x] Existing tests using one `instances.version_id` still pass or have an
   explicit migration path.
+
+Stage 2 partial audit notes:
+
+- [crates/whipplescript-store/migrations/0001_runtime_store.sql](../crates/whipplescript-store/migrations/0001_runtime_store.sql)
+  now creates `instance_revisions`, `effect_cancellation_requests`,
+  `instances.revision_epoch`, and effect version/epoch attribution columns.
+- [crates/whipplescript-store/src/lib.rs](../crates/whipplescript-store/src/lib.rs)
+  now activates revisions atomically, updates the active instance version/epoch,
+  stores revision rows, attributes rule-created effects to the active revision,
+  terminal-cancels queued/blocked old effects for revision policies, and records
+  running-effect cancellation requests without changing the effect terminal
+  status.
+- Claimability now excludes effects with open cancellation requests, including
+  effects that return to `queued` after lease expiry.
+- Projection rebuild currently replays rule-commit effect attribution and
+  cancellation request events. Full active-revision reconstruction from the
+  revision event log and revision-aware workflow invocation attribution remain
+  open Stage 2 work.
 
 ## Stage 3: Compiler And Compatibility Analysis
 

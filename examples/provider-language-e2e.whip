@@ -1,6 +1,5 @@
 workflow ProviderLanguageE2E
 
-use skill "baml-coerce-user"
 
 class LanguageTask {
   provider AgentRef<codex | claude | pi>

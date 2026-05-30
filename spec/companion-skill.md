@@ -1,9 +1,9 @@
 # Companion Skill
 
-Status: implemented local package, active dogfood
+Status: implemented local package, active validation
 
-Whippletree should ship a companion skill for coding agents that author or operate
-Whippletree workflows.
+WhippleScript should ship a companion skill for coding agents that author or operate
+WhippleScript workflows.
 
 The skill is core because most target users will ask a coding agent to write the
 workflow. The agent needs current language and runtime guidance that is not in
@@ -12,14 +12,14 @@ its training distribution.
 ## Skill Name
 
 ```text
-whippletree-author
+whipplescript-author
 ```
 
 ## Purpose
 
 The skill teaches agents:
 
-- Whippletree is a restricted event-sourced rule machine.
+- WhippleScript is a restricted event-sourced rule machine.
 - Rules produce facts and durable effects; effects do not run inline.
 - Source order does not sequence effects; use `after` for explicit dependency.
 - Use Loft for project work tracking when available.
@@ -49,7 +49,7 @@ profile-selection guidance
 evidence/status inspection guidance
 ```
 
-Current authoring guidance from dogfood:
+Current authoring guidance from validation:
 
 - Use guarded fact matches for deterministic routing over typed fields, for
   example `when LanguageTask as task where task.provider == "codex"`.
@@ -65,13 +65,10 @@ Current authoring guidance from dogfood:
 - Use `call <capability> ... as <binding>` for plugin capabilities such as
   memory. Do not invent plugin-specific control-flow syntax.
 
-## Dogfood Fixture
+## Validation Fixture
 
-`examples/companion-skill-dogfood.whip` is the checked companion-skill dogfood
-fixture. It uses:
+The checked companion-skill validation fixture uses:
 
-- `use skill "whippletree-author"` to make the authored workflow explicitly
-  depend on this skill.
 - one shared `CompanionReviewTask` schema with
   `reviewer AgentRef<codex | claude | pi>`.
 - deterministic source-seeded review tasks for spec, validation, and docs
@@ -87,13 +84,7 @@ selected. The prompt repeats that route identity has already been selected by
 typed source metadata and asks the thread only to review its assigned phase and
 update the visible tracker.
 
-Validation:
-
-```sh
-cargo run -q -p whippletree-cli -- check examples/companion-skill-dogfood.whip
-cargo run -q -p whippletree-cli -- compile examples/companion-skill-dogfood.whip
-cargo test -p whippletree-cli --test control_plane dev_companion_skill_dogfood_routes_with_agentref_metadata
-```
+Validation runs through the checked example fixture and the CLI e2e suite.
 
 ## Anti-Patterns
 
@@ -102,7 +93,7 @@ The skill should warn against:
 ```text
 writing arbitrary TypeScript control loops
 using shell scripts as hidden workflow engines
-encoding issue tracking inside Whippletree facts when Loft is available
+encoding issue tracking inside WhippleScript facts when Loft is available
 silently injecting memory/context without provenance
 starting agent turns before claims/capabilities are accepted
 depending on source order to sequence effects
@@ -116,26 +107,26 @@ The skill should be installed as a first-party package resource and exposed by
 the skill registry. It should be available to:
 
 ```text
-Whippletree authors
-agent harness turns that need to operate Whippletree
+WhippleScript authors
+agent harness turns that need to operate WhippleScript
 dev-mode sessions
 ```
 
 Current local install path:
 
 ```sh
-scripts/install-whippletree-skill.sh
+scripts/install-whipplescript-skill.sh
 ```
 
-By default this copies `skills/whippletree-author/SKILL.md` to
-`$HOME/.codex/skills/whippletree-author/SKILL.md`. Set `WHIPPLETREE_SKILL_DIR` to
+By default this copies `skills/whipplescript-author/SKILL.md` to
+`$HOME/.codex/skills/whipplescript-author/SKILL.md`. Set `WHIPPLESCRIPT_SKILL_DIR` to
 install into a different skill directory.
 
 Current package path:
 
 ```sh
-scripts/package-whippletree-skill.sh
+scripts/package-whipplescript-skill.sh
 ```
 
-By default this writes `dist/whippletree-author-skill.tar.gz` plus a `.sha256`
-checksum. Set `WHIPPLETREE_SKILL_DIST_DIR` to write the package elsewhere.
+By default this writes `dist/whipplescript-author-skill.tar.gz` plus a `.sha256`
+checksum. Set `WHIPPLESCRIPT_SKILL_DIST_DIR` to write the package elsewhere.

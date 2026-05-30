@@ -8,11 +8,11 @@ set -euo pipefail
 #   2. nudges the director when the runtime appears idle
 #
 # The director agent owns planning and scheduling. The implementation ledger owns
-# durable workflow state. Whippletree owns run/event/log observation.
+# durable workflow state. WhippleScript owns run/event/log observation.
 
 WORKSPACE="${WORKSPACE:-.}"
 PLAN_FILE="${PLAN_FILE:-state/implementation-plan.json}"
-STATE_DIR="${STATE_DIR:-.whippletree/supervisor}"
+STATE_DIR="${STATE_DIR:-.whipplescript/supervisor}"
 POLL_SECONDS="${POLL_SECONDS:-15}"
 IDLE_NUDGE_SECONDS="${IDLE_NUDGE_SECONDS:-120}"
 RUN_LIMIT="${RUN_LIMIT:-50}"
@@ -35,7 +35,7 @@ send_to_director() {
     return
   fi
 
-  # Fallback for local Whippletree-only experiments. A task can listen on this
+  # Fallback for local WhippleScript-only experiments. A task can listen on this
   # event and forward the payload to a real director thread.
   whip event emit director.message \
     --source supervisor \
@@ -128,7 +128,7 @@ maybe_nudge_idle() {
   send_to_director "$(cat <<EOF
 The implementation loop appears idle.
 
-Active Whippletree runs: $active
+Active WhippleScript runs: $active
 Unfinished ledger items: $unfinished
 Ledger: $PLAN_FILE
 

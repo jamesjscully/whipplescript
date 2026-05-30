@@ -12,8 +12,8 @@ typed `finished` completions to a director thread.
 Useful local commands:
 
 ```sh
-store=/tmp/whippletree-template.sqlite
-harness=/tmp/whippletree-template-harness.json
+store=/tmp/whipplescript-template.sqlite
+harness=/tmp/whipplescript-template-harness.json
 
 cat >"$harness" <<'JSON'
 {

@@ -63,8 +63,8 @@ The active implementation already has these pieces:
   calls, current coerce failure, historical latest coerce failures,
   current effect failures, current blockers, and policy blockers from durable
   storage
-- opt-in real BAML HTTP e2e coverage gated by `WHIPPLETREE_RUN_BAML_E2E=1` and
-  `WHIPPLETREE_BAML_URL`
+- opt-in real BAML HTTP e2e coverage gated by `WHIPPLESCRIPT_RUN_BAML_E2E=1` and
+  `WHIPPLESCRIPT_BAML_URL`
 - first scoped JSON plan file adapter slice through `run --plan-file`, covering
   plan snapshot reads and task status updates for ready-for-quality, done, and
   blocked; plan-only workflows get a built-in JSON plan manifest automatically
@@ -165,7 +165,7 @@ Exit criteria:
 
 ### 0.2 Add Agent Ledger Storage
 
-Work in `crates/whippletree-engine` storage:
+Work in `crates/whipplescript-engine` storage:
 
 - bump the SQLite schema version
 - add tables:
@@ -194,7 +194,7 @@ Exit criteria:
 
 ### 0.3 Make `start` And `send` Native
 
-Work in `crates/whippletree-engine`:
+Work in `crates/whipplescript-engine`:
 
 - route `start` for `codingAgent`/local provider agents to the native ledger
   instead of the manifest dispatcher
@@ -216,7 +216,7 @@ Exit criteria:
 
 ### 0.4 Add Harness Commands
 
-Work in `crates/whippletree-cli` and, if the code gets large, a new harness module
+Work in `crates/whipplescript-cli` and, if the code gets large, a new harness module
 or crate:
 
 ```text
@@ -267,7 +267,7 @@ Provider config:
   "agents": {
     "worker": {
       "provider": "command",
-      "command": ["sh", "-c", "printf '%s\n' \"$WHIPPLETREE_PROMPT\""],
+      "command": ["sh", "-c", "printf '%s\n' \"$WHIPPLESCRIPT_PROMPT\""],
       "cwd": ".",
       "timeoutSeconds": 1800
     }
@@ -278,12 +278,12 @@ Provider config:
 Runtime environment for providers:
 
 ```text
-WHIPPLETREE_WORKFLOW_ID
-WHIPPLETREE_INVOCATION_ID
-WHIPPLETREE_AGENT
-WHIPPLETREE_PROMPT
-WHIPPLETREE_INPUT_JSON
-WHIPPLETREE_RUN_DIR
+WHIPPLESCRIPT_WORKFLOW_ID
+WHIPPLESCRIPT_INVOCATION_ID
+WHIPPLESCRIPT_AGENT
+WHIPPLESCRIPT_PROMPT
+WHIPPLESCRIPT_INPUT_JSON
+WHIPPLESCRIPT_RUN_DIR
 ```
 
 Presets compile to the same internal command-runner contract. `command`
@@ -322,8 +322,8 @@ Default completion event:
 
 Rules:
 
-- `id` is the Whippletree invocation id
-- `name` is the declared Whippletree agent name
+- `id` is the WhippleScript invocation id
+- `name` is the declared WhippleScript agent name
 - `status` is `succeeded`, `failed`, `cancelled`, or `timed_out`
 - `summary` is a short harness/provider summary, not raw logs
 - raw stdout/stderr remain artifacts
@@ -380,7 +380,7 @@ Design commitments:
   requested authority, enforced authority, and unsupported best-effort gaps.
 - Raw `command` providers are allowed by default only in permissive mode; in
   separated/custom mode they must be explicitly named by policy.
-- The Whippletree skill should teach coding agents to read profile descriptions
+- The WhippleScript skill should teach coding agents to read profile descriptions
   before assigning profiles.
 
 Implementation slices:
@@ -434,7 +434,7 @@ The native harness records lightweight local observation:
 - expose recent observations through `harness status --json`
 
 This is not a telemetry system. It is a local product-development apparatus for
-watching agents use Whippletree and turning repeated mistakes into better language
+watching agents use WhippleScript and turning repeated mistakes into better language
 and CLI ergonomics.
 
 Exit criteria:
@@ -493,7 +493,7 @@ adding new behavior.
 
 ### 1.1 Workflow Crate
 
-Work in `crates/whippletree-workflow`:
+Work in `crates/whipplescript-workflow`:
 
 - keep `class`, `enum`, and `coerce` declarations as the source of truth
 - keep generated BAML source as a derived artifact
@@ -515,7 +515,7 @@ Exit criteria:
 
 ### 1.2 Engine Boundary
 
-Work in `crates/whippletree-engine`:
+Work in `crates/whipplescript-engine`:
 
 - introduce `CoerceExecutor` as a runtime dependency, separate from
   `EffectDispatcher`
@@ -547,7 +547,7 @@ Exit criteria:
 
 ### 1.3 Adapter Crate
 
-Work in `crates/whippletree-adapters`:
+Work in `crates/whipplescript-adapters`:
 
 - remove or demote the placeholder `BamlAdapter` trait if it conflicts with
   the engine-facing `CoerceExecutor`: implemented by removing the placeholder
@@ -569,7 +569,7 @@ Exit criteria:
 
 Goal: make `coerce` replay-safe and inspectable before calling any real model.
 
-Work in `crates/whippletree-engine` storage:
+Work in `crates/whipplescript-engine` storage:
 
 - add a `coerce_calls` table matching [storage.md](storage.md)
 - add migration/version handling for the new table
@@ -653,7 +653,7 @@ Testing:
 - add opt-in real BAML integration test gated by:
 
 ```text
-WHIPPLETREE_RUN_BAML_E2E=1
+WHIPPLESCRIPT_RUN_BAML_E2E=1
 BAML server URL or managed test setup
 provider credentials or compatible local provider
 ```
@@ -774,7 +774,7 @@ Exit criteria:
 
 Goal: keep verification useful as runtime semantics become more complete.
 
-Work in `crates/whippletree-modelgen` and `models/statechart-workflows`:
+Work in `crates/whipplescript-modelgen` and `models/statechart-workflows`:
 
 - keep BAML HTTP internals out of generated and hand-written models
 - model coerce as nondeterministic schema-valid output
@@ -913,7 +913,7 @@ Policy work:
   - `allowed_baml_urls`: implemented as exact URL allowlist for `run --baml-url`
   - `allow_managed_baml_server`: schema field reserved until managed process
     mode exists
-  - `allowed_models`: schema field validated and reserved until Whippletree owns
+  - `allowed_models`: schema field validated and reserved until WhippleScript owns
     provider/model selection
   - `allowed_env_vars`: schema field validated and reserved until managed
     process mode owns environment projection
@@ -978,7 +978,7 @@ CI expectations:
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo build -p whippletree-cli
+cargo build -p whipplescript-cli
 scripts/check-docs.sh
 scripts/check-e2e.sh
 scripts/check-formal-models.sh
@@ -1018,7 +1018,7 @@ Deliverables:
 - workflow templates: started with
   `examples/templates/simple-agent-supervisor.whip`
   - the documented local lifecycle is covered by `scripts/check-docs.sh`
-- companion skill updates: current `skills/whippletree-statechart` documents
+- companion skill updates: current `skills/whipplescript-statechart` documents
   file-backed adapter shortcuts, typed response/completion event intake, and
   debugging flow
 - example workflows
@@ -1027,7 +1027,7 @@ Deliverables:
   [operations.md](operations.md)
 - diagnostics written for coding agents and operators: capability policy
   diagnostics include conservative `Fix:` hints naming exact policy fields
-- migration notes from legacy Whippletree: added [migration.md](migration.md)
+- migration notes from legacy WhippleScript: added [migration.md](migration.md)
 - schema/database migration story: added
   [database-migrations.md](database-migrations.md)
 - release checklist: added [release-checklist.md](release-checklist.md)

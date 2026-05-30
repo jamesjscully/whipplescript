@@ -1,6 +1,6 @@
 # Implementation Plan Phase Review Tracker
 
-Status: dogfood tracker
+Status: validation tracker
 
 Each Codex review thread should update exactly one row. Use `Clean`,
 `Findings`, `Blocked`, or `Needs follow-up` for status.
@@ -17,7 +17,7 @@ Each Codex review thread should update exactly one row. Use `Clean`,
 | 7 | Capability Registry And Plugin Kernel | Queued |  |  |  |  |
 | 8 | Core Integrations | Queued |  |  |  |  |
 | 9 | Generated Verification And Static Tooling | Queued |  |  |  |  |
-| 10 | Examples And Dogfood Workflows | Queued |  |  |  |  |
+| 10 | Examples And Validation Workflows | Queued |  |  |  |  |
 | 11 | E2E Test System | Queued |  |  |  |  |
 | 12 | Companion Skill, Docs, And Release Hardening | Queued |  |  |  |  |
 | 13 | Final Audit And Gap Closure | Queued |  |  |  |  |

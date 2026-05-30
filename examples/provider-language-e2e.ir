@@ -1,6 +1,4 @@
 workflow ProviderLanguageE2E
-uses
-  skill baml-coerce-user
 schemas
   class LanguageTask
     provider agentref<codex | claude | pi>

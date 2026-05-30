@@ -1,6 +1,4 @@
 workflow MultiProviderPoemReview
-uses
-  skill baml-coerce-user
 schemas
   class PoemTask
     poet agentref<codex | claude | pi>

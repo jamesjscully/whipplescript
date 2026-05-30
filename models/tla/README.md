@@ -30,10 +30,13 @@ append event
 derive projection cursor
 claim effect
 start run
-complete/fail run
+complete/fail/timeout run
+cancel run
 expire lease
+retry failed or timed-out effect
 start/finish recovery from the durable event log
 pause/resume/cancel
+workflow complete/fail terminal states
 dependency-gated claimability
 ```
 
@@ -44,7 +47,11 @@ run/effect references
 claimed/running run consistency
 claimability and dependency satisfaction
 paused instances not producing new claimable work
-terminal effects staying terminal
+terminal instances not producing new claimable work
+cancelled/completed/failed instance states remaining mutually exclusive
+current terminal-effect set matching effect status
+run-scoped lease consistency
+retry removing current terminal status before a new attempt
 projection cursor bounds
 recovery preserving event-log order
 basic type correctness
@@ -61,9 +68,11 @@ ProjectionEventuallyCatchesUp
 RecoveryEventuallyFinishes
 ```
 
-The default script typechecks these formulas with Apalache. It does not treat
-full temporal liveness proof as a v0 release gate; the formulas are kept in the
-model so future TLC/Apalache temporal-checking work has a stable target.
+The default script typechecks these formulas with Apalache and runs a bounded
+safety check over `SafetyInvariants` using `ConstInit`, a small finite harness.
+It does not treat full temporal liveness proof as a v0 release gate; the
+formulas are kept in the model so future TLC/Apalache temporal-checking work
+has a stable target.
 
 Current local workspace status:
 
@@ -80,6 +89,13 @@ scripts/check-tla-models.sh
 
 If `apalache-mc` is not already on `PATH`, the script enters the repo Nix dev
 shell and runs the check there.
+
+The bounded safety depth defaults to `6`. Override it when doing deeper local
+validation:
+
+```sh
+WHIPPLESCRIPT_TLA_LENGTH=10 scripts/check-tla-models.sh
+```
 
 CI policy:
 

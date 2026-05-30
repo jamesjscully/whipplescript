@@ -1,0 +1,15 @@
+[package]
+name = "whipplescript-adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+whipplescript-engine = { path = "../whipplescript-engine" }
+whipplescript-workflow = { path = "../whipplescript-workflow" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

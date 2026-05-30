@@ -9,7 +9,7 @@ ordered trace and pass it through a conformance checker.
 The initial Rust checker lives in:
 
 ```text
-crates/whippletree-kernel/src/trace.rs
+crates/whipplescript-kernel/src/trace.rs
 ```
 
 It validates these invariants:

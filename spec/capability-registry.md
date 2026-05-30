@@ -70,7 +70,7 @@ retry_policy
 artifact_policy
 ```
 
-Descriptions matter because coding agents writing Whippletree scripts should be
+Descriptions matter because coding agents writing WhippleScript scripts should be
 able to choose profiles by intent.
 
 ## Default Profile Sets

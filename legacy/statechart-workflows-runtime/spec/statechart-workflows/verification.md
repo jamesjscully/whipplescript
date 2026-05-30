@@ -2,7 +2,7 @@
 
 Status: design sketch
 
-Whippletree workflows should be designed so their semantics can be validated both
+WhippleScript workflows should be designed so their semantics can be validated both
 statically and with transition-system verification. Verification starts after
 the native `.whip` source has been parsed, lowered, and validated; formal
 backends consume WorkflowIR, not raw source text.
@@ -139,7 +139,7 @@ checks remain authoritative.
 
 ### 3. Generated Transition-System Checks
 
-For high-value workflows, Whippletree should generate a formal transition-system
+For high-value workflows, WhippleScript should generate a formal transition-system
 model from the validated IR.
 
 The generated model should include:
@@ -151,7 +151,7 @@ The generated model should include:
 - capability declarations
 - bounded work item abstractions
 - coerce outputs as nondeterministic values constrained by schema
-- Whippletree expression primitives as pure deterministic operations over bounded
+- WhippleScript expression primitives as pure deterministic operations over bounded
   typed values
 
 The generated model should not include:
@@ -191,7 +191,7 @@ Veil support should stay exploratory until the dependency/version story is
 pinned. The compiler can lower workflow IR to a Veil module:
 
 ```text
-Whippletree workflow state       -> Veil mutable state
+WhippleScript workflow state       -> Veil mutable state
 events                        -> Veil actions
 transitions                   -> guarded action bodies
 agent/resource counters       -> mutable relations/functions
@@ -282,7 +282,7 @@ modeling external agent execution.
 
 Users may define additional invariants over workflow state:
 
-```whippletree
+```whipplescript
 invariant retryCountWithinBound {
   assert data.retryCount <= 3
 }

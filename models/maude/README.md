@@ -1,6 +1,6 @@
 # Maude Models
 
-Maude is the primary formal target for the Whippletree rule kernel.
+Maude is the primary formal target for the WhippleScript rule kernel.
 
 Use it to model:
 
@@ -42,6 +42,7 @@ effect-dependencies.maude   success/failure/completes dependency release
 expression-kernel.maude     guards, assertions, optional reads, AgentRef targets
 policy-capacity-retry.maude policy/capacity blocks, lease expiry, retry
 ralph-loop.maude            external-event-bounded Ralph loop
+workflow-composition.maude  pattern elaboration, workflow completion, invocation
 ```
 
 The shell script runs every Maude test file and checks the expected number of

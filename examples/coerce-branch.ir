@@ -1,7 +1,4 @@
 workflow CoerceBranch
-uses
-  skill baml-coerce-user
-  skill human-review-user
 schemas
   enum Priority { Low, Normal, Urgent }
   class MessageClassification

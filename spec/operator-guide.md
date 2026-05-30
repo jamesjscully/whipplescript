@@ -2,31 +2,31 @@
 
 Status: draft
 
-Whippletree runtime state is stored in SQLite. The default CLI store path is:
+WhippleScript runtime state is stored in SQLite. The default CLI store path is:
 
 ```text
-.whippletree/store.sqlite
+.whipplescript/store.sqlite
 ```
 
-Use `--store <path>` or `WHIPPLETREE_STORE` to isolate environments.
+Use `--store <path>` or `WHIPPLESCRIPT_STORE` to isolate environments.
 
 ## Store Operations
 
 Create or open a store:
 
 ```sh
-whip --store .whippletree/prod.sqlite doctor
+whip --store .whipplescript/prod.sqlite doctor
 ```
 
 Inspect an instance:
 
 ```sh
-whip --store .whippletree/prod.sqlite status <instance>
-whip --store .whippletree/prod.sqlite log <instance>
-whip --store .whippletree/prod.sqlite effects <instance>
-whip --store .whippletree/prod.sqlite runs <instance>
-whip --store .whippletree/prod.sqlite evidence <instance> --json
-whip --store .whippletree/prod.sqlite trace <instance> --check --json
+whip --store .whipplescript/prod.sqlite status <instance>
+whip --store .whipplescript/prod.sqlite log <instance>
+whip --store .whipplescript/prod.sqlite effects <instance>
+whip --store .whipplescript/prod.sqlite runs <instance>
+whip --store .whipplescript/prod.sqlite evidence <instance> --json
+whip --store .whipplescript/prod.sqlite trace <instance> --check --json
 ```
 
 The store records events, facts, effects, dependencies, runs, leases, inbox

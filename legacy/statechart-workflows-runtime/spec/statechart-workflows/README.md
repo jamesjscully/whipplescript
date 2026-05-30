@@ -1,8 +1,8 @@
-# Whippletree Statechart Workflows
+# WhippleScript Statechart Workflows
 
 Status: design track
 
-This folder specifies the proposed next Whippletree product surface: restricted,
+This folder specifies the proposed next WhippleScript product surface: restricted,
 verifiable workflow orchestration for coding agents from `.whip` workflow
 files.
 
@@ -51,11 +51,11 @@ concurrency bounds, event replay, or capability checks themselves.
 
 ## Direction
 
-Whippletree should provide a restricted statechart workflow system:
+WhippleScript should provide a restricted statechart workflow system:
 
 ```text
 .whip source file
-  -> Whippletree DSL parser
+  -> WhippleScript DSL parser
   -> static validator
   -> generated BAML artifacts for coerce declarations
   -> statechart IR
@@ -94,7 +94,7 @@ and policy-checked adapters.
 - [expression-primitives.md](expression-primitives.md) defines the small
   orchestration-grade expression kernel and explicitly excludes general-purpose
   data programming.
-- [baml-integration.md](baml-integration.md) defines how Whippletree `class`,
+- [baml-integration.md](baml-integration.md) defines how WhippleScript `class`,
   `enum`, and `coerce` declarations lower to BAML artifacts and execute through
   BAML HTTP.
 - [workflow-ir.md](workflow-ir.md) defines the normalized representation shared
@@ -113,7 +113,7 @@ and policy-checked adapters.
   semantics.
 - [operations.md](operations.md) explains how to inspect and repair stuck
   workflows.
-- [migration.md](migration.md) maps legacy Whippletree script concepts onto the
+- [migration.md](migration.md) maps legacy WhippleScript script concepts onto the
   statechart workflow surface.
 - [release-checklist.md](release-checklist.md) defines release and upgrade
   checks for this track.
@@ -123,7 +123,7 @@ and policy-checked adapters.
 - [implementation-plan.md](implementation-plan.md) sequences specification,
   formal modeling, runtime scaffolding, generated validation, and gates.
 - [reuse-boundary.md](reuse-boundary.md) defines what may be kept from the
-  existing Whippletree implementation and what should not constrain the new system.
+  existing WhippleScript implementation and what should not constrain the new system.
 - [external-validation.md](external-validation.md) records documentation checks,
   local probes, corrections, and remaining unvalidated assumptions for external
   systems.
@@ -141,9 +141,9 @@ action, agent, or coerce function.
 This system does not support arbitrary TypeScript or shell as workflow logic.
 External tools may still exist behind declared effects or adapters.
 
-## Relationship To Existing Whippletree
+## Relationship To Existing WhippleScript
 
-This design supersedes the old product center for this track. The old Whippletree
+This design supersedes the old product center for this track. The old WhippleScript
 runtime may be mined for useful ideas and code:
 
 ```text
@@ -165,5 +165,5 @@ TypeScript is an acceptable workflow runtime
 
 The new boundary is:
 
-**Users author `.whip` workflow files. Whippletree validates and executes them
+**Users author `.whip` workflow files. WhippleScript validates and executes them
 through a constrained Rust interpreter.**

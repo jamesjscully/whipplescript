@@ -1,4 +1,4 @@
-# Whippletree Grammar
+# WhippleScript Grammar
 
 Status: v0 implementation sketch
 
@@ -249,7 +249,7 @@ Literal     = String | BlockString | Int | Float | Duration | "true" | "false" |
 
 `!in` may be added as sugar later. The v0 canonical spelling is:
 
-```whippletree
+```whipplescript
 guard !(run.id in data.seenRuns)
 ```
 
@@ -287,7 +287,7 @@ BAML-compatible primitive type names are:
 string int float bool null
 ```
 
-Whippletree-native type names include:
+WhippleScript-native type names include:
 
 ```text
 time duration agent json

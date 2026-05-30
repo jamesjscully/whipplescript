@@ -3,8 +3,8 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_LOFT_REPO="../loft"
-LOFT_REPO="${1:-${WHIPPLETREE_LOFT_REPO:-$DEFAULT_LOFT_REPO}}"
-REPORT="${2:-${WHIPPLETREE_LOFT_HANDOFF_REPORT:-$ROOT/target/loft-handoff-report.md}}"
+LOFT_REPO="${1:-${WHIPPLESCRIPT_LOFT_REPO:-$DEFAULT_LOFT_REPO}}"
+REPORT="${2:-${WHIPPLESCRIPT_LOFT_HANDOFF_REPORT:-$ROOT/target/loft-handoff-report.md}}"
 LOG_DIR="$(mktemp -d)"
 printf -v LOFT_REPO_Q "%q" "$LOFT_REPO"
 printf -v ROOT_Q "%q" "$ROOT"
@@ -39,8 +39,8 @@ PROBE_LOGS=()
 
 run_probe "Loft repo status" "if [[ -d $LOFT_REPO_Q/.git ]]; then git -C $LOFT_REPO_Q status --short; else echo 'missing local Loft git repo: $LOFT_REPO'; exit 2; fi"
 run_probe "Loft source preflight" "cd $ROOT_Q && scripts/check-loft-source-repo.sh $LOFT_REPO_Q"
-run_probe "Whippletree submodule readiness" "cd $ROOT_Q && scripts/check-loft-submodule-readiness.sh"
-run_probe "Strict submodule fixture conformance" "cd $ROOT_Q && WHIPPLETREE_REQUIRE_LOFT_SUBMODULE_FIXTURES=1 scripts/check-loft-fixtures.sh"
+run_probe "WhippleScript submodule readiness" "cd $ROOT_Q && scripts/check-loft-submodule-readiness.sh"
+run_probe "Strict submodule fixture conformance" "cd $ROOT_Q && WHIPPLESCRIPT_REQUIRE_LOFT_SUBMODULE_FIXTURES=1 scripts/check-loft-fixtures.sh"
 
 mkdir -p "$(dirname "$REPORT")"
 {
@@ -48,7 +48,7 @@ mkdir -p "$(dirname "$REPORT")"
   echo
   echo "- Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   echo "- Loft repo: $LOFT_REPO"
-  echo "- Whippletree repo: $ROOT"
+  echo "- WhippleScript repo: $ROOT"
   echo
   echo "## Current State"
   echo
@@ -61,21 +61,21 @@ mkdir -p "$(dirname "$REPORT")"
   echo "## Next Commands"
   echo
   echo '```sh'
-  echo "# In Whippletree: export a Loft-side patch for review"
+  echo "# In WhippleScript: export a Loft-side patch for review"
   echo "scripts/export-loft-source-patch.sh $LOFT_REPO_Q"
   echo
   echo "# In Loft: apply/review that patch, then commit spec and fixtures"
   echo "git -C $LOFT_REPO_Q status --short"
-  echo "git -C $LOFT_REPO_Q add spec/loft-v0.1.md fixtures/whippletree/v0.1"
-  echo "git -C $LOFT_REPO_Q commit -m 'Add Whippletree conformance fixtures'"
+  echo "git -C $LOFT_REPO_Q add spec/loft-v0.1.md fixtures/whipplescript/v0.1"
+  echo "git -C $LOFT_REPO_Q commit -m 'Add WhippleScript conformance fixtures'"
   echo
-  echo "# In Whippletree: add and verify Loft as source-of-truth submodule"
+  echo "# In WhippleScript: add and verify Loft as source-of-truth submodule"
   echo "scripts/add-loft-submodule.sh $LOFT_REPO_Q vendor/loft"
   echo "scripts/check-loft-submodule-readiness.sh"
-  echo "WHIPPLETREE_REQUIRE_LOFT_SUBMODULE_FIXTURES=1 scripts/check-loft-fixtures.sh"
+  echo "WHIPPLESCRIPT_REQUIRE_LOFT_SUBMODULE_FIXTURES=1 scripts/check-loft-fixtures.sh"
   echo
   echo "# Optional, after provider credentials/tools are configured"
-  echo "WHIPPLETREE_E2E_REAL_PROVIDERS=1 WHIPPLETREE_REAL_PROVIDERS=loft scripts/check-real-providers-report.sh"
+  echo "WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 WHIPPLESCRIPT_REAL_PROVIDERS=loft scripts/check-real-providers-report.sh"
   echo '```'
   echo
   for index in "${!PROBE_NAMES[@]}"; do

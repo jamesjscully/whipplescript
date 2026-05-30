@@ -15,19 +15,19 @@ run_maude() {
 }
 
 run_generated_checks() {
-  cargo run -q -p whippletree-cli -- check \
+  cargo run -q -p whipplescript-cli -- check \
     examples/workflows/spec-implementation.whip \
     --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
     --policy examples/policies/spec-implementation.enterprise-policy.json \
     --target tla \
     --json >/dev/null
-  cargo run -q -p whippletree-cli -- check \
+  cargo run -q -p whipplescript-cli -- check \
     examples/workflows/spec-implementation.whip \
     --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
     --policy examples/policies/spec-implementation.enterprise-policy.json \
     --target maude \
     --json >/dev/null
-  cargo run -q -p whippletree-cli -- prove \
+  cargo run -q -p whipplescript-cli -- prove \
     examples/workflows/spec-implementation.whip \
     --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
     --policy examples/policies/spec-implementation.enterprise-policy.json \
@@ -44,19 +44,19 @@ elif command -v nix >/dev/null 2>&1; then
       -config models/statechart-workflows/SpecImplementation.cfg \
       models/statechart-workflows/SpecImplementation.tla
     maude models/statechart-workflows/SpecImplementation.maude
-    cargo run -q -p whippletree-cli -- check \
+    cargo run -q -p whipplescript-cli -- check \
       examples/workflows/spec-implementation.whip \
       --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
       --policy examples/policies/spec-implementation.enterprise-policy.json \
       --target tla \
       --json >/dev/null
-    cargo run -q -p whippletree-cli -- check \
+    cargo run -q -p whipplescript-cli -- check \
       examples/workflows/spec-implementation.whip \
       --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
       --policy examples/policies/spec-implementation.enterprise-policy.json \
       --target maude \
       --json >/dev/null
-    cargo run -q -p whippletree-cli -- prove \
+    cargo run -q -p whipplescript-cli -- prove \
       examples/workflows/spec-implementation.whip \
       --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json \
       --policy examples/policies/spec-implementation.enterprise-policy.json \

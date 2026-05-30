@@ -1,6 +1,4 @@
 workflow HumanReview
-uses
-  skill human-review-user
 schemas
   class HumanDecision
     subject string

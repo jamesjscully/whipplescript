@@ -42,7 +42,7 @@ whip events workflow.whip --json
 whip log workflow.whip --json
 ```
 
-`status` and `overview` read only durable Whippletree state. They must not call
+`status` and `overview` read only durable WhippleScript state. They must not call
 adapters, BAML, providers, agents, or backing JSON files.
 The human `status` and `overview` outputs include a `waiting:` line that
 summarizes the highest-priority visible reason: validation failure for

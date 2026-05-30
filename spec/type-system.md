@@ -2,18 +2,18 @@
 
 Status: draft
 
-Whippletree needs a real type system because facts, effect payloads, Loft
+WhippleScript needs a real type system because facts, effect payloads, Loft
 contracts, BAML coercions, plugin capabilities, and evidence records all cross
 typed boundaries.
 
-Whippletree is still not a general-purpose data language. Types are schemas for
+WhippleScript is still not a general-purpose data language. Types are schemas for
 validation, routing, persistence, and external calls. Supporting a type does not
 mean supporting every operation over that type.
 
 ## Design Rule
 
 ```text
-Whippletree-compatible types are schemas; they do not imply a full data language.
+WhippleScript-compatible types are schemas; they do not imply a full data language.
 ```
 
 For example:
@@ -23,7 +23,7 @@ For example:
 - a `string[]` can be stored, counted, checked for membership, passed to
   `coerce`, and interpolated; v0 does not provide `map`, `filter`, or `reduce`
 - an `image` can be passed to a model/capability as an opaque boundary value;
-  Whippletree cannot inspect pixels or transform the media inline
+  WhippleScript cannot inspect pixels or transform the media inline
 
 ## Type Universe
 
@@ -64,7 +64,7 @@ video
 
 Primitive types:
 
-```whippletree
+```whipplescript
 string
 int
 float
@@ -80,27 +80,27 @@ video
 
 Optional types:
 
-```whippletree
+```whipplescript
 string?
 WorkReview?
 ```
 
 Arrays:
 
-```whippletree
+```whipplescript
 string[]
 WorkItem[]
 ```
 
 Maps:
 
-```whippletree
+```whipplescript
 map<string>
 map<int>
 map<WorkReview>
 ```
 
-Whippletree maps have string keys in v0. `map<T>` means:
+WhippleScript maps have string keys in v0. `map<T>` means:
 
 ```text
 string -> T
@@ -108,7 +108,7 @@ string -> T
 
 Enums and classes:
 
-```whippletree
+```whipplescript
 enum ReviewStatus {
   Accept
   Revise
@@ -125,7 +125,7 @@ class WorkReview {
 
 Literal types use BAML-style literal values where needed:
 
-```whippletree
+```whipplescript
 class StatusEvent {
   kind "accepted" | "rejected" | "blocked"
   reason string
@@ -135,7 +135,7 @@ class StatusEvent {
 Agent references name workflow-declared logical agents and are used for
 deterministic routing:
 
-```whippletree
+```whipplescript
 class LanguageTask {
   provider AgentRef<codex | claude | pi>
 }
@@ -148,7 +148,7 @@ must belong to the allowed domain, and dynamic `tell` targets must have an
 
 Declared agents carry typed static metadata that is visible to the compiler:
 
-```whippletree
+```whipplescript
 agent codex {
   profile "code"
   capacity "high"
@@ -165,7 +165,7 @@ target must satisfy those static constraints before the rule is accepted.
 
 Agent-routing effects can declare their target capability contract directly:
 
-```whippletree
+```whipplescript
 tell task.provider requires ["repo.write"] as turn """
 Update the implementation.
 """
@@ -207,8 +207,8 @@ IR should represent types structurally:
     "capabilities": ["edit", "test"]
   },
   "provenance": {
-    "declared_at": "workflow.whippletree:3:1",
-    "refined_by": ["workflow.whippletree:18:27"]
+    "declared_at": "workflow.whipplescript:3:1",
+    "refined_by": ["workflow.whipplescript:18:27"]
   }
 }
 { "type": "media", "kind": "image" }
@@ -259,7 +259,7 @@ optional  missing field or null, depending on containing schema
 ```
 
 Closed classes reject unknown fields unless a specific adapter contract marks a
-payload as open. Whippletree-authored classes should be closed by default.
+payload as open. WhippleScript-authored classes should be closed by default.
 
 ## Media Boundary Values
 
@@ -281,10 +281,10 @@ Rules:
 - media values are never inline bytes inside facts/effects
 - media values may be passed to `coerce` or registered capabilities when schema
   and policy allow it
-- Whippletree may compare media references for identity
-- Whippletree may inspect metadata fields only if the schema exposes them as
+- WhippleScript may compare media references for identity
+- WhippleScript may inspect metadata fields only if the schema exposes them as
   ordinary fields
-- Whippletree cannot transform media inline
+- WhippleScript cannot transform media inline
 
 ## Allowed Operations
 
@@ -352,7 +352,7 @@ capabilities.
 Literal unions and enums must be usable in guards because deterministic routing
 is a core workflow concern:
 
-```whippletree
+```whipplescript
 enum Provider {
   Codex
   Claude
@@ -381,7 +381,7 @@ field to an incompatible scalar type is a compile-time error.
 
 Agent references are a distinct routing type, not arbitrary strings:
 
-```whippletree
+```whipplescript
 AgentRef<codex | claude | pi>
 ```
 
@@ -443,7 +443,7 @@ provider evidence, not as a way to select or confirm orchestration routes.
 
 Optional fields must be proven present before field access:
 
-```whippletree
+```whipplescript
 when issue.assignee != null
 when issue.assignee.name == "Ada"
 ```
@@ -477,7 +477,7 @@ tagged terminal-output union
 
 Enum patterns must name declared variants:
 
-```whippletree
+```whipplescript
 enum ReviewStatus {
   Accept
   Revise
@@ -493,7 +493,7 @@ case review.status {
 
 Literal-union patterns must use one of the exact literal values in the union:
 
-```whippletree
+```whipplescript
 class LanguageTask {
   provider "codex" | "claude" | "pi"
 }
@@ -507,7 +507,7 @@ case task.provider {
 
 Optional patterns refine presence:
 
-```whippletree
+```whipplescript
 case issue.assignee {
   Some assignee => assignee.name
   None => "unassigned"
@@ -533,7 +533,7 @@ Compiler obligations:
 
 ## BAML Lowering
 
-Reachable Whippletree declarations used by `coerce` lower to generated BAML:
+Reachable WhippleScript declarations used by `coerce` lower to generated BAML:
 
 ```text
 enum       -> BAML enum
@@ -551,10 +551,10 @@ pdf        -> pdf
 video      -> video
 ```
 
-The compiler must reject any Whippletree type used in a `coerce` signature that
+The compiler must reject any WhippleScript type used in a `coerce` signature that
 cannot be lowered to the selected BAML version.
 
-Generated BAML is a build artifact. Whippletree declarations remain the source of
+Generated BAML is a build artifact. WhippleScript declarations remain the source of
 truth.
 
 ## Boundary Validation
@@ -579,9 +579,9 @@ successes.
 
 ## Fact Types
 
-Whippletree-authored durable facts use class schemas:
+WhippleScript-authored durable facts use class schemas:
 
-```whippletree
+```whipplescript
 class ReviewedWork {
   turn AgentTurn
   review WorkReview
@@ -627,7 +627,7 @@ But strict where semantics matter:
 Good diagnostic shape:
 
 ```text
-`review.followups.map(...)` is not supported in Whippletree.
-Whippletree is an orchestration language, not a data language.
+`review.followups.map(...)` is not supported in WhippleScript.
+WhippleScript is an orchestration language, not a data language.
 Move this transformation into a `coerce` function or a registered capability.
 ```

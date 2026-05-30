@@ -91,6 +91,6 @@ search found no invariant-violating solution
 Apalache is not currently pinned. Phase 1 should either add an Apalache
 installation path or continue with TLC plus Maude first.
 
-Generated models should eventually live under `.whippletree/build/models/` for a
+Generated models should eventually live under `.whipplescript/build/models/` for a
 specific workflow build. This directory is for source-controlled design models
 and fixtures.

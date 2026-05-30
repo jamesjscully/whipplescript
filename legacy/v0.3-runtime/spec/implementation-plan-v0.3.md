@@ -1,12 +1,12 @@
-# Whippletree v0.3 - Implementation Plan
+# WhippleScript v0.3 - Implementation Plan
 
-This plan fixes the implementation decisions for the first build of Whippletree v0.3.
+This plan fixes the implementation decisions for the first build of WhippleScript v0.3.
 
-It is subordinate to `spec/whippletree-v0.3.md`. If this file appears to introduce workflow semantics, the normative specification wins.
+It is subordinate to `spec/whipplescript-v0.3.md`. If this file appears to introduce workflow semantics, the normative specification wins.
 
 ## 1. Implementation Goal
 
-Whippletree v0.3 should produce a complete local daemon runtime:
+WhippleScript v0.3 should produce a complete local daemon runtime:
 
 ```text
 whip init
@@ -105,9 +105,9 @@ Recommended package layout:
 
 ```text
 crates/
-  whippletree-cli/
-  whippletree-daemon/
-  whippletree-core/
+  whipplescript-cli/
+  whipplescript-daemon/
+  whipplescript-core/
 packages/
   sdk/
 ```
@@ -119,12 +119,12 @@ The Rust CLI and daemon may initially live in one binary if that accelerates the
 Workspace discovery walks upward from the current working directory until it finds:
 
 ```text
-.whippletree/project.whip
+.whipplescript/project.whip
 ```
 
-Whippletree must not search downward into subdirectories.
+WhippleScript must not search downward into subdirectories.
 
-If a user is inside a nested project, the nearest ancestor with `.whippletree/project.whip` is the workspace.
+If a user is inside a nested project, the nearest ancestor with `.whipplescript/project.whip` is the workspace.
 
 An explicit workspace flag should override discovery:
 
@@ -132,7 +132,7 @@ An explicit workspace flag should override discovery:
 whip --workspace /path/to/workspace status
 ```
 
-The workspace root is the directory containing `.whippletree/`.
+The workspace root is the directory containing `.whipplescript/`.
 
 ## 5. State Location
 
@@ -140,18 +140,18 @@ SQLite is the v0.3 store.
 
 The SQLite database must not live in the working tree by default.
 
-The workspace `.whippletree/` directory may contain user-editable config and run artifacts, but the internal database should live under an Whippletree-controlled state root outside the repository checkout.
+The workspace `.whipplescript/` directory may contain user-editable config and run artifacts, but the internal database should live under an WhippleScript-controlled state root outside the repository checkout.
 
 Recommended default:
 
 ```text
-$XDG_STATE_HOME/whippletree/workspaces/<workspace-id>/whippletree.sqlite
+$XDG_STATE_HOME/whipplescript/workspaces/<workspace-id>/whipplescript.sqlite
 ```
 
 Fallback:
 
 ```text
-~/.local/state/whippletree/workspaces/<workspace-id>/whippletree.sqlite
+~/.local/state/whipplescript/workspaces/<workspace-id>/whipplescript.sqlite
 ```
 
 The workspace id should be a stable hash of the canonical workspace path.
@@ -198,7 +198,7 @@ Config format is TOML.
 Default path:
 
 ```text
-.whippletree/project.whip
+.whipplescript/project.whip
 ```
 
 The daemon validates config on startup and reload.
@@ -453,7 +453,7 @@ Each run has a private run directory.
 Recommended default:
 
 ```text
-.whippletree/runs/<run-id>/
+.whipplescript/runs/<run-id>/
   event.json
   meta.json
   stdout.log
@@ -512,7 +512,7 @@ The TypeScript SDK is part of v0.3, not deferred.
 
 It must be optional and must not create a second runtime.
 
-It should be complete for v0.3 core functionality while remaining a thin wrapper over Whippletree runtime facts, environment variables, CLI commands, or daemon transport.
+It should be complete for v0.3 core functionality while remaining a thin wrapper over WhippleScript runtime facts, environment variables, CLI commands, or daemon transport.
 
 It should wrap:
 
@@ -553,7 +553,7 @@ readJson()
 writeJson()
 ```
 
-SDK helpers should either use environment variables or call the Whippletree CLI/daemon transport.
+SDK helpers should either use environment variables or call the WhippleScript CLI/daemon transport.
 
 The SDK must not expose workflow, activity, durable promise, agent graph, managed join, managed race, semantic retry, or semantic dedupe helpers.
 
@@ -572,7 +572,7 @@ whip init recipe <name>
 Recipes may create:
 
 ```text
-.whippletree/project.whip
+.whipplescript/project.whip
 scripts/
 sources/
 package.json
@@ -623,7 +623,7 @@ Foreground operation must remain explicit through `whip dev` or a foreground opt
 The daemon validates:
 
 ```text
-Whippletree config schema
+WhippleScript config schema
 event envelope schema
 run status transitions
 service state transitions
@@ -677,6 +677,6 @@ Build the first implementation in this order:
 Each step should preserve the core boundary:
 
 ```text
-Whippletree records and controls mechanical runtime facts.
+WhippleScript records and controls mechanical runtime facts.
 User code owns operational meaning.
 ```

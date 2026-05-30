@@ -1,14 +1,18 @@
-# Whippletree Specs
+# WhippleScript Specs
 
 Status: draft reset
 
-These specs define the new Whippletree design from first principles. The current
+These specs define the new WhippleScript design from first principles. The current
 target is not a statechart language and not a general programming language. It
 is a restricted event-sourced rule system for orchestrating agent work.
 
+For user-facing documentation, start in [`../docs/README.md`](../docs/README.md).
+The specs remain the design record, acceptance criteria, and implementation
+tracker.
+
 ## North Star
 
-Whippletree should let coding agents and humans write orchestration logic that is:
+WhippleScript should let coding agents and humans write orchestration logic that is:
 
 - explicit about when agent work is requested
 - durable across crashes and restarts
@@ -17,7 +21,7 @@ Whippletree should let coding agents and humans write orchestration logic that i
 - formally modelable with a small operational semantics
 - safe to expose in enterprise environments through capability profiles
 
-Whippletree should not require authors to debug arbitrary distributed systems
+WhippleScript should not require authors to debug arbitrary distributed systems
 control flow. The runtime owns delivery, effect queues, leases, idempotency,
 timeouts, and replay. The language owns policy.
 
@@ -34,6 +38,8 @@ timeouts, and replay. The language owns policy.
 - [type-system.md](type-system.md): boundary types, schemas, validation, and BAML lowering
 - [expression-kernel.md](expression-kernel.md): pure guard/assertion expression semantics
 - [expression-kernel-tracker.md](expression-kernel-tracker.md): implementation checklist for guard/assertion expression coverage
+- [workflow-composition-transition-tracker.md](workflow-composition-transition-tracker.md): transition checklist for `workflow`, `pattern`, `apply`, `invoke`, `include`, and explicit terminal actions
+- [workflow-revision-transition-tracker.md](workflow-revision-transition-tracker.md): transition checklist for in-flight workflow revision, revision epochs, and cancellation policy
 - [capability-registry.md](capability-registry.md): runtime authority bindings and enforcement modes
 - [plugin-system.md](plugin-system.md): Pi-inspired package, plugin, and resource model
 - [skills.md](skills.md): deterministic skill registry and attachment model
@@ -47,11 +53,12 @@ timeouts, and replay. The language owns policy.
 - [plugin-author-guide.md](plugin-author-guide.md): capability/provider plugin authoring
 - [troubleshooting.md](troubleshooting.md): common diagnostics and operational failures
 - [release-checklist.md](release-checklist.md): v0 release gate checklist
+- [distribution-tracker.md](distribution-tracker.md): cross-platform install and release artifact tracker
 - [migration-notes.md](migration-notes.md): why legacy systems moved aside
 - [final-audit.md](final-audit.md): staged audit findings and gap classification
 - [memory-plugin.md](memory-plugin.md): memory as a registered plugin capability
 - [thoth-plugin.md](thoth-plugin.md): Thoth governance as a registered plugin capability
-- [companion-skill.md](companion-skill.md): first-party skill for authoring Whippletree workflows
+- [companion-skill.md](companion-skill.md): first-party skill for authoring WhippleScript workflows
 - [language.md](language.md): author-facing rule language sketch
 - [semantics.md](semantics.md): mathematical runtime model
 - [static-analysis.md](static-analysis.md): compiler checks and restrictions
@@ -60,6 +67,18 @@ timeouts, and replay. The language owns policy.
 - [implementation-plan.md](implementation-plan.md): staged project tracker from formal verification through e2e testing
 - [examples.md](examples.md): early syntax sketches
 
+## User-Facing Docs
+
+- [../docs/README.md](../docs/README.md): documentation map and canonical terms
+- [../docs/manual.md](../docs/manual.md): end-to-end workflow author/operator
+  manual
+- [../docs/api-reference.md](../docs/api-reference.md): CLI, language,
+  runtime, JSON, and Rust API reference
+- [../docs/language-reference.md](../docs/language-reference.md): practical
+  `.whip` language reference
+- [../docs/runtime-operations.md](../docs/runtime-operations.md): runtime
+  lifecycle, provider failure capture, and inspection commands
+
 ## Design Commitments
 
 1. Rules are restricted rewrites over typed facts, not arbitrary programs.
@@ -67,12 +86,13 @@ timeouts, and replay. The language owns policy.
 3. Agent completions return as events/facts and are correlated by the runtime.
 4. Rules may enqueue finite effect graphs with explicit dependency edges.
 5. Source order never implies effect ordering.
-6. Recursive rule composition is allowed only under analyzable strata.
+6. Reusable `pattern` composition elaborates before runtime; recursive pattern
+   composition is allowed only under analyzable, structurally bounded strata.
 7. Effectful cycles must cross an external event, clock, or explicit durable
    boundary.
 8. The compiler should be able to explain why a program is safe or rejected.
-9. A source file compiles into a versioned program; each run is a durable
-   instance managed by the control plane.
+9. A source bundle plus selected root workflow compiles into a versioned
+   program; each run is a durable instance managed by the control plane.
 10. The core stays small: rule runtime, registries, harnesses, skills, BAML,
    Loft, human review, and observability.
 11. Memory, Thoth, external trackers, browsers, research tools, dashboards, and

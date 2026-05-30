@@ -4,14 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/loft-fixtures-lib.sh"
 
-if [[ "${WHIPPLETREE_E2E_REAL_PROVIDERS:-}" != "1" ]]; then
+if [[ "${WHIPPLESCRIPT_E2E_REAL_PROVIDERS:-}" != "1" ]]; then
   echo "Skipping real-provider e2e checks."
-  echo "Set WHIPPLETREE_E2E_REAL_PROVIDERS=1 after configuring provider credentials."
+  echo "Set WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 after configuring provider credentials."
   exit 0
 fi
 
 missing=0
-SELECTED_PROVIDERS="${WHIPPLETREE_REAL_PROVIDERS:-loft,baml}"
+SELECTED_PROVIDERS="${WHIPPLESCRIPT_REAL_PROVIDERS:-loft,baml}"
 
 provider_enabled() {
   local provider="$1"
@@ -37,7 +37,7 @@ validate_selected_providers() {
   done
 
   if [[ "$selected_any" -ne 1 ]]; then
-    echo "WHIPPLETREE_REAL_PROVIDERS must include loft, baml, codex, or a comma-separated subset" >&2
+    echo "WHIPPLESCRIPT_REAL_PROVIDERS must include loft, baml, codex, or a comma-separated subset" >&2
     missing=1
   fi
 }
@@ -82,7 +82,7 @@ require_env() {
 check_baml_endpoint() {
   local endpoint="$1"
   if [[ ! "$endpoint" =~ ^http://([^/:]+)(:([0-9]+))?(/.*)?$ ]]; then
-    echo "WHIPPLETREE_BAML_TEST_ENDPOINT must be an http:// URL" >&2
+    echo "WHIPPLESCRIPT_BAML_TEST_ENDPOINT must be an http:// URL" >&2
     missing=1
     return
   fi
@@ -98,13 +98,13 @@ check_baml_endpoint() {
   fi
   echo "BAML endpoint TCP check ok: $host:$port"
 
-  if [[ -n "${WHIPPLETREE_BAML_HEALTH_PATH:-}" ]]; then
+  if [[ -n "${WHIPPLESCRIPT_BAML_HEALTH_PATH:-}" ]]; then
     if ! command -v curl >/dev/null 2>&1; then
-      echo "missing required tool for WHIPPLETREE_BAML_HEALTH_PATH: curl" >&2
+      echo "missing required tool for WHIPPLESCRIPT_BAML_HEALTH_PATH: curl" >&2
       missing=1
       return
     fi
-    local health_path="$WHIPPLETREE_BAML_HEALTH_PATH"
+    local health_path="$WHIPPLESCRIPT_BAML_HEALTH_PATH"
     if [[ "$health_path" != /* ]]; then
       health_path="/$health_path"
     fi
@@ -115,10 +115,10 @@ check_baml_endpoint() {
 }
 
 check_loft_fixture_repo() {
-  local repo="${WHIPPLETREE_LOFT_REPO:-$ROOT/vendor/loft}"
+  local repo="${WHIPPLESCRIPT_LOFT_REPO:-$ROOT/vendor/loft}"
   if [[ ! -d "$repo/.git" ]]; then
     echo "Loft fixture repo not present at $repo"
-    echo "Set WHIPPLETREE_LOFT_REPO or add the Loft repo as vendor/loft when fixtures are tracked."
+    echo "Set WHIPPLESCRIPT_LOFT_REPO or add the Loft repo as vendor/loft when fixtures are tracked."
     missing=1
     return
   fi
@@ -132,28 +132,28 @@ echo "Selected real providers: $SELECTED_PROVIDERS"
 validate_selected_providers
 
 if provider_enabled loft; then
-  require_command "${WHIPPLETREE_LOFT_CLI:-loft}" || true
-  require_env WHIPPLETREE_LOFT_TEST_ISSUE || true
-  if [[ "${WHIPPLETREE_LOFT_SKIP_REPO_PREFLIGHT:-}" == "1" ]]; then
-    echo "Skipping Loft fixture repo preflight because WHIPPLETREE_LOFT_SKIP_REPO_PREFLIGHT=1"
+  require_command "${WHIPPLESCRIPT_LOFT_CLI:-loft}" || true
+  require_env WHIPPLESCRIPT_LOFT_TEST_ISSUE || true
+  if [[ "${WHIPPLESCRIPT_LOFT_SKIP_REPO_PREFLIGHT:-}" == "1" ]]; then
+    echo "Skipping Loft fixture repo preflight because WHIPPLESCRIPT_LOFT_SKIP_REPO_PREFLIGHT=1"
   else
     check_loft_fixture_repo
   fi
 fi
 
 if provider_enabled baml; then
-  if [[ "${WHIPPLETREE_BAML_SKIP_CLI:-}" == "1" ]]; then
-    echo "Skipping BAML CLI probe because WHIPPLETREE_BAML_SKIP_CLI=1"
+  if [[ "${WHIPPLESCRIPT_BAML_SKIP_CLI:-}" == "1" ]]; then
+    echo "Skipping BAML CLI probe because WHIPPLESCRIPT_BAML_SKIP_CLI=1"
   else
     require_any_command "baml-cli or baml" baml-cli baml || true
   fi
-  require_env WHIPPLETREE_BAML_TEST_ENDPOINT || true
-  require_env WHIPPLETREE_BAML_TEST_FUNCTION || true
-  require_env WHIPPLETREE_BAML_TEST_ARGUMENTS_JSON || true
-  require_env WHIPPLETREE_BAML_TEST_OUTPUT_TYPE || true
+  require_env WHIPPLESCRIPT_BAML_TEST_ENDPOINT || true
+  require_env WHIPPLESCRIPT_BAML_TEST_FUNCTION || true
+  require_env WHIPPLESCRIPT_BAML_TEST_ARGUMENTS_JSON || true
+  require_env WHIPPLESCRIPT_BAML_TEST_OUTPUT_TYPE || true
 
-  if [[ -n "${WHIPPLETREE_BAML_TEST_ENDPOINT:-}" ]]; then
-    check_baml_endpoint "$WHIPPLETREE_BAML_TEST_ENDPOINT"
+  if [[ -n "${WHIPPLESCRIPT_BAML_TEST_ENDPOINT:-}" ]]; then
+    check_baml_endpoint "$WHIPPLESCRIPT_BAML_TEST_ENDPOINT"
   fi
 fi
 
@@ -165,18 +165,18 @@ if [[ "$missing" -ne 0 ]]; then
   exit 2
 fi
 
-cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p whippletree-cli -- doctor
-cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p whippletree-cli -- check \
+cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript-cli -- doctor
+cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript-cli -- check \
   "$ROOT/examples/loft-worker-with-review.whip" \
   "$ROOT/examples/coerce-branch.whip"
 
 if provider_enabled loft; then
-  cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whippletree-kernel \
+  cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript-kernel \
     real_loft_show_smoke -- --nocapture
 fi
 
 if provider_enabled baml; then
-  cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whippletree-kernel \
+  cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript-kernel \
     real_baml_coerce_endpoint_smoke -- --nocapture
 fi
 

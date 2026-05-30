@@ -6,9 +6,9 @@ import path from "node:path";
 const root = path.resolve(import.meta.dirname, "..");
 loadDotenv(path.join(root, ".env"));
 
-const host = process.env.WHIPPLETREE_OPENAI_COERCE_HOST || "127.0.0.1";
-const port = Number(process.env.WHIPPLETREE_OPENAI_COERCE_PORT || "18765");
-const model = process.env.WHIPPLETREE_OPENAI_MODEL || "gpt-5.4-mini";
+const host = process.env.WHIPPLESCRIPT_OPENAI_COERCE_HOST || "127.0.0.1";
+const port = Number(process.env.WHIPPLESCRIPT_OPENAI_COERCE_PORT || "18765");
+const model = process.env.WHIPPLESCRIPT_OPENAI_MODEL || "gpt-5.4-mini";
 const apiKey = process.env.OPENAI_API_KEY;
 
 if (!apiKey) {
@@ -56,7 +56,7 @@ async function coerce(request) {
   const outputType = String(request.output_type || "CoerceResult");
   const schema = responseSchema(outputType);
   const prompt = [
-    "Run this Whippletree coerce function and return only the structured output.",
+    "Run this WhippleScript coerce function and return only the structured output.",
     "Use the function name, output type, and arguments as the source of truth.",
     "Choose conservative confidence values when the input is sparse.",
     JSON.stringify(
@@ -82,7 +82,7 @@ async function coerce(request) {
         {
           role: "system",
           content:
-            "You are a deterministic data coercion provider for Whippletree. Return JSON that exactly matches the requested schema.",
+            "You are a deterministic data coercion provider for WhippleScript. Return JSON that exactly matches the requested schema.",
         },
         { role: "user", content: prompt },
       ],
@@ -129,8 +129,8 @@ async function coerce(request) {
 }
 
 function responseSchema(outputType) {
-  if (process.env.WHIPPLETREE_OPENAI_COERCE_SCHEMA_JSON) {
-    return JSON.parse(process.env.WHIPPLETREE_OPENAI_COERCE_SCHEMA_JSON);
+  if (process.env.WHIPPLESCRIPT_OPENAI_COERCE_SCHEMA_JSON) {
+    return JSON.parse(process.env.WHIPPLESCRIPT_OPENAI_COERCE_SCHEMA_JSON);
   }
 
   if (outputType === "MessageClassification") {

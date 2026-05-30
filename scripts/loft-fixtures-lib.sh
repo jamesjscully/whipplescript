@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-LOFT_FIXTURE_DIR="fixtures/whippletree/v0.1"
+LOFT_FIXTURE_DIR="fixtures/whipplescript/v0.1"
 LOFT_FIXTURE_MANIFEST="manifest.json"
 
 loft_manifest_path() {

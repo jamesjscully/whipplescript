@@ -1,12 +1,12 @@
-# Whippletree Dynamic Management Interface
+# WhippleScript Dynamic Management Interface
 
 Status: design proposal
 
-This document describes the desired CLI/API shape for managing Whippletree as a
+This document describes the desired CLI/API shape for managing WhippleScript as a
 runtime scaffold for agent projects. It is intentionally separate from the v0.3
 normative spec: not every command described here exists yet.
 
-The goal is to make Whippletree a reusable coordination layer for ordinary
+The goal is to make WhippleScript a reusable coordination layer for ordinary
 long-running processes without turning it into a workflow engine, tracing
 system, or agent framework.
 
@@ -26,7 +26,7 @@ recover from crashes
 inspect what happened
 ```
 
-Whippletree should provide that plumbing with a clear object model and a predictable
+WhippleScript should provide that plumbing with a clear object model and a predictable
 CLI. User code remains responsible for semantic meaning:
 
 ```text
@@ -42,7 +42,7 @@ domain-specific conflict handling
 
 The boundary remains:
 
-**Whippletree owns invocation truth. User code owns operational meaning.**
+**WhippleScript owns invocation truth. User code owns operational meaning.**
 
 ## 2. Interface Principles
 
@@ -71,7 +71,7 @@ The first form is canonical. The second form is an alias.
 
 ## 3. Ontology
 
-Whippletree's interface should distinguish definitions from records.
+WhippleScript's interface should distinguish definitions from records.
 
 Definitions describe desired behavior:
 
@@ -147,7 +147,7 @@ name = "github-source"
 run = "node sources/github-events.mjs"
 ```
 
-Services are definitions with reconciliation. Whippletree should keep enabled
+Services are definitions with reconciliation. WhippleScript should keep enabled
 services running according to mechanical supervision policy.
 
 Agents use services for:
@@ -164,7 +164,7 @@ log tailers
 
 ### 3.4 Source
 
-A source is anything that emits Whippletree events:
+A source is anything that emits WhippleScript events:
 
 ```text
 manual CLI emit
@@ -191,7 +191,7 @@ mechanical provenance such as source run, parent event, and correlation id.
 
 ### 3.6 Trigger
 
-A trigger is a routing/admission record produced by Whippletree. If an event causes
+A trigger is a routing/admission record produced by WhippleScript. If an event causes
 a task to start, the trigger records:
 
 ```text
@@ -230,7 +230,7 @@ Where are the logs?
 ### 3.8 Log
 
 A log is captured stdout/stderr plus mechanical metadata for a run. Logs should
-be good enough that Whippletree does not need a structured result object for v0.x.
+be good enough that WhippleScript does not need a structured result object for v0.x.
 
 ### 3.9 Lock
 
@@ -365,7 +365,7 @@ Useful list filters:
 --limit N
 ```
 
-Whippletree should not add a separate `publish` command. `emit` is the canonical
+WhippleScript should not add a separate `publish` command. `emit` is the canonical
 event creation verb.
 
 ### 4.5 Trigger Commands
@@ -469,7 +469,7 @@ whip tasks                 # task list
 whip services              # service list
 whip runs                  # run list
 whip events                # event list
-whippletree triggers              # trigger list
+whipplescript triggers              # trigger list
 
 whip run <task>            # task run <task>
 whip exec -- <cmd...>      # run start -- <cmd...>
@@ -511,8 +511,8 @@ dynamic definitions live until removed, daemon shutdown, or workspace reset
 ```
 
 Persistence should be designed separately. If added, persistent dynamic
-definitions should not rewrite the user's primary `.whippletree/project.whip`
-without explicit consent. A separate Whippletree-managed dynamic definition file is
+definitions should not rewrite the user's primary `.whipplescript/project.whip`
+without explicit consent. A separate WhippleScript-managed dynamic definition file is
 preferable.
 
 ## 7. Lock Semantics
@@ -553,13 +553,13 @@ If the lock exists and is not expired, acquire fails with conflict.
 
 If the lock exists but is expired, the daemon may replace it.
 
-When acquire is called from inside an Whippletree-managed run, owner fields should
+When acquire is called from inside an WhippleScript-managed run, owner fields should
 be inferred from environment:
 
 ```text
-WHIPPLETREE_RUN_ID
-WHIPPLETREE_NAME
-WHIPPLETREE_CORRELATION_ID
+WHIPPLESCRIPT_RUN_ID
+WHIPPLESCRIPT_NAME
+WHIPPLESCRIPT_CORRELATION_ID
 ```
 
 ### 7.3 Renew
@@ -583,7 +583,7 @@ whip lock release repo:main --token lock_...
 This prevents stale holders from releasing newer locks.
 
 For ergonomics, tokenless release may be allowed only when the caller is the same
-Whippletree run that owns the lock:
+WhippleScript run that owns the lock:
 
 ```sh
 whip lock release repo:main
@@ -592,7 +592,7 @@ whip lock release repo:main
 The daemon may accept this only if:
 
 ```text
-caller WHIPPLETREE_RUN_ID == lock.owner_run_id
+caller WHIPPLESCRIPT_RUN_ID == lock.owner_run_id
 ```
 
 Outside the owning run context, tokenless release must fail and explain how to
@@ -647,7 +647,7 @@ automatic renewal while the command is running
 
 ## 8. Provenance and Correlation
 
-Whippletree should track mechanical causality, not semantic workflow traces.
+WhippleScript should track mechanical causality, not semantic workflow traces.
 
 Good mechanical provenance fields:
 
@@ -661,14 +661,14 @@ event_id
 trigger_id
 ```
 
-When `event emit` is called from inside an Whippletree-managed run, Whippletree should
+When `event emit` is called from inside an WhippleScript-managed run, WhippleScript should
 infer:
 
 ```text
-source_run_id    from WHIPPLETREE_RUN_ID
-parent_event_id  from WHIPPLETREE_EVENT_ID
-correlation_id   from WHIPPLETREE_CORRELATION_ID, unless overridden
-source           from WHIPPLETREE_NAME, unless overridden
+source_run_id    from WHIPPLESCRIPT_RUN_ID
+parent_event_id  from WHIPPLESCRIPT_EVENT_ID
+correlation_id   from WHIPPLESCRIPT_CORRELATION_ID, unless overridden
+source           from WHIPPLESCRIPT_NAME, unless overridden
 ```
 
 These fields answer:
@@ -720,7 +720,7 @@ idempotency hooks where appropriate
 Recommended environment default:
 
 ```sh
-WHIPPLETREE_FORMAT=json
+WHIPPLESCRIPT_FORMAT=json
 ```
 
 Potential future flags:
@@ -748,7 +748,7 @@ business state machines
 semantic deduplication
 ```
 
-Whippletree may carry labels, names, correlation IDs, and provenance. User code
+WhippleScript may carry labels, names, correlation IDs, and provenance. User code
 decides what they mean.
 
 ## 12. Suggested Implementation Order

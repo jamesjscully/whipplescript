@@ -2,7 +2,7 @@
 
 Status: design proposal
 
-Whippletree uses BAML's type and prompt model without making users author a
+WhippleScript uses BAML's type and prompt model without making users author a
 separate embedded BAML island by default.
 
 `.whip` source owns:
@@ -20,7 +20,7 @@ artifact, not the primary authoring surface.
 
 Use this source model:
 
-```whippletree
+```whipplescript
 enum ActionKind {
   StartWorker
   Wait
@@ -59,7 +59,7 @@ class NextAction {
   reason string
 }
 
-client<llm> WhippletreeDefaultLLM {
+client<llm> WhippleScriptDefaultLLM {
   provider "openai"
   options {
     model "gpt-4o-mini"
@@ -68,7 +68,7 @@ client<llm> WhippletreeDefaultLLM {
 }
 
 function selectNextAction(planText: string) -> NextAction {
-  client WhippletreeDefaultLLM
+  client WhippleScriptDefaultLLM
   prompt #"
     Choose the next safe orchestration action.
 
@@ -81,7 +81,7 @@ function selectNextAction(planText: string) -> NextAction {
 
 Do not require this as the normal user-authored shape:
 
-```whippletree
+```whipplescript
 baml {
   '''
   enum ActionKind { ... }
@@ -95,10 +95,10 @@ product surface.
 
 ## Source Of Truth
 
-Whippletree declarations are canonical. Generated BAML artifacts are derived:
+WhippleScript declarations are canonical. Generated BAML artifacts are derived:
 
 ```text
-.whippletree/build/workflows/<machine>/baml_src/*.baml
+.whipplescript/build/workflows/<machine>/baml_src/*.baml
 ```
 
 The generated BAML source includes only declarations reachable from `coerce`
@@ -106,7 +106,7 @@ function inputs and outputs. Workflow-only `class` or `enum` declarations that
 are used only for events, data, or adapter schemas remain in WorkflowIR but are
 not emitted into `workflow.baml`.
 
-The v1 runtime uses BAML HTTP as the selected execution path. Whippletree either
+The v1 runtime uses BAML HTTP as the selected execution path. WhippleScript either
 connects to an existing BAML server or, in a later managed mode, starts:
 
 ```sh
@@ -154,7 +154,7 @@ Request shape:
 
 The source syntax can look positional:
 
-```whippletree
+```whipplescript
 let next = coerce chooseNextStep(planText, recentRuns)
 ```
 
@@ -186,7 +186,7 @@ against the generated `baml_src` directory.
 
 Advantages:
 
-- smallest Whippletree implementation slice
+- smallest WhippleScript implementation slice
 - clearer enterprise deployment boundary
 - no process supervision required for the first real `coerce` path
 - simple integration testing when `baml-cli` and provider credentials exist
@@ -199,7 +199,7 @@ Managed mode is a later convenience:
 whip run workflow.whip --manage-baml
 ```
 
-Whippletree starts `baml-cli serve --from <build-dir>/baml_src`, captures logs, and
+WhippleScript starts `baml-cli serve --from <build-dir>/baml_src`, captures logs, and
 stops the server when the workflow host stops. This mode may reuse process and
 log-capture lessons from the legacy runtime, but the legacy runtime should not
 own the `coerce` semantics.
@@ -304,7 +304,7 @@ allowed.
 
 ## Supported Declaration Surface
 
-Whippletree-authored BAML-shaped declarations:
+WhippleScript-authored BAML-shaped declarations:
 
 ```text
 enum
@@ -320,7 +320,7 @@ the product needs them.
 
 ## Type Mapping
 
-BAML-compatible declarations map into Whippletree schema types:
+BAML-compatible declarations map into WhippleScript schema types:
 
 ```text
 BAML string              -> Schema::String
@@ -338,11 +338,11 @@ BAML enum                -> Schema::Enum
 BAML class               -> Schema::Record or Schema::Ref
 ```
 
-Generated Whippletree records/classes are closed for validation. Values may omit
+Generated WhippleScript records/classes are closed for validation. Values may omit
 optional fields but may not include undeclared fields. Use `map<string, T>` or a
 native `json` field for deliberately open object-shaped data.
 
-Whippletree stores and validates map values as JSON objects. The compiler therefore
+WhippleScript stores and validates map values as JSON objects. The compiler therefore
 accepts only string-compatible map keys in v0: `string`, enums, string literals,
 and unions/refs composed from those. This keeps generated BAML map boundaries
 aligned with the runtime representation instead of accepting schemas that cannot
@@ -352,7 +352,7 @@ Enum values must start with an uppercase ASCII letter, matching BAML's enum
 rules. The workflow validator rejects lowercase enum values before build so
 generated `workflow.baml` does not fail later in the BAML toolchain.
 
-Whippletree workflow-native types such as `time`, `duration`, and `agent` may
+WhippleScript workflow-native types such as `time`, `duration`, and `agent` may
 exist in `data`, event payloads, and adapter schemas, but they are not valid
 BAML boundary types unless an adapter or compiler rule maps them explicitly to a
 BAML-compatible representation.
@@ -362,15 +362,15 @@ for future opaque media schema support. The current runtime must reject them
 unless the schema layer, policy layer, and BAML HTTP executor all explicitly
 support the media representation being passed.
 
-BAML does not support `set` or `tuple`. If Whippletree supports set-like durable
+BAML does not support `set` or `tuple`. If WhippleScript supports set-like durable
 data internally, it must not emit that type as a BAML input/output schema.
 
 BAML does not support generic `any/json` as a preferred structured boundary. If
 a workflow needs arbitrary JSON at a model boundary, it should pass a string or
 use a more specific class/map/union schema.
 
-BAML-compatible schemas do not imply full inline operations in the Whippletree
-expression language. Whippletree can store, compare where meaningful, route, and
+BAML-compatible schemas do not imply full inline operations in the WhippleScript
+expression language. WhippleScript can store, compare where meaningful, route, and
 pass values through typed boundaries. The supported operation set is defined in
 [expression-primitives.md](expression-primitives.md).
 
@@ -378,7 +378,7 @@ pass values through typed boundaries. The supported operation set is defined in
 
 Both call forms are accepted:
 
-```whippletree
+```whipplescript
 let next = coerce selectNextAction(planText)
 let next = selectNextAction(planText)
 ```
@@ -401,11 +401,11 @@ function classify(input: string) -> "bug" | "feature" {
 }
 ```
 
-Whippletree should support these as `Schema::Literal` and `Schema::Union`.
+WhippleScript should support these as `Schema::Literal` and `Schema::Union`.
 
 For workflow control branches, examples should prefer enums:
 
-```whippletree
+```whipplescript
 enum ActionKind {
   StartWorker
   Wait
@@ -420,7 +420,7 @@ model-generation domains.
 
 The first authoring surface uses simple model shorthand:
 
-```whippletree
+```whipplescript
 coerce choose(planText string) -> NextStep {
   model "gpt-4o-mini"
   prompt """..."""
@@ -437,7 +437,7 @@ allowed environment variables
 whether network/model calls are allowed
 whether BAML tools are allowed
 allowed BAML HTTP URLs
-whether Whippletree may manage a local baml-cli serve process
+whether WhippleScript may manage a local baml-cli serve process
 ```
 
 Advanced explicit client declarations may be added later, but they should stay
@@ -447,13 +447,13 @@ compatible with BAML rather than inventing a parallel client language.
 
 Prompt blocks use BAML/Jinja template semantics inside generated BAML.
 
-Whippletree expression interpolation is not active inside prompt blocks. Prompt
+WhippleScript expression interpolation is not active inside prompt blocks. Prompt
 variables are the coerce function parameters and BAML-provided context such as
 `ctx.output_format`.
 
-Outside prompt blocks, Whippletree strings use Whippletree interpolation rules:
+Outside prompt blocks, WhippleScript strings use WhippleScript interpolation rules:
 
-```whippletree
+```whipplescript
 send director """
 Worker failed: {{ classification.reason }}
 """
@@ -463,12 +463,12 @@ Worker failed: {{ classification.reason }}
 
 BAML supports multimodal types such as `image`, `audio`, `pdf`, and `video`.
 
-Whippletree should not support multimodal coerce inputs in the first
+WhippleScript should not support multimodal coerce inputs in the first
 implementation unless adapter policy explicitly enables them. URL-based media
 can create SSRF and egress risks, so multimodal values need explicit policy,
 allowlists, and audit records.
 
-When enabled, multimodal values are opaque in Whippletree expressions. Workflows may
+When enabled, multimodal values are opaque in WhippleScript expressions. Workflows may
 store them, pass them to BAML, pass them to declared adapters, or test for
 presence. They may not inspect, transform, fetch, transcode, or parse media
 inline.

@@ -2,14 +2,25 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MODEL="$ROOT/models/tla/ControlPlaneLifecycle.tla"
+LENGTH="${WHIPPLESCRIPT_TLA_LENGTH:-6}"
 
-if ! command -v apalache-mc >/dev/null 2>&1; then
+if command -v apalache-mc >/dev/null 2>&1; then
+  APALACHE=(apalache-mc)
+else
   if command -v nix >/dev/null 2>&1; then
-    exec nix --extra-experimental-features 'nix-command flakes' develop "$ROOT" --command "$0"
+    APALACHE=(nix --extra-experimental-features 'nix-command flakes' develop "$ROOT" --command apalache-mc)
+  else
+    echo "apalache-mc not found and nix is unavailable" >&2
+    exit 1
   fi
-
-  echo "apalache-mc not found and nix is unavailable" >&2
-  exit 1
 fi
 
-apalache-mc typecheck "$ROOT/models/tla/ControlPlaneLifecycle.tla"
+"${APALACHE[@]}" typecheck "$MODEL"
+"${APALACHE[@]}" check \
+  --cinit=ConstInit \
+  --init=Init \
+  --next=Next \
+  --inv=SafetyInvariants \
+  --length="$LENGTH" \
+  "$MODEL"

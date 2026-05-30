@@ -32,7 +32,7 @@ Produced by source rules using `record`.
 
 Example:
 
-```whippletree
+```whipplescript
 record ReviewedWork {
   turn turn
   review review
@@ -68,7 +68,7 @@ loft.unfinishedIssue
 loft.conflict
 ```
 
-Loft remains the source of truth for Loft facts. Whippletree may cache or
+Loft remains the source of truth for Loft facts. WhippleScript may cache or
 project them for rule matching, but the provenance must remain visible.
 
 ### Plugin Projection Facts
@@ -84,7 +84,7 @@ github.prStatus
 ```
 
 Plugins may register schemas for these facts. They may not write them directly
-into an instance. Plugin observations enter Whippletree through effects/events and
+into an instance. Plugin observations enter WhippleScript through effects/events and
 kernel-mediated projection.
 
 ## Required Fact Metadata

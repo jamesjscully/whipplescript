@@ -1,6 +1,4 @@
 workflow ImplementationPlanPhaseReview
-uses
-  skill whippletree-author
 schemas
   class PhaseReviewRequest
     number int
@@ -15,7 +13,7 @@ schemas
     turn ref<AgentTurn>
     status literal<"dispatched">
 agents
-  agent codex profile=repo-reader capacity=4 skills=[whippletree-author] capabilities=[]
+  agent codex profile=repo-reader capacity=4 skills=[whipplescript-author] capabilities=[]
 assertions
   assert count(PhaseReviewRequest where status == "queued") == 0
     reads

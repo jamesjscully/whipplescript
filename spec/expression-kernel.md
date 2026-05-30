@@ -190,7 +190,7 @@ sides against the complete finite domain when either side has one. A value
 outside the domain is a compile-time error even if it appears on the syntactic
 side that is not currently implemented as the "field side":
 
-```whippletree
+```whipplescript
 task.provider == "gpt5"     # invalid if provider is "codex" | "claude" | "pi"
 "gpt5" == task.provider     # same diagnostic
 task.provider != "gpt5"     # same domain error; do not silently accept as true
@@ -241,7 +241,7 @@ not be used to paper over an expression the compiler could have rejected.
 
 Optional field access must be guarded by an obvious proof:
 
-```whippletree
+```whipplescript
 when issue.assignee != null
 when issue.assignee.name == "Ada"
 ```
@@ -266,7 +266,7 @@ not infer arbitrary logical equivalences.
 
 For `&&`, proofs flow left-to-right only:
 
-```whippletree
+```whipplescript
 exists issue.assignee && issue.assignee.name == "Ada"   # accepted
 issue.assignee.name == "Ada" && exists issue.assignee   # rejected
 ```
@@ -274,7 +274,7 @@ issue.assignee.name == "Ada" && exists issue.assignee   # rejected
 For `||`, a proof from one branch does not hold in the other branch or after the
 operator:
 
-```whippletree
+```whipplescript
 exists issue.assignee || issue.assignee.name == "Ada"   # rejected
 ```
 
@@ -323,7 +323,7 @@ Branch guards must not perform I/O or call providers.
 The compiler should exhaustiveness-check finite domains when the branch result
 must be total:
 
-```whippletree
+```whipplescript
 case review.status {
   Accept => "ready"
   Revise => "needs-work"
@@ -333,7 +333,7 @@ case review.status {
 
 Optional branches may bind a proven-present value:
 
-```whippletree
+```whipplescript
 case issue.assignee {
   Some assignee => assignee.name
   None => "unassigned"
@@ -342,7 +342,7 @@ case issue.assignee {
 
 The initial implemented rule-body form is:
 
-```whippletree
+```whipplescript
 case task.provider {
   "codex" => {
     record RoutedTask {
@@ -356,7 +356,7 @@ case task.provider {
 union for deterministic branching. The v0 source pattern follows the existing
 case-branch form and binds the variant payload:
 
-```whippletree
+```whipplescript
 after classification completes {
   case classification {
     Completed result => {
@@ -457,7 +457,7 @@ arrays and objects only when every nested field is equality-comparable
 ```
 
 `int` and `float` may compare numerically when lossless and well-defined. NaN
-and infinities are not valid Whippletree numeric values.
+and infinities are not valid WhippleScript numeric values.
 
 Class/object equality is not a routing primitive unless the class is explicitly
 marked comparable or the comparison is over known identity fields. Prefer field
@@ -475,7 +475,7 @@ time
 string, only if explicitly enabled for lexicographic ordering
 ```
 
-String ordering is not needed for the provider-routing dogfood path and should
+String ordering is not needed for the provider-routing validation path and should
 remain disabled unless a concrete workflow requires it. Equality on strings is
 allowed.
 
@@ -507,7 +507,7 @@ operator is specified.
 
 Membership is deterministic and type-checked:
 
-```whippletree
+```whipplescript
 task.provider in ["codex", "claude", "pi"]
 "repo-writer" in agent.profiles
 "owner" in issue.labels
@@ -521,7 +521,7 @@ domain before runtime.
 For maps, membership checks key existence and the left-hand side must be a
 string or string-literal type:
 
-```whippletree
+```whipplescript
 "priority" in issue.metadata
 "priority" not in issue.metadata
 ```
@@ -530,13 +530,13 @@ Map membership never inspects values. If the map itself is present and the key
 is absent, `key in map` is `false` and `key not in map` is `true`. If the map
 path is optional or may be missing, the map path must first be proven present:
 
-```whippletree
+```whipplescript
 exists issue.metadata && "priority" in issue.metadata
 ```
 
 Map indexing has the same key type rule:
 
-```whippletree
+```whipplescript
 issue.metadata["priority"]
 ```
 
@@ -557,7 +557,7 @@ Membership does not search object fields or perform substring checks.
 `count` and `empty` are available for arrays, maps, fact queries, and effect
 queries:
 
-```whippletree
+```whipplescript
 count(LanguageE2EResult where provider == "codex") == 2
 empty(BlockingIssue where severity == Critical)
 ```
@@ -606,7 +606,7 @@ presence/null checks.
 
 Object literals are allowed only where an expected schema is known:
 
-```whippletree
+```whipplescript
 record LanguageTask {
   provider "codex"
   language "French"
@@ -620,9 +620,9 @@ from a record/effect argument, static row, action/template parameter, or another
 typed object field. The checker must validate them exactly like `record`
 construction:
 
-```whippletree
+```whipplescript
 tell codex WritePatch {
-  repo "whippletree"
+  repo "whipplescript"
   task {
     title issue.title
     metadata {
@@ -641,7 +641,7 @@ before runtime evaluation records the constructed value.
 Object literals outside an expected schema context are rejected, including
 comparisons against anonymous objects and untyped array elements:
 
-```whippletree
+```whipplescript
 { provider "codex" } == task          # rejected
 [{ provider "codex" }]                # rejected unless Array<SomeSchema> expected
 ```
@@ -662,7 +662,7 @@ facts, not general collection programming.
 Interpolation is not string programming. It is a formatting operation over
 already-typed values:
 
-```whippletree
+```whipplescript
 """
 Implement {{ issue.title }} for {{ issue.owner }}.
 """
@@ -692,7 +692,7 @@ transport between rules; use typed facts/effect arguments for that.
 
 The kernel may support small deterministic updates over workflow-owned facts:
 
-```whippletree
+```whipplescript
 append item.tags "needs-review"
 remove item.blockers blockerId
 ```
@@ -707,7 +707,7 @@ transcripts.
 
 `AgentRef<...>` is the only dynamic agent-target type:
 
-```whippletree
+```whipplescript
 AgentRef<codex | claude | pi>
 ```
 
@@ -719,7 +719,7 @@ A plain `string` never coerces to `AgentRef`.
 
 Assertions are deterministic checks over projected state:
 
-```whippletree
+```whipplescript
 assert count(LanguageE2EResult where provider == "codex") == 2
 assert exists(LanguageE2EResult where language == "Japanese")
 assert count(effect kind agent.tell where status == completed) == 6

@@ -51,31 +51,31 @@ as complete:
 | Assertion diagnostics and event surfaces | [x] | [x] | [x] | [x] | Failed/error assertions now persist deterministic diagnostic rows during `dev` with assertion source spans; CLI JSON/human output, exit status, and `whip diagnostics` list the durable surface after store reopen. |
 | Provider/harness failure capture | [x] | [x] | [x] | [x] | Failed/timed-out agent, BAML, and Loft provider runs now persist diagnostic rows linked to terminal event, effect, run, provider evidence, and source span metadata when the effect came from compiled source. Terminal events embed the diagnostic payload so provider diagnostics can be reconstructed from event replay. |
 | Parser-only expression matrix | [x] | [x] | [x] | [x] | Parser-only tests now cover precedence, calls, fact/effect queries, map indexes, arrays, invalid syntax, and optional presence-proof syntax. |
-| Golden IR expression fixture | [x] | [x] | [x] | [x] | Added `examples/expression-kernel-dogfood.whip/.ir` covering guards, assertions, projections, maps, arrays, optional presence, and deterministic routing. |
+| Golden IR expression fixture | [x] | [x] | [x] | [x] | Added the expression-kernel validation fixture covering guards, assertions, projections, maps, arrays, optional presence, and deterministic routing. |
 | Static-analysis diagnostic matrix | [x] | [x] | [x] | [x] | Parser tests now cover assertion validation, unknown roots/fields, non-boolean guards/assertions, incompatible equality, membership misuse, bad array literals, finite-domain typos/contradictions, quoted AgentRef misuse, expression function/query errors, bad effect payloads, terminal-output tags, dynamic `AgentRef` capability checks, and duration/time literal errors. |
-| Companion-skill dogfood cleanup | [x] | [x] | [x] | [x] | `examples/companion-skill-dogfood.whip/.ir` and CLI e2e coverage now dogfood `use skill "whippletree-author"`, typed `AgentRef` routing, tracker-path prompts, source assertions, and no LLM provider/model classification. |
+| Companion-skill validation cleanup | [x] | [x] | [x] | [x] | The companion-skill fixture and CLI e2e coverage now validate typed `AgentRef` routing, tracker-path prompts, source assertions, and no LLM provider/model classification. |
 
 ### Completed Implementation Slices
 
 | Slice | Files | Result |
 | --- | --- | --- |
-| Parser/type-checker validation | `crates/whippletree-parser/src/lib.rs` | Assertion validation, symmetric finite-domain diagnostics, unknown dotted-root diagnostics, simple fact-query guard typing, and parser-only expression matrix tests landed. |
-| Full guard/assertion type-checking closure | `crates/whippletree-parser/src/lib.rs`, `examples/*dogfood.*`, `spec/expression-kernel-tracker.md` | Expression inference now preserves finite domains and AgentRefs, rejects non-boolean/incompatible/membership/array errors in guards and assertions, rejects quoted AgentRef record values, and diagnoses unsatisfiable finite-domain relations. |
-| Generated Maude validation | `crates/whippletree-cli/src/main.rs`, `models/maude/kernel.maude` | Guard-gated rule and assertion non-mutation searches now use generated expression terms for equality, boolean connectives, and query count/exists/empty while preserving dependency checks. |
-| Broadened generated Maude expressions | `crates/whippletree-cli/src/main.rs`, `models/maude/kernel.maude`, `models/maude/tests/expression-kernel.maude` | Generated model searches now include abstract Maude terms for ordering, membership, array/object/map collection witnesses, index misses, and query filters, with hand-written Maude tests for true/false/error behavior. |
-| Store diagnostics | `crates/whippletree-store/src/lib.rs`, `crates/whippletree-store/migrations/0001_runtime_store.sql` | Durable diagnostic record/list APIs, schema columns, idempotency indexes, and legacy upgrade coverage landed. |
-| Golden dogfood fixture | `examples/expression-kernel-dogfood.whip`, `examples/expression-kernel-dogfood.ir` | Compiled golden fixture landed for guards, assertions, projections, map indexes, optional presence, arrays, and deterministic routing. |
-| Object/map literal construction | `crates/whippletree-parser/src/lib.rs`, `crates/whippletree-cli/src/main.rs`, `crates/whippletree-cli/tests/control_plane.rs`, `examples/expression-kernel-dogfood.*` | Record-field map/object literals now validate and materialize, including multiline nested bodies and BAML object/map effect arguments. |
-| Effect payload validation | `crates/whippletree-parser/src/lib.rs`, `crates/whippletree-cli/tests/control_plane.rs`, `examples/invalid/bad-effect-payload.*` | `coerce` arguments are checked against declared parameter types, multiline object/map arguments are validated deterministically, `claim ... with loft` requires a `LoftIssue`, and anonymous object literals are rejected when no expected type exists. |
-| Duration/time ordering | `crates/whippletree-parser/src/lib.rs`, `crates/whippletree-cli/src/main.rs`, `crates/whippletree-cli/tests/control_plane.rs` | Duration/time fields are no longer treated as strings for ordering validation; source literals are validated with fractional timestamp support; runtime ordering parses typed duration/time strings and reports typed errors for invalid external values. CLI tests cover check/dev/invalid-literal/external-invalid behavior. |
-| Function/query validation fixture | `examples/invalid/bad-expression-functions.*`, `crates/whippletree-parser/src/lib.rs` | Invalid function/query diagnostics are now enforced and included in invalid fixture discovery. |
-| Provider diagnostics trace slice | `crates/whippletree-kernel/src/trace.rs`, `crates/whippletree-kernel/src/lib.rs`, `crates/whippletree-cli/src/main.rs` | Provider diagnostics now appear in kernel trace and CLI trace JSON before terminal events. |
-| Durable runtime diagnostics | `crates/whippletree-store/src/lib.rs`, `crates/whippletree-kernel/src/lib.rs`, `crates/whippletree-cli/src/main.rs`, `crates/whippletree-cli/tests/control_plane.rs` | Provider/harness failures and assertion failures are recorded through the store diagnostics API and listed through `whip diagnostics` after reopening the SQLite store. Terminal provider diagnostics are also embedded in `effect.terminal` events and covered by replay-derived store tests. |
-| AgentRef store enforcement | `crates/whippletree-store/src/lib.rs`, `crates/whippletree-kernel/src/lib.rs`, `crates/whippletree-cli/src/main.rs` | Real compiled `agent` declarations are persisted to program versions; claimability/start-run enforce declared target/profile/capability/capacity metadata; capacity blocks now emit `effect.blocked` and set `blocked_by_capacity`. |
+| Parser/type-checker validation | `crates/whipplescript-parser/src/lib.rs` | Assertion validation, symmetric finite-domain diagnostics, unknown dotted-root diagnostics, simple fact-query guard typing, and parser-only expression matrix tests landed. |
+| Full guard/assertion type-checking closure | `crates/whipplescript-parser/src/lib.rs`, checked example fixtures, `spec/expression-kernel-tracker.md` | Expression inference now preserves finite domains and AgentRefs, rejects non-boolean/incompatible/membership/array errors in guards and assertions, rejects quoted AgentRef record values, and diagnoses unsatisfiable finite-domain relations. |
+| Generated Maude validation | `crates/whipplescript-cli/src/main.rs`, `models/maude/kernel.maude` | Guard-gated rule and assertion non-mutation searches now use generated expression terms for equality, boolean connectives, and query count/exists/empty while preserving dependency checks. |
+| Broadened generated Maude expressions | `crates/whipplescript-cli/src/main.rs`, `models/maude/kernel.maude`, `models/maude/tests/expression-kernel.maude` | Generated model searches now include abstract Maude terms for ordering, membership, array/object/map collection witnesses, index misses, and query filters, with hand-written Maude tests for true/false/error behavior. |
+| Store diagnostics | `crates/whipplescript-store/src/lib.rs`, `crates/whipplescript-store/migrations/0001_runtime_store.sql` | Durable diagnostic record/list APIs, schema columns, idempotency indexes, and legacy upgrade coverage landed. |
+| Golden validation fixture | expression-kernel example fixture | Compiled golden fixture landed for guards, assertions, projections, map indexes, optional presence, arrays, and deterministic routing. |
+| Object/map literal construction | `crates/whipplescript-parser/src/lib.rs`, `crates/whipplescript-cli/src/main.rs`, `crates/whipplescript-cli/tests/control_plane.rs`, expression-kernel example fixture | Record-field map/object literals now validate and materialize, including multiline nested bodies and BAML object/map effect arguments. |
+| Effect payload validation | `crates/whipplescript-parser/src/lib.rs`, `crates/whipplescript-cli/tests/control_plane.rs`, `examples/invalid/bad-effect-payload.*` | `coerce` arguments are checked against declared parameter types, multiline object/map arguments are validated deterministically, `claim ... with loft` requires a `LoftIssue`, and anonymous object literals are rejected when no expected type exists. |
+| Duration/time ordering | `crates/whipplescript-parser/src/lib.rs`, `crates/whipplescript-cli/src/main.rs`, `crates/whipplescript-cli/tests/control_plane.rs` | Duration/time fields are no longer treated as strings for ordering validation; source literals are validated with fractional timestamp support; runtime ordering parses typed duration/time strings and reports typed errors for invalid external values. CLI tests cover check/dev/invalid-literal/external-invalid behavior. |
+| Function/query validation fixture | `examples/invalid/bad-expression-functions.*`, `crates/whipplescript-parser/src/lib.rs` | Invalid function/query diagnostics are now enforced and included in invalid fixture discovery. |
+| Provider diagnostics trace slice | `crates/whipplescript-kernel/src/trace.rs`, `crates/whipplescript-kernel/src/lib.rs`, `crates/whipplescript-cli/src/main.rs` | Provider diagnostics now appear in kernel trace and CLI trace JSON before terminal events. |
+| Durable runtime diagnostics | `crates/whipplescript-store/src/lib.rs`, `crates/whipplescript-kernel/src/lib.rs`, `crates/whipplescript-cli/src/main.rs`, `crates/whipplescript-cli/tests/control_plane.rs` | Provider/harness failures and assertion failures are recorded through the store diagnostics API and listed through `whip diagnostics` after reopening the SQLite store. Terminal provider diagnostics are also embedded in `effect.terminal` events and covered by replay-derived store tests. |
+| AgentRef store enforcement | `crates/whipplescript-store/src/lib.rs`, `crates/whipplescript-kernel/src/lib.rs`, `crates/whipplescript-cli/src/main.rs` | Real compiled `agent` declarations are persisted to program versions; claimability/start-run enforce declared target/profile/capability/capacity metadata; capacity blocks now emit `effect.blocked` and set `blocked_by_capacity`. |
 | Tagged terminal checklist | `spec/expression-kernel-tracker.md` | Added implementation checklist for tagged terminal-output union branch matching. |
-| Case branch context safety | `crates/whippletree-cli/src/main.rs`, `crates/whippletree-cli/tests/control_plane.rs` | Failed guarded `Some` branches no longer leak payload bindings into later branches or fallbacks. |
-| Tagged terminal branch runtime | `crates/whippletree-parser/src/lib.rs`, `crates/whippletree-cli/src/main.rs`, `crates/whippletree-cli/tests/control_plane.rs` | Parser validates terminal-output tags inside `after ... completes`; runtime binds completed/failed terminal payload variants for deterministic case routing. |
-| Companion skill dogfood | `skills/whippletree-author/SKILL.md`, `spec/companion-skill.md`, `examples/companion-skill-dogfood.*`, `crates/whippletree-cli/tests/control_plane.rs` | Companion-skill workflow authored with one shared task schema, typed `AgentRef` reviewers, source assertions, and fixture-provider e2e coverage. |
+| Case branch context safety | `crates/whipplescript-cli/src/main.rs`, `crates/whipplescript-cli/tests/control_plane.rs` | Failed guarded `Some` branches no longer leak payload bindings into later branches or fallbacks. |
+| Tagged terminal branch runtime | `crates/whipplescript-parser/src/lib.rs`, `crates/whipplescript-cli/src/main.rs`, `crates/whipplescript-cli/tests/control_plane.rs` | Parser validates terminal-output tags inside `after ... completes`; runtime binds completed/failed terminal payload variants for deterministic case routing. |
+| Companion skill validation | `skills/whipplescript-author/SKILL.md`, `spec/companion-skill.md`, companion-skill example fixture, `crates/whipplescript-cli/tests/control_plane.rs` | Companion-skill workflow authored with one shared task schema, typed `AgentRef` reviewers, source assertions, and fixture-provider e2e coverage. |
 
 ## Current Implementation Summary
 
@@ -85,9 +85,9 @@ as complete:
 - [x] Source accepts top-level `assert` statements.
 - [x] Runtime `whip dev` evaluates assertion reports over fact/effect
   projections and exits nonzero on assertion failure.
-- [x] Provider-language dogfood asserts provider counts, agent-turn counts, and
+- [x] Provider-language validation asserts provider counts, agent-turn counts, and
   BAML coerce counts in source.
-- [x] Companion-skill dogfood asserts deterministic phase-review dispatch counts
+- [x] Companion-skill validation asserts deterministic phase-review dispatch counts
   in source without asking providers or BAML to identify route/provider/model
   identity.
 - [~] Compiler validates known field paths in guards.
@@ -226,7 +226,7 @@ as complete:
 - [x] Type-check target profile, capacity, and capability constraints.
 - [x] Reject dynamic `tell` targets that are plain strings.
 - [x] Evaluate dynamic target expressions deterministically at rule commit.
-- [x] Add provider-language dogfood coverage that routes through typed
+- [x] Add provider-language validation coverage that routes through typed
   `AgentRef` once available.
 
 ### 6. Pattern Matching And Branching
@@ -315,7 +315,7 @@ Tagged terminal-output union branch matching implementation checklist:
 - [x] Maude tests for guard false/error, optional presence, enum/literal domain
   validity, finite-domain pattern branches, optional Some/None branches,
   dynamic agent target validity, and assertion non-mutation.
-- [x] Companion-skill dogfood test that authors deterministic routing without
+- [x] Companion-skill validation test that authors deterministic routing without
   asking an LLM to identify provider/model identity.
 
 ### 8. Docs And Agent Guidance
@@ -328,7 +328,7 @@ Tagged terminal-output union branch matching implementation checklist:
   JSON/IR representation.
 - [x] Update [companion-skill.md](companion-skill.md) to recommend deterministic
   routing metadata, `AgentRef`, source assertions, and projection checks.
-- [x] Update [e2e.md](e2e.md) with expression-kernel dogfood coverage.
+- [x] Update [e2e.md](e2e.md) with expression-kernel validation coverage.
 - [x] Keep this tracker and [implementation-plan.md](implementation-plan.md)
   synchronized as features land.
 

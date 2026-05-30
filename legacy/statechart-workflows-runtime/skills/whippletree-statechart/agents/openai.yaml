@@ -1,4 +1,0 @@
-interface:
-  display_name: "Whippletree Statecharts"
-  short_description: "Author and inspect restricted Whippletree .whip workflows"
-  default_prompt: "Use $whippletree-statechart to author, validate, run, inspect, or repair Whippletree .whip statechart workflows, adapter manifests, durable events, and formal checks."

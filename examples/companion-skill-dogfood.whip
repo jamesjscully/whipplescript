@@ -1,6 +1,5 @@
 workflow CompanionSkillDogfood
 
-use skill "whippletree-author"
 
 class CompanionReviewTask {
   reviewer AgentRef<codex | claude | pi>
@@ -81,7 +80,7 @@ rule dispatch_companion_review
   when task.reviewer is available
 => {
   tell task.reviewer requires ["agent.tell"] as turn """
-  Use the whippletree-author companion skill.
+  Use the whipplescript-author companion skill.
 
   Review phase {{ task.phase }}: {{ task.title }}.
 

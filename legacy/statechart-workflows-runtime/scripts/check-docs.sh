@@ -30,9 +30,9 @@ EOF
 target/debug/whip init "$init_dir" --name DocsSmoke --json >/dev/null
 grep -q 'machine DocsSmoke' "$init_dir/workflow.whip"
 target/debug/whip validate "$init_dir/workflow.whip" --json >/dev/null
-target/debug/whip validate-policy "$init_dir/.whippletree/policy.json" --json >/dev/null
-test -d "$init_dir/.whippletree/state"
-test -d "$init_dir/.whippletree/workflows"
+target/debug/whip validate-policy "$init_dir/.whipplescript/policy.json" --json >/dev/null
+test -d "$init_dir/.whipplescript/state"
+test -d "$init_dir/.whipplescript/workflows"
 
 target/debug/whip validate \
   "$template" \
@@ -156,28 +156,28 @@ grep -q 'retry-event --event-id evt_cli_...' README.md
 grep -q 'git diff --check' .github/workflows/ci.yml
 grep -q 'git diff --check' spec/statechart-workflows/release-checklist.md
 grep -q 'whip events workflow.whip --status dead_lettered --json' \
-  skills/whippletree-statechart/SKILL.md
+  skills/whipplescript-statechart/SKILL.md
 grep -q 'whip retry-event workflow.whip --event-id evt_cli_... --json' \
-  skills/whippletree-statechart/SKILL.md
-grep -q 'events --limit' skills/whippletree-statechart/SKILL.md
-grep -q 'last_error' skills/whippletree-statechart/SKILL.md
+  skills/whipplescript-statechart/SKILL.md
+grep -q 'events --limit' skills/whipplescript-statechart/SKILL.md
+grep -q 'last_error' skills/whipplescript-statechart/SKILL.md
 grep -q 'last_error' spec/statechart-workflows/product-surface.md
 grep -q 'last_error' spec/statechart-workflows/operations.md
-grep -q 'pending_events' skills/whippletree-statechart/SKILL.md
+grep -q 'pending_events' skills/whipplescript-statechart/SKILL.md
 grep -q 'pending event count' spec/statechart-workflows/product-surface.md
 grep -q 'whip status \[file\] --compact' spec/statechart-workflows/product-surface.md
 grep -q 'status --compact' README.md
-grep -q 'status --compact' skills/whippletree-statechart/SKILL.md
+grep -q 'status --compact' skills/whipplescript-statechart/SKILL.md
 grep -q 'current_effect_failures' README.md
-grep -q 'current_effect_failures' skills/whippletree-statechart/SKILL.md
+grep -q 'current_effect_failures' skills/whipplescript-statechart/SKILL.md
 grep -q 'current_coerce_failure' README.md
-grep -q 'current_coerce_failure' skills/whippletree-statechart/SKILL.md
+grep -q 'current_coerce_failure' skills/whipplescript-statechart/SKILL.md
 grep -q 'current effect failures' spec/statechart-workflows/runtime-semantics.md
 grep -q 'current blockers' spec/statechart-workflows/runtime-semantics.md
-grep -q 'agent worker = codingAgent()' skills/whippletree-statechart/SKILL.md
-grep -q 'payload does not match schema for event' skills/whippletree-statechart/SKILL.md
+grep -q 'agent worker = codingAgent()' skills/whipplescript-statechart/SKILL.md
+grep -q 'payload does not match schema for event' skills/whipplescript-statechart/SKILL.md
 grep -q 'creating an empty workflow store' spec/statechart-workflows/operations.md
-grep -Fq 'recent_effects[].idempotency_key' skills/whippletree-statechart/SKILL.md
+grep -Fq 'recent_effects[].idempotency_key' skills/whipplescript-statechart/SKILL.md
 grep -q 'effect idempotency keys' README.md
 grep -q 'status JSON' spec/statechart-workflows/effects.md
 grep -Fq 'recent_effects[]' spec/statechart-workflows/component-contracts.md
@@ -205,7 +205,7 @@ for path in \
   spec/statechart-workflows/database-migrations.md \
   spec/statechart-workflows/release-checklist.md \
   examples/templates/README.md \
-  skills/whippletree-statechart/SKILL.md
+  skills/whipplescript-statechart/SKILL.md
 do
   test -s "$path"
 done

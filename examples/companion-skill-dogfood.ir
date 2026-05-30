@@ -1,6 +1,4 @@
 workflow CompanionSkillDogfood
-uses
-  skill whippletree-author
 schemas
   class CompanionReviewTask
     reviewer agentref<codex | claude | pi>
@@ -59,6 +57,6 @@ rules
       schema:CompanionReviewTask
     effects
       turn kind=agent.tell binding=turn key=ba85edd93a4a1658
-    body_hash 1d9329648c8e8522
+    body_hash 52338ae869c77fab
 rule_dependencies
   seed_companion_review_matrix --schema:CompanionReviewTask--> dispatch_companion_review

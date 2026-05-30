@@ -6,7 +6,7 @@ source "$ROOT/scripts/loft-fixtures-lib.sh"
 
 LOFT_REPO="${1:-}"
 SOURCE_FIXTURE_DIR="$ROOT/examples/loft-fixtures/v0.1"
-OVERWRITE="${WHIPPLETREE_OVERWRITE_LOFT_FIXTURES:-0}"
+OVERWRITE="${WHIPPLESCRIPT_OVERWRITE_LOFT_FIXTURES:-0}"
 
 if [[ -z "$LOFT_REPO" ]]; then
   echo "usage: scripts/stage-loft-fixtures.sh <local-loft-repo>" >&2
@@ -28,13 +28,13 @@ fi
 mapfile -t fixture_files < <(loft_fixture_files "$SOURCE_FIXTURE_DIR")
 
 if [[ "${#fixture_files[@]}" -eq 0 ]]; then
-  echo "Whippletree compatibility fixture manifest has no fixtures: $(loft_manifest_path "$SOURCE_FIXTURE_DIR")" >&2
+  echo "WhippleScript compatibility fixture manifest has no fixtures: $(loft_manifest_path "$SOURCE_FIXTURE_DIR")" >&2
   exit 2
 fi
 
 for fixture in "$LOFT_FIXTURE_MANIFEST" "${fixture_files[@]}"; do
   if [[ ! -f "$SOURCE_FIXTURE_DIR/$fixture" ]]; then
-    echo "Whippletree compatibility fixture is missing: $SOURCE_FIXTURE_DIR/$fixture" >&2
+    echo "WhippleScript compatibility fixture is missing: $SOURCE_FIXTURE_DIR/$fixture" >&2
     exit 2
   fi
 done
@@ -45,7 +45,7 @@ for fixture in "$LOFT_FIXTURE_MANIFEST" "${fixture_files[@]}"; do
   source="$SOURCE_FIXTURE_DIR/$fixture"
   target="$LOFT_REPO/$LOFT_FIXTURE_DIR/$fixture"
   if [[ -f "$target" && "$OVERWRITE" != "1" ]] && ! cmp -s "$source" "$target"; then
-    echo "target fixture differs; set WHIPPLETREE_OVERWRITE_LOFT_FIXTURES=1 to replace: $target" >&2
+    echo "target fixture differs; set WHIPPLESCRIPT_OVERWRITE_LOFT_FIXTURES=1 to replace: $target" >&2
     exit 2
   fi
   install -m 0644 "$source" "$target"

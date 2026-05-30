@@ -2,7 +2,7 @@
 
 Status: draft tracker
 
-This is the project tracker for the new Whippletree system. It runs from formal
+This is the project tracker for the new WhippleScript system. It runs from formal
 modeling through the last e2e acceptance tests.
 
 The plan is organized as stage gates. A stage is complete only when its
@@ -11,7 +11,7 @@ updated. Checkboxes should be updated as implementation lands.
 
 ## Product Target
 
-Whippletree v0 should provide:
+WhippleScript v0 should provide:
 
 - a restricted rule language for durable agent orchestration
 - typed facts, schemas, effect contracts, and capability profiles
@@ -38,7 +38,7 @@ Whippletree v0 should provide:
 - [ ] M5: Capability registry, skills, real agent harnesses, BAML coerce, Loft,
   human review, and observability are wired through typed effect contracts.
 - [x] M6: Static analysis and generated Maude checks protect user programs.
-- [ ] M7: E2E suite covers happy paths, failure paths, recovery, and dogfood
+- [ ] M7: E2E suite covers happy paths, failure paths, recovery, and validation
   workflows through real provider surfaces where configured.
 - [x] M8: Companion skill and release hardening make the system usable by
   coding agents without hand-holding.
@@ -90,6 +90,8 @@ Goal: validate the core execution model before and during implementation.
 - [x] Model retry, timeout, cancellation, and lease expiry outcomes.
 - [x] Add a Ralph loop model with an explicit external-event boundary.
 - [x] Add a coerce classification model with success/failure branches.
+- [x] Model `pattern` elaboration, explicit workflow `complete`/`fail`, and
+  child workflow `invoke` resolution.
 - [x] Add generated Maude checks from typed IR once the compiler exists.
 - [ ] Extend the generated per-program Maude spec from effect dependencies to
   expression-kernel behavior:
@@ -170,9 +172,9 @@ Acceptance:
 - [x] Runtime trace fixtures catch impossible lifecycle transitions.
 - [x] Generated Maude checks can be run optionally from the CLI.
 - [ ] Generated Maude checks catch intentionally broken guard-gated rule commit
-  behavior from compiled Whippletree fixtures.
+  behavior from compiled WhippleScript fixtures.
 - [ ] Generated Maude checks catch intentionally broken assertion
-  non-mutation behavior from compiled Whippletree fixtures.
+  non-mutation behavior from compiled WhippleScript fixtures.
 - [ ] Adding guard/assertion searches does not remove or weaken the existing
   generated effect dependency checks.
 
@@ -182,6 +184,15 @@ Goal: compile `.whip` source into deterministic, typed IR.
 
 - [x] Finalize v0 grammar for rules, schemas, agents, skills, capabilities,
   effects, `after` blocks, `coerce`, and record construction.
+- [ ] Finalize source-bundle grammar for `include`, root workflow selection, and
+  library files. Detailed transition work is tracked in
+  [workflow-composition-transition-tracker.md](workflow-composition-transition-tracker.md).
+- [ ] Add `pattern` declarations and `apply` expansion with hygienic generated
+  names and source provenance.
+- [ ] Add workflow input/output/failure contracts plus explicit `complete` and
+  `fail` terminal syntax.
+- [ ] Add `invoke` for durable child workflow invocation with typed terminal
+  outputs projected back to the parent.
 - [x] Choose and document the parser implementation strategy.
 - [x] Implement lexer/parser with diagnostics that preserve source spans.
 - [x] Build a recoverable parse tree suitable for formatting and helpful
@@ -338,7 +349,7 @@ Acceptance:
 
 ## Stage 6: Control Plane And CLI
 
-Goal: expose Whippletree as an inspectable system for many concurrent scripts.
+Goal: expose WhippleScript as an inspectable system for many concurrent scripts.
 
 - [x] Implement CLI crate.
 - [x] Implement commands:
@@ -436,7 +447,7 @@ Goal: wire the built-in effect families through the same contract system.
 ### Skills
 
 - [x] Implement deterministic skill registry.
-- [x] Attach skills to agents, turns, and program scopes.
+- [x] Attach skills to agents and individual turns.
 - [x] Record skill versions and source paths in evidence.
 
 ### Agent Harnesses
@@ -448,7 +459,7 @@ Goal: wire the built-in effect families through the same contract system.
 - [ ] Implement Claude adapter against the Claude Agent SDK, with API/provider
   auth, allowed-tool/profile mapping, streaming message handling, artifact
   capture, and usage capture.
-- [ ] Implement Pi adapter through the Pi extension system, with Whippletree
+- [ ] Implement Pi adapter through the Pi extension system, with WhippleScript
   effect/run correlation to Pi conversation threads, transcript/evidence export,
   and completion detection.
 - [ ] Capture provider transcripts, artifacts, exit/status, tool calls, usage,
@@ -474,11 +485,11 @@ Goal: wire the built-in effect families through the same contract system.
 - [x] Add no-mock coerce integration tests when credentials/environment are
   available.
   - `real_baml_coerce_endpoint_smoke` runs against a configured
-    `WHIPPLETREE_BAML_TEST_ENDPOINT` and function contract.
+    `WHIPPLESCRIPT_BAML_TEST_ENDPOINT` and function contract.
   - `scripts/check-real-providers.sh` requires the BAML smoke-test environment
     before claiming real-provider readiness.
   - `scripts/openai-coerce-server.mjs` provides a local BAML-compatible
-    `/coerce` bridge backed by OpenAI Structured Outputs for dogfooding.
+    `/coerce` bridge backed by OpenAI Structured Outputs for local validation.
   - `scripts/check-openai-coerce.sh` loads `OPENAI_API_KEY` from `.env`, starts
     the OpenAI bridge, and runs the no-mock Coerce smoke test through
     `HttpBamlClient`.
@@ -492,7 +503,7 @@ Goal: wire the built-in effect families through the same contract system.
     the Loft repo has tracked spec and fixture files.
   - `scripts/check-loft-source-repo.sh` centralizes the local Loft repo
     preflight used by submodule and real-provider readiness.
-  - `scripts/stage-loft-fixtures.sh` stages Whippletree's compatibility fixtures
+  - `scripts/stage-loft-fixtures.sh` stages WhippleScript's compatibility fixtures
     into a local Loft repo for review and Loft-side commit.
   - `scripts/export-loft-source-patch.sh` produces a reviewable Loft patch
     artifact for the staged spec and fixtures without committing in Loft.
@@ -516,7 +527,7 @@ Goal: wire the built-in effect families through the same contract system.
     claim/renew/release, lease-scoped mutation failures, structured evidence,
     resource intent, lifecycle complete/fail, retryable error details, and
     partial lifecycle recovery.
-  - `WHIPPLETREE_REQUIRE_LOFT_SUBMODULE_FIXTURES=1` requires the future
+  - `WHIPPLESCRIPT_REQUIRE_LOFT_SUBMODULE_FIXTURES=1` requires the future
     source-of-truth submodule fixture path and rejects local fallback fixtures.
   - `scripts/check-loft-submodule-readiness.sh` validates the future
     `vendor/loft` source-of-truth wiring end to end once the submodule exists.
@@ -589,7 +600,7 @@ Acceptance:
 - [x] Counterexamples identify the rule/effect path that caused the issue.
 - [x] Users can run normal checks without installing all formal tools.
 
-## Stage 10: Examples And Dogfood Workflows
+## Stage 10: Examples And Validation Workflows
 
 Goal: prove the language is ergonomic before we harden syntax.
 
@@ -602,24 +613,24 @@ Goal: prove the language is ergonomic before we harden syntax.
   - [x] multi-agent bounded concurrency
   - [x] OpenClaw-lite composition
   - [x] plugin memory example
-- [x] Run desire-path sessions where agents author Whippletree scripts.
+- [x] Run desire-path sessions where agents author WhippleScript scripts.
 - [x] Record common wrong guesses.
 - [x] Decide which guesses become aliases, diagnostics, or hard errors.
 - [x] Update language syntax and companion skill based on results.
-- [x] Audit Stage 10 against examples, dogfood notes, desire-path outcomes, and
+- [x] Audit Stage 10 against examples, Validation Notes, desire-path outcomes, and
   fixture coverage; record gaps for the final audit stage.
   - Examples now cover all listed Stage 10 workflow shapes and have checked IR
     snapshots.
   - CLI integration runs `whip check` across all checked examples.
   - Generated Maude model search passes for examples with effect dependencies.
-  - Dogfood guesses are recorded in `spec/examples.md`; companion authoring
+  - Validation guesses are recorded in `spec/examples.md`; companion authoring
     guidance is updated in `spec/companion-skill.md`.
   - Follow-up: guarded fact matches and source assertions now exist, but the
     full expression kernel is still tracked separately in
     `spec/expression-kernel-tracker.md`.
   - Fixed during final audit: `as binding` after a multi-line string now
     receives a targeted diagnostic.
-  - Dogfood gap: provider-language e2e now uses one shared task schema, but
+  - Validation gap: provider-language e2e now uses one shared task schema, but
     typed dynamic agent targets, static matrices, and action/template expansion
     are not implemented.
 
@@ -667,10 +678,10 @@ not be considered complete until that tracker reaches its acceptance gates.
   require BAML/model judgment.
 - [x] Rewrite `examples/provider-language-e2e.whip` to use one shared
   `LanguageTask` schema routed by typed `AgentRef`.
-- [x] Add `examples/companion-skill-dogfood.whip` to prove companion-skill
-  authored workflows can route phase-review work through typed `AgentRef`
-  metadata, source assertions, and tracker-path prompts without provider/model
-  identity classification by an LLM.
+- [x] Add a companion-skill validation fixture to prove authored workflows can
+  route phase-review work through typed `AgentRef` metadata, source assertions,
+  and tracker-path prompts without provider/model identity classification by an
+  LLM.
 - [x] Update the companion authoring skill to recommend deterministic routing
   metadata and warn against asking models to identify providers/routes.
 
@@ -715,9 +726,9 @@ Goal: test the real system from source file to provider outcome.
   and trace export; record gaps for the final audit stage.
   - Mock-provider e2e coverage runs through `scripts/check-e2e.sh`.
   - Optional real-provider prerequisites are gated by
-    `WHIPPLETREE_E2E_REAL_PROVIDERS=1` in `scripts/check-real-providers.sh`.
+    `WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1` in `scripts/check-real-providers.sh`.
   - Selected no-mock provider smoke runs are supported with
-    `WHIPPLETREE_REAL_PROVIDERS=loft`, `baml`, or `loft,baml`.
+    `WHIPPLESCRIPT_REAL_PROVIDERS=loft`, `baml`, or `loft,baml`.
   - Real-provider readiness now checks provider tools, required environment,
     Loft fixture repo cleanliness/tracked spec when Loft is selected, and
     BAML endpoint reachability when BAML is selected before any destructive flow
@@ -741,10 +752,10 @@ Acceptance:
     prerequisite tracking.
 - [x] A failed e2e run leaves artifacts useful enough to debug without
   rerunning immediately.
-- [ ] Dogfood workflow `implementation-plan-phase-review.whip` can create phase
+- [ ] validation workflow `implementation-plan-phase-review.whip` can create phase
   review facts, enqueue Codex review effects, run configured Codex threads, and
   update `spec/implementation-plan-phase-review-tracker.md`.
-- [ ] Real-provider dogfood can be run with Codex, Claude, and Pi provider
+- [ ] Real-provider validation can be run with Codex, Claude, and Pi provider
   bindings independently, with skipped providers reported as unavailable rather
   than silently passing.
 
@@ -752,7 +763,7 @@ Acceptance:
 
 Goal: make the system usable by coding agents and non-expert operators.
 
-- [x] Write first-party Whippletree companion skill.
+- [x] Write first-party WhippleScript companion skill.
 - [x] Include:
   - [x] language overview
   - [x] common workflow patterns
@@ -770,17 +781,17 @@ Goal: make the system usable by coding agents and non-expert operators.
 - [x] Add migration notes explaining why legacy systems were moved aside.
 - [x] Audit Stage 12 against the companion skill, docs, operator guidance,
   release checklist, and migration notes; record gaps for the final audit stage.
-  - Companion skill lives at `skills/whippletree-author/SKILL.md`.
+  - Companion skill lives at `skills/whipplescript-author/SKILL.md`.
   - User/operator docs live in `spec/quickstart.md`, `spec/operator-guide.md`,
     `spec/plugin-author-guide.md`, and `spec/troubleshooting.md`.
   - Release and migration docs live in `spec/release-checklist.md` and
     `spec/migration-notes.md`.
-  - Fixed during final audit: `scripts/install-whippletree-skill.sh` installs the
+  - Fixed during final audit: `scripts/install-whipplescript-skill.sh` installs the
     companion skill into a local skill directory.
 
 Acceptance:
 
-- [x] A fresh agent using the companion skill can write a valid Whippletree script.
+- [x] A fresh agent using the companion skill can write a valid WhippleScript script.
 - [x] A human can run the quickstart without reading architecture docs.
 - [x] Release checklist covers tests, formal checks, docs, and known gaps.
 
@@ -852,6 +863,6 @@ The next implementation slice should be:
 1. Resolve deferred audit gaps in `spec/final-audit.md` when their external
    prerequisites are ready.
 2. Run optional real-provider smoke tests with isolated Loft/BAML fixtures.
-3. Package the `whippletree-author` companion skill for the chosen distribution
+3. Package the `whipplescript-author` companion skill for the chosen distribution
    mechanism.
-   - Local package automation exists at `scripts/package-whippletree-skill.sh`.
+   - Local package automation exists at `scripts/package-whipplescript-skill.sh`.

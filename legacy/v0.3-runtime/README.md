@@ -1,6 +1,6 @@
-# Whippletree v0.3 Runtime
+# WhippleScript v0.3 Runtime
 
-This directory contains the previous Whippletree task/service/script runner.
+This directory contains the previous WhippleScript task/service/script runner.
 
 It has been moved out of the active workspace because the current project is
 being rebuilt around native `.whip` statechart workflows, validated

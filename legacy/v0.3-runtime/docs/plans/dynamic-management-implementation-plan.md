@@ -8,13 +8,13 @@ Primary design document:
 
 Supporting spec:
 
-- `spec/whippletree-v0.3.md`
+- `spec/whipplescript-v0.3.md`
 
 The goal of this plan is to align the implementation with the dynamic-management
-interface without turning Whippletree into a workflow engine. The implementation
+interface without turning WhippleScript into a workflow engine. The implementation
 should keep the v0.3 boundary intact:
 
-**Whippletree owns invocation truth. User code owns operational meaning.**
+**WhippleScript owns invocation truth. User code owns operational meaning.**
 
 ## Implementation Strategy
 
@@ -83,14 +83,14 @@ whip runs
 whip logs <run-id>
 whip cancel <run-id>
 whip events
-whippletree triggers
+whipplescript triggers
 whip emit <type>
 whip run <task-name>
 ```
 
 Expected implementation work:
 
-- Add command groups in `crates/whippletree-cli/src/main.rs`.
+- Add command groups in `crates/whipplescript-cli/src/main.rs`.
 - Reuse existing command implementations rather than duplicating logic.
 - Add CLI help tests and e2e smoke tests for canonical/alias equivalence.
 - Update README command examples to introduce the object model.
@@ -98,8 +98,8 @@ Expected implementation work:
 Acceptance checks:
 
 ```sh
-cargo test -p whippletree-cli --bin whip
-cargo test -p whippletree-cli --test e2e object_cli_aliases
+cargo test -p whipplescript-cli --bin whip
+cargo test -p whipplescript-cli --test e2e object_cli_aliases
 cargo test
 ```
 
@@ -147,14 +147,14 @@ Expected implementation work:
 Acceptance checks:
 
 ```sh
-cargo test -p whippletree-cli --test e2e wait_and_subscribe_agent_flow
-cargo test -p whippletree-daemon
+cargo test -p whipplescript-cli --test e2e wait_and_subscribe_agent_flow
+cargo test -p whipplescript-daemon
 cargo test
 ```
 
 ## Slice 3: Ad Hoc Tracked Runs
 
-Goal: let agents run arbitrary finite commands under Whippletree tracking without
+Goal: let agents run arbitrary finite commands under WhippleScript tracking without
 creating a task definition.
 
 Canonical command:
@@ -200,8 +200,8 @@ Expected implementation work:
 Acceptance checks:
 
 ```sh
-cargo test -p whippletree-cli --test e2e adhoc_run_is_tracked_and_cancelable
-cargo test -p whippletree-daemon
+cargo test -p whipplescript-cli --test e2e adhoc_run_is_tracked_and_cancelable
+cargo test -p whipplescript-daemon
 cargo test
 ```
 
@@ -226,7 +226,7 @@ whip lock renew <name> --token TOKEN --ttl DURATION
 whip lock release <name> --token TOKEN
 ```
 
-Tokenless release may be allowed only for the owning Whippletree run.
+Tokenless release may be allowed only for the owning WhippleScript run.
 
 Expected implementation work:
 
@@ -238,8 +238,8 @@ Expected implementation work:
 Acceptance checks:
 
 ```sh
-cargo test -p whippletree-cli --test e2e lock_recovery_and_with_lock
-cargo test -p whippletree-daemon manual_lock
+cargo test -p whipplescript-cli --test e2e lock_recovery_and_with_lock
+cargo test -p whipplescript-daemon manual_lock
 cargo test
 ```
 
@@ -271,7 +271,7 @@ Initial semantics:
 - Dynamic services are ephemeral.
 - They live until removed, daemon shutdown, or workspace reset.
 - They are inspectable and marked `dynamic: true`.
-- They do not rewrite `.whippletree/project.whip`.
+- They do not rewrite `.whipplescript/project.whip`.
 
 Expected implementation work:
 
@@ -283,8 +283,8 @@ Expected implementation work:
 Acceptance checks:
 
 ```sh
-cargo test -p whippletree-cli --test e2e dynamic_service_lifecycle
-cargo test -p whippletree-daemon
+cargo test -p whipplescript-cli --test e2e dynamic_service_lifecycle
+cargo test -p whipplescript-daemon
 cargo test
 ```
 
@@ -320,8 +320,8 @@ Expected implementation work:
 Acceptance checks:
 
 ```sh
-cargo test -p whippletree-cli --test e2e dynamic_task_event_and_watch_lifecycle
-cargo test -p whippletree-daemon
+cargo test -p whipplescript-cli --test e2e dynamic_task_event_and_watch_lifecycle
+cargo test -p whipplescript-daemon
 cargo test
 ```
 
@@ -333,14 +333,14 @@ without adding a second runtime.
 Expected SDK additions:
 
 ```ts
-whippletree.task.list()
-whippletree.task.run(name)
-whippletree.run.start(...)
-whippletree.event.emit(...)
-whippletree.wait.event(...)
-whippletree.service.add(...)
-whippletree.task.add(...)
-whippletree.lock.with(...)
+whipplescript.task.list()
+whipplescript.task.run(name)
+whipplescript.run.start(...)
+whipplescript.event.emit(...)
+whipplescript.wait.event(...)
+whipplescript.service.add(...)
+whipplescript.task.add(...)
+whipplescript.lock.with(...)
 ```
 
 Rules:
@@ -361,7 +361,7 @@ Documentation updates:
 Acceptance checks:
 
 ```sh
-npm test --workspace @whippletree/sdk
+npm test --workspace @whipplescript/sdk
 cargo test
 ```
 
@@ -374,8 +374,8 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo test --release
-cargo test -p whippletree-cli --test e2e -- --ignored sustained_stress_many_events_watch_changes_and_services
-npm test --workspace @whippletree/sdk
+cargo test -p whipplescript-cli --test e2e -- --ignored sustained_stress_many_events_watch_changes_and_services
+npm test --workspace @whipplescript/sdk
 ```
 
 Manual smoke:

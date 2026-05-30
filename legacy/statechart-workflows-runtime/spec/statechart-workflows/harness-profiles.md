@@ -4,7 +4,7 @@ Status: design proposal for the next implementation slice
 
 Harness profiles are the authority boundary for native agent execution.
 
-Whippletree workflows should describe agent intent. Harness policy should decide
+WhippleScript workflows should describe agent intent. Harness policy should decide
 what that intent is allowed to do in the current environment. This keeps
 `.whip` files portable while letting local users stay permissive and
 enterprise teams enforce stricter provider behavior.
@@ -24,7 +24,7 @@ provider authority  what the harness may launch to satisfy that request
 agent authority     what the launched agent may do after it starts
 ```
 
-Whippletree can enforce workflow and provider authority directly. Agent authority
+WhippleScript can enforce workflow and provider authority directly. Agent authority
 can be enforced only to the degree the selected provider exposes sandbox,
 permission, network, and filesystem controls, or an external sandbox wraps the
 provider.
@@ -43,7 +43,7 @@ provider.
 
 - perfectly control arbitrary LLM behavior after launch
 - make every provider expose the same sandbox flags
-- force enterprise users to accept Whippletree's default profile set
+- force enterprise users to accept WhippleScript's default profile set
 - put provider command strings in ordinary workflow source
 
 ## Profile Modes
@@ -203,7 +203,7 @@ enforcement       native | best_effort | external | native_or_best_effort
 
 Workflow authors should select profiles by intent:
 
-```whippletree
+```whipplescript
 agent researcher = codingAgent() {
   profile "research"
   maxActive 2
@@ -269,7 +269,7 @@ Providers advertise enforcement support:
 }
 ```
 
-Whippletree should not silently claim enforcement it cannot provide. When a
+WhippleScript should not silently claim enforcement it cannot provide. When a
 restriction is best-effort, the harness event should say so.
 
 ## CLI Surface
@@ -279,15 +279,15 @@ Harness commands should accept:
 ```sh
 whip harness once workflow.whip \
   --config harness.json \
-  --profile-policy .whippletree/harness-policy.json
+  --profile-policy .whipplescript/harness-policy.json
 
 whip harness run workflow.whip \
   --config harness.json \
-  --profile-policy .whippletree/harness-policy.json \
+  --profile-policy .whipplescript/harness-policy.json \
   --drive-workflow
 
 whip validate workflow.whip \
-  --profile-policy .whippletree/harness-policy.json
+  --profile-policy .whipplescript/harness-policy.json
 ```
 
 `--config` remains the concrete provider runner config for local experiments.
@@ -297,7 +297,7 @@ concepts should stay distinct: profile intent versus concrete runner details.
 
 ## Skill Guidance
 
-The Whippletree skill should teach coding agents:
+The WhippleScript skill should teach coding agents:
 
 - use `research` for internet/package/docs discovery
 - use `repo-reader` for codebase inspection without edits

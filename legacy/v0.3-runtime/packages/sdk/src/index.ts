@@ -9,7 +9,7 @@ const execFileAsync = promisify(execFile);
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
-export interface WhippletreeEvent<TPayload extends JsonValue = JsonValue> {
+export interface WhippleScriptEvent<TPayload extends JsonValue = JsonValue> {
   id?: string;
   type?: string;
   event_type: string;
@@ -105,7 +105,7 @@ export interface OverviewSnapshot {
   tasks: TaskOverview[];
   services: ServiceOverview[];
   active_runs: RunSummary[];
-  recent_events: WhippletreeEvent[];
+  recent_events: WhippleScriptEvent[];
   recent_triggers: TriggerRecord[];
   recent_failures: RunSummary[];
 }
@@ -256,7 +256,7 @@ export interface LockReleaseResult {
 
 export type StructuredLogEntry = Record<string, JsonValue>;
 
-export interface WhippletreeClientOptions {
+export interface WhippleScriptClientOptions {
   bin?: string;
   workspace?: string;
   cwd?: string;
@@ -433,13 +433,13 @@ type LockNamespace = {
   withCommand(name: string, command: string[], options: LockWithCommandOptions): Promise<LockReleaseResult>;
 };
 
-export class WhippletreeSdkError extends Error {
+export class WhippleScriptSdkError extends Error {
   readonly kind: string;
   readonly details?: Record<string, JsonValue>;
 
   constructor(kind: string, message: string, details?: Record<string, JsonValue>) {
     super(message);
-    this.name = "WhippletreeSdkError";
+    this.name = "WhippleScriptSdkError";
     this.kind = kind;
     this.details = details;
   }
@@ -450,7 +450,7 @@ function parseJson<T>(raw: string, context: string): T {
     return JSON.parse(raw) as T;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new WhippletreeSdkError("invalid_json", `failed to parse ${context}: ${message}`, {
+    throw new WhippleScriptSdkError("invalid_json", `failed to parse ${context}: ${message}`, {
       context,
       raw
     });
@@ -458,24 +458,24 @@ function parseJson<T>(raw: string, context: string): T {
 }
 
 function resolveEventJson(env: NodeJS.ProcessEnv): string {
-  const inline = env.WHIPPLETREE_EVENT_JSON ?? env.WHIPPLETREE_EVENT;
+  const inline = env.WHIPPLESCRIPT_EVENT_JSON ?? env.WHIPPLESCRIPT_EVENT;
   if (inline) {
     return inline;
   }
 
-  const path = env.WHIPPLETREE_EVENT_PATH;
+  const path = env.WHIPPLESCRIPT_EVENT_PATH;
   if (path && existsSync(path)) {
     return readFileSync(path, "utf8");
   }
 
-  throw new WhippletreeSdkError(
+  throw new WhippleScriptSdkError(
     "missing_env",
-    "missing Whippletree event payload; expected WHIPPLETREE_EVENT_JSON or WHIPPLETREE_EVENT_PATH"
+    "missing WhippleScript event payload; expected WHIPPLESCRIPT_EVENT_JSON or WHIPPLESCRIPT_EVENT_PATH"
   );
 }
 
-async function runCli<T>(args: string[], options: WhippletreeClientOptions): Promise<T> {
-  const command = options.bin ?? process.env.WHIPPLETREE_BIN ?? "whippletree";
+async function runCli<T>(args: string[], options: WhippleScriptClientOptions): Promise<T> {
+  const command = options.bin ?? process.env.WHIPPLESCRIPT_BIN ?? "whipplescript";
   const commandArgs = ["--format", "json"];
 
   if (options.workspace) {
@@ -499,7 +499,7 @@ async function runCli<T>(args: string[], options: WhippletreeClientOptions): Pro
         stderr?: string;
         message?: string;
       };
-      throw new WhippletreeSdkError("cli_failed", commandError.message ?? "whippletree CLI call failed", {
+      throw new WhippleScriptSdkError("cli_failed", commandError.message ?? "whipplescript CLI call failed", {
         command,
         args: commandArgs,
         code: commandError.code == null ? null : String(commandError.code),
@@ -509,7 +509,7 @@ async function runCli<T>(args: string[], options: WhippletreeClientOptions): Pro
     }
 
     const message = error instanceof Error ? error.message : String(error);
-    throw new WhippletreeSdkError("transport", `failed to execute ${command}: ${message}`, {
+    throw new WhippleScriptSdkError("transport", `failed to execute ${command}: ${message}`, {
       command,
       args: commandArgs
     });
@@ -534,8 +534,8 @@ function pushEnv(args: string[], env?: Record<string, string>): void {
   }
 }
 
-export class WhippletreeClient {
-  readonly options: WhippletreeClientOptions;
+export class WhippleScriptClient {
+  readonly options: WhippleScriptClientOptions;
   readonly task: {
     list: (options?: TaskListOptions) => Promise<TaskStatus[]>;
     show: (name: string) => Promise<TaskStatus>;
@@ -545,8 +545,8 @@ export class WhippletreeClient {
   };
   readonly run: RunNamespace;
   readonly event: {
-    list: (options?: EventListOptions) => Promise<WhippletreeEvent[]>;
-    show: (eventId: string) => Promise<WhippletreeEvent>;
+    list: (options?: EventListOptions) => Promise<WhippleScriptEvent[]>;
+    show: (eventId: string) => Promise<WhippleScriptEvent>;
     emit: <TPayload extends JsonValue = JsonValue>(
       eventType: string,
       payload?: TPayload,
@@ -558,7 +558,7 @@ export class WhippletreeClient {
     show: (triggerId: string) => Promise<TriggerRecord>;
   };
   readonly wait: {
-    event: (eventType: string, options: WaitEventOptions) => Promise<WhippletreeEvent>;
+    event: (eventType: string, options: WaitEventOptions) => Promise<WhippleScriptEvent>;
     run: (runId: string, options: WaitRunOptions) => Promise<RunRecord>;
     trigger: (options: WaitTriggerOptions) => Promise<TriggerRecord>;
     service: (name: string, options: WaitServiceOptions) => Promise<ServiceStatus>;
@@ -574,7 +574,7 @@ export class WhippletreeClient {
   };
   readonly lock: LockNamespace;
 
-  constructor(options: WhippletreeClientOptions = {}) {
+  constructor(options: WhippleScriptClientOptions = {}) {
     this.options = { ...options };
     this.task = {
       list: (taskOptions = {}) => this.listTasks(taskOptions),
@@ -595,7 +595,7 @@ export class WhippletreeClient {
     );
     this.event = {
       list: (eventOptions = {}) => this.listEvents(eventOptions),
-      show: (eventId) => runCli<WhippletreeEvent>(["event", "show", eventId], this.options),
+      show: (eventId) => runCli<WhippleScriptEvent>(["event", "show", eventId], this.options),
       emit: <TPayload extends JsonValue = JsonValue>(
         eventType: string,
         payload: TPayload = {} as TPayload,
@@ -823,11 +823,11 @@ export class WhippletreeClient {
     return runCli<RunRecord[]>(args, this.options);
   }
 
-  private listEvents(options: EventListOptions): Promise<WhippletreeEvent[]> {
+  private listEvents(options: EventListOptions): Promise<WhippleScriptEvent[]> {
     const args = ["event", "list"];
     const { type, ...rest } = options;
     pushOptions(args, { ...rest, type });
-    return runCli<WhippletreeEvent[]>(args, this.options);
+    return runCli<WhippleScriptEvent[]>(args, this.options);
   }
 
   private listTriggers(options: TriggerListOptions): Promise<TriggerRecord[]> {
@@ -836,10 +836,10 @@ export class WhippletreeClient {
     return runCli<TriggerRecord[]>(args, this.options);
   }
 
-  private waitEvent(eventType: string, options: WaitEventOptions): Promise<WhippletreeEvent> {
+  private waitEvent(eventType: string, options: WaitEventOptions): Promise<WhippleScriptEvent> {
     const args = ["wait", "event", eventType];
     pushOptions(args, { correlation: options.correlation, timeout: options.timeout });
-    return runCli<WhippletreeEvent>(args, this.options);
+    return runCli<WhippleScriptEvent>(args, this.options);
   }
 
   private waitTrigger(options: WaitTriggerOptions): Promise<TriggerRecord> {
@@ -884,34 +884,34 @@ export class WhippletreeClient {
   }
 }
 
-export function createWhippletree(options: WhippletreeClientOptions = {}): WhippletreeClient {
-  return new WhippletreeClient(options);
+export function createWhippleScript(options: WhippleScriptClientOptions = {}): WhippleScriptClient {
+  return new WhippleScriptClient(options);
 }
 
-export const whippletree = createWhippletree();
+export const whipplescript = createWhippleScript();
 
 export function getRunContext(env: NodeJS.ProcessEnv = process.env): RunContext {
   return {
-    kind: env.WHIPPLETREE_KIND,
-    name: env.WHIPPLETREE_NAME,
-    runId: env.WHIPPLETREE_RUN_ID,
-    runDirectory: env.WHIPPLETREE_RUN_DIR,
-    stdoutPath: env.WHIPPLETREE_STDOUT_LOG,
-    stderrPath: env.WHIPPLETREE_STDERR_LOG,
-    configVersion: env.WHIPPLETREE_CONFIG_VERSION,
-    eventId: env.WHIPPLETREE_EVENT_ID,
-    eventType: env.WHIPPLETREE_EVENT_TYPE,
-    eventJson: env.WHIPPLETREE_EVENT_JSON ?? env.WHIPPLETREE_EVENT,
-    eventPath: env.WHIPPLETREE_EVENT_PATH,
-    correlationId: env.WHIPPLETREE_CORRELATION_ID,
-    workspace: env.WHIPPLETREE_WORKSPACE ?? env.WHIPPLETREE_WORKSPACE_ROOT
+    kind: env.WHIPPLESCRIPT_KIND,
+    name: env.WHIPPLESCRIPT_NAME,
+    runId: env.WHIPPLESCRIPT_RUN_ID,
+    runDirectory: env.WHIPPLESCRIPT_RUN_DIR,
+    stdoutPath: env.WHIPPLESCRIPT_STDOUT_LOG,
+    stderrPath: env.WHIPPLESCRIPT_STDERR_LOG,
+    configVersion: env.WHIPPLESCRIPT_CONFIG_VERSION,
+    eventId: env.WHIPPLESCRIPT_EVENT_ID,
+    eventType: env.WHIPPLESCRIPT_EVENT_TYPE,
+    eventJson: env.WHIPPLESCRIPT_EVENT_JSON ?? env.WHIPPLESCRIPT_EVENT,
+    eventPath: env.WHIPPLESCRIPT_EVENT_PATH,
+    correlationId: env.WHIPPLESCRIPT_CORRELATION_ID,
+    workspace: env.WHIPPLESCRIPT_WORKSPACE ?? env.WHIPPLESCRIPT_WORKSPACE_ROOT
   };
 }
 
 export function getEvent<TPayload extends JsonValue = JsonValue>(
   env: NodeJS.ProcessEnv = process.env
-): WhippletreeEvent<TPayload> {
-  return parseJson<WhippletreeEvent<TPayload>>(resolveEventJson(env), "Whippletree event");
+): WhippleScriptEvent<TPayload> {
+  return parseJson<WhippleScriptEvent<TPayload>>(resolveEventJson(env), "WhippleScript event");
 }
 
 export function getPayload<TPayload extends JsonValue = JsonValue>(
@@ -937,55 +937,55 @@ export async function emit<TPayload extends JsonValue = JsonValue>(
   payload: TPayload = {} as TPayload,
   options: EmitOptions = {}
 ): Promise<EmitResult<TPayload>> {
-  return whippletree.emit(eventType, payload, options);
+  return whipplescript.emit(eventType, payload, options);
 }
 
 export async function run(taskName: string, options: RunOptions = {}): Promise<RunStartResult> {
-  return whippletree.run(taskName, options);
+  return whipplescript.run(taskName, options);
 }
 
 export async function status(): Promise<StatusSnapshot> {
-  return whippletree.status();
+  return whipplescript.status();
 }
 
 export async function overview(options: OverviewOptions = {}): Promise<OverviewSnapshot> {
-  return whippletree.overview(options);
+  return whipplescript.overview(options);
 }
 
 export async function tasks(): Promise<TaskStatus[]> {
-  return whippletree.tasks();
+  return whipplescript.tasks();
 }
 
 export async function services(): Promise<ServiceStatus[]> {
-  return whippletree.services();
+  return whipplescript.services();
 }
 
 export async function runs(): Promise<RunRecord[]> {
-  return whippletree.runs();
+  return whipplescript.runs();
 }
 
 export async function logs(runId: string): Promise<LogsResult> {
-  return whippletree.logs(runId);
+  return whipplescript.logs(runId);
 }
 
 export async function cancel(runId: string): Promise<CancelResult> {
-  return whippletree.cancel(runId);
+  return whipplescript.cancel(runId);
 }
 
 export async function lock(name: string, ttl?: string, reason?: string): Promise<ManualLockRecord> {
-  return whippletree.lock(name, ttl, reason);
+  return whipplescript.lock(name, ttl, reason);
 }
 
 export async function renewLock(name: string, token: string, ttl: string): Promise<ManualLockRecord> {
-  return whippletree.renewLock(name, token, ttl);
+  return whipplescript.renewLock(name, token, ttl);
 }
 
 export async function unlock(name: string, token: string): Promise<LockReleaseResult> {
-  return whippletree.unlock(name, token);
+  return whipplescript.unlock(name, token);
 }
 
 export async function locks(): Promise<ManualLockRecord[]> {
-  return whippletree.locks();
+  return whipplescript.locks();
 }
 
 export async function withLock<T>(
@@ -993,5 +993,5 @@ export async function withLock<T>(
   fn: () => Promise<T> | T,
   options: WithLockOptions = {}
 ): Promise<T> {
-  return whippletree.withLock(name, fn, options);
+  return whipplescript.withLock(name, fn, options);
 }

@@ -1,0 +1,4 @@
+interface:
+  display_name: "WhippleScript Runtime"
+  short_description: "Use WhippleScript for local agent runtime coordination"
+  default_prompt: "Use $whipplescript-runtime to configure, operate, or debug WhippleScript tasks, services, events, runs, locks, waits, and SDK integrations."

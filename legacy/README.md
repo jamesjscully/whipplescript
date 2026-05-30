@@ -1,6 +1,6 @@
-# Legacy Whippletree Work
+# Legacy WhippleScript Work
 
-This directory preserves prior Whippletree designs and implementations. They are
+This directory preserves prior WhippleScript designs and implementations. They are
 reference material, not the current product model.
 
 ## Contents

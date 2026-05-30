@@ -2,7 +2,7 @@
 
 Status: draft
 
-`coerce` is Whippletree's typed model-decision effect. It uses BAML's strengths:
+`coerce` is WhippleScript's typed model-decision effect. It uses BAML's strengths:
 typed classes/enums, prompt functions, clients, tests, and output validation.
 
 In the rule-machine design, `coerce` is not a synchronous in-transaction call.
@@ -27,7 +27,7 @@ See [type-system.md](type-system.md) for the shared boundary type system used by
 
 Possible authoring syntax:
 
-```whippletree
+```whipplescript
 class WorkClassification {
   status WorkStatus
   reason string
@@ -52,7 +52,10 @@ rule classify
 rule accept
   when classification.status is Accepted for work as item
 => {
-  complete item
+  done item -> record AcceptedWork {
+    id item.id
+    status "accepted"
+  }
 }
 ```
 
@@ -62,7 +65,7 @@ typed fact that the second rule can match.
 If another effect must use the coerce output immediately, use the execution
 contract's dependency syntax:
 
-```whippletree
+```whipplescript
 coerce classifyWork(item.summary) as classification
 
 after classification succeeds {
@@ -76,7 +79,7 @@ This lowers to durable effect dependency edges, not an inline model call.
 
 Source syntax:
 
-```whippletree
+```whipplescript
 coerce reviewWork(turn.issue.title, turn.summary, turn.changedFiles) as review
 ```
 
@@ -108,7 +111,7 @@ DeclaredReturnType
 
 If `reviewWork(...) -> WorkReview`, then inside:
 
-```whippletree
+```whipplescript
 after review succeeds {
   // review : WorkReview
 }
@@ -140,7 +143,7 @@ BamlCoerceTimedOut {
 
 Typing rules:
 
-```whippletree
+```whipplescript
 after review succeeds {
   // review : WorkReview
 }
@@ -156,11 +159,11 @@ after review completes {
 
 ## Data Operations
 
-Whippletree should keep the legacy expression rule, now formalized in
+WhippleScript should keep the legacy expression rule, now formalized in
 [type-system.md](type-system.md):
 
 ```text
-Whippletree-compatible types are schemas; they do not imply a full data language.
+WhippleScript-compatible types are schemas; they do not imply a full data language.
 ```
 
 The language may support BAML-compatible boundary types:
@@ -211,7 +214,7 @@ general user-defined functions
 ```
 
 If a workflow needs nontrivial reasoning over data, it should call a typed
-`coerce` function or registered capability. That keeps Whippletree an
+`coerce` function or registered capability. That keeps WhippleScript an
 orchestration language rather than slowly growing into a brittle half-language.
 
 Multimodal values are opaque boundary values. A workflow may pass an `image`,
@@ -220,7 +223,7 @@ schema and policy allow it, but it cannot inspect or transform the media inline.
 
 ## Generated BAML
 
-Whippletree source may define:
+WhippleScript source may define:
 
 - classes
 - enums
@@ -262,15 +265,15 @@ Current implementation:
 - `scripts/openai-coerce-server.mjs` is a local BAML-compatible `/coerce`
   bridge backed by the OpenAI Responses API. It loads `OPENAI_API_KEY` from
   `.env` or the environment, uses Structured Outputs, and defaults to
-  `gpt-5.4-mini` unless `WHIPPLETREE_OPENAI_MODEL` is set.
+  `gpt-5.4-mini` unless `WHIPPLESCRIPT_OPENAI_MODEL` is set.
 - `scripts/check-openai-coerce.sh` starts that bridge and runs the no-mock
   Coerce smoke test through the same `HttpBamlClient` path used for external
   BAML-compatible endpoints.
 - `FakeBamlClient` provides deterministic CI coverage for success and failure
   branches without credentials.
-- A no-mock smoke test runs when `WHIPPLETREE_BAML_TEST_ENDPOINT`,
-  `WHIPPLETREE_BAML_TEST_FUNCTION`, `WHIPPLETREE_BAML_TEST_ARGUMENTS_JSON`, and
-  `WHIPPLETREE_BAML_TEST_OUTPUT_TYPE` are set. `scripts/check-real-providers.sh`
+- A no-mock smoke test runs when `WHIPPLESCRIPT_BAML_TEST_ENDPOINT`,
+  `WHIPPLESCRIPT_BAML_TEST_FUNCTION`, `WHIPPLESCRIPT_BAML_TEST_ARGUMENTS_JSON`, and
+  `WHIPPLESCRIPT_BAML_TEST_OUTPUT_TYPE` are set. `scripts/check-real-providers.sh`
   requires those variables before claiming real-provider readiness.
 
 The built-in HTTP transport intentionally covers plain `http://` endpoints only.

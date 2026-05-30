@@ -29,8 +29,8 @@
     "evidence": [
       {
         "evidence_id": "evd_fixture",
-        "kind": "whippletree.trace",
-        "artifact": "artifact:whippletree/run/fixture/trace.json",
+        "kind": "whipplescript.trace",
+        "artifact": "artifact:whipplescript/run/fixture/trace.json",
         "data": {
           "exit_code": 0
         },

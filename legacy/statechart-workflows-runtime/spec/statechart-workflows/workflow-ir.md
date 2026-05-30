@@ -64,7 +64,7 @@ Workflow metadata defines the coordination boundary:
   "contracts": [
     "builder_only/orchestration/contracts/spec-implementation.contract.json"
   ],
-  "state_scope": ".whippletree/workflows/spec-implementation",
+  "state_scope": ".whipplescript/workflows/spec-implementation",
   "plan": "state/implementation-plan.json"
 }
 ```
@@ -214,7 +214,7 @@ The IR records coerce function schemas and the generated BAML artifact location:
     ],
     "output": {"type": "ref", "name": "RunClassification"},
     "model": "gpt-4o-mini",
-    "generated_baml_artifact": ".whippletree/build/workflows/SpecImplementation/baml_src/workflow.baml"
+    "generated_baml_artifact": ".whipplescript/build/workflows/SpecImplementation/baml_src/workflow.baml"
   }
 }
 ```
@@ -222,7 +222,7 @@ The IR records coerce function schemas and the generated BAML artifact location:
 The model generator treats each coerce call as nondeterministic over the output
 schema. The runtime records the concrete result returned by the model provider.
 
-Whippletree `class`, `enum`, and `coerce` declarations are source of truth.
+WhippleScript `class`, `enum`, and `coerce` declarations are source of truth.
 Generated BAML files are derived artifacts.
 
 ## Statechart
@@ -421,7 +421,7 @@ Invariants are either named built-ins or supported expressions:
 ```
 
 Invariant names must be unique across built-in and expression invariants.
-Built-in invariant names must be from Whippletree's supported built-in invariant
+Built-in invariant names must be from WhippleScript's supported built-in invariant
 set. Unsupported invariant forms fail validation.
 
 ## Source Spans

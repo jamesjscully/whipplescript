@@ -1,6 +1,6 @@
-# whippletree
+# whipplescript
 
-Whippletree is being rebuilt as a restricted statechart workflow runtime for
+WhippleScript is being rebuilt as a restricted statechart workflow runtime for
 orchestrating coding agents.
 
 The current product surface is native `.whip` workflow files, validated
@@ -16,11 +16,11 @@ code.
 New implementation work lives in these crates:
 
 ```text
-crates/whippletree-workflow   native DSL parser, IR, schemas, diagnostics, validation
-crates/whippletree-engine     durable queue/log/state and interpreter skeleton
-crates/whippletree-adapters   trusted adapter manifests and dispatchers for BAML, humans, agents, legacy bridges
-crates/whippletree-modelgen   TLA+/Apalache/Maude/Veil model generation
-crates/whippletree-cli        small workflow CLI for validate/emit/run/status/overview/events/log/build/check/model iteration
+crates/whipplescript-workflow   native DSL parser, IR, schemas, diagnostics, validation
+crates/whipplescript-engine     durable queue/log/state and interpreter skeleton
+crates/whipplescript-adapters   trusted adapter manifests and dispatchers for BAML, humans, agents, legacy bridges
+crates/whipplescript-modelgen   TLA+/Apalache/Maude/Veil model generation
+crates/whipplescript-cli        small workflow CLI for validate/emit/run/status/overview/events/log/build/check/model iteration
 ```
 
 Specs live in [`spec/statechart-workflows`](spec/statechart-workflows).
@@ -29,7 +29,7 @@ Fake adapter manifests live in [`examples/adapters`](examples/adapters).
 Example capability policies live in [`examples/policies`](examples/policies).
 Formal-model work starts in [`models/statechart-workflows`](models/statechart-workflows).
 The companion coding-agent skill lives in
-[`skills/whippletree-statechart`](skills/whippletree-statechart).
+[`skills/whipplescript-statechart`](skills/whipplescript-statechart).
 Operational repair guidance lives in
 [`spec/statechart-workflows/operations.md`](spec/statechart-workflows/operations.md);
 legacy migration notes live in
@@ -53,7 +53,7 @@ Run the active Rust workspace checks with:
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo build -p whippletree-cli
+cargo build -p whipplescript-cli
 scripts/check-docs.sh
 scripts/check-e2e.sh
 scripts/check-formal-models.sh
@@ -214,7 +214,7 @@ models, and `artifact-hashes.json` with SHA-256 hashes for reproducibility. If
 `--adapter-manifest` or `--policy` is supplied, `build` validates the workflow
 against those contracts and writes `adapter-manifests.json` and
 `policy-documents.json` bundles beside the other artifacts.
-`skills/whippletree-statechart` contains the companion skill for coding agents. It
+`skills/whipplescript-statechart` contains the companion skill for coding agents. It
 documents the restricted workflow boundary, the statechart authoring pattern,
 coerce usage, adapter manifests, debug commands, and common repairs.
 Schema validation follows BAML-style optional fields: a `?` field may be absent
@@ -223,36 +223,36 @@ or `null`, while non-optional fields must be present.
 Useful CLI examples:
 
 ```sh
-cargo run -p whippletree-cli -- validate examples/workflows/minimal.whip --json
-cargo run -p whippletree-cli -- init target/tmp/whippletree-demo --name DemoWorkflow --json
-cargo run -p whippletree-cli -- validate examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --json
-cargo run -p whippletree-cli -- validate examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --json
-cargo run -p whippletree-cli -- validate-adapter examples/adapters/spec-implementation.fake-adapter.json --json
-cargo run -p whippletree-cli -- validate-policy examples/policies/spec-implementation.enterprise-policy.json --json
-cargo run -p whippletree-cli -- emit examples/workflows/minimal.whip --event start --payload '{"message":"hello"}' --json
-cargo run -p whippletree-cli -- run examples/workflows/minimal.whip --event start --payload '{"message":"hello"}' --json
-cargo run -p whippletree-cli -- run examples/workflows/minimal.whip --json
-cargo run -p whippletree-cli -- run examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --event idle --payload '{"activeRuns":0,"unfinishedItems":1}' --fake-call-output 'plan.snapshot="W1 ready"' --fake-coerce-output 'chooseNextStep={"action":"StartWorker","workItemId":"W1","reason":"ready","message":"Implement W1"}' --json
-cargo run -p whippletree-cli -- status examples/workflows/minimal.whip --json
-cargo run -p whippletree-cli -- overview examples/workflows/minimal.whip
-cargo run -p whippletree-cli -- harness status examples/workflows/minimal.whip --json
-cargo run -p whippletree-cli -- harness once examples/workflows/minimal.whip --config harness.json --json
-cargo run -p whippletree-cli -- harness run examples/workflows/minimal.whip --config harness.json --drive-workflow --max-iterations 10 --json
-cargo run -p whippletree-cli -- events examples/workflows/minimal.whip --json
-cargo run -p whippletree-cli -- events examples/workflows/minimal.whip --status failed --json
-cargo run -p whippletree-cli -- events examples/workflows/minimal.whip --status dead_lettered --json
-cargo run -p whippletree-cli -- retry-event examples/workflows/minimal.whip --event-id evt_cli_... --json
-cargo run -p whippletree-cli -- log examples/workflows/minimal.whip --json
-cargo run -p whippletree-cli -- build examples/workflows/minimal.whip --json
-cargo run -p whippletree-cli -- build examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --json
-cargo run -p whippletree-cli -- check examples/workflows/minimal.whip --target tla --json
-cargo run -p whippletree-cli -- check examples/workflows/minimal.whip --target maude --json
-cargo run -p whippletree-cli -- check examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --target tla --json
-cargo run -p whippletree-cli -- prove examples/workflows/minimal.whip --json
-cargo run -p whippletree-cli -- emit-model examples/workflows/minimal.whip --target tla
-cargo run -p whippletree-cli -- emit-config examples/workflows/minimal.whip --target tla
-cargo run -p whippletree-cli -- emit-model examples/workflows/minimal.whip --target maude
-cargo run -p whippletree-cli -- emit-model examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --target maude
+cargo run -p whipplescript-cli -- validate examples/workflows/minimal.whip --json
+cargo run -p whipplescript-cli -- init target/tmp/whipplescript-demo --name DemoWorkflow --json
+cargo run -p whipplescript-cli -- validate examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --json
+cargo run -p whipplescript-cli -- validate examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --json
+cargo run -p whipplescript-cli -- validate-adapter examples/adapters/spec-implementation.fake-adapter.json --json
+cargo run -p whipplescript-cli -- validate-policy examples/policies/spec-implementation.enterprise-policy.json --json
+cargo run -p whipplescript-cli -- emit examples/workflows/minimal.whip --event start --payload '{"message":"hello"}' --json
+cargo run -p whipplescript-cli -- run examples/workflows/minimal.whip --event start --payload '{"message":"hello"}' --json
+cargo run -p whipplescript-cli -- run examples/workflows/minimal.whip --json
+cargo run -p whipplescript-cli -- run examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --event idle --payload '{"activeRuns":0,"unfinishedItems":1}' --fake-call-output 'plan.snapshot="W1 ready"' --fake-coerce-output 'chooseNextStep={"action":"StartWorker","workItemId":"W1","reason":"ready","message":"Implement W1"}' --json
+cargo run -p whipplescript-cli -- status examples/workflows/minimal.whip --json
+cargo run -p whipplescript-cli -- overview examples/workflows/minimal.whip
+cargo run -p whipplescript-cli -- harness status examples/workflows/minimal.whip --json
+cargo run -p whipplescript-cli -- harness once examples/workflows/minimal.whip --config harness.json --json
+cargo run -p whipplescript-cli -- harness run examples/workflows/minimal.whip --config harness.json --drive-workflow --max-iterations 10 --json
+cargo run -p whipplescript-cli -- events examples/workflows/minimal.whip --json
+cargo run -p whipplescript-cli -- events examples/workflows/minimal.whip --status failed --json
+cargo run -p whipplescript-cli -- events examples/workflows/minimal.whip --status dead_lettered --json
+cargo run -p whipplescript-cli -- retry-event examples/workflows/minimal.whip --event-id evt_cli_... --json
+cargo run -p whipplescript-cli -- log examples/workflows/minimal.whip --json
+cargo run -p whipplescript-cli -- build examples/workflows/minimal.whip --json
+cargo run -p whipplescript-cli -- build examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --json
+cargo run -p whipplescript-cli -- check examples/workflows/minimal.whip --target tla --json
+cargo run -p whipplescript-cli -- check examples/workflows/minimal.whip --target maude --json
+cargo run -p whipplescript-cli -- check examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --target tla --json
+cargo run -p whipplescript-cli -- prove examples/workflows/minimal.whip --json
+cargo run -p whipplescript-cli -- emit-model examples/workflows/minimal.whip --target tla
+cargo run -p whipplescript-cli -- emit-config examples/workflows/minimal.whip --target tla
+cargo run -p whipplescript-cli -- emit-model examples/workflows/minimal.whip --target maude
+cargo run -p whipplescript-cli -- emit-model examples/workflows/spec-implementation.whip --adapter-manifest examples/adapters/spec-implementation.fake-adapter.json --policy examples/policies/spec-implementation.enterprise-policy.json --target maude
 ```
 
 The repository smoke suite runs the maintained command set through

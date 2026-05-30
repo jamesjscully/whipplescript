@@ -2,10 +2,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPORT="${WHIPPLETREE_CODEX_SMOKE_REPORT:-$ROOT/target/codex-message-smoke-report.md}"
-EXPECTED="${WHIPPLETREE_CODEX_SMOKE_EXPECTED:-WHIPPLETREE_CODEX_SMOKE_OK}"
-PROMPT="${WHIPPLETREE_CODEX_SMOKE_PROMPT:-Reply with exactly: $EXPECTED}"
-TIMEOUT_SECONDS="${WHIPPLETREE_CODEX_SMOKE_TIMEOUT:-180}"
+REPORT="${WHIPPLESCRIPT_CODEX_SMOKE_REPORT:-$ROOT/target/codex-message-smoke-report.md}"
+EXPECTED="${WHIPPLESCRIPT_CODEX_SMOKE_EXPECTED:-WHIPPLESCRIPT_CODEX_SMOKE_OK}"
+PROMPT="${WHIPPLESCRIPT_CODEX_SMOKE_PROMPT:-Reply with exactly: $EXPECTED}"
+TIMEOUT_SECONDS="${WHIPPLESCRIPT_CODEX_SMOKE_TIMEOUT:-180}"
 
 if ! command -v codex >/dev/null 2>&1; then
   echo "missing required tool: codex" >&2
@@ -14,7 +14,7 @@ fi
 
 WORKDIR="$(mktemp -d)"
 cleanup() {
-  if [[ "${WHIPPLETREE_KEEP_CODEX_SMOKE:-}" == "1" ]]; then
+  if [[ "${WHIPPLESCRIPT_KEEP_CODEX_SMOKE:-}" == "1" ]]; then
     echo "Kept Codex smoke workspace: $WORKDIR" >&2
   else
     rm -rf "$WORKDIR"
@@ -35,12 +35,12 @@ args=(
   --output-last-message "$LAST_MESSAGE"
 )
 
-if [[ -n "${WHIPPLETREE_CODEX_MODEL:-}" ]]; then
-  args+=(-m "$WHIPPLETREE_CODEX_MODEL")
+if [[ -n "${WHIPPLESCRIPT_CODEX_MODEL:-}" ]]; then
+  args+=(-m "$WHIPPLESCRIPT_CODEX_MODEL")
 fi
 
-if [[ -n "${WHIPPLETREE_CODEX_PROFILE:-}" ]]; then
-  args+=(-p "$WHIPPLETREE_CODEX_PROFILE")
+if [[ -n "${WHIPPLESCRIPT_CODEX_PROFILE:-}" ]]; then
+  args+=(-p "$WHIPPLESCRIPT_CODEX_PROFILE")
 fi
 
 started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -64,11 +64,11 @@ if grep -q '"type":"turn.completed"' "$EVENTS_JSONL"; then
   turn_completed="yes"
 fi
 model_override="unset"
-if [[ -n "${WHIPPLETREE_CODEX_MODEL:-}" ]]; then
+if [[ -n "${WHIPPLESCRIPT_CODEX_MODEL:-}" ]]; then
   model_override="set"
 fi
 profile_override="unset"
-if [[ -n "${WHIPPLETREE_CODEX_PROFILE:-}" ]]; then
+if [[ -n "${WHIPPLESCRIPT_CODEX_PROFILE:-}" ]]; then
   profile_override="set"
 fi
 

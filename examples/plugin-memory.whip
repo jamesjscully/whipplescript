@@ -1,6 +1,6 @@
 workflow PluginMemory
 
-use plugin "memory"
+use memory
 
 agent worker {
   profile "repo-writer"

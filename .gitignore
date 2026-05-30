@@ -6,5 +6,5 @@ _apalache-out/
 .env
 .env.local
 .env.*.local
-**/.whippletree/workflows/*.sqlite
-.whippletree/*.sqlite
+**/.whipplescript/workflows/*.sqlite
+.whipplescript/*.sqlite

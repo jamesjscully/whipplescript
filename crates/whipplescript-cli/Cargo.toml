@@ -1,0 +1,25 @@
+[package]
+name = "whipplescript-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Control-plane CLI for WhippleScript workflows"
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords = ["agents", "automation", "cli", "orchestration", "workflow"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+whipplescript-core = { path = "../whipplescript-core" }
+whipplescript-kernel = { path = "../whipplescript-kernel" }
+whipplescript-parser = { path = "../whipplescript-parser" }
+whipplescript-store = { path = "../whipplescript-store" }
+serde_json = "1"
+
+[[bin]]
+name = "whip"
+path = "src/main.rs"
+
+[lints]
+workspace = true

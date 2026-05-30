@@ -14,7 +14,7 @@ The source pipeline is:
 
 ```text
 read .whip file
-lex and parse Whippletree DSL
+lex and parse WhippleScript DSL
 build parsed syntax tree with source spans
 lower BAML-shaped enum/class/coerce declarations
 normalize statechart source into WorkflowIR
@@ -26,7 +26,7 @@ optionally generate BAML artifacts and verification models
 
 Source:
 
-```whippletree
+```whipplescript
 machine implementationLoop
 initial running
 ```
@@ -77,7 +77,7 @@ final
 
 Source:
 
-```whippletree
+```whipplescript
 data {
   seenRuns string[] = []
   lastIdleNudgeAt time? = nil
@@ -118,7 +118,7 @@ uses `data`.
 
 Source:
 
-```whippletree
+```whipplescript
 agent director = thread("director")
 agent external = adapter("untie")
 agent worker = codingAgent() {
@@ -159,7 +159,7 @@ contract is loaded and policy permits it.
 
 Source:
 
-```whippletree
+```whipplescript
 capability plan = adapter("implementationPlan")
 ```
 
@@ -182,7 +182,7 @@ policy, not from arbitrary code in the workflow file.
 
 Source:
 
-```whippletree
+```whipplescript
 enum RunKind {
   WorkerComplete
   WorkerFailed
@@ -222,14 +222,14 @@ IR:
 }
 ```
 
-These declarations must be accepted by Whippletree's type checker and lowerable to
+These declarations must be accepted by WhippleScript's type checker and lowerable to
 BAML when referenced by a `coerce` declaration.
 
 ## Coerce Declarations
 
 Source:
 
-```whippletree
+```whipplescript
 coerce classifyRun(run RunSummary) -> RunClassification {
   model "gpt-4o-mini"
 
@@ -255,20 +255,20 @@ IR:
       "output": {"type": "ref", "name": "RunClassification"},
       "model": "gpt-4o-mini",
       "prompt_span": "workflow.whip:36:3",
-      "generated_baml_artifact": ".whippletree/build/workflows/implementationLoop/baml_src/classifyRun.baml"
+      "generated_baml_artifact": ".whipplescript/build/workflows/implementationLoop/baml_src/classifyRun.baml"
     }
   }
 }
 ```
 
-The compiler generates BAML from Whippletree declarations. Generated BAML artifacts
+The compiler generates BAML from WhippleScript declarations. Generated BAML artifacts
 are derived build outputs.
 
 ## Statechart Handlers
 
 Source:
 
-```whippletree
+```whipplescript
 state running {
   initial watching
 
@@ -347,7 +347,7 @@ with spans.
 
 Source:
 
-```whippletree
+```whipplescript
 let next = coerce chooseNextStep(planText)
 let classification = classifyRun(summary)
 assign data.lastIdleNudgeAt = now()
@@ -424,7 +424,7 @@ ArgList     := Expr ("," Expr)*
 `matches` is a pattern operator available in `case` arms. Guard-level glob
 matching should use the explicit `text.matchesGlob(value, pattern)` helper:
 
-```whippletree
+```whipplescript
 case run.name {
   matches "worker-*" -> { ... }
   _ -> { stay }
@@ -450,9 +450,9 @@ allowed.
 
 ## String Interpolation
 
-Whippletree strings use `{{ path }}` interpolation in v1:
+WhippleScript strings use `{{ path }}` interpolation in v1:
 
-```whippletree
+```whipplescript
 send director """
 Worker failed: {{ classification.reason }}
 """
@@ -464,7 +464,7 @@ instead of forcing a string. General expressions inside interpolation are
 deferred so message formatting does not become a second expression language.
 
 Prompt blocks inside `coerce` declarations are passed to BAML as prompt
-templates. Whippletree expression interpolation is not active inside prompt blocks;
+templates. WhippleScript expression interpolation is not active inside prompt blocks;
 BAML/Jinja owns that syntax.
 
 ## Handler Outcomes
@@ -487,13 +487,13 @@ action block. The parser rejects later statements and repeated outcomes.
 
 Supported built-in invariants may be referenced by name:
 
-```whippletree
+```whipplescript
 invariant agentCapabilitiesRespected
 ```
 
 Expression invariants must be named:
 
-```whippletree
+```whipplescript
 invariant seenRunsShapeStable {
   assert data.seenRuns == data.seenRuns
 }

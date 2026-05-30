@@ -37,7 +37,7 @@ deser-hjson parse of temporary candidate HJSON workflow fixtures
 
 These probes were run against the former HJSON-shaped workflow sketches, not
 against the current native `.whip` source files. Current `.whip` files
-are parsed only by Whippletree's native parser.
+are parsed only by WhippleScript's native parser.
 
 Correction found:
 
@@ -80,7 +80,7 @@ Confirmed:
 - BAML enums require values that start with an uppercase letter.
 - Generated TypeScript client code is produced by `baml-cli generate`.
 - `baml-cli serve --from <PATH>` is the selected v1 execution path for
-  Whippletree `coerce`, using BAML HTTP instead of generated TypeScript or the Rust
+  WhippleScript `coerce`, using BAML HTTP instead of generated TypeScript or the Rust
   SDK.
 - The Rust crate exposes a lower-level runtime surface including in-memory
   source loading, dynamic values, parsing, calls, and type builder APIs.
@@ -88,7 +88,7 @@ Confirmed:
 Direct probe:
 
 ```text
-construct BAML source equivalent to Whippletree-shaped enum/class/coerce declarations
+construct BAML source equivalent to WhippleScript-shaped enum/class/coerce declarations
 write that source into baml_src/
 run npm exec --package @boundaryml/baml@0.220.0 -- baml-cli generate
 attempt a Rust SDK probe with baml = 0.221.0
@@ -191,5 +191,5 @@ Confirmed:
 
 Not directly tested in this validation pass:
 
-- no Whippletree workflow adapter was run against a live un-tie session because the
+- no WhippleScript workflow adapter was run against a live un-tie session because the
   adapter does not exist yet.

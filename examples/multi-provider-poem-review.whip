@@ -1,6 +1,5 @@
 workflow MultiProviderPoemReview
 
-use skill "baml-coerce-user"
 
 class PoemTask {
   poet AgentRef<codex | claude | pi>

@@ -1,6 +1,4 @@
 workflow CodexPoemCoerceReview
-uses
-  skill baml-coerce-user
 schemas
   class PoemRequest
     topic string

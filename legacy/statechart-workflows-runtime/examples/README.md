@@ -16,8 +16,8 @@ surface.
 
 The examples are used by parser, validation, runtime, formal-check, and e2e
 tests. Normal CI uses deterministic fake adapter/coerce outputs; the BAML smoke
-workflow runs only when a developer opts in with `WHIPPLETREE_RUN_BAML_E2E=1` and
-`WHIPPLETREE_BAML_URL`.
+workflow runs only when a developer opts in with `WHIPPLESCRIPT_RUN_BAML_E2E=1` and
+`WHIPPLESCRIPT_BAML_URL`.
 
 ## Policies
 

@@ -1,0 +1,25 @@
+[package]
+name = "whipplescript-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "whip"
+path = "src/main.rs"
+
+[dependencies]
+whipplescript-adapters = { path = "../whipplescript-adapters" }
+whipplescript-engine = { path = "../whipplescript-engine" }
+whipplescript-modelgen = { path = "../whipplescript-modelgen" }
+whipplescript-workflow = { path = "../whipplescript-workflow" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile.workspace = true

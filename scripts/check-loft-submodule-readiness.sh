@@ -62,7 +62,7 @@ if [[ "$missing" -ne 0 ]]; then
   exit 2
 fi
 
-WHIPPLETREE_REQUIRE_LOFT_SUBMODULE_FIXTURES=1 \
+WHIPPLESCRIPT_REQUIRE_LOFT_SUBMODULE_FIXTURES=1 \
   "$ROOT/scripts/check-loft-fixtures.sh"
 
-echo "Loft submodule is ready as Whippletree source of truth: $TARGET"
+echo "Loft submodule is ready as WhippleScript source of truth: $TARGET"

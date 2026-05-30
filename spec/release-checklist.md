@@ -43,10 +43,10 @@ Result: passed.
 Additional release checks:
 
 ```text
-cargo run -q -p whippletree-cli -- doctor
-cargo run -q -p whippletree-cli -- check --model-search examples/*.whip
+cargo run -q -p whipplescript-cli -- doctor
+cargo run -q -p whipplescript-cli -- check --model-search examples/*.whip
 scripts/check-loft-fixtures.sh
-WHIPPLETREE_REQUIRE_LOFT_SUBMODULE_FIXTURES=1 scripts/check-loft-fixtures.sh
+WHIPPLESCRIPT_REQUIRE_LOFT_SUBMODULE_FIXTURES=1 scripts/check-loft-fixtures.sh
 scripts/stage-loft-fixtures.sh <temp-loft-repo>
 scripts/export-loft-source-patch.sh <temp-loft-repo>
 scripts/loft-handoff-report.sh <temp-loft-repo>
@@ -79,12 +79,12 @@ and `target/loft-handoff-report.md` as the `readiness-reports` artifact.
 
 `scripts/check-release-readiness.sh` writes
 `target/release-readiness-report.md` by default. Set
-`WHIPPLETREE_RELEASE_READINESS_FULL=1` for the full local verification suite and
-`WHIPPLETREE_RELEASE_STRICT_EXTERNAL=1` when Loft submodule and real-provider
+`WHIPPLESCRIPT_RELEASE_READINESS_FULL=1` for the full local verification suite and
+`WHIPPLESCRIPT_RELEASE_STRICT_EXTERNAL=1` when Loft submodule and real-provider
 prerequisites should fail the readiness command.
 
 Real-provider readiness now also fails explicitly when provider tools,
-`WHIPPLETREE_LOFT_TEST_ISSUE`, `WHIPPLETREE_BAML_TEST_ENDPOINT`, BAML endpoint
+`WHIPPLESCRIPT_LOFT_TEST_ISSUE`, `WHIPPLESCRIPT_BAML_TEST_ENDPOINT`, BAML endpoint
 reachability, BAML smoke-test function metadata, tracked Loft spec/fixture
 files, or a clean Loft fixture repo are missing. Selected provider smoke runs
-can be scoped with `WHIPPLETREE_REAL_PROVIDERS=loft`, `baml`, or `loft,baml`.
+can be scoped with `WHIPPLESCRIPT_REAL_PROVIDERS=loft`, `baml`, or `loft,baml`.

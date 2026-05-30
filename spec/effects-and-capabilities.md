@@ -2,7 +2,7 @@
 
 Status: draft
 
-Effects are the only way Whippletree interacts with external systems. Capabilities
+Effects are the only way WhippleScript interacts with external systems. Capabilities
 define which effects a program may request and how the runtime may execute
 them.
 
@@ -110,7 +110,7 @@ after x completes  x has a tagged terminal-output union
 
 The language can make effects feel direct:
 
-```whippletree
+```whipplescript
 tell worker "Implement this work item."
 coerce classify(result.summary) as classification
 askHuman "This task is blocked. What should happen?"
@@ -155,14 +155,14 @@ network = "allowed"
 allowed_capabilities = []
 ```
 
-The same Whippletree program can run in different environments if all required
+The same WhippleScript program can run in different environments if all required
 capabilities and profiles are satisfied.
 
 ## Script Declarations
 
 A source program should be explicit about non-built-in authority:
 
-```whippletree
+```whipplescript
 requires capability issueTracker
 
 agent worker {
@@ -202,7 +202,7 @@ Provider selection belongs in environment policy. The language names intent.
 
 ## Enforcement
 
-Whippletree must not claim stronger enforcement than a provider can supply.
+WhippleScript must not claim stronger enforcement than a provider can supply.
 
 Each provider binding reports:
 

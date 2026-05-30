@@ -2,7 +2,7 @@
 
 Status: draft
 
-This directory holds formal and semi-formal models for the new Whippletree kernel.
+This directory holds formal and semi-formal models for the new WhippleScript kernel.
 
 The split is intentional:
 
