@@ -1,0 +1,36 @@
+workflow RevisionFixture {
+  input ticket TicketInput
+  output result RevisionResult
+  failure error RevisionFailure
+
+  class TicketInput {
+    title string
+  }
+
+  class RevisionResult {
+    summary string
+  }
+
+  class RevisionFailure {
+    reason string
+  }
+
+  class WorkItem {
+    title string
+    status string?
+    priority int?
+  }
+
+  class AuditTrail {
+    note string
+  }
+
+  rule seed_v2
+    when started
+  => {
+    record WorkItem {
+      title "seed"
+      priority 1
+    }
+  }
+}

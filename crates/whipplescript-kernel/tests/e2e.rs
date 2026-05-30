@@ -11,8 +11,8 @@ use whipplescript_kernel::{
 };
 use whipplescript_parser::compile_program;
 use whipplescript_store::{
-    EffectCompletion, NewEffect, NewEffectDependency, NewFact, RuleCommit, RunStart, SqliteStore,
-    StoreError,
+    EffectCompletion, NewEffect, NewEffectDependency, NewFact, ProgramVersionRecord,
+    RevisionActivation, RuleCommit, RunStart, SqliteStore, StoreError,
 };
 
 #[test]
@@ -807,6 +807,198 @@ fn e2e_repeated_dependency_claimability_stress() {
     }
 }
 
+#[test]
+fn e2e_revision_keep_preserves_running_old_effect_and_changes_future_dispatch() {
+    let (mut kernel, instance_id, version1, version2) = revision_kernel("RevisionKeepE2E");
+    commit_single_effect(
+        &mut kernel,
+        &instance_id,
+        effect("old-turn", "agent.tell", r#"{"prompt":"old dispatch"}"#),
+        "old_dispatch",
+    );
+    kernel
+        .start_run(RunStart {
+            instance_id: &instance_id,
+            effect_id: "old-turn",
+            run_id: "run-old-turn",
+            provider: "mock-agent",
+            worker_id: "worker-1",
+            lease_id: "lease-old-turn",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        })
+        .expect("old turn starts");
+
+    kernel
+        .activate_revision(RevisionActivation {
+            instance_id: &instance_id,
+            from_version_id: &version1.version_id,
+            to_version_id: &version2.version_id,
+            activation_policy_json: r#"{"test":"keep"}"#,
+            cancellation_policy: "keep",
+            idempotency_key: Some("e2e-revision-keep"),
+        })
+        .expect("revision activates");
+    kernel
+        .complete_run(EffectCompletion {
+            instance_id: &instance_id,
+            effect_id: "old-turn",
+            run_id: "run-old-turn",
+            provider: "mock-agent",
+            worker_id: "worker-1",
+            status: "ignored",
+            exit_code: Some(0),
+            summary: Some("old dispatch completed"),
+            metadata_json: "{}",
+            idempotency_key: Some("complete-old-turn"),
+        })
+        .expect("old turn completes after revision");
+    commit_single_effect(
+        &mut kernel,
+        &instance_id,
+        effect("new-turn", "agent.tell", r#"{"prompt":"new dispatch"}"#),
+        "new_dispatch",
+    );
+
+    assert_e2e_trace("revision-keep", &kernel);
+    let store = kernel.into_store();
+    let effects = store.list_effects(&instance_id).expect("effects list");
+    let old = effects
+        .iter()
+        .find(|effect| effect.effect_id == "old-turn")
+        .expect("old effect exists");
+    let new = effects
+        .iter()
+        .find(|effect| effect.effect_id == "new-turn")
+        .expect("new effect exists");
+    assert_eq!(
+        old.program_version_id.as_deref(),
+        Some(version1.version_id.as_str())
+    );
+    assert_eq!(old.revision_epoch, 0);
+    assert_eq!(
+        new.program_version_id.as_deref(),
+        Some(version2.version_id.as_str())
+    );
+    assert_eq!(new.revision_epoch, 1);
+}
+
+#[test]
+fn e2e_revision_queued_cancel_terminal_cancels_old_effects() {
+    let (mut kernel, instance_id, version1, version2) = revision_kernel("RevisionQueuedE2E");
+    let effects = [
+        effect("queued-turn", "agent.tell", r#"{"prompt":"queued"}"#),
+        effect("after-cancel", "agent.tell", r#"{"prompt":"after"}"#),
+    ];
+    let dependencies = [dependency(
+        "dep-queued-after",
+        "queued-turn",
+        "completes",
+        "after-cancel",
+    )];
+    kernel
+        .commit_rule(RuleCommit {
+            instance_id: &instance_id,
+            rule: "queued_dispatch",
+            trigger_event_id: None,
+            facts: &[],
+            consumed_fact_ids: &[],
+            effects: &effects,
+            dependencies: &dependencies,
+            terminal: None,
+            idempotency_key: Some("commit-queued-revision"),
+        })
+        .expect("queued effects commit");
+
+    kernel
+        .activate_revision(RevisionActivation {
+            instance_id: &instance_id,
+            from_version_id: &version1.version_id,
+            to_version_id: &version2.version_id,
+            activation_policy_json: r#"{"test":"queued"}"#,
+            cancellation_policy: "queued",
+            idempotency_key: Some("e2e-revision-queued"),
+        })
+        .expect("queued revision activates");
+
+    assert_e2e_trace("revision-queued-cancel", &kernel);
+    let store = kernel.into_store();
+    let effects = store.list_effects(&instance_id).expect("effects list");
+    let queued = effects
+        .iter()
+        .find(|effect| effect.effect_id == "queued-turn")
+        .expect("queued effect exists");
+    let after = effects
+        .iter()
+        .find(|effect| effect.effect_id == "after-cancel")
+        .expect("downstream effect exists");
+    assert_eq!(queued.status, "cancelled");
+    assert_eq!(after.status, "cancelled");
+}
+
+#[test]
+fn e2e_revision_running_cancel_request_allows_late_terminal() {
+    let (mut kernel, instance_id, version1, version2) = revision_kernel("RevisionRunningE2E");
+    commit_single_effect(
+        &mut kernel,
+        &instance_id,
+        effect("running-turn", "agent.tell", r#"{"prompt":"running"}"#),
+        "running_dispatch",
+    );
+    kernel
+        .start_run(RunStart {
+            instance_id: &instance_id,
+            effect_id: "running-turn",
+            run_id: "run-running-turn",
+            provider: "mock-agent",
+            worker_id: "worker-1",
+            lease_id: "lease-running-turn",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        })
+        .expect("running turn starts");
+
+    kernel
+        .activate_revision(RevisionActivation {
+            instance_id: &instance_id,
+            from_version_id: &version1.version_id,
+            to_version_id: &version2.version_id,
+            activation_policy_json: r#"{"test":"running"}"#,
+            cancellation_policy: "running",
+            idempotency_key: Some("e2e-revision-running"),
+        })
+        .expect("running revision activates");
+    kernel
+        .fail_run(EffectCompletion {
+            instance_id: &instance_id,
+            effect_id: "running-turn",
+            run_id: "run-running-turn",
+            provider: "mock-agent",
+            worker_id: "worker-1",
+            status: "ignored",
+            exit_code: Some(1),
+            summary: Some("provider observed cancellation request"),
+            metadata_json: "{}",
+            idempotency_key: Some("fail-running-turn"),
+        })
+        .expect("running turn fails after cancellation request");
+
+    assert_e2e_trace("revision-running-cancel-request", &kernel);
+    let store = kernel.into_store();
+    let effects = store.list_effects(&instance_id).expect("effects list");
+    let running = effects
+        .iter()
+        .find(|effect| effect.effect_id == "running-turn")
+        .expect("running effect exists");
+    assert_eq!(running.status, "failed");
+    assert!(!running.cancel_requested);
+    let requests = store
+        .list_effect_cancellation_requests(&instance_id)
+        .expect("cancellation requests list");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].status, "terminal");
+}
+
 fn kernel_from_source(name: &str, source: &str) -> (RuntimeKernel, String) {
     let compiled = compile_program(source);
     assert_eq!(compiled.diagnostics, Vec::new());
@@ -826,6 +1018,54 @@ fn kernel_from_source(name: &str, source: &str) -> (RuntimeKernel, String) {
         .create_instance(&version, "{}")
         .expect("instance creates");
     (kernel, instance_id)
+}
+
+fn revision_kernel(
+    name: &str,
+) -> (
+    RuntimeKernel,
+    String,
+    ProgramVersionRecord,
+    ProgramVersionRecord,
+) {
+    let store = SqliteStore::open_in_memory().expect("store opens");
+    let mut kernel = RuntimeKernel::new(store);
+    let version1 = revision_program_version(&mut kernel, name, "v1");
+    let version2 = revision_program_version(&mut kernel, name, "v2");
+    let instance_id = kernel
+        .create_instance(&version1, "{}")
+        .expect("instance creates");
+    (kernel, instance_id, version1, version2)
+}
+
+fn revision_program_version(
+    kernel: &mut RuntimeKernel,
+    workflow_name: &str,
+    label: &str,
+) -> ProgramVersionRecord {
+    let source = format!(
+        r#"
+workflow {workflow_name}
+
+rule {label}_noop
+=> {{
+}}
+"#
+    );
+    let compiled = compile_program(&source);
+    assert_eq!(compiled.diagnostics, Vec::new());
+    let ir = compiled.ir.expect("revision source compiles");
+    kernel
+        .create_program_version_for_program(
+            ProgramVersionInput {
+                program_name: &ir.workflow,
+                source_hash: &format!("{label}-source"),
+                ir_hash: &format!("{label}-ir"),
+                compiler_version: "e2e",
+            },
+            &ir,
+        )
+        .expect("revision program version creates")
 }
 
 fn commit_single_effect(

@@ -9677,6 +9677,54 @@ workflow ReviewPhase {
     }
 
     #[test]
+    fn revision_fixture_bundles_compile_with_expected_contract_shapes() {
+        let compatible_v1 =
+            compile_program(include_str!("../fixtures/revision-compatible-v1.whip"));
+        let compatible_v2 =
+            compile_program(include_str!("../fixtures/revision-compatible-v2.whip"));
+        let incompatible_v2 =
+            compile_program(include_str!("../fixtures/revision-incompatible-v2.whip"));
+        for compiled in [&compatible_v1, &compatible_v2, &incompatible_v2] {
+            assert_eq!(compiled.diagnostics, Vec::new());
+        }
+        let compatible_v1 = compatible_v1.ir.expect("compatible v1 compiles");
+        let compatible_v2 = compatible_v2.ir.expect("compatible v2 compiles");
+        let incompatible_v2 = incompatible_v2.ir.expect("incompatible v2 compiles");
+
+        assert_eq!(compatible_v1.workflow, "RevisionFixture");
+        assert_eq!(compatible_v2.workflow, "RevisionFixture");
+        assert_eq!(incompatible_v2.workflow, "RevisionFixture");
+        assert_eq!(
+            compatible_v1
+                .workflow_contracts
+                .iter()
+                .map(|contract| (&contract.kind, contract.name.as_str(), &contract.ty))
+                .collect::<Vec<_>>(),
+            compatible_v2
+                .workflow_contracts
+                .iter()
+                .map(|contract| (&contract.kind, contract.name.as_str(), &contract.ty))
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(
+            compatible_v1
+                .workflow_contracts
+                .iter()
+                .map(|contract| (&contract.kind, contract.name.as_str(), &contract.ty))
+                .collect::<Vec<_>>(),
+            incompatible_v2
+                .workflow_contracts
+                .iter()
+                .map(|contract| (&contract.kind, contract.name.as_str(), &contract.ty))
+                .collect::<Vec<_>>()
+        );
+        assert!(compatible_v2
+            .schemas
+            .iter()
+            .any(|schema| matches!(schema, IrSchema::Class(class) if class.name == "AuditTrail")));
+    }
+
+    #[test]
     fn expands_pattern_applications_with_hygienic_names() {
         let source = r#"
 pattern Review<Input> {

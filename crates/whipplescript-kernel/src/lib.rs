@@ -20,8 +20,8 @@ use whipplescript_store::{
     ArtifactRecord, ClaimableEffect, DerivedFact, EffectCancellation, EffectCompletion,
     EvidenceRecord, ExpiredLease, InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent,
     NewFact, NewInboxItem, NewInstance, NewProgramVersion, ProgramVersionRecord, RetryEffect,
-    RuleCommit, RunStart, SkillEvidence, SqliteStore, StoreError, StoreResult, StoredEvent,
-    TerminalDiagnosticRecord,
+    RevisionActivation, RuleCommit, RunStart, SkillEvidence, SqliteStore, StoreError, StoreResult,
+    StoredEvent, TerminalDiagnosticRecord, WorkflowRevisionView,
 };
 
 pub struct RuntimeKernel {
@@ -262,6 +262,38 @@ impl RuntimeKernel {
             self.emit(TraceEvent::DependencyCreated(dependency_edge(dependency)));
         }
         Ok(event)
+    }
+
+    pub fn activate_revision(
+        &mut self,
+        activation: RevisionActivation<'_>,
+    ) -> StoreResult<WorkflowRevisionView> {
+        let impact = self
+            .store
+            .revision_cancellation_impact(activation.instance_id, activation.cancellation_policy)?;
+        let revision = self.store.activate_revision(activation)?;
+        self.emit(TraceEvent::RevisionActivated {
+            revision_id: revision.revision_id.clone(),
+            from_version_id: revision.from_version_id.clone(),
+            to_version_id: revision.to_version_id.clone(),
+            from_epoch: impact.active_revision_epoch,
+            to_epoch: revision.epoch,
+            cancellation_policy: impact.cancellation_policy,
+            terminal_cancel_effects: impact.terminal_cancel_effects.clone(),
+            request_cancel_effects: impact.request_cancel_effects.clone(),
+        });
+        for effect_id in impact.terminal_cancel_effects {
+            self.emit(TraceEvent::EffectCancelled { effect_id });
+        }
+        for effect_id in impact.request_cancel_effects {
+            self.emit(TraceEvent::EffectCancellationRequested {
+                effect_id,
+                revision_id: Some(revision.revision_id.clone()),
+                reason: Some("workflow revision".to_owned()),
+                requested_by: "workflow.revision".to_owned(),
+            });
+        }
+        Ok(revision)
     }
 
     pub fn claimable_effects(&self, instance_id: &str) -> StoreResult<Vec<ClaimableEffect>> {

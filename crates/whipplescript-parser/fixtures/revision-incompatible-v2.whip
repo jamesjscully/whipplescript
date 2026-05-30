@@ -1,0 +1,31 @@
+workflow RevisionFixture {
+  input ticket TicketInput
+  output result ChangedRevisionResult
+  failure error RevisionFailure
+
+  class TicketInput {
+    title string
+  }
+
+  class ChangedRevisionResult {
+    summary int
+  }
+
+  class RevisionFailure {
+    reason string
+  }
+
+  class WorkItem {
+    title int
+    status string
+  }
+
+  rule seed_incompatible
+    when started
+  => {
+    record WorkItem {
+      title 1
+      status "changed"
+    }
+  }
+}

@@ -585,16 +585,16 @@ Stage 6 partial audit notes:
 Goal: cover the feature through deterministic tests before real-provider
 validation.
 
-- [ ] Add parser/compiler fixtures for revision-compatible and
+- [x] Add parser/compiler fixtures for revision-compatible and
   revision-incompatible source bundles.
-- [ ] Add store/kernel unit tests:
-  - [ ] activation creates revision row and event
-  - [ ] terminal instances reject activation
-  - [ ] old effect attribution is stable
-  - [ ] queued cancellation is idempotent
-  - [ ] running cancellation request is idempotent
-  - [ ] recovery preserves active revision
-- [ ] Add CLI tests:
+- [x] Add store/kernel unit tests:
+  - [x] activation creates revision row and event
+  - [x] terminal instances reject activation
+  - [x] old effect attribution is stable
+  - [x] queued cancellation is idempotent
+  - [x] running cancellation request is idempotent
+  - [x] recovery preserves active revision
+- [x] Add CLI tests:
   - [x] dry-run compatible
   - [x] dry-run incompatible
   - [x] activation with `--cancel keep`
@@ -602,9 +602,9 @@ validation.
   - [x] activation with `--cancel running`
   - [x] status/trace JSON after revision
 - [ ] Add e2e workflows:
-  - [ ] v1 starts an agent turn, v2 changes future dispatch
-  - [ ] v1 queued effect is cancelled during revision
-  - [ ] v1 running effect receives cancel request and later completes/fails
+  - [x] v1 starts an agent turn, v2 changes future dispatch
+  - [x] v1 queued effect is cancelled during revision
+  - [x] v1 running effect receives cancel request and later completes/fails
   - [ ] parent invokes child, parent revises while child is running
   - [ ] child revises independently and parent observes terminal output
 - [x] Add generated Maude fixture from a revision-aware compiled example.
@@ -613,10 +613,26 @@ validation.
 
 Acceptance:
 
-- [ ] `cargo test --workspace` covers revision happy and failure paths.
-- [ ] `scripts/check-formal-models.sh` covers revision.
+- [x] `cargo test --workspace` covers revision happy and failure paths.
+- [x] `scripts/check-formal-models.sh` covers revision.
 - [ ] Deterministic fixture-provider e2e covers keep, queued-cancel, and
   running-cancel-request policies.
+
+Stage 7 partial audit notes:
+
+- Store/kernel unit coverage now includes revision activation, terminal-instance
+  rejection, stable old-effect attribution, idempotent queued/running
+  cancellation, and projection rebuild across active revision state.
+- Parser/compiler fixture coverage now keeps revision-compatible v1/v2 bundles
+  and a revision-incompatible v2 bundle compiling while asserting the expected
+  contract shape difference.
+- CLI coverage now includes dry-run compatible/incompatible, keep/queued/running
+  activation policies, status/trace JSON, diagnostics, and evidence links.
+- Kernel e2e coverage now exercises keep-policy old running work, queued
+  cancellation, and running cancellation requests with late provider terminal
+  completion/failure under trace conformance.
+- `scripts/check-formal-models.sh` passed with the revision-aware Maude checks
+  and TLA+/Apalache lifecycle model enabled.
 
 ## Stage 8: Docs, Examples, And validation
 
