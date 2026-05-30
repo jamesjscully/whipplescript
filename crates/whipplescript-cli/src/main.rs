@@ -8657,6 +8657,16 @@ fn revision_report_json(
         "compatibility": revision_compatibility_to_json(compatibility),
         "cancellation": revision_cancellation_impact_to_json(impact),
         "agent_impact": revision_agent_impact_to_json(agent_impact),
+        "would_create": revision_would_create_to_json(
+            dry_run,
+            revise_options,
+            ir,
+            source_hash,
+            ir_hash,
+            compatibility,
+            impact,
+            agent_impact
+        ),
         "would_activate": dry_run && compatibility.compatible,
         "revision": revision.map(workflow_revision_to_json),
         "next": revision.map(|revision| {
@@ -8744,6 +8754,12 @@ fn emit_revision_report(
         "agent_impact removed_agents_affecting_effects={}",
         agent_impact.removed_agents_affecting_effects.len()
     );
+    if dry_run {
+        println!(
+            "would_create diagnostics={} evidence=1",
+            compatibility.diagnostics.len()
+        );
+    }
     for removed in &agent_impact.removed_agents_affecting_effects {
         println!(
             "removed_agent {} effect={} status={} version={} epoch={}",
@@ -8758,6 +8774,65 @@ fn emit_revision_report(
         println!("diagnostic {}: {}", diagnostic.code, diagnostic.message);
     }
     ExitCode::SUCCESS
+}
+
+fn revision_would_create_to_json(
+    dry_run: bool,
+    revise_options: &ReviseOptions,
+    ir: &IrProgram,
+    source_hash: &str,
+    ir_hash: &str,
+    compatibility: &RevisionCompatibilityReport,
+    impact: &RevisionCancellationImpact,
+    agent_impact: &RevisionAgentImpact,
+) -> Value {
+    if !dry_run {
+        return json!({
+            "diagnostics": [],
+            "evidence": [],
+        });
+    }
+
+    json!({
+        "diagnostics": compatibility
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                json!({
+                    "severity": "error",
+                    "code": diagnostic.code,
+                    "message": diagnostic.message,
+                    "source_span": diagnostic.source_span_json.as_deref().map(json_from_str),
+                    "subject": diagnostic.subject,
+                    "subject_type": "revision",
+                    "subject_id": revise_options.instance_id,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "evidence": [
+            {
+                "kind": "workflow.revision.dry_run",
+                "subject_type": "instance",
+                "subject_id": revise_options.instance_id,
+                "summary": if compatibility.compatible {
+                    "revision dry-run compatible"
+                } else {
+                    "revision dry-run blocked"
+                },
+                "metadata": {
+                    "source_path": display_path(&revise_options.program_path),
+                    "root_workflow": ir.workflow,
+                    "candidate_source_hash": source_hash,
+                    "candidate_version_hash": ir_hash,
+                    "compatible": compatibility.compatible,
+                    "cancellation_policy": impact.cancellation_policy,
+                    "terminal_cancel_count": impact.terminal_cancel_effects.len(),
+                    "request_cancel_count": impact.request_cancel_effects.len(),
+                    "removed_agent_impact_count": agent_impact.removed_agents_affecting_effects.len(),
+                },
+            }
+        ],
+    })
 }
 
 fn inbox_item_to_json(item: &InboxItemView) -> Value {

@@ -384,18 +384,18 @@ Goal: expose revision as an explicit operator action with a safe dry-run path.
   - [x] compatibility status
   - [x] impacted effects by status and version
   - [x] cancellation actions that would be taken
-  - [ ] diagnostics/evidence that would be created
+  - [x] diagnostics/evidence that would be created
 - [x] Make activation report:
   - [x] revision id/epoch
   - [x] old/new version ids
   - [x] cancellation summary
   - [x] next recommended command
-- [ ] Require explicit confirmation flags for future destructive policies if
+- [x] Require explicit confirmation flags for future destructive policies if
   additional policy levels are introduced.
 - [x] Update `whip status --json` with active revision and revision history.
 - [x] Update `whip trace` with revision activation and cancellation-request
   records.
-- [ ] Audit Stage 4 against CLI UX, JSON stability, status readability, and
+- [x] Audit Stage 4 against CLI UX, JSON stability, status readability, and
   operator failure modes; record missing surfaces.
 
 Stage 4 partial audit notes:
@@ -409,9 +409,23 @@ Stage 4 partial audit notes:
 - JSON output includes compatibility diagnostics, active version/epoch,
   candidate hashes, terminal-cancel/request-cancel effect lists, and activation
   details.
+- Dry-run JSON now includes a `would_create` preview with planned compatibility
+  diagnostics and a deterministic revision dry-run evidence record summarizing
+  the candidate source, compatibility result, cancellation policy, and impact
+  counts without mutating the store.
 - `whip trace --check --json` now reconstructs abstract revision activation and
   cancellation-request records from the event log, including revision ids,
   version ids, epoch transitions, cancellation policy, and requested effects.
+- Stage 4 audit result: complete for the current CLI surface. The JSON report
+  is additive and stable for dry-runs and activations, status exposes active
+  revision/history without opening SQLite, and text output keeps the operator
+  path concise with counts plus next command guidance.
+- Confirmation flags are deferred to the first policy beyond the current
+  explicit `--cancel keep|queued|running` set. Unknown policies are rejected
+  today; future broader destructive policies must add a dedicated confirmation
+  flag before activation is allowed.
+- Non-blocking missing surface: dry-run diagnostics/evidence are previewed but
+  intentionally not persisted, preserving the dry-run non-mutation guarantee.
 
 Acceptance:
 

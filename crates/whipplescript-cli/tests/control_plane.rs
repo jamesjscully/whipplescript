@@ -461,6 +461,25 @@ rule noop_v2
             .and_then(Value::as_bool),
         Some(true)
     );
+    assert_eq!(
+        report
+            .pointer("/would_create/diagnostics")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        report
+            .pointer("/would_create/evidence/0/kind")
+            .and_then(Value::as_str),
+        Some("workflow.revision.dry_run")
+    );
+    assert_eq!(
+        report
+            .pointer("/would_create/evidence/0/metadata/compatible")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
 
     let status = run_json(
         bin,
@@ -1532,6 +1551,23 @@ workflow RevisionSpan {
     assert_eq!(
         schema.pointer("/source_span/start").and_then(Value::as_u64),
         Some(v2_source.find("class WorkItem").expect("class offset") as u64)
+    );
+    let planned_diagnostics = report
+        .pointer("/would_create/diagnostics")
+        .and_then(Value::as_array)
+        .expect("planned diagnostics");
+    assert!(planned_diagnostics.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(Value::as_str) == Some("revision.contract_changed")
+            && diagnostic
+                .pointer("/source_span/construct")
+                .and_then(Value::as_str)
+                == Some("workflow_contract")
+    }));
+    assert_eq!(
+        report
+            .pointer("/would_create/evidence/0/metadata/compatible")
+            .and_then(Value::as_bool),
+        Some(false)
     );
 
     let _ = fs::remove_file(store_path);
