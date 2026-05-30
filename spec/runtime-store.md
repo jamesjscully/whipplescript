@@ -12,10 +12,13 @@ SQLite-specific behavior beyond transactional durability and useful indexes.
 programs
 program_versions
 instances
+instance_revisions
 events
 facts
 effects
 effect_dependencies
+workflow_invocations
+effect_cancellation_requests
 runs
 artifacts
 evidence
@@ -35,6 +38,8 @@ correlation to reconstruct a local trace:
 instance_id
 program_id?
 program_version_id?
+revision_id?
+revision_epoch?
 causation_id?
 correlation_id?
 idempotency_key?
@@ -72,7 +77,8 @@ Required fields:
 ```text
 instance_id
 program_id
-version_id
+version_id                 # active program-version cache
+active_revision_epoch
 status
 created_at
 started_at
@@ -82,6 +88,39 @@ input_json
 last_event_id?
 last_error?
 ```
+
+`instances.version_id` is a denormalized cache of the active program version.
+The canonical append-only revision history lives in `instance_revisions`.
+
+## Instance Revisions
+
+Every instance starts at revision epoch `0`, which points at the program version
+used at start. A later workflow revision appends another row with the next
+monotonic epoch and updates the instance active-version cache.
+
+Required fields:
+
+```text
+revision_id
+instance_id
+epoch
+from_version_id?
+to_version_id
+activated_by_event_id?
+activation_policy_json
+cancellation_policy          # keep | cancel_queued | request_running
+status                       # active | superseded | rejected
+requester?
+reason?
+created_at
+activated_at?
+diagnostic_ids?
+evidence_ids?
+```
+
+The `(instance_id, epoch)` pair is unique. Replaying revision activation events
+must reconstruct the same active epoch, active version, diagnostics, evidence,
+and cancellation requests.
 
 ## Events
 
@@ -141,6 +180,20 @@ Assertion payloads must include `assertion_id`, `assertion_text`, `result`,
 `message`, `diagnostic_ids`, `evidence_ids`, `correlation_id`, and
 `idempotency_key`.
 
+Revision events use:
+
+```text
+revision.activated
+effect.cancel_requested
+```
+
+`revision.activated` payloads must include `revision_id`, `instance_id`,
+`from_version_id`, `to_version_id`, `revision_epoch`, `cancellation_policy`,
+`diagnostic_ids`, `evidence_ids`, `correlation_id`, and `idempotency_key`.
+`effect.cancel_requested` payloads must include `cancellation_request_id`,
+`effect_id`, `revision_id`, `revision_epoch`, `reason`, `diagnostic_ids`,
+`evidence_ids`, `correlation_id`, and `idempotency_key`.
+
 ## Facts
 
 Facts are the current materialized state:
@@ -148,6 +201,8 @@ Facts are the current materialized state:
 ```text
 fact_id
 instance_id
+program_version_id?
+revision_epoch?
 name
 key
 value_json
@@ -177,12 +232,17 @@ Effects are durable outbox records:
 ```text
 effect_id
 instance_id
+program_version_id
+revision_epoch
 kind
 target
+resolved_target_json?
+resolved_provider_binding_id?
 input_json
 status
 created_by_rule
 created_by_event_id?
+source_span?
 correlation_id
 idempotency_key
 required_capabilities
@@ -207,6 +267,42 @@ blocked_by_policy
 
 The store may compute `claimable` from `queued` effects whose dependencies,
 policy checks, retry windows, and capacity constraints are satisfied.
+
+Effects created before a workflow revision keep their original
+`program_version_id`, `revision_epoch`, resolved target, provider binding,
+profile, and capability attribution. New effects created after revision use the
+active program version and revision epoch at rule-commit time.
+
+## Effect Cancellation Requests
+
+Running cancellation is represented as a separate durable request rather than a
+terminal effect status. Status views may display `cancel_requested`, but the
+effect's terminal status remains one of the normal terminal outcomes.
+
+Required fields:
+
+```text
+cancellation_request_id
+effect_id
+instance_id
+revision_id
+revision_epoch
+requested_by_event_id
+requester?
+reason?
+idempotency_key
+status                       # requested | acknowledged | ignored | terminal_seen
+created_at
+acknowledged_at?
+terminal_event_id?
+diagnostic_ids?
+evidence_ids?
+```
+
+`idempotency_key` is unique for the effect/revision pair. Replaying recovery
+must not create duplicate cancellation requests or convert a request into a
+terminal `effect.cancelled` event without provider, harness, timeout, or
+recovery evidence.
 
 ## Effect Dependencies
 
@@ -233,6 +329,39 @@ completes
 Source order never creates dependency edges. Edges exist only when the source
 program expresses dependency, such as an `after` block.
 
+## Workflow Invocations
+
+Workflow invocations are durable parent-to-child links created by
+`workflow.invoke` effects.
+
+Required fields:
+
+```text
+invocation_id
+parent_instance_id
+parent_effect_id
+parent_program_version_id
+parent_revision_epoch
+child_instance_id?
+child_program_version_id?
+child_revision_epoch?
+target_workflow
+input_json
+status
+terminal_event_id?
+source_span?
+correlation_id?
+idempotency_key?
+created_at
+updated_at
+```
+
+Parent and child instances may revise independently. The invocation row
+preserves the parent effect's original program version and revision epoch, and
+links to the child instance's starting version/epoch when the child is created.
+Revision does not rewrite invocation links or project child terminal state more
+than once.
+
 ## Runs
 
 A run is one provider attempt to execute an effect:
@@ -241,6 +370,8 @@ A run is one provider attempt to execute an effect:
 run_id
 effect_id
 instance_id
+program_version_id
+revision_epoch
 provider
 worker_id
 status
@@ -327,6 +458,8 @@ human_answered
 policy_blocked
 provider_failure
 assertion_result
+workflow_revision
+cancellation_request
 diagnostic_link
 source_span_link
 ```
@@ -421,6 +554,23 @@ derive completion/failure facts when applicable
 If any part of this transaction fails, the run remains recoverable and the
 worker must not report completion out of band.
 
+Workflow revision activation is atomic at the store boundary:
+
+```text
+append revision activation event
+insert instance revision row
+update instance active-version cache
+record compatibility diagnostics
+record evidence links
+terminal-cancel queued/blocked/claimable old-version effects when requested
+insert cancellation requests for claimed/running old-version effects when requested
+```
+
+If any part of revision activation fails, no active-version change,
+terminal-cancel, or cancellation request from that activation may persist.
+`whip revise --dry-run` uses the same compatibility and impact analysis but
+must not write events, rows, diagnostics, evidence, or effect state.
+
 ## Recovery
 
 On startup, the control plane recovers:
@@ -429,6 +579,8 @@ On startup, the control plane recovers:
 - instances with unprocessed events
 - provider runs that exited without recorded completion
 - diagnostics for failed rule commits
+- active revision caches from revision activation events
+- effect cancellation requests and terminal cancellation idempotency
 
 Recovery must not duplicate effects with the same idempotency key.
 It also must not duplicate provider terminal events, assertion result events,
@@ -436,3 +588,8 @@ diagnostics, evidence links, artifacts, or derived facts when their
 idempotency/correlation keys already exist. Retrying a provider effect must
 reuse the original effect idempotency key for external de-duplication and create
 a distinct run idempotency key for the new attempt.
+
+Recovery must preserve revision event order. It must not let an old-version rule
+commit create new effects after a later revision epoch is active. It must also
+preserve old-version effect attribution when those effects complete after a
+revision.

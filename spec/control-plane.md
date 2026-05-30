@@ -2,28 +2,32 @@
 
 Status: draft
 
-Whippletree runs many workflow instances concurrently. A `.whip` source file is
+WhippleScript runs many workflow instances concurrently. A `.whip` source file is
 not itself a process. It compiles into a versioned program, and each execution is
 a durable instance managed by the local or hosted control plane.
 
 ## Core Objects
 
 ```text
-Program       compiled source plus version hash
-Instance      one durable running copy of a program
-Event         append-only observation for an instance
-Fact          current materialized truth for an instance
-Effect        durable request for external work
-EffectEdge    durable dependency between two effects
-Run           provider execution attempt for an effect
-Capability    registered external authority or effect surface
-Profile       policy bundle for agent/tool authority
-Runtime       daemon/control-plane process
-Artifact      durable file/log/output associated with a run
-Evidence      causal record linking events, rules, effects, runs, and artifacts
-Skill         deterministic context bundle for an agent or turn
-Plugin        package-provided effect/fact-schema/resource extension
-InboxItem     pending human review request
+Program              compiled source plus version hash
+Instance             one durable running copy of a program
+Invocation           durable parent-to-child workflow request
+WorkflowRevision     append-only activation record for changing one running instance to a new program version
+RevisionEpoch        monotonic active-program epoch for one instance
+Event                append-only observation for an instance
+Fact                 current materialized truth for an instance
+Effect               durable request for external work
+EffectEdge           durable dependency between two effects
+Run                  provider execution attempt for an effect
+CancellationRequest  durable request to stop or terminal-cancel old-version work
+Capability           registered external authority or effect surface
+Profile              policy bundle for agent/tool authority
+Runtime              daemon/control-plane process
+Artifact             durable file/log/output associated with a run
+Evidence             causal record linking events, rules, effects, runs, and artifacts
+Skill                deterministic context bundle for an agent or turn
+Plugin               package-provided effect/fact-schema/resource extension
+InboxItem            pending human review request
 ```
 
 Every object that belongs to a running workflow is namespaced by:
@@ -46,15 +50,36 @@ A compiled program records:
 - source hash
 - compiler version
 - generated IR hash
+- included source bundle members
+- pattern applications and their generated declaration provenance
+- workflow input/output/failure contract
+- imported/invokable workflow contracts
 - declared capabilities
 - declared profiles
-- declared skills
+- declared agent skills
 - declared fact/event schemas
 - analysis results
 - optional generated verification artifacts
 - optional generated BAML artifacts
 
 Deploying a program does not run it. Starting creates an instance.
+
+## Source Bundle And Root Selection
+
+The compiler treats a source bundle as an include closure plus one selected root
+workflow. A file may contain reusable top-level declarations such as schemas,
+coerces, patterns, and invokable workflow declarations. A bundle is deployable
+only when exactly one root workflow is selected. If more than one workflow
+declaration is visible, the deploy/start command must name the root workflow.
+
+Top-level `pattern` declarations are compile-time building blocks. `apply`
+elaborates them into ordinary rules/schemas/effects before runtime. The compiled
+program records source provenance for generated declarations so traces can point
+back to both the application site and the pattern definition.
+
+Top-level `workflow` declarations are runtime contracts. A root workflow starts
+an instance directly. An imported workflow can be invoked by another workflow,
+which creates a child instance or equivalent durable invocation record.
 
 ## Instance Lifecycle
 
@@ -84,6 +109,76 @@ Pausing an instance means:
 Stopping or cancelling an instance appends an event and transitions the
 instance into a terminal control-plane state. It does not delete the log.
 
+`complete` and `fail` are workflow terminal actions. They append terminal
+workflow events, validate the declared output/failure payload, and transition
+the instance to `completed` or `failed`. A workflow can record intermediate
+facts forever; it becomes terminal only through `complete`, `fail`, cancellation,
+or control-plane policy.
+
+For child invocations, a terminal child event resolves the parent's invocation
+effect/result with the declared output or failure payload. Parent workflows do
+not inspect child-local facts or rules except through declared contracts,
+evidence, events, and artifacts.
+
+## Workflow Revision
+
+Workflow revision is a control-plane operation for adapting a non-terminal
+running instance to a new compiled program version. It is distinct from source
+language composition:
+
+```text
+apply   = compile-time pattern expansion
+invoke  = runtime child workflow invocation
+revise  = control-plane activation of a new program version for one instance
+```
+
+Ordinary workflow rules cannot activate a revision. They may produce patch
+proposal artifacts, ask for human approval, call validation plugins, coerce a
+typed decision, tell an agent to prepare a change, or invoke a child workflow
+that produces a proposed source bundle. The active program changes only through
+`whip revise` or an authorized control-plane API.
+
+Revision activation is append-only and inspectable. A successful activation:
+
+- validates a candidate source bundle and selected root workflow
+- creates a new `WorkflowRevision` with the next `RevisionEpoch`
+- links the previous active program version to the new program version
+- appends a revision activation event with diagnostics and evidence
+- makes future rule stepping use the new active revision epoch
+- preserves attribution for all existing events, facts, effects, runs,
+  invocations, evidence, and diagnostics
+
+Revision is allowed only for non-terminal instances. Completed, failed, and
+cancelled instances cannot be revised; a future retry/reopen feature must create
+a new instance or another explicit control-plane object.
+
+Compatibility checks are part of the revision dry-run and activation path:
+
+- the selected root workflow name must match the active instance root unless a
+  future explicit retarget operation is designed
+- the candidate input contract must accept the already-started instance input
+- output and failure contracts must remain compatible for parent invocations
+- active facts read by candidate rules or schemas must typecheck, or activation
+  must fail with a clear diagnostic
+- old effects keep their resolved targets, provider bindings, profiles,
+  capabilities, source spans, and version attribution even if the candidate
+  program removes the declaration that originally produced them
+
+Revision activation accepts an explicit cancellation policy for old-version
+effects:
+
+```text
+keep             do not cancel old-version effects
+cancel queued    terminal-cancel queued, blocked, and claimable old-version effects
+request running  cancel queued old-version effects and request cancellation for claimed/running effects
+```
+
+Queued/blocked/claimable effects can be terminal-cancelled by the control plane
+because no provider work is in flight. Claimed or running effects receive a
+durable `CancellationRequest`; they become terminal only after provider/harness
+confirmation, timeout, or recovery. Revision must not fabricate a terminal
+provider result for work that already crossed the provider boundary.
+
 ## CLI Shape
 
 Target local CLI:
@@ -105,6 +200,10 @@ whip pause <instance>
 whip resume <instance>
 whip stop <instance>
 whip emit <instance> event.type --json payload.json
+whip revise <instance> workflow.whip --root Workflow --dry-run
+whip revise <instance> workflow.whip --root Workflow --cancel keep
+whip revise <instance> workflow.whip --root Workflow --cancel queued
+whip revise <instance> workflow.whip --root Workflow --cancel running
 
 whip plugins
 whip skills
@@ -113,11 +212,18 @@ whip trace <instance>
 whip evidence <run-or-effect>
 ```
 
-`whip dev` is a convenience command for dogfooding. It should compile,
+`whip status --json <instance>` includes workflow invocation links when the
+instance is either a parent or child in a durable invocation. Parent instances
+expose `workflow_invocations.children[]`; child instances expose
+`workflow_invocations.parent`. Each link includes the parent instance/effect,
+child instance, target workflow, invocation input, source span when available,
+and creation time.
+
+`whip dev` is a convenience command for local validation. It should compile,
 start one instance, run local effect workers, and stream useful status.
 
 `whip run` may create and start an instance without driving it. The control
-plane still needs an explicit driving surface for local dogfooding:
+plane still needs an explicit driving surface for local validation:
 
 ```sh
 whip step <instance> --program workflow.whip
@@ -130,6 +236,10 @@ and effect rewrites transactionally, and stop before running external effects.
 `whip worker` should claim already-materialized effects and execute configured
 providers. `whip dev` may compose those loops for an operator-facing
 single-command experience.
+
+For production stepping, the compiled IR comes from the instance's active
+revision epoch. A development override may exist for local experiments, but it
+must be named explicitly and must not silently revise a running instance.
 
 ## Driver Semantics
 
@@ -162,6 +272,12 @@ state, it should:
 
 `whip step` must never execute providers. It only creates durable facts and
 outbox effects.
+
+Cron and heartbeat jobs are control-plane observations, not hidden source-level
+loops. A local daemon, hosted scheduler, or test fixture may append a durable
+timer/tick event, and workflow rules should turn that observation into ordinary
+facts or effects. This keeps recurring work replayable and inspectable while
+leaving scheduling policy outside the rule evaluator.
 
 Rule readiness includes pure guard evaluation. For a rule with `when Class as
 binding where <expr>`, the stepper must bind candidate facts first, evaluate the
@@ -256,7 +372,7 @@ be idempotent: the same terminal event idempotency key cannot create duplicate
 terminal events, duplicate completion facts, or duplicate external side-effect
 acknowledgements.
 
-`whip dev` composes `step` and `worker` for one local dogfood session. It should
+`whip dev` composes `step` and `worker` for one local validation session. It should
 stream status, stop at idle/blocked/terminal states, and make every provider
 decision visible in the store.
 
@@ -279,9 +395,12 @@ claim issue with loft       -> loft.claim effect
 askHuman ...                -> human.ask effect
 call plugin.capability ...  -> capability.call effect
 emit event                  -> event.emit effect
+invoke Workflow             -> workflow.invoke effect or child invocation record
 after effect succeeds       -> dependency edge
 after effect succeeds as x  -> dependency edge with terminal-output alias
 then effect/done            -> success-chain sugar over after blocks
+complete output             -> workflow.completed terminal event
+fail failure                -> workflow.failed terminal event
 matrix rows                 -> typed fact records
 action/template expansion   -> ordinary facts/effects before commit
 assert expression           -> read-only assertion result
@@ -358,7 +477,7 @@ may be committed by the assertion. Re-running the same assertion against the
 same program version, instance sequence, and read set must produce the same
 idempotency key so recovery does not duplicate assertion diagnostics.
 
-Dogfood acceptance for this layer:
+Validation acceptance for this layer:
 
 ```text
 whip dev examples/implementation-plan-phase-review.whip --provider codex --until idle

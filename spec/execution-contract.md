@@ -9,10 +9,36 @@ The key rule:
 
 ```text
 rules enqueue durable effect graphs; effects never run inline
+patterns elaborate before runtime; workflows complete explicitly
 ```
 
 An effect graph is still part of the outbox model. It is not a second workflow
 language and not a hidden callback system.
+
+## Program Fragments And Runtime Boundaries
+
+WhippleScript keeps compile-time composition separate from runtime execution:
+
+```text
+include -> source bundle composition
+apply   -> pattern elaboration into first-order rules/effects
+invoke  -> durable child workflow invocation
+revise  -> control-plane activation of a new program version for one instance
+```
+
+`pattern` applications must be fully elaborated before runtime. The kernel sees
+ordinary first-order rules, facts, effects, dependencies, and assertions with
+source provenance back to the pattern definition and application site.
+
+`workflow` declarations are runtime boundaries. Invoking a workflow starts a
+child instance or records an equivalent durable invocation. The parent observes
+typed terminal output; it does not inline the child's rules or inspect the
+child's private projection.
+
+Revision is not a source-level construct and is not available in rule bodies.
+Rules may produce ordinary patch proposals through effects, artifacts, events,
+human review requests, typed model decisions, or child workflow invocations.
+Only the control plane can activate a proposed revision.
 
 ## Rule Commit
 
@@ -23,6 +49,7 @@ consume/update facts
 produce facts
 append derived events
 enqueue an effect graph
+complete or fail the current workflow instance
 record diagnostics/evidence
 advance the instance cursor
 ```
@@ -31,6 +58,17 @@ Provider execution is never part of the rule commit.
 
 If validation fails, no facts, events, effects, evidence, or diagnostics from
 that rule commit are persisted.
+
+If `complete` or `fail` appears in a rule commit, terminal validation is part of
+the same atomic commit. The workflow terminal event, terminal output/failure
+payload, and any facts/effects produced by that rule either persist together or
+not at all. A completed or failed instance cannot later commit more effectful
+rules unless a future explicit reopen/retry control-plane operation creates a
+new instance.
+
+Revision activation is not a rule commit. It has its own control-plane
+transaction boundary and cannot be smuggled into `record`, `emit`, `call`,
+`tell`, `coerce`, `askHuman`, `invoke`, `complete`, or `fail`.
 
 Fact records and effect graph nodes produced by the same rule commit share
 correlation metadata. This lets later rules match typed relationships such as
@@ -67,7 +105,7 @@ Source order does not imply effect ordering.
 
 This is unordered:
 
-```whippletree
+```whipplescript
 => {
   loft.note "Starting work"
   tell worker "Implement the issue"
@@ -76,7 +114,7 @@ This is unordered:
 
 If ordering matters, the source must express it:
 
-```whippletree
+```whipplescript
 => {
   claim issue with loft as claim
 
@@ -140,7 +178,7 @@ predicate is satisfied.
 
 Allowed:
 
-```whippletree
+```whipplescript
 claim issue with loft as claim
 after claim succeeds {
   tell worker "{{ claim.issue.title }}"
@@ -149,7 +187,7 @@ after claim succeeds {
 
 Rejected:
 
-```whippletree
+```whipplescript
 claim issue with loft as claim
 tell worker "{{ claim.issue.title }}"
 ```
@@ -179,7 +217,7 @@ fields available on `claim` come from the `loft.claim` success contract.
 
 Effect graphs may branch:
 
-```whippletree
+```whipplescript
 coerce classifyWork(result.summary) as classification
 
 after classification succeeds {
@@ -198,7 +236,7 @@ Effect graph joins are not part of v0.
 To wait for multiple external results, let completions produce facts/events and
 write a normal rule:
 
-```whippletree
+```whipplescript
 rule synthesize
   when research result from alpha
   when research result from beta
@@ -243,6 +281,66 @@ human.answer.received
 Domain-specific facts should be produced by rules unless a core effect contract
 explicitly defines them.
 
+## Workflow Completion Events
+
+Workflow completion is explicit. Intermediate facts never imply that an instance
+is done. A rule must execute one of the declared terminal operations:
+
+```text
+complete <output-name> <payload>
+fail <failure-name> <payload>
+```
+
+Successful completion appends:
+
+```text
+workflow.completed
+```
+
+Failure completion appends:
+
+```text
+workflow.failed
+```
+
+The payload must validate against the workflow's declared `output` or `failure`
+contract. Terminal events must include the workflow name, instance id, program
+version, terminal declaration name, payload type, payload value, source rule, and
+source span.
+
+If the instance is a child invocation, terminal workflow events are projected
+back to the parent as the terminal output of the invocation:
+
+```text
+workflow.invoke.succeeded
+workflow.invoke.failed
+workflow.invoke.timed_out
+workflow.invoke.cancelled
+```
+
+The parent may branch with ordinary dependency syntax:
+
+```whipplescript
+invoke ReviewPhase { phase request } as review
+
+after review succeeds as result {
+  record ReviewAccepted { result result }
+}
+
+after review fails as failure {
+  record ReviewBlocked { reason failure.reason }
+}
+```
+
+The parent observes only the declared child output/failure payload plus standard
+instance metadata. Child-local facts, rules, and helper declarations remain
+private.
+
+The `after invoke succeeds as result` alias binds the declared output payload
+directly. Standard instance metadata stays in the event/evidence model rather
+than being mixed into the output value unless the workflow contract explicitly
+includes it.
+
 Provider and harness failures are event-stream data, not side-channel logs.
 After an effect is claimed, each failed provider boundary must either append a
 terminal event or leave enough lease state for recovery to retry that append.
@@ -262,6 +360,68 @@ effect state with diagnostics and evidence. Examples include missing provider
 configuration, missing credentials, insufficient native enforcement, or no
 healthy provider binding. These are distinct from provider runtime failures
 because no provider turn was attempted.
+
+## Revision Activation And Cancellation
+
+Revision activation changes the active program version for one running instance
+without rewriting prior history. The dry-run path must compile the candidate
+program, run compatibility analysis, compute impacted old-version effects, and
+return diagnostics without mutating the store.
+
+Activation is one atomic control-plane transaction:
+
+```text
+verify instance is non-terminal
+verify candidate root and contracts are compatible
+append revision activation event
+insert instance revision row with next epoch
+update the instance active-version cache
+record diagnostics and evidence
+apply the requested cancellation policy to impacted old-version effects
+```
+
+If any activation step fails, the active program version and all effect states
+remain unchanged. The activation event and `WorkflowRevision` row are the causal
+source for any terminal cancellation or cancellation request created by the
+same transaction.
+
+After activation, deterministic rule stepping must use only rules from the
+active revision epoch. A rule commit is valid only when the program version and
+revision epoch used to evaluate the rule still match the instance's active
+revision at commit time. If another revision wins the race, the stale rule
+commit is rejected and may be retried against the new active version.
+
+Effects and invocations created before activation keep their original
+`program_version_id`, `revision_epoch`, source span, resolved target, provider
+binding, profile, and capability attribution. They may still complete after the
+revision. Their terminal events remain attributed to the old effect and old
+program version even when the instance's active revision has advanced.
+
+Cancellation policies have different terminal semantics:
+
+```text
+keep             no old-version effects are changed
+cancel queued    queued, blocked, and claimable old-version effects receive effect.cancelled terminal events
+request running  queued effects are cancelled; claimed/running effects receive cancellation requests
+```
+
+Queued, blocked, and claimable effects have not crossed a provider boundary, so
+the control plane may terminal-cancel them immediately. Claimed and running
+effects have crossed or may have crossed a provider boundary, so revision only
+creates a durable cancellation request. A requested cancellation is not a
+terminal outcome. The effect becomes terminal only when the provider/harness
+acknowledges cancellation, completes, fails, times out, or recovery determines a
+real terminal state.
+
+A late provider completion after a cancellation request records the real
+terminal outcome at most once. Recovery must not turn a request into a fake
+`effect.cancelled` event merely because a revision requested cancellation.
+
+Child workflow invocations preserve their parent/child links across revision.
+Revising the parent does not revise or terminate the child. Revising the child
+does not rewrite the parent invocation effect. Parent observation of child
+success, failure, timeout, or cancellation remains a single-shot terminal
+projection through the invocation effect.
 
 ## Rule Advancement Loop
 
@@ -294,6 +454,7 @@ Every effect node has a stable idempotency key derived from:
 ```text
 instance_id
 program_version
+revision_epoch
 rule_name
 trigger_event_id or consumed_fact_keys
 effect_path_in_graph

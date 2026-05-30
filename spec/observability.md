@@ -2,7 +2,7 @@
 
 Status: draft
 
-Whippletree must be inspectable. Agent orchestration is only useful if users can
+WhippleScript must be inspectable. Agent orchestration is only useful if users can
 understand why work started, what authority it used, what it observed, and why
 it stopped.
 
@@ -30,6 +30,8 @@ capability decision
 skill/context injection
 assertion result
 provider failure
+workflow revision
+cancellation request
 ```
 
 Every external effect should produce an evidence trail even when it fails.
@@ -65,6 +67,8 @@ thoth_verify
 memory_query
 memory_result
 patch
+revision_report
+cancellation_report
 test_output
 human_answer
 failure_transcript
@@ -81,6 +85,10 @@ Suggested span hierarchy:
 
 ```text
 instance
+  revision activation
+    compatibility diagnostics
+    cancellation impact
+    cancellation request
   event processing
     rule firing
       fact record
@@ -100,6 +108,8 @@ Required correlation fields:
 ```text
 instance_id
 program_version
+revision_id
+revision_epoch
 event_id
 rule_name
 effect_id
@@ -136,6 +146,10 @@ assertion evaluated
 assertion passed
 assertion failed
 assertion errored
+revision dry-run evaluated
+revision activated
+old-version effect terminal-cancelled
+old-version effect cancellation requested
 terminal event appended
 projection advanced
 ```
@@ -167,6 +181,18 @@ read set, result event, diagnostic, and optional compact actual/expected JSON.
 records evaluator/type/missing-data errors. Neither result may be represented
 only as process exit status or stderr.
 
+Revision evidence links the activation event, revision id/epoch, old and new
+program versions, compatibility diagnostics, candidate source-bundle identity,
+selected root workflow, cancellation policy, impacted effects, and any
+terminal-cancel or cancellation-request records created by the activation.
+Dry-run evidence, when persisted as an operator artifact, must be clearly marked
+non-mutating and must not be confused with an activation event.
+
+Cancellation request evidence links the request event, effect, active run or
+lease when present, provider/harness acknowledgement when available, and the
+eventual terminal outcome. A cancellation request is evidence of intent to stop
+work, not evidence that the effect has reached a terminal cancellation state.
+
 ## Export Shape
 
 The first implementation should store evidence locally, but avoid painting
@@ -187,7 +213,7 @@ source of truth for v0 because it must work offline and inside local agent
 sandboxes.
 
 Current implementation exports a local JSON trace with schema
-`whippletree.local_trace.v0` through:
+`whipplescript.local_trace.v0` through:
 
 ```sh
 whip trace <instance> --json
@@ -205,9 +231,12 @@ sections:
 schema
 instance
 program_version
+revisions
 events
 facts
 effects
+workflow_invocations
+effect_cancellation_requests
 runs
 artifacts
 diagnostics
@@ -221,6 +250,11 @@ present. Provider failure records must expose structured startup/auth/tool/
 transport/timeout details rather than flattening them into a message string.
 Assertion pass/fail/error records must expose assertion id, source span, read
 set, result, diagnostics, and evidence links.
+Revision records must expose revision id, epoch, old/new program versions,
+activation event, cancellation policy, compatibility diagnostics, cancellation
+impact, and linked evidence. Effects and runs must include their
+`program_version_id` and `revision_epoch` so an operator can distinguish old
+work completing after a revision from work created by the active version.
 
 Trace export is read-only and idempotent. Re-running `whip trace <instance>
 --json` over an unchanged store must produce the same logical records and stable
@@ -240,6 +274,9 @@ what Loft issues are claimed?
 what recent failures/blockers exist?
 what capabilities or policies blocked work?
 what evidence changed since last view?
+which revision is active?
+which version/epoch created this effect or run?
+which effects were cancelled or requested to cancel by revision?
 ```
 
 Target commands:
@@ -262,7 +299,16 @@ pending inbox items
 recent capability blocks
 recent Loft claims
 recent evidence summaries
+active revision plus recent revision history
+cancellation requests with terminal outcome when known
 ```
+
+`whip status --json <instance>` must include the active revision epoch, active
+program version, revision history, and a cancellation summary. `whip trace
+<instance> --json` must include revision activation and cancellation-request
+records in event order so trace conformance can reject impossible sequences such
+as old-version rule commits after activation or fabricated terminal
+cancellation for running effects.
 
 ## Open Question
 
