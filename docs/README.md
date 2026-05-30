@@ -52,6 +52,7 @@ Use these words consistently in docs, examples, and diagnostics:
 | `use` | Plugin import by name, for example `use memory`. |
 | `apply` | Compile-time pattern specialization. |
 | `invoke` | Durable child workflow invocation. |
+| `revise` | Control-plane activation of a new program version for a running instance. |
 | `complete` | Successful workflow terminal action. |
 | `fail` | Failed workflow terminal action. |
 | skill | Claude-style context bundle assigned to an agent or turn. |
@@ -63,7 +64,8 @@ The current workspace implements the v0 spine: parser/IR snapshots, SQLite
 runtime store, deterministic kernel, CLI, trace conformance, Maude checks,
 TLA+/Apalache lifecycle checks, BAML coerce effects, Loft contracts, human
 review, skills, plugin registration, pattern expansion, workflow terminal
-events, and child workflow invocation fixtures.
+events, child workflow invocation fixtures, and explicit workflow revision for
+non-terminal running instances.
 
 Some surfaces are still transitional. When docs describe intended behavior that
 is only partially implemented, they should say so explicitly and link back to

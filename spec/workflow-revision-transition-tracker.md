@@ -27,10 +27,10 @@ without changing the source-level meaning of `pattern`, `apply`, `workflow`,
 | --- | --- | --- |
 | Conceptual spec | [x] | Stage 0 landed revision epochs, activation policy, cancellation policy, compatibility rules, store objects, transaction boundaries, and observability requirements in the core specs. |
 | Formal model | [x] | Stage 1 added Maude revision searches and TLA+ revision/cancel-request actions and invariants; the bounded formal suite passes. |
-| Store/runtime implementation | [ ] | Revision rows, active-epoch caching, per-effect version attribution, replay, active-version stepper/worker semantics, cancellation requests, and child invocation revision projection are in place; Stage 2 audit, observability evidence, and e2e remain open. |
-| CLI/control plane | [ ] | `whip revise`, dry-run compatibility reports, activation reports, status revision history, and trace revision projection are in place; evidence/diagnostic previews and final UX audit remain open. |
+| Store/runtime implementation | [x] | Revision rows, active-epoch caching, per-effect version attribution, replay, active-version stepper/worker semantics, cancellation requests, and child invocation revision projection are implemented and covered by tests. |
+| CLI/control plane | [x] | `whip revise`, dry-run compatibility reports, activation reports, status revision history, trace revision projection, evidence, and diagnostics are implemented. |
 | Generated checks | [x] | Per-program Maude checks assert active-version rule firing, stale-rule rejection, old-effect attribution, and revision-cancelled `completes` release. |
-| Examples/e2e | [ ] | No revision example exercises keep/cancel behavior for queued/running effects or child workflows. |
+| Examples/e2e | [x] | Deterministic e2e covers keep, queued cancel, running cancel request, and parent/child revision; Stage 8 examples document the operator-facing flows. |
 
 ## Product Target
 
@@ -57,28 +57,28 @@ Non-goals for this feature:
 
 ## Acceptance Gates
 
-- [ ] Revision activation is an append-only, inspectable event with evidence
+- [x] Revision activation is an append-only, inspectable event with evidence
   linking old and new program versions.
-- [ ] Every rule commit and effect created after activation is attributed to the
+- [x] Every rule commit and effect created after activation is attributed to the
   active revision epoch.
-- [ ] Effects created before activation keep their original version/epoch
+- [x] Effects created before activation keep their original version/epoch
   attribution.
-- [ ] `whip revise --dry-run` reports compatibility, cancellation impact, and
+- [x] `whip revise --dry-run` reports compatibility, cancellation impact, and
   blocked activation reasons without mutating the store.
-- [ ] `whip revise` cannot activate a revision for completed, failed, or
+- [x] `whip revise` cannot activate a revision for completed, failed, or
   cancelled instances.
-- [ ] Revision cannot make old-version rules fire after the new epoch is active.
-- [ ] Queued/blocked/claimable old-version effects can be terminal-cancelled when
+- [x] Revision cannot make old-version rules fire after the new epoch is active.
+- [x] Queued/blocked/claimable old-version effects can be terminal-cancelled when
   policy requests it.
-- [ ] Running old-version effects use cancel-request semantics, not immediate
+- [x] Running old-version effects use cancel-request semantics, not immediate
   fake terminal cancellation.
-- [ ] Child workflow invocations preserve parent/child links across revision and
+- [x] Child workflow invocations preserve parent/child links across revision and
   project success/failure/timeout/cancellation at most once.
-- [ ] Recovery preserves event order, active revision, cancellation requests,
+- [x] Recovery preserves event order, active revision, cancellation requests,
   and terminal effect uniqueness.
-- [ ] Maude and TLA+ checks cover revision/cancellation safety before runtime
+- [x] Maude and TLA+ checks cover revision/cancellation safety before runtime
   implementation lands.
-- [ ] Status, trace, evidence, and diagnostics explain which version/epoch
+- [x] Status, trace, evidence, and diagnostics explain which version/epoch
   produced each visible action.
 
 ## Stage 0: Spec Alignment
@@ -245,7 +245,7 @@ Goal: persist revisions and version attribution without losing replayability.
     terminal effect status
   - [x] request reason, requester, revision id, causation event, idempotency key
   - [x] terminal outcome still uses the normal effect terminal lifecycle
-- [ ] Add kernel/store operations:
+- [x] Add kernel/store operations:
   - [x] create revision candidate/dry-run report
   - [x] activate revision atomically
   - [x] list active revision for instance
@@ -255,7 +255,7 @@ Goal: persist revisions and version attribution without losing replayability.
 - [x] Ensure projection rebuild replays revision events and effect attribution.
 - [x] Add store tests for duplicate activation, idempotent cancellation,
   terminal instance rejection, and recovery replay.
-- [ ] Audit Stage 2 against schema replay, transaction boundaries, idempotency,
+- [x] Audit Stage 2 against schema replay, transaction boundaries, idempotency,
   and migration needs; record any store compatibility gaps.
 
 Acceptance:
@@ -266,7 +266,7 @@ Acceptance:
 - [x] Existing tests using one `instances.version_id` still pass or have an
   explicit migration path.
 
-Stage 2 partial audit notes:
+Stage 2 audit notes:
 
 - [crates/whipplescript-store/migrations/0001_runtime_store.sql](../crates/whipplescript-store/migrations/0001_runtime_store.sql)
   now creates `instance_revisions`, `effect_cancellation_requests`,
@@ -287,8 +287,11 @@ Stage 2 partial audit notes:
   terminal cancellations, rule-commit effect attribution, and cancellation
   request events so the active revision cache and request rows can be rebuilt
   from the event log.
-- Stage 2 still leaves the full candidate/dry-run report open because it
-  depends on the Stage 3 compatibility analysis.
+- Stage 2 audit result: complete. The store/kernel path persists revision
+  history, version/epoch attribution, cancellation requests, workflow invocation
+  revision projection, and replayable activation/cancellation state. The
+  candidate/dry-run report is completed through the Stage 3 compatibility
+  analysis and Stage 4 CLI reporting layers.
 
 ## Stage 3: Compiler And Compatibility Analysis
 
@@ -378,7 +381,7 @@ Goal: expose revision as an explicit operator action with a safe dry-run path.
   - [x] `whip revise <instance> <workflow.whip> --root <name> --cancel queued`
   - [x] `whip revise <instance> <workflow.whip> --root <name> --cancel running`
 - [x] Make `keep` the default cancellation policy.
-- [ ] Make dry-run report:
+- [x] Make dry-run report:
   - [x] active version/epoch
   - [x] candidate version hash
   - [x] compatibility status
@@ -398,7 +401,7 @@ Goal: expose revision as an explicit operator action with a safe dry-run path.
 - [x] Audit Stage 4 against CLI UX, JSON stability, status readability, and
   operator failure modes; record missing surfaces.
 
-Stage 4 partial audit notes:
+Stage 4 audit notes:
 
 - `whip revise` now compiles the candidate source bundle, runs compatibility
   analysis against the active instance, reports cancellation impact, and keeps
@@ -646,31 +649,52 @@ Stage 7 partial audit notes:
 
 Goal: teach the feature without encouraging source-level self-modifying rules.
 
-- [ ] Update [docs/language-reference.md](../docs/language-reference.md) to say
+- [x] Update [docs/language-reference.md](../docs/language-reference.md) to say
   revision is a control-plane operation and patch proposals are ordinary
   workflow outputs/artifacts.
-- [ ] Update [quickstart.md](quickstart.md) with a small `whip revise
+- [x] Update [quickstart.md](quickstart.md) with a small `whip revise
   --dry-run` example after the basic run/step flow.
-- [ ] Update [operator-guide.md](operator-guide.md) with revision, rollback-by-
+- [x] Update [operator-guide.md](operator-guide.md) with revision, rollback-by-
   new-revision, and cancellation policy guidance.
-- [ ] Update [troubleshooting.md](troubleshooting.md) with common revision
+- [x] Update [troubleshooting.md](troubleshooting.md) with common revision
   diagnostics.
-- [ ] Add examples:
-  - [ ] repair planner workflow that proposes a patch artifact
-  - [ ] revised workflow v1/v2 pair
-  - [ ] parent/child invocation revision example
-  - [ ] running cancellation request example with fixture provider
-- [ ] Add a validation workflow that invokes a patch-proposal child workflow, asks
+- [x] Add examples:
+  - [x] repair planner workflow that proposes a patch artifact
+  - [x] revised workflow v1/v2 pair
+  - [x] parent/child invocation revision example
+  - [x] running cancellation request example with fixture provider
+- [x] Add a validation workflow that invokes a patch-proposal child workflow, asks
   human approval, and leaves instructions for running `whip revise`.
-- [ ] Audit Stage 8 against docs, examples, companion skill guidance, and
+- [x] Audit Stage 8 against docs, examples, companion skill guidance, and
   user-facing terminology; record outdated references.
 
 Acceptance:
 
-- [ ] Docs do not imply ordinary rules can activate revisions.
-- [ ] Examples show both keeping and cancelling old work.
-- [ ] Companion guidance tells agents to propose patches, not self-modify live
+- [x] Docs do not imply ordinary rules can activate revisions.
+- [x] Examples show both keeping and cancelling old work.
+- [x] Companion guidance tells agents to propose patches, not self-modify live
   instances.
+
+Stage 8 audit notes:
+
+- [docs/language-reference.md](../docs/language-reference.md) now defines
+  workflow revision as a control-plane operation and points patch-producing
+  rules at ordinary `tell`, `coerce`, `invoke`, and `askHuman` effects.
+- [runtime-operations.md](../docs/runtime-operations.md),
+  [quickstart.md](quickstart.md), [operator-guide.md](operator-guide.md), and
+  [troubleshooting.md](troubleshooting.md) now cover dry-run, activation,
+  rollback-by-new-revision, cancellation policies, inspection commands, and
+  common revision diagnostics.
+- Added checked examples for a repair-planner patch proposal,
+  compatible `RevisionTicket` v1/v2 source bundles, parent/child revision,
+  running cancellation request, and a validation workflow that invokes a
+  patch-proposal child workflow before human approval.
+- [skills/whipplescript-author/SKILL.md](../skills/whipplescript-author/SKILL.md)
+  and [companion-skill.md](companion-skill.md) now tell authoring agents to
+  propose patch artifacts and leave activation to `whip revise`.
+- Stage 8 audit result: complete. User-facing docs, examples, and companion
+  guidance consistently distinguish source-level patch proposals from
+  control-plane revision activation.
 
 ## Stage 9: Final Release Audit
 
@@ -723,8 +747,7 @@ Acceptance:
 
 ## Next Implementation Slice
 
-1. Add Stage 1 Maude/TLA+ revision checks and wire them into
-   `scripts/check-formal-models.sh`.
-2. Implement Stage 2 store schema and kernel operations behind tests before
-   adding the CLI.
-3. Add Stage 3 compiler compatibility analysis before exposing `whip revise`.
+1. Run the Stage 9 final audit commands.
+2. Classify any remaining gaps as release-blocking or follow-up.
+3. Record the final release status in [final-audit.md](final-audit.md) or a
+   linked release note.

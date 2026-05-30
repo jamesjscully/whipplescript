@@ -1,0 +1,88 @@
+workflow ParentRevisionExample {
+  input task ParentTask
+  output result ParentResult
+  failure error ParentFailure
+
+  class ParentTask {
+    title string
+    body string
+  }
+
+  class ParentResult {
+    childSummary string
+  }
+
+  class ParentFailure {
+    reason string
+  }
+
+  rule invoke_child_workflow
+    when ParentTask as task
+  => {
+    invoke ChildRevisionExample { task { title task.title body task.body } } as child
+
+    after child succeeds as childResult {
+      done task
+
+      complete result {
+        childSummary childResult.summary
+      }
+    }
+
+    after child fails as childFailure {
+      done task
+
+      fail error {
+        reason childFailure.reason
+      }
+    }
+  }
+}
+
+workflow ChildRevisionExample {
+  input task ChildTask
+  output result ChildResult
+  failure error ChildFailure
+
+  class ChildTask {
+    title string
+    body string
+  }
+
+  class ChildResult {
+    summary string
+  }
+
+  class ChildFailure {
+    reason string
+  }
+
+  agent childWorker {
+    profile "repo-writer"
+    capacity 1
+    skills ["whipplescript-author"]
+  }
+
+  rule perform_child_work
+    when ChildTask as task
+    when childWorker is available
+  => {
+    tell childWorker as turn """
+    Complete child workflow work for the parent.
+
+    Title:
+    {{ task.title }}
+
+    Body:
+    {{ task.body }}
+    """
+
+    after turn succeeds {
+      done task
+
+      complete result {
+        summary turn.summary
+      }
+    }
+  }
+}

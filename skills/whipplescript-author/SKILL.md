@@ -11,6 +11,8 @@ WhippleScript is a restricted event-sourced rule machine.
 - Source order does not sequence effects. Use `after <effect> succeeds`,
   `after <effect> fails`, or `after <effect> completes`.
 - Every effect must be auditable through status, events, evidence, and trace.
+- Workflow revision is a control-plane operation. Source rules may propose
+  candidate patch artifacts, but they must not activate a running revision.
 - Prefer Loft for project work, BAML `coerce` for typed model decisions, and
   plugins for memory or external systems.
 
@@ -206,6 +208,29 @@ schema plus `AgentRef` metadata is preferred over one class per provider. Source
 assertions should check dispatch/result counts; BAML reviews should judge the
 artifact or evidence, not choose the route.
 
+## Revision Guidance
+
+When a workflow needs to adapt itself or repair a running instance, model that
+as ordinary work:
+
+- produce a candidate `.whip` file or patch artifact through `tell`, `coerce`,
+  `call`, `invoke`, or `askHuman`
+- record where the proposal lives and why it was produced
+- ask a human or operator workflow to review the proposal when appropriate
+- instruct the operator to run `whip revise --dry-run` first
+
+Do not write `.whip` source that pretends to call `revise` from a rule body.
+Activation must happen from the control plane:
+
+```sh
+whip revise <instance> candidate.whip --root Workflow --dry-run
+whip revise <instance> candidate.whip --root Workflow --cancel keep
+```
+
+Use `--cancel keep` when old effects should finish, `--cancel queued` when
+queued old effects should be terminal-cancelled, and `--cancel running` when
+running providers should receive cancellation requests.
+
 ## Profiles
 
 Choose profiles by authority intent:
@@ -272,5 +297,7 @@ changing prompts.
 - Never hide orchestration in shell scripts or prompt text.
 - Never rely on source order for effect sequencing.
 - Do not silently inject memory. Query it as an effect and preserve evidence.
+- Do not self-modify live instances from source rules. Propose a patch artifact
+  and let the control plane activate it with `whip revise`.
 - Keep provider credentials outside workflow source.
 - Use human review for destructive or ambiguous steps.

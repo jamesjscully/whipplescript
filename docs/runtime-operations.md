@@ -156,6 +156,27 @@ child cancelled -> parent invocation completes on the cancellation branch
 The parent observes declared terminal payloads and invocation metadata. It does
 not read child-local facts as ordinary parent facts.
 
+## Workflow Revision
+
+`whip revise` changes the active program version for a non-terminal running
+instance after compatibility checks pass. Revision is append-only: the runtime
+records a revision activation event, a new revision epoch, old/new program
+version ids, cancellation policy, diagnostics, and evidence links.
+
+Existing effects keep their original `program_version_id` and `revision_epoch`.
+Future rule commits and effects use the active revision epoch.
+
+```sh
+whip --store .whipplescript/dev.sqlite revise <instance> candidate.whip --root Workflow --dry-run
+whip --store .whipplescript/dev.sqlite revise <instance> candidate.whip --root Workflow --cancel keep
+whip --store .whipplescript/dev.sqlite revise <instance> candidate.whip --root Workflow --cancel queued
+whip --store .whipplescript/dev.sqlite revise <instance> candidate.whip --root Workflow --cancel running
+```
+
+`--cancel running` requests cancellation for already-running old-version work.
+It does not invent a terminal effect result; the provider, timeout, or recovery
+path still records the terminal outcome.
+
 ## Inspecting State
 
 Common commands:

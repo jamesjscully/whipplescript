@@ -59,6 +59,47 @@ Retry moves failed or timed-out effects back to queued:
 whip retry <instance> <effect>
 ```
 
+## Workflow Revision
+
+Use `whip revise` when a non-terminal running instance should move to a newer
+program version. Revision is an operator control-plane action, not a workflow
+rule operation.
+
+Always preview first:
+
+```sh
+whip revise <instance> candidate.whip --root Workflow --dry-run --cancel keep
+```
+
+The dry-run reports compatibility, active version/epoch, candidate hashes,
+impacted old-version effects, cancellation actions, and diagnostics/evidence
+that activation would create.
+
+Activate only after reviewing the dry-run:
+
+```sh
+whip revise <instance> candidate.whip --root Workflow --cancel keep
+```
+
+Cancellation policies:
+
+| Policy | Use when | Behavior |
+| --- | --- | --- |
+| `keep` | Old work should finish under its original version. | Existing effects keep their old version/epoch attribution and remain runnable. |
+| `queued` | Queued old work should be abandoned. | Queued, blocked, and claimable old effects become terminal `cancelled`. |
+| `running` | Running old work should be asked to stop. | Queued old effects cancel; running effects receive cancellation requests and finish through provider acknowledgement or normal terminal outcome. |
+
+Rollback is another revision to a prior compatible source bundle:
+
+```sh
+whip revise <instance> previous.whip --root Workflow --dry-run
+whip revise <instance> previous.whip --root Workflow --cancel keep
+```
+
+Terminal instances cannot be revised. Parent and child workflow instances revise
+independently; revising a parent does not revise or terminate an already-running
+child invocation.
+
 ## Profiles And Providers
 
 Profiles describe authority. Providers execute effect kinds. Capability bindings

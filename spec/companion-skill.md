@@ -28,6 +28,8 @@ The skill teaches agents:
 - Choose profiles by authority intent, not provider brand.
 - Keep workflows small, explicit, and analyzable.
 - Avoid internal effect recursion.
+- Treat workflow revision as a control-plane action. Source rules may propose
+  candidate patch artifacts, but they must not activate running revisions.
 - Prefer plugin capabilities for memory, Thoth, GitHub, browser, etc.
 - Inspect status/evidence before guessing.
 
@@ -43,6 +45,7 @@ coerce example
 human review example
 dependent-effect / `after` example
 common diagnostics and fixes
+workflow revision patch-proposal guidance
 capability/profile selection guidance
 plugin discovery guidance
 profile-selection guidance
@@ -64,6 +67,9 @@ Current authoring guidance from validation:
   parser.
 - Use `call <capability> ... as <binding>` for plugin capabilities such as
   memory. Do not invent plugin-specific control-flow syntax.
+- For running workflow revision, propose a candidate `.whip` artifact with
+  ordinary effects or child workflow invocations. Tell the operator to run
+  `whip revise --dry-run` and activate the revision from the control plane.
 
 ## Validation Fixture
 
@@ -99,6 +105,8 @@ starting agent turns before claims/capabilities are accepted
 depending on source order to sequence effects
 depending on prompt text as a completion condition
 using one powerful profile for unrelated research and write tasks
+self-modifying a running instance from source rules instead of proposing a
+patch artifact for `whip revise`
 ```
 
 ## Delivery

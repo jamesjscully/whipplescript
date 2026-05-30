@@ -321,6 +321,42 @@ The parent sees declared output/failure payloads, not child-local facts. Child
 provider failures remain child effect/run events unless the child workflow
 chooses to `fail`.
 
+## Workflow Revision
+
+Workflow revision is a control-plane operation for changing the active program
+version of a non-terminal running instance. It is not a source-level rule body
+operation, and there is no `.whip` syntax that activates a revision.
+
+Use ordinary workflow effects when a workflow should propose a change:
+
+- `tell` an agent to write a candidate source artifact.
+- `coerce` a typed review or classification of the proposal.
+- `invoke` a child workflow that prepares or validates a patch.
+- `askHuman` for approval before an operator activates the candidate.
+
+The activation path stays outside source:
+
+```sh
+whip revise <instance> candidate.whip --root Workflow --dry-run
+whip revise <instance> candidate.whip --root Workflow --cancel keep
+```
+
+`revise` validates the candidate bundle, records a new revision epoch, and
+makes future stepping use the new active program version. Effects that already
+exist keep their original `program_version_id` and `revision_epoch`.
+
+Cancellation policy is explicit:
+
+| Policy | Effect |
+| --- | --- |
+| `--cancel keep` | Keep old-version effects claimable/runnable. |
+| `--cancel queued` | Terminal-cancel queued, blocked, and claimable old-version effects. |
+| `--cancel running` | Cancel queued effects and request cancellation for running effects. |
+
+Running cancellation requests are not terminal results. A provider must
+acknowledge cancellation or complete, fail, or time out through the normal effect
+lifecycle.
+
 ## Lifecycle
 
 Instances have these durable states:

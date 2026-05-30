@@ -46,6 +46,41 @@ whip inbox show <item>
 whip inbox answer <item> --choice approve --by operator
 ```
 
+## Workflow Revision Is Blocked
+
+Preview the candidate first:
+
+```sh
+whip revise <instance> candidate.whip --root Workflow --dry-run --json
+whip diagnostics <instance>
+whip evidence <instance> --json
+whip status <instance> --json
+```
+
+Common revision diagnostics:
+
+- `revision.incompatible_root_workflow`: the candidate root workflow name does
+  not match the running instance.
+- `revision.incompatible_input_contract`: the candidate changed an already
+  started workflow input contract.
+- `revision.incompatible_output_contract` or
+  `revision.incompatible_failure_contract`: parent invocations could no longer
+  observe the declared terminal payload shape.
+- `revision.incompatible_active_fact`: a live unconsumed fact no longer
+  typechecks against the candidate schema.
+- `revision.stale_program_path`: `whip step` was pointed at source that does
+  not match the active revision.
+- `revision.source_bundle_unavailable`: the candidate source bundle could not
+  be read during revision.
+- `provider.cancellation.unsupported`: `--cancel running` requested
+  out-of-band cancellation from a provider that cannot acknowledge it. The run
+  remains recoverable until it records a normal terminal outcome or lease
+  recovery handles it.
+
+Use `--cancel keep` when old-version effects should continue, `--cancel queued`
+when queued old work should become terminal `cancelled`, and `--cancel running`
+when running providers should receive cancellation requests.
+
 ## Formal Tool Missing
 
 Run:

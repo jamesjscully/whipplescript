@@ -1,0 +1,125 @@
+workflow RevisionValidation {
+  input target RevisionTarget
+  output result ValidationResult
+  failure error ValidationFailure
+
+  class RevisionTarget {
+    instanceId string
+    currentPath string
+    candidatePath string
+    rootWorkflow string
+    requestedChange string
+  }
+
+  class ValidationResult {
+    proposedPath string
+    dryRunCommand string
+  }
+
+  class ValidationFailure {
+    reason string
+  }
+
+  rule request_patch_proposal
+    when RevisionTarget as target
+  => {
+    invoke PatchProposalChild { target target } as proposal
+
+    after proposal succeeds as patch {
+      done target
+
+      askHuman """
+      Review this patch proposal before activating a workflow revision.
+
+      Instance:
+      {{ target.instanceId }}
+
+      Candidate path:
+      {{ patch.proposedPath }}
+
+      Run this dry-run command first:
+      {{ patch.dryRunCommand }}
+
+      If the dry-run is compatible, activate from the control plane with
+      whip revise. Do not try to activate the revision from a workflow rule.
+      """
+
+      complete result {
+        proposedPath patch.proposedPath
+        dryRunCommand patch.dryRunCommand
+      }
+    }
+
+    after proposal fails as failure {
+      done target
+
+      fail error {
+        reason failure.reason
+      }
+    }
+  }
+}
+
+workflow PatchProposalChild {
+  input target RevisionTarget
+  output proposal PatchProposal
+  failure error PatchFailure
+
+  class RevisionTarget {
+    instanceId string
+    currentPath string
+    candidatePath string
+    rootWorkflow string
+    requestedChange string
+  }
+
+  class PatchProposal {
+    proposedPath string
+    dryRunCommand string
+  }
+
+  class PatchFailure {
+    reason string
+  }
+
+  agent planner {
+    profile "repo-writer"
+    capacity 1
+    skills ["whipplescript-author"]
+  }
+
+  rule draft_candidate
+    when RevisionTarget as target
+    when planner is available
+  => {
+    tell planner as turn """
+    Draft a candidate workflow source file for this requested revision.
+
+    Instance:
+    {{ target.instanceId }}
+
+    Current source:
+    {{ target.currentPath }}
+
+    Candidate source path:
+    {{ target.candidatePath }}
+
+    Root workflow:
+    {{ target.rootWorkflow }}
+
+    Requested change:
+    {{ target.requestedChange }}
+
+    Write the candidate source path only. Leave activation to the operator.
+    """
+
+    after turn succeeds {
+      done target
+
+      complete proposal {
+        proposedPath target.candidatePath
+        dryRunCommand "whip revise <instance_id> <candidate.whip> --root <root> --dry-run"
+      }
+    }
+  }
+}

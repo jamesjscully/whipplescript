@@ -58,11 +58,54 @@ cargo run -p whipplescript-cli -- --store .whipplescript/quickstart.sqlite facts
 cargo run -p whipplescript-cli -- --store .whipplescript/quickstart.sqlite trace <instance_id> --check --json
 ```
 
-## 5. Use Examples As Starting Points
+## 5. Preview A Revision
+
+Start the revision v1 example:
+
+```sh
+whip --store .whipplescript/quickstart.sqlite \
+  run examples/revision-ticket-v1.whip \
+  --root RevisionTicket \
+  --input '{"ticket":{"title":"quickstart","body":"initial workflow"}}' \
+  --json
+```
+
+Save the returned `instance_id`, then preview the compatible v2 candidate
+without mutating the store:
+
+```sh
+whip --store .whipplescript/quickstart.sqlite \
+  revise <instance_id> examples/revision-ticket-v2.whip \
+  --root RevisionTicket \
+  --dry-run \
+  --cancel keep
+```
+
+If the dry-run is compatible, activate from the control plane:
+
+```sh
+whip --store .whipplescript/quickstart.sqlite \
+  revise <instance_id> examples/revision-ticket-v2.whip \
+  --root RevisionTicket \
+  --cancel keep
+```
+
+Use `--cancel queued` to terminal-cancel queued old-version effects, or
+`--cancel running` to request cancellation for running old-version provider
+work. Source rules may propose candidate files, but they do not activate
+revisions.
+
+## 6. Use Examples As Starting Points
 
 Checked examples live in `examples/`:
 
 - `minimal-noop.whip`
+- `revision-ticket-v1.whip`
+- `revision-ticket-v2.whip`
+- `revision-running-cancel.whip`
+- `revision-parent-child.whip`
+- `revision-repair-planner.whip`
+- `revision-validation-approval.whip`
 - `ralph.whip`
 - `loft-worker-with-review.whip`
 - `coerce-branch.whip`

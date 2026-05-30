@@ -10982,6 +10982,42 @@ rule_dependencies
     }
 
     #[test]
+    fn revision_examples_compile() {
+        let examples = [
+            (
+                include_str!("../../../examples/revision-ticket-v1.whip"),
+                Some("RevisionTicket"),
+            ),
+            (
+                include_str!("../../../examples/revision-ticket-v2.whip"),
+                Some("RevisionTicket"),
+            ),
+            (
+                include_str!("../../../examples/revision-repair-planner.whip"),
+                Some("RevisionRepairPlanner"),
+            ),
+            (
+                include_str!("../../../examples/revision-running-cancel.whip"),
+                Some("RevisionRunningCancel"),
+            ),
+            (
+                include_str!("../../../examples/revision-parent-child.whip"),
+                Some("ParentRevisionExample"),
+            ),
+            (
+                include_str!("../../../examples/revision-validation-approval.whip"),
+                Some("RevisionValidation"),
+            ),
+        ];
+
+        for (source, root) in examples {
+            let compiled = compile_program_with_root(source, root);
+            assert_eq!(compiled.diagnostics, Vec::new());
+            assert!(compiled.ir.is_some());
+        }
+    }
+
+    #[test]
     fn rejects_unknown_schema_references() {
         let source = include_str!("../../../examples/invalid/unknown-schema.whip");
         let compiled = compile_program(source);
