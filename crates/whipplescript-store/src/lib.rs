@@ -6151,7 +6151,11 @@ fn rule_commit_payload(
                 "required_capabilities": serde_json::from_str::<Value>(effect.required_capabilities_json)?,
                 "profile": effect.profile,
                 "correlation_id": effect.correlation_id,
-                "source_span": effect.source_span_json.map(|span| serde_json::from_str::<Value>(span)).transpose()?.unwrap_or(Value::Null),
+                "source_span": effect
+                    .source_span_json
+                    .map(serde_json::from_str::<Value>)
+                    .transpose()?
+                    .unwrap_or(Value::Null),
             }))
         })
         .collect::<StoreResult<Vec<_>>>()?;
@@ -8294,7 +8298,7 @@ mod tests {
                 .source_span_json
                 .as_deref()
                 .and_then(|span| serde_json::from_str::<Value>(span).ok())
-                .and_then(|span| span.get("start").and_then(Value::as_u64).map(|start| start)),
+                .and_then(|span| span.get("start").and_then(Value::as_u64)),
             Some(31)
         );
         let removed = report
@@ -8307,7 +8311,7 @@ mod tests {
                 .source_span_json
                 .as_deref()
                 .and_then(|span| serde_json::from_str::<Value>(span).ok())
-                .and_then(|span| span.get("start").and_then(Value::as_u64).map(|start| start)),
+                .and_then(|span| span.get("start").and_then(Value::as_u64)),
             Some(11)
         );
     }

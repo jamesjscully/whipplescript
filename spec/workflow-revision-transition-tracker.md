@@ -1,6 +1,6 @@
 # Workflow Revision Transition Tracker
 
-Status: draft tracker
+Status: final audit complete
 
 This tracker covers dynamic workflow revision for running instances:
 
@@ -136,8 +136,9 @@ Stage 0 audit notes:
   `effect_cancellation_requests` records plus version/epoch attribution fields.
 - [observability.md](observability.md) now requires revision and cancellation
   request data in status, trace, evidence, and export surfaces.
-- Stage 0 resolved the representation decisions listed below; implementation
-  must still validate them through Stage 1 models before runtime code lands.
+- Stage 0 resolved the representation decisions listed below, and later stages
+  validated them through formal models, runtime implementation, CLI coverage,
+  e2e tests, docs, and the final Stage 9 audit.
 
 ## Stage 1: Formal Model Spine
 
@@ -323,7 +324,7 @@ version for a running instance.
   current language-reference examples; record cases deferred to future explicit
   fact migration.
 
-Stage 3 partial audit notes:
+Stage 3 audit notes:
 
 - Compiled program versions now store a structured `analysis_summary` with the
   root workflow, workflow contracts, include closure hashes, pattern application
@@ -472,7 +473,7 @@ Acceptance:
 - [x] Old effects can finish after revision with old attribution.
 - [x] Running cancel requests do not fabricate terminal cancellation.
 
-Stage 5 partial audit notes:
+Stage 5 audit notes:
 
 - `whip step` now compiles the operator-supplied program path and rejects it
   unless its source and IR hashes match the instance's active program version.
@@ -482,8 +483,8 @@ Stage 5 partial audit notes:
   revision epoch, so equivalent rule/context/lowering output does not collide
   across revision epochs.
 - `whip dev` and child-invocation stepping remain explicit development paths
-  that pass an in-memory IR; their revision behavior still needs the broader
-  Stage 5 worker/child audit.
+  that pass an in-memory IR; Stage 7 now covers parent/child revision behavior
+  and independent child revision through deterministic kernel e2e.
 - A keep-policy revision leaves existing old-version effects claimable; fixture
   worker completion preserves the old effect's original program version and
   revision epoch attribution.
@@ -517,10 +518,10 @@ Stage 5 partial audit notes:
   invocation through its original bundle, and verifies the parent observes one
   terminal child projection.
 - Stage 5 audit result: complete for the current synchronous fixture/provider
-  runtime. Remaining Stage 7 work should add deterministic e2e examples for
-  keep-policy old effects, queued cancellation, running provider
-  acknowledgement, unsupported-provider diagnostics, parent revision while a
-  child is running, and independent child revision.
+  runtime. Stage 7 subsequently added deterministic coverage for keep-policy
+  old effects, queued cancellation, running provider acknowledgement,
+  unsupported-provider diagnostics, parent revision while a child is running,
+  and independent child revision.
 
 ## Stage 6: Observability, Evidence, And Diagnostics
 
@@ -554,7 +555,7 @@ Acceptance:
   from CLI output.
 - [x] Trace conformance rejects impossible revision/cancellation sequences.
 
-Stage 6 partial audit notes:
+Stage 6 audit notes:
 
 - Revision activation now records `workflow.revision.activated` evidence linked
   to the activation event, old/new program versions, terminal-cancelled
@@ -581,7 +582,7 @@ Stage 6 partial audit notes:
   surfaces. `whip log`, `whip status`, `whip effects --json`, `whip runs`,
   `whip diagnostics`, `whip evidence`, and trace JSON now expose the revision,
   cancellation, source-span, and evidence relationships needed for operator
-  debugging. Remaining validation work is tracked in Stage 7 e2e coverage.
+  debugging. Stage 7 validates those surfaces through deterministic tests.
 
 ## Stage 7: Tests And E2E
 
@@ -621,7 +622,7 @@ Acceptance:
 - [x] Deterministic fixture-provider e2e covers keep, queued-cancel, and
   running-cancel-request policies.
 
-Stage 7 partial audit notes:
+Stage 7 audit notes:
 
 - Store/kernel unit coverage now includes revision activation, terminal-instance
   rejection, stable old-effect attribution, idempotent queued/running
@@ -712,8 +713,12 @@ experimental.
 - [x] Audit Stage 7 findings and close or classify all test/e2e gaps.
 - [x] Audit Stage 8 findings and close or classify all docs/example gaps.
 - [x] Run required checks:
+  - [x] `cargo fmt --all -- --check`
+  - [x] `cargo clippy --workspace --all-targets -- -D warnings`
   - [x] `cargo test --workspace`
   - [x] `scripts/check-formal-models.sh`
+  - [x] `scripts/check-tla-models.sh`
+  - [x] `scripts/check-e2e.sh`
   - [x] revision-specific deterministic e2e
   - [x] trace conformance on revised instances
 - [x] Decide release status:
@@ -732,8 +737,13 @@ Acceptance:
 Stage 9 audit notes:
 
 - Stage 0 through Stage 8 each now has an explicit audit result in this tracker.
-- Required checks passed on May 30, 2026:
+- The final 0-9 audit pass on May 30, 2026 verified tracker claims against the
+  spec, store schema, runtime/kernel behavior, CLI control plane, formal
+  models, docs, examples, and companion authoring guidance.
+- Required checks passed on May 30, 2026: `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace`, `scripts/check-formal-models.sh`,
+  `scripts/check-tla-models.sh`, `scripts/check-e2e.sh`,
   `cargo test -p whipplescript-kernel --test e2e revision`, and
   `cargo test -p whipplescript -- reconstructs_revision_trace_records_from_store_events renders_revision_log_event_details`.
 - Release status: stable for the in-repo v0 runtime and CLI. Revision is not

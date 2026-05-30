@@ -3433,6 +3433,7 @@ impl ReadyContexts {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eval_guard(
     rule: &str,
     when: &str,
@@ -7836,6 +7837,7 @@ fn generate_maude_model_search(
     (output, expected)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_revision_model_searches(
     source: &str,
     output: &mut String,
@@ -8016,14 +8018,8 @@ fn maude_bool_cases(expr: &Expr, context: &mut MaudeExprContext) -> MaudeBoolCas
             true_expr: format!("notExpr({})", maude_eq_false_expr(left, right, context)),
             false_expr: format!(
                 "neExpr({}, {})",
-                {
-                    let lhs = maude_scalar_expr(left, context);
-                    lhs
-                },
-                {
-                    let lhs = maude_scalar_expr(left, context);
-                    lhs
-                }
+                maude_scalar_expr(left, context),
+                maude_scalar_expr(left, context)
             ),
             error_expr: "exprError".to_owned(),
         },
@@ -8964,6 +8960,7 @@ fn revision_removed_agent_impact_to_json(impact: &RevisionRemovedAgentImpact) ->
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn revision_report_json(
     dry_run: bool,
     revise_options: &ReviseOptions,
@@ -9003,6 +9000,7 @@ fn revision_report_json(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_revision_dry_run(
     options: &CliOptions,
     revise_options: &ReviseOptions,
@@ -9026,6 +9024,7 @@ fn emit_revision_dry_run(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_revision_report(
     options: &CliOptions,
     revise_options: &ReviseOptions,
@@ -9104,6 +9103,7 @@ fn emit_revision_report(
     ExitCode::SUCCESS
 }
 
+#[allow(clippy::too_many_arguments)]
 fn revision_would_create_to_json(
     dry_run: bool,
     revise_options: &ReviseOptions,

@@ -5972,8 +5972,8 @@ fn validate_binding_uses(
 fn after_scopes(block_stack: &[BlockFrame]) -> Vec<(String, DependencyPredicate)> {
     block_stack
         .iter()
-        .filter_map(|frame| match frame {
-            BlockFrame::After { binding, predicate } => Some((binding.clone(), predicate.clone())),
+        .map(|frame| match frame {
+            BlockFrame::After { binding, predicate } => (binding.clone(), predicate.clone()),
         })
         .collect()
 }
@@ -6641,6 +6641,7 @@ fn validate_literal_assignment(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_expected_assignment(
     rule: &RuleDecl,
     record_schema: &str,
@@ -6666,6 +6667,7 @@ fn validate_expected_assignment(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_expr_source_against_type(
     rule: &RuleDecl,
     record_schema: &str,
@@ -6805,6 +6807,7 @@ fn validate_expr_source_against_type(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_expr_against_type(
     rule: &RuleDecl,
     record_schema: &str,
@@ -6903,6 +6906,7 @@ fn push_invalid_assignment_expr(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_object_literal_fields(
     rule: &RuleDecl,
     record_schema: &str,
@@ -6968,6 +6972,7 @@ fn validate_object_literal_fields(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_inferred_assignment_type(
     rule: &RuleDecl,
     record_schema: &str,
@@ -7744,9 +7749,7 @@ fn parse_consume_line(line: &str) -> Option<String> {
         .unwrap_or_default()
         .trim();
     let mut chars = binding.chars();
-    let Some(first) = chars.next() else {
-        return None;
-    };
+    let first = chars.next()?;
     if !(first.is_ascii_alphabetic() || first == '_') {
         return None;
     }
@@ -9790,7 +9793,7 @@ workflow Child {
             .rules
             .iter()
             .find(|rule| rule.name == "dispatch")
-            .unwrap();
+            .expect("dispatch rule lowers");
         assert_eq!(rule.metadata.effects.len(), 1);
         assert_eq!(rule.metadata.effects[0].kind, IrEffectKind::WorkflowInvoke);
         assert_eq!(rule.metadata.effects[0].binding.as_deref(), Some("child"));

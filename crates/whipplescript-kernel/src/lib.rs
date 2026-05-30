@@ -1215,6 +1215,7 @@ impl RuntimeKernel {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn provider_terminal_diagnostic(
         &self,
         instance_id: &str,

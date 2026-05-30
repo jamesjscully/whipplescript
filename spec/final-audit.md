@@ -1,6 +1,6 @@
 # Final Audit
 
-Status: draft
+Status: active v0 audit log; workflow revision audit complete.
 
 This file collects the audit findings from the staged implementation plan and
 classifies them for v0.
@@ -18,12 +18,20 @@ running cancellation requests, parent/child invocation attribution, evidence,
 diagnostics, trace conformance, docs, examples, and companion authoring
 guidance.
 
+Final 0-9 workflow revision audit pass: May 30, 2026. This pass verified the
+tracker claims against the specs, store schema, runtime/kernel behavior, CLI
+control plane, formal models, docs, examples, and companion authoring guidance.
+
 Verification run for this audit:
 
 | Check | Result |
 | --- | --- |
+| `cargo fmt --all -- --check` | Passed. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed after narrow mechanical lint cleanup in parser/store/kernel/CLI helpers. |
 | `cargo test --workspace` | Passed. |
 | `scripts/check-formal-models.sh` | Passed, including `workflow-revision.maude` and TLA+/Apalache bounded check to length 6. |
+| `scripts/check-tla-models.sh` | Passed with Apalache bounded check to length 6. |
+| `scripts/check-e2e.sh` | Passed 17 kernel e2e tests and 54 CLI control-plane tests. |
 | `cargo test -p whipplescript-kernel --test e2e revision` | Passed 5 revision e2e tests covering keep, queued cancel, running cancel request, parent revision with child running, and independent child revision. |
 | `cargo test -p whipplescript -- reconstructs_revision_trace_records_from_store_events renders_revision_log_event_details` | Passed revision trace/log reconstruction checks. |
 
@@ -122,7 +130,7 @@ Result: no blocking reliability gaps identified.
 
 ## Verification Rerun
 
-Required before declaring final v0:
+Completed for the May 30, 2026 workflow revision final audit:
 
 ```sh
 cargo fmt --all -- --check
