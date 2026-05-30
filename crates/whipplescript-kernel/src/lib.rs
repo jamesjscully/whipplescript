@@ -12,7 +12,7 @@ use harness::{
 use loft::{LoftAction, LoftClient, LoftEffectRequest, LoftEffectResult, LoftEffectStatus};
 use serde_json::{json, Value};
 use trace::{DependencyEdge, EffectStatus, TraceEvent, TraceRecord};
-use whipplescript_parser::IrProgram;
+use whipplescript_parser::{IrPrimitiveType, IrProgram, IrSchema, IrType, IrWorkflowContractKind};
 use whipplescript_store::{
     ArtifactRecord, ClaimableEffect, DerivedFact, EffectCancellation, EffectCompletion,
     EvidenceRecord, ExpiredLease, InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent,
@@ -151,6 +151,7 @@ impl RuntimeKernel {
         let declared_profiles_json = declared_profiles_json(program);
         let declared_skills_json = declared_skills_json(program);
         let declared_schemas_json = declared_schemas_json(program);
+        let analysis_summary_json = analysis_summary_json(program);
         self.store.create_program_version(NewProgramVersion {
             program_name: input.program_name,
             source_hash: input.source_hash,
@@ -160,7 +161,7 @@ impl RuntimeKernel {
             declared_profiles_json: &declared_profiles_json,
             declared_skills_json: &declared_skills_json,
             declared_schemas_json: &declared_schemas_json,
-            analysis_summary_json: "{}",
+            analysis_summary_json: &analysis_summary_json,
             generated_artifacts_json: "[]",
             artifact_root: None,
         })
@@ -1238,6 +1239,150 @@ fn declared_schemas_json(program: &IrProgram) -> String {
         })
         .collect::<Vec<_>>();
     json!(schemas).to_string()
+}
+
+fn analysis_summary_json(program: &IrProgram) -> String {
+    let workflow_contracts = program
+        .workflow_contracts
+        .iter()
+        .map(|contract| {
+            json!({
+                "kind": workflow_contract_kind_name(&contract.kind),
+                "name": contract.name,
+                "type": ir_type_signature(&contract.ty),
+            })
+        })
+        .collect::<Vec<_>>();
+    let include_closure = program
+        .includes
+        .iter()
+        .map(|include| {
+            json!({
+                "path": include.path,
+                "source_hash": include.source_hash,
+            })
+        })
+        .collect::<Vec<_>>();
+    let pattern_applications = program
+        .pattern_applications
+        .iter()
+        .map(|application| {
+            json!({
+                "pattern": application.pattern,
+                "alias": application.alias,
+                "type_args": application
+                    .type_args
+                    .iter()
+                    .map(ir_type_signature)
+                    .collect::<Vec<_>>(),
+                "value_args": application
+                    .value_args
+                    .iter()
+                    .map(|argument| json!({
+                        "name": argument.name,
+                        "value": argument.value,
+                    }))
+                    .collect::<Vec<_>>(),
+                "generated": application.generated,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut generated_declarations = program
+        .pattern_applications
+        .iter()
+        .flat_map(|application| application.generated.iter().cloned())
+        .collect::<Vec<_>>();
+    generated_declarations.sort();
+    generated_declarations.dedup();
+    let schemas = program
+        .schemas
+        .iter()
+        .map(schema_summary)
+        .collect::<Vec<_>>();
+
+    json!({
+        "workflow": program.workflow,
+        "workflow_contracts": workflow_contracts,
+        "include_closure": include_closure,
+        "pattern_applications": pattern_applications,
+        "generated_declarations": generated_declarations,
+        "schemas": schemas,
+    })
+    .to_string()
+}
+
+fn workflow_contract_kind_name(kind: &IrWorkflowContractKind) -> &'static str {
+    match kind {
+        IrWorkflowContractKind::Input => "input",
+        IrWorkflowContractKind::Output => "output",
+        IrWorkflowContractKind::Failure => "failure",
+    }
+}
+
+fn schema_summary(schema: &IrSchema) -> Value {
+    match schema {
+        IrSchema::Class(class) => json!({
+            "kind": "class",
+            "name": class.name,
+            "fields": class
+                .fields
+                .iter()
+                .map(|field| json!({
+                    "name": field.name,
+                    "type": ir_type_signature(&field.ty),
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        IrSchema::Enum(enum_decl) => json!({
+            "kind": "enum",
+            "name": enum_decl.name,
+            "variants": enum_decl.variants,
+        }),
+    }
+}
+
+fn ir_type_signature(ty: &IrType) -> String {
+    match ty {
+        IrType::Primitive(primitive) => primitive_type_name(primitive).to_owned(),
+        IrType::LiteralString(value) => format!("literal<{value:?}>"),
+        IrType::Ref(name) => format!("ref<{name}>"),
+        IrType::AgentRef(agents) => format!("agentref<{}>", agents.join(" | ")),
+        IrType::Object(fields) => {
+            let fields = fields
+                .iter()
+                .map(|field| format!("{} {}", field.name, ir_type_signature(&field.ty)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("object<{{{fields}}}>")
+        }
+        IrType::Optional(inner) => format!("optional<{}>", ir_type_signature(inner)),
+        IrType::Array(inner) => format!("array<{}>", ir_type_signature(inner)),
+        IrType::Map(inner) => format!("map<{}>", ir_type_signature(inner)),
+        IrType::Union(variants) => {
+            let variants = variants
+                .iter()
+                .map(ir_type_signature)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            format!("union<{variants}>")
+        }
+    }
+}
+
+fn primitive_type_name(primitive: &IrPrimitiveType) -> &'static str {
+    match primitive {
+        IrPrimitiveType::String => "string",
+        IrPrimitiveType::Int => "int",
+        IrPrimitiveType::Float => "float",
+        IrPrimitiveType::Bool => "bool",
+        IrPrimitiveType::Null => "null",
+        IrPrimitiveType::Duration => "duration",
+        IrPrimitiveType::Time => "time",
+        IrPrimitiveType::Image => "image",
+        IrPrimitiveType::Audio => "audio",
+        IrPrimitiveType::Pdf => "pdf",
+        IrPrimitiveType::Video => "video",
+    }
 }
 
 fn dependency_edge(dependency: &NewEffectDependency<'_>) -> DependencyEdge {

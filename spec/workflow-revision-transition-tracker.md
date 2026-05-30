@@ -295,10 +295,10 @@ Stage 2 partial audit notes:
 Goal: decide safely whether a candidate source bundle can replace the active
 version for a running instance.
 
-- [ ] Add a revision compatibility analysis pass that compares active and
+- [x] Add a revision compatibility analysis pass that compares active and
   candidate program versions.
-- [ ] Validate selected root workflow compatibility.
-- [ ] Validate workflow input/output/failure contracts.
+- [x] Validate selected root workflow compatibility.
+- [x] Validate workflow input/output/failure contracts.
 - [ ] Validate active fact compatibility against candidate schemas where
   possible.
 - [ ] Validate agent/profile/capability changes:
@@ -306,11 +306,11 @@ version for a running instance.
   - [ ] old effects continue with stored resolved targets and capabilities
   - [ ] removed agents are reported when they affect active or queued work
 - [ ] Validate source bundle metadata:
-  - [ ] include closure hash
-  - [ ] root workflow
-  - [ ] pattern application provenance
+  - [x] include closure hash
+  - [x] root workflow
+  - [x] pattern application provenance
   - [ ] generated declaration hashes
-- [ ] Produce structured diagnostics for incompatible revisions.
+- [x] Produce structured diagnostics for incompatible revisions.
 - [ ] Add generated Maude checks that assert:
   - [ ] rules commit only when their version equals active revision
   - [ ] old effects keep old attribution
@@ -319,6 +319,19 @@ version for a running instance.
 - [ ] Audit Stage 3 against compatibility diagnostics, generated checks, and
   current language-reference examples; record cases deferred to future explicit
   fact migration.
+
+Stage 3 partial audit notes:
+
+- Compiled program versions now store a structured `analysis_summary` with the
+  root workflow, workflow contracts, include closure hashes, pattern application
+  provenance, generated declaration names, and schema summaries.
+- The store now exposes a non-mutating compatibility report comparing an
+  instance's active version with a candidate version. It rejects root workflow
+  changes, input contract additions/changes/removals, output/failure removals,
+  and output/failure type changes with structured diagnostic codes.
+- Active fact schema compatibility, agent/profile/capability impact analysis,
+  generated declaration hashes, generated Maude checks, and CLI dry-run
+  rendering remain open Stage 3/4 work.
 
 Acceptance:
 

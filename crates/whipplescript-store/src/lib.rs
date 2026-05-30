@@ -1,6 +1,11 @@
 //! Durable SQLite store for event logs, facts, effects, and evidence.
 
-use std::{collections::BTreeSet, fs, path::Path, result};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+    result,
+};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -607,6 +612,22 @@ pub struct RevisionCancellationImpact {
     pub request_cancel_effects: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevisionCompatibilityReport {
+    pub instance_id: String,
+    pub active_version_id: String,
+    pub candidate_version_id: String,
+    pub compatible: bool,
+    pub diagnostics: Vec<RevisionCompatibilityDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevisionCompatibilityDiagnostic {
+    pub code: String,
+    pub message: String,
+    pub subject: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EffectCancellationRequest<'a> {
     pub instance_id: &'a str,
@@ -940,6 +961,61 @@ impl SqliteStore {
             cancellation_policy: cancellation_policy.to_owned(),
             terminal_cancel_effects,
             request_cancel_effects,
+        })
+    }
+
+    pub fn analyze_revision_compatibility(
+        &self,
+        instance_id: &str,
+        candidate_version_id: &str,
+    ) -> StoreResult<RevisionCompatibilityReport> {
+        let (program_id, active_version_id, status) = self
+            .connection
+            .query_row(
+                r#"
+                SELECT program_id, version_id, status
+                FROM instances
+                WHERE instance_id = ?1
+                "#,
+                [instance_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))?;
+        let (active_program_id, active_summary) =
+            program_version_analysis_on(&self.connection, &active_version_id)?;
+        let (candidate_program_id, candidate_summary) =
+            program_version_analysis_on(&self.connection, candidate_version_id)?;
+
+        let mut diagnostics = Vec::new();
+        if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+            diagnostics.push(revision_compatibility_diagnostic(
+                "revision.terminal_instance",
+                format!("instance is {status}; revisions require a non-terminal instance"),
+                Some(instance_id),
+            ));
+        }
+        if active_program_id != program_id || candidate_program_id != program_id {
+            diagnostics.push(revision_compatibility_diagnostic(
+                "revision.program_mismatch",
+                "candidate version belongs to a different program".to_owned(),
+                Some(candidate_version_id),
+            ));
+        }
+        compare_revision_summaries(&active_summary, &candidate_summary, &mut diagnostics);
+
+        Ok(RevisionCompatibilityReport {
+            instance_id: instance_id.to_owned(),
+            active_version_id,
+            candidate_version_id: candidate_version_id.to_owned(),
+            compatible: diagnostics.is_empty(),
+            diagnostics,
         })
     }
 
@@ -4667,6 +4743,130 @@ fn active_revision_on(
         .map_err(Into::into)
 }
 
+fn program_version_analysis_on(
+    connection: &Connection,
+    version_id: &str,
+) -> StoreResult<(String, Value)> {
+    let (program_id, analysis_summary_json) = connection
+        .query_row(
+            r#"
+            SELECT program_id, analysis_summary
+            FROM program_versions
+            WHERE version_id = ?1
+            "#,
+            [version_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::Conflict("program version does not exist".to_owned()))?;
+    let analysis_summary = serde_json::from_str::<Value>(&analysis_summary_json)?;
+    Ok((program_id, analysis_summary))
+}
+
+fn compare_revision_summaries(
+    active: &Value,
+    candidate: &Value,
+    diagnostics: &mut Vec<RevisionCompatibilityDiagnostic>,
+) {
+    let active_workflow = active.get("workflow").and_then(Value::as_str);
+    let candidate_workflow = candidate.get("workflow").and_then(Value::as_str);
+    match (active_workflow, candidate_workflow) {
+        (Some(active_workflow), Some(candidate_workflow))
+            if active_workflow != candidate_workflow =>
+        {
+            diagnostics.push(revision_compatibility_diagnostic(
+                "revision.root_workflow_changed",
+                format!(
+                    "candidate root workflow `{candidate_workflow}` does not match active root `{active_workflow}`"
+                ),
+                Some(candidate_workflow),
+            ));
+        }
+        (None, _) => diagnostics.push(revision_compatibility_diagnostic(
+            "revision.active_analysis_missing",
+            "active version does not include revision analysis metadata".to_owned(),
+            None,
+        )),
+        (_, None) => diagnostics.push(revision_compatibility_diagnostic(
+            "revision.candidate_analysis_missing",
+            "candidate version does not include revision analysis metadata".to_owned(),
+            None,
+        )),
+        _ => {}
+    }
+
+    compare_contracts("input", true, active, candidate, diagnostics);
+    compare_contracts("output", false, active, candidate, diagnostics);
+    compare_contracts("failure", false, active, candidate, diagnostics);
+}
+
+fn compare_contracts(
+    kind: &str,
+    reject_candidate_additions: bool,
+    active: &Value,
+    candidate: &Value,
+    diagnostics: &mut Vec<RevisionCompatibilityDiagnostic>,
+) {
+    let active_contracts = contracts_by_name(active, kind);
+    let candidate_contracts = contracts_by_name(candidate, kind);
+    for (name, active_ty) in &active_contracts {
+        match candidate_contracts.get(name) {
+            Some(candidate_ty) if candidate_ty == active_ty => {}
+            Some(candidate_ty) => diagnostics.push(revision_compatibility_diagnostic(
+                "revision.contract_changed",
+                format!("{kind} contract `{name}` changed from `{active_ty}` to `{candidate_ty}`"),
+                Some(name.as_str()),
+            )),
+            None => diagnostics.push(revision_compatibility_diagnostic(
+                "revision.contract_removed",
+                format!("{kind} contract `{name}` is missing from the candidate version"),
+                Some(name.as_str()),
+            )),
+        }
+    }
+    if reject_candidate_additions {
+        for (name, candidate_ty) in candidate_contracts {
+            if !active_contracts.contains_key(&name) {
+                diagnostics.push(revision_compatibility_diagnostic(
+                    "revision.input_contract_added",
+                    format!(
+                        "candidate adds input contract `{name}` with type `{candidate_ty}` to an already-started instance"
+                    ),
+                    Some(name.as_str()),
+                ));
+            }
+        }
+    }
+}
+
+fn contracts_by_name(summary: &Value, kind: &str) -> BTreeMap<String, String> {
+    summary
+        .get("workflow_contracts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|contract| contract.get("kind").and_then(Value::as_str) == Some(kind))
+        .filter_map(|contract| {
+            Some((
+                contract.get("name")?.as_str()?.to_owned(),
+                contract.get("type")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect()
+}
+
+fn revision_compatibility_diagnostic(
+    code: &str,
+    message: String,
+    subject: Option<&str>,
+) -> RevisionCompatibilityDiagnostic {
+    RevisionCompatibilityDiagnostic {
+        code: code.to_owned(),
+        message,
+        subject: subject.map(str::to_owned),
+    }
+}
+
 fn normalize_cancellation_policy(policy: &str) -> StoreResult<&'static str> {
     match policy {
         "keep" => Ok("keep"),
@@ -6886,6 +7086,111 @@ mod tests {
             Some(child_version.version_id.as_str())
         );
         assert_eq!(after_revision.child_revision_epoch, Some(0));
+    }
+
+    #[test]
+    fn revision_compatibility_accepts_same_root_and_additive_terminals() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let active_summary = json!({
+            "workflow": "Compat",
+            "workflow_contracts": [
+                {"kind": "input", "name": "request", "type": "ref<Request>"},
+                {"kind": "output", "name": "done", "type": "ref<Result>"},
+                {"kind": "failure", "name": "failed", "type": "ref<Failure>"}
+            ]
+        })
+        .to_string();
+        let candidate_summary = json!({
+            "workflow": "Compat",
+            "workflow_contracts": [
+                {"kind": "input", "name": "request", "type": "ref<Request>"},
+                {"kind": "output", "name": "done", "type": "ref<Result>"},
+                {"kind": "output", "name": "skipped", "type": "ref<Result>"},
+                {"kind": "failure", "name": "failed", "type": "ref<Failure>"}
+            ]
+        })
+        .to_string();
+        let active_version = store
+            .create_program_version(NewProgramVersion {
+                analysis_summary_json: &active_summary,
+                ..test_program_version("Compat", "source-1", "ir-1")
+            })
+            .expect("active version creates");
+        let candidate_version = store
+            .create_program_version(NewProgramVersion {
+                analysis_summary_json: &candidate_summary,
+                ..test_program_version("Compat", "source-2", "ir-2")
+            })
+            .expect("candidate version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &active_version.program_id,
+                version_id: &active_version.version_id,
+                input_json: r#"{"request":{"id":"1"}}"#,
+            })
+            .expect("instance creates");
+
+        let report = store
+            .analyze_revision_compatibility(&instance.instance_id, &candidate_version.version_id)
+            .expect("compatibility report");
+        assert!(report.compatible);
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn revision_compatibility_reports_root_and_contract_breaks() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let active_summary = json!({
+            "workflow": "Compat",
+            "workflow_contracts": [
+                {"kind": "input", "name": "request", "type": "ref<Request>"},
+                {"kind": "output", "name": "done", "type": "ref<Result>"},
+                {"kind": "failure", "name": "failed", "type": "ref<Failure>"}
+            ]
+        })
+        .to_string();
+        let candidate_summary = json!({
+            "workflow": "Other",
+            "workflow_contracts": [
+                {"kind": "input", "name": "request", "type": "ref<ChangedRequest>"},
+                {"kind": "input", "name": "extra", "type": "string"},
+                {"kind": "failure", "name": "failed", "type": "ref<Failure>"}
+            ]
+        })
+        .to_string();
+        let active_version = store
+            .create_program_version(NewProgramVersion {
+                analysis_summary_json: &active_summary,
+                ..test_program_version("CompatBreak", "source-1", "ir-1")
+            })
+            .expect("active version creates");
+        let candidate_version = store
+            .create_program_version(NewProgramVersion {
+                analysis_summary_json: &candidate_summary,
+                ..test_program_version("CompatBreak", "source-2", "ir-2")
+            })
+            .expect("candidate version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &active_version.program_id,
+                version_id: &active_version.version_id,
+                input_json: r#"{"request":{"id":"1"}}"#,
+            })
+            .expect("instance creates");
+
+        let report = store
+            .analyze_revision_compatibility(&instance.instance_id, &candidate_version.version_id)
+            .expect("compatibility report");
+        assert!(!report.compatible);
+        let codes = report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(codes.contains("revision.root_workflow_changed"));
+        assert!(codes.contains("revision.contract_changed"));
+        assert!(codes.contains("revision.input_contract_added"));
+        assert!(codes.contains("revision.contract_removed"));
     }
 
     #[test]
