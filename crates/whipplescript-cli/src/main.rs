@@ -1468,8 +1468,11 @@ fn worker(options: &CliOptions) -> ExitCode {
         Ok(report) if options.json => emit_json(worker_report_to_json(&report)),
         Ok(report) => {
             println!(
-                "worker {} ran={} provider={}",
-                report.instance_id, report.ran_effects, report.provider
+                "worker {} ran={} provider={} cancellation_diagnostics={}",
+                report.instance_id,
+                report.ran_effects,
+                report.provider,
+                report.cancellation_diagnostics
             );
             ExitCode::SUCCESS
         }
@@ -1583,17 +1586,23 @@ struct WorkerReport {
     instance_id: String,
     provider: String,
     ran_effects: usize,
+    cancellation_diagnostics: usize,
     terminal_events: Vec<String>,
 }
 
 fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerReport, StoreError> {
-    let store = SqliteStore::open(store_path)?;
-    let claimable = store.claimable_effects(&options.instance_id)?;
     let mut report = WorkerReport {
         instance_id: options.instance_id.clone(),
         provider: options.provider.clone(),
         ..WorkerReport::default()
     };
+    report.cancellation_diagnostics = record_unsupported_running_cancellations(
+        store_path,
+        &options.instance_id,
+        &options.provider,
+    )?;
+    let store = SqliteStore::open(store_path)?;
+    let claimable = store.claimable_effects(&options.instance_id)?;
     for effect in claimable {
         let terminal = match effect.kind.as_str() {
             "agent.tell" => run_agent_effect(store_path, &options.instance_id, &effect, options)?,
@@ -1613,6 +1622,64 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
         report.terminal_events.push(terminal.event_id);
     }
     Ok(report)
+}
+
+fn record_unsupported_running_cancellations(
+    store_path: &Path,
+    instance_id: &str,
+    provider: &str,
+) -> Result<usize, StoreError> {
+    let store = SqliteStore::open(store_path)?;
+    let requests = store.list_effect_cancellation_requests(instance_id)?;
+    let open_requests = requests
+        .iter()
+        .filter(|request| request.status == "requested")
+        .map(|request| (request.effect_id.as_str(), request))
+        .collect::<BTreeMap<_, _>>();
+    if open_requests.is_empty() {
+        return Ok(0);
+    }
+
+    let mut recorded = 0;
+    for run in store
+        .list_runs(instance_id)?
+        .into_iter()
+        .filter(|run| run.status == "running" && run.cancel_requested)
+    {
+        let Some(request) = open_requests.get(run.effect_id.as_str()) else {
+            continue;
+        };
+        let message = format!(
+            "provider `{provider}` does not support out-of-band cancellation; effect `{}` remains running until the provider exits, times out, or lease recovery resolves it",
+            run.effect_id
+        );
+        let idempotency_key = format!(
+            "provider-cancellation-unsupported:{}:{}:{}",
+            request.request_id, run.run_id, provider
+        );
+        store.record_diagnostic(DiagnosticRecord {
+            instance_id: Some(instance_id),
+            program_id: None,
+            program_version_id: None,
+            severity: "warning",
+            code: Some("provider.cancellation.unsupported"),
+            message: &message,
+            source_span_json: None,
+            subject_type: Some("effect"),
+            subject_id: Some(&run.effect_id),
+            event_id: request.causation_event_id.as_deref(),
+            effect_id: Some(&run.effect_id),
+            run_id: Some(&run.run_id),
+            assertion_id: None,
+            evidence_ids_json: "[]",
+            artifact_ids_json: "[]",
+            causation_id: Some(&request.request_id),
+            correlation_id: request.revision_id.as_deref(),
+            idempotency_key: Some(&idempotency_key),
+        })?;
+        recorded += 1;
+    }
+    Ok(recorded)
 }
 
 fn run_agent_effect(
@@ -5696,6 +5763,7 @@ fn worker_report_to_json(report: &WorkerReport) -> Value {
         "instance_id": report.instance_id,
         "provider": report.provider,
         "ran_effects": report.ran_effects,
+        "cancellation_diagnostics": report.cancellation_diagnostics,
         "terminal_events": report.terminal_events,
     })
 }

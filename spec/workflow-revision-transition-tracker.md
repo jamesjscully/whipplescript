@@ -454,7 +454,7 @@ state.
 - [ ] Implement running cancel-request behavior:
   - [ ] agent harness observes cancellation request before launch where possible
   - [ ] long-running providers can be asked to stop where supported
-  - [ ] unsupported providers leave visible diagnostics and keep recoverable
+  - [x] unsupported providers leave visible diagnostics and keep recoverable
     lease state
   - [x] late provider completion after cancel-request records the real terminal
     outcome
@@ -494,6 +494,10 @@ Stage 5 partial audit notes:
 - The same request-running coverage now completes the requested effect with a
   late real provider success and verifies that the cancellation request resolves
   to `terminal` while the effect records `completed`.
+- The worker now records an idempotent warning diagnostic when it sees a running
+  cancellation request for a provider without out-of-band cancellation support;
+  the effect and lease remain running/recoverable until the real provider
+  terminal path or lease recovery resolves them.
 - A queued-cancel revision now has CLI coverage showing that queued old-version
   effects become terminal `cancelled` effects and produce a conforming trace
   cancellation record.

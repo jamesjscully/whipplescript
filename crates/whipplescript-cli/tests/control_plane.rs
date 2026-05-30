@@ -1108,6 +1108,40 @@ rule noop_v2
             == Some("effect_cancelled")
     }));
 
+    let worker = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "worker",
+            instance_id,
+        ],
+    );
+    assert_eq!(worker.get("ran_effects").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        worker
+            .get("cancellation_diagnostics")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    let diagnostics = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "diagnostics",
+            instance_id,
+        ],
+    );
+    let diagnostics = diagnostics.as_array().expect("diagnostics array");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(Value::as_str) == Some("provider.cancellation.unsupported")
+            && diagnostic.get("effect_id").and_then(Value::as_str) == Some(effect_id.as_str())
+            && diagnostic.get("run_id").and_then(Value::as_str) == Some("run-running-cancel")
+    }));
+
     let mut store = SqliteStore::open(&store_path).expect("open store");
     store
         .complete_effect(EffectCompletion {
