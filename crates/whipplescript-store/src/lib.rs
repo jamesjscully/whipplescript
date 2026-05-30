@@ -82,6 +82,17 @@ pub struct ProgramVersionRecord {
     pub version_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramVersionView {
+    pub program_id: String,
+    pub program_name: String,
+    pub version_id: String,
+    pub source_hash: String,
+    pub ir_hash: String,
+    pub compiler_version: String,
+    pub analysis_summary_json: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NewInstance<'a> {
     pub program_id: &'a str,
@@ -840,6 +851,39 @@ impl SqliteStore {
             program_id,
             version_id,
         })
+    }
+
+    pub fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT
+                    program_versions.program_id,
+                    programs.name,
+                    program_versions.version_id,
+                    program_versions.source_hash,
+                    program_versions.ir_hash,
+                    program_versions.compiler_version,
+                    program_versions.analysis_summary
+                FROM program_versions
+                JOIN programs ON programs.program_id = program_versions.program_id
+                WHERE program_versions.version_id = ?1
+                "#,
+                [version_id],
+                |row| {
+                    Ok(ProgramVersionView {
+                        program_id: row.get(0)?,
+                        program_name: row.get(1)?,
+                        version_id: row.get(2)?,
+                        source_hash: row.get(3)?,
+                        ir_hash: row.get(4)?,
+                        compiler_version: row.get(5)?,
+                        analysis_summary_json: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn create_instance(&self, instance: NewInstance<'_>) -> StoreResult<InstanceRecord> {

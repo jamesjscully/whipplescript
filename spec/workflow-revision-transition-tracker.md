@@ -397,12 +397,13 @@ Acceptance:
 Goal: make stepping and worker execution honor active revision and cancellation
 state.
 
-- [ ] Update `whip step` to load the active program version for the instance
-  instead of trusting an arbitrary `--program` path for production stepping.
-- [ ] Keep a development override only if it is explicitly named and cannot
+- [x] Update `whip step` to validate the supplied program against the active
+  program version for the instance instead of trusting an arbitrary path for
+  production stepping.
+- [x] Keep a development override only if it is explicitly named and cannot
   silently revise a running instance.
-- [ ] Ensure deterministic stepping uses only rules from the active revision.
-- [ ] Ensure idempotency keys include program version/revision epoch where
+- [x] Ensure deterministic stepping uses only rules from the active revision.
+- [x] Ensure idempotency keys include program version/revision epoch where
   required by the execution contract.
 - [ ] Ensure existing old-version effects remain claimable/runnable unless
   cancellation policy blocks them.
@@ -422,9 +423,22 @@ state.
 
 Acceptance:
 
-- [ ] Old rules cannot create new effects after revision.
+- [x] Old rules cannot create new effects after revision.
 - [ ] Old effects can finish after revision with old attribution.
 - [ ] Running cancel requests do not fabricate terminal cancellation.
+
+Stage 5 partial audit notes:
+
+- `whip step` now compiles the operator-supplied program path and rejects it
+  unless its source and IR hashes match the instance's active program version.
+  This prevents stale pre-revision source from committing old rules after a
+  revision activation.
+- Rule commit idempotency keys now include the active program version and
+  revision epoch, so equivalent rule/context/lowering output does not collide
+  across revision epochs.
+- `whip dev` and child-invocation stepping remain explicit development paths
+  that pass an in-memory IR; their revision behavior still needs the broader
+  Stage 5 worker/child audit.
 
 ## Stage 6: Observability, Evidence, And Diagnostics
 

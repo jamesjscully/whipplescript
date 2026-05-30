@@ -1095,18 +1095,29 @@ fn step(options: &CliOptions) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (_source, ir) = match compile_source_path_with_root(
+    let (source, ir) = match compile_source_path_with_root(
         &step_options.program_path,
         step_options.root.as_deref(),
     ) {
         Ok(compiled) => compiled,
         Err(error) => return report_compile_failure(&step_options.program_path, error),
     };
+    let active_version_id = match validate_step_program_version(
+        &options.store_path,
+        &step_options.instance_id,
+        &step_options.program_path,
+        &source,
+        &ir,
+    ) {
+        Ok(active_version_id) => active_version_id,
+        Err(error) => return report_store_error("failed to validate step program", error),
+    };
     match step_instance(
         &options.store_path,
         &step_options.instance_id,
         &ir,
         Some(Path::new(&step_options.program_path)),
+        Some(&active_version_id),
     ) {
         Ok(report) if options.json => emit_json(step_report_to_json(&report)),
         Ok(report) => {
@@ -1138,6 +1149,37 @@ fn step(options: &CliOptions) -> ExitCode {
         }
         Err(error) => report_store_error("failed to step instance", error),
     }
+}
+
+fn validate_step_program_version(
+    store_path: &Path,
+    instance_id: &str,
+    program_path: &str,
+    source: &str,
+    ir: &IrProgram,
+) -> Result<String, StoreError> {
+    let store = SqliteStore::open(store_path)?;
+    let instance = store
+        .get_instance(instance_id)?
+        .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))?;
+    let active_version = store
+        .get_program_version(&instance.version_id)?
+        .ok_or_else(|| StoreError::Conflict("active program version does not exist".to_owned()))?;
+    let snapshot = ir.to_snapshot();
+    let source_hash = stable_hash_hex(source);
+    let ir_hash = stable_hash_hex(&snapshot);
+    if source_hash != active_version.source_hash || ir_hash != active_version.ir_hash {
+        return Err(StoreError::Conflict(format!(
+            "step program `{program_path}` does not match active version {} at epoch {} (expected source_hash={} ir_hash={}, got source_hash={} ir_hash={}); activate the candidate with `whip revise` before stepping it",
+            active_version.version_id,
+            instance.revision_epoch,
+            active_version.source_hash,
+            active_version.ir_hash,
+            source_hash,
+            ir_hash
+        )));
+    }
+    Ok(active_version.version_id)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1173,7 +1215,6 @@ impl StepOptions {
                     return Err(format!("unknown step option `{other}`"));
                 }
                 value if instance_id.is_none() => instance_id = Some(value.to_owned()),
-                value if program_path.is_none() => program_path = Some(value.to_owned()),
                 _ => return Err("usage: whip step <instance> --program <workflow.whip>".to_owned()),
             }
             index += 1;
@@ -1291,6 +1332,7 @@ fn step_instance(
     instance_id: &str,
     ir: &IrProgram,
     source_path: Option<&Path>,
+    active_version_guard: Option<&str>,
 ) -> Result<StepReport, StoreError> {
     let mut report = StepReport {
         instance_id: instance_id.to_owned(),
@@ -1300,11 +1342,22 @@ fn step_instance(
     while made_progress {
         made_progress = false;
         let store = SqliteStore::open(store_path)?;
-        if let Some(status) = store.status(instance_id)? {
-            if status.instance.status != "running" {
-                break;
+        let status = store
+            .status(instance_id)?
+            .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))?;
+        if status.instance.status != "running" {
+            break;
+        }
+        if let Some(active_version_guard) = active_version_guard {
+            if status.instance.version_id != active_version_guard {
+                return Err(StoreError::Conflict(format!(
+                    "active version changed during step from {active_version_guard} to {}; rerun `whip step` with the active program",
+                    status.instance.version_id
+                )));
             }
         }
+        let active_version_id = status.instance.version_id;
+        let active_revision_epoch = status.instance.revision_epoch.to_string();
         let events = store.list_events(instance_id)?;
         let facts = store.list_facts(instance_id)?;
         let all_facts = store.list_facts_including_consumed(instance_id)?;
@@ -1359,6 +1412,8 @@ fn step_instance(
                 let lowering_key = lowering_idempotency_key(&lowering);
                 let commit_key = idempotency_key(&[
                     instance_id,
+                    &active_version_id,
+                    &active_revision_epoch,
                     &rule.name,
                     context.identity.as_deref().unwrap_or("started"),
                     &lowering_key,
@@ -2260,6 +2315,7 @@ fn run_workflow_invoke_effect(
             &child_instance_id,
             &child_ir,
             Some(program_path),
+            None,
         )?;
         let child_worker = WorkerOptions {
             instance_id: child_instance_id.clone(),
@@ -2638,6 +2694,7 @@ fn dev(options: &CliOptions) -> ExitCode {
             &started.instance_id,
             &ir,
             Some(Path::new(&dev_options.program_path)),
+            None,
         ) {
             Ok(report) => report,
             Err(error) => return report_store_error("failed to step instance", error),

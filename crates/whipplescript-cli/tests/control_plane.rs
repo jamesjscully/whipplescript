@@ -594,6 +594,140 @@ rule noop_v2
 }
 
 #[test]
+fn step_rejects_stale_program_after_revision() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("step-revision-v1");
+    let v2 = temp_workflow_path("step-revision-v2");
+    fs::write(
+        &v1,
+        r#"
+workflow StepRevision
+
+class Marker {
+  version string
+}
+
+rule seed_v1
+  when started
+=> {
+  record Marker {
+    version "v1"
+  }
+}
+"#,
+    )
+    .expect("write v1 workflow");
+    fs::write(
+        &v2,
+        r#"
+workflow StepRevision
+
+class Marker {
+  version string
+}
+
+rule seed_v2
+  when started
+=> {
+  record Marker {
+    version "v2"
+  }
+}
+"#,
+    )
+    .expect("write v2 workflow");
+
+    let started = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "run",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "revise",
+            instance_id,
+            v2.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+
+    let stale_step = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "step",
+            instance_id,
+            "--program",
+            v1.to_str().expect("utf-8 workflow path"),
+        ])
+        .output()
+        .expect("command runs");
+    assert!(!stale_step.status.success());
+    let stderr = String::from_utf8_lossy(&stale_step.stderr);
+    assert!(stderr.contains("does not match active version"), "{stderr}");
+
+    let step = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "step",
+            instance_id,
+            "--program",
+            v2.to_str().expect("utf-8 workflow path"),
+        ],
+    );
+    assert_eq!(step.get("committed_rules").and_then(Value::as_u64), Some(1));
+
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+    assert!(facts.iter().any(|fact| {
+        fact.get("name").and_then(Value::as_str) == Some("Marker")
+            && fact
+                .get("value")
+                .and_then(|value| value.get("version"))
+                .and_then(Value::as_str)
+                == Some("v2")
+    }));
+    assert!(!facts.iter().any(|fact| {
+        fact.get("name").and_then(Value::as_str) == Some("Marker")
+            && fact
+                .get("value")
+                .and_then(|value| value.get("version"))
+                .and_then(Value::as_str)
+                == Some("v1")
+    }));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(v1);
+    let _ = fs::remove_file(v2);
+}
+
+#[test]
 fn revise_dry_run_reports_incompatible_root_without_mutating() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
@@ -3595,6 +3729,7 @@ rule accept
             "--json",
             "step",
             &instance_id,
+            "--program",
             source_path.to_str().expect("utf-8 source path"),
         ],
     );
