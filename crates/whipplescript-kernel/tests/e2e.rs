@@ -11,8 +11,9 @@ use whipplescript_kernel::{
 };
 use whipplescript_parser::compile_program;
 use whipplescript_store::{
-    EffectCompletion, NewEffect, NewEffectDependency, NewFact, ProgramVersionRecord,
-    RevisionActivation, RuleCommit, RunStart, SqliteStore, StoreError,
+    EffectCompletion, NewEffect, NewEffectDependency, NewFact, NewWorkflowInvocation,
+    ProgramVersionRecord, RevisionActivation, RuleCommit, RunStart, SqliteStore, StoreError,
+    WorkflowTerminal, WorkflowTerminalKind,
 };
 
 #[test]
@@ -997,6 +998,213 @@ fn e2e_revision_running_cancel_request_allows_late_terminal() {
         .expect("cancellation requests list");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].status, "terminal");
+}
+
+#[test]
+fn e2e_parent_revision_preserves_running_child_invocation() {
+    let (mut kernel, parent_id, parent_v1, parent_v2) = revision_kernel("ParentRevisionE2E");
+    let child_v1 = revision_program_version(&mut kernel, "ChildRevisionE2E", "child_v1");
+    let child_id = kernel
+        .create_instance(&child_v1, r#"{"task":"child"}"#)
+        .expect("child instance creates");
+    commit_single_effect(
+        &mut kernel,
+        &parent_id,
+        effect(
+            "invoke-child",
+            "workflow.invoke",
+            r#"{"workflow":"ChildRevisionE2E"}"#,
+        ),
+        "invoke_child",
+    );
+    kernel
+        .start_run(RunStart {
+            instance_id: &parent_id,
+            effect_id: "invoke-child",
+            run_id: "run-invoke-child",
+            provider: "workflow",
+            worker_id: "worker-1",
+            lease_id: "lease-invoke-child",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        })
+        .expect("parent invocation run starts");
+    kernel
+        .record_workflow_invocation(NewWorkflowInvocation {
+            invocation_id: "inv-parent-running-child",
+            parent_instance_id: &parent_id,
+            parent_effect_id: "invoke-child",
+            child_instance_id: &child_id,
+            target_workflow: "ChildRevisionE2E",
+            input_json: r#"{"task":"child"}"#,
+            source_span_json: None,
+            idempotency_key: "inv-parent-running-child",
+        })
+        .expect("invocation records");
+    commit_single_effect(
+        &mut kernel,
+        &child_id,
+        effect("child-turn", "agent.tell", r#"{"prompt":"child"}"#),
+        "child_dispatch",
+    );
+    kernel
+        .start_run(RunStart {
+            instance_id: &child_id,
+            effect_id: "child-turn",
+            run_id: "run-child-turn",
+            provider: "mock-agent",
+            worker_id: "worker-1",
+            lease_id: "lease-child-turn",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        })
+        .expect("child run starts");
+
+    kernel
+        .activate_revision(RevisionActivation {
+            instance_id: &parent_id,
+            from_version_id: &parent_v1.version_id,
+            to_version_id: &parent_v2.version_id,
+            activation_policy_json: r#"{"test":"parent"}"#,
+            cancellation_policy: "keep",
+            idempotency_key: Some("e2e-revision-parent"),
+        })
+        .expect("parent revision activates");
+
+    assert_e2e_trace("revision-parent-child-running", &kernel);
+    let invocation = kernel
+        .get_workflow_invocation(&parent_id, "invoke-child")
+        .expect("invocation loads")
+        .expect("invocation exists");
+    assert_eq!(
+        invocation.parent_program_version_id.as_deref(),
+        Some(parent_v1.version_id.as_str())
+    );
+    assert_eq!(invocation.parent_revision_epoch, 0);
+    assert_eq!(
+        invocation.parent_active_program_version_id.as_deref(),
+        Some(parent_v2.version_id.as_str())
+    );
+    assert_eq!(invocation.parent_active_revision_epoch, Some(1));
+    assert_eq!(
+        invocation.child_program_version_id.as_deref(),
+        Some(child_v1.version_id.as_str())
+    );
+    assert_eq!(invocation.child_active_revision_epoch, Some(0));
+    assert_eq!(invocation.status, "running");
+}
+
+#[test]
+fn e2e_child_revision_parent_observes_terminal_output() {
+    let (mut kernel, parent_id, parent_v1, _parent_v2) = revision_kernel("ParentObserveE2E");
+    let child_v1 = revision_program_version(&mut kernel, "ChildObserveE2E", "child_v1");
+    let child_v2 = revision_program_version(&mut kernel, "ChildObserveE2E", "child_v2");
+    let child_id = kernel
+        .create_instance(&child_v1, r#"{"task":"child"}"#)
+        .expect("child instance creates");
+    commit_single_effect(
+        &mut kernel,
+        &parent_id,
+        effect(
+            "invoke-child",
+            "workflow.invoke",
+            r#"{"workflow":"ChildObserveE2E"}"#,
+        ),
+        "invoke_child",
+    );
+    kernel
+        .start_run(RunStart {
+            instance_id: &parent_id,
+            effect_id: "invoke-child",
+            run_id: "run-observe-child",
+            provider: "workflow",
+            worker_id: "worker-1",
+            lease_id: "lease-observe-child",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        })
+        .expect("parent invocation run starts");
+    kernel
+        .record_workflow_invocation(NewWorkflowInvocation {
+            invocation_id: "inv-parent-observe-child",
+            parent_instance_id: &parent_id,
+            parent_effect_id: "invoke-child",
+            child_instance_id: &child_id,
+            target_workflow: "ChildObserveE2E",
+            input_json: r#"{"task":"child"}"#,
+            source_span_json: None,
+            idempotency_key: "inv-parent-observe-child",
+        })
+        .expect("invocation records");
+
+    kernel
+        .activate_revision(RevisionActivation {
+            instance_id: &child_id,
+            from_version_id: &child_v1.version_id,
+            to_version_id: &child_v2.version_id,
+            activation_policy_json: r#"{"test":"child"}"#,
+            cancellation_policy: "keep",
+            idempotency_key: Some("e2e-revision-child"),
+        })
+        .expect("child revision activates");
+    kernel
+        .commit_rule(RuleCommit {
+            instance_id: &child_id,
+            rule: "complete_child",
+            trigger_event_id: None,
+            facts: &[],
+            consumed_fact_ids: &[],
+            effects: &[],
+            dependencies: &[],
+            terminal: Some(WorkflowTerminal {
+                kind: WorkflowTerminalKind::Completed,
+                name: "result",
+                payload_json: r#"{"summary":"done"}"#,
+                idempotency_key: Some("child-terminal"),
+            }),
+            idempotency_key: Some("commit-child-terminal"),
+        })
+        .expect("child workflow completes");
+    kernel
+        .complete_run(EffectCompletion {
+            instance_id: &parent_id,
+            effect_id: "invoke-child",
+            run_id: "run-observe-child",
+            provider: "workflow",
+            worker_id: "worker-1",
+            status: "ignored",
+            exit_code: Some(0),
+            summary: Some("child workflow completed"),
+            metadata_json: r#"{"terminal":{"result":{"summary":"done"}}}"#,
+            idempotency_key: Some("complete-parent-invocation"),
+        })
+        .expect("parent observes child terminal output");
+
+    assert_e2e_trace("revision-child-observed", &kernel);
+    let store = kernel.into_store();
+    let invocation = store
+        .get_workflow_invocation(&parent_id, "invoke-child")
+        .expect("invocation loads")
+        .expect("invocation exists");
+    assert_eq!(
+        invocation.parent_program_version_id.as_deref(),
+        Some(parent_v1.version_id.as_str())
+    );
+    assert_eq!(
+        invocation.child_program_version_id.as_deref(),
+        Some(child_v1.version_id.as_str())
+    );
+    assert_eq!(
+        invocation.child_active_program_version_id.as_deref(),
+        Some(child_v2.version_id.as_str())
+    );
+    assert_eq!(invocation.child_active_revision_epoch, Some(1));
+    assert_eq!(invocation.status, "completed");
+    let child = store
+        .get_instance(&child_id)
+        .expect("child loads")
+        .expect("child exists");
+    assert_eq!(child.status, "completed");
 }
 
 fn kernel_from_source(name: &str, source: &str) -> (RuntimeKernel, String) {

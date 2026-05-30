@@ -19,9 +19,10 @@ use whipplescript_parser::{
 use whipplescript_store::{
     ArtifactRecord, ClaimableEffect, DerivedFact, EffectCancellation, EffectCompletion,
     EvidenceRecord, ExpiredLease, InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent,
-    NewFact, NewInboxItem, NewInstance, NewProgramVersion, ProgramVersionRecord, RetryEffect,
-    RevisionActivation, RuleCommit, RunStart, SkillEvidence, SqliteStore, StoreError, StoreResult,
-    StoredEvent, TerminalDiagnosticRecord, WorkflowRevisionView,
+    NewFact, NewInboxItem, NewInstance, NewProgramVersion, NewWorkflowInvocation,
+    ProgramVersionRecord, RetryEffect, RevisionActivation, RuleCommit, RunStart, SkillEvidence,
+    SqliteStore, StoreError, StoreResult, StoredEvent, TerminalDiagnosticRecord,
+    WorkflowInvocationView, WorkflowRevisionView,
 };
 
 pub struct RuntimeKernel {
@@ -294,6 +295,22 @@ impl RuntimeKernel {
             });
         }
         Ok(revision)
+    }
+
+    pub fn record_workflow_invocation(
+        &self,
+        invocation: NewWorkflowInvocation<'_>,
+    ) -> StoreResult<()> {
+        self.store.record_workflow_invocation(invocation)
+    }
+
+    pub fn get_workflow_invocation(
+        &self,
+        parent_instance_id: &str,
+        parent_effect_id: &str,
+    ) -> StoreResult<Option<WorkflowInvocationView>> {
+        self.store
+            .get_workflow_invocation(parent_instance_id, parent_effect_id)
     }
 
     pub fn claimable_effects(&self, instance_id: &str) -> StoreResult<Vec<ClaimableEffect>> {

@@ -601,21 +601,21 @@ validation.
   - [x] activation with `--cancel queued`
   - [x] activation with `--cancel running`
   - [x] status/trace JSON after revision
-- [ ] Add e2e workflows:
+- [x] Add e2e workflows:
   - [x] v1 starts an agent turn, v2 changes future dispatch
   - [x] v1 queued effect is cancelled during revision
   - [x] v1 running effect receives cancel request and later completes/fails
-  - [ ] parent invokes child, parent revises while child is running
-  - [ ] child revises independently and parent observes terminal output
+  - [x] parent invokes child, parent revises while child is running
+  - [x] child revises independently and parent observes terminal output
 - [x] Add generated Maude fixture from a revision-aware compiled example.
-- [ ] Audit Stage 7 against formal model coverage, unit coverage, CLI coverage,
+- [x] Audit Stage 7 against formal model coverage, unit coverage, CLI coverage,
   and deterministic e2e; record flaky or provider-dependent gaps.
 
 Acceptance:
 
 - [x] `cargo test --workspace` covers revision happy and failure paths.
 - [x] `scripts/check-formal-models.sh` covers revision.
-- [ ] Deterministic fixture-provider e2e covers keep, queued-cancel, and
+- [x] Deterministic fixture-provider e2e covers keep, queued-cancel, and
   running-cancel-request policies.
 
 Stage 7 partial audit notes:
@@ -631,8 +631,16 @@ Stage 7 partial audit notes:
 - Kernel e2e coverage now exercises keep-policy old running work, queued
   cancellation, and running cancellation requests with late provider terminal
   completion/failure under trace conformance.
+- Parent/child e2e coverage now exercises a parent revision while a child
+  invocation is running and an independent child revision whose terminal output
+  is observed by the parent invocation effect.
 - `scripts/check-formal-models.sh` passed with the revision-aware Maude checks
   and TLA+/Apalache lifecycle model enabled.
+- Stage 7 audit result: complete. Unit, CLI, generated Maude, formal
+  Maude/TLA+, and deterministic kernel e2e coverage now cover the revision happy
+  paths, blocked compatibility paths, cancellation policies, stale source
+  rejection, diagnostics/evidence surfaces, and parent/child invocation
+  attribution.
 
 ## Stage 8: Docs, Examples, And validation
 
