@@ -3,6 +3,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT="${WHIPPLESCRIPT_REAL_PROVIDER_REPORT:-$ROOT/target/real-provider-smoke-report.md}"
+PREFLIGHT_REPORT="${WHIPPLESCRIPT_REAL_PROVIDER_PREFLIGHT_REPORT:-$ROOT/target/real-provider-preflight.jsonl}"
 OUTPUT="$(mktemp)"
 
 cleanup() {
@@ -22,7 +23,8 @@ env_state() {
 started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
 set +e
-"$ROOT/scripts/check-real-providers.sh" >"$OUTPUT" 2>&1
+WHIPPLESCRIPT_REAL_PROVIDER_PREFLIGHT_REPORT="$PREFLIGHT_REPORT" \
+  "$ROOT/scripts/check-real-providers.sh" >"$OUTPUT" 2>&1
 status=$?
 set -e
 
@@ -52,6 +54,15 @@ mkdir -p "$(dirname "$REPORT")"
   echo "- Codex smoke model override: $(env_state WHIPPLESCRIPT_CODEX_MODEL)"
   echo "- Codex smoke profile override: $(env_state WHIPPLESCRIPT_CODEX_PROFILE)"
   echo "- Codex smoke report override: $(env_state WHIPPLESCRIPT_CODEX_SMOKE_REPORT)"
+  echo "- Preflight JSONL: $PREFLIGHT_REPORT"
+  echo
+  echo "## Boundary Preflight"
+  echo
+  echo '```jsonl'
+  if [[ -f "$PREFLIGHT_REPORT" ]]; then
+    sed 's/```/` ` `/g' "$PREFLIGHT_REPORT"
+  fi
+  echo '```'
   echo
   echo "## Output"
   echo

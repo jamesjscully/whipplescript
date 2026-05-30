@@ -5903,6 +5903,42 @@ rule seed
         assertion.get("passed").and_then(Value::as_bool),
         Some(false)
     );
+    assert_eq!(
+        assertion
+            .pointer("/expected/predicate")
+            .and_then(Value::as_str),
+        Some("==")
+    );
+    assert_eq!(
+        assertion.pointer("/expected/left").and_then(Value::as_str),
+        Some("count(Seen)")
+    );
+    assert_eq!(
+        assertion.pointer("/expected/right").and_then(Value::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        assertion
+            .pointer("/actual_values/left")
+            .and_then(Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        assertion
+            .pointer("/actual_values/right")
+            .and_then(Value::as_i64),
+        Some(2)
+    );
+    assert_eq!(
+        assertion
+            .pointer("/actual_values/result")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        assertion.get("failure_reason").and_then(Value::as_str),
+        Some("predicate `==` evaluated to false")
+    );
 
     let instance_id = dev
         .get("instance_id")

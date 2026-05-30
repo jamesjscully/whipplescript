@@ -1783,13 +1783,17 @@ fn provider_metadata(result: &ProviderRunResult) -> String {
 
 fn provider_failure_json(failure: &ProviderFailure) -> serde_json::Value {
     json!({
+        "provider": failure.provider,
+        "adapter": failure.adapter,
         "phase": failure.phase,
         "error_kind": failure.error_kind,
         "message": failure.message,
         "recoverable": failure.recoverable,
         "retry_after": failure.retry_after,
+        "workspace_id": failure.workspace_id,
         "provider_session_id": failure.provider_session_id,
         "provider_thread_id": failure.provider_thread_id,
+        "missing_config_keys": failure.missing_config_keys,
         "raw": failure.raw_json.as_deref().map(json_from_str),
     })
 }
@@ -3136,6 +3140,30 @@ rule wait
                 && event
                     .payload_json
                     .contains("\"error_kind\":\"fixture_failure\"")));
+        let failed_turn: Value = events
+            .iter()
+            .find(|event| event.event_type == "agent.turn.failed")
+            .map(|event| serde_json::from_str(&event.payload_json).expect("payload parses"))
+            .expect("failed turn event exists");
+        assert_eq!(
+            failed_turn
+                .pointer("/failure/provider")
+                .and_then(Value::as_str),
+            Some("mock")
+        );
+        assert_eq!(
+            failed_turn
+                .pointer("/failure/adapter")
+                .and_then(Value::as_str),
+            Some("mock")
+        );
+        assert_eq!(
+            failed_turn
+                .pointer("/failure/missing_config_keys")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
 
         let evidence = store.list_evidence(&instance_id).expect("evidence lists");
         assert!(evidence

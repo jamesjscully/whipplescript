@@ -423,6 +423,24 @@ does not rewrite the parent invocation effect. Parent observation of child
 success, failure, timeout, or cancellation remains a single-shot terminal
 projection through the invocation effect.
 
+Root workflow retargeting, source-declared active fact migration,
+provider-specific native cancellation acknowledgement, and broader destructive
+revision policies are future control-plane operations. They must have their own
+atomic transaction boundaries and must preserve the same replay and
+single-terminal-outcome requirements as ordinary revision. In particular:
+
+- ordinary same-root revision must continue to reject candidate roots that do
+  not match the active instance root
+- active facts may be transformed or tombstoned only through a declared,
+  deterministic migration run recorded in the activation transaction
+- provider cancellation acknowledgements are evidence and lifecycle state, not
+  permission to duplicate or overwrite terminal effect outcomes
+- destructive policies require matching confirmation evidence tied to a dry-run
+  impact report
+
+Implementation requirements for those follow-ups are tracked in
+[workflow-revision-followups-tracker.md](workflow-revision-followups-tracker.md).
+
 ## Rule Advancement Loop
 
 Rule advancement is part of the control plane, but it is constrained by this

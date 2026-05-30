@@ -728,6 +728,13 @@ assert count(effect kind agent.tell where status == completed) == 6
 Assertions do not create user facts or effects. The runtime may record assertion
 results as diagnostics/evidence for CI and debugging.
 
+Machine-readable assertion reports must include the assertion expression, pass
+status, the final evaluated result, deterministic expected predicate metadata,
+actual evaluated values for the predicate when available, and a failure reason
+for failed/error assertions. For example, `assert count(Seen) == 2` reports the
+expected predicate `==`, the evaluated left/right values, and a stable reason
+when the predicate is false.
+
 ## Maude Modeling Target
 
 The first Maude expression model should be abstract and finite. It does not need

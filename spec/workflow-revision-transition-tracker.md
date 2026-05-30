@@ -32,6 +32,13 @@ without changing the source-level meaning of `pattern`, `apply`, `workflow`,
 | Generated checks | [x] | Per-program Maude checks assert active-version rule firing, stale-rule rejection, old-effect attribution, revision-cancelled `completes` release, and corrected `!=` operand lowering. |
 | Examples/e2e | [x] | Deterministic e2e covers keep, queued cancel, running cancel request, and parent/child revision; Stage 8 examples document the operator-facing flows. |
 
+Non-blocking vNext follow-ups from the final audit are tracked separately in
+[workflow-revision-followups-tracker.md](workflow-revision-followups-tracker.md).
+That tracker must not weaken the v0 contract here: ordinary revision remains a
+same-root operation, live fact migration is explicit, running cancellation
+requests are not terminal outcomes, and broader destructive policies require
+dedicated confirmation surfaces.
+
 ## Stage 10: Post-Audit Hardening
 
 Goal: close code-level safety gaps found by the implementation audit before
@@ -814,7 +821,8 @@ Stage 9 audit notes:
   [final-audit.md](final-audit.md): explicit root retargeting, source-declared
   live fact migration, provider-specific out-of-band cancellation depth, and
   confirmation flags for any future cancellation policy broader than
-  `keep|queued|running`.
+  `keep|queued|running`. The implementation-ready follow-up tracker is
+  [workflow-revision-followups-tracker.md](workflow-revision-followups-tracker.md).
 
 ## Stage 0 Decisions
 
@@ -835,6 +843,5 @@ Stage 9 audit notes:
 ## Next Implementation Slice
 
 No workflow-revision implementation slice remains. Future work should start
-from the non-blocking follow-ups in [final-audit.md](final-audit.md) or from a
-new tracker for retargeting, explicit fact migration, or provider-specific
-cancellation support.
+from the non-blocking follow-ups in
+[workflow-revision-followups-tracker.md](workflow-revision-followups-tracker.md).

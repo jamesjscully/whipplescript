@@ -203,7 +203,12 @@ scripts/check-real-providers-report.sh
 The report path defaults to `target/real-provider-smoke-report.md`. Set
 `WHIPPLESCRIPT_REAL_PROVIDER_REPORT` to write it elsewhere. The report records
 sensitive environment inputs as set/unset rather than values, then includes the
-command output for audit.
+command output for audit. The underlying readiness script also writes a JSONL
+boundary-preflight artifact at `target/real-provider-preflight.jsonl` by default;
+set `WHIPPLESCRIPT_REAL_PROVIDER_PREFLIGHT_REPORT` to choose another path. Each
+record names the provider, boundary phase, check id, status, and a redacted
+message, so config, adapter resolution, workspace preparation, launch, health,
+and result-validation failures are visible without scraping free-form output.
 
 The real-provider script verifies prerequisite tools, required environment,
 Loft fixture repo readiness when Loft is selected, including tracked spec

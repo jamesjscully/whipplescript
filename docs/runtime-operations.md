@@ -177,6 +177,14 @@ whip --store .whipplescript/dev.sqlite revise <instance> candidate.whip --root W
 It does not invent a terminal effect result; the provider, timeout, or recovery
 path still records the terminal outcome.
 
+Same-root revision is the v0 boundary. Changing the root workflow, migrating
+active facts across schema-breaking changes, using provider-specific native
+cancellation depth, or applying policies more destructive than queued/running
+cancellation must use future explicit operations with dry-run reports and
+dedicated confirmation flags. The implementation plan for those operations is
+tracked in
+[`../spec/workflow-revision-followups-tracker.md`](../spec/workflow-revision-followups-tracker.md).
+
 ## Inspecting State
 
 Common commands:

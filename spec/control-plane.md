@@ -19,7 +19,7 @@ Fact                 current materialized truth for an instance
 Effect               durable request for external work
 EffectEdge           durable dependency between two effects
 Run                  provider execution attempt for an effect
-CancellationRequest  durable request to stop or terminal-cancel old-version work
+CancellationRequest  durable request to stop old-version work that may have crossed a provider boundary
 Capability           registered external authority or effect surface
 Profile              policy bundle for agent/tool authority
 Runtime              daemon/control-plane process
@@ -178,6 +178,21 @@ because no provider work is in flight. Claimed or running effects receive a
 durable `CancellationRequest`; they become terminal only after provider/harness
 confirmation, timeout, or recovery. Revision must not fabricate a terminal
 provider result for work that already crossed the provider boundary.
+
+The following behaviors are vNext follow-ups, not part of ordinary v0
+revision:
+
+- changing the active root workflow of an instance
+- migrating active facts across schema-breaking revisions
+- using provider-specific native cancellation depth beyond durable request
+  recording
+- applying policies more destructive than `keep`, `queued`, or `running`
+
+Those behaviors require explicit control-plane surfaces, dry-run reports,
+formal-model coverage, evidence, and dedicated confirmation flags as tracked in
+[workflow-revision-followups-tracker.md](workflow-revision-followups-tracker.md).
+They must not be introduced as silent extensions of `whip revise --root` or a
+generic force flag.
 
 ## CLI Shape
 

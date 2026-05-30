@@ -467,6 +467,16 @@ Goal: wire the built-in effect families through the same contract system.
 - [ ] Capture harness failure events and evidence for config, auth, workspace,
   adapter, launch, request, stream, timeout, cancellation, result-validation, and
   artifact-capture failures.
+  - [x] Command-backed harnesses classify missing provider config, adapter
+    resolution, workspace preparation, launch, stdin/request submission,
+    wait/stream, timeout, nonzero exit, and structured stdout validation.
+  - [x] Real-provider readiness emits a redacted JSONL boundary preflight report
+    for selected providers.
+  - [x] Kernel terminal payloads expose structured boundary fields, including
+    provider, adapter, workspace id, session/thread ids, retry metadata, and
+    missing config keys.
+  - [ ] Real adapters still need provider-native cancellation and
+    artifact-capture failure coverage.
 - [ ] Normalize real provider lifecycle into `agent.turn.*` facts/events.
 - [ ] Implement a control-plane driver that materializes ready rules into facts
   and effect outbox entries before providers try to claim effects.
@@ -732,7 +742,8 @@ Goal: test the real system from source file to provider outcome.
   - Real-provider readiness now checks provider tools, required environment,
     Loft fixture repo cleanliness/tracked spec when Loft is selected, and
     BAML endpoint reachability when BAML is selected before any destructive flow
-    is attempted.
+    is attempted. It also writes `target/real-provider-preflight.jsonl` with
+    structured boundary classifications.
   - Read-only no-mock Loft `show` and no-mock BAML `coerce` smoke tests run
     when real-provider prerequisites are configured.
   - Kernel e2e tests export temp trace artifacts before checking conformance.
@@ -848,7 +859,8 @@ Acceptance:
 - [x] Optional real-provider smoke tests have been run and results documented.
   - `scripts/check-real-providers-report.sh` writes
     `target/real-provider-smoke-report.md` by default and preserves the
-    underlying `scripts/check-real-providers.sh` exit code.
+    underlying `scripts/check-real-providers.sh` exit code. It embeds the
+    structured real-provider preflight JSONL artifact.
   - `scripts/check-openai-coerce.sh` passed locally against the OpenAI-backed
     Coerce bridge using `OPENAI_API_KEY` from `.env`.
 - [x] Trace conformance runs over every e2e test.

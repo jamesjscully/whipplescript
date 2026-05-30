@@ -256,6 +256,32 @@ impact, and linked evidence. Effects and runs must include their
 `program_version_id` and `revision_epoch` so an operator can distinguish old
 work completing after a revision from work created by the active version.
 
+Future workflow revision follow-ups add distinct observability records rather
+than overloading ordinary revision fields. Trace and evidence exports for those
+features must expose:
+
+```text
+workflow_retargets
+fact_migration_runs
+cancellation_acknowledgements
+destructive_revision_confirmations
+```
+
+Retarget records must name old/new roots, old/new program versions, parent
+invocation compatibility, input mapping or mapping absence, active fact impact,
+and cancellation impact. Migration records must list consumed, produced,
+retained, tombstoned, and rejected facts with migration plan ids and source
+spans. Cancellation acknowledgements must include provider capability depth,
+provider/harness response, timeout state, evidence, and eventual terminal
+outcome when known. Destructive confirmations must include policy name,
+confirmation flag, dry-run impact hash, operator identity when available,
+reason, and evidence links.
+
+Trace conformance for these follow-ups must reject root changes without a
+retarget activation, migrated facts without a migration run, destructive
+activation without matching confirmation evidence, and duplicate terminal
+outcomes after provider cancellation acknowledgement races.
+
 Trace export is read-only and idempotent. Re-running `whip trace <instance>
 --json` over an unchanged store must produce the same logical records and stable
 ids, aside from allowed formatting/order normalization documented by the CLI.

@@ -1521,6 +1521,9 @@ struct AssertionReport {
     status: AssertionStatus,
     passed: bool,
     actual: Value,
+    actual_values: Value,
+    expected: Value,
+    failure_reason: Option<String>,
     error: Option<String>,
 }
 
@@ -3666,10 +3669,10 @@ fn eval_assertion(
     effects: &[EffectView],
 ) -> AssertionReport {
     let source = source.trim();
-    let (status, actual, error) = assertion_result(eval_expr_value(
-        expr,
-        &EvalScope::assertions(facts, effects, ir),
-    ));
+    let scope = EvalScope::assertions(facts, effects, ir);
+    let (status, actual, error) = assertion_result(eval_expr_value(expr, &scope));
+    let (expected, actual_values) = assertion_details(expr, &scope, &actual);
+    let failure_reason = assertion_failure_reason(expr, &status, error.as_deref());
     let passed = status == AssertionStatus::Passed;
     AssertionReport {
         expr: source.to_owned(),
@@ -3677,6 +3680,9 @@ fn eval_assertion(
         status,
         passed,
         actual,
+        actual_values,
+        expected,
+        failure_reason,
         error,
     }
 }
@@ -3710,6 +3716,87 @@ fn assertion_result(value: EvalValue) -> (AssertionStatus, Value, Option<String>
             json!({"internal": "Error", "message": message}),
             Some(message),
         ),
+    }
+}
+
+fn assertion_details(expr: &Expr, scope: &EvalScope<'_>, result: &Value) -> (Value, Value) {
+    if let Expr::Binary { op, left, right } = expr {
+        if assertion_binary_op_is_predicate(*op) {
+            return (
+                json!({
+                    "predicate": binary_op_label(*op),
+                    "left": left.to_snapshot(),
+                    "right": right.to_snapshot(),
+                }),
+                json!({
+                    "left": eval_expr_value(left, scope).into_json(),
+                    "right": eval_expr_value(right, scope).into_json(),
+                    "result": result,
+                }),
+            );
+        }
+    }
+
+    (
+        json!({
+            "predicate": "truthy",
+            "expr": expr.to_snapshot(),
+        }),
+        json!({
+            "value": result,
+            "result": result,
+        }),
+    )
+}
+
+fn assertion_binary_op_is_predicate(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge
+            | BinaryOp::In
+            | BinaryOp::NotIn
+    )
+}
+
+fn assertion_failure_reason(
+    expr: &Expr,
+    status: &AssertionStatus,
+    error: Option<&str>,
+) -> Option<String> {
+    match status {
+        AssertionStatus::Passed => None,
+        AssertionStatus::Error => error.map(str::to_owned),
+        AssertionStatus::Failed => {
+            if let Expr::Binary { op, .. } = expr {
+                if assertion_binary_op_is_predicate(*op) {
+                    return Some(format!(
+                        "predicate `{}` evaluated to false",
+                        binary_op_label(*op)
+                    ));
+                }
+            }
+            Some("assertion expression evaluated to false".to_owned())
+        }
+    }
+}
+
+fn binary_op_label(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Or => "||",
+        BinaryOp::And => "&&",
+        BinaryOp::Eq => "==",
+        BinaryOp::Ne => "!=",
+        BinaryOp::Lt => "<",
+        BinaryOp::Le => "<=",
+        BinaryOp::Gt => ">",
+        BinaryOp::Ge => ">=",
+        BinaryOp::In => "in",
+        BinaryOp::NotIn => "not in",
     }
 }
 
@@ -6051,7 +6138,17 @@ fn assertion_report_to_json(report: &AssertionReport) -> Value {
         "status": report.status.as_str(),
         "passed": report.passed,
         "actual": report.actual,
+        "actual_values": report.actual_values,
+        "expected": report.expected,
     });
+    if let Some(failure_reason) = &report.failure_reason {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "failure_reason".to_owned(),
+                Value::String(failure_reason.clone()),
+            );
+        }
+    }
     if let Some(error) = &report.error {
         if let Some(object) = value.as_object_mut() {
             object.insert("error".to_owned(), Value::String(error.clone()));
@@ -9592,6 +9689,10 @@ assert exists(Window where elapsed < limit)
             .error
             .as_deref()
             .is_some_and(|error| error.contains("invalid duration value `bad-duration`")));
+        assert!(assertions[0]
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("invalid duration value `bad-duration`")));
     }
 
     #[test]

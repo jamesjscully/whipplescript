@@ -5,6 +5,7 @@ use std::{
     io::Write,
     path::PathBuf,
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use serde_json::json;
@@ -37,13 +38,17 @@ pub struct ProviderArtifact {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderFailure {
+    pub provider: String,
+    pub adapter: String,
     pub phase: String,
     pub error_kind: String,
     pub message: String,
     pub recoverable: bool,
     pub retry_after: Option<String>,
+    pub workspace_id: Option<String>,
     pub provider_session_id: Option<String>,
     pub provider_thread_id: Option<String>,
+    pub missing_config_keys: Vec<String>,
     pub raw_json: Option<String>,
 }
 
@@ -54,19 +59,38 @@ impl ProviderFailure {
         message: impl Into<String>,
     ) -> Self {
         Self {
+            provider: String::new(),
+            adapter: String::new(),
             phase: phase.into(),
             error_kind: error_kind.into(),
             message: message.into(),
             recoverable: false,
             retry_after: None,
+            workspace_id: None,
             provider_session_id: None,
             provider_thread_id: None,
+            missing_config_keys: Vec::new(),
             raw_json: None,
         }
     }
 
+    pub fn provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = provider.into();
+        self
+    }
+
+    pub fn adapter(mut self, adapter: impl Into<String>) -> Self {
+        self.adapter = adapter.into();
+        self
+    }
+
     pub fn recoverable(mut self, recoverable: bool) -> Self {
         self.recoverable = recoverable;
+        self
+    }
+
+    pub fn missing_config_keys(mut self, keys: Vec<String>) -> Self {
+        self.missing_config_keys = keys;
         self
     }
 
@@ -98,20 +122,30 @@ pub trait AgentHarness {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandLaunchPlan {
     pub provider: String,
+    pub adapter: String,
     pub executable: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
+    pub required_env: Vec<String>,
+    pub required_commands: Vec<String>,
+    pub timeout: Option<Duration>,
+    pub require_stdout_json: bool,
 }
 
 impl CommandLaunchPlan {
     pub fn new(provider: impl Into<String>, executable: impl Into<String>) -> Self {
         Self {
             provider: provider.into(),
+            adapter: "command".to_owned(),
             executable: executable.into(),
             args: Vec::new(),
             cwd: None,
             env: BTreeMap::new(),
+            required_env: Vec::new(),
+            required_commands: Vec::new(),
+            timeout: None,
+            require_stdout_json: false,
         }
     }
 
@@ -127,6 +161,31 @@ impl CommandLaunchPlan {
 
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn adapter(mut self, adapter: impl Into<String>) -> Self {
+        self.adapter = adapter.into();
+        self
+    }
+
+    pub fn require_env(mut self, key: impl Into<String>) -> Self {
+        self.required_env.push(key.into());
+        self
+    }
+
+    pub fn require_command(mut self, command: impl Into<String>) -> Self {
+        self.required_commands.push(command.into());
+        self
+    }
+
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn require_stdout_json(mut self) -> Self {
+        self.require_stdout_json = true;
         self
     }
 }
@@ -160,6 +219,10 @@ impl CommandAgentHarness {
 impl AgentHarness for CommandAgentHarness {
     fn run(&self, request: AgentTurnRequest) -> ProviderRunResult {
         let payload = self.request_payload(&request);
+        if let Some(result) = self.preflight_failure(&request, &payload) {
+            return result;
+        }
+
         let mut command = Command::new(&self.plan.executable);
         command.args(&self.plan.args);
         command.stdin(Stdio::piped());
@@ -186,6 +249,7 @@ impl AgentHarness for CommandAgentHarness {
                     stdout: "",
                     stderr: &error.to_string(),
                     recoverable: true,
+                    missing_config_keys: Vec::new(),
                 });
             }
         };
@@ -203,12 +267,52 @@ impl AgentHarness for CommandAgentHarness {
                     stdout: "",
                     stderr: &error.to_string(),
                     recoverable: true,
+                    missing_config_keys: Vec::new(),
                 });
             }
         }
 
-        let output = match child.wait_with_output() {
-            Ok(output) => output,
+        let output = match wait_with_optional_timeout(child, self.plan.timeout) {
+            Ok(WaitOutcome::Completed(output)) => output,
+            Ok(WaitOutcome::TimedOut(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                return ProviderRunResult {
+                    status: ProviderRunStatus::TimedOut,
+                    summary: format!(
+                        "{} timed out after {}ms",
+                        self.plan.provider,
+                        self.plan
+                            .timeout
+                            .map(|timeout| timeout.as_millis())
+                            .unwrap_or(0)
+                    ),
+                    transcript: command_transcript(
+                        &self.plan, &request, &payload, &stdout, &stderr,
+                    ),
+                    stdout,
+                    stderr,
+                    exit_code: output.status.code().map(i64::from),
+                    usage_json: "{}".to_owned(),
+                    artifacts: Vec::new(),
+                    failure: Some(
+                        base_failure(
+                            &self.plan,
+                            "provider.timeout",
+                            "timeout",
+                            format!(
+                                "{} timed out after {}ms",
+                                self.plan.provider,
+                                self.plan
+                                    .timeout
+                                    .map(|timeout| timeout.as_millis())
+                                    .unwrap_or(0)
+                            ),
+                        )
+                        .recoverable(true),
+                    ),
+                };
+            }
             Err(error) => {
                 return command_failure_result(CommandFailure {
                     plan: &self.plan,
@@ -221,12 +325,32 @@ impl AgentHarness for CommandAgentHarness {
                     stdout: "",
                     stderr: &error.to_string(),
                     recoverable: true,
+                    missing_config_keys: Vec::new(),
                 });
             }
         };
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let exit_code = output.status.code().map(i64::from);
+        if output.status.success()
+            && self.plan.require_stdout_json
+            && serde_json::from_str::<serde_json::Value>(&stdout).is_err()
+        {
+            let summary = format!("{} returned invalid JSON stdout", self.plan.provider);
+            return command_failure_result(CommandFailure {
+                plan: &self.plan,
+                request: &request,
+                payload: &payload,
+                phase: "provider.result.invalid",
+                error_kind: "invalid_stdout_json",
+                summary,
+                exit_code,
+                stdout: &stdout,
+                stderr: &stderr,
+                recoverable: false,
+                missing_config_keys: Vec::new(),
+            });
+        }
         let status = if output.status.success() {
             ProviderRunStatus::Completed
         } else {
@@ -242,8 +366,13 @@ impl AgentHarness for CommandAgentHarness {
         };
         let transcript = command_transcript(&self.plan, &request, &payload, &stdout, &stderr);
         let failure = (!output.status.success()).then(|| {
-            ProviderFailure::new("provider.exit.failed", "nonzero_exit", summary.clone())
-                .recoverable(true)
+            base_failure(
+                &self.plan,
+                "provider.exit.failed",
+                "nonzero_exit",
+                summary.clone(),
+            )
+            .recoverable(true)
         });
 
         ProviderRunResult {
@@ -257,6 +386,92 @@ impl AgentHarness for CommandAgentHarness {
             artifacts: Vec::new(),
             failure,
         }
+    }
+}
+
+impl CommandAgentHarness {
+    fn preflight_failure(
+        &self,
+        request: &AgentTurnRequest,
+        payload: &str,
+    ) -> Option<ProviderRunResult> {
+        let missing_env = self
+            .plan
+            .required_env
+            .iter()
+            .filter(|key| std::env::var_os(key.as_str()).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_env.is_empty() {
+            let summary = format!(
+                "{} missing required provider config: {}",
+                self.plan.provider,
+                missing_env.join(", ")
+            );
+            return Some(command_failure_result(
+                CommandFailure {
+                    plan: &self.plan,
+                    request,
+                    payload,
+                    phase: "provider.config.missing",
+                    error_kind: "missing_provider_config",
+                    summary,
+                    exit_code: None,
+                    stdout: "",
+                    stderr: "",
+                    recoverable: true,
+                    missing_config_keys: Vec::new(),
+                }
+                .missing_config_keys(missing_env),
+            ));
+        }
+
+        for command in &self.plan.required_commands {
+            if !command_exists(command) {
+                let summary = format!(
+                    "{} adapter command not found on PATH: {}",
+                    self.plan.provider, command
+                );
+                return Some(command_failure_result(CommandFailure {
+                    plan: &self.plan,
+                    request,
+                    payload,
+                    phase: "adapter.resolve.failed",
+                    error_kind: "adapter_command_not_found",
+                    summary,
+                    exit_code: None,
+                    stdout: "",
+                    stderr: "",
+                    recoverable: true,
+                    missing_config_keys: Vec::new(),
+                }));
+            }
+        }
+
+        if let Some(cwd) = &self.plan.cwd {
+            if !cwd.is_dir() {
+                let summary = format!(
+                    "{} workspace cwd is not available: {}",
+                    self.plan.provider,
+                    cwd.display()
+                );
+                return Some(command_failure_result(CommandFailure {
+                    plan: &self.plan,
+                    request,
+                    payload,
+                    phase: "workspace.prepare.failed",
+                    error_kind: "workspace_cwd_missing",
+                    summary,
+                    exit_code: None,
+                    stdout: "",
+                    stderr: "",
+                    recoverable: true,
+                    missing_config_keys: Vec::new(),
+                }));
+            }
+        }
+
+        None
     }
 }
 
@@ -356,11 +571,11 @@ impl MockAgentHarness {
                 exit_code: Some(1),
                 usage_json: r#"{"input_tokens":1,"output_tokens":0}"#.to_owned(),
                 artifacts: Vec::new(),
-                failure: Some(ProviderFailure::new(
-                    "provider.fixture.failed",
-                    "fixture_failure",
-                    summary,
-                )),
+                failure: Some(
+                    ProviderFailure::new("provider.fixture.failed", "fixture_failure", summary)
+                        .provider("mock")
+                        .adapter("mock"),
+                ),
             },
         }
     }
@@ -391,6 +606,14 @@ struct CommandFailure<'a> {
     stdout: &'a str,
     stderr: &'a str,
     recoverable: bool,
+    missing_config_keys: Vec<String>,
+}
+
+impl<'a> CommandFailure<'a> {
+    fn missing_config_keys(mut self, missing_config_keys: Vec<String>) -> Self {
+        self.missing_config_keys = missing_config_keys;
+        self
+    }
 }
 
 fn command_failure_result(failure: CommandFailure<'_>) -> ProviderRunResult {
@@ -410,10 +633,67 @@ fn command_failure_result(failure: CommandFailure<'_>) -> ProviderRunResult {
         usage_json: "{}".to_owned(),
         artifacts: Vec::new(),
         failure: Some(
-            ProviderFailure::new(failure.phase, failure.error_kind, failure.summary)
-                .recoverable(failure.recoverable),
+            base_failure(
+                failure.plan,
+                failure.phase,
+                failure.error_kind,
+                failure.summary,
+            )
+            .recoverable(failure.recoverable)
+            .missing_config_keys(failure.missing_config_keys),
         ),
     }
+}
+
+fn base_failure(
+    plan: &CommandLaunchPlan,
+    phase: impl Into<String>,
+    error_kind: impl Into<String>,
+    message: impl Into<String>,
+) -> ProviderFailure {
+    ProviderFailure::new(phase, error_kind, message)
+        .provider(plan.provider.clone())
+        .adapter(plan.adapter.clone())
+}
+
+enum WaitOutcome {
+    Completed(std::process::Output),
+    TimedOut(std::process::Output),
+}
+
+fn wait_with_optional_timeout(
+    mut child: std::process::Child,
+    timeout: Option<Duration>,
+) -> std::io::Result<WaitOutcome> {
+    let Some(timeout) = timeout else {
+        return child.wait_with_output().map(WaitOutcome::Completed);
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map(WaitOutcome::Completed);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return child.wait_with_output().map(WaitOutcome::TimedOut);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn command_exists(command: &str) -> bool {
+    let path = PathBuf::from(command);
+    if path.components().count() > 1 {
+        return path.is_file();
+    }
+
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(command))
+                .any(|candidate| candidate.is_file())
+        })
+        .unwrap_or(false)
 }
 
 fn command_transcript(
@@ -519,6 +799,98 @@ mod tests {
     }
 
     #[test]
+    fn command_harness_classifies_missing_provider_config_before_launch() {
+        let harness = CommandAgentHarness::new(
+            CommandLaunchPlan::new("fixture", "sh")
+                .require_env("WHIPPLESCRIPT_TEST_PROVIDER_CONFIG_DOES_NOT_EXIST"),
+        );
+
+        let result = harness.run(test_request());
+
+        let failure = result.failure.expect("failure is structured");
+        assert_eq!(result.status, ProviderRunStatus::Failed);
+        assert_eq!(failure.provider, "fixture");
+        assert_eq!(failure.adapter, "command");
+        assert_eq!(failure.phase, "provider.config.missing");
+        assert_eq!(failure.error_kind, "missing_provider_config");
+        assert_eq!(
+            failure.missing_config_keys,
+            vec!["WHIPPLESCRIPT_TEST_PROVIDER_CONFIG_DOES_NOT_EXIST"]
+        );
+        assert!(failure.recoverable);
+        assert_eq!(result.stdout, "");
+    }
+
+    #[test]
+    fn command_harness_classifies_adapter_resolution_before_launch() {
+        let harness = CommandAgentHarness::new(
+            CommandLaunchPlan::new("fixture", "sh")
+                .adapter("codex-app-server")
+                .require_command("definitely-not-a-provider-adapter-command"),
+        );
+
+        let result = harness.run(test_request());
+
+        let failure = result.failure.expect("failure is structured");
+        assert_eq!(result.status, ProviderRunStatus::Failed);
+        assert_eq!(failure.adapter, "codex-app-server");
+        assert_eq!(failure.phase, "adapter.resolve.failed");
+        assert_eq!(failure.error_kind, "adapter_command_not_found");
+    }
+
+    #[test]
+    fn command_harness_classifies_workspace_prepare_before_launch() {
+        let harness = CommandAgentHarness::new(
+            CommandLaunchPlan::new("fixture", "sh")
+                .cwd("/definitely/not/a/whipplescript/workspace"),
+        );
+
+        let result = harness.run(test_request());
+
+        let failure = result.failure.expect("failure is structured");
+        assert_eq!(result.status, ProviderRunStatus::Failed);
+        assert_eq!(failure.phase, "workspace.prepare.failed");
+        assert_eq!(failure.error_kind, "workspace_cwd_missing");
+    }
+
+    #[test]
+    fn command_harness_classifies_timeout() {
+        let harness = CommandAgentHarness::new(
+            CommandLaunchPlan::new("fixture", "sh")
+                .arg("-c")
+                .arg("sleep 1")
+                .timeout(Duration::from_millis(25)),
+        );
+
+        let result = harness.run(test_request());
+
+        let failure = result.failure.expect("failure is structured");
+        assert_eq!(result.status, ProviderRunStatus::TimedOut);
+        assert_eq!(failure.phase, "provider.timeout");
+        assert_eq!(failure.error_kind, "timeout");
+        assert!(failure.recoverable);
+    }
+
+    #[test]
+    fn command_harness_classifies_result_validation_failure() {
+        let harness = CommandAgentHarness::new(
+            CommandLaunchPlan::new("fixture", "sh")
+                .arg("-c")
+                .arg("printf not-json")
+                .require_stdout_json(),
+        );
+
+        let result = harness.run(test_request());
+
+        let failure = result.failure.expect("failure is structured");
+        assert_eq!(result.status, ProviderRunStatus::Failed);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(failure.phase, "provider.result.invalid");
+        assert_eq!(failure.error_kind, "invalid_stdout_json");
+        assert!(!failure.recoverable);
+    }
+
+    #[test]
     fn real_provider_adapters_delegate_to_command_plan() {
         let request = AgentTurnRequest {
             instance_id: "instance-a".to_owned(),
@@ -555,5 +927,17 @@ mod tests {
             ProviderRunStatus::Completed
         );
         assert_eq!(pi.run(request).status, ProviderRunStatus::Completed);
+    }
+
+    fn test_request() -> AgentTurnRequest {
+        AgentTurnRequest {
+            instance_id: "instance-a".to_owned(),
+            effect_id: "tell".to_owned(),
+            run_id: "run-tell".to_owned(),
+            agent: "worker".to_owned(),
+            profile: Some("repo-writer".to_owned()),
+            input_json: r#"{"prompt":"go"}"#.to_owned(),
+            skill_names: Vec::new(),
+        }
     }
 }

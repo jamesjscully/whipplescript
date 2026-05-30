@@ -76,6 +76,7 @@ as complete:
 | Case branch context safety | `crates/whipplescript-cli/src/main.rs`, `crates/whipplescript-cli/tests/control_plane.rs` | Failed guarded `Some` branches no longer leak payload bindings into later branches or fallbacks. |
 | Tagged terminal branch runtime | `crates/whipplescript-parser/src/lib.rs`, `crates/whipplescript-cli/src/main.rs`, `crates/whipplescript-cli/tests/control_plane.rs` | Parser validates terminal-output tags inside `after ... completes`; runtime binds completed/failed terminal payload variants for deterministic case routing. |
 | Companion skill validation | `skills/whipplescript-author/SKILL.md`, `spec/companion-skill.md`, companion-skill example fixture, `crates/whipplescript-cli/tests/control_plane.rs` | Companion-skill workflow authored with one shared task schema, typed `AgentRef` reviewers, source assertions, and fixture-provider e2e coverage. |
+| Assertion JSON detail surface | `crates/whipplescript-cli/src/main.rs`, `crates/whipplescript-cli/tests/control_plane.rs` | `whip dev --json` assertion reports now include deterministic expected predicate metadata, evaluated actual operand values, and failure reasons for failed/error assertions. |
 
 ## Current Implementation Summary
 
@@ -201,7 +202,7 @@ as complete:
   commit plus diagnostic.
 - [x] Ensure assertion `false` or `Error` cannot mutate facts/effects and
   produces structured failure output.
-- [~] Add deterministic JSON output for assertion actual/expected values and
+- [x] Add deterministic JSON output for assertion actual/expected values and
   failure reasons.
 
 ### 4. IR, Lowering, And Generated Checks

@@ -245,6 +245,7 @@ provider.stdin.failed
 provider.stream.failed
 provider.timeout
 provider.cancelled
+provider.result.invalid
 artifact.capture.failed
 ```
 
@@ -279,6 +280,14 @@ missing_config_keys[]
 
 Secrets must never be written to failure payloads. Missing credentials should be
 reported by credential reference or key name, not value.
+
+The command-backed harness now implements the deterministic boundary taxonomy
+for the test/compatibility surface: missing required environment keys,
+unresolvable adapter commands, missing configured workspaces, launch/stdin/wait
+failures, provider timeout, nonzero exit, and invalid structured stdout are
+classified before they become `ProviderRunResult` values. This does not make
+Codex, Claude, or Pi real adapters complete; it gives those adapters a stable
+failure vocabulary to target.
 
 If the failure happens before a provider run can be started, the effect should
 be marked blocked rather than silently skipped. Missing provider config,
