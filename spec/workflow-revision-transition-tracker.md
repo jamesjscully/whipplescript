@@ -407,7 +407,7 @@ state.
   required by the execution contract.
 - [x] Ensure existing old-version effects remain claimable/runnable unless
   cancellation policy blocks them.
-- [ ] Implement queued/blocked/claimable terminal cancellation for revision
+- [x] Implement queued/blocked/claimable terminal cancellation for revision
   policies.
 - [ ] Implement running cancel-request behavior:
   - [ ] agent harness observes cancellation request before launch where possible
@@ -446,6 +446,9 @@ Stage 5 partial audit notes:
   stay `running`, expose `cancel_requested` on effects/runs, and produce a
   conforming trace cancellation-request record without a fabricated terminal
   cancellation.
+- A queued-cancel revision now has CLI coverage showing that queued old-version
+  effects become terminal `cancelled` effects and produce a conforming trace
+  cancellation record.
 
 ## Stage 6: Observability, Evidence, And Diagnostics
 
@@ -497,7 +500,7 @@ validation.
   - [x] dry-run compatible
   - [x] dry-run incompatible
   - [x] activation with `--cancel keep`
-  - [ ] activation with `--cancel queued`
+  - [x] activation with `--cancel queued`
   - [x] activation with `--cancel running`
   - [x] status/trace JSON after revision
 - [ ] Add e2e workflows:
