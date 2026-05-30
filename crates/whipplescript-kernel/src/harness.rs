@@ -90,6 +90,8 @@ pub struct ProviderRunResult {
 }
 
 pub trait AgentHarness {
+    fn before_launch(&self, _request: &AgentTurnRequest) {}
+
     fn run(&self, request: AgentTurnRequest) -> ProviderRunResult;
 }
 

@@ -1197,6 +1197,199 @@ rule noop_v2
 }
 
 #[test]
+fn running_cancel_supported_provider_acknowledges_cancellation() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("running-cancel-ack-v1");
+    let v2 = temp_workflow_path("running-cancel-ack-v2");
+    fs::write(
+        &v1,
+        r#"
+workflow RunningCancelAck
+
+agent worker {
+  profile "repo-writer"
+  capacity 1
+}
+
+rule start_work
+  when started
+  when worker is available
+=> {
+  tell worker "running work"
+}
+"#,
+    )
+    .expect("write v1 workflow");
+    fs::write(
+        &v2,
+        r#"
+workflow RunningCancelAck
+
+rule noop_v2
+  when started
+=> {
+}
+"#,
+    )
+    .expect("write v2 workflow");
+
+    let started = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "run",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "step",
+            instance_id,
+            "--program",
+            v1.to_str().expect("utf-8 workflow path"),
+        ],
+    );
+    let effects = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "effects",
+            instance_id,
+        ],
+    );
+    let effect_id = effects
+        .as_array()
+        .expect("effects array")
+        .iter()
+        .find(|effect| effect.get("kind").and_then(Value::as_str) == Some("agent.tell"))
+        .and_then(|effect| effect.get("effect_id"))
+        .and_then(Value::as_str)
+        .expect("agent effect id")
+        .to_owned();
+    let mut store = SqliteStore::open(&store_path).expect("open store");
+    store
+        .start_run(RunStart {
+            instance_id,
+            effect_id: &effect_id,
+            run_id: "run-cancellable-provider",
+            provider: "fixture-cancellable",
+            worker_id: "worker-1",
+            lease_id: "lease-cancellable-provider",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        })
+        .expect("run starts");
+    drop(store);
+
+    run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "revise",
+            instance_id,
+            v2.to_str().expect("utf-8 workflow path"),
+            "--cancel",
+            "running",
+            "--json",
+        ],
+    );
+    let worker = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "worker",
+            instance_id,
+            "--provider",
+            "fixture-cancellable",
+        ],
+    );
+    assert_eq!(worker.get("ran_effects").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        worker
+            .get("cancellation_acknowledgements")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        worker
+            .get("cancellation_diagnostics")
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+
+    let effects = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "effects",
+            instance_id,
+        ],
+    );
+    let cancelled = effects
+        .as_array()
+        .expect("effects array")
+        .iter()
+        .find(|effect| effect.get("effect_id").and_then(Value::as_str) == Some(effect_id.as_str()))
+        .expect("cancelled effect");
+    assert_eq!(
+        cancelled.get("status").and_then(Value::as_str),
+        Some("cancelled")
+    );
+    assert_eq!(
+        cancelled.get("cancel_requested").and_then(Value::as_bool),
+        Some(false)
+    );
+    let store = SqliteStore::open(&store_path).expect("open store");
+    let requests = store
+        .list_effect_cancellation_requests(instance_id)
+        .expect("requests list");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].status, "terminal");
+    drop(store);
+
+    let trace = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "trace",
+            instance_id,
+            "--check",
+        ],
+    );
+    assert_eq!(
+        trace
+            .get("conformance")
+            .and_then(|conformance| conformance.get("ok"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(v1);
+    let _ = fs::remove_file(v2);
+}
+
+#[test]
 fn queued_cancel_revision_terminal_cancels_old_effect() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();

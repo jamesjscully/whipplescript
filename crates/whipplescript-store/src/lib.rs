@@ -1351,6 +1351,14 @@ impl SqliteStore {
         Ok(view)
     }
 
+    pub fn effect_has_open_cancellation_request(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+    ) -> StoreResult<bool> {
+        effect_has_open_cancellation_request_on(&self.connection, instance_id, effect_id)
+    }
+
     pub fn list_effect_cancellation_requests(
         &self,
         instance_id: &str,

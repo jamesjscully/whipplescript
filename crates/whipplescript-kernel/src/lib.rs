@@ -479,7 +479,7 @@ impl RuntimeKernel {
             ])),
         })?;
 
-        let result = harness.run(AgentTurnRequest {
+        let request = AgentTurnRequest {
             instance_id: execution.instance_id.to_owned(),
             effect_id: execution.effect_id.to_owned(),
             run_id: execution.run_id.to_owned(),
@@ -491,7 +491,36 @@ impl RuntimeKernel {
                 .iter()
                 .map(|skill| (*skill).to_owned())
                 .collect(),
-        });
+        };
+        harness.before_launch(&request);
+        if self
+            .store
+            .effect_has_open_cancellation_request(execution.instance_id, execution.effect_id)?
+        {
+            let metadata_json = json!({
+                "cancellation": "requested_before_provider_launch",
+                "provider": execution.provider,
+            })
+            .to_string();
+            return self.cancel_run(EffectCompletion {
+                instance_id: execution.instance_id,
+                effect_id: execution.effect_id,
+                run_id: execution.run_id,
+                provider: execution.provider,
+                worker_id: execution.worker_id,
+                status: "cancelled",
+                exit_code: None,
+                summary: Some("provider launch skipped because cancellation was requested"),
+                metadata_json: &metadata_json,
+                idempotency_key: Some(&idempotency_key(&[
+                    execution.instance_id,
+                    execution.run_id,
+                    "cancel-before-launch",
+                ])),
+            });
+        }
+
+        let result = harness.run(request);
         let evidence = self.record_provider_result(execution, &result)?;
         let metadata_json = provider_metadata(&result);
         self.emit_provider_diagnostic(
@@ -1840,12 +1869,12 @@ mod tests {
         PiStyleAgentHarness,
     };
     use loft::{FakeLoftClient, LoftAction, LoftEffectRequest};
-    use std::process::Command;
+    use std::{fs, path::PathBuf, process::Command};
     use trace::check_trace;
     use whipplescript_parser::compile_program;
     use whipplescript_store::{
-        EffectCancellation, EffectCompletion, LeaseRenewal, NewEffect, NewFact, RetryEffect,
-        RuleCommit, RunStart, SkillRegistration,
+        EffectCancellation, EffectCancellationRequest, EffectCompletion, LeaseRenewal, NewEffect,
+        NewFact, RetryEffect, RuleCommit, RunStart, SkillRegistration,
     };
 
     #[test]
@@ -2712,6 +2741,122 @@ rule wait
         assert!(events
             .iter()
             .any(|event| event.event_type == "agent.turn.completed"));
+    }
+
+    #[test]
+    fn agent_harness_skips_provider_launch_when_cancel_requested_before_launch() {
+        struct CancelBeforeLaunchHarness {
+            store_path: PathBuf,
+        }
+
+        impl AgentHarness for CancelBeforeLaunchHarness {
+            fn before_launch(&self, request: &AgentTurnRequest) {
+                let mut store = SqliteStore::open(&self.store_path).expect("store reopens");
+                store
+                    .request_effect_cancellation(EffectCancellationRequest {
+                        instance_id: &request.instance_id,
+                        effect_id: &request.effect_id,
+                        revision_id: None,
+                        reason: Some("test pre-launch cancellation"),
+                        requested_by: "test",
+                        causation_event_id: None,
+                        idempotency_key: Some("test-pre-launch-cancel"),
+                    })
+                    .expect("cancellation request records");
+            }
+
+            fn run(&self, _request: AgentTurnRequest) -> ProviderRunResult {
+                panic!("provider should not launch after pre-launch cancellation request");
+            }
+        }
+
+        let store_path = std::env::temp_dir().join(format!(
+            "whip-kernel-pre-launch-cancel-{}.sqlite",
+            idempotency_key(&["pre-launch-cancel", "store"])
+        ));
+        let _ = fs::remove_file(&store_path);
+        let store = SqliteStore::open(&store_path).expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version(ProgramVersionInput {
+                program_name: "HarnessPreLaunchCancel",
+                source_hash: "source",
+                ir_hash: "ir",
+                compiler_version: "test",
+            })
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[NewEffect {
+                    effect_id: "tell",
+                    kind: "agent.tell",
+                    target: Some("worker"),
+                    input_json: r#"{"prompt":"go"}"#,
+                    status: "queued",
+                    idempotency_key: "rule=start;effect=tell",
+                    required_capabilities_json: "[]",
+                    profile: Some("repo-reader"),
+                    correlation_id: None,
+                    source_span_json: None,
+                }],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commits");
+
+        kernel
+            .run_agent_turn(
+                AgentTurnExecution {
+                    instance_id: &instance_id,
+                    effect_id: "tell",
+                    run_id: "run-tell",
+                    provider: "mock",
+                    worker_id: "worker-1",
+                    lease_id: "lease-tell",
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    agent: "worker",
+                    profile: Some("repo-reader"),
+                    input_json: r#"{"prompt":"go"}"#,
+                    skill_names: &[],
+                },
+                &CancelBeforeLaunchHarness {
+                    store_path: store_path.clone(),
+                },
+            )
+            .expect("turn cancels before provider launch");
+
+        check_trace(kernel.trace()).expect("kernel trace conforms");
+        let store = kernel.into_store();
+        let effect = store
+            .list_effects(&instance_id)
+            .expect("effects list")
+            .pop()
+            .expect("effect exists");
+        assert_eq!(effect.status, "cancelled");
+        let requests = store
+            .list_effect_cancellation_requests(&instance_id)
+            .expect("cancellation requests list");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].status, "terminal");
+        let events = store.list_events(&instance_id).expect("events list");
+        assert_eq!(
+            events.last().map(|event| event.event_type.as_str()),
+            Some("effect.terminal")
+        );
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "agent.turn.completed"));
+
+        let _ = fs::remove_file(store_path);
     }
 
     #[test]

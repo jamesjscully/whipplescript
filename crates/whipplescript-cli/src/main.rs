@@ -1468,10 +1468,11 @@ fn worker(options: &CliOptions) -> ExitCode {
         Ok(report) if options.json => emit_json(worker_report_to_json(&report)),
         Ok(report) => {
             println!(
-                "worker {} ran={} provider={} cancellation_diagnostics={}",
+                "worker {} ran={} provider={} cancellation_acknowledgements={} cancellation_diagnostics={}",
                 report.instance_id,
                 report.ran_effects,
                 report.provider,
+                report.cancellation_acknowledgements,
                 report.cancellation_diagnostics
             );
             ExitCode::SUCCESS
@@ -1586,6 +1587,7 @@ struct WorkerReport {
     instance_id: String,
     provider: String,
     ran_effects: usize,
+    cancellation_acknowledgements: usize,
     cancellation_diagnostics: usize,
     terminal_events: Vec<String>,
 }
@@ -1596,11 +1598,10 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
         provider: options.provider.clone(),
         ..WorkerReport::default()
     };
-    report.cancellation_diagnostics = record_unsupported_running_cancellations(
-        store_path,
-        &options.instance_id,
-        &options.provider,
-    )?;
+    let cancellation_report =
+        process_running_cancellations(store_path, &options.instance_id, &options.provider)?;
+    report.cancellation_acknowledgements = cancellation_report.acknowledgements;
+    report.cancellation_diagnostics = cancellation_report.diagnostics;
     let store = SqliteStore::open(store_path)?;
     let claimable = store.claimable_effects(&options.instance_id)?;
     for effect in claimable {
@@ -1624,11 +1625,17 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
     Ok(report)
 }
 
-fn record_unsupported_running_cancellations(
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RunningCancellationReport {
+    acknowledgements: usize,
+    diagnostics: usize,
+}
+
+fn process_running_cancellations(
     store_path: &Path,
     instance_id: &str,
     provider: &str,
-) -> Result<usize, StoreError> {
+) -> Result<RunningCancellationReport, StoreError> {
     let store = SqliteStore::open(store_path)?;
     let requests = store.list_effect_cancellation_requests(instance_id)?;
     let open_requests = requests
@@ -1637,18 +1644,50 @@ fn record_unsupported_running_cancellations(
         .map(|request| (request.effect_id.as_str(), request))
         .collect::<BTreeMap<_, _>>();
     if open_requests.is_empty() {
-        return Ok(0);
+        return Ok(RunningCancellationReport::default());
     }
 
-    let mut recorded = 0;
+    let mut report = RunningCancellationReport::default();
     for run in store
         .list_runs(instance_id)?
         .into_iter()
-        .filter(|run| run.status == "running" && run.cancel_requested)
+        .filter(|run| run.status == "running" && run.cancel_requested && run.provider == provider)
     {
         let Some(request) = open_requests.get(run.effect_id.as_str()) else {
             continue;
         };
+        if provider_supports_out_of_band_cancellation(provider) {
+            let metadata_json = json!({
+                "cancellation": "provider_acknowledged",
+                "request_id": request.request_id,
+                "revision_id": request.revision_id,
+                "reason": request.reason,
+                "provider": provider,
+                "run_id": run.run_id,
+            })
+            .to_string();
+            let store = SqliteStore::open(store_path)?;
+            let mut kernel = RuntimeKernel::new(store);
+            kernel.cancel_run(EffectCompletion {
+                instance_id,
+                effect_id: &run.effect_id,
+                run_id: &run.run_id,
+                provider: &run.provider,
+                worker_id: &run.worker_id,
+                status: "cancelled",
+                exit_code: Some(0),
+                summary: Some("provider acknowledged cancellation request"),
+                metadata_json: &metadata_json,
+                idempotency_key: Some(&idempotency_key(&[
+                    instance_id,
+                    &run.run_id,
+                    "provider-cancellation-acknowledged",
+                ])),
+            })?;
+            report.acknowledgements += 1;
+            continue;
+        }
+
         let message = format!(
             "provider `{provider}` does not support out-of-band cancellation; effect `{}` remains running until the provider exits, times out, or lease recovery resolves it",
             run.effect_id
@@ -1677,9 +1716,13 @@ fn record_unsupported_running_cancellations(
             correlation_id: request.revision_id.as_deref(),
             idempotency_key: Some(&idempotency_key),
         })?;
-        recorded += 1;
+        report.diagnostics += 1;
     }
-    Ok(recorded)
+    Ok(report)
+}
+
+fn provider_supports_out_of_band_cancellation(provider: &str) -> bool {
+    matches!(provider, "fixture-cancellable")
 }
 
 fn run_agent_effect(
@@ -5763,6 +5806,7 @@ fn worker_report_to_json(report: &WorkerReport) -> Value {
         "instance_id": report.instance_id,
         "provider": report.provider,
         "ran_effects": report.ran_effects,
+        "cancellation_acknowledgements": report.cancellation_acknowledgements,
         "cancellation_diagnostics": report.cancellation_diagnostics,
         "terminal_events": report.terminal_events,
     })

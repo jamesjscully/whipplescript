@@ -27,7 +27,7 @@ without changing the source-level meaning of `pattern`, `apply`, `workflow`,
 | --- | --- | --- |
 | Conceptual spec | [x] | Stage 0 landed revision epochs, activation policy, cancellation policy, compatibility rules, store objects, transaction boundaries, and observability requirements in the core specs. |
 | Formal model | [x] | Stage 1 added Maude revision searches and TLA+ revision/cancel-request actions and invariants; the bounded formal suite passes. |
-| Store/runtime implementation | [ ] | Revision rows, active-epoch caching, per-effect version attribution, replay, and cancellation requests are in place; active-version stepper/worker semantics remain open. |
+| Store/runtime implementation | [ ] | Revision rows, active-epoch caching, per-effect version attribution, replay, active-version stepper/worker semantics, cancellation requests, and child invocation revision projection are in place; Stage 2 audit, observability evidence, and e2e remain open. |
 | CLI/control plane | [ ] | `whip revise`, dry-run compatibility reports, activation reports, status revision history, and trace revision projection are in place; evidence/diagnostic previews and final UX audit remain open. |
 | Generated checks | [x] | Per-program Maude checks assert active-version rule firing, stale-rule rejection, old-effect attribution, and revision-cancelled `completes` release. |
 | Examples/e2e | [ ] | No revision example exercises keep/cancel behavior for queued/running effects or child workflows. |
@@ -451,16 +451,16 @@ state.
   cancellation policy blocks them.
 - [x] Implement queued/blocked/claimable terminal cancellation for revision
   policies.
-- [ ] Implement running cancel-request behavior:
-  - [ ] agent harness observes cancellation request before launch where possible
-  - [ ] long-running providers can be asked to stop where supported
+- [x] Implement running cancel-request behavior:
+  - [x] agent harness observes cancellation request before launch where possible
+  - [x] long-running providers can be asked to stop where supported
   - [x] unsupported providers leave visible diagnostics and keep recoverable
     lease state
   - [x] late provider completion after cancel-request records the real terminal
     outcome
 - [x] Update child workflow invocation handling so parent and child revisions
   are explicit and cancellation projection remains single-shot.
-- [ ] Audit Stage 5 against rule attribution, worker cancellation, lease
+- [x] Audit Stage 5 against rule attribution, worker cancellation, lease
   recovery, and child invocation behavior; record edge cases for e2e.
 
 Acceptance:
@@ -491,9 +491,16 @@ Stage 5 partial audit notes:
   stay `running`, expose `cancel_requested` on effects/runs, and produce a
   conforming trace cancellation-request record without a fabricated terminal
   cancellation.
+- The agent harness path now checks for a cancellation request after run start
+  but before provider launch, and skips provider execution by recording a real
+  cancelled terminal run when a request lands in that window.
 - The same request-running coverage now completes the requested effect with a
   late real provider success and verifies that the cancellation request resolves
   to `terminal` while the effect records `completed`.
+- A supported fixture provider can acknowledge an out-of-band running
+  cancellation request; the worker records a normal cancelled terminal outcome
+  and resolves the cancellation request without a fake `effect.cancelled`
+  event.
 - The worker now records an idempotent warning diagnostic when it sees a running
   cancellation request for a provider without out-of-band cancellation support;
   the effect and lease remain running/recoverable until the real provider
@@ -506,6 +513,11 @@ Stage 5 partial audit notes:
   revises a parent while a child invocation is running, resumes the old child
   invocation through its original bundle, and verifies the parent observes one
   terminal child projection.
+- Stage 5 audit result: complete for the current synchronous fixture/provider
+  runtime. Remaining Stage 7 work should add deterministic e2e examples for
+  keep-policy old effects, queued cancellation, running provider
+  acknowledgement, unsupported-provider diagnostics, parent revision while a
+  child is running, and independent child revision.
 
 ## Stage 6: Observability, Evidence, And Diagnostics
 
