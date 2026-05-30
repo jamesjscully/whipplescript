@@ -801,7 +801,7 @@ rule noop_v2
         Some(1)
     );
 
-    run_json(
+    let revision = run_json(
         bin,
         &[
             "--store",
@@ -813,6 +813,25 @@ rule noop_v2
             "keep",
             "--json",
         ],
+    );
+    let removed_agents = revision
+        .pointer("/agent_impact/removed_agents_affecting_effects")
+        .and_then(Value::as_array)
+        .expect("removed agent impact list");
+    assert_eq!(removed_agents.len(), 1, "{revision}");
+    assert_eq!(
+        removed_agents[0].get("agent").and_then(Value::as_str),
+        Some("worker")
+    );
+    assert_eq!(
+        removed_agents[0].get("status").and_then(Value::as_str),
+        Some("queued")
+    );
+    assert_eq!(
+        removed_agents[0]
+            .get("program_version_id")
+            .and_then(Value::as_str),
+        Some(original_version)
     );
 
     let worker = run_json(

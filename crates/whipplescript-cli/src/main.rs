@@ -596,6 +596,10 @@ fn revise(options: &CliOptions) -> ExitCode {
         Ok(impact) => impact,
         Err(error) => return report_store_error("failed to analyze cancellation impact", error),
     };
+    let agent_impact = match revision_agent_impact(&store, &revise_options.instance_id, &ir) {
+        Ok(impact) => impact,
+        Err(error) => return report_store_error("failed to analyze agent impact", error),
+    };
 
     if revise_options.dry_run {
         return emit_revision_dry_run(
@@ -606,6 +610,7 @@ fn revise(options: &CliOptions) -> ExitCode {
             &ir_hash,
             &compatibility,
             &impact,
+            &agent_impact,
         );
     }
 
@@ -618,6 +623,7 @@ fn revise(options: &CliOptions) -> ExitCode {
             &ir_hash,
             &compatibility,
             &impact,
+            &agent_impact,
             None,
         );
         return ExitCode::FAILURE;
@@ -650,6 +656,7 @@ fn revise(options: &CliOptions) -> ExitCode {
         "ir_hash": &ir_hash,
         "compatibility": revision_compatibility_to_json(&compatibility),
         "cancellation": revision_cancellation_impact_to_json(&impact),
+        "agent_impact": revision_agent_impact_to_json(&agent_impact),
     })
     .to_string();
     let activation = match store.activate_revision(RevisionActivation {
@@ -677,6 +684,7 @@ fn revise(options: &CliOptions) -> ExitCode {
         &ir_hash,
         &compatibility,
         &impact,
+        &agent_impact,
         Some(&activation),
     );
     ExitCode::SUCCESS
@@ -8434,6 +8442,75 @@ fn revision_cancellation_impact_to_json(impact: &RevisionCancellationImpact) -> 
     })
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RevisionAgentImpact {
+    removed_agents_affecting_effects: Vec<RevisionRemovedAgentImpact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RevisionRemovedAgentImpact {
+    agent: String,
+    effect_id: String,
+    status: String,
+    program_version_id: Option<String>,
+    revision_epoch: i64,
+}
+
+fn revision_agent_impact(
+    store: &SqliteStore,
+    instance_id: &str,
+    candidate: &IrProgram,
+) -> Result<RevisionAgentImpact, StoreError> {
+    let candidate_agents = candidate
+        .agents
+        .iter()
+        .map(|agent| agent.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let removed_agents_affecting_effects = store
+        .list_effects(instance_id)?
+        .into_iter()
+        .filter(|effect| effect.kind == "agent.tell")
+        .filter(|effect| !effect_status_is_terminal(&effect.status))
+        .filter_map(|effect| {
+            let agent = effect.target.as_deref()?;
+            (!candidate_agents.contains(agent)).then(|| RevisionRemovedAgentImpact {
+                agent: agent.to_owned(),
+                effect_id: effect.effect_id,
+                status: effect.status,
+                program_version_id: effect.program_version_id,
+                revision_epoch: effect.revision_epoch,
+            })
+        })
+        .collect();
+    Ok(RevisionAgentImpact {
+        removed_agents_affecting_effects,
+    })
+}
+
+fn effect_status_is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "timed_out" | "cancelled")
+}
+
+fn revision_agent_impact_to_json(impact: &RevisionAgentImpact) -> Value {
+    json!({
+        "removed_agents_affecting_effects": impact
+            .removed_agents_affecting_effects
+            .iter()
+            .map(revision_removed_agent_impact_to_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn revision_removed_agent_impact_to_json(impact: &RevisionRemovedAgentImpact) -> Value {
+    json!({
+        "agent": impact.agent,
+        "effect_id": impact.effect_id,
+        "status": impact.status,
+        "program_version_id": impact.program_version_id,
+        "revision_epoch": impact.revision_epoch,
+    })
+}
+
 fn revision_report_json(
     dry_run: bool,
     revise_options: &ReviseOptions,
@@ -8442,6 +8519,7 @@ fn revision_report_json(
     ir_hash: &str,
     compatibility: &RevisionCompatibilityReport,
     impact: &RevisionCancellationImpact,
+    agent_impact: &RevisionAgentImpact,
     revision: Option<&WorkflowRevisionView>,
 ) -> Value {
     json!({
@@ -8453,6 +8531,7 @@ fn revision_report_json(
         "candidate_version_hash": ir_hash,
         "compatibility": revision_compatibility_to_json(compatibility),
         "cancellation": revision_cancellation_impact_to_json(impact),
+        "agent_impact": revision_agent_impact_to_json(agent_impact),
         "would_activate": dry_run && compatibility.compatible,
         "revision": revision.map(workflow_revision_to_json),
         "next": revision.map(|revision| {
@@ -8469,6 +8548,7 @@ fn emit_revision_dry_run(
     ir_hash: &str,
     compatibility: &RevisionCompatibilityReport,
     impact: &RevisionCancellationImpact,
+    agent_impact: &RevisionAgentImpact,
 ) -> ExitCode {
     emit_revision_report(
         options,
@@ -8478,6 +8558,7 @@ fn emit_revision_dry_run(
         ir_hash,
         compatibility,
         impact,
+        agent_impact,
         None,
     )
 }
@@ -8490,6 +8571,7 @@ fn emit_revision_report(
     ir_hash: &str,
     compatibility: &RevisionCompatibilityReport,
     impact: &RevisionCancellationImpact,
+    agent_impact: &RevisionAgentImpact,
     revision: Option<&WorkflowRevisionView>,
 ) -> ExitCode {
     let dry_run = revise_options.dry_run;
@@ -8502,6 +8584,7 @@ fn emit_revision_report(
             ir_hash,
             compatibility,
             impact,
+            agent_impact,
             revision,
         ));
     }
@@ -8532,6 +8615,20 @@ fn emit_revision_report(
         impact.terminal_cancel_effects.len(),
         impact.request_cancel_effects.len()
     );
+    println!(
+        "agent_impact removed_agents_affecting_effects={}",
+        agent_impact.removed_agents_affecting_effects.len()
+    );
+    for removed in &agent_impact.removed_agents_affecting_effects {
+        println!(
+            "removed_agent {} effect={} status={} version={} epoch={}",
+            removed.agent,
+            removed.effect_id,
+            removed.status,
+            removed.program_version_id.as_deref().unwrap_or("-"),
+            removed.revision_epoch
+        );
+    }
     for diagnostic in &compatibility.diagnostics {
         println!("diagnostic {}: {}", diagnostic.code, diagnostic.message);
     }

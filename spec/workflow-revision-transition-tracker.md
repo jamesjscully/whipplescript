@@ -301,11 +301,11 @@ version for a running instance.
 - [x] Validate workflow input/output/failure contracts.
 - [x] Validate active fact compatibility against candidate schemas where
   possible.
-- [ ] Validate agent/profile/capability changes:
+- [x] Validate agent/profile/capability changes:
   - [x] new effects use candidate declarations and policies
   - [x] old effects continue with stored resolved targets and capabilities
-  - [ ] removed agents are reported when they affect active or queued work
-- [ ] Validate source bundle metadata:
+  - [x] removed agents are reported when they affect active or queued work
+- [x] Validate source bundle metadata:
   - [x] include closure hash
   - [x] root workflow
   - [x] pattern application provenance
@@ -341,8 +341,10 @@ Stage 3 partial audit notes:
   Kept old-version effects can still start against their original agent
   declarations after a revision removes or changes the candidate agent, while
   new post-revision effects use the candidate version's declarations.
-- Reporting removed agents that affect active or queued work and generated Maude
-  checks remain open Stage 3 work.
+- Revision reports now include non-blocking agent impact for removed candidate
+  agents that still have non-terminal effects, so operators can see old work
+  that will continue under stored old-version attribution.
+- Generated Maude checks remain open Stage 3 work.
 
 Acceptance:
 
