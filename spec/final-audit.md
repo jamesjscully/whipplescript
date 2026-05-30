@@ -5,6 +5,41 @@ Status: draft
 This file collects the audit findings from the staged implementation plan and
 classifies them for v0.
 
+## Workflow Revision Final Audit
+
+Status: stable for the in-repo v0 runtime and CLI.
+
+Date: May 30, 2026.
+
+Workflow revision is implemented as an explicit control-plane operation for
+non-terminal running instances. It supports compatibility dry-runs, activation
+epochs, active-version stepping, old-effect attribution, queued cancellation,
+running cancellation requests, parent/child invocation attribution, evidence,
+diagnostics, trace conformance, docs, examples, and companion authoring
+guidance.
+
+Verification run for this audit:
+
+| Check | Result |
+| --- | --- |
+| `cargo test --workspace` | Passed. |
+| `scripts/check-formal-models.sh` | Passed, including `workflow-revision.maude` and TLA+/Apalache bounded check to length 6. |
+| `cargo test -p whipplescript-kernel --test e2e revision` | Passed 5 revision e2e tests covering keep, queued cancel, running cancel request, parent revision with child running, and independent child revision. |
+| `cargo test -p whipplescript -- reconstructs_revision_trace_records_from_store_events renders_revision_log_event_details` | Passed revision trace/log reconstruction checks. |
+
+Non-blocking revision follow-ups:
+
+| Area | Owner | Rationale / Follow-up |
+| --- | --- | --- |
+| Root workflow retargeting | WhippleScript runtime maintainer | Retargeting is intentionally out of scope for v0. Add an explicit retarget control-plane operation if operators need it later. |
+| Live fact migration | WhippleScript language maintainer | Current compatibility checks reject or classify incompatible active facts. Add source-declared migration plans before allowing schema-breaking revision. |
+| Provider cancellation depth | WhippleScript integration maintainer | Running cancellation requests are persisted and observable. Individual providers may still lack out-of-band cancellation support and should add provider-specific acknowledgements over time. |
+| Broader destructive policies | WhippleScript control-plane maintainer | Current policies are explicit `keep`, `queued`, and `running`. Any more destructive future policy must add a dedicated confirmation flag. |
+
+Result: no release-blocking workflow revision gaps remain for the local
+deterministic runtime, SQLite store, CLI, formal model, and fixture-provider
+e2e surface.
+
 ## Gap List
 
 | ID | Area | Classification | Owner | Finding | Rationale / Follow-up |

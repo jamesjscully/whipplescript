@@ -701,33 +701,48 @@ Stage 8 audit notes:
 Goal: decide whether workflow revision is ready to ship or should remain
 experimental.
 
-- [ ] Audit Stage 0 findings and close or classify all spec gaps.
-- [ ] Audit Stage 1 findings and close or classify all formal model gaps.
-- [ ] Audit Stage 2 findings and close or classify all store/kernel gaps.
-- [ ] Audit Stage 3 findings and close or classify all compatibility-analysis
+- [x] Audit Stage 0 findings and close or classify all spec gaps.
+- [x] Audit Stage 1 findings and close or classify all formal model gaps.
+- [x] Audit Stage 2 findings and close or classify all store/kernel gaps.
+- [x] Audit Stage 3 findings and close or classify all compatibility-analysis
   gaps.
-- [ ] Audit Stage 4 findings and close or classify all CLI/control-plane gaps.
-- [ ] Audit Stage 5 findings and close or classify all runtime/worker gaps.
-- [ ] Audit Stage 6 findings and close or classify all observability gaps.
-- [ ] Audit Stage 7 findings and close or classify all test/e2e gaps.
-- [ ] Audit Stage 8 findings and close or classify all docs/example gaps.
-- [ ] Run required checks:
-  - [ ] `cargo test --workspace`
-  - [ ] `scripts/check-formal-models.sh`
-  - [ ] revision-specific deterministic e2e
-  - [ ] trace conformance on revised instances
-- [ ] Decide release status:
-  - [ ] stable
+- [x] Audit Stage 4 findings and close or classify all CLI/control-plane gaps.
+- [x] Audit Stage 5 findings and close or classify all runtime/worker gaps.
+- [x] Audit Stage 6 findings and close or classify all observability gaps.
+- [x] Audit Stage 7 findings and close or classify all test/e2e gaps.
+- [x] Audit Stage 8 findings and close or classify all docs/example gaps.
+- [x] Run required checks:
+  - [x] `cargo test --workspace`
+  - [x] `scripts/check-formal-models.sh`
+  - [x] revision-specific deterministic e2e
+  - [x] trace conformance on revised instances
+- [x] Decide release status:
+  - [x] stable
   - [ ] experimental behind feature flag
   - [ ] deferred
-- [ ] Record final audit summary in [final-audit.md](final-audit.md) or a
+- [x] Record final audit summary in [final-audit.md](final-audit.md) or a
   linked release note.
 
 Acceptance:
 
-- [ ] Every stage has an explicit audit result.
-- [ ] All release-blocking gaps are closed.
-- [ ] Remaining non-blocking gaps have owners, rationale, and follow-up tasks.
+- [x] Every stage has an explicit audit result.
+- [x] All release-blocking gaps are closed.
+- [x] Remaining non-blocking gaps have owners, rationale, and follow-up tasks.
+
+Stage 9 audit notes:
+
+- Stage 0 through Stage 8 each now has an explicit audit result in this tracker.
+- Required checks passed on May 30, 2026:
+  `cargo test --workspace`, `scripts/check-formal-models.sh`,
+  `cargo test -p whipplescript-kernel --test e2e revision`, and
+  `cargo test -p whipplescript -- reconstructs_revision_trace_records_from_store_events renders_revision_log_event_details`.
+- Release status: stable for the in-repo v0 runtime and CLI. Revision is not
+  behind a feature flag and no workflow-revision release blockers remain.
+- Remaining non-blocking follow-ups are recorded in
+  [final-audit.md](final-audit.md): explicit root retargeting, source-declared
+  live fact migration, provider-specific out-of-band cancellation depth, and
+  confirmation flags for any future cancellation policy broader than
+  `keep|queued|running`.
 
 ## Stage 0 Decisions
 
@@ -747,7 +762,7 @@ Acceptance:
 
 ## Next Implementation Slice
 
-1. Run the Stage 9 final audit commands.
-2. Classify any remaining gaps as release-blocking or follow-up.
-3. Record the final release status in [final-audit.md](final-audit.md) or a
-   linked release note.
+No workflow-revision implementation slice remains. Future work should start
+from the non-blocking follow-ups in [final-audit.md](final-audit.md) or from a
+new tracker for retargeting, explicit fact migration, or provider-specific
+cancellation support.
