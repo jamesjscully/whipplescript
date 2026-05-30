@@ -527,20 +527,20 @@ Goal: make revision understandable from the normal inspection surfaces.
 - [x] Add active revision and history to `whip status`.
 - [x] Add per-effect version/epoch to `whip effects --json`.
 - [x] Add cancellation request state to `whip effects` and `whip runs`.
-- [ ] Add evidence links:
+- [x] Add evidence links:
   - [x] revision event -> old/new program versions
-  - [ ] revision event -> compatibility diagnostics
+  - [x] revision event -> compatibility diagnostics
   - [x] revision event -> cancelled/requested effects
   - [x] cancellation request -> provider/run evidence
-- [ ] Add diagnostics for:
+- [x] Add diagnostics for:
   - [x] incompatible root workflow
   - [x] incompatible input/output/failure contract
   - [x] active fact schema mismatch
   - [x] unsupported running cancellation provider
-  - [ ] stale program path or missing source bundle during revision
+  - [x] stale program path or missing source bundle during revision
 - [x] Update trace conformance to understand revision and cancel-request
   records.
-- [ ] Audit Stage 6 against operator debugging workflows, trace JSON, evidence
+- [x] Audit Stage 6 against operator debugging workflows, trace JSON, evidence
   links, and diagnostic source spans; record remaining explainability gaps.
 
 Acceptance:
@@ -566,6 +566,19 @@ Stage 6 partial audit notes:
 - Unsupported running cancellation providers now surface as idempotent
   `provider.cancellation.unsupported` diagnostics from the worker while leaving
   the effect and lease recoverable.
+- Stale step attempts against pre-revision source now persist
+  `revision.stale_program_path` diagnostics, and revision attempts with an
+  unreadable source bundle persist `revision.source_bundle_unavailable`
+  diagnostics on the affected instance.
+- Blocked non-dry-run revisions now append `workflow.revision_rejected` events;
+  the persisted compatibility diagnostics point at that event, and
+  `workflow.revision.compatibility_rejected` evidence links the event to the
+  diagnostic rows.
+- Stage 6 audit result: complete for the currently implemented inspection
+  surfaces. `whip log`, `whip status`, `whip effects --json`, `whip runs`,
+  `whip diagnostics`, `whip evidence`, and trace JSON now expose the revision,
+  cancellation, source-span, and evidence relationships needed for operator
+  debugging. Remaining validation work is tracked in Stage 7 e2e coverage.
 
 ## Stage 7: Tests And E2E
 

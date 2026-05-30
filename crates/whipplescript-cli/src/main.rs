@@ -26,12 +26,12 @@ use whipplescript_parser::{
 };
 use whipplescript_store::{
     ClaimableEffect, DiagnosticRecord, DiagnosticView, EffectCancellation, EffectCompletion,
-    EffectView, EventView, EvidenceLinkView, EvidenceView, FactView, HumanAnswer, InboxItemView,
-    InstanceView, NewEffect, NewEffectDependency, NewFact, NewWorkflowInvocation, RetryEffect,
-    RevisionActivation, RevisionCancellationImpact, RevisionCandidate,
-    RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RuleCommit, RunStart, RunView,
-    SqliteStore, StatusView, StoreError, WorkflowInvocationView, WorkflowRevisionView,
-    WorkflowTerminal, WorkflowTerminalKind,
+    EffectView, EventView, EvidenceLink, EvidenceLinkView, EvidenceRecord, EvidenceView, FactView,
+    HumanAnswer, InboxItemView, InstanceView, NewEffect, NewEffectDependency, NewEvent, NewFact,
+    NewWorkflowInvocation, RetryEffect, RevisionActivation, RevisionCancellationImpact,
+    RevisionCandidate, RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RuleCommit,
+    RunStart, RunView, SqliteStore, StatusView, StoreError, WorkflowInvocationView,
+    WorkflowRevisionView, WorkflowTerminal, WorkflowTerminalKind,
 };
 
 fn main() -> ExitCode {
@@ -558,19 +558,6 @@ fn revise(options: &CliOptions) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (source, ir) = match compile_source_path_with_root(
-        &revise_options.program_path,
-        revise_options.root.as_deref(),
-    ) {
-        Ok(compiled) => compiled,
-        Err(error) => return report_compile_failure(&revise_options.program_path, error),
-    };
-    let snapshot = ir.to_snapshot();
-    let source_hash = stable_hash_hex(&source);
-    let ir_hash = stable_hash_hex(&snapshot);
-    let analysis_summary_json = program_analysis_summary_json(&ir);
-    let candidate_label = format!("candidate:{ir_hash}");
-
     let store = match open_store(&options.store_path) {
         Ok(store) => store,
         Err(message) => {
@@ -578,6 +565,29 @@ fn revise(options: &CliOptions) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let (source, ir) = match compile_source_path_with_root(
+        &revise_options.program_path,
+        revise_options.root.as_deref(),
+    ) {
+        Ok(compiled) => compiled,
+        Err(error) => {
+            if let Err(store_error) =
+                persist_revision_source_bundle_diagnostic(&store, &revise_options, &error)
+            {
+                return report_store_error(
+                    "failed to record revision source diagnostic",
+                    store_error,
+                );
+            }
+            return report_compile_failure(&revise_options.program_path, error);
+        }
+    };
+    let snapshot = ir.to_snapshot();
+    let source_hash = stable_hash_hex(&source);
+    let ir_hash = stable_hash_hex(&snapshot);
+    let analysis_summary_json = program_analysis_summary_json(&ir);
+    let candidate_label = format!("candidate:{ir_hash}");
+
     let compatibility = match store.analyze_revision_candidate(
         &revise_options.instance_id,
         RevisionCandidate {
@@ -618,8 +628,7 @@ fn revise(options: &CliOptions) -> ExitCode {
         if let Err(error) = persist_revision_compatibility_diagnostics(
             &store,
             &revise_options.instance_id,
-            &candidate_label,
-            &compatibility.diagnostics,
+            &compatibility,
         ) {
             return report_store_error("failed to record revision diagnostics", error);
         }
@@ -701,23 +710,46 @@ fn revise(options: &CliOptions) -> ExitCode {
 fn persist_revision_compatibility_diagnostics(
     store: &SqliteStore,
     instance_id: &str,
-    candidate_version_id: &str,
-    diagnostics: &[RevisionCompatibilityDiagnostic],
+    compatibility: &RevisionCompatibilityReport,
 ) -> Result<(), StoreError> {
-    for diagnostic in diagnostics {
+    let diagnostic_json = compatibility
+        .diagnostics
+        .iter()
+        .map(revision_compatibility_diagnostic_to_json)
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "instance_id": instance_id,
+        "active_version_id": compatibility.active_version_id,
+        "candidate_version_id": compatibility.candidate_version_id,
+        "compatible": false,
+        "diagnostics": diagnostic_json,
+    })
+    .to_string();
+    let event = store.append_event(NewEvent {
+        instance_id,
+        event_type: "workflow.revision_rejected",
+        payload_json: &payload,
+        source: "cli",
+        causation_id: None,
+        correlation_id: Some(&compatibility.candidate_version_id),
+        idempotency_key: None,
+    })?;
+
+    let mut diagnostic_ids = Vec::new();
+    for diagnostic in &compatibility.diagnostics {
         let subject_id = diagnostic
             .subject
             .as_deref()
-            .unwrap_or(candidate_version_id)
+            .unwrap_or(&compatibility.candidate_version_id)
             .to_owned();
         let idempotency_key = idempotency_key(&[
             instance_id,
             "revision-compatibility",
-            candidate_version_id,
+            &compatibility.candidate_version_id,
             &diagnostic.code,
             &subject_id,
         ]);
-        store.record_diagnostic(DiagnosticRecord {
+        let diagnostic_id = store.record_diagnostic(DiagnosticRecord {
             instance_id: Some(instance_id),
             program_id: None,
             program_version_id: None,
@@ -727,17 +759,91 @@ fn persist_revision_compatibility_diagnostics(
             source_span_json: diagnostic.source_span_json.as_deref(),
             subject_type: Some("revision_compatibility"),
             subject_id: Some(&subject_id),
-            event_id: None,
+            event_id: Some(&event.event_id),
             effect_id: None,
             run_id: None,
             assertion_id: None,
             evidence_ids_json: "[]",
             artifact_ids_json: "[]",
-            causation_id: None,
-            correlation_id: Some(candidate_version_id),
+            causation_id: Some(&event.event_id),
+            correlation_id: Some(&compatibility.candidate_version_id),
             idempotency_key: Some(&idempotency_key),
         })?;
+        diagnostic_ids.push(diagnostic_id);
     }
+
+    let evidence_metadata = json!({
+        "event_id": event.event_id,
+        "active_version_id": compatibility.active_version_id,
+        "candidate_version_id": compatibility.candidate_version_id,
+        "diagnostic_ids": diagnostic_ids,
+        "diagnostics": diagnostic_json,
+    })
+    .to_string();
+    let evidence_id = store.record_evidence(EvidenceRecord {
+        instance_id,
+        kind: "workflow.revision.compatibility_rejected",
+        subject_type: "revision_candidate",
+        subject_id: &compatibility.candidate_version_id,
+        causation_id: Some(&event.event_id),
+        correlation_id: Some(&compatibility.candidate_version_id),
+        summary: Some("workflow revision rejected by compatibility diagnostics"),
+        metadata_json: &evidence_metadata,
+    })?;
+    store.link_evidence(EvidenceLink {
+        evidence_id: &evidence_id,
+        instance_id,
+        target_type: "event",
+        target_id: &event.event_id,
+        relation: "rejected",
+    })?;
+    for diagnostic_id in &diagnostic_ids {
+        store.link_evidence(EvidenceLink {
+            evidence_id: &evidence_id,
+            instance_id,
+            target_type: "diagnostic",
+            target_id: diagnostic_id,
+            relation: "compatibility_diagnostic",
+        })?;
+    }
+    Ok(())
+}
+
+fn persist_revision_source_bundle_diagnostic(
+    store: &SqliteStore,
+    revise_options: &ReviseOptions,
+    error: &CompileFailure,
+) -> Result<(), StoreError> {
+    let CompileFailure::Io(error) = error else {
+        return Ok(());
+    };
+    let subject_id = display_path(&revise_options.program_path);
+    let idempotency_key = idempotency_key(&[
+        &revise_options.instance_id,
+        "revision-source-bundle",
+        &subject_id,
+    ]);
+    let message = format!("failed to read revision source bundle `{subject_id}`: {error}");
+    store.record_diagnostic(DiagnosticRecord {
+        instance_id: Some(&revise_options.instance_id),
+        program_id: None,
+        program_version_id: None,
+        severity: "error",
+        code: Some("revision.source_bundle_unavailable"),
+        message: &message,
+        source_span_json: None,
+        subject_type: Some("revision_source_bundle"),
+        subject_id: Some(&subject_id),
+        event_id: None,
+        effect_id: None,
+        run_id: None,
+        assertion_id: None,
+        evidence_ids_json: "[]",
+        artifact_ids_json: "[]",
+        causation_id: None,
+        correlation_id: Some(&revise_options.instance_id),
+        idempotency_key: Some(&idempotency_key),
+    })?;
     Ok(())
 }
 
@@ -1228,7 +1334,7 @@ fn validate_step_program_version(
     let source_hash = stable_hash_hex(source);
     let ir_hash = stable_hash_hex(&snapshot);
     if source_hash != active_version.source_hash || ir_hash != active_version.ir_hash {
-        return Err(StoreError::Conflict(format!(
+        let message = format!(
             "step program `{program_path}` does not match active version {} at epoch {} (expected source_hash={} ir_hash={}, got source_hash={} ir_hash={}); activate the candidate with `whip revise` before stepping it",
             active_version.version_id,
             instance.revision_epoch,
@@ -1236,9 +1342,58 @@ fn validate_step_program_version(
             active_version.ir_hash,
             source_hash,
             ir_hash
-        )));
+        );
+        persist_stale_step_program_diagnostic(
+            &store,
+            instance_id,
+            program_path,
+            &active_version.version_id,
+            instance.revision_epoch,
+            &message,
+        )?;
+        return Err(StoreError::Conflict(message));
     }
     Ok(active_version.version_id)
+}
+
+fn persist_stale_step_program_diagnostic(
+    store: &SqliteStore,
+    instance_id: &str,
+    program_path: &str,
+    active_version_id: &str,
+    revision_epoch: i64,
+    message: &str,
+) -> Result<(), StoreError> {
+    let subject_id = display_path(program_path);
+    let revision_epoch = revision_epoch.to_string();
+    let idempotency_key = idempotency_key(&[
+        instance_id,
+        "stale-step-program",
+        active_version_id,
+        &subject_id,
+        &revision_epoch,
+    ]);
+    store.record_diagnostic(DiagnosticRecord {
+        instance_id: Some(instance_id),
+        program_id: None,
+        program_version_id: Some(active_version_id),
+        severity: "error",
+        code: Some("revision.stale_program_path"),
+        message,
+        source_span_json: None,
+        subject_type: Some("program_path"),
+        subject_id: Some(&subject_id),
+        event_id: None,
+        effect_id: None,
+        run_id: None,
+        assertion_id: None,
+        evidence_ids_json: "[]",
+        artifact_ids_json: "[]",
+        causation_id: None,
+        correlation_id: Some(active_version_id),
+        idempotency_key: Some(&idempotency_key),
+    })?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6043,6 +6198,12 @@ fn log_event_details(event: &EventView) -> Option<String> {
             payload_str(&payload, "cancellation_policy"),
             payload_array_len(&payload, "terminal_cancel_effects"),
             payload_array_len(&payload, "request_cancel_effects"),
+        )),
+        "workflow.revision_rejected" => Some(format!(
+            "candidate={} active={} diagnostics={}",
+            payload_str(&payload, "candidate_version_id"),
+            payload_str(&payload, "active_version_id"),
+            payload_array_len(&payload, "diagnostics"),
         )),
         "effect.cancellation_requested" => Some(format!(
             "effect={} revision={} by={} reason={}",

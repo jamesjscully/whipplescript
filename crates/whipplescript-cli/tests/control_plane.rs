@@ -698,6 +698,25 @@ rule seed_v2
     assert!(!stale_step.status.success());
     let stderr = String::from_utf8_lossy(&stale_step.stderr);
     assert!(stderr.contains("does not match active version"), "{stderr}");
+    let diagnostics = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "diagnostics",
+            instance_id,
+        ],
+    );
+    let diagnostics = diagnostics.as_array().expect("diagnostics array");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(Value::as_str) == Some("revision.stale_program_path")
+            && diagnostic.get("subject_type").and_then(Value::as_str) == Some("program_path")
+            && diagnostic
+                .get("program_version_id")
+                .and_then(Value::as_str)
+                .is_some()
+    }));
 
     let step = run_json(
         bin,
@@ -744,6 +763,77 @@ rule seed_v2
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(v1);
     let _ = fs::remove_file(v2);
+}
+
+#[test]
+fn revise_records_missing_source_bundle_diagnostic() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("revise-missing-source-v1");
+    let missing = temp_workflow_path("revise-missing-source-v2");
+    fs::write(
+        &v1,
+        r#"
+workflow RevisionMissingSource
+
+rule noop
+  when started
+=> {
+}
+"#,
+    )
+    .expect("write v1 workflow");
+
+    let started = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "run",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let revise = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "revise",
+            instance_id,
+            missing.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(!revise.status.success());
+    let stderr = String::from_utf8_lossy(&revise.stderr);
+    assert!(stderr.contains("failed to read"), "{stderr}");
+
+    let diagnostics = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "diagnostics",
+            instance_id,
+        ],
+    );
+    let diagnostics = diagnostics.as_array().expect("diagnostics array");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(Value::as_str) == Some("revision.source_bundle_unavailable")
+            && diagnostic.get("subject_type").and_then(Value::as_str)
+                == Some("revision_source_bundle")
+    }));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(v1);
+    let _ = fs::remove_file(missing);
 }
 
 #[test]
@@ -1664,10 +1754,79 @@ rule noop
         ],
     );
     let persisted = persisted.as_array().expect("diagnostics array");
-    assert!(persisted.iter().any(|diagnostic| {
-        diagnostic.get("code").and_then(Value::as_str) == Some("revision.root_workflow_changed")
-            && diagnostic.get("subject_type").and_then(Value::as_str)
-                == Some("revision_compatibility")
+    let root_diagnostic = persisted
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.get("code").and_then(Value::as_str) == Some("revision.root_workflow_changed")
+                && diagnostic.get("subject_type").and_then(Value::as_str)
+                    == Some("revision_compatibility")
+        })
+        .expect("persisted root compatibility diagnostic");
+    let root_diagnostic_id = root_diagnostic
+        .get("diagnostic_id")
+        .and_then(Value::as_str)
+        .expect("diagnostic id")
+        .to_owned();
+
+    let log = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "log",
+            instance_id,
+        ],
+    );
+    let rejected_event = log
+        .as_array()
+        .expect("log array")
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("workflow.revision_rejected")
+        })
+        .expect("revision rejected event");
+    let rejected_event_id = rejected_event
+        .get("event_id")
+        .and_then(Value::as_str)
+        .expect("event id")
+        .to_owned();
+    assert_eq!(
+        root_diagnostic.get("event_id").and_then(Value::as_str),
+        Some(rejected_event_id.as_str())
+    );
+
+    let evidence = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "evidence",
+            instance_id,
+        ],
+    );
+    let evidence_items = evidence
+        .get("evidence")
+        .and_then(Value::as_array)
+        .expect("evidence array");
+    assert!(evidence_items.iter().any(|item| {
+        item.get("kind").and_then(Value::as_str) == Some("workflow.revision.compatibility_rejected")
+            && item.get("causation_id").and_then(Value::as_str) == Some(rejected_event_id.as_str())
+    }));
+    let evidence_links = evidence
+        .get("links")
+        .and_then(Value::as_array)
+        .expect("evidence links");
+    assert!(evidence_links.iter().any(|link| {
+        link.get("target_type").and_then(Value::as_str) == Some("event")
+            && link.get("target_id").and_then(Value::as_str) == Some(rejected_event_id.as_str())
+            && link.get("relation").and_then(Value::as_str) == Some("rejected")
+    }));
+    assert!(evidence_links.iter().any(|link| {
+        link.get("target_type").and_then(Value::as_str) == Some("diagnostic")
+            && link.get("target_id").and_then(Value::as_str) == Some(root_diagnostic_id.as_str())
+            && link.get("relation").and_then(Value::as_str) == Some("compatibility_diagnostic")
     }));
 
     let status = run_json(
