@@ -1,0 +1,128 @@
+# Troubleshooting
+
+This page covers common failures in the first few minutes.
+
+## `cargo` Or `rustc` Is Missing
+
+Install Rust from <https://rustup.rs/>, then open a new shell:
+
+```sh
+rustc --version
+cargo --version
+```
+
+## `whip` Is Not Found
+
+Cargo installs binaries into `~/.cargo/bin` by default. Add it to `PATH`:
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+Then open a new shell and run:
+
+```sh
+whip --version
+whip doctor
+```
+
+## `run` Produced No Facts
+
+That is expected. `run` starts an instance and records `external.started`; it
+does not evaluate rules or execute providers.
+
+For first experiments, use:
+
+```sh
+whip --store .whipplescript/quickstart.sqlite \
+  dev examples/minimal-noop.whip \
+  --provider fixture \
+  --until idle \
+  --json
+```
+
+If you already used `run`, step the instance:
+
+```sh
+whip --store .whipplescript/quickstart.sqlite \
+  step <instance_id> --program examples/minimal-noop.whip
+```
+
+## I Lost The Instance ID
+
+List instances in the store:
+
+```sh
+whip --store .whipplescript/quickstart.sqlite instances
+```
+
+Then inspect one:
+
+```sh
+whip --store .whipplescript/quickstart.sqlite status <instance_id>
+```
+
+## I Used The Wrong Store
+
+Every command that reads an instance must use the same store path that created
+it. If you ran with:
+
+```sh
+--store .whipplescript/tutorial.sqlite
+```
+
+use that same `--store` for `status`, `facts`, `effects`, and `trace`.
+
+You can also set:
+
+```sh
+export WHIPPLESCRIPT_STORE=.whipplescript/tutorial.sqlite
+```
+
+## Multiple Workflows Need `--root`
+
+If a source bundle exposes multiple workflows, select the root workflow:
+
+```sh
+whip check examples/revision-ticket-v1.whip --root RevisionTicket
+```
+
+The same applies to `run`, `dev`, `step`, and `revise` where a root workflow is
+ambiguous.
+
+## Real Provider Checks Are Skipped Or Fail
+
+Real provider smoke tests are opt-in. Start with the fixture provider unless
+you are intentionally testing external integrations.
+
+When using real-provider scripts, check the required environment variables:
+
+```sh
+WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \
+WHIPPLESCRIPT_REAL_PROVIDERS=loft,baml,codex \
+scripts/check-real-providers.sh
+```
+
+Provider failures should become diagnostics, evidence, run status, and effect
+status. They should not be hidden as generic command failures.
+
+## `cargo install --git` Fails
+
+Use the checkout path first:
+
+```sh
+git clone https://github.com/jamesjscully/whipplescript.git
+cd whipplescript
+cargo install --path crates/whipplescript-cli --locked
+```
+
+If that works, the Git install failure is likely a network, lockfile, or remote
+toolchain issue.
+
+## `whip doctor` Reports Missing Tools
+
+Some tools are optional. For fixture-backed quickstart and tutorial flows, you
+do not need Maude, Apalache, BAML, Codex, Claude, Pi, or Loft.
+
+Install optional tools only when you need formal checks or real provider smoke
+tests.

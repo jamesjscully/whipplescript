@@ -1,26 +1,41 @@
 # WhippleScript Documentation
 
-Status: in progress
-
 This directory is the user-facing documentation path. The `spec/` directory
 remains the design record and implementation tracker; docs here should explain
 the current authoring and operating model directly.
 
+Stability note: the in-repo tests and local runtime checks may call individual
+subsystems stable, but the public language, CLI, runtime behavior, and
+provider/plugin interfaces are still early and may change.
+
 ## Start Here
 
+- [Quickstart](quickstart.md): install from source, run a fixture-backed local
+  workflow, and inspect the result.
+- [Tutorial](tutorial.md): route work to logical agents, review the results,
+  and inspect durable facts/effects.
+- [Concepts](concepts.md): workflow, fact, event, rule, effect, agent,
+  provider, worker, and local command boundaries.
 - [Manual](manual.md): end-to-end guide for writing, running, inspecting, and
   operating workflows.
+- [Install](install.md): source install, planned binary releases, verification,
+  and troubleshooting.
 - [API Reference](api-reference.md): exact CLI, language, status/event, JSON,
   and Rust crate surfaces.
-- [Language Reference](language-reference.md): `.whip` concepts, syntax, and
-  lowering behavior.
+- [Language Reference](language-reference.md): `.whip` syntax and lowering
+  behavior.
 - [Runtime And Operations Reference](runtime-operations.md): instance lifecycle,
   effects/runs/leases, provider failures, and inspection commands.
-- [CLI Quickstart](../spec/quickstart.md): local commands for checking,
-  compiling, running, and inspecting workflows.
-- [Operator Guide](../spec/operator-guide.md): store paths, lifecycle controls,
+- [Providers And Plugins](providers.md): fixture provider, experimental native
+  providers, plugin entry points, and validation scripts.
+- [Examples](examples.md): which checked workflow to try and why.
+- [Current State](current-state.md): what works today, what is experimental,
+  and what "stable" means in this repo.
+- [Troubleshooting](troubleshooting.md): first-10-minute setup and runtime
+  issues.
+- [Operator Guide](operator-guide.md): store paths, lifecycle controls,
   profiles, providers, and recovery bundles.
-- [Plugin Author Guide](../spec/plugin-author-guide.md): how plugins extend
+- [Plugin Authoring](plugin-authoring.md): how plugins extend
   capabilities and providers without changing language semantics.
 - [Verification](../spec/verification.md): Maude, TLA+/Apalache, and static
   analysis strategy.

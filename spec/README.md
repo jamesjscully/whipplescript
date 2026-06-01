@@ -41,6 +41,8 @@ timeouts, and replay. The language owns policy.
 - [workflow-composition-transition-tracker.md](workflow-composition-transition-tracker.md): transition checklist for `workflow`, `pattern`, `apply`, `invoke`, `include`, and explicit terminal actions
 - [workflow-revision-transition-tracker.md](workflow-revision-transition-tracker.md): transition checklist for in-flight workflow revision, revision epochs, and cancellation policy
 - [workflow-revision-followups-tracker.md](workflow-revision-followups-tracker.md): vNext planning tracker for root retargeting, live fact migration, provider cancellation depth, and destructive confirmation policies
+- [native-provider-surfaces.md](native-provider-surfaces.md): validated Codex, Claude, and Pi native integration surface notes
+- [native-provider-implementation-tracker.md](native-provider-implementation-tracker.md): execution tracker for native provider capability/config, adapter spikes, cancellation, artifacts, recovery, and validation
 - [capability-registry.md](capability-registry.md): runtime authority bindings and enforcement modes
 - [plugin-system.md](plugin-system.md): Pi-inspired package, plugin, and resource model
 - [skills.md](skills.md): deterministic skill registry and attachment model
@@ -55,7 +57,7 @@ timeouts, and replay. The language owns policy.
 - [troubleshooting.md](troubleshooting.md): common diagnostics and operational failures
 - [release-checklist.md](release-checklist.md): v0 release gate checklist
 - [distribution-tracker.md](distribution-tracker.md): cross-platform install and release artifact tracker
-- [migration-notes.md](migration-notes.md): why legacy systems moved aside
+- [documentation-improvement-tracker.md](documentation-improvement-tracker.md): product-oriented docs improvement tracker
 - [final-audit.md](final-audit.md): staged audit findings and gap classification
 - [memory-plugin.md](memory-plugin.md): memory as a registered plugin capability
 - [thoth-plugin.md](thoth-plugin.md): Thoth governance as a registered plugin capability
@@ -71,6 +73,16 @@ timeouts, and replay. The language owns policy.
 ## User-Facing Docs
 
 - [../docs/README.md](../docs/README.md): documentation map and canonical terms
+- [../docs/quickstart.md](../docs/quickstart.md): user-facing local
+  quickstart
+- [../docs/tutorial.md](../docs/tutorial.md): fixture-backed agent routing and
+  review tutorial
+- [../docs/concepts.md](../docs/concepts.md): core WhippleScript terms and
+  command boundaries
+- [../docs/examples.md](../docs/examples.md): checked examples by use case and
+  credential requirements
+- [../docs/current-state.md](../docs/current-state.md): what works today and
+  what remains experimental
 - [../docs/manual.md](../docs/manual.md): end-to-end workflow author/operator
   manual
 - [../docs/api-reference.md](../docs/api-reference.md): CLI, language,
@@ -79,6 +91,14 @@ timeouts, and replay. The language owns policy.
   `.whip` language reference
 - [../docs/runtime-operations.md](../docs/runtime-operations.md): runtime
   lifecycle, provider failure capture, and inspection commands
+- [../docs/providers.md](../docs/providers.md): fixture provider, experimental
+  native providers, and plugin entry points
+- [../docs/troubleshooting.md](../docs/troubleshooting.md): first-10-minute
+  setup and runtime fixes
+- [../docs/operator-guide.md](../docs/operator-guide.md): user-facing operator
+  command map
+- [../docs/plugin-authoring.md](../docs/plugin-authoring.md): user-facing
+  plugin authoring orientation
 
 ## Design Commitments
 

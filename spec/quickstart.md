@@ -5,6 +5,10 @@ Status: draft
 This quickstart uses the deterministic local workflow path. It does not require
 real provider credentials.
 
+Install `whip` first with [`../docs/install.md`](../docs/install.md), or run the
+checkout fallback commands shown below with `cargo run -p whipplescript --`.
+
+For the user-facing quickstart, read [`../docs/quickstart.md`](../docs/quickstart.md).
 For the authoring model, read
 [`../docs/language-reference.md`](../docs/language-reference.md). For runtime
 lifecycle and failure behavior, read
@@ -13,8 +17,13 @@ lifecycle and failure behavior, read
 ## 1. Check Tooling
 
 ```sh
-cargo build --workspace
-cargo run -p whipplescript-cli -- doctor
+whip doctor
+```
+
+Checkout fallback:
+
+```sh
+cargo run -p whipplescript -- doctor
 ```
 
 For formal and e2e checks:
@@ -28,22 +37,26 @@ scripts/check-e2e.sh
 ## 2. Compile A Workflow
 
 ```sh
-cargo run -p whipplescript-cli -- check examples/minimal-noop.whip
-cargo run -p whipplescript-cli -- compile examples/minimal-noop.whip
+whip check examples/minimal-noop.whip
+whip compile examples/minimal-noop.whip
 ```
 
 Use generated model searches when Maude is installed:
 
 ```sh
-cargo run -p whipplescript-cli -- check --model-search examples/loft-worker-with-review.whip
+whip check --model-search examples/loft-worker-with-review.whip
 ```
 
-## 3. Run An Instance
+## 3. Run A Local Validation Loop
+
+Use `dev` for the first run. It starts an instance, steps deterministic rules,
+runs fixture workers, and evaluates assertions.
 
 ```sh
-cargo run -p whipplescript-cli -- --store .whipplescript/quickstart.sqlite \
-  run examples/minimal-noop.whip \
-  --input '{"ticket":"quickstart"}' \
+whip --store .whipplescript/quickstart.sqlite \
+  dev examples/minimal-noop.whip \
+  --provider fixture \
+  --until idle \
   --json
 ```
 
@@ -52,13 +65,42 @@ Save the returned `instance_id`.
 ## 4. Inspect State
 
 ```sh
-cargo run -p whipplescript-cli -- --store .whipplescript/quickstart.sqlite status <instance_id>
-cargo run -p whipplescript-cli -- --store .whipplescript/quickstart.sqlite log <instance_id>
-cargo run -p whipplescript-cli -- --store .whipplescript/quickstart.sqlite facts <instance_id>
-cargo run -p whipplescript-cli -- --store .whipplescript/quickstart.sqlite trace <instance_id> --check --json
+whip --store .whipplescript/quickstart.sqlite status <instance_id>
+whip --store .whipplescript/quickstart.sqlite log <instance_id>
+whip --store .whipplescript/quickstart.sqlite facts <instance_id>
+whip --store .whipplescript/quickstart.sqlite trace <instance_id> --check --json
 ```
 
-## 5. Preview A Revision
+## 5. Start And Step Manually
+
+`run` only starts an instance and records `external.started`; it does not
+evaluate rules or execute providers.
+
+```sh
+whip --store .whipplescript/quickstart.sqlite \
+  run examples/minimal-noop.whip \
+  --input '{"ticket":"quickstart"}' \
+  --json
+```
+
+Save the returned `instance_id`.
+
+Then step deterministic rules:
+
+```sh
+whip --store .whipplescript/quickstart.sqlite \
+  step <instance_id> --program examples/minimal-noop.whip
+```
+
+Inspect state:
+
+```sh
+whip --store .whipplescript/quickstart.sqlite status <instance_id>
+whip --store .whipplescript/quickstart.sqlite log <instance_id>
+whip --store .whipplescript/quickstart.sqlite facts <instance_id>
+```
+
+## 6. Preview A Revision
 
 Start the revision v1 example:
 
@@ -95,7 +137,7 @@ Use `--cancel queued` to terminal-cancel queued old-version effects, or
 work. Source rules may propose candidate files, but they do not activate
 revisions.
 
-## 6. Use Examples As Starting Points
+## 7. Use Examples As Starting Points
 
 Checked examples live in `examples/`:
 

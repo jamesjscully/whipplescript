@@ -1,7 +1,5 @@
 # WhippleScript Language Reference
 
-Status: in progress
-
 This reference describes the canonical `.whip` authoring model. It is meant to
 be read by workflow authors before they need the detailed specs.
 
@@ -362,10 +360,8 @@ lifecycle.
 Instances have these durable states:
 
 ```text
-created
 running
 paused
-blocked
 completed
 failed
 cancelled
@@ -388,11 +384,12 @@ failures according to source policy.
 Typical local use:
 
 ```sh
-cargo run -p whipplescript-cli -- check examples/minimal-noop.whip
-cargo run -p whipplescript-cli -- compile examples/minimal-noop.whip
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite run examples/minimal-noop.whip --input '{}' --json
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite status <instance>
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite trace <instance> --check --json
+whip check examples/minimal-noop.whip
+whip compile examples/minimal-noop.whip
+whip --store .whipplescript/dev.sqlite dev examples/minimal-noop.whip --provider fixture --until idle --json
+whip --store .whipplescript/dev.sqlite status <instance>
+whip --store .whipplescript/dev.sqlite facts <instance>
+whip --store .whipplescript/dev.sqlite trace <instance> --check --json
 ```
 
 Use `dev` for a local validation loop that composes start, step, and fixture

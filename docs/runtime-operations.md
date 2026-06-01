@@ -1,7 +1,5 @@
 # Runtime And Operations Reference
 
-Status: in progress
-
 This page explains what happens after a `.whip` bundle is checked, compiled,
 and started.
 
@@ -31,7 +29,7 @@ The default local store is:
 Use `--store <path>` or `WHIPPLESCRIPT_STORE` to isolate environments:
 
 ```sh
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite doctor
+whip --store .whipplescript/dev.sqlite doctor
 ```
 
 The store records:
@@ -63,10 +61,8 @@ invocation links are projections over durable state.
 Instances move through these states:
 
 ```text
-created
 running
 paused
-blocked
 completed
 failed
 cancelled
@@ -98,7 +94,8 @@ queued -> running -> failed
 queued -> running -> timed_out
 queued -> blocked_by_dependency
 queued -> blocked_by_capacity
-queued -> blocked_by_policy
+queued -> blocked_by_capability
+queued -> blocked_by_profile
 ```
 
 Terminal provider outcomes are recorded as effect/run events. They do not
@@ -190,14 +187,14 @@ tracked in
 Common commands:
 
 ```sh
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite instances
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite status <instance>
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite log <instance>
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite facts <instance>
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite effects <instance>
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite runs <instance>
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite evidence <instance> --json
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite trace <instance> --check --json
+whip --store .whipplescript/dev.sqlite instances
+whip --store .whipplescript/dev.sqlite status <instance>
+whip --store .whipplescript/dev.sqlite log <instance>
+whip --store .whipplescript/dev.sqlite facts <instance>
+whip --store .whipplescript/dev.sqlite effects <instance>
+whip --store .whipplescript/dev.sqlite runs <instance>
+whip --store .whipplescript/dev.sqlite evidence <instance> --json
+whip --store .whipplescript/dev.sqlite trace <instance> --check --json
 ```
 
 `status --json` includes parent/child invocation links when available.
@@ -205,10 +202,10 @@ cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite trace <insta
 ## Lifecycle Controls
 
 ```sh
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite pause <instance>
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite resume <instance>
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite cancel <instance>
-cargo run -p whipplescript-cli -- --store .whipplescript/dev.sqlite retry <instance> <effect>
+whip --store .whipplescript/dev.sqlite pause <instance>
+whip --store .whipplescript/dev.sqlite resume <instance>
+whip --store .whipplescript/dev.sqlite cancel <instance>
+whip --store .whipplescript/dev.sqlite retry <instance> <effect>
 ```
 
 Pause/resume are nonterminal controls. Cancel is terminal. Retry moves eligible
@@ -219,13 +216,13 @@ failed or timed-out effects back to queued when policy allows.
 Before manually repairing or deleting runtime state, collect:
 
 ```sh
-cargo run -p whipplescript-cli -- --store <store> status <instance> --json
-cargo run -p whipplescript-cli -- --store <store> log <instance> --json
-cargo run -p whipplescript-cli -- --store <store> facts <instance> --json
-cargo run -p whipplescript-cli -- --store <store> effects <instance> --json
-cargo run -p whipplescript-cli -- --store <store> runs <instance> --json
-cargo run -p whipplescript-cli -- --store <store> evidence <instance> --json
-cargo run -p whipplescript-cli -- --store <store> trace <instance> --check --json
+whip --store <store> status <instance> --json
+whip --store <store> log <instance> --json
+whip --store <store> facts <instance> --json
+whip --store <store> effects <instance> --json
+whip --store <store> runs <instance> --json
+whip --store <store> evidence <instance> --json
+whip --store <store> trace <instance> --check --json
 ```
 
 For provider issues, also preserve the relevant artifacts and provider-specific

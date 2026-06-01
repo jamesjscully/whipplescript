@@ -1,10 +1,10 @@
 # WhippleScript Manual
 
-Status: draft
-
 This manual explains how to build, run, inspect, and extend WhippleScript
-workflows. Use [API Reference](api-reference.md) when you need exact command
-syntax or crate-level surfaces.
+workflows. If you are new, start with [Quickstart](quickstart.md),
+[Tutorial](tutorial.md), and [Concepts](concepts.md). Use
+[API Reference](api-reference.md) when you need exact command syntax or
+crate-level surfaces.
 
 ## 1. What WhippleScript Is
 
@@ -26,13 +26,19 @@ the workflow eventually completes, fails, or is cancelled
 The language owns policy. The runtime owns durability, effect delivery, leases,
 idempotency, retries, replay, and inspection.
 
-## 2. Install And Check The Workspace
+## 2. Install And Check The CLI
 
-From the repository root:
+Install `whip` with [Install WhippleScript](install.md), then check the local
+tooling:
+
+```sh
+whip doctor
+```
+
+From a development checkout, build the full workspace when changing code:
 
 ```sh
 cargo build --workspace
-cargo run -p whipplescript-cli -- doctor
 ```
 
 Optional formal tooling is available through the repo Nix shell:
@@ -82,13 +88,13 @@ rule observe_start
 Check it:
 
 ```sh
-cargo run -p whipplescript-cli -- check examples/minimal-noop.whip
+whip check examples/minimal-noop.whip
 ```
 
 Compile it:
 
 ```sh
-cargo run -p whipplescript-cli -- compile examples/minimal-noop.whip
+whip compile examples/minimal-noop.whip
 ```
 
 ## 4. Start And Inspect An Instance
@@ -102,7 +108,7 @@ STORE=.whipplescript/manual.sqlite
 Start the workflow:
 
 ```sh
-cargo run -p whipplescript-cli -- --store "$STORE" \
+whip --store "$STORE" \
   run examples/minimal-noop.whip \
   --input '{}' \
   --json
@@ -113,9 +119,9 @@ Save the returned `instance_id`.
 Inspect:
 
 ```sh
-cargo run -p whipplescript-cli -- --store "$STORE" status <instance>
-cargo run -p whipplescript-cli -- --store "$STORE" log <instance>
-cargo run -p whipplescript-cli -- --store "$STORE" facts <instance>
+whip --store "$STORE" status <instance>
+whip --store "$STORE" log <instance>
+whip --store "$STORE" facts <instance>
 ```
 
 At this point `run` has created the instance and start event. It has not stepped
@@ -124,14 +130,14 @@ rules unless you use `dev`.
 Advance deterministic rules:
 
 ```sh
-cargo run -p whipplescript-cli -- --store "$STORE" \
+whip --store "$STORE" \
   step <instance> --program examples/minimal-noop.whip
 ```
 
 Inspect facts again:
 
 ```sh
-cargo run -p whipplescript-cli -- --store "$STORE" facts <instance>
+whip --store "$STORE" facts <instance>
 ```
 
 ## 5. Use `dev` For Local Validation
@@ -140,7 +146,7 @@ cargo run -p whipplescript-cli -- --store "$STORE" facts <instance>
 assertions:
 
 ```sh
-cargo run -p whipplescript-cli -- --store "$STORE" \
+whip --store "$STORE" \
   dev examples/provider-language-e2e.whip \
   --provider fixture \
   --until idle \
@@ -150,13 +156,13 @@ cargo run -p whipplescript-cli -- --store "$STORE" \
 Use fixture outcome switches to exercise terminal branches:
 
 ```sh
-cargo run -p whipplescript-cli -- --store "$STORE" \
+whip --store "$STORE" \
   dev examples/human-review.whip --provider fixture --fail
 
-cargo run -p whipplescript-cli -- --store "$STORE" \
+whip --store "$STORE" \
   dev examples/human-review.whip --provider fixture --timeout
 
-cargo run -p whipplescript-cli -- --store "$STORE" \
+whip --store "$STORE" \
   dev examples/human-review.whip --provider fixture --cancel
 ```
 
@@ -234,7 +240,7 @@ rule implement
 ```
 
 `tell` creates an `agent.tell` effect. The provider does not run during the rule
-commit. A worker claims and completes the effect later.
+commit. A worker starts a provider run and completes the effect later.
 
 ## 8. Use BAML Coercion For Typed Model Decisions
 
@@ -554,6 +560,9 @@ For an OpenAI-backed local BAML-compatible coerce bridge:
 ```sh
 scripts/check-openai-coerce.sh
 ```
+
+The wrapper loads `OPENAI_API_KEY` as data from `.env` when needed and generates
+a per-run bearer token for the local `/coerce` bridge.
 
 Provider failures must appear as events, run/effect terminal state, diagnostics,
 and evidence. They do not automatically fail the workflow unless source rules

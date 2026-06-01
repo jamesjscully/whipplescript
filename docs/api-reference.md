@@ -1,7 +1,5 @@
 # WhippleScript API Reference
 
-Status: draft
-
 This reference catalogs the currently implemented surfaces: the `.whip`
 language, CLI commands, runtime events/statuses, JSON inspection shapes, and
 Rust crate APIs. It is intentionally factual; design rationale belongs in
@@ -24,8 +22,9 @@ whip [--store path] [--json] [--input JSON] <command> [args]
 The current command set is:
 
 ```text
-check, compile, run, step, worker, dev, instances, status, log, facts, effects,
-runs, inbox, evidence, diagnostics, trace, pause, resume, cancel, retry, doctor
+check, compile, run, revise, step, worker, dev, instances, status, log, facts,
+effects, runs, inbox, evidence, diagnostics, trace, pause, resume, cancel,
+retry, doctor
 ```
 
 ## CLI Commands
@@ -150,7 +149,7 @@ whip [--store path] worker <instance> \
   [--max-child-iterations N]
 ```
 
-Claims currently claimable effects and completes them through the selected
+Starts currently claimable effects and completes them through the selected
 provider. The default provider is the deterministic fixture provider. `--fail`,
 `--timeout`, and `--cancel` force fixture terminal outcomes for failure-path
 tests.
@@ -196,6 +195,36 @@ evaluates source assertions.
 JSON output includes the instance id, workflow name, per-iteration step reports,
 worker reports, and assertion reports.
 
+### `revise`
+
+```sh
+whip [--store path] revise <instance> <workflow.whip> \
+  [--root Workflow] \
+  [--dry-run] \
+  [--cancel keep|queued|running]
+```
+
+Checks whether a candidate source bundle can become the active program version
+for a non-terminal running instance. With `--dry-run`, it reports compatibility
+without changing the store. Without `--dry-run`, it records a revision
+activation event and future `step` calls use the new active program version.
+
+Cancellation policy controls old-version effects:
+
+| Policy | Meaning |
+| --- | --- |
+| `keep` | Keep old-version effects claimable/runnable. |
+| `queued` | Terminal-cancel queued, blocked, and claimable old-version effects. |
+| `running` | Cancel queued old-version effects and request cancellation for running old-version work. |
+
+Running cancellation requests are not terminal results. Providers still record
+the eventual completion, failure, timeout, or cancellation acknowledgement.
+
+JSON dry-run output includes the candidate version, compatibility diagnostics,
+agent impact, cancellation impact, and no activation event. Activation output
+includes the activated version, revision epoch, cancellation policy, diagnostics,
+and evidence links.
+
 ### Inspection Commands
 
 | Command | Meaning |
@@ -237,7 +266,7 @@ whip retry <instance> <effect>
 | --- | --- |
 | `pause` | Transition a running instance to paused. |
 | `resume` | Transition a paused instance back to running. |
-| `cancel` | Transition a running/paused/blocked instance to terminal cancelled. |
+| `cancel` | Transition a running or paused instance to terminal cancelled. |
 | `retry` | Move an eligible failed or timed-out effect back to queued. |
 
 Terminal instances are absorbing: completed, failed, and cancelled instances do
@@ -299,10 +328,8 @@ This section is a compact index of source constructs.
 ### Instance Status
 
 ```text
-created
 running
 paused
-blocked
 completed
 failed
 cancelled
@@ -316,8 +343,8 @@ cancelled
 queued
 blocked_by_dependency
 blocked_by_capacity
-blocked_by_policy
-claimed
+blocked_by_capability
+blocked_by_profile
 running
 completed
 failed
@@ -355,16 +382,25 @@ Common event types:
 | `effect.run_started` | Provider run started for an effect. |
 | `effect.terminal` | Effect completed, failed, timed out, or cancelled. |
 | `effect.blocked` | Effect blocked before provider start. |
-| `effect.retry_requested` | Effect returned to queued for retry. |
+| `effect.cancellation_requested` | Running effect received a durable cancellation request. |
+| `effect.retried` | Effect returned to queued for retry. |
 | `lease.expired` | Active run lease expired. |
+| `lease.renewed` | Active run lease was renewed. |
 | `instance.transitioned` | Pause/resume/cancel transition. |
 | `workflow.completed` | Workflow produced declared output and became completed. |
 | `workflow.failed` | Workflow produced declared failure and became failed. |
+| `workflow.revision_activated` | Instance active program version changed. |
+| `workflow.revision_rejected` | Non-dry-run revision failed compatibility checks. |
+| `fact.derived` | Runtime projection derived a durable fact from an event/effect. |
+| `assertion.passed` | Explicit assertion evaluation returned true. |
+| `assertion.failed` | Explicit assertion evaluation returned false and produced a diagnostic. |
+| `assertion.errored` | Explicit assertion evaluation could not produce a boolean result and produced a diagnostic. |
 | `agent.turn.completed` | Agent turn completion projection. |
 | `agent.turn.failed` | Agent turn failure projection. |
 | `agent.turn.timed_out` | Agent turn timeout projection. |
 | `agent.turn.cancelled` | Agent turn cancellation projection. |
-| `human.answered` | Human answered an inbox item. |
+| `human.ask.created` | Human review request was created. |
+| `human.answer.received` | Human answered an inbox item. |
 
 ## JSON Inspection Shapes
 
@@ -391,11 +427,13 @@ Field sets may grow. Consumers should ignore unknown fields.
 ```json
 {
   "fact_id": "fact_...",
+  "program_version_id": "ver_...",
+  "revision_epoch": 0,
   "name": "WorkItem",
   "key": "item-1",
   "value": {},
-  "source_event_id": "evt_...",
-  "source_rule": "seed"
+  "provenance_class": "rule",
+  "source_span": null
 }
 ```
 

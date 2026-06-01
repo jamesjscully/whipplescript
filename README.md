@@ -1,98 +1,201 @@
 # WhippleScript
 
-WhippleScript is being redesigned as a restricted orchestration language for coding
-agents.
+A whippletree distributes load from different sources. WhippleScript is a
+programming language for coordinating work across multiple AI agents.
 
-The new direction is an event-sourced relational rule machine:
+WhippleScript is for programmers who want agents to collaborate in a repeatable
+way: route work to specialized agents, wait for results, ask for review, retry
+failures, and inspect what happened afterward.
 
-- facts and events describe what is true
-- rules rewrite those facts into new facts and durable effects
-- agent turns are effects, not arbitrary host-language calls
-- runtime state is append-only and auditable
-- static analysis and formal modeling are first-class design constraints
+> Warning: WhippleScript is early and not yet stable. The language, CLI, runtime
+> behavior, and provider/plugin interfaces may change as the project settles.
+> The current build is best for local experiments and prototype agent
+> orchestration, not stable production dependencies.
 
-The previous Rust statechart implementation has been moved to
-`legacy/statechart-workflows-runtime/`. Older TypeScript-oriented runtime work
-remains in `legacy/v0.3-runtime/`.
+## What You Can Use It For
 
-Current user-facing documentation starts in `docs/`. Current design work and
-implementation trackers live in `spec/`.
+- Split a goal across several agents with clear handoffs.
+- Put human review or approval in the middle of an agent workflow.
+- Keep a durable record of agent turns, facts, effects, logs, and traces.
+- Retry, resume, or audit long-running work instead of losing context in chat.
+- Connect agent turns to tools, skills, providers, schemas, and plugins.
+- Test orchestration rules locally before trusting them with real work.
 
-The target core is intentionally small: rule runtime, control plane, registries,
-agent harnesses, skills, BAML coercion, Loft integration, human review, and
-evidence/observability. Memory, Thoth, external trackers, browser automation,
-research tools, notifications, dashboards, and evaluators should begin as
-plugins unless the kernel must understand them.
+The target use case is not "write one better prompt." It is "describe the way
+work should move between agents, tools, and people so the process can run again
+and be inspected afterward."
 
-Formal model scaffolding starts in `models/`. Maude is the first runnable model
-target for the rule/effect-graph kernel; TLA+/Apalache is planned for durable
-control-plane lifecycle checks; Veil/Lean is deferred until the kernel semantics
-stabilize.
+## Try It
 
-## Active Workspace
+You need Rust and Cargo for now. Prebuilt releases are planned, but early builds
+are installed from source.
+
+Clone the repo and install the CLI from the checkout:
+
+```sh
+git clone https://github.com/jamesjscully/whipplescript.git
+cd whipplescript
+cargo install --path crates/whipplescript-cli --locked
+whip doctor
+```
+
+Check a multi-agent workflow:
+
+```sh
+whip check examples/multi-agent-bounded-concurrency.whip
+```
+
+Run a no-credentials local workflow with the fixture provider:
+
+```sh
+mkdir -p .whipplescript
+whip --store .whipplescript/quickstart.sqlite \
+  dev examples/minimal-noop.whip \
+  --provider fixture \
+  --until idle \
+  --json
+```
+
+Inspect the result with the returned `instance_id`:
+
+```sh
+whip --store .whipplescript/quickstart.sqlite status <instance_id>
+whip --store .whipplescript/quickstart.sqlite log <instance_id>
+whip --store .whipplescript/quickstart.sqlite facts <instance_id>
+```
+
+For the full walkthrough, use the [Quickstart](docs/quickstart.md).
+For a more useful first workflow, follow the [Tutorial](docs/tutorial.md).
+
+## What A Workflow Looks Like
+
+This is the shape of a simple multi-agent workflow:
+
+```whip
+workflow MultiAgentBoundedConcurrency
+
+agent implementer {
+  profile "repo-writer"
+  capacity 2
+}
+
+agent reviewer {
+  profile "repo-reader"
+  capacity 1
+}
+
+rule implement_ready_work
+  when WorkItem as item
+  when implementer is available
+=> {
+  tell implementer """
+  Implement this work item:
+
+  {{ item.title }}
+
+  {{ item.body }}
+  """
+}
+
+rule review_completed_turn
+  when worker completed turn for loft issue as turn
+  when reviewer is available
+=> {
+  tell reviewer """
+  Review this completed turn:
+
+  {{ turn.summary }}
+
+  Changed files:
+  {{ turn.changedFiles }}
+  """
+}
+```
+
+See the checked examples in [`examples/`](examples/), especially:
+
+- [`examples/multi-agent-bounded-concurrency.whip`](examples/multi-agent-bounded-concurrency.whip)
+- [`examples/loft-worker-with-review.whip`](examples/loft-worker-with-review.whip)
+- [`examples/codex-poem-coerce-review.whip`](examples/codex-poem-coerce-review.whip)
+- [`examples/multi-provider-poem-review.whip`](examples/multi-provider-poem-review.whip)
+
+## Docs By Goal
+
+- I want to install it: [`docs/install.md`](docs/install.md)
+- I want to run an example: [`docs/quickstart.md`](docs/quickstart.md)
+- I want the main tutorial: [`docs/tutorial.md`](docs/tutorial.md)
+- I want the core concepts: [`docs/concepts.md`](docs/concepts.md)
+- I want to choose an example: [`docs/examples.md`](docs/examples.md)
+- I want to write a workflow: [`docs/language-reference.md`](docs/language-reference.md)
+- I want the full guide: [`docs/manual.md`](docs/manual.md)
+- I want to know what works today: [`docs/current-state.md`](docs/current-state.md)
+- I want to understand runtime state and failures:
+  [`docs/runtime-operations.md`](docs/runtime-operations.md)
+- I want exact CLI and API surfaces: [`docs/api-reference.md`](docs/api-reference.md)
+- I want to plug in capabilities or providers:
+  [`docs/providers.md`](docs/providers.md)
+- I hit a setup or runtime problem: [`docs/troubleshooting.md`](docs/troubleshooting.md)
+
+When asking a coding agent to author workflows, start with
+[`skills/whipplescript-author/SKILL.md`](skills/whipplescript-author/SKILL.md).
+
+## Good For / Not Yet Good For
+
+Good for:
+
+- local experiments with multi-agent workflows
+- durable agent handoffs
+- human review gates
+- testing orchestration ideas
+- inspecting what happened after a run
+- building toward provider/plugin integrations
+
+Not yet good for:
+
+- depending on stable syntax
+- unattended production automation
+- assuming provider integrations will stay unchanged
+- plug-and-play hosted agent orchestration
+
+## How It Works
+
+You describe who should do what, when to wait, when to ask for review, and what
+counts as done. WhippleScript keeps the run durable and inspectable.
+
+At a high level:
+
+```text
+facts/events + rules -> durable facts/effects
+effects + workers    -> provider runs
+provider results     -> events/facts
+workflow terminals   -> completed/failed instances
+```
+
+Source composition is split by role:
+
+- `include "schemas/common.whip"` composes source files.
+- `use memory` imports a plugin.
+- `pattern` and `apply` create reusable workflow fragments.
+- `invoke` starts durable child workflows.
+- skills are attached to agents or turns rather than imported as language
+  extensions.
+
+## For Contributors
 
 The active implementation starts at the repository root.
 
 ```text
-Cargo.toml                 Rust workspace
+Cargo.toml                      Rust workspace
 crates/whipplescript-core       shared types and contracts
 crates/whipplescript-parser     `.whip` source parser and typed IR
 crates/whipplescript-store      SQLite-backed runtime store
 crates/whipplescript-kernel     deterministic rule/effect runtime kernel
 crates/whipplescript-cli        control-plane CLI
-spec/                      current design specs and implementation tracker
-models/                    formal models and checks
-scripts/                   root project checks
+docs/                           user-facing documentation
+spec/                           design specs and implementation trackers
+models/                         formal models and checks
+scripts/                        root project checks
 ```
-
-The current Rust crates implement the v0 spine: parser/IR snapshots, durable
-SQLite store, runtime kernel, control-plane CLI, trace conformance, mock e2e
-tests, generated Maude checks, BAML coerce integration, Loft effect contracts,
-human review, skills, evidence, and plugin registration.
-
-The source of truth for remaining work is
-[`spec/implementation-plan.md`](spec/implementation-plan.md). Start with
-[`docs/README.md`](docs/README.md) for the documentation map,
-[`docs/manual.md`](docs/manual.md) for the end-to-end manual,
-[`docs/api-reference.md`](docs/api-reference.md) for exact API surfaces,
-[`docs/language-reference.md`](docs/language-reference.md) for `.whip`
-authoring, [`spec/quickstart.md`](spec/quickstart.md) for CLI usage, and
-[`skills/whipplescript-author/SKILL.md`](skills/whipplescript-author/SKILL.md) when asking
-a coding agent to author workflows.
-
-Source composition is intentionally split by role: `use memory` imports a
-plugin, `include "schemas/common.whip"` composes source files, `pattern`/`apply`
-provides compile-time reusable workflow fragments, `invoke` starts durable child
-workflows, and Claude-style skills are attached to agents or turns rather than
-imported as top-level language extensions.
-
-## Install
-
-Early builds are installed from source. The command-line binary is named `whip`.
-
-Install from the repository:
-
-```sh
-cargo install --git https://github.com/jamesjscully/whipplescript.git --package whipplescript-cli --locked
-```
-
-From a local checkout, install into Cargo's bin directory:
-
-```sh
-cargo install --path crates/whipplescript-cli --locked
-```
-
-Verify the installed binary:
-
-```sh
-whip --version
-whip doctor
-```
-
-The distribution tracker for GitHub Releases, Homebrew, crates.io, and signed
-artifacts lives in [`spec/distribution-tracker.md`](spec/distribution-tracker.md).
-
-## Developer Checks
 
 Run the current root checks:
 
@@ -111,73 +214,12 @@ For a single readiness artifact, run:
 scripts/check-release-readiness.sh
 ```
 
-Set `WHIPPLESCRIPT_RELEASE_READINESS_FULL=1` to include clippy, workspace tests,
-formal models, TLA, and e2e. Set `WHIPPLESCRIPT_RELEASE_STRICT_EXTERNAL=1` when the
-Loft submodule and real-provider prerequisites must be hard failures. The
-default report path is `target/release-readiness-report.md`.
-CI uploads the release readiness report and real-provider smoke report as a
-single `readiness-reports` artifact.
+The source of truth for remaining work is
+[`spec/implementation-plan.md`](spec/implementation-plan.md). Distribution work
+is tracked in [`spec/distribution-tracker.md`](spec/distribution-tracker.md).
 
-`scripts/check-formal-models.sh` requires Maude. `scripts/check-tla-models.sh`
-requires Apalache and Java; if they are not already on `PATH`, it uses the repo
-Nix flake to provide them. `scripts/check-e2e.sh` runs deterministic mock
-provider e2e tests and CLI control-plane checks.
-
-Optional real-provider prerequisites are checked with:
-
-```sh
-WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \
-WHIPPLESCRIPT_LOFT_TEST_ISSUE=iss_... \
-WHIPPLESCRIPT_BAML_TEST_ENDPOINT=http://127.0.0.1:... \
-WHIPPLESCRIPT_BAML_TEST_FUNCTION=classifyMessage \
-WHIPPLESCRIPT_BAML_TEST_ARGUMENTS_JSON='{"title":"Smoke","body":"Check"}' \
-WHIPPLESCRIPT_BAML_TEST_OUTPUT_TYPE=MessageClassification \
-scripts/check-real-providers.sh
-```
-
-Set `WHIPPLESCRIPT_REAL_PROVIDERS=loft`, `WHIPPLESCRIPT_REAL_PROVIDERS=baml`, or
-`WHIPPLESCRIPT_REAL_PROVIDERS=codex` to run only the provider smoke tests that are
-configured. Comma-separated subsets such as `loft,baml,codex` are accepted. The
-default is `loft,baml`.
-
-For the smallest real Codex validation test, run:
-
-```sh
-scripts/check-codex-message.sh
-```
-
-It sends one non-interactive `codex exec` prompt, requires the final message to
-match `WHIPPLESCRIPT_CODEX_SMOKE_EXPECTED`, and writes
-`target/codex-message-smoke-report.md`. Override the prompt, expected response,
-model, or profile with `WHIPPLESCRIPT_CODEX_SMOKE_PROMPT`,
-`WHIPPLESCRIPT_CODEX_SMOKE_EXPECTED`, `WHIPPLESCRIPT_CODEX_MODEL`, and
-`WHIPPLESCRIPT_CODEX_PROFILE`.
-
-Set `WHIPPLESCRIPT_LOFT_REPO` when the Loft fixture repo is not available at
-`vendor/loft`. Set `WHIPPLESCRIPT_BAML_HEALTH_PATH` to add a non-destructive HTTP
-health probe after the default TCP reachability check.
-
-To capture a smoke-test artifact while preserving the underlying exit code, use:
-
-```sh
-scripts/check-real-providers-report.sh
-```
-
-Set `WHIPPLESCRIPT_REAL_PROVIDER_REPORT=/path/to/report.md` to choose the report
-path. The default is `target/real-provider-smoke-report.md`.
-
-## Development Shell
-
-The repo includes a Nix dev shell for formal tooling:
+The repo also includes a Nix dev shell for formal tooling:
 
 ```sh
 nix develop
-```
-
-It provides:
-
-```text
-OpenJDK 21
-Maude
-Apalache 0.57.1
 ```
