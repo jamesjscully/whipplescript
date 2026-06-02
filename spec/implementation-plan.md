@@ -507,7 +507,7 @@ Goal: wire the built-in effect families through the same contract system.
 
 ### Loft
 
-- [ ] Add the Loft repository as a git submodule, for example under
+- [x] Add the Loft repository as a git submodule, for example under
   `vendor/loft` or `external/loft`.
   - `scripts/add-loft-submodule.sh` now performs the guarded add only once
     the Loft repo has tracked spec and fixture files.
@@ -519,7 +519,7 @@ Goal: wire the built-in effect families through the same contract system.
     artifact for the staged spec and fixtures without committing in Loft.
   - `scripts/loft-handoff-report.sh` summarizes Loft-side blockers and next
     commands without mutating either repository.
-- [ ] Import and reference the Loft repo specs/fixtures as the source of truth
+- [x] Import and reference the Loft repo specs/fixtures as the source of truth
   for issue IDs, issue state, leases, commands, JSON shapes, and failure modes.
 - [x] Replace local placeholder assumptions with the Loft v0.1 CLI/API
   contract.
@@ -527,7 +527,7 @@ Goal: wire the built-in effect families through the same contract system.
 - [x] Implement show, claim, renew, release, note, transition, evidence,
   resource-intent, complete, and fail command shapes.
 - [x] Model claim success/failure as typed facts.
-- [ ] Add Loft contract/conformance tests against submodule fixtures.
+- [x] Add Loft contract/conformance tests against submodule fixtures.
   - `scripts/check-loft-fixtures.sh` and
     `loft_submodule_fixture_shapes_are_compatible` validate the
     manifest-driven fixture JSON contract against an explicit fixture override,

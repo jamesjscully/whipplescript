@@ -218,8 +218,10 @@ Use `tell` to enqueue work:
 
 ```whip
 rule implement
-  when WorkItem as item where item.status == "queued"
-  when worker is available
+  when {
+    WorkItem as item where item.status == "queued"
+    worker is available
+  }
 => {
   tell worker requires ["agent.tell"] as turn """
   Implement this item:
@@ -329,8 +331,10 @@ pattern ReviewWithAgent<Input, Output> {
   input Input as item
 
   rule dispatch
-    when Input as item
-    when reviewer is available
+    when {
+      Input as item
+      reviewer is available
+    }
   => {
     tell reviewer as turn "Review {{ item.title }}."
 
@@ -575,6 +579,7 @@ Before treating a workflow as ready:
 - `whip check <file>` succeeds.
 - `whip compile <file>` snapshot is stable and understandable.
 - Effects are ordered with `after`, not source order.
+- Rule readiness uses `when` clauses or `when { ... }` groups, never `with`.
 - Provider/model routing is deterministic source metadata, not an LLM decision.
 - Agent profiles are as narrow as possible.
 - Plugin capabilities are explicit `call` effects.
@@ -596,3 +601,4 @@ Before treating a workflow as ready:
 | Storing credentials in source. | Use provider/runtime configuration references. |
 | Reading effect output outside an `after` branch. | Bind output inside the terminal branch. |
 | Treating provider failure as workflow failure. | Add a rule that chooses to `fail` when policy requires it. |
+| Using `with` as a rule condition. | Use `when`; reserve `with` for action configuration like `claim issue with loft`. |

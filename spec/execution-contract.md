@@ -238,9 +238,11 @@ write a normal rule:
 
 ```whipplescript
 rule synthesize
-  when research result from alpha
-  when research result from beta
-  when synthesizer is available
+  when {
+    research result from alpha
+    research result from beta
+    synthesizer is available
+  }
 => {
   tell synthesizer "Synthesize both findings."
 }

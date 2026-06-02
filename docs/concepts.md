@@ -32,8 +32,10 @@ A rule is deterministic orchestration policy:
 
 ```whip
 rule dispatch
-  when WorkItem as item where item.status == "queued"
-  when worker is available
+  when {
+    WorkItem as item where item.status == "queued"
+    worker is available
+  }
 => {
   tell worker as turn "Do {{ item.title }}"
 }

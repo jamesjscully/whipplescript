@@ -88,8 +88,10 @@ Then one rule routes each queued task to the task's selected agent:
 
 ```whip
 rule run_language_task
-  when LanguageTask as task where task.status == "queued"
-  when task.provider is available
+  when {
+    LanguageTask as task where task.status == "queued"
+    task.provider is available
+  }
 => {
   tell task.provider as turn """
   Complete this language e2e task.

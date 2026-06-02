@@ -85,8 +85,10 @@ agent reviewer {
 }
 
 rule implement_ready_work
-  when WorkItem as item
-  when implementer is available
+  when {
+    WorkItem as item
+    implementer is available
+  }
 => {
   tell implementer """
   Implement this work item:
@@ -98,8 +100,10 @@ rule implement_ready_work
 }
 
 rule review_completed_turn
-  when worker completed turn for loft issue as turn
-  when reviewer is available
+  when {
+    worker completed turn for loft issue as turn
+    reviewer is available
+  }
 => {
   tell reviewer """
   Review this completed turn:

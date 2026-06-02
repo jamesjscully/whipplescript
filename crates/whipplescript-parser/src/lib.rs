@@ -9010,7 +9010,21 @@ impl Parser<'_> {
 
         while !self.is_at_end() && !self.at_arrow() {
             if self.at_ident("when") {
-                whens.push(self.parse_when_clause()?);
+                whens.extend(self.parse_when_clauses()?);
+            } else if self.at_ident("with") {
+                let span = self
+                    .peek()
+                    .map(|token| token.span)
+                    .unwrap_or(SourceSpan { start, end: start });
+                self.diagnostics.push(Diagnostic {
+                    span,
+                    message: "`with` is not a rule readiness clause".to_owned(),
+                    suggestion: Some(
+                        "use `when` for rule conditions; reserve `with` for effect configuration such as `claim issue with loft`"
+                            .to_owned(),
+                    ),
+                });
+                self.advance();
             } else {
                 self.unexpected("`when` clause or `=>`");
                 self.advance();
@@ -9029,6 +9043,15 @@ impl Parser<'_> {
             body,
             span,
         })
+    }
+
+    fn parse_when_clauses(&mut self) -> Option<Vec<WhenClause>> {
+        let when = self.expect_keyword("when")?;
+        if self.at_symbol('{') {
+            return self.parse_grouped_when_clauses(when.span);
+        }
+
+        Some(vec![self.parse_when_clause_after_keyword(when.span)?])
     }
 
     fn parse_assert(&mut self) -> Option<AssertDecl> {
@@ -9053,9 +9076,8 @@ impl Parser<'_> {
         Some(AssertDecl { expr, span })
     }
 
-    fn parse_when_clause(&mut self) -> Option<WhenClause> {
-        let when = self.expect_keyword("when")?;
-        let text_start = when.span.end;
+    fn parse_when_clause_after_keyword(&mut self, when: SourceSpan) -> Option<WhenClause> {
+        let text_start = when.end;
         let mut text_end = text_start;
 
         while !self.is_at_end()
@@ -9073,6 +9095,88 @@ impl Parser<'_> {
         };
         let (text, span) = trimmed_source_text(self.source_text(span), span);
         Some(WhenClause { text, span })
+    }
+
+    fn parse_grouped_when_clauses(&mut self, when: SourceSpan) -> Option<Vec<WhenClause>> {
+        let open = self.expect_symbol('{')?;
+        let body_start = open.span.end;
+        let mut depth = 1usize;
+        let mut body_end = body_start;
+        let mut close_end = open.span.end;
+
+        while !self.is_at_end() {
+            let token = self.advance().clone();
+            match token.kind {
+                TokenKind::Symbol('{') => {
+                    depth += 1;
+                    body_end = token.span.end;
+                }
+                TokenKind::Symbol('}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = token.span.start;
+                        close_end = token.span.end;
+                        break;
+                    }
+                    body_end = token.span.end;
+                }
+                _ => body_end = token.span.end,
+            }
+        }
+
+        if depth != 0 {
+            self.diagnostics.push(Diagnostic {
+                span: SourceSpan {
+                    start: when.start,
+                    end: body_end,
+                },
+                message: "unterminated grouped `when` block".to_owned(),
+                suggestion: Some("close the grouped readiness block with `}`".to_owned()),
+            });
+            return Some(Vec::new());
+        }
+
+        let body_span = SourceSpan {
+            start: body_start,
+            end: body_end,
+        };
+        let mut clauses = Vec::new();
+        let mut offset = 0usize;
+        for line in self.source_text(body_span).split_inclusive('\n') {
+            let line_without_newline = line.trim_end_matches('\n');
+            let line_start = body_span.start + offset;
+            offset += line.len();
+            let leading = line_without_newline.len() - line_without_newline.trim_start().len();
+            let trailing = line_without_newline.len() - line_without_newline.trim_end().len();
+            let trimmed_start = line_start + leading;
+            let trimmed_end = line_start + line_without_newline.len().saturating_sub(trailing);
+            if trimmed_start >= trimmed_end {
+                continue;
+            }
+            clauses.push(WhenClause {
+                text: self.source[trimmed_start..trimmed_end].to_owned(),
+                span: SourceSpan {
+                    start: trimmed_start,
+                    end: trimmed_end,
+                },
+            });
+        }
+
+        if clauses.is_empty() {
+            self.diagnostics.push(Diagnostic {
+                span: SourceSpan {
+                    start: when.start,
+                    end: close_end,
+                },
+                message: "grouped `when` block has no readiness clauses".to_owned(),
+                suggestion: Some(
+                    "add one condition per line, such as `started` or `Class as binding`"
+                        .to_owned(),
+                ),
+            });
+        }
+
+        Some(clauses)
     }
 
     fn parse_block_source(&mut self) -> Option<BlockSource> {
@@ -10029,6 +10133,71 @@ workflow DuplicateInput {
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("workflow declares input `phase` more than once")));
+    }
+
+    #[test]
+    fn rejects_with_as_rule_readiness_alias() {
+        let source = r#"
+workflow WithIsNotWhen
+
+rule bad
+  with started
+=> {
+}
+"#;
+        let compiled = compile_program(source);
+
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("`with` is not a rule readiness clause")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .suggestion
+            .as_deref()
+            .is_some_and(|suggestion| suggestion.contains("use `when` for rule conditions"))));
+    }
+
+    #[test]
+    fn parses_grouped_when_clauses_as_ordinary_readiness_clauses() {
+        let source = r#"
+workflow GroupedWhen
+
+class Task {
+  status "queued"
+}
+
+agent worker {
+  profile "repo-writer"
+  capacity 1
+}
+
+rule start
+  when {
+    Task as task where task.status == "queued"
+    worker is available
+  }
+=> {
+  tell worker "do it"
+}
+"#;
+        let compiled = compile_program(source);
+        let ir = compiled.ir.expect("program compiles");
+        let rule = &ir.rules[0];
+
+        assert_eq!(rule.whens.len(), 2);
+        assert_eq!(rule.whens[0].pattern, "Task as task");
+        assert_eq!(
+            rule.whens[0]
+                .guard
+                .as_ref()
+                .map(|guard| guard.expr.to_snapshot()),
+            Some("task.status == \"queued\"".to_owned())
+        );
+        assert_eq!(rule.whens[1].pattern, "worker is available");
+        assert!(ir
+            .to_snapshot()
+            .contains("    when Task as task where task.status == \"queued\""));
+        assert!(ir.to_snapshot().contains("    when worker is available"));
     }
 
     #[test]

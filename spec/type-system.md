@@ -366,8 +366,10 @@ class LanguageTask {
 }
 
 rule route_codex
-  when LanguageTask as task where task.provider == Codex
-  when codex is available
+  when {
+    LanguageTask as task where task.provider == Codex
+    codex is available
+  }
 => {
   tell codex """
   {{ task.language }}

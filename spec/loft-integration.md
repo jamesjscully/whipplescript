@@ -58,8 +58,10 @@ Author-facing sketch:
 requires capability loft
 
 rule implement_ready_issue
-  when loft has ready issue as issue
-  when worker is available
+  when {
+    loft has ready issue as issue
+    worker is available
+  }
 => {
   claim issue with loft as claim
 

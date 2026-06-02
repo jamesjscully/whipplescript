@@ -301,7 +301,8 @@ This section is a compact index of source constructs.
 | Fact match | `when Class as binding` | Bind an unconsumed fact. |
 | Guarded match | `when Class as binding where expr` | Bind fact only when pure guard is true. |
 | Started event | `when started` | Match the initial `external.started` event. |
-| Availability | `when worker is available` | Match logical agent capacity/policy availability. |
+| Readiness | `when Class as item` or `when { ... }` | Match facts and other deterministic rule conditions. |
+| Availability | `worker is available` inside a `when` clause/group | Match logical agent capacity/policy availability. |
 
 ### Rule Body Operations
 

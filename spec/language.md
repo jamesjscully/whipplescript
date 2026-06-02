@@ -43,8 +43,10 @@ rule discover_ready_work
 }
 
 rule implement
-  when ready work as item
-  when worker is available
+  when {
+    ready work as item
+    worker is available
+  }
 => {
   tell worker """
   Implement this work item:
@@ -136,6 +138,28 @@ attach skill
 These must remain visibly causal. A phrase may be friendly, but if it changes
 durable state or touches the world, the lowering must be explainable as facts
 and effects.
+
+`when` is the only rule-readiness clause introducer. `with` is reserved for
+action/effect configuration, such as selecting the Loft work kernel in
+`claim issue with loft`. It must not be accepted as a synonym for `when`; doing
+so would blur state observation with effect routing.
+
+Authors may group readiness clauses to reduce repetition:
+
+```whipplescript
+rule implement_ready_issue
+  when {
+    loft has ready issue as issue
+    worker is available
+  }
+=> {
+  claim issue with loft as claim
+}
+```
+
+This is source sugar for separate `when` clauses. Each non-empty line inside the
+block lowers to one ordinary readiness clause; it does not introduce new runtime
+semantics.
 
 ## Source Composition
 
@@ -255,8 +279,10 @@ pattern AgentReview<Input, Output> {
   input Input as item
 
   rule dispatch
-    when Input as item
-    when reviewer is available
+    when {
+      Input as item
+      reviewer is available
+    }
   => {
     tell reviewer """
     Review {{ item.title }}.
@@ -315,8 +341,10 @@ workflow ReviewPhase {
   failure error ReviewPhaseFailure
 
   rule dispatch
-    when PhaseReviewRequest as phase
-    when reviewer is available
+    when {
+      PhaseReviewRequest as phase
+      reviewer is available
+    }
   => {
     tell reviewer """
     Review {{ phase.title }}.
@@ -569,8 +597,10 @@ class LanguageTask {
 }
 
 rule run_codex_language_task
-  when LanguageTask as task where task.provider == "codex"
-  when codex is available
+  when {
+    LanguageTask as task where task.provider == "codex"
+    codex is available
+  }
 => {
   tell codex as turn """
   Write {{ task.language }} text to {{ task.artifactPath }}.
@@ -821,8 +851,10 @@ set to `null`.
 Conversational fact sugar is allowed for core integrations:
 
 ```whipplescript
-when loft has ready issue as issue
-when worker is available
+when {
+  loft has ready issue as issue
+  worker is available
+}
 ```
 
 But sugar must lower to typed fact queries. Source text should not invent hidden
@@ -916,7 +948,7 @@ chosen deterministically before any provider starts.
 statement may declare the target capability contract with `requires [...]`; for
 dynamic `AgentRef` targets, every possible target in the refined domain must
 declare every required capability. The runtime repeats the same check against
-the program-version agent metadata before claiming or starting a provider run,
+the program-version agent metadata before starting a provider run,
 so externally inserted or replayed effects cannot bypass source validation.
 
 ## Reuse And Matrices
@@ -992,8 +1024,10 @@ Use `after` when one effect must wait for another:
 
 ```whipplescript
 rule implement_claimed_issue
-  when loft has ready issue as issue
-  when worker is available
+  when {
+    loft has ready issue as issue
+    worker is available
+  }
 => {
   claim issue with loft as claim
 
@@ -1063,8 +1097,10 @@ manage team until done
 Good direction:
 
 ```whipplescript
-when ready work as item
-when worker is available
+when {
+  ready work as item
+  worker is available
+}
 => tell worker item
 ```
 

@@ -301,6 +301,14 @@ false before lowering the rule body. Guard evaluation is part of deterministic
 stepping and must not consult providers, BAML, plugins, the filesystem, the
 network, wall-clock time, or random sources.
 
+`when` is the only source-level introducer for rule readiness. `with` is not an
+alias for readiness; it is reserved for effect/action configuration such as
+`claim issue with loft`. The lowering pass must keep this distinction so a rule
+cannot make a world-touching provider choice look like a fact observation.
+Grouped readiness blocks, written as `when { ... }`, are parse-time sugar for
+ordinary `when` clauses. Each non-empty line in the block must become one
+readiness clause in IR before rule readiness and guard evaluation run.
+
 `whip worker` is nondeterministic at the provider boundary but durable at the
 kernel boundary. It should:
 

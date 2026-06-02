@@ -24,8 +24,10 @@ agent worker {
 }
 
 rule start_ready_issue
-  when loft has ready issue as issue
-  when worker is available
+  when {
+    loft has ready issue as issue
+    worker is available
+  }
 => {
   claim issue with loft as claim
 
@@ -130,8 +132,10 @@ agent worker {
 }
 
 rule start_ready_issue
-  when loft has ready issue as issue
-  when worker is available
+  when {
+    loft has ready issue as issue
+    worker is available
+  }
 => {
   claim issue with loft as claim
 
@@ -180,9 +184,11 @@ rule accept_reviewed_work
 }
 
 rule request_revision
-  when ReviewedWork as reviewed
-  when reviewed.review.status == Revise
-  when worker is available
+  when {
+    ReviewedWork as reviewed
+    reviewed.review.status == Revise
+    worker is available
+  }
 => {
   tell worker """
   Revise this Loft issue:
@@ -243,15 +249,19 @@ agent ralph {
 }
 
 rule begin
-  when started
-  when ralph is available
+  when {
+    started
+    ralph is available
+  }
 => {
   tell ralph "Do one small useful thing and update the todo list."
 }
 
 rule again
-  when ralph completed turn
-  when ralph is available
+  when {
+    ralph completed turn
+    ralph is available
+  }
 => {
   tell ralph "Do one small useful thing and update the todo list."
 }
@@ -292,8 +302,10 @@ agent reviewer {
 }
 
 rule implement_ready_work
-  when ready work as item
-  when worker is available
+  when {
+    ready work as item
+    worker is available
+  }
 => {
   tell worker """
   Claim and implement this work item:
@@ -303,8 +315,10 @@ rule implement_ready_work
 }
 
 rule review_successful_work
-  when worker completed work as item
-  when reviewer is available
+  when {
+    worker completed work as item
+    reviewer is available
+  }
 => {
   tell reviewer """
   Review this work item:
@@ -348,8 +362,10 @@ agent synthesizer {
 }
 
 rule investigate
-  when open question as q
-  when researcher is available
+  when {
+    open question as q
+    researcher is available
+  }
 => {
   tell researcher """
   Research this question and return cited findings:
@@ -365,8 +381,10 @@ rule collect
 }
 
 rule synthesize
-  when findings are sufficient for dossier as d
-  when synthesizer is available
+  when {
+    findings are sufficient for dossier as d
+    synthesizer is available
+  }
 => {
   tell synthesizer """
   Synthesize these findings into a concise answer:
@@ -468,9 +486,11 @@ rule emit_heartbeat
 }
 
 rule plan_ready_work
-  when OpenClawHeartbeat as beat where beat.status == "observed"
-  when WorkItem as item where item.status == "ready"
-  when planner is available
+  when {
+    OpenClawHeartbeat as beat where beat.status == "observed"
+    WorkItem as item where item.status == "ready"
+    planner is available
+  }
 => {
   call memory.query for item as context
 

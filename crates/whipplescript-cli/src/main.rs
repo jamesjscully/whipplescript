@@ -5561,6 +5561,15 @@ fn dependency_predicate_str(predicate: &IrDependencyPredicate) -> &'static str {
 }
 
 fn normalize_pattern_name(pattern: &str) -> String {
+    if pattern.starts_with("loft has ready issue") {
+        return "LoftIssue".to_owned();
+    }
+    if pattern.starts_with("worker completed turn") {
+        return "AgentTurn".to_owned();
+    }
+    if pattern.starts_with("human answered") {
+        return "HumanAnswer".to_owned();
+    }
     pattern.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -9743,6 +9752,42 @@ rule finish
 
         assert_eq!(lowering.consumed_fact_ids, vec!["fact-task"]);
         assert_eq!(lowering.facts.len(), 1);
+    }
+
+    #[test]
+    fn ready_contexts_match_loft_ready_issue_alias_to_loft_issue_fact() {
+        let source = r#"
+workflow LoftReadyAlias
+
+agent worker {
+  profile "repo-writer"
+  capacity 1
+}
+
+rule claim_ready
+  when loft has ready issue as issue
+  when worker is available
+=> {
+  claim issue with loft as claim
+}
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compile");
+        let fact = FactView {
+            fact_id: "fact-loft-issue".to_owned(),
+            name: "LoftIssue".to_owned(),
+            key: "LoftIssue:ready".to_owned(),
+            value_json: r#"{"id":"ISS-1","title":"Ready issue","body":"Do work"}"#.to_owned(),
+            provenance_class: "rule".to_owned(),
+        };
+        let facts = vec![fact];
+        let effects = Vec::new();
+        let ready = ready_contexts(&ir, &ir.rules[0], &facts, &effects, None);
+
+        assert_eq!(ready.contexts.len(), 1);
+        assert_eq!(ready.contexts[0].bindings[0].0, "issue");
+        assert_eq!(ready.contexts[0].bindings[0].1.name, "LoftIssue");
     }
 
     #[test]

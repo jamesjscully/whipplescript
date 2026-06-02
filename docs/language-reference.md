@@ -26,8 +26,10 @@ workflow Example {
   }
 
   rule start
-    when WorkRequest as request
-    when worker is available
+    when {
+      WorkRequest as request
+      worker is available
+    }
   => {
     tell worker as turn """
     Do the work:
@@ -41,8 +43,24 @@ workflow Example {
       }
     }
   }
+```
+
+Use `when` for rule readiness and fact observation. `with` is not a `when`
+alias; it is reserved for action configuration such as `claim issue with loft`.
+When a rule has several readiness clauses, you can group them:
+
+```whipplescript
+rule start
+  when {
+    WorkRequest as request
+    worker is available
+  }
+=> {
+  tell worker "Do the work"
 }
 ```
+
+The grouped form is equivalent to writing one `when` line per condition.
 
 If a bundle exposes multiple workflows, commands must select the root workflow.
 Library workflows remain invokable by name from the same source bundle.
@@ -145,8 +163,10 @@ pattern AgentReview<Input, Output> {
   input Input as item
 
   rule dispatch
-    when Input as item
-    when reviewer is available
+    when {
+      Input as item
+      reviewer is available
+    }
   => {
     tell reviewer as turn "Review {{ item.title }}."
 
@@ -198,8 +218,10 @@ Rules match facts/events and commit deterministic rewrites.
 
 ```whip
 rule write_and_review_poem
-  when PoemTask as task where task.status == "queued"
-  when task.poet is available
+  when {
+    PoemTask as task where task.status == "queued"
+    task.poet is available
+  }
 => {
   tell task.poet as turn """
   Write a poem in {{ task.language }}.

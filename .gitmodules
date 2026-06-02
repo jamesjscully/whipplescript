@@ -1,0 +1,3 @@
+[submodule "vendor/loft"]
+	path = vendor/loft
+	url = ../loft
