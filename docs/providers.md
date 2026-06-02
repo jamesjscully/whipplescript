@@ -37,21 +37,30 @@ effect state, provider runs, leases, diagnostics, and evidence.
 
 ## How Agents Connect
 
-A workflow declares logical agents:
+A workflow can declare named harnesses and bind logical agents to them:
 
 ```whip
-agent codex {
+harness coder: codex
+harness reviewerHarness: claude
+
+agent implementer using coder {
   profile "repo-writer"
   capacity 2
   capabilities ["agent.tell"]
   skills ["whipplescript-author"]
+}
+
+agent reviewer using reviewerHarness {
+  profile "repo-reader"
+  capacity 1
+  capabilities ["agent.tell"]
 }
 ```
 
 The workflow sends work with `tell`:
 
 ```whip
-tell codex requires ["agent.tell"] as turn """
+tell implementer requires ["agent.tell"] as turn """
 Implement this task and summarize the changed files.
 """
 ```
@@ -69,7 +78,7 @@ after turn succeeds as completed => {
 
 This separation is the key integration model:
 
-- source code chooses the logical agent and policy
+- source code chooses the harness topology, logical agent, and policy
 - the runtime records the durable effect
 - a worker executes the effect through a provider
 - provider output returns as events, facts, runs, diagnostics, and evidence
@@ -115,7 +124,7 @@ credential references and execution details.
 Provider configs are validated with:
 
 ```sh
-WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json \
+WHIPPLESCRIPT_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json \
 scripts/check-native-provider-configs.sh
 ```
 
@@ -128,6 +137,46 @@ Provider credentials should be represented as references in config, such as an
 environment variable name, keychain handle, or external secret id. The runtime
 should validate that the reference exists and is allowed for the selected
 provider, but source workflows should never embed the value.
+
+When source declares harnesses, provider config binds to them by `provider_id`.
+For example, this source harness:
+
+```whip
+harness coder: codex
+```
+
+is bound by a provider config whose `provider_id` is `coder`:
+
+```json
+{
+  "provider_id": "coder",
+  "provider_kind": "codex",
+  "surface": "codex_app_server",
+  "credentials_ref": "env:OPENAI_API_KEY"
+}
+```
+
+The source harness kind and config `provider_kind` must match. The config
+selects the concrete native surface and operational settings.
+
+Workers load provider configs from `--provider-config <path>`, or from
+colon-separated `WHIPPLESCRIPT_PROVIDER_CONFIGS`. The legacy
+`WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS` variable is still accepted by worker
+and validation commands for existing native-provider setups. `whip dev` accepts
+the same `--provider-config <path>` flag and passes the configs through to its
+embedded worker loop.
+
+For Codex, Claude, and Pi native harnesses, the provider config drives request
+fields such as `default_model`, `workspace_policy`, `cancellation_depth`,
+`artifact_policy`, `credentials_ref`, `timeout_ms`, `profile_ids`, and
+health-check metadata. Extra provider fields are surfaced as redacted option
+keys rather than secret values.
+
+For `harness runner: command`, the matching provider config uses
+`provider_kind: "command"` and `surface: "command"`. Command harness configs
+must include an `executable` field; optional command-specific fields are
+`args`, `cwd`, `env`, `required_env`, `required_commands`, `timeout_ms`, and
+`require_stdout_json`.
 
 Provider-specific setup expectations:
 
@@ -211,7 +260,7 @@ Strict native validation:
 ```sh
 WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \
 WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_STRICT=1 \
-WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json \
+WHIPPLESCRIPT_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json \
 scripts/check-real-providers-report.sh
 ```
 

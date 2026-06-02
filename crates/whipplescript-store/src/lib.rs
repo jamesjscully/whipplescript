@@ -607,6 +607,7 @@ pub struct ClaimableEffect {
     pub profile: Option<String>,
     pub input_json: String,
     pub required_capabilities_json: String,
+    pub declared_profiles_json: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -643,6 +644,7 @@ pub struct EffectView {
     pub revision_epoch: i64,
     pub profile: Option<String>,
     pub required_capabilities_json: String,
+    pub declared_profiles_json: String,
     pub policy_block_reason: Option<String>,
     pub cancel_requested: bool,
 }
@@ -656,6 +658,7 @@ pub struct RunView {
     pub status: String,
     pub started_at: String,
     pub completed_at: Option<String>,
+    pub metadata_json: String,
     pub cancel_requested: bool,
 }
 
@@ -2214,8 +2217,20 @@ impl SqliteStore {
         }
         let mut statement = self.connection.prepare(
             r#"
-            SELECT effect_id, kind, target, profile, input_json, required_capabilities
+            SELECT
+                candidate.effect_id,
+                candidate.kind,
+                candidate.target,
+                candidate.profile,
+                candidate.input_json,
+                candidate.required_capabilities,
+                COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]')
             FROM effects AS candidate
+            LEFT JOIN instances ON instances.instance_id = candidate.instance_id
+            LEFT JOIN program_versions AS active_versions
+              ON active_versions.version_id = instances.version_id
+            LEFT JOIN program_versions AS effect_versions
+              ON effect_versions.version_id = candidate.program_version_id
             WHERE candidate.instance_id = ?1
               AND (
                   candidate.status IN ('queued', 'blocked_by_dependency', 'blocked_by_capacity')
@@ -2242,7 +2257,7 @@ impl SqliteStore {
                         OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled'))
                     )
               )
-            ORDER BY created_at, effect_id
+            ORDER BY candidate.created_at, candidate.effect_id
             "#,
         )?;
         let effects = statement
@@ -2254,6 +2269,7 @@ impl SqliteStore {
                     profile: row.get(3)?,
                     input_json: row.get(4)?,
                     required_capabilities_json: row.get(5)?,
+                    declared_profiles_json: row.get(6)?,
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()
@@ -3747,17 +3763,18 @@ impl SqliteStore {
         let mut statement = self.connection.prepare(
             r#"
             SELECT
-                effect_id,
-                kind,
-                target,
-                input_json,
-                status,
-                created_by_rule,
-                program_version_id,
-                revision_epoch,
-                profile,
-                required_capabilities,
-                policy_block_reason,
+                effects.effect_id,
+                effects.kind,
+                effects.target,
+                effects.input_json,
+                effects.status,
+                effects.created_by_rule,
+                effects.program_version_id,
+                effects.revision_epoch,
+                effects.profile,
+                effects.required_capabilities,
+                effects.policy_block_reason,
+                COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'),
                 EXISTS (
                     SELECT 1
                     FROM effect_cancellation_requests AS request
@@ -3766,8 +3783,13 @@ impl SqliteStore {
                       AND request.status = 'requested'
                 ) AS cancel_requested
             FROM effects
+            LEFT JOIN instances ON instances.instance_id = effects.instance_id
+            LEFT JOIN program_versions AS active_versions
+              ON active_versions.version_id = instances.version_id
+            LEFT JOIN program_versions AS effect_versions
+              ON effect_versions.version_id = effects.program_version_id
             WHERE effects.instance_id = ?1
-            ORDER BY created_at, effect_id
+            ORDER BY effects.created_at, effects.effect_id
             "#,
         )?;
         let rows = statement
@@ -3784,7 +3806,8 @@ impl SqliteStore {
                     profile: row.get(8)?,
                     required_capabilities_json: row.get(9)?,
                     policy_block_reason: row.get(10)?,
-                    cancel_requested: row.get(11)?,
+                    declared_profiles_json: row.get(11)?,
+                    cancel_requested: row.get(12)?,
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
@@ -3802,6 +3825,7 @@ impl SqliteStore {
                 status,
                 started_at,
                 completed_at,
+                metadata_json,
                 EXISTS (
                     SELECT 1
                     FROM effect_cancellation_requests AS request
@@ -3824,7 +3848,8 @@ impl SqliteStore {
                     status: row.get(4)?,
                     started_at: row.get(5)?,
                     completed_at: row.get(6)?,
-                    cancel_requested: row.get(7)?,
+                    metadata_json: row.get(7)?,
+                    cancel_requested: row.get(8)?,
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
@@ -5365,10 +5390,23 @@ fn declared_agents_present(declared_profiles_json: &str) -> StoreResult<bool> {
     let parsed = serde_json::from_str::<Value>(declared_profiles_json)?;
     Ok(match &parsed {
         Value::Array(items) => !items.is_empty(),
-        Value::Object(object) => object
-            .get("agents")
-            .and_then(Value::as_array)
-            .is_some_and(|agents| !agents.is_empty()),
+        Value::Object(object) => {
+            object
+                .get("agents")
+                .and_then(Value::as_array)
+                .is_some_and(|agents| !agents.is_empty())
+                || object.iter().any(|(key, value)| {
+                    if matches!(key.as_str(), "harnesses" | "workflow" | "schemas") {
+                        return false;
+                    }
+                    value.as_object().is_some_and(|entry| {
+                        entry.contains_key("profile")
+                            || entry.contains_key("capacity")
+                            || entry.contains_key("capabilities")
+                            || entry.contains_key("harness")
+                    })
+                })
+        }
         _ => false,
     })
 }
@@ -10746,8 +10784,11 @@ mod tests {
     #[test]
     fn inspection_views_report_instance_state() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let declared_profiles_json = r#"{"harnesses":[{"name":"coder","kind":"codex"}],"agents":[{"name":"worker","profile":"repo-writer","capacity":1,"harness":"coder","capabilities":["agent.tell"]}]}"#;
+        let mut program_version = test_program_version("Ralph", "source-1", "ir-1");
+        program_version.declared_profiles_json = declared_profiles_json;
         let version = store
-            .create_program_version(test_program_version("Ralph", "source-1", "ir-1"))
+            .create_program_version(program_version)
             .expect("program version creates");
         let instance = store
             .create_instance(NewInstance {
@@ -10780,6 +10821,7 @@ mod tests {
                 idempotency_key: Some("commit-start"),
             })
             .expect("rule commits");
+        let run_metadata_json = r#"{"native_provider":{"provider_id":"coder","provider_kind":"codex","surface":"codex.app_server"}}"#;
         store
             .start_run(RunStart {
                 instance_id: &instance_id,
@@ -10789,7 +10831,7 @@ mod tests {
                 worker_id: "worker-1",
                 lease_id: "lease-tell",
                 lease_expires_at: "2030-01-01T00:00:00Z",
-                metadata_json: "{}",
+                metadata_json: run_metadata_json,
             })
             .expect("run starts");
 
@@ -10806,11 +10848,13 @@ mod tests {
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].effect_id, "tell");
         assert_eq!(effects[0].status, "running");
+        assert_eq!(effects[0].declared_profiles_json, declared_profiles_json);
 
         let runs = store.list_runs(&instance_id).expect("runs list");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].run_id, "run-tell");
         assert_eq!(runs[0].status, "running");
+        assert_eq!(runs[0].metadata_json, run_metadata_json);
         assert!(!runs[0].cancel_requested);
 
         let events = store.list_events(&instance_id).expect("events list");
@@ -11575,6 +11619,18 @@ mod tests {
 
         assert!(claimable.is_empty());
         assert_eq!(effect_status(&store, "memory"), "queued");
+    }
+
+    #[test]
+    fn declared_agents_present_supports_map_shaped_metadata() {
+        assert!(declared_agents_present(
+            r#"{"worker":{"profile":"repo-writer","capacity":1,"capabilities":["agent.tell"]}}"#
+        )
+        .expect("metadata parses"));
+        assert!(
+            !declared_agents_present(r#"{"harnesses":[{"name":"coder","kind":"codex"}]}"#)
+                .expect("metadata parses")
+        );
     }
 
     #[test]

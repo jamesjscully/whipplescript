@@ -15,9 +15,9 @@ schemas
     turn ref<AgentTurn>
     status literal<"dispatched">
 agents
-  agent codex profile=repo-reader capacity=1 skills=[] capabilities=[agent.tell]
-  agent claude profile=repo-reader capacity=1 skills=[] capabilities=[agent.tell]
-  agent pi profile=repo-reader capacity=1 skills=[] capabilities=[agent.tell]
+  agent codex harness=<fallback> profile=repo-reader capacity=1 skills=[] capabilities=[agent.tell]
+  agent claude harness=<fallback> profile=repo-reader capacity=1 skills=[] capabilities=[agent.tell]
+  agent pi harness=<fallback> profile=repo-reader capacity=1 skills=[] capabilities=[agent.tell]
 assertions
   assert count(CompanionReviewTask where status == "queued") == 0
     reads

@@ -20,6 +20,7 @@ fn checks_all_example_workflows() {
         "coerce-branch.whip",
         "codex-french-poem-dogfood.whip",
         "codex-poem-coerce-review.whip",
+        "codex-claude-harness-review.whip",
         "companion-skill-dogfood.whip",
         "human-review.whip",
         "implementation-plan-phase-review.whip",

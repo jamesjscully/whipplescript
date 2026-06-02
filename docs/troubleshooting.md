@@ -125,14 +125,15 @@ coverage:
 ```sh
 WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \
 WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_STRICT=1 \
-WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json \
+WHIPPLESCRIPT_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json \
 scripts/check-real-providers-report.sh
 ```
 
 Common failures:
 
-- `WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS is required in native strict mode`:
-  set it to a colon-separated list of native provider config files.
+- `WHIPPLESCRIPT_PROVIDER_CONFIGS is required in native strict mode`: set it to
+  a colon-separated list of provider config files. The legacy
+  `WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS` name is still accepted.
 - `command-wrapper provider is not accepted in native strict mode`: strict mode
   requires Codex, Claude, and Pi native providers, not Loft/BAML compatibility
   wrappers.

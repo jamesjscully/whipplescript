@@ -17,7 +17,7 @@ schemas
     turn ref<AgentTurn>
     status literal<"judged">
 agents
-  agent codex profile=repo-writer capacity=1 skills=[] capabilities=[]
+  agent codex harness=<fallback> profile=repo-writer capacity=1 skills=[] capabilities=[]
 assertions
   assert count(FrenchPoemRequest where status == "queued") == 0
     reads

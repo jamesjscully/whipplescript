@@ -1,0 +1,73 @@
+workflow CodexClaudeHarnessReview
+
+harness coder: codex
+harness reviewerHarness: claude
+
+class ImplementationTask {
+  title string
+  body string
+  status "queued"
+}
+
+class ReviewedImplementation {
+  title string
+  implementation AgentTurn
+  review AgentTurn
+  status "reviewed"
+}
+
+agent implementer using coder {
+  profile "repo-writer"
+  capacity 1
+  capabilities ["agent.tell"]
+}
+
+agent reviewer using reviewerHarness {
+  profile "repo-reader"
+  capacity 1
+  capabilities ["agent.tell"]
+}
+
+assert none(ImplementationTask where status == "queued")
+assert one(ReviewedImplementation where status == "reviewed")
+assert count(effect kind agent.tell where status == completed) == 2
+
+rule seed_task
+  when started
+=> {
+  record ImplementationTask {
+    title "Add a focused regression test"
+    body "Inspect the target repository, add one regression test for the requested behavior, and summarize the changed files."
+    status "queued"
+  }
+}
+
+rule implement_then_review
+  when ImplementationTask as task where task.status == "queued"
+  when implementer is available
+=> {
+  tell implementer requires ["agent.tell"] as implementation """
+  {{ task.title }}
+
+  {{ task.body }}
+  """
+
+  after implementation succeeds as completed => {
+    tell reviewer requires ["agent.tell"] as review """
+    Review this implementation turn.
+
+    Summary:
+    {{ completed.summary }}
+
+    Changed files:
+    {{ completed.changedFiles }}
+    """
+
+    then done task -> record ReviewedImplementation from task {
+      title
+      implementation completed
+      review review
+      status "reviewed"
+    }
+  }
+}

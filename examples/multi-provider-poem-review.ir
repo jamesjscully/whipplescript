@@ -23,9 +23,9 @@ schemas
     review ref<PoemQualityReview>
     status literal<"reviewed">
 agents
-  agent codex profile=repo-writer capacity=1 skills=[] capabilities=[agent.tell]
-  agent claude profile=repo-writer capacity=1 skills=[] capabilities=[agent.tell]
-  agent pi profile=repo-writer capacity=1 skills=[] capabilities=[agent.tell]
+  agent codex harness=<fallback> profile=repo-writer capacity=1 skills=[] capabilities=[agent.tell]
+  agent claude harness=<fallback> profile=repo-writer capacity=1 skills=[] capabilities=[agent.tell]
+  agent pi harness=<fallback> profile=repo-writer capacity=1 skills=[] capabilities=[agent.tell]
 coerces
   coerce reviewPoem(language string, topic string, expectedLineCount int, artifactPath string, turnSummary string) -> ref<PoemQualityReview>
 assertions

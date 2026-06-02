@@ -115,12 +115,28 @@ Supported boundary types follow the BAML-compatible subset used by the type
 system: scalar values, arrays, objects/classes, enums, optionals where
 supported, and finite domains such as `AgentRef<codex | claude | pi>`.
 
+### `harness`
+
+`harness` declares a named execution endpoint for agent turns. The source names
+the provider family; runtime configuration supplies credentials, native
+surfaces, workspace policy, and other machine-specific details.
+
+```whip
+harness coder: codex
+harness reviewer: claude
+```
+
+Supported harness kinds in this implementation slice are `codex`, `claude`,
+`pi`, `fixture`, and `command`.
+
 ### `agent`
 
 `agent` declares an addressable provider target and policy profile.
 
 ```whip
-agent codex {
+harness coder: codex
+
+agent codex using coder {
   profile "repo-writer"
   capacity 2
   capabilities ["agent.tell"]

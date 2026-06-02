@@ -152,6 +152,7 @@ JSON output includes:
 ```sh
 whip [--store path] worker <instance> \
   [--provider fixture] \
+  [--provider-config <path>] \
   [--program <workflow.whip>] \
   [--root Workflow] \
   [--once] \
@@ -160,9 +161,12 @@ whip [--store path] worker <instance> \
 ```
 
 Starts currently claimable effects and completes them through the selected
-provider. The default provider is the deterministic fixture provider. `--fail`,
-`--timeout`, and `--cancel` force fixture terminal outcomes for failure-path
-tests.
+provider. The default provider is the deterministic fixture provider.
+`--provider-config <path>` can be repeated to bind source harness ids to
+concrete provider configs; worker also reads colon-separated
+`WHIPPLESCRIPT_PROVIDER_CONFIGS` and the legacy
+`WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS`. `--fail`, `--timeout`, and `--cancel`
+force fixture terminal outcomes for failure-path tests.
 
 Supported fixture effect kinds:
 
@@ -193,6 +197,7 @@ JSON output includes:
 whip [--store path] [--input JSON] dev <workflow.whip> \
   [--root Workflow] \
   [--provider fixture] \
+  [--provider-config <path>] \
   [--until idle] \
   [--max-iterations N] \
   [--fail | --timeout | --cancel]
@@ -200,7 +205,8 @@ whip [--store path] [--input JSON] dev <workflow.whip> \
 
 Convenience local validation loop. It starts a new instance, alternates `step`
 and `worker`, stops when idle or when `--max-iterations` is reached, then
-evaluates source assertions.
+evaluates source assertions. `--provider-config <path>` can be repeated and is
+passed to the embedded worker loop.
 
 JSON output includes the instance id, workflow name, per-iteration step reports,
 worker reports, and assertion reports.
@@ -507,7 +513,8 @@ optional `workflow_invocations.parent` / `workflow_invocations.children` links.
 
 ### Provider Binding Config
 
-Provider binding config JSON is consumed by `whip doctor --provider-config` and
+Provider binding config JSON is consumed by `whip doctor --provider-config`,
+`whip worker --provider-config`, `whip dev --provider-config`, and
 `scripts/check-native-provider-configs.sh`.
 
 ```json
@@ -536,6 +543,13 @@ Enums:
 
 Unknown config fields are preserved as `extra` for validation/reporting but
 must not contain secret values.
+
+Workers can discover config files through colon-separated
+`WHIPPLESCRIPT_PROVIDER_CONFIGS`; `WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS` is
+accepted as a legacy alias. Source harness ids bind to config `provider_id`
+values, and matching configs populate native request fields such as
+`default_model`, `workspace_policy`, `cancellation_depth`, `artifact_policy`,
+`credentials_ref`, `timeout_ms`, `profile_ids`, and health-check metadata.
 
 ### Provider Capability JSON
 

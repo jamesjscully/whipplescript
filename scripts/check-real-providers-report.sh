@@ -58,6 +58,7 @@ const envNames = [
   "WHIPPLESCRIPT_REAL_PROVIDERS",
   "WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_STRICT",
   "WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_SURFACE",
+  "WHIPPLESCRIPT_PROVIDER_CONFIGS",
   "WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS",
   "WHIPPLESCRIPT_REAL_PROVIDER_DESTRUCTIVE_TESTS",
   "WHIPPLESCRIPT_REAL_PROVIDER_DISPOSABLE_TARGET",
@@ -194,7 +195,8 @@ NODE
   echo "- Real-provider gate: $(env_state WHIPPLESCRIPT_E2E_REAL_PROVIDERS)"
   echo "- Native strict mode: $(env_state WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_STRICT)"
   echo "- Native surface mode: $(env_state WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_SURFACE)"
-  echo "- Native provider configs: $(env_state WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS)"
+  echo "- Provider configs: $(env_state WHIPPLESCRIPT_PROVIDER_CONFIGS)"
+  echo "- Legacy native provider configs: $(env_state WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS)"
   echo "- Destructive provider tests: $(env_state WHIPPLESCRIPT_REAL_PROVIDER_DESTRUCTIVE_TESTS)"
   echo "- Disposable target marker: $(env_state WHIPPLESCRIPT_REAL_PROVIDER_DISPOSABLE_TARGET)"
   echo "- Disposable target acknowledgement: $(env_state WHIPPLESCRIPT_REAL_PROVIDER_DISPOSABLE_ACK)"
