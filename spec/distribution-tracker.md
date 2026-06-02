@@ -63,6 +63,8 @@ default SQLite store, and checked `examples/minimal-noop.whip`.
 - [x] Generate local shell and PowerShell installer artifacts.
 - [x] Add a `dist` custom CI job that smoke-tests the packaged Linux x64 archive
   before publish.
+- [x] Add a manual release workflow dry run that builds and uploads release
+  artifacts without publishing a GitHub Release.
 - [ ] Build all configured platform artifacts in CI.
 - [ ] Publish archive assets with checksums.
 - [ ] Publish shell and PowerShell installers.
@@ -84,9 +86,19 @@ Result: passed for the local Linux x64 archive, global source archive, shell
 installer artifact, PowerShell installer artifact, checksum files, and extracted
 `whip` smoke checks.
 
-Correction from setup: `dist generate --mode ci --allow-dirty` intentionally
-skips CI regeneration because the generated CI is allowed to be out of date.
-Running `dist generate --mode ci` produced `.github/workflows/release.yml`.
+Correction from setup: `.github/workflows/release.yml` intentionally carries
+WhippleScript-specific packaging and manual dry-run hooks beyond cargo-dist's
+generated CI. `dist-workspace.toml` therefore sets `allow-dirty = ["ci"]`, so
+`dist plan --output-format=json --no-local-paths` remains a valid release check
+while `dist generate --mode ci --check` correctly refuses to overwrite the
+customized workflow. The 2026-06-02 local plan listed 15 artifacts across
+`aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`,
+`x86_64-pc-windows-msvc`, and `x86_64-unknown-linux-gnu`.
+
+The `Release` workflow can now be manually dispatched with
+`build_artifacts=true` to run the non-publishing artifact build matrix and
+upload the temporary artifacts for review. Tag pushes remain the only path that
+creates a GitHub Release.
 
 ## Phase 2: Friendly Package Managers
 

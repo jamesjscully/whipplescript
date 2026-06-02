@@ -25,6 +25,8 @@ Before declaring v0 complete:
       release body
 - [x] local Linux x64 `dist build` archive smoke-tested with packaged `whip`
 - [x] generated release workflow includes the packaged binary smoke job
+- [x] generated release workflow includes a manual non-publishing artifact
+      build dry run
 - [ ] GitHub release artifacts built by CI for macOS, Windows, and Linux
 
 Known v0 deferrals must include owner, rationale, and follow-up location.
@@ -274,6 +276,11 @@ requires `WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS` to point at configs containing
 `whip doctor --record-provider-evidence <instance-id>` records parsed provider
 binding validation results as `provider.validation` evidence without starting
 provider runs; use it after creating or selecting a release-validation instance.
+
+The `Release` workflow has a manual `workflow_dispatch` dry-run mode. Dispatch
+it with `build_artifacts=true` to build and upload all configured cargo-dist
+artifacts as GitHub Actions artifacts without creating a GitHub Release. Tag
+pushes remain the only publishing path.
 
 `scripts/check-release-readiness.sh` writes
 `target/release-readiness-report.md` by default. Set
