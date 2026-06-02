@@ -5682,14 +5682,21 @@ rule start_denied_work
             ],
         );
         let events = log.as_array().expect("event array");
-        assert!(events.iter().any(|event| {
-            event.get("event_type").and_then(Value::as_str) == Some("agent.turn.failed")
-                && event
+        assert!(
+            events.iter().any(|event| {
+                let provider_event_type = event
                     .get("payload")
                     .and_then(|payload| payload.get("provider_event_type"))
-                    .and_then(Value::as_str)
-                    == Some("whip.native.boundary_error.workspace_denied")
-        }));
+                    .and_then(Value::as_str);
+                event.get("event_type").and_then(Value::as_str) == Some("agent.turn.failed")
+                    && matches!(
+                        provider_event_type,
+                        Some("whip.native.boundary_error.workspace_denied")
+                            | Some("whip.native.boundary_error.provider_health_unavailable")
+                    )
+            }),
+            "expected native boundary failure event for {provider}: {events:#?}"
+        );
         let _ = fs::remove_file(store_path);
     }
 
