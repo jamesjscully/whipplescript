@@ -116,6 +116,11 @@ Result: passed on 2026-06-02. The run built and uploaded
 `artifacts-build-local-x86_64-pc-windows-msvc`, and
 `artifacts-build-global`. The packaged Linux x64 archive smoke job also passed.
 
+Loft is now public at `https://github.com/jamesjscully/loft`, so CI and release
+validation checkout steps use recursive submodule checkout. Fresh
+`--recurse-submodules` clones can fetch `vendor/loft` at the recorded submodule
+commit, keeping the source-of-truth Loft fixture path available in automation.
+
 ## Phase 2: Friendly Package Managers
 
 - [ ] Create `jamesjscully/homebrew-tap`.

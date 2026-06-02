@@ -13,6 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          submodules: recursive
           persist-credentials: false
       - name: Download local release artifacts
         uses: actions/download-artifact@v8

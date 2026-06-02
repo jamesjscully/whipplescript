@@ -288,9 +288,10 @@ artifact bundles for Apple Silicon macOS, Intel macOS, ARM64 Linux, x64 Linux,
 and x64 Windows, built the global installer/checksum/source artifacts, and
 passed the packaged Linux x64 archive smoke job. A previous dry run,
 `26820226807`, failed during checkout because the generated release workflow
-attempted to recursively clone the private/local Loft source submodule; release
-and dist-smoke checkout steps no longer fetch submodules because the packaged
-`whip` distribution does not require Loft source fixtures.
+attempted to recursively clone the private/local Loft source submodule. Loft is
+now public, fresh recursive submodule clones can fetch
+`https://github.com/jamesjscully/loft`, and CI plus release checkout steps fetch
+submodules so validation keeps exercising the source-of-truth Loft fixture path.
 
 `scripts/check-release-readiness.sh` writes
 `target/release-readiness-report.md` by default. Set

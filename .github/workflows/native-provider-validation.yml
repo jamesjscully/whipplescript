@@ -79,6 +79,8 @@ jobs:
       WHIPPLESCRIPT_PI_DISPOSABLE_ACK: ${{ inputs.live_pi == 'true' && matrix.provider == 'pi' && 'I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE' || '' }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -133,6 +135,8 @@ jobs:
       WHIPPLESCRIPT_PI_DISPOSABLE_ACK: ${{ inputs.live_pi == 'true' && 'I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE' || '' }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
