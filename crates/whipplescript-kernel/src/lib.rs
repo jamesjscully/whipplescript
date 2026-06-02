@@ -1810,7 +1810,7 @@ impl RuntimeKernel {
             fact: NewFact {
                 fact_id: &fact_id,
                 name: event_type,
-                key: execution.run_id,
+                key: &fact_key,
                 value_json: &payload,
                 schema_id: None,
                 provenance_class: "effect",
@@ -3705,11 +3705,33 @@ rule wait
                 NativeProviderEvent {
                     provider_id: "native-fixture".to_owned(),
                     run_id: "run-tell".to_owned(),
+                    event_kind: NativeProviderEventKind::Streamed,
+                    provider_event_type: "fixture.turn.delta".to_owned(),
+                    provider_session_id: Some("session-1".to_owned()),
+                    provider_turn_id: Some("turn-1".to_owned()),
+                    sequence: Some(2),
+                    evidence: json!({"delta": 1}),
+                    artifacts: Vec::new(),
+                },
+                NativeProviderEvent {
+                    provider_id: "native-fixture".to_owned(),
+                    run_id: "run-tell".to_owned(),
+                    event_kind: NativeProviderEventKind::Streamed,
+                    provider_event_type: "fixture.turn.delta".to_owned(),
+                    provider_session_id: Some("session-1".to_owned()),
+                    provider_turn_id: Some("turn-1".to_owned()),
+                    sequence: Some(3),
+                    evidence: json!({"delta": 2}),
+                    artifacts: Vec::new(),
+                },
+                NativeProviderEvent {
+                    provider_id: "native-fixture".to_owned(),
+                    run_id: "run-tell".to_owned(),
                     event_kind: NativeProviderEventKind::ArtifactCaptured,
                     provider_event_type: "fixture.artifact.captured".to_owned(),
                     provider_session_id: Some("session-1".to_owned()),
                     provider_turn_id: Some("turn-1".to_owned()),
-                    sequence: Some(2),
+                    sequence: Some(4),
                     evidence: json!({"artifact": true}),
                     artifacts: vec![NativeProviderArtifactRef {
                         artifact_id: Some("artifact-1".to_owned()),
@@ -3727,7 +3749,7 @@ rule wait
                     provider_event_type: "fixture.turn.completed".to_owned(),
                     provider_session_id: Some("session-1".to_owned()),
                     provider_turn_id: Some("turn-1".to_owned()),
-                    sequence: Some(3),
+                    sequence: Some(5),
                     evidence: json!({"completed": true}),
                     artifacts: Vec::new(),
                 },
@@ -3783,6 +3805,13 @@ rule wait
         assert_eq!(artifacts[0].kind, "diff");
         let facts = kernel.store.list_facts("instance-a").expect("facts list");
         assert!(facts.iter().any(|fact| fact.name == "agent.turn.started"));
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|fact| fact.name == "agent.turn.streamed")
+                .count(),
+            2
+        );
         assert!(facts
             .iter()
             .any(|fact| fact.name == "agent.turn.artifact_captured"));
@@ -4324,7 +4353,8 @@ rule wait
         let facts = store.list_facts(&instance_id).expect("facts list");
         assert!(facts.iter().any(|fact| {
             fact.name == "agent.turn.cancelled"
-                && fact.key == "run-tell"
+                && fact.key != "run-tell"
+                && fact.value_json.contains(r#""run_id":"run-tell""#)
                 && !fact.value_json.contains("secret")
         }));
         let evidence = store.list_evidence(&instance_id).expect("evidence lists");

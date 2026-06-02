@@ -27,8 +27,11 @@ and be inspected afterward."
 
 ## Try It
 
-You need Rust and Cargo for now. Prebuilt releases are planned, but early builds
-are installed from source.
+Install the released `whip` binary from GitHub Releases, or use Rust and Cargo
+to install the current source build.
+
+For prebuilt release installers and checksum verification, see
+[`docs/install.md`](docs/install.md).
 
 Clone the repo and install the CLI from the checkout:
 

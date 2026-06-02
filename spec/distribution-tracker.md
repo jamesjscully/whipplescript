@@ -104,8 +104,8 @@ Latest CI artifact dry run:
 
 ```text
 Release workflow_dispatch, build_artifacts=true
-Run: 26820271988
-Commit: f8c8170
+Run: 26821656011
+Commit: 23873be
 ```
 
 Result: passed on 2026-06-02. The run built and uploaded
@@ -123,11 +123,21 @@ commit, keeping the source-of-truth Loft fixture path available in automation.
 
 ## Phase 2: Friendly Package Managers
 
-- [ ] Create `jamesjscully/homebrew-tap`.
+- [x] Create `jamesjscully/homebrew-tap`.
+  - Tap initialized at `https://github.com/jamesjscully/homebrew-tap` with a
+    `Formula/` directory and README. The formula itself needs the final tagged
+    release asset URL and SHA256 values.
 - [ ] Publish a Homebrew formula from release artifacts.
-- [ ] Add Homebrew install docs.
-- [ ] Prepare crates for crates.io publishing by replacing internal path-only
+- [x] Add Homebrew install docs.
+- [x] Prepare crates for crates.io publishing by replacing internal path-only
   dependencies with versioned path dependencies.
+  - Crates must publish in dependency order:
+    `whipplescript-core`, `whipplescript-parser`, `whipplescript-store`,
+    `whipplescript-kernel`, then `whipplescript`.
+  - `cargo package -p whipplescript-core --allow-dirty` verified the first
+    package. Dependent crates require the preceding internal crates to exist on
+    crates.io before `cargo package` or `cargo publish --dry-run` can fully
+    resolve them against the registry.
 - [ ] Publish `whipplescript` to crates.io.
 - [ ] Revisit Windows package managers after GitHub release assets are stable:
   - [ ] WinGet
@@ -139,7 +149,7 @@ commit, keeping the source-of-truth Loft fixture path available in automation.
 - [ ] Sign macOS binaries with Developer ID.
 - [ ] Notarize macOS release artifacts.
 - [ ] Sign Windows binaries with Authenticode.
-- [ ] Record checksum verification instructions in install docs.
+- [x] Record checksum verification instructions in install docs.
 - [ ] Consider release provenance attestations once the release workflow is
   stable.
 

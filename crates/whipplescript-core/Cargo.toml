@@ -3,6 +3,10 @@ name = "whipplescript-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Shared core types for WhippleScript workflows"
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
 
 [lib]
 path = "src/lib.rs"

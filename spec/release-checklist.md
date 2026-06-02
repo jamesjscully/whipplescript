@@ -36,48 +36,48 @@ Known v0 deferrals must include owner, rationale, and follow-up location.
 For a release that advertises usable native Codex, Claude, and Pi providers,
 the following checks are ship-blocking:
 
-- [ ] Native surface probes pass:
+- [x] Native surface probes pass:
       `scripts/check-native-provider-surfaces.sh`
-- [ ] Codex app-server schema pin passes:
+- [x] Codex app-server schema pin passes:
       `scripts/check-codex-app-server-schema.sh`
-- [ ] Codex live app-server turn and interrupt smokes pass against a disposable
+- [x] Codex live app-server turn and interrupt smokes pass against a disposable
       read-only workspace:
       `WHIPPLESCRIPT_CODEX_APP_SERVER_LIVE=1 scripts/check-codex-app-server-live-smoke.sh`
       and
       `WHIPPLESCRIPT_CODEX_APP_SERVER_LIVE=1 scripts/check-codex-app-server-interrupt-smoke.sh`
-- [ ] Codex live app-server diff artifact smoke passes against a disposable
+- [x] Codex live app-server diff artifact smoke passes against a disposable
       workspace:
       `WHIPPLESCRIPT_CODEX_APP_SERVER_ARTIFACT_LIVE=1 WHIPPLESCRIPT_CODEX_DISPOSABLE_TARGET=codex-artifact-fixture WHIPPLESCRIPT_CODEX_DISPOSABLE_ACK=I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE scripts/check-codex-app-server-artifact-smoke.sh`
-- [ ] Codex live app-server error smoke passes and records a redacted JSON-RPC
+- [x] Codex live app-server error smoke passes and records a redacted JSON-RPC
       error response shape:
       `WHIPPLESCRIPT_CODEX_APP_SERVER_ERROR_LIVE=1 scripts/check-codex-app-server-error-smoke.sh`
-- [ ] Codex live source workflow smoke passes through the native bridge:
+- [x] Codex live source workflow smoke passes through the native bridge:
       `WHIPPLESCRIPT_CODEX_NATIVE_WORKFLOW_LIVE=1 scripts/check-codex-native-workflow-smoke.sh`
-- [ ] Claude Agent SDK surface and sidecar smokes pass, including live
+- [x] Claude Agent SDK surface and sidecar smokes pass, including live
       cancellation before native cancellation is advertised:
       `scripts/check-claude-agent-sdk-surface.sh`,
       `WHIPPLESCRIPT_CLAUDE_AGENT_SDK_LIVE=1 scripts/check-claude-agent-sdk-live-smoke.sh`,
       and
       `WHIPPLESCRIPT_CLAUDE_AGENT_SDK_LIVE=1 scripts/check-claude-agent-sdk-interrupt-smoke.sh`
-- [ ] Claude live source workflow smoke passes through the native bridge using
+- [x] Claude live source workflow smoke passes through the native bridge using
       local Claude auth or embedded API/provider auth:
       `WHIPPLESCRIPT_CLAUDE_NATIVE_WORKFLOW_LIVE=1 scripts/check-claude-native-workflow-smoke.sh`
-- [ ] Claude live artifact smoke passes against a disposable workspace using
+- [x] Claude live artifact smoke passes against a disposable workspace using
       local Claude auth or embedded API/provider auth:
       `WHIPPLESCRIPT_CLAUDE_AGENT_SDK_ARTIFACT_LIVE=1 WHIPPLESCRIPT_CLAUDE_DISPOSABLE_TARGET=claude-artifact-fixture WHIPPLESCRIPT_CLAUDE_DISPOSABLE_ACK=I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE scripts/check-claude-agent-sdk-artifact-smoke.sh`
-- [ ] Pi RPC surface and interrupt smokes pass, including live in-flight abort:
+- [x] Pi RPC surface and interrupt smokes pass, including live in-flight abort:
       `scripts/check-pi-rpc-surface.sh` and
       `WHIPPLESCRIPT_PI_RPC_INTERRUPT_LIVE=1 scripts/check-pi-rpc-interrupt-smoke.sh`
-- [ ] Pi live source workflow smoke passes through the native bridge:
+- [x] Pi live source workflow smoke passes through the native bridge:
       `WHIPPLESCRIPT_PI_NATIVE_WORKFLOW_LIVE=1 scripts/check-pi-native-workflow-smoke.sh`
-- [ ] Pi live artifact smoke passes against a disposable workspace:
+- [x] Pi live artifact smoke passes against a disposable workspace:
       `WHIPPLESCRIPT_PI_RPC_ARTIFACT_LIVE=1 WHIPPLESCRIPT_PI_DISPOSABLE_TARGET=pi-artifact-fixture WHIPPLESCRIPT_PI_DISPOSABLE_ACK=I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE scripts/check-pi-rpc-artifact-smoke.sh`
-- [ ] Native provider config validation passes for configs containing
+- [x] Native provider config validation passes for configs containing
       `codex-main`, `claude-main`, and `pi-main`:
       `WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json scripts/check-native-provider-configs.sh`
-- [ ] Strict real-provider validation passes and emits per-provider reports:
+- [x] Strict real-provider validation passes and emits per-provider reports:
       `WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_STRICT=1 WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json scripts/check-real-providers-report.sh`
-- [ ] Destructive provider suites, if enabled, use disposable target markers
+- [x] Destructive provider suites, if enabled, use disposable target markers
       and the exact acknowledgement
       `I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE`.
 - [ ] The `Native Provider Validation` GitHub Actions workflow has run with
@@ -114,6 +114,16 @@ target/distrib/native-provider-config-examples.tar.gz
 ```
 
 Command-wrapper-only Loft/BAML/Codex checks do not satisfy this gate.
+
+Native provider gate result for v0.1: passed locally on 2026-06-02.
+Codex live app-server, interrupt, diff-artifact, error-shape, and source
+workflow bridge smokes passed. Claude Agent SDK live, interrupt, artifact,
+error-shape, and source workflow bridge smokes passed. Pi RPC live interrupt,
+artifact, error-shape, and source workflow bridge smokes passed. Strict
+native-provider config/report validation passed with
+`examples/provider-configs/native/native.example.json`. The live Codex source
+workflow smoke exposed and then validated a fix for duplicate native lifecycle
+facts when one provider run emits repeated lifecycle events of the same kind.
 
 ## Latest Local Verification
 
@@ -282,7 +292,7 @@ it with `build_artifacts=true` to build and upload all configured cargo-dist
 artifacts as GitHub Actions artifacts without creating a GitHub Release. Tag
 pushes remain the only publishing path.
 
-`Release` workflow run `26820271988` passed on 2026-06-02 at commit `f8c8170`
+`Release` workflow run `26821656011` passed on 2026-06-02 at commit `23873be`
 with `build_artifacts=true`. It built and uploaded all configured local platform
 artifact bundles for Apple Silicon macOS, Intel macOS, ARM64 Linux, x64 Linux,
 and x64 Windows, built the global installer/checksum/source artifacts, and

@@ -24,7 +24,8 @@ orchestration, but it is not a stable production dependency yet.
 - Native provider integration for Codex, Claude, Pi, Loft, and BAML is still
   settling.
 - Plugin/provider packaging and configuration are not stable public contracts.
-- Prebuilt binary releases are planned but not the primary install path yet.
+- Prebuilt GitHub Release binaries are the v0.1 binary install path; source
+  install remains the fallback for unsigned or platform-specific issues.
 - Production automation is not recommended without project-specific review.
 
 ## Stability Language
