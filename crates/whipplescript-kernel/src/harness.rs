@@ -1111,7 +1111,7 @@ mod tests {
         let harness = CommandAgentHarness::new(
             CommandLaunchPlan::new("fixture", "sh")
                 .arg("-c")
-                .arg("printf not-json")
+                .arg("cat >/dev/null; printf not-json")
                 .require_stdout_json(),
         );
 
