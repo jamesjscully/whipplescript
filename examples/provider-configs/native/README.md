@@ -11,11 +11,12 @@ whip --json doctor --provider-config examples/provider-configs/native/native.exa
 scripts/check-native-provider-configs.sh
 ```
 
-For strict release validation, point `WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS` at
-this file or at an environment-specific copy:
+For strict release validation, point `WHIPPLESCRIPT_PROVIDER_CONFIGS` at this
+file or at an environment-specific copy. The legacy
+`WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS` variable is still accepted.
 
 ```sh
-WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json \
+WHIPPLESCRIPT_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json \
 WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIG_STRICT=1 \
 scripts/check-native-provider-configs.sh
 ```

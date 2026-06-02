@@ -66,6 +66,7 @@ pub enum Item {
     Pattern(PatternDecl),
     Apply(ApplyDecl),
     WorkflowContract(WorkflowContractDecl),
+    Harness(HarnessDecl),
     Agent(AgentDecl),
     Enum(EnumDecl),
     Class(ClassDecl),
@@ -133,8 +134,16 @@ pub struct UseDecl {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessDecl {
+    pub name: Ident,
+    pub kind: Ident,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentDecl {
     pub name: Ident,
+    pub harness: Option<Ident>,
     pub fields: Vec<AgentField>,
     pub span: SourceSpan,
 }
@@ -280,6 +289,7 @@ pub struct IrProgram {
     pub pattern_applications: Vec<IrPatternApplication>,
     pub workflow_contracts: Vec<IrWorkflowContract>,
     pub uses: Vec<IrUse>,
+    pub harnesses: Vec<IrHarness>,
     pub schemas: Vec<IrSchema>,
     pub agents: Vec<IrAgent>,
     pub coerces: Vec<IrCoerce>,
@@ -359,6 +369,13 @@ pub enum IrUseKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrHarness {
+    pub name: String,
+    pub kind: String,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IrSchema {
     Enum(IrEnum),
     Class(IrClass),
@@ -416,6 +433,7 @@ pub enum IrPrimitiveType {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrAgent {
     pub name: String,
+    pub harness: Option<String>,
     pub profile: Option<String>,
     pub capacity: Option<u32>,
     pub skills: Vec<String>,
@@ -1050,10 +1068,21 @@ impl IrProgram {
             }
         }
 
+        if !self.harnesses.is_empty() {
+            push_line(&mut snapshot, "harnesses");
+            for harness in &self.harnesses {
+                push_line(
+                    &mut snapshot,
+                    format!("  harness {} kind={}", harness.name, harness.kind),
+                );
+            }
+        }
+
         if !self.agents.is_empty() {
             push_line(&mut snapshot, "agents");
             for agent in &self.agents {
                 let profile = agent.profile.as_deref().unwrap_or("<missing>");
+                let harness = agent.harness.as_deref().unwrap_or("<fallback>");
                 let capacity = agent
                     .capacity
                     .map(|capacity| capacity.to_string())
@@ -1071,8 +1100,8 @@ impl IrProgram {
                 push_line(
                     &mut snapshot,
                     format!(
-                        "  agent {} profile={} capacity={} skills={} capabilities={}",
-                        agent.name, profile, capacity, skills, capabilities
+                        "  agent {} harness={} profile={} capacity={} skills={} capabilities={}",
+                        agent.name, harness, profile, capacity, skills, capabilities
                     ),
                 );
             }
@@ -1369,6 +1398,7 @@ fn lower_program(
     let mut diagnostics = Vec::new();
     let (program, pattern_applications) = expand_pattern_applications(program, &mut diagnostics);
     let schema_names = collect_schema_names(&program, &mut diagnostics);
+    let harness_names = collect_harness_names(&program, &mut diagnostics);
     let agent_names = collect_agent_names(&program, &mut diagnostics);
     let workflow_contract_names = collect_workflow_contract_names(&program, &mut diagnostics);
     let semantic = SemanticContext::from_program(&program, workflow_inputs);
@@ -1390,6 +1420,7 @@ fn lower_program(
         pattern_applications,
         workflow_contracts: Vec::new(),
         uses: Vec::new(),
+        harnesses: Vec::new(),
         schemas: Vec::new(),
         agents: Vec::new(),
         coerces: Vec::new(),
@@ -1427,7 +1458,8 @@ fn lower_program(
                     "ensure the applied pattern is declared at source top level".to_owned(),
                 ),
             }),
-            Item::Agent(agent) => lower_agent(agent, &mut ir, &mut diagnostics),
+            Item::Harness(harness) => lower_harness(harness, &mut ir, &mut diagnostics),
+            Item::Agent(agent) => lower_agent(agent, &mut ir, &harness_names, &mut diagnostics),
             Item::Enum(enum_decl) => lower_enum(enum_decl, &mut ir, &mut diagnostics),
             Item::Class(class_decl) => lower_class(
                 class_decl,
@@ -1552,6 +1584,12 @@ fn pattern_local_names(pattern: &PatternDecl, alias: &str) -> BTreeMap<String, S
     let mut names = BTreeMap::new();
     for item in &pattern.items {
         match item {
+            Item::Harness(harness) => {
+                names.insert(
+                    harness.name.name.clone(),
+                    generated_pattern_name(alias, &harness.name.name),
+                );
+            }
             Item::Agent(agent) => {
                 names.insert(
                     agent.name.name.clone(),
@@ -1659,6 +1697,12 @@ fn expand_pattern_item(
             Item::Include(include),
         )),
         Item::Use(use_decl) => Some((format!("use:{}", use_decl.name.value), Item::Use(use_decl))),
+        Item::Harness(mut harness) => {
+            let name = rename_ident(harness.name, alias, local_names);
+            let generated = format!("harness:{}", name.name);
+            harness.name = name;
+            Some((generated, Item::Harness(harness)))
+        }
         Item::WorkflowContract(contract) => {
             diagnostics.push(Diagnostic {
                 span: contract.span,
@@ -1693,6 +1737,15 @@ fn expand_pattern_item(
             let name = rename_ident(agent.name, alias, local_names);
             let generated = format!("agent:{}", name.name);
             agent.name = name;
+            if let Some(harness) = agent.harness {
+                agent.harness = Some(Ident {
+                    name: local_names
+                        .get(&harness.name)
+                        .cloned()
+                        .unwrap_or(harness.name),
+                    span: harness.span,
+                });
+            }
             Some((generated, Item::Agent(agent)))
         }
         Item::Enum(mut enum_decl) => {
@@ -1992,6 +2045,25 @@ fn collect_schema_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) ->
         }
     }
 
+    names
+}
+
+fn collect_harness_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for item in &program.items {
+        let Item::Harness(harness) = item else {
+            continue;
+        };
+        if !names.insert(harness.name.name.clone()) {
+            diagnostics.push(Diagnostic {
+                span: harness.name.span,
+                message: format!("harness `{}` is declared more than once", harness.name.name),
+                suggestion: Some(
+                    "rename one harness declaration or merge the harness settings".to_owned(),
+                ),
+            });
+        }
+    }
     names
 }
 
@@ -2375,14 +2447,62 @@ fn lower_use(use_decl: UseDecl, ir: &mut IrProgram, _diagnostics: &mut Vec<Diagn
     });
 }
 
-fn lower_agent(agent: AgentDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+fn lower_harness(harness: HarnessDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    if !is_supported_harness_kind(&harness.kind.name) {
+        diagnostics.push(Diagnostic {
+            span: harness.kind.span,
+            message: format!(
+                "harness `{}` uses unsupported kind `{}`",
+                harness.name.name, harness.kind.name
+            ),
+            suggestion: Some(
+                "supported harness kinds are `codex`, `claude`, `pi`, `fixture`, and `command`"
+                    .to_owned(),
+            ),
+        });
+    }
+
+    ir.harnesses.push(IrHarness {
+        name: harness.name.name,
+        kind: harness.kind.name,
+        span: harness.span,
+    });
+}
+
+fn is_supported_harness_kind(kind: &str) -> bool {
+    matches!(kind, "codex" | "claude" | "pi" | "fixture" | "command")
+}
+
+fn lower_agent(
+    agent: AgentDecl,
+    ir: &mut IrProgram,
+    harness_names: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     let mut lowered = IrAgent {
         name: agent.name.name.clone(),
+        harness: agent.harness.as_ref().map(|harness| harness.name.clone()),
         profile: None,
         capacity: None,
         skills: Vec::new(),
         capabilities: Vec::new(),
     };
+
+    if let Some(harness) = &agent.harness {
+        if !harness_names.contains(&harness.name) {
+            diagnostics.push(Diagnostic {
+                span: harness.span,
+                message: format!(
+                    "agent `{}` uses unknown harness `{}`",
+                    agent.name.name, harness.name
+                ),
+                suggestion: Some(format!(
+                    "declare `harness {}: fixture` before using it",
+                    harness.name
+                )),
+            });
+        }
+    }
 
     for field in agent.fields {
         match field {
@@ -8106,6 +8226,7 @@ fn format_item(item: Item, formatted: &mut String) {
                 ),
             );
         }
+        Item::Harness(harness) => format_harness(harness, formatted),
         Item::Agent(agent) => format_agent(agent, formatted),
         Item::Enum(enum_decl) => format_enum(enum_decl, formatted),
         Item::Class(class_decl) => format_class(class_decl, formatted),
@@ -8184,8 +8305,23 @@ fn format_workflow(workflow: WorkflowDecl, formatted: &mut String) {
     push_line(formatted, "}");
 }
 
+fn format_harness(harness: HarnessDecl, formatted: &mut String) {
+    push_line(
+        formatted,
+        format!("harness {}: {}", harness.name.name, harness.kind.name),
+    );
+}
+
 fn format_agent(agent: AgentDecl, formatted: &mut String) {
-    push_line(formatted, format!("agent {} {{", agent.name.name));
+    let harness = agent
+        .harness
+        .as_ref()
+        .map(|harness| format!(" using {}", harness.name))
+        .unwrap_or_default();
+    push_line(
+        formatted,
+        format!("agent {}{} {{", agent.name.name, harness),
+    );
     for field in agent.fields {
         match field {
             AgentField::Profile(profile) => {
@@ -8671,6 +8807,8 @@ impl Parser<'_> {
             self.parse_apply().map(Item::Apply)
         } else if self.at_ident("input") || self.at_ident("output") || self.at_ident("failure") {
             self.parse_workflow_contract().map(Item::WorkflowContract)
+        } else if self.at_ident("harness") {
+            self.parse_harness().map(Item::Harness)
         } else if self.at_ident("agent") {
             self.parse_agent().map(Item::Agent)
         } else if self.at_ident("enum") {
@@ -8832,9 +8970,27 @@ impl Parser<'_> {
         })
     }
 
+    fn parse_harness(&mut self) -> Option<HarnessDecl> {
+        let start = self.expect_keyword("harness")?.span.start;
+        let name = self.expect_ident("harness name")?;
+        self.expect_symbol(':')?;
+        let kind = self.expect_ident("harness kind")?;
+        let span = SourceSpan {
+            start,
+            end: kind.span.end,
+        };
+        Some(HarnessDecl { name, kind, span })
+    }
+
     fn parse_agent(&mut self) -> Option<AgentDecl> {
         let start = self.expect_keyword("agent")?.span.start;
         let name = self.expect_ident("agent name")?;
+        let harness = if self.at_ident("using") {
+            self.advance();
+            Some(self.expect_ident("harness name")?)
+        } else {
+            None
+        };
         let open = self.expect_symbol('{')?;
         let mut fields = Vec::new();
 
@@ -8891,6 +9047,7 @@ impl Parser<'_> {
 
         Some(AgentDecl {
             name,
+            harness,
             fields,
             span: SourceSpan { start, end },
         })
@@ -10201,6 +10358,102 @@ rule start
     }
 
     #[test]
+    fn accepts_harness_declarations_and_agent_bindings() {
+        let source = r#"
+workflow HarnessTopology
+
+harness coder: codex
+harness reviewer: claude
+
+agent implementer using coder {
+  profile "repo-writer"
+  capacity 1
+}
+
+agent critic using reviewer {
+  profile "repo-reader"
+  capacity 1
+}
+
+rule start
+  when started
+=> {
+  tell implementer as turn "implement"
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("program compiles");
+        assert_eq!(ir.harnesses.len(), 2);
+        assert_eq!(ir.harnesses[0].name, "coder");
+        assert_eq!(ir.harnesses[0].kind, "codex");
+        assert_eq!(
+            ir.agents
+                .iter()
+                .find(|agent| agent.name == "implementer")
+                .and_then(|agent| agent.harness.as_deref()),
+            Some("coder")
+        );
+        let snapshot = ir.to_snapshot();
+        assert!(snapshot.contains("harness coder kind=codex"));
+        assert!(snapshot.contains("agent implementer harness=coder"));
+    }
+
+    #[test]
+    fn rejects_agent_binding_to_unknown_harness() {
+        let source = r#"
+workflow UnknownHarness
+
+agent worker using missing {
+  profile "repo-writer"
+  capacity 1
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("agent `worker` uses unknown harness `missing`")));
+    }
+
+    #[test]
+    fn rejects_duplicate_and_unsupported_harness_declarations() {
+        let source = r#"
+workflow BadHarnesses
+
+harness coder: spaceship
+harness coder: codex
+
+agent worker using coder {
+  profile "repo-writer"
+  capacity 1
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        let messages = compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("harness `coder` is declared more than once")),
+            "{messages:#?}"
+        );
+        assert!(
+            messages.iter().any(|message| {
+                message.contains("harness `coder` uses unsupported kind `spaceship`")
+            }),
+            "{messages:#?}"
+        );
+    }
+
+    #[test]
     fn validates_workflow_terminal_payload_fields() {
         let source = r#"
 workflow BadTerminalPayload {
@@ -11058,7 +11311,7 @@ schemas
     files array<string>
     state union<literal<\"open\"> | literal<\"done\">>
 agents
-  agent worker profile=repo-writer capacity=2 skills=[loft-user] capabilities=[]
+  agent worker harness=<fallback> profile=repo-writer capacity=2 skills=[loft-user] capabilities=[]
 rules
   rule start
     when Work as work
@@ -11103,6 +11356,10 @@ rule_dependencies
             (
                 include_str!("../../../examples/codex-poem-coerce-review.whip"),
                 include_str!("../../../examples/codex-poem-coerce-review.ir"),
+            ),
+            (
+                include_str!("../../../examples/codex-claude-harness-review.whip"),
+                include_str!("../../../examples/codex-claude-harness-review.ir"),
             ),
             (
                 include_str!("../../../examples/human-review.whip"),
@@ -12135,6 +12392,32 @@ when started
             "  when started\n",
             "=> {\n",
             "  tell worker \"hi\"\n",
+            "}\n",
+        );
+
+        assert_eq!(formatted.formatted.as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn formats_harness_declarations_and_agent_bindings() {
+        let source = r#"workflow HarnessFormat
+harness coder: codex
+agent implementer using coder {
+profile "repo-writer"
+capacity 1
+}
+"#;
+
+        let formatted = format_program(source);
+        assert_eq!(formatted.diagnostics, Vec::new());
+        let expected = concat!(
+            "workflow HarnessFormat\n",
+            "\n",
+            "harness coder: codex\n",
+            "\n",
+            "agent implementer using coder {\n",
+            "  profile \"repo-writer\"\n",
+            "  capacity 1\n",
             "}\n",
         );
 

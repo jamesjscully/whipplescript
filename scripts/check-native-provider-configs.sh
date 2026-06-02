@@ -3,7 +3,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT="${WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIG_REPORT:-$ROOT/target/native-provider-config-validation.json}"
-CONFIGS="${WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS:-}"
+CONFIGS="${WHIPPLESCRIPT_PROVIDER_CONFIGS:-}"
+if [[ -n "${WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS:-}" ]]; then
+  if [[ -n "$CONFIGS" ]]; then
+    CONFIGS="$CONFIGS:$WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS"
+  else
+    CONFIGS="$WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS"
+  fi
+fi
 STRICT="${WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIG_STRICT:-0}"
 
 mkdir -p "$(dirname "$REPORT")"
@@ -12,11 +19,11 @@ if [[ -z "$CONFIGS" ]]; then
   cat >"$REPORT" <<JSON
 {
   "status": "skip",
-  "message": "WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS is not set"
+  "message": "WHIPPLESCRIPT_PROVIDER_CONFIGS or WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS is not set"
 }
 JSON
   echo "Skipping native provider config validation."
-  echo "Set WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS to a colon-separated list of config files."
+  echo "Set WHIPPLESCRIPT_PROVIDER_CONFIGS to a colon-separated list of config files."
   if [[ "$STRICT" == "1" ]]; then
     echo "Native provider config validation is required in strict mode." >&2
     exit 2
@@ -34,7 +41,7 @@ for path in "${config_paths[@]}"; do
 done
 
 if [[ "${#doctor_args[@]}" -eq 2 ]]; then
-  echo "WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS did not contain any config paths" >&2
+  echo "provider config variables did not contain any config paths" >&2
   exit 2
 fi
 

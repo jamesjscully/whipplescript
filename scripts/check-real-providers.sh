@@ -141,9 +141,9 @@ check_native_provider_config_gate() {
   if [[ "$STRICT_NATIVE" != "1" ]]; then
     return
   fi
-  if [[ -z "${WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS:-}" ]]; then
-    record_preflight all provider.config.missing native-provider-configs fail "WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS is required in native strict mode"
-    echo "WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS is required in native strict mode" >&2
+  if [[ -z "${WHIPPLESCRIPT_PROVIDER_CONFIGS:-}" && -z "${WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS:-}" ]]; then
+    record_preflight all provider.config.missing native-provider-configs fail "WHIPPLESCRIPT_PROVIDER_CONFIGS is required in native strict mode"
+    echo "WHIPPLESCRIPT_PROVIDER_CONFIGS is required in native strict mode" >&2
     missing=1
     return
   fi

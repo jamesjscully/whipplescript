@@ -3,6 +3,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Command, ExitCode},
+    time::Duration,
 };
 
 use serde_json::{json, Value};
@@ -544,7 +545,8 @@ fn validate_doctor_provider_config_json_with_bindings(
     for provider in provider_values {
         match ProviderBindingConfig::from_value(provider) {
             Ok(config) => {
-                let results = validate_provider_binding(&config, capabilities);
+                let mut results = validate_provider_binding(&config, capabilities);
+                results.extend(validate_provider_runtime_config(&config));
                 all_results.extend(results.iter().cloned());
                 bindings.push(DoctorProviderBindingCheck { config, results });
             }
@@ -552,6 +554,37 @@ fn validate_doctor_provider_config_json_with_bindings(
         }
     }
     (all_results, bindings)
+}
+
+fn validate_provider_runtime_config(
+    config: &ProviderBindingConfig,
+) -> Vec<ProviderValidationResult> {
+    if config.provider_kind != ProviderKind::Command || config.surface != AdapterSurface::Command {
+        return Vec::new();
+    }
+    match command_launch_plan_from_config(config) {
+        Ok(_) => vec![ProviderValidationResult::pass(
+            config.provider_id.clone(),
+            config.surface.as_str(),
+            "provider.command.valid",
+            "command_config_valid",
+            "command provider config is launchable",
+        )],
+        Err(StoreError::Conflict(message)) => vec![ProviderValidationResult::fail(
+            config.provider_id.clone(),
+            config.surface.as_str(),
+            "provider.command.invalid",
+            "invalid_command_config",
+            message,
+        )],
+        Err(error) => vec![ProviderValidationResult::fail(
+            config.provider_id.clone(),
+            config.surface.as_str(),
+            "provider.command.invalid",
+            "invalid_command_config",
+            format!("{error:?}"),
+        )],
+    }
 }
 
 fn record_doctor_provider_validation_evidence(
@@ -2179,6 +2212,7 @@ struct WorkerOptions {
     outcome: FixtureOutcome,
     program_path: Option<PathBuf>,
     root: Option<String>,
+    provider_config_paths: Vec<PathBuf>,
     max_child_iterations: usize,
 }
 
@@ -2189,6 +2223,7 @@ impl WorkerOptions {
         let mut outcome = FixtureOutcome::Completed;
         let mut program_path = None;
         let mut root = None;
+        let mut provider_config_paths = Vec::new();
         let mut max_child_iterations = 8usize;
         let mut index = 0;
         while index < args.len() {
@@ -2199,6 +2234,13 @@ impl WorkerOptions {
                         return Err("expected provider after `--provider`".to_owned());
                     };
                     provider = value.clone();
+                }
+                "--provider-config" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected path after `--provider-config`".to_owned());
+                    };
+                    provider_config_paths.push(PathBuf::from(value));
                 }
                 "--program" => {
                     index += 1;
@@ -2235,7 +2277,7 @@ impl WorkerOptions {
                 value if instance_id.is_none() => instance_id = Some(value.to_owned()),
                 _ => {
                     return Err(
-                        "usage: whip worker <instance> [--provider fixture] [--once] [--fail|--timeout|--cancel]".to_owned(),
+                        "usage: whip worker <instance> [--provider fixture] [--provider-config path] [--once] [--fail|--timeout|--cancel]".to_owned(),
                     )
                 }
             }
@@ -2243,7 +2285,7 @@ impl WorkerOptions {
         }
         let Some(instance_id) = instance_id else {
             return Err(
-                "usage: whip worker <instance> [--provider fixture] [--once] [--fail|--timeout|--cancel]"
+                "usage: whip worker <instance> [--provider fixture] [--provider-config path] [--once] [--fail|--timeout|--cancel]"
                     .to_owned(),
             );
         };
@@ -2253,6 +2295,7 @@ impl WorkerOptions {
             outcome,
             program_path,
             root,
+            provider_config_paths,
             max_child_iterations,
         })
     }
@@ -2465,6 +2508,9 @@ fn run_agent_effect(
     options: &WorkerOptions,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input_json = resolve_effect_input_after_bindings(store_path, instance_id, effect)?;
+    let config_paths = provider_config_paths_with_env(&options.provider_config_paths);
+    let provider_selection =
+        agent_provider_selection_with_config_paths(effect, &options.provider, &config_paths)?;
     let store = SqliteStore::open(store_path)?;
     let mut kernel = RuntimeKernel::new(store);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "run"]);
@@ -2473,7 +2519,7 @@ fn run_agent_effect(
         instance_id,
         effect_id: &effect.effect_id,
         run_id: &run_id,
-        provider: &options.provider,
+        provider: &provider_selection.provider_id,
         worker_id: "whip-worker",
         lease_id: &lease_id,
         lease_expires_at: "2030-01-01T00:00:00Z",
@@ -2482,29 +2528,39 @@ fn run_agent_effect(
         input_json: &input_json,
         skill_names: &[],
     };
-    if options.provider == "native-fixture" {
-        let mut adapter =
-            NativeFixtureAdapter::new(&options.provider, &run_id, options.outcome.is_failed());
-        return kernel.run_native_agent_turn(
+    if provider_selection.kind == "native-fixture" {
+        let mut adapter = NativeFixtureAdapter::new(
+            &provider_selection.provider_id,
+            &run_id,
+            options.outcome.is_failed(),
+        );
+        let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
+        return kernel.run_native_agent_turn_with_metadata(
             execution,
             native_fixture_turn_request(execution, &input_json),
             &mut adapter,
             8,
+            &metadata_json,
         );
     }
-    if is_codex_native_provider(&options.provider) {
-        let request = codex_native_turn_request(execution, effect, &input_json)?;
+    if provider_selection.kind == "codex" {
+        let request = codex_native_turn_request(
+            execution,
+            effect,
+            &input_json,
+            provider_selection.provider_config.as_ref(),
+        )?;
         let mut unavailable_adapter;
         let mut adapter;
         let native_adapter: &mut dyn NativeProviderAdapter =
-            match codex_app_server_adapter(&options.provider) {
+            match codex_app_server_adapter(&provider_selection.provider_id) {
                 Ok(healthy_adapter) => {
                     adapter = healthy_adapter;
                     &mut adapter
                 }
                 Err(error) => {
                     unavailable_adapter = unavailable_native_provider_adapter(
-                        &options.provider,
+                        &provider_selection.provider_id,
                         ProviderKind::Codex,
                         AdapterSurface::CodexAppServer,
                         error,
@@ -2512,26 +2568,33 @@ fn run_agent_effect(
                     &mut unavailable_adapter
                 }
             };
-        return kernel.run_native_agent_turn(
+        let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
+        return kernel.run_native_agent_turn_with_metadata(
             execution,
             request,
             native_adapter,
             native_provider_max_events(),
+            &metadata_json,
         );
     }
-    if is_claude_native_provider(&options.provider) {
-        let request = claude_native_turn_request(execution, effect, &input_json)?;
+    if provider_selection.kind == "claude" {
+        let request = claude_native_turn_request(
+            execution,
+            effect,
+            &input_json,
+            provider_selection.provider_config.as_ref(),
+        )?;
         let mut unavailable_adapter;
         let mut adapter;
         let native_adapter: &mut dyn NativeProviderAdapter =
-            match claude_agent_sdk_adapter(&options.provider) {
+            match claude_agent_sdk_adapter(&provider_selection.provider_id) {
                 Ok(healthy_adapter) => {
                     adapter = healthy_adapter;
                     &mut adapter
                 }
                 Err(error) => {
                     unavailable_adapter = unavailable_native_provider_adapter(
-                        &options.provider,
+                        &provider_selection.provider_id,
                         ProviderKind::Claude,
                         AdapterSurface::ClaudeAgentSdk,
                         error,
@@ -2539,43 +2602,406 @@ fn run_agent_effect(
                     &mut unavailable_adapter
                 }
             };
-        return kernel.run_native_agent_turn(
+        let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
+        return kernel.run_native_agent_turn_with_metadata(
             execution,
             request,
             native_adapter,
             native_provider_max_events(),
+            &metadata_json,
         );
     }
-    if is_pi_native_provider(&options.provider) {
-        let request = pi_native_turn_request(execution, effect, &input_json)?;
+    if provider_selection.kind == "pi" {
+        let request = pi_native_turn_request(
+            execution,
+            effect,
+            &input_json,
+            provider_selection.provider_config.as_ref(),
+        )?;
         let mut unavailable_adapter;
         let mut adapter;
-        let native_adapter: &mut dyn NativeProviderAdapter = match pi_rpc_adapter(&options.provider)
-        {
-            Ok(healthy_adapter) => {
-                adapter = healthy_adapter;
-                &mut adapter
-            }
-            Err(error) => {
-                unavailable_adapter = unavailable_native_provider_adapter(
-                    &options.provider,
-                    ProviderKind::Pi,
-                    AdapterSurface::PiRpc,
-                    error,
-                )?;
-                &mut unavailable_adapter
-            }
-        };
-        return kernel.run_native_agent_turn(
+        let native_adapter: &mut dyn NativeProviderAdapter =
+            match pi_rpc_adapter(&provider_selection.provider_id) {
+                Ok(healthy_adapter) => {
+                    adapter = healthy_adapter;
+                    &mut adapter
+                }
+                Err(error) => {
+                    unavailable_adapter = unavailable_native_provider_adapter(
+                        &provider_selection.provider_id,
+                        ProviderKind::Pi,
+                        AdapterSurface::PiRpc,
+                        error,
+                    )?;
+                    &mut unavailable_adapter
+                }
+            };
+        let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
+        return kernel.run_native_agent_turn_with_metadata(
             execution,
             request,
             native_adapter,
             native_provider_max_events(),
+            &metadata_json,
         );
     }
+    if provider_selection.kind == "command" {
+        let Some(plan) = provider_selection.command_plan.clone() else {
+            return Err(StoreError::Conflict(format!(
+                "agent `{}` is bound to command harness `{}`, but no command provider config was found",
+                effect.target.as_deref().unwrap_or("<unknown>"),
+                provider_selection.provider_id
+            )));
+        };
+        let harness = CommandAgentHarness::new(plan);
+        let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
+        return kernel.run_agent_turn_with_metadata(execution, &harness, &metadata_json);
+    }
 
-    let harness = fixture_harness(options.outcome.is_failed());
-    kernel.run_agent_turn(execution, &harness)
+    let harness = fixture_harness(&provider_selection.provider_id, options.outcome.is_failed());
+    let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
+    kernel.run_agent_turn_with_metadata(execution, &harness, &metadata_json)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentProviderSelection {
+    provider_id: String,
+    kind: String,
+    source_harness_id: Option<String>,
+    surface: Option<String>,
+    provider_config: Option<ProviderBindingConfig>,
+    command_plan: Option<CommandLaunchPlan>,
+}
+
+fn agent_provider_selection_with_config_paths(
+    effect: &ClaimableEffect,
+    fallback_provider: &str,
+    config_paths: &[PathBuf],
+) -> Result<AgentProviderSelection, StoreError> {
+    let Some(agent) = effect.target.as_deref() else {
+        return Ok(fallback_provider_selection(fallback_provider));
+    };
+    let declared = serde_json::from_str::<Value>(&effect.declared_profiles_json)?;
+    let Some(harness) = declared_agent_harness_in_value(&declared, agent) else {
+        return Ok(fallback_provider_selection(fallback_provider));
+    };
+    let Some(kind) = declared_harness_kind_in_value(&declared, &harness) else {
+        return Err(StoreError::Conflict(format!(
+            "agent `{agent}` is bound to harness `{harness}`, but that harness is not declared"
+        )));
+    };
+    if let Some(config) = provider_binding_for_harness(&harness, config_paths)? {
+        let config_kind = config.provider_kind.as_str();
+        if config_kind != kind {
+            return Err(StoreError::Conflict(format!(
+                "provider config for harness `{harness}` has kind `{config_kind}`, but source declares `{kind}`"
+            )));
+        }
+        let command_plan = if kind == "command" {
+            Some(command_launch_plan_from_config(&config)?)
+        } else {
+            None
+        };
+        return Ok(AgentProviderSelection {
+            provider_id: config.provider_id.clone(),
+            kind,
+            source_harness_id: Some(harness),
+            surface: Some(config.surface.as_str().to_owned()),
+            provider_config: Some(config),
+            command_plan,
+        });
+    }
+
+    Ok(AgentProviderSelection {
+        provider_id: harness.clone(),
+        kind,
+        source_harness_id: Some(harness),
+        surface: None,
+        provider_config: None,
+        command_plan: None,
+    })
+}
+
+fn fallback_provider_selection(provider: &str) -> AgentProviderSelection {
+    AgentProviderSelection {
+        provider_id: provider.to_owned(),
+        kind: fallback_provider_kind(provider).to_owned(),
+        source_harness_id: None,
+        surface: None,
+        provider_config: None,
+        command_plan: None,
+    }
+}
+
+fn agent_provider_selection_metadata_json(selection: &AgentProviderSelection) -> String {
+    json!({
+        "provider_selection": {
+            "provider_id": selection.provider_id,
+            "provider_kind": selection.kind,
+            "source_harness_id": selection.source_harness_id,
+            "surface": selection.surface,
+        }
+    })
+    .to_string()
+}
+
+fn provider_config_paths_with_env(explicit_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = explicit_paths.to_vec();
+    paths.extend(provider_config_paths_from_env());
+    paths
+}
+
+fn provider_config_paths_from_env() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for env_key in [
+        "WHIPPLESCRIPT_PROVIDER_CONFIGS",
+        "WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS",
+    ] {
+        if let Some(value) = env::var_os(env_key) {
+            paths.extend(env::split_paths(&value).filter(|path| !path.as_os_str().is_empty()));
+        }
+    }
+    paths
+}
+
+fn provider_binding_for_harness(
+    harness: &str,
+    config_paths: &[PathBuf],
+) -> Result<Option<ProviderBindingConfig>, StoreError> {
+    for path in config_paths {
+        let config_json = fs::read_to_string(path)?;
+        let (_results, bindings) = validate_doctor_provider_config_json_with_bindings(
+            &config_json,
+            &builtin_provider_capabilities(),
+        );
+        for binding in bindings {
+            if binding.config.provider_id != harness {
+                continue;
+            }
+            if let Some(failure) = binding
+                .results
+                .iter()
+                .find(|result| result.status == ProviderValidationStatus::Fail)
+            {
+                return Err(StoreError::Conflict(format!(
+                    "provider config for harness `{harness}` failed validation: {}",
+                    failure.message
+                )));
+            }
+            return Ok(Some(binding.config));
+        }
+    }
+    Ok(None)
+}
+
+fn command_launch_plan_from_config(
+    config: &ProviderBindingConfig,
+) -> Result<CommandLaunchPlan, StoreError> {
+    if config.provider_kind != ProviderKind::Command || config.surface != AdapterSurface::Command {
+        return Err(StoreError::Conflict(format!(
+            "provider config `{}` must use provider_kind `command` and surface `command` for a command harness",
+            config.provider_id
+        )));
+    }
+    let executable = required_extra_string(config, "executable")?;
+    let mut plan = CommandLaunchPlan::new(&config.provider_id, executable);
+
+    for arg in optional_extra_string_array(config, "args")? {
+        plan = plan.arg(arg);
+    }
+    if let Some(cwd) = optional_extra_string(config, "cwd")? {
+        plan = plan.cwd(cwd);
+    }
+    for (key, value) in optional_extra_string_map(config, "env")? {
+        plan = plan.env(key, value);
+    }
+    for key in optional_extra_string_array(config, "required_env")? {
+        plan = plan.require_env(key);
+    }
+    for command in optional_extra_string_array(config, "required_commands")? {
+        plan = plan.require_command(command);
+    }
+    if let Some(timeout_ms) = config.timeout_ms {
+        plan = plan.timeout(Duration::from_millis(timeout_ms));
+    }
+    if optional_extra_bool(config, "require_stdout_json")?.unwrap_or(false) {
+        plan = plan.require_stdout_json();
+    }
+
+    Ok(plan)
+}
+
+fn required_extra_string(config: &ProviderBindingConfig, key: &str) -> Result<String, StoreError> {
+    optional_extra_string(config, key)?.ok_or_else(|| {
+        StoreError::Conflict(format!(
+            "provider config `{}` is missing required command field `{key}`",
+            config.provider_id
+        ))
+    })
+}
+
+fn optional_extra_string(
+    config: &ProviderBindingConfig,
+    key: &str,
+) -> Result<Option<String>, StoreError> {
+    let Some(value) = config.extra.get(key) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_str() else {
+        return Err(StoreError::Conflict(format!(
+            "provider config `{}` field `{key}` must be a string",
+            config.provider_id
+        )));
+    };
+    Ok(Some(value.to_owned()))
+}
+
+fn optional_extra_bool(
+    config: &ProviderBindingConfig,
+    key: &str,
+) -> Result<Option<bool>, StoreError> {
+    let Some(value) = config.extra.get(key) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_bool() else {
+        return Err(StoreError::Conflict(format!(
+            "provider config `{}` field `{key}` must be a boolean",
+            config.provider_id
+        )));
+    };
+    Ok(Some(value))
+}
+
+fn optional_extra_string_array(
+    config: &ProviderBindingConfig,
+    key: &str,
+) -> Result<Vec<String>, StoreError> {
+    let Some(value) = config.extra.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        return Err(StoreError::Conflict(format!(
+            "provider config `{}` field `{key}` must be an array of strings",
+            config.provider_id
+        )));
+    };
+    let mut values = Vec::new();
+    for item in items {
+        let Some(item) = item.as_str() else {
+            return Err(StoreError::Conflict(format!(
+                "provider config `{}` field `{key}` must be an array of strings",
+                config.provider_id
+            )));
+        };
+        values.push(item.to_owned());
+    }
+    Ok(values)
+}
+
+fn optional_extra_string_map(
+    config: &ProviderBindingConfig,
+    key: &str,
+) -> Result<BTreeMap<String, String>, StoreError> {
+    let Some(value) = config.extra.get(key) else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(object) = value.as_object() else {
+        return Err(StoreError::Conflict(format!(
+            "provider config `{}` field `{key}` must be an object of string values",
+            config.provider_id
+        )));
+    };
+    let mut values = BTreeMap::new();
+    for (entry_key, entry_value) in object {
+        let Some(entry_value) = entry_value.as_str() else {
+            return Err(StoreError::Conflict(format!(
+                "provider config `{}` field `{key}` must be an object of string values",
+                config.provider_id
+            )));
+        };
+        values.insert(entry_key.clone(), entry_value.to_owned());
+    }
+    Ok(values)
+}
+
+fn fallback_provider_kind(provider: &str) -> &'static str {
+    if provider == "native-fixture" {
+        "native-fixture"
+    } else if is_codex_native_provider(provider) {
+        "codex"
+    } else if is_claude_native_provider(provider) {
+        "claude"
+    } else if is_pi_native_provider(provider) {
+        "pi"
+    } else {
+        "fixture"
+    }
+}
+
+fn declared_agent_harness_in_value(value: &Value, agent: &str) -> Option<String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| declared_agent_harness_in_value(item, agent)),
+        Value::Object(object) => {
+            if let Some(entry) = object.get(agent) {
+                return entry
+                    .get("harness")
+                    .or_else(|| entry.get("harness_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            let object_agent = object
+                .get("name")
+                .or_else(|| object.get("agent_name"))
+                .and_then(Value::as_str);
+            if object_agent == Some(agent) {
+                return object
+                    .get("harness")
+                    .or_else(|| object.get("harness_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            object
+                .get("agents")
+                .and_then(|agents| declared_agent_harness_in_value(agents, agent))
+        }
+        _ => None,
+    }
+}
+
+fn declared_harness_kind_in_value(value: &Value, harness: &str) -> Option<String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| declared_harness_kind_in_value(item, harness)),
+        Value::Object(object) => {
+            if let Some(entry) = object.get(harness) {
+                if let Some(kind) = entry
+                    .get("kind")
+                    .or_else(|| entry.get("provider_kind"))
+                    .and_then(Value::as_str)
+                {
+                    return Some(kind.to_owned());
+                }
+            }
+            let object_harness = object
+                .get("name")
+                .or_else(|| object.get("harness_id"))
+                .and_then(Value::as_str);
+            if object_harness == Some(harness) {
+                return object
+                    .get("kind")
+                    .or_else(|| object.get("provider_kind"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            object
+                .get("harnesses")
+                .and_then(|harnesses| declared_harness_kind_in_value(harnesses, harness))
+        }
+        _ => None,
+    }
 }
 
 fn is_codex_native_provider(provider: &str) -> bool {
@@ -2633,6 +3059,7 @@ fn codex_native_turn_request(
     execution: AgentTurnExecution<'_>,
     effect: &ClaimableEffect,
     input_json: &str,
+    config: Option<&ProviderBindingConfig>,
 ) -> Result<NativeProviderTurnRequest, StoreError> {
     let input = serde_json::from_str::<Value>(input_json)?;
     let prompt_json = input
@@ -2641,22 +3068,16 @@ fn codex_native_turn_request(
         .map(|prompt| Value::String(prompt.to_owned()))
         .unwrap_or(input);
     let mut provider_options = BTreeMap::new();
-    provider_options.insert(
-        "cwd".to_owned(),
-        Value::String(
-            env::current_dir()
-                .map_err(StoreError::Io)?
-                .to_string_lossy()
-                .into_owned(),
-        ),
-    );
+    provider_options.insert("cwd".to_owned(), Value::String(provider_cwd(config)?));
     provider_options.insert(
         "model".to_owned(),
-        Value::String(
-            env::var("WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL")
-                .unwrap_or_else(|_| "gpt-5.4-mini".to_owned()),
-        ),
+        Value::String(provider_model(
+            config,
+            "WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL",
+            "gpt-5.4-mini",
+        )),
     );
+    apply_provider_config_options(&mut provider_options, config);
     Ok(NativeProviderTurnRequest {
         provider_id: execution.provider.to_owned(),
         provider_kind: ProviderKind::Codex,
@@ -2666,11 +3087,11 @@ fn codex_native_turn_request(
         agent: execution.agent.to_owned(),
         profile: execution.profile.map(str::to_owned),
         prompt_json,
-        workspace_policy: "read_only".to_owned(),
+        workspace_policy: provider_workspace_policy(config, "read_only"),
         required_capabilities: native_required_capabilities(effect)?,
-        cancellation_depth: CancellationDepth::NativeStop,
-        artifact_policy: "metadata".to_owned(),
-        credential_ref: None,
+        cancellation_depth: provider_cancellation_depth(config, CancellationDepth::NativeStop),
+        artifact_policy: provider_artifact_policy(config, "metadata"),
+        credential_ref: provider_credential_ref(config),
         provider_options,
     })
 }
@@ -2706,6 +3127,7 @@ fn claude_native_turn_request(
     execution: AgentTurnExecution<'_>,
     effect: &ClaimableEffect,
     input_json: &str,
+    config: Option<&ProviderBindingConfig>,
 ) -> Result<NativeProviderTurnRequest, StoreError> {
     let input = serde_json::from_str::<Value>(input_json)?;
     let prompt_json = input
@@ -2714,22 +3136,16 @@ fn claude_native_turn_request(
         .map(|prompt| Value::String(prompt.to_owned()))
         .unwrap_or(input);
     let mut provider_options = BTreeMap::new();
-    provider_options.insert(
-        "cwd".to_owned(),
-        Value::String(
-            env::current_dir()
-                .map_err(StoreError::Io)?
-                .to_string_lossy()
-                .into_owned(),
-        ),
-    );
+    provider_options.insert("cwd".to_owned(), Value::String(provider_cwd(config)?));
     provider_options.insert(
         "model".to_owned(),
-        Value::String(
-            env::var("WHIPPLESCRIPT_CLAUDE_AGENT_SDK_MODEL")
-                .unwrap_or_else(|_| "sonnet".to_owned()),
-        ),
+        Value::String(provider_model(
+            config,
+            "WHIPPLESCRIPT_CLAUDE_AGENT_SDK_MODEL",
+            "sonnet",
+        )),
     );
+    apply_provider_config_options(&mut provider_options, config);
     Ok(NativeProviderTurnRequest {
         provider_id: execution.provider.to_owned(),
         provider_kind: ProviderKind::Claude,
@@ -2742,11 +3158,14 @@ fn claude_native_turn_request(
             .map(str::to_owned)
             .or_else(|| Some("repo-reader".to_owned())),
         prompt_json,
-        workspace_policy: "read_only".to_owned(),
+        workspace_policy: provider_workspace_policy(config, "read_only"),
         required_capabilities: native_required_capabilities(effect)?,
-        cancellation_depth: CancellationDepth::CooperativeRequest,
-        artifact_policy: "metadata".to_owned(),
-        credential_ref: None,
+        cancellation_depth: provider_cancellation_depth(
+            config,
+            CancellationDepth::CooperativeRequest,
+        ),
+        artifact_policy: provider_artifact_policy(config, "metadata"),
+        credential_ref: provider_credential_ref(config),
         provider_options,
     })
 }
@@ -2774,6 +3193,7 @@ fn pi_native_turn_request(
     execution: AgentTurnExecution<'_>,
     effect: &ClaimableEffect,
     input_json: &str,
+    config: Option<&ProviderBindingConfig>,
 ) -> Result<NativeProviderTurnRequest, StoreError> {
     let input = serde_json::from_str::<Value>(input_json)?;
     let prompt_json = input
@@ -2788,6 +3208,15 @@ fn pi_native_turn_request(
     if let Ok(model) = env::var("WHIPPLESCRIPT_PI_RPC_MODEL") {
         provider_options.insert("model".to_owned(), Value::String(model));
     }
+    if let Some(model) = config.and_then(|config| config.default_model.clone()) {
+        provider_options.insert("model".to_owned(), Value::String(model));
+    }
+    if let Some(config) = config {
+        if let Some(provider) = optional_extra_string(config, "model_provider")? {
+            provider_options.insert("provider".to_owned(), Value::String(provider));
+        }
+    }
+    apply_provider_config_options(&mut provider_options, config);
     Ok(NativeProviderTurnRequest {
         provider_id: execution.provider.to_owned(),
         provider_kind: ProviderKind::Pi,
@@ -2800,13 +3229,81 @@ fn pi_native_turn_request(
             .map(str::to_owned)
             .or_else(|| Some("repo-reader".to_owned())),
         prompt_json,
-        workspace_policy: "read_only".to_owned(),
+        workspace_policy: provider_workspace_policy(config, "read_only"),
         required_capabilities: native_required_capabilities(effect)?,
-        cancellation_depth: CancellationDepth::NativeStop,
-        artifact_policy: "metadata".to_owned(),
-        credential_ref: None,
+        cancellation_depth: provider_cancellation_depth(config, CancellationDepth::NativeStop),
+        artifact_policy: provider_artifact_policy(config, "metadata"),
+        credential_ref: provider_credential_ref(config),
         provider_options,
     })
+}
+
+fn provider_workspace_policy(config: Option<&ProviderBindingConfig>, default: &str) -> String {
+    config
+        .map(|config| config.workspace_policy.clone())
+        .unwrap_or_else(|| default.to_owned())
+}
+
+fn provider_artifact_policy(config: Option<&ProviderBindingConfig>, default: &str) -> String {
+    config
+        .map(|config| config.artifact_policy.clone())
+        .unwrap_or_else(|| default.to_owned())
+}
+
+fn provider_cancellation_depth(
+    config: Option<&ProviderBindingConfig>,
+    default: CancellationDepth,
+) -> CancellationDepth {
+    config
+        .map(|config| config.cancellation_depth)
+        .unwrap_or(default)
+}
+
+fn provider_credential_ref(config: Option<&ProviderBindingConfig>) -> Option<String> {
+    config.and_then(|config| config.credentials_ref.clone())
+}
+
+fn provider_model(config: Option<&ProviderBindingConfig>, env_key: &str, default: &str) -> String {
+    config
+        .and_then(|config| config.default_model.clone())
+        .or_else(|| env::var(env_key).ok())
+        .unwrap_or_else(|| default.to_owned())
+}
+
+fn provider_cwd(config: Option<&ProviderBindingConfig>) -> Result<String, StoreError> {
+    if let Some(config) = config {
+        if let Some(cwd) = optional_extra_string(config, "cwd")? {
+            return Ok(cwd);
+        }
+    }
+    Ok(env::current_dir()
+        .map_err(StoreError::Io)?
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn apply_provider_config_options(
+    provider_options: &mut BTreeMap<String, Value>,
+    config: Option<&ProviderBindingConfig>,
+) {
+    let Some(config) = config else {
+        return;
+    };
+    if let Some(timeout_ms) = config.timeout_ms {
+        provider_options.insert("timeout_ms".to_owned(), json!(timeout_ms));
+    }
+    if !config.profile_ids.is_empty() {
+        provider_options.insert("profile_ids".to_owned(), json!(config.profile_ids));
+    }
+    if !config.health_checks.is_empty() {
+        provider_options.insert("health_checks".to_owned(), json!(config.health_checks));
+    }
+    if !config.extra.is_empty() {
+        provider_options.insert(
+            "provider_config_extra_keys".to_owned(),
+            json!(config.extra.keys().cloned().collect::<Vec<_>>()),
+        );
+    }
 }
 
 fn native_required_capabilities(effect: &ClaimableEffect) -> Result<Vec<String>, StoreError> {
@@ -3841,6 +4338,7 @@ fn run_workflow_invoke_effect(
             outcome: options.outcome,
             program_path: Some(program_path.to_path_buf()),
             root: Some(target_workflow.to_owned()),
+            provider_config_paths: options.provider_config_paths.clone(),
             max_child_iterations: options.max_child_iterations,
         };
         let worker_report = run_worker_once(store_path, &child_worker)?;
@@ -4168,17 +4666,13 @@ fn fixture_baml_value(output_type: &str) -> String {
     .to_string()
 }
 
-fn fixture_harness(fail: bool) -> CommandAgentHarness {
+fn fixture_harness(provider: &str, fail: bool) -> CommandAgentHarness {
     let script = if fail {
         "cat >/dev/null; echo fixture failure >&2; exit 42"
     } else {
         "cat >/dev/null; echo fixture completed"
     };
-    CommandAgentHarness::new(
-        CommandLaunchPlan::new("fixture", "sh")
-            .arg("-c")
-            .arg(script),
-    )
+    CommandAgentHarness::new(CommandLaunchPlan::new(provider, "sh").arg("-c").arg(script))
 }
 
 fn dev(options: &CliOptions) -> ExitCode {
@@ -4225,6 +4719,7 @@ fn dev(options: &CliOptions) -> ExitCode {
                 outcome: dev_options.outcome,
                 program_path: Some(PathBuf::from(&dev_options.program_path)),
                 root: dev_options.root.clone(),
+                provider_config_paths: dev_options.provider_config_paths.clone(),
                 max_child_iterations: 8,
             },
         ) {
@@ -4362,6 +4857,7 @@ struct DevOptions {
     program_path: String,
     root: Option<String>,
     provider: String,
+    provider_config_paths: Vec<PathBuf>,
     outcome: FixtureOutcome,
     max_iterations: usize,
 }
@@ -4371,6 +4867,7 @@ impl DevOptions {
         let mut program_path = None;
         let mut root = None;
         let mut provider = "fixture".to_owned();
+        let mut provider_config_paths = Vec::new();
         let mut outcome = FixtureOutcome::Completed;
         let mut max_iterations = 8usize;
         let mut index = 0;
@@ -4389,6 +4886,13 @@ impl DevOptions {
                         return Err("expected provider after `--provider`".to_owned());
                     };
                     provider = value.clone();
+                }
+                "--provider-config" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected path after `--provider-config`".to_owned());
+                    };
+                    provider_config_paths.push(PathBuf::from(value));
                 }
                 "--fail" => outcome = FixtureOutcome::Failed,
                 "--timeout" => outcome = FixtureOutcome::TimedOut,
@@ -4417,7 +4921,7 @@ impl DevOptions {
                 value if program_path.is_none() => program_path = Some(value.to_owned()),
                 _ => {
                     return Err(
-                        "usage: whip dev <workflow.whip> [--provider fixture] [--until idle] [--fail|--timeout|--cancel]"
+                        "usage: whip dev <workflow.whip> [--provider fixture] [--provider-config path] [--until idle] [--fail|--timeout|--cancel]"
                             .to_owned(),
                     )
                 }
@@ -4426,7 +4930,7 @@ impl DevOptions {
         }
         let Some(program_path) = program_path else {
             return Err(
-                "usage: whip dev <workflow.whip> [--provider fixture] [--until idle] [--fail|--timeout|--cancel]"
+                "usage: whip dev <workflow.whip> [--provider fixture] [--provider-config path] [--until idle] [--fail|--timeout|--cancel]"
                     .to_owned(),
             );
         };
@@ -4434,6 +4938,7 @@ impl DevOptions {
             program_path,
             root,
             provider,
+            provider_config_paths,
             outcome,
             max_iterations,
         })
@@ -5091,6 +5596,7 @@ fn empty_ir_program() -> IrProgram {
         pattern_applications: Vec::new(),
         workflow_contracts: Vec::new(),
         uses: Vec::new(),
+        harnesses: Vec::new(),
         schemas: Vec::new(),
         agents: Vec::new(),
         coerces: Vec::new(),
@@ -7644,7 +8150,17 @@ fn status(options: &CliOptions) -> ExitCode {
     };
 
     if options.json {
-        emit_json(status_to_json(&status))
+        let effects = match store.list_effects(instance_id) {
+            Ok(effects) => effects,
+            Err(error) => return report_store_error("failed to load effects", error),
+        };
+        let runs = match store.list_runs(instance_id) {
+            Ok(runs) => runs,
+            Err(error) => return report_store_error("failed to load runs", error),
+        };
+        emit_json(status_to_json_with_effects_and_runs(
+            &status, &effects, &runs,
+        ))
     } else {
         println!(
             "instance {} {}",
@@ -10431,6 +10947,7 @@ fn effect_to_json(effect: &EffectView) -> Value {
         "effect_id": effect.effect_id,
         "kind": effect.kind,
         "target": effect.target,
+        "provider_selection": effect_provider_selection_json(effect).unwrap_or(Value::Null),
         "input": json_from_str(&effect.input_json),
         "status": effect.status,
         "created_by_rule": effect.created_by_rule,
@@ -10443,16 +10960,59 @@ fn effect_to_json(effect: &EffectView) -> Value {
     })
 }
 
+fn effect_provider_selection_json(effect: &EffectView) -> Option<Value> {
+    if effect.kind != "agent.tell" {
+        return None;
+    }
+    let agent = effect.target.as_deref()?;
+    let declared = serde_json::from_str::<Value>(&effect.declared_profiles_json).ok()?;
+    let harness = declared_agent_harness_in_value(&declared, agent)?;
+    let kind = declared_harness_kind_in_value(&declared, &harness)?;
+    Some(json!({
+        "source_harness_id": harness,
+        "provider_id": harness,
+        "provider_kind": kind,
+    }))
+}
+
 fn run_to_json(run: &RunView) -> Value {
     json!({
         "run_id": run.run_id,
         "effect_id": run.effect_id,
         "provider": run.provider,
+        "provider_selection": run_provider_selection_json(run),
         "worker_id": run.worker_id,
         "status": run.status,
         "started_at": run.started_at,
         "completed_at": run.completed_at,
         "cancel_requested": run.cancel_requested,
+    })
+}
+
+fn run_provider_selection_json(run: &RunView) -> Value {
+    let metadata = json_from_str(&run.metadata_json);
+    if let Some(selection) = metadata.get("provider_selection") {
+        return selection.clone();
+    }
+    let native_provider = metadata.get("native_provider");
+    if let Some(native_provider) = native_provider {
+        return json!({
+            "provider_id": native_provider
+                .get("provider_id")
+                .cloned()
+                .unwrap_or_else(|| Value::String(run.provider.clone())),
+            "provider_kind": native_provider
+                .get("provider_kind")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "surface": native_provider
+                .get("surface")
+                .cloned()
+                .unwrap_or(Value::Null),
+        });
+    }
+    json!({
+        "provider_id": run.provider,
     })
 }
 
@@ -11038,6 +11598,25 @@ fn status_to_json(status: &StatusView) -> Value {
         "native_lifecycle": native_lifecycle_events(&status.recent_events),
         "recent_events": status.recent_events.iter().map(event_to_json).collect::<Vec<_>>(),
     })
+}
+
+fn status_to_json_with_effects_and_runs(
+    status: &StatusView,
+    effects: &[EffectView],
+    runs: &[RunView],
+) -> Value {
+    let mut value = status_to_json(status);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "effects".to_owned(),
+            Value::Array(effects.iter().map(effect_to_json).collect()),
+        );
+        object.insert(
+            "runs".to_owned(),
+            Value::Array(runs.iter().map(run_to_json).collect()),
+        );
+    }
+    value
 }
 
 fn workflow_terminal_summary(events: &[EventView]) -> Option<Value> {
@@ -11772,6 +12351,7 @@ case classification {
             status: "running".to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             completed_at: None,
+            metadata_json: "{}".to_owned(),
             cancel_requested: true,
         };
 
@@ -11779,6 +12359,183 @@ case classification {
         assert_eq!(
             rendered.get("cancel_requested").and_then(Value::as_bool),
             Some(true)
+        );
+        assert_eq!(
+            rendered
+                .pointer("/provider_selection/provider_id")
+                .and_then(Value::as_str),
+            Some("fixture")
+        );
+    }
+
+    #[test]
+    fn renders_run_provider_selection_metadata_json() {
+        let run = RunView {
+            run_id: "run-1".to_owned(),
+            effect_id: "effect-1".to_owned(),
+            provider: "runner".to_owned(),
+            worker_id: "worker-1".to_owned(),
+            status: "running".to_owned(),
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
+            completed_at: None,
+            metadata_json: json!({
+                "provider_selection": {
+                    "provider_id": "runner",
+                    "provider_kind": "command",
+                    "source_harness_id": "runner",
+                    "surface": "command"
+                }
+            })
+            .to_string(),
+            cancel_requested: false,
+        };
+
+        let rendered = run_to_json(&run);
+        assert_eq!(
+            rendered
+                .pointer("/provider_selection/provider_kind")
+                .and_then(Value::as_str),
+            Some("command")
+        );
+        assert_eq!(
+            rendered
+                .pointer("/provider_selection/source_harness_id")
+                .and_then(Value::as_str),
+            Some("runner")
+        );
+        assert_eq!(
+            rendered
+                .pointer("/provider_selection/surface")
+                .and_then(Value::as_str),
+            Some("command")
+        );
+    }
+
+    #[test]
+    fn renders_effect_harness_provider_selection_json() {
+        let effect = EffectView {
+            effect_id: "eff-1".to_owned(),
+            kind: "agent.tell".to_owned(),
+            target: Some("implementer".to_owned()),
+            input_json: r#"{"prompt":"go"}"#.to_owned(),
+            status: "queued".to_owned(),
+            created_by_rule: "start".to_owned(),
+            program_version_id: Some("version-1".to_owned()),
+            revision_epoch: 0,
+            profile: Some("repo-writer".to_owned()),
+            required_capabilities_json: r#"["agent.tell"]"#.to_owned(),
+            declared_profiles_json: json!({
+                "harnesses": [{"name": "coder", "kind": "codex"}],
+                "agents": [{"name": "implementer", "harness": "coder"}]
+            })
+            .to_string(),
+            policy_block_reason: None,
+            cancel_requested: false,
+        };
+
+        let rendered = effect_to_json(&effect);
+
+        assert_eq!(
+            rendered
+                .pointer("/provider_selection/source_harness_id")
+                .and_then(Value::as_str),
+            Some("coder")
+        );
+        assert_eq!(
+            rendered
+                .pointer("/provider_selection/provider_kind")
+                .and_then(Value::as_str),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn status_json_includes_effects_and_runs_provider_selection() {
+        let status = StatusView {
+            instance: InstanceView {
+                instance_id: "ins-1".to_owned(),
+                program_id: "prog-1".to_owned(),
+                version_id: "ver-1".to_owned(),
+                revision_epoch: 0,
+                status: "running".to_owned(),
+                input_json: "{}".to_owned(),
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            },
+            fact_count: 0,
+            queued_effect_count: 1,
+            blocked_effect_count: 0,
+            active_run_count: 1,
+            failure_count: 0,
+            cancellation_request_count: 0,
+            revisions: Vec::new(),
+            parent_invocation: None,
+            child_invocations: Vec::new(),
+            recent_events: Vec::new(),
+        };
+        let effect = EffectView {
+            effect_id: "eff-1".to_owned(),
+            kind: "agent.tell".to_owned(),
+            target: Some("implementer".to_owned()),
+            input_json: r#"{"prompt":"go"}"#.to_owned(),
+            status: "running".to_owned(),
+            created_by_rule: "start".to_owned(),
+            program_version_id: Some("ver-1".to_owned()),
+            revision_epoch: 0,
+            profile: Some("repo-writer".to_owned()),
+            required_capabilities_json: r#"["agent.tell"]"#.to_owned(),
+            declared_profiles_json: json!({
+                "harnesses": [{"name": "coder", "kind": "codex"}],
+                "agents": [{"name": "implementer", "harness": "coder"}]
+            })
+            .to_string(),
+            policy_block_reason: None,
+            cancel_requested: false,
+        };
+        let run = RunView {
+            run_id: "run-1".to_owned(),
+            effect_id: "eff-1".to_owned(),
+            provider: "coder".to_owned(),
+            worker_id: "worker-1".to_owned(),
+            status: "running".to_owned(),
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
+            completed_at: None,
+            metadata_json: json!({
+                "native_provider": {
+                    "provider_id": "coder",
+                    "provider_kind": "codex",
+                    "surface": "codex_app_server"
+                },
+                "provider_selection": {
+                    "provider_id": "coder",
+                    "provider_kind": "codex",
+                    "source_harness_id": "coder",
+                    "surface": "codex_app_server"
+                }
+            })
+            .to_string(),
+            cancel_requested: false,
+        };
+
+        let rendered = status_to_json_with_effects_and_runs(&status, &[effect], &[run]);
+
+        assert_eq!(
+            rendered
+                .pointer("/effects/0/provider_selection/provider_kind")
+                .and_then(Value::as_str),
+            Some("codex")
+        );
+        assert_eq!(
+            rendered
+                .pointer("/runs/0/provider_selection/source_harness_id")
+                .and_then(Value::as_str),
+            Some("coder")
+        );
+        assert_eq!(
+            rendered
+                .pointer("/runs/0/provider_selection/surface")
+                .and_then(Value::as_str),
+            Some("codex_app_server")
         );
     }
 
@@ -12302,6 +13059,45 @@ rule accept
     }
 
     #[test]
+    fn parses_worker_and_dev_provider_config_options() {
+        let worker = WorkerOptions::parse(&[
+            "ins_123".to_owned(),
+            "--provider".to_owned(),
+            "fixture".to_owned(),
+            "--provider-config".to_owned(),
+            "providers-a.json".to_owned(),
+            "--provider-config".to_owned(),
+            "providers-b.json".to_owned(),
+            "--once".to_owned(),
+        ])
+        .expect("worker options parse");
+
+        assert_eq!(worker.instance_id, "ins_123");
+        assert_eq!(
+            worker.provider_config_paths,
+            vec![
+                PathBuf::from("providers-a.json"),
+                PathBuf::from("providers-b.json")
+            ]
+        );
+
+        let dev = DevOptions::parse(&[
+            "workflow.whip".to_owned(),
+            "--provider-config".to_owned(),
+            "providers.json".to_owned(),
+            "--until".to_owned(),
+            "idle".to_owned(),
+        ])
+        .expect("dev options parse");
+
+        assert_eq!(dev.program_path, "workflow.whip");
+        assert_eq!(
+            dev.provider_config_paths,
+            vec![PathBuf::from("providers.json")]
+        );
+    }
+
+    #[test]
     fn doctor_provider_config_validation_redacts_extra_values() {
         let results = validate_doctor_provider_config_json(
             r#"{
@@ -12341,6 +13137,33 @@ rule accept
             .collect::<Vec<_>>())
         .to_string()
         .contains("sk-should-not-appear"));
+    }
+
+    #[test]
+    fn doctor_provider_config_validation_rejects_command_without_executable() {
+        let results = validate_doctor_provider_config_json(
+            r#"{
+              "providers": [
+                {
+                  "provider_id": "runner",
+                  "provider_kind": "command",
+                  "surface": "command",
+                  "workspace_policy": "read_only",
+                  "cancellation_depth": "none",
+                  "artifact_policy": "metadata"
+                }
+              ]
+            }"#,
+        );
+
+        assert!(results.iter().any(|result| {
+            result.status == whipplescript_kernel::provider::ProviderValidationStatus::Fail
+                && result.provider == "runner"
+                && result.code == "invalid_command_config"
+                && result
+                    .message
+                    .contains("missing required command field `executable`")
+        }));
     }
 
     #[test]
@@ -12395,6 +13218,14 @@ rule accept
             status: "running".to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             completed_at: None,
+            metadata_json: json!({
+                "native_provider": {
+                    "provider_id": "pi-main",
+                    "provider_kind": "pi",
+                    "surface": "pi_rpc"
+                }
+            })
+            .to_string(),
             cancel_requested: true,
         };
         let run_json = run_to_json_with_lifecycle_and_artifacts(&run, &events, &BTreeMap::new());
@@ -12409,6 +13240,12 @@ rule accept
                 .pointer("/native_lifecycle/evidence_id")
                 .and_then(Value::as_str),
             Some("evd_cancel")
+        );
+        assert_eq!(
+            run_json
+                .pointer("/provider_selection/surface")
+                .and_then(Value::as_str),
+            Some("pi_rpc")
         );
     }
 
@@ -12435,6 +13272,490 @@ rule accept
         assert_eq!(
             provider_cancellation_policy("claude-main"),
             ProviderCancellationPolicy::Unsupported
+        );
+    }
+
+    #[test]
+    fn agent_provider_selection_uses_bound_harness_metadata() {
+        let effect = ClaimableEffect {
+            effect_id: "eff-1".to_owned(),
+            kind: "agent.tell".to_owned(),
+            target: Some("implementer".to_owned()),
+            profile: Some("repo-writer".to_owned()),
+            input_json: "{}".to_owned(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: json!({
+                "harnesses": [
+                    {"name": "coder", "kind": "codex"},
+                    {"name": "reviewer", "kind": "claude"}
+                ],
+                "agents": [
+                    {"name": "implementer", "harness": "coder", "profile": "repo-writer"},
+                    {"name": "critic", "harness": "reviewer", "profile": "repo-reader"}
+                ]
+            })
+            .to_string(),
+        };
+
+        let selection =
+            agent_provider_selection_with_config_paths(&effect, "fixture", &[]).expect("selection");
+
+        assert_eq!(
+            selection,
+            AgentProviderSelection {
+                provider_id: "coder".to_owned(),
+                kind: "codex".to_owned(),
+                source_harness_id: Some("coder".to_owned()),
+                surface: None,
+                provider_config: None,
+                command_plan: None,
+            }
+        );
+    }
+
+    #[test]
+    fn agent_provider_selection_supports_map_shaped_harness_metadata() {
+        let effect = ClaimableEffect {
+            effect_id: "eff-1".to_owned(),
+            kind: "agent.tell".to_owned(),
+            target: Some("implementer".to_owned()),
+            profile: Some("repo-writer".to_owned()),
+            input_json: "{}".to_owned(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: json!({
+                "harnesses": {
+                    "coder": {"kind": "codex"}
+                },
+                "agents": {
+                    "implementer": {"harness": "coder", "profile": "repo-writer"}
+                }
+            })
+            .to_string(),
+        };
+
+        let selection =
+            agent_provider_selection_with_config_paths(&effect, "fixture", &[]).expect("selection");
+
+        assert_eq!(selection.provider_id, "coder");
+        assert_eq!(selection.kind, "codex");
+        assert_eq!(selection.source_harness_id.as_deref(), Some("coder"));
+    }
+
+    #[test]
+    fn agent_provider_selection_uses_provider_config_for_harness_surface() {
+        let config_path = std::env::temp_dir().join(format!(
+            "whipplescript-harness-provider-config-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &config_path,
+            json!({
+                "providers": [
+                    {
+                        "provider_id": "coder",
+                        "provider_kind": "codex",
+                        "surface": "codex_app_server",
+                        "credentials_ref": "env:OPENAI_API_KEY",
+                        "profile_ids": ["repo-writer"],
+                        "workspace_policy": "read_only",
+                        "cancellation_depth": "native_stop",
+                        "artifact_policy": "metadata"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("config writes");
+        let effect = ClaimableEffect {
+            effect_id: "eff-1".to_owned(),
+            kind: "agent.tell".to_owned(),
+            target: Some("implementer".to_owned()),
+            profile: Some("repo-writer".to_owned()),
+            input_json: "{}".to_owned(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: json!({
+                "harnesses": [
+                    {"name": "coder", "kind": "codex"}
+                ],
+                "agents": [
+                    {"name": "implementer", "harness": "coder", "profile": "repo-writer"}
+                ]
+            })
+            .to_string(),
+        };
+
+        let selection = agent_provider_selection_with_config_paths(
+            &effect,
+            "fixture",
+            std::slice::from_ref(&config_path),
+        )
+        .expect("selection");
+
+        assert_eq!(selection.provider_id, "coder");
+        assert_eq!(selection.kind, "codex");
+        assert_eq!(selection.source_harness_id.as_deref(), Some("coder"));
+        assert_eq!(selection.surface.as_deref(), Some("codex_app_server"));
+        assert!(selection.command_plan.is_none());
+        let config = selection
+            .provider_config
+            .as_ref()
+            .expect("provider config selected");
+        assert_eq!(config.provider_kind, ProviderKind::Codex);
+        assert_eq!(config.surface, AdapterSurface::CodexAppServer);
+        assert_eq!(config.workspace_policy, "read_only");
+        assert_eq!(
+            config.credentials_ref.as_deref(),
+            Some("env:OPENAI_API_KEY")
+        );
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn agent_provider_selection_uses_command_provider_config_plan() {
+        let config_path = std::env::temp_dir().join(format!(
+            "whipplescript-command-harness-provider-config-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &config_path,
+            json!({
+                "providers": [
+                    {
+                        "provider_id": "runner",
+                        "provider_kind": "command",
+                        "surface": "command",
+                        "workspace_policy": "read_only",
+                        "cancellation_depth": "none",
+                        "artifact_policy": "metadata",
+                        "executable": "sh",
+                        "args": ["-c", "cat >/dev/null; echo command completed"],
+                        "env": {"MODE": "test"},
+                        "required_env": ["PATH"],
+                        "required_commands": ["sh"],
+                        "timeout_ms": 2500,
+                        "require_stdout_json": true
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("config writes");
+        let effect = ClaimableEffect {
+            effect_id: "eff-1".to_owned(),
+            kind: "agent.tell".to_owned(),
+            target: Some("worker".to_owned()),
+            profile: Some("repo-reader".to_owned()),
+            input_json: "{}".to_owned(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: json!({
+                "harnesses": [
+                    {"name": "runner", "kind": "command"}
+                ],
+                "agents": [
+                    {"name": "worker", "harness": "runner", "profile": "repo-reader"}
+                ]
+            })
+            .to_string(),
+        };
+
+        let selection = agent_provider_selection_with_config_paths(
+            &effect,
+            "fixture",
+            std::slice::from_ref(&config_path),
+        )
+        .expect("selection");
+
+        let expected_plan = CommandLaunchPlan::new("runner", "sh")
+            .arg("-c")
+            .arg("cat >/dev/null; echo command completed")
+            .env("MODE", "test")
+            .require_env("PATH")
+            .require_command("sh")
+            .timeout(Duration::from_millis(2500))
+            .require_stdout_json();
+        assert_eq!(selection.provider_id, "runner");
+        assert_eq!(selection.kind, "command");
+        assert_eq!(selection.source_harness_id.as_deref(), Some("runner"));
+        assert_eq!(selection.surface.as_deref(), Some("command"));
+        assert_eq!(selection.command_plan.as_ref(), Some(&expected_plan));
+        let config = selection
+            .provider_config
+            .as_ref()
+            .expect("provider config selected");
+        assert_eq!(config.provider_kind, ProviderKind::Command);
+        assert_eq!(config.timeout_ms, Some(2500));
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn command_provider_config_requires_executable() {
+        let config_path = std::env::temp_dir().join(format!(
+            "whipplescript-command-harness-missing-executable-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &config_path,
+            json!({
+                "providers": [
+                    {
+                        "provider_id": "runner",
+                        "provider_kind": "command",
+                        "surface": "command",
+                        "workspace_policy": "read_only",
+                        "cancellation_depth": "none"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("config writes");
+        let effect = ClaimableEffect {
+            effect_id: "eff-1".to_owned(),
+            kind: "agent.tell".to_owned(),
+            target: Some("worker".to_owned()),
+            profile: Some("repo-reader".to_owned()),
+            input_json: "{}".to_owned(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: json!({
+                "harnesses": [
+                    {"name": "runner", "kind": "command"}
+                ],
+                "agents": [
+                    {"name": "worker", "harness": "runner", "profile": "repo-reader"}
+                ]
+            })
+            .to_string(),
+        };
+
+        let error = agent_provider_selection_with_config_paths(
+            &effect,
+            "fixture",
+            std::slice::from_ref(&config_path),
+        )
+        .expect_err("missing executable rejects command config");
+
+        match error {
+            StoreError::Conflict(message) => {
+                assert!(message.contains("missing required command field `executable`"));
+            }
+            error => panic!("expected command config conflict, got {error:?}"),
+        }
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn agent_provider_selection_falls_back_without_harness_binding() {
+        let effect = ClaimableEffect {
+            effect_id: "eff-1".to_owned(),
+            kind: "agent.tell".to_owned(),
+            target: Some("worker".to_owned()),
+            profile: Some("repo-writer".to_owned()),
+            input_json: "{}".to_owned(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: json!({
+                "agents": [
+                    {"name": "worker", "profile": "repo-writer"}
+                ]
+            })
+            .to_string(),
+        };
+
+        let selection = agent_provider_selection_with_config_paths(&effect, "claude-main", &[])
+            .expect("selection");
+
+        assert_eq!(
+            selection,
+            AgentProviderSelection {
+                provider_id: "claude-main".to_owned(),
+                kind: "claude".to_owned(),
+                source_harness_id: None,
+                surface: None,
+                provider_config: None,
+                command_plan: None,
+            }
+        );
+    }
+
+    #[test]
+    fn native_turn_request_applies_provider_config_fields() {
+        let config_json = json!({
+            "provider_id": "coder",
+            "provider_kind": "codex",
+            "surface": "codex_app_server",
+            "credentials_ref": "env:OPENAI_API_KEY",
+            "profile_ids": ["repo-writer"],
+            "default_model": "gpt-5.4",
+            "workspace_policy": "shared",
+            "timeout_ms": 60000,
+            "cancellation_depth": "hard_process_stop",
+            "artifact_policy": "required",
+            "health_checks": ["codex_cli"],
+            "cwd": "/tmp/whip-coder"
+        });
+        let config =
+            ProviderBindingConfig::from_value(&config_json).expect("provider config parses");
+        let effect = ClaimableEffect {
+            effect_id: "eff-1".to_owned(),
+            kind: "agent.tell".to_owned(),
+            target: Some("implementer".to_owned()),
+            profile: Some("repo-writer".to_owned()),
+            input_json: r#"{"prompt":"go"}"#.to_owned(),
+            required_capabilities_json: r#"["agent.tell"]"#.to_owned(),
+            declared_profiles_json: "{}".to_owned(),
+        };
+        let execution = AgentTurnExecution {
+            instance_id: "ins-1",
+            effect_id: "eff-1",
+            run_id: "run-1",
+            provider: "coder",
+            worker_id: "worker-1",
+            lease_id: "lease-1",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            agent: "implementer",
+            profile: Some("repo-writer"),
+            input_json: r#"{"prompt":"go"}"#,
+            skill_names: &[],
+        };
+
+        let request =
+            codex_native_turn_request(execution, &effect, r#"{"prompt":"go"}"#, Some(&config))
+                .expect("request builds");
+
+        assert_eq!(request.provider_id, "coder");
+        assert_eq!(request.workspace_policy, "shared");
+        assert_eq!(
+            request.cancellation_depth,
+            CancellationDepth::HardProcessStop
+        );
+        assert_eq!(request.artifact_policy, "required");
+        assert_eq!(
+            request.credential_ref.as_deref(),
+            Some("env:OPENAI_API_KEY")
+        );
+        assert_eq!(
+            request.provider_options.get("cwd").and_then(Value::as_str),
+            Some("/tmp/whip-coder")
+        );
+        assert_eq!(
+            request
+                .provider_options
+                .get("model")
+                .and_then(Value::as_str),
+            Some("gpt-5.4")
+        );
+        assert_eq!(
+            request
+                .provider_options
+                .get("timeout_ms")
+                .and_then(Value::as_u64),
+            Some(60000)
+        );
+        assert_eq!(
+            request
+                .provider_options
+                .get("profile_ids")
+                .and_then(Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(Value::as_str),
+            Some("repo-writer")
+        );
+
+        let claude_config_json = json!({
+            "provider_id": "reviewer",
+            "provider_kind": "claude",
+            "surface": "claude_agent_sdk",
+            "credentials_ref": "env:ANTHROPIC_API_KEY",
+            "default_model": "sonnet-4",
+            "workspace_policy": "per_effect_worktree",
+            "cancellation_depth": "cooperative_request",
+            "artifact_policy": "metadata",
+            "timeout_ms": 45000,
+            "cwd": "/tmp/whip-reviewer"
+        });
+        let claude_config =
+            ProviderBindingConfig::from_value(&claude_config_json).expect("claude config parses");
+        let claude_request = claude_native_turn_request(
+            AgentTurnExecution {
+                provider: "reviewer",
+                agent: "critic",
+                profile: None,
+                ..execution
+            },
+            &effect,
+            r#"{"prompt":"review"}"#,
+            Some(&claude_config),
+        )
+        .expect("claude request builds");
+
+        assert_eq!(claude_request.provider_id, "reviewer");
+        assert_eq!(claude_request.workspace_policy, "per_effect_worktree");
+        assert_eq!(
+            claude_request.cancellation_depth,
+            CancellationDepth::CooperativeRequest
+        );
+        assert_eq!(
+            claude_request.credential_ref.as_deref(),
+            Some("env:ANTHROPIC_API_KEY")
+        );
+        assert_eq!(
+            claude_request
+                .provider_options
+                .get("model")
+                .and_then(Value::as_str),
+            Some("sonnet-4")
+        );
+        assert_eq!(
+            claude_request
+                .provider_options
+                .get("cwd")
+                .and_then(Value::as_str),
+            Some("/tmp/whip-reviewer")
+        );
+
+        let pi_config_json = json!({
+            "provider_id": "pi-main",
+            "provider_kind": "pi",
+            "surface": "pi_rpc",
+            "credentials_ref": "env:PI_API_KEY",
+            "default_model": "pi-model",
+            "workspace_policy": "shared",
+            "cancellation_depth": "native_stop",
+            "artifact_policy": "required",
+            "model_provider": "openai-compatible"
+        });
+        let pi_config =
+            ProviderBindingConfig::from_value(&pi_config_json).expect("pi config parses");
+        let pi_request = pi_native_turn_request(
+            AgentTurnExecution {
+                provider: "pi-main",
+                agent: "planner",
+                profile: None,
+                ..execution
+            },
+            &effect,
+            r#"{"prompt":"plan"}"#,
+            Some(&pi_config),
+        )
+        .expect("pi request builds");
+
+        assert_eq!(pi_request.provider_id, "pi-main");
+        assert_eq!(pi_request.workspace_policy, "shared");
+        assert_eq!(pi_request.cancellation_depth, CancellationDepth::NativeStop);
+        assert_eq!(pi_request.artifact_policy, "required");
+        assert_eq!(pi_request.credential_ref.as_deref(), Some("env:PI_API_KEY"));
+        assert_eq!(
+            pi_request
+                .provider_options
+                .get("model")
+                .and_then(Value::as_str),
+            Some("pi-model")
+        );
+        assert_eq!(
+            pi_request
+                .provider_options
+                .get("provider")
+                .and_then(Value::as_str),
+            Some("openai-compatible")
         );
     }
 

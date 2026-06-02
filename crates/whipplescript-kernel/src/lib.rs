@@ -573,6 +573,15 @@ impl RuntimeKernel {
         execution: AgentTurnExecution<'_>,
         harness: &dyn AgentHarness,
     ) -> StoreResult<StoredEvent> {
+        self.run_agent_turn_with_metadata(execution, harness, "{}")
+    }
+
+    pub fn run_agent_turn_with_metadata(
+        &mut self,
+        execution: AgentTurnExecution<'_>,
+        harness: &dyn AgentHarness,
+        run_metadata_json: &str,
+    ) -> StoreResult<StoredEvent> {
         self.start_run(RunStart {
             instance_id: execution.instance_id,
             effect_id: execution.effect_id,
@@ -581,7 +590,7 @@ impl RuntimeKernel {
             worker_id: execution.worker_id,
             lease_id: execution.lease_id,
             lease_expires_at: execution.lease_expires_at,
-            metadata_json: "{}",
+            metadata_json: run_metadata_json,
         })?;
         self.store.record_skill_evidence(SkillEvidence {
             instance_id: execution.instance_id,
@@ -613,10 +622,13 @@ impl RuntimeKernel {
             .store
             .effect_has_open_cancellation_request(execution.instance_id, execution.effect_id)?
         {
-            let metadata_json = json!({
-                "cancellation": "requested_before_provider_launch",
-                "provider": execution.provider,
-            })
+            let metadata_json = merge_provider_run_metadata(
+                json!({
+                    "cancellation": "requested_before_provider_launch",
+                    "provider": execution.provider,
+                }),
+                run_metadata_json,
+            )
             .to_string();
             return self.cancel_run(EffectCompletion {
                 instance_id: execution.instance_id,
@@ -639,8 +651,12 @@ impl RuntimeKernel {
         let mut result = harness.run(request);
         enforce_required_artifact_capture_failure(&mut result);
         let evidence = self.record_provider_result(execution, &result)?;
-        let (metadata_json, terminal_hash, provider_correlation_id) =
-            provider_terminal_metadata(execution.instance_id, execution.run_id, &result);
+        let (metadata_json, terminal_hash, provider_correlation_id) = provider_terminal_metadata(
+            execution.instance_id,
+            execution.run_id,
+            &result,
+            run_metadata_json,
+        );
         let safe_summary = redacted_provider_summary(&result.summary);
         self.emit_provider_diagnostic(
             execution.run_id,
@@ -697,6 +713,29 @@ impl RuntimeKernel {
         adapter: &mut dyn NativeProviderAdapter,
         max_events: usize,
     ) -> StoreResult<StoredEvent> {
+        self.run_native_agent_turn_with_metadata(execution, request, adapter, max_events, "{}")
+    }
+
+    pub fn run_native_agent_turn_with_metadata(
+        &mut self,
+        execution: AgentTurnExecution<'_>,
+        request: NativeProviderTurnRequest,
+        adapter: &mut dyn NativeProviderAdapter,
+        max_events: usize,
+        run_metadata_json: &str,
+    ) -> StoreResult<StoredEvent> {
+        let run_metadata = merge_provider_run_metadata(
+            json!({
+                "native_provider": request.to_json_redacted(),
+                "adapter_provider_id": adapter.provider_id(),
+                "adapter_capability": {
+                    "provider_kind": adapter.capability().provider_kind.as_str(),
+                    "surface": adapter.capability().surface.as_str(),
+                },
+            }),
+            run_metadata_json,
+        )
+        .to_string();
         self.start_run(RunStart {
             instance_id: execution.instance_id,
             effect_id: execution.effect_id,
@@ -705,15 +744,7 @@ impl RuntimeKernel {
             worker_id: execution.worker_id,
             lease_id: execution.lease_id,
             lease_expires_at: execution.lease_expires_at,
-            metadata_json: &json!({
-                "native_provider": request.to_json_redacted(),
-                "adapter_provider_id": adapter.provider_id(),
-                "adapter_capability": {
-                    "provider_kind": adapter.capability().provider_kind.as_str(),
-                    "surface": adapter.capability().surface.as_str(),
-                },
-            })
-            .to_string(),
+            metadata_json: &run_metadata,
         })?;
         self.store.record_skill_evidence(SkillEvidence {
             instance_id: execution.instance_id,
@@ -736,13 +767,23 @@ impl RuntimeKernel {
                     &failed,
                     "native-provider-boundary-start",
                 )?;
-                return self.complete_native_agent_turn(execution, &failed, &evidence);
+                return self.complete_native_agent_turn(
+                    execution,
+                    &failed,
+                    &evidence,
+                    run_metadata_json,
+                );
             }
         };
         let mut latest_evidence =
             self.record_native_provider_event(execution, &started, "native-provider-started")?;
         if started.event_kind.is_terminal() {
-            return self.complete_native_agent_turn(execution, &started, &latest_evidence);
+            return self.complete_native_agent_turn(
+                execution,
+                &started,
+                &latest_evidence,
+                run_metadata_json,
+            );
         }
 
         for index in 0..max_events {
@@ -756,7 +797,12 @@ impl RuntimeKernel {
                         &failed,
                         &format!("native-provider-boundary-event-{index}"),
                     )?;
-                    return self.complete_native_agent_turn(execution, &failed, &latest_evidence);
+                    return self.complete_native_agent_turn(
+                        execution,
+                        &failed,
+                        &latest_evidence,
+                        run_metadata_json,
+                    );
                 }
             };
             latest_evidence = self.record_native_provider_event(
@@ -765,7 +811,12 @@ impl RuntimeKernel {
                 &format!("native-provider-event-{index}"),
             )?;
             if event.event_kind.is_terminal() {
-                return self.complete_native_agent_turn(execution, &event, &latest_evidence);
+                return self.complete_native_agent_turn(
+                    execution,
+                    &event,
+                    &latest_evidence,
+                    run_metadata_json,
+                );
             }
         }
 
@@ -782,7 +833,7 @@ impl RuntimeKernel {
         };
         latest_evidence =
             self.record_native_provider_event(execution, &timed_out, "native-provider-timeout")?;
-        self.complete_native_agent_turn(execution, &timed_out, &latest_evidence)
+        self.complete_native_agent_turn(execution, &timed_out, &latest_evidence, run_metadata_json)
     }
 
     pub fn record_native_agent_turn_observation(
@@ -884,7 +935,12 @@ impl RuntimeKernel {
                 artifact_ids,
             };
             return self
-                .complete_native_agent_turn(execution, &native_event, &provider_evidence)
+                .complete_native_agent_turn(
+                    execution,
+                    &native_event,
+                    &provider_evidence,
+                    &run.metadata_json,
+                )
                 .map(Some);
         }
 
@@ -1545,6 +1601,7 @@ impl RuntimeKernel {
         execution: AgentTurnExecution<'_>,
         event: &NativeProviderEvent,
         evidence: &ProviderEvidence,
+        run_metadata_json: &str,
     ) -> StoreResult<StoredEvent> {
         let status = native_terminal_status(event.event_kind);
         let summary = format!(
@@ -1555,10 +1612,13 @@ impl RuntimeKernel {
         let provider_correlation_id =
             provider_terminal_correlation_id(execution.instance_id, execution.run_id);
         let metadata_base = add_provider_correlation_id(
-            json!({
-                "native_provider": event.to_json_redacted(),
-                "artifact_ids": evidence.artifact_ids,
-            }),
+            merge_provider_run_metadata(
+                json!({
+                    "native_provider": event.to_json_redacted(),
+                    "artifact_ids": evidence.artifact_ids,
+                }),
+                run_metadata_json,
+            ),
             &provider_correlation_id,
         );
         let terminal_hash =
@@ -1919,12 +1979,23 @@ fn effect_status(status: &str) -> EffectStatus {
 }
 
 fn declared_profiles_json(program: &IrProgram) -> String {
+    let harnesses = program
+        .harnesses
+        .iter()
+        .map(|harness| {
+            json!({
+                "name": harness.name,
+                "kind": harness.kind,
+            })
+        })
+        .collect::<Vec<_>>();
     let agents = program
         .agents
         .iter()
         .map(|agent| {
             json!({
                 "name": agent.name,
+                "harness": agent.harness,
                 "profile": agent.profile,
                 "capacity": agent.capacity,
                 "skills": agent.skills,
@@ -1932,7 +2003,7 @@ fn declared_profiles_json(program: &IrProgram) -> String {
             })
         })
         .collect::<Vec<_>>();
-    json!({ "agents": agents }).to_string()
+    json!({ "harnesses": harnesses, "agents": agents }).to_string()
 }
 
 fn declared_skills_json(program: &IrProgram) -> String {
@@ -2021,6 +2092,17 @@ pub fn program_analysis_summary_json(program: &IrProgram) -> String {
         .iter()
         .map(|schema| schema_summary(schema, true))
         .collect::<Vec<_>>();
+    let harnesses = program
+        .harnesses
+        .iter()
+        .map(|harness| {
+            json!({
+                "name": harness.name,
+                "kind": harness.kind,
+                "source_span": source_span_summary(harness.span, "harness"),
+            })
+        })
+        .collect::<Vec<_>>();
 
     json!({
         "workflow": program.workflow,
@@ -2029,6 +2111,7 @@ pub fn program_analysis_summary_json(program: &IrProgram) -> String {
         "pattern_applications": pattern_applications,
         "generated_declarations": generated_declarations,
         "generated_declaration_hashes": generated_declaration_hashes,
+        "harnesses": harnesses,
         "schemas": schemas,
     })
     .to_string()
@@ -2128,10 +2211,22 @@ fn generated_declaration_payload(program: &IrProgram, declaration: &str) -> Opti
                 json!({
                     "kind": "agent",
                     "name": agent.name,
+                    "harness": agent.harness,
                     "profile": agent.profile,
                     "capacity": agent.capacity,
                     "skills": agent.skills,
                     "capabilities": agent.capabilities,
+                })
+            }),
+        "harness" => program
+            .harnesses
+            .iter()
+            .find(|harness| harness.name == name)
+            .map(|harness| {
+                json!({
+                    "kind": "harness",
+                    "name": harness.name,
+                    "provider_kind": harness.kind,
                 })
             }),
         "enum" => program.schemas.iter().find_map(|schema| match schema {
@@ -2777,11 +2872,15 @@ fn provider_terminal_metadata(
     instance_id: &str,
     run_id: &str,
     result: &ProviderRunResult,
+    run_metadata_json: &str,
 ) -> (String, String, String) {
     let provider_correlation_id = provider_terminal_correlation_id(instance_id, run_id);
     let metadata = add_provider_correlation_id(
-        serde_json::from_str::<Value>(&provider_metadata(result))
-            .expect("provider metadata is generated from JSON values"),
+        merge_provider_run_metadata(
+            serde_json::from_str::<Value>(&provider_metadata(result))
+                .expect("provider metadata is generated from JSON values"),
+            run_metadata_json,
+        ),
         &provider_correlation_id,
     );
     let terminal_hash = terminal_payload_hash(
@@ -2795,6 +2894,18 @@ fn provider_terminal_metadata(
         terminal_hash,
         provider_correlation_id,
     )
+}
+
+fn merge_provider_run_metadata(mut metadata: Value, run_metadata_json: &str) -> Value {
+    let run_metadata = json_from_str(run_metadata_json);
+    let (Value::Object(metadata), Value::Object(run_metadata)) = (&mut metadata, run_metadata)
+    else {
+        return metadata;
+    };
+    for (key, value) in run_metadata {
+        metadata.entry(key).or_insert(value);
+    }
+    Value::Object(metadata.clone())
 }
 
 fn provider_terminal_correlation_id(instance_id: &str, run_id: &str) -> String {
@@ -3774,7 +3885,7 @@ rule wait
         };
 
         let terminal = kernel
-            .run_native_agent_turn(
+            .run_native_agent_turn_with_metadata(
                 AgentTurnExecution {
                     instance_id: "instance-a",
                     effect_id: "tell",
@@ -3791,12 +3902,26 @@ rule wait
                 request,
                 &mut adapter,
                 8,
+                r#"{"provider_selection":{"provider_id":"native-fixture","provider_kind":"native-fixture","source_harness_id":"fixtureHarness","surface":"fixture"}}"#,
             )
             .expect("native turn completes");
         assert!(terminal.sequence > 1);
 
         let runs = kernel.store.list_runs("instance-a").expect("runs list");
         assert_eq!(runs[0].status, "completed");
+        let run_metadata = json_from_str(&runs[0].metadata_json);
+        assert_eq!(
+            run_metadata
+                .pointer("/provider_selection/source_harness_id")
+                .and_then(Value::as_str),
+            Some("fixtureHarness")
+        );
+        assert_eq!(
+            run_metadata
+                .pointer("/native_provider/provider_id")
+                .and_then(Value::as_str),
+            Some("native-fixture")
+        );
         let artifacts = kernel
             .store
             .list_artifacts_for_run("run-tell")
@@ -4164,8 +4289,17 @@ rule wait
             })
             .expect("rule commits");
 
+        let run_metadata_json = json!({
+            "provider_selection": {
+                "provider_id": "mock",
+                "provider_kind": "fixture",
+                "source_harness_id": "mock",
+                "surface": Value::Null,
+            }
+        })
+        .to_string();
         let terminal = kernel
-            .run_agent_turn(
+            .run_agent_turn_with_metadata(
                 AgentTurnExecution {
                     instance_id: &instance_id,
                     effect_id: "tell",
@@ -4180,6 +4314,7 @@ rule wait
                     skill_names: &["loft-user"],
                 },
                 &MockAgentHarness::completed("done"),
+                &run_metadata_json,
             )
             .expect("mock turn runs");
 
@@ -4272,6 +4407,20 @@ rule wait
             .pointer("/metadata/terminal_payload_hash")
             .and_then(Value::as_str)
             .is_some());
+        assert_eq!(
+            terminal_payload
+                .pointer("/metadata/provider_selection/source_harness_id")
+                .and_then(Value::as_str),
+            Some("mock")
+        );
+        let runs = store.list_runs(&instance_id).expect("runs list");
+        assert_eq!(
+            serde_json::from_str::<Value>(&runs[0].metadata_json)
+                .expect("run metadata json")
+                .pointer("/provider_selection/provider_kind")
+                .and_then(Value::as_str),
+            Some("fixture")
+        );
         assert!(events
             .iter()
             .any(|event| event.event_type == "agent.turn.completed"));

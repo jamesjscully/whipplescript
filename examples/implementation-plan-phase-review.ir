@@ -13,7 +13,7 @@ schemas
     turn ref<AgentTurn>
     status literal<"dispatched">
 agents
-  agent codex profile=repo-reader capacity=4 skills=[whipplescript-author] capabilities=[]
+  agent codex harness=<fallback> profile=repo-reader capacity=4 skills=[whipplescript-author] capabilities=[]
 assertions
   assert count(PhaseReviewRequest where status == "queued") == 0
     reads

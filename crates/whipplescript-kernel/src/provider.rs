@@ -748,6 +748,18 @@ pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
             health_checks: Vec::new(),
             auth_requirements: Vec::new(),
         },
+        ProviderCapability {
+            provider_kind: ProviderKind::Command,
+            surface: AdapterSurface::Command,
+            protocol_version: Some("command-agent-harness".to_owned()),
+            session_identity_fields: Vec::new(),
+            stream_event_kinds: strings(&["completed", "failed", "timed_out"]),
+            tool_policy: "adapter_defined".to_owned(),
+            cancellation_depths: vec![CancellationDepth::None],
+            artifact_manifest: true,
+            health_checks: strings(&["executable"]),
+            auth_requirements: Vec::new(),
+        },
     ]
 }
 
@@ -1022,6 +1034,11 @@ mod tests {
                 && capability
                     .session_identity_fields
                     .contains(&"session_id".to_owned())
+        }));
+        assert!(capabilities.iter().any(|capability| {
+            capability.provider_kind == ProviderKind::Command
+                && capability.surface == AdapterSurface::Command
+                && capability.cancellation_depths == vec![CancellationDepth::None]
         }));
     }
 
