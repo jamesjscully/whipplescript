@@ -25,9 +25,9 @@ if [[ "$status" -ne 2 ]]; then
   exit 1
 fi
 
-if rg -q "$SECRET" "$TMPDIR"; then
+if grep -R -q -- "$SECRET" "$TMPDIR"; then
   echo "real-provider report redaction fixture leaked raw secret" >&2
-  rg -n "$SECRET" "$TMPDIR" >&2 || true
+  grep -R -n -- "$SECRET" "$TMPDIR" >&2 || true
   exit 1
 fi
 
@@ -37,7 +37,7 @@ if [[ ! -f "$TMPDIR/reports/sk-REDACTED.json" ]]; then
   exit 1
 fi
 
-if ! rg -q "sk-REDACTED" "$TMPDIR/report.md" "$TMPDIR/preflight.jsonl" "$TMPDIR/reports/sk-REDACTED.json"; then
+if ! grep -q -- "sk-REDACTED" "$TMPDIR/report.md" "$TMPDIR/preflight.jsonl" "$TMPDIR/reports/sk-REDACTED.json"; then
   echo "expected redacted token marker in report artifacts" >&2
   exit 1
 fi

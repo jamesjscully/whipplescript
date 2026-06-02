@@ -67,6 +67,13 @@ function probeRpc() {
     const timeout = setTimeout(() => {
       finish({ ok: false, error: "timeout", timeoutMs });
     }, timeoutMs);
+    child.on("error", (error) => {
+      finish({
+        ok: false,
+        error: "spawn-failed",
+        code: error.code || null,
+      });
+    });
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });

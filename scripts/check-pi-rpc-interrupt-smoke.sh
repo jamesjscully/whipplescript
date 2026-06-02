@@ -20,7 +20,11 @@ const timeoutMs = Number(process.env.WHIPPLESCRIPT_PI_RPC_INTERRUPT_TIMEOUT_MS |
 const live = process.env.WHIPPLESCRIPT_PI_RPC_INTERRUPT_LIVE === "1";
 
 function stopChild(child) {
-  child.stdin.end();
+  try {
+    child.stdin.end();
+  } catch {
+    // The process may have failed before stdin was established.
+  }
   child.kill("SIGTERM");
   setTimeout(() => child.kill("SIGKILL"), 2000).unref();
 }
@@ -49,6 +53,14 @@ function probeAbort() {
     const timeout = setTimeout(() => {
       finish({ ok: false, error: "timeout", timeoutMs });
     }, timeoutMs);
+    child.on("error", (error) => {
+      finish({
+        ok: false,
+        error: "spawn-failed",
+        code: error.code || null,
+      });
+    });
+    child.stdin.on("error", () => {});
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });
@@ -128,6 +140,14 @@ function probeLiveAbort() {
     const timeout = setTimeout(() => {
       finish({ ok: false, error: "timeout", timeoutMs });
     }, timeoutMs);
+    child.on("error", (error) => {
+      finish({
+        ok: false,
+        error: "spawn-failed",
+        code: error.code || null,
+      });
+    });
+    child.stdin.on("error", () => {});
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });

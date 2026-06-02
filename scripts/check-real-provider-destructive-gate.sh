@@ -31,7 +31,7 @@ if [[ "$skip_status" -ne 0 ]]; then
   echo "expected non-destructive fixture gate run to pass, got $skip_status" >&2
   exit 1
 fi
-if ! rg -q '"phase":"destructive.fixture.skip".*"status":"skip"' "$TMPDIR/skip.jsonl"; then
+if ! grep -Eq '"phase":"destructive\.fixture\.skip".*"status":"skip"' "$TMPDIR/skip.jsonl"; then
   echo "expected destructive fixture skip record" >&2
   cat "$TMPDIR/skip.jsonl" >&2
   exit 1
@@ -42,7 +42,7 @@ if [[ "$missing_status" -ne 2 ]]; then
   echo "expected missing disposable marker run to fail with exit 2, got $missing_status" >&2
   exit 1
 fi
-if ! rg -q '"phase":"destructive.fixture.missing".*"check":"disposable-target".*"status":"fail"' "$TMPDIR/missing.jsonl"; then
+if ! grep -Eq '"phase":"destructive\.fixture\.missing".*"check":"disposable-target".*"status":"fail"' "$TMPDIR/missing.jsonl"; then
   echo "expected missing disposable target failure record" >&2
   cat "$TMPDIR/missing.jsonl" >&2
   exit 1
@@ -56,14 +56,14 @@ if [[ "$pass_status" -ne 0 ]]; then
   echo "expected acknowledged disposable marker run to pass, got $pass_status" >&2
   exit 1
 fi
-if ! rg -q '"phase":"destructive.fixture.ok".*"check":"disposable-target".*"status":"pass"' "$TMPDIR/pass.jsonl"; then
+if ! grep -Eq '"phase":"destructive\.fixture\.ok".*"check":"disposable-target".*"status":"pass"' "$TMPDIR/pass.jsonl"; then
   echo "expected disposable target pass record" >&2
   cat "$TMPDIR/pass.jsonl" >&2
   exit 1
 fi
-if rg -q "$SECRET_TARGET" "$TMPDIR"; then
+if grep -R -q -- "$SECRET_TARGET" "$TMPDIR"; then
   echo "destructive fixture gate leaked disposable target value" >&2
-  rg -n "$SECRET_TARGET" "$TMPDIR" >&2 || true
+  grep -R -n -- "$SECRET_TARGET" "$TMPDIR" >&2 || true
   exit 1
 fi
 
