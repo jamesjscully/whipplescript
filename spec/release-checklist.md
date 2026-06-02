@@ -27,7 +27,7 @@ Before declaring v0 complete:
 - [x] generated release workflow includes the packaged binary smoke job
 - [x] generated release workflow includes a manual non-publishing artifact
       build dry run
-- [ ] GitHub release artifacts built by CI for macOS, Windows, and Linux
+- [x] GitHub release artifacts built by CI for macOS, Windows, and Linux
 
 Known v0 deferrals must include owner, rationale, and follow-up location.
 
@@ -281,6 +281,16 @@ The `Release` workflow has a manual `workflow_dispatch` dry-run mode. Dispatch
 it with `build_artifacts=true` to build and upload all configured cargo-dist
 artifacts as GitHub Actions artifacts without creating a GitHub Release. Tag
 pushes remain the only publishing path.
+
+`Release` workflow run `26820271988` passed on 2026-06-02 at commit `f8c8170`
+with `build_artifacts=true`. It built and uploaded all configured local platform
+artifact bundles for Apple Silicon macOS, Intel macOS, ARM64 Linux, x64 Linux,
+and x64 Windows, built the global installer/checksum/source artifacts, and
+passed the packaged Linux x64 archive smoke job. A previous dry run,
+`26820226807`, failed during checkout because the generated release workflow
+attempted to recursively clone the private/local Loft source submodule; release
+and dist-smoke checkout steps no longer fetch submodules because the packaged
+`whip` distribution does not require Loft source fixtures.
 
 `scripts/check-release-readiness.sh` writes
 `target/release-readiness-report.md` by default. Set

@@ -65,7 +65,7 @@ default SQLite store, and checked `examples/minimal-noop.whip`.
   before publish.
 - [x] Add a manual release workflow dry run that builds and uploads release
   artifacts without publishing a GitHub Release.
-- [ ] Build all configured platform artifacts in CI.
+- [x] Build all configured platform artifacts in CI.
 - [ ] Publish archive assets with checksums.
 - [ ] Publish shell and PowerShell installers.
 - [x] Add packaged-binary smoke checks:
@@ -99,6 +99,22 @@ The `Release` workflow can now be manually dispatched with
 `build_artifacts=true` to run the non-publishing artifact build matrix and
 upload the temporary artifacts for review. Tag pushes remain the only path that
 creates a GitHub Release.
+
+Latest CI artifact dry run:
+
+```text
+Release workflow_dispatch, build_artifacts=true
+Run: 26820271988
+Commit: f8c8170
+```
+
+Result: passed on 2026-06-02. The run built and uploaded
+`artifacts-build-local-aarch64-apple-darwin`,
+`artifacts-build-local-x86_64-apple-darwin`,
+`artifacts-build-local-aarch64-unknown-linux-gnu`,
+`artifacts-build-local-x86_64-unknown-linux-gnu`,
+`artifacts-build-local-x86_64-pc-windows-msvc`, and
+`artifacts-build-global`. The packaged Linux x64 archive smoke job also passed.
 
 ## Phase 2: Friendly Package Managers
 
