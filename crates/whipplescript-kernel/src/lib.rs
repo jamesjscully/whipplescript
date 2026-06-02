@@ -1805,13 +1805,12 @@ impl RuntimeKernel {
             occurrence_key,
             "native-lifecycle-fact",
         ]);
-        let fact_record_key = format!("{}:{occurrence_key}", execution.run_id);
         self.store.derive_fact(DerivedFact {
             instance_id: execution.instance_id,
             fact: NewFact {
                 fact_id: &fact_id,
                 name: event_type,
-                key: &fact_record_key,
+                key: execution.run_id,
                 value_json: &payload,
                 schema_id: None,
                 provenance_class: "effect",
