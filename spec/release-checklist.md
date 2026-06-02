@@ -80,9 +80,10 @@ the following checks are ship-blocking:
 - [x] Destructive provider suites, if enabled, use disposable target markers
       and the exact acknowledgement
       `I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE`.
-- [ ] The `Native Provider Validation` GitHub Actions workflow has run with
+- [x] The `Native Provider Validation` GitHub Actions workflow has run with
       `strict=true`, uploaded `native-provider-*-reports`, and failed no matrix
       or strict gate job.
+      Run `26823071958` passed on 2026-06-02 at commit `597a65c`.
 
 Required native-provider release artifacts:
 
@@ -292,12 +293,13 @@ it with `build_artifacts=true` to build and upload all configured cargo-dist
 artifacts as GitHub Actions artifacts without creating a GitHub Release. Tag
 pushes remain the only publishing path.
 
-`Release` workflow run `26821656011` passed on 2026-06-02 at commit `23873be`
+`Release` workflow run `26823079397` passed on 2026-06-02 at commit `597a65c`
 with `build_artifacts=true`. It built and uploaded all configured local platform
 artifact bundles for Apple Silicon macOS, Intel macOS, ARM64 Linux, x64 Linux,
 and x64 Windows, built the global installer/checksum/source artifacts, and
-passed the packaged Linux x64 archive smoke job. A previous dry run,
-`26820226807`, failed during checkout because the generated release workflow
+passed the packaged Linux x64 archive smoke job. Earlier dry run `26821656011`
+passed at commit `23873be`, and previous dry run `26820226807` failed during
+checkout because the generated release workflow
 attempted to recursively clone the private/local Loft source submodule. Loft is
 now public, fresh recursive submodule clones can fetch
 `https://github.com/jamesjscully/loft`, and CI plus release checkout steps fetch

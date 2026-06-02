@@ -104,8 +104,8 @@ Latest CI artifact dry run:
 
 ```text
 Release workflow_dispatch, build_artifacts=true
-Run: 26821656011
-Commit: 23873be
+Run: 26823079397
+Commit: 597a65c
 ```
 
 Result: passed on 2026-06-02. The run built and uploaded
