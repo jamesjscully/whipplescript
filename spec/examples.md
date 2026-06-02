@@ -218,7 +218,7 @@ rule escalate_blocked_review
 }
 ```
 
-What transfers from the legacy expression design:
+What transfers from the earlier expression design:
 
 - BAML-compatible scalar/container/schema types are still valid at boundaries.
 - Field access, equality, ordering, boolean logic, membership, object/list

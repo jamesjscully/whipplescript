@@ -26,7 +26,7 @@ The target behavior is specified in [language.md](language.md),
 | --- | --- | --- |
 | Conceptual spec | [x] | `workflow`, `pattern`, `rule`, `include`, `use`, `apply`, `invoke`, `complete`, and `fail` are described. |
 | Maude model | [x] | Pattern elaboration, workflow terminal actions, child invocation resolution, and cancellation are modeled. |
-| `use` cleanup | [x] | Source now uses `use memory` for plugin imports; legacy `use plugin` and `use skill` are rejected. |
+| `use` cleanup | [x] | Source now uses `use memory` for plugin imports; removed `use plugin` and `use skill` forms are rejected. |
 | Parser/runtime implementation | [~] | `include` parsing, CLI source-bundle resolution, duplicate-include diagnostics, explicit multi-workflow root selection, workflow contract IR, class-shaped terminal payload validation, keyed workflow input validation/seeding, pattern expansion with type and simple value arguments, static workflow invocation target/input/direct-recursion validation, resumable dev-worker child workflow invocation with source-span records and success/failure/timeout/cancellation projection, status JSON parent/child invocation links, non-class terminal contract rejection, and basic `complete`/`fail` runtime terminal actions are implemented; scalar terminal payload syntax remains. |
 | Examples migration | [ ] | Existing examples still use the current implicit one-workflow file shape. |
 | E2E coverage | [~] | Parser/runtime e2e now covers `include`, explicit root selection, keyed workflow inputs, `pattern`/`apply` with simple value arguments, static workflow invocation target/input validation, `workflow.invoke` child success/failure/timeout/cancellation projection, resumable running invocation completion, status JSON invocation links, and `complete`/`fail`. |
@@ -161,7 +161,7 @@ The target behavior is specified in [language.md](language.md),
 - [ ] Update `whip diagnostics` to group errors by file, workflow, pattern
   application, and generated declaration.
 
-## Phase 8: Examples, Docs, And Migration
+## Phase 8: Examples And Docs
 
 - [ ] Rewrite core examples with explicit `workflow` declarations.
 - [ ] Add at least one library file included by multiple workflows.
@@ -170,7 +170,7 @@ The target behavior is specified in [language.md](language.md),
   declared failure, timeout, and cancellation.
 - [ ] Update quickstart, language sketch, examples spec, companion skill, and
   troubleshooting docs to use the canonical model.
-- [ ] Add migration notes for old single-file workflows.
+- [ ] Document the canonical explicit-workflow shape in examples and quickstart.
 - [ ] Remove or downgrade examples that imply lifecycle patterns are built into
   the language.
 

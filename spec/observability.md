@@ -134,7 +134,6 @@ fact recorded/projected
 effect queued
 dependency edge created
 effect blocked
-effect claimed
 run started
 run completed
 provider startup failed

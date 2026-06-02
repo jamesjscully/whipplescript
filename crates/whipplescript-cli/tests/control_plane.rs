@@ -5,8 +5,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::Value;
-use whipplescript_store::{EffectCompletion, NewFact, RuleCommit, RunStart, SqliteStore};
+use serde_json::{json, Value};
+use whipplescript_store::{
+    ArtifactRecord, EffectCompletion, NewFact, RuleCommit, RunStart, SqliteStore,
+};
 
 #[test]
 fn checks_all_example_workflows() {
@@ -88,6 +90,52 @@ rule noop
 
     let _ = fs::remove_file(root);
     let _ = fs::remove_file(lib);
+}
+
+#[test]
+fn doctor_providers_reports_deterministic_health_posture() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+
+    let doctor = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "doctor",
+            "--providers",
+        ],
+    );
+    let checks = doctor
+        .get("provider_health_checks")
+        .and_then(Value::as_array)
+        .expect("provider health checks");
+    for provider in ["codex", "claude", "pi"] {
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.get("provider").and_then(Value::as_str) == Some(provider)),
+            "missing health check for {provider}: {checks:?}"
+        );
+    }
+    assert!(!checks.iter().any(|check| {
+        check.get("provider").and_then(Value::as_str) == Some("fixture")
+            || check.get("provider").and_then(Value::as_str) == Some("command")
+    }));
+    assert!(checks.iter().all(|check| {
+        matches!(
+            check.get("status").and_then(Value::as_str),
+            Some("pass" | "fail" | "skip")
+        )
+    }));
+    let doctor_json = doctor.to_string();
+    assert!(!doctor_json.contains("sk-test-secret"), "{doctor_json}");
+    assert!(!doctor_json.contains("ANTHROPIC_API_KEY="), "{doctor_json}");
+    assert!(!doctor_json.contains("OPENAI_API_KEY="), "{doctor_json}");
+    assert!(!doctor_json.contains("PI_API_KEY="), "{doctor_json}");
+
+    let _ = fs::remove_file(store_path);
 }
 
 #[test]
@@ -386,6 +434,166 @@ fn starts_and_inspects_two_instances_independently() {
     );
 
     let _ = fs::remove_file(store_path);
+}
+
+#[test]
+fn artifacts_command_lists_metadata_without_raw_content() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let workflow_path = temp_workflow_path("artifact-metadata");
+    let secret = "sk-test-secret-token-1234567890";
+    fs::write(
+        &workflow_path,
+        r#"
+workflow ArtifactMetadata
+
+agent worker {
+  profile "repo-writer"
+  capacity 1
+}
+
+rule start_work
+  when started
+  when worker is available
+=> {
+  tell worker "collect artifact metadata"
+}
+"#,
+    )
+    .expect("write workflow");
+
+    let started = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "run",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "step",
+            instance_id,
+            "--program",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+        ],
+    );
+    let effects = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "effects",
+            instance_id,
+        ],
+    );
+    let effect_id = effects
+        .as_array()
+        .expect("effects array")
+        .iter()
+        .find(|effect| effect.get("kind").and_then(Value::as_str) == Some("agent.tell"))
+        .and_then(|effect| effect.get("effect_id"))
+        .and_then(Value::as_str)
+        .expect("agent effect id")
+        .to_owned();
+
+    let mut store = SqliteStore::open(&store_path).expect("open store");
+    store
+        .start_run(RunStart {
+            instance_id,
+            effect_id: &effect_id,
+            run_id: "run-artifact-metadata",
+            provider: "fixture",
+            worker_id: "worker-1",
+            lease_id: "lease-artifact-metadata",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        })
+        .expect("run starts");
+    store
+        .record_artifact(ArtifactRecord {
+            run_id: "run-artifact-metadata",
+            kind: "transcript",
+            path: &format!("provider://fixture/runs/run-artifact-metadata/{secret}/transcript"),
+            content_hash: Some(&format!("sha256:{secret}")),
+            mime_type: Some("text/plain"),
+        })
+        .expect("artifact records");
+    drop(store);
+
+    let artifacts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "artifacts",
+            "run-artifact-metadata",
+        ],
+    );
+    let artifacts_json = artifacts.to_string();
+    assert!(!artifacts_json.contains(secret), "{artifacts_json}");
+    assert!(!artifacts_json.contains("content\""), "{artifacts_json}");
+    let artifact = artifacts
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .expect("artifact row");
+    assert_eq!(
+        artifact.get("path").and_then(Value::as_str),
+        Some("[REDACTED]")
+    );
+    assert_eq!(
+        artifact.get("content_hash").and_then(Value::as_str),
+        Some("[REDACTED]")
+    );
+    let runs = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "runs",
+            instance_id,
+        ],
+    );
+    assert!(runs.as_array().expect("runs").iter().any(|run| {
+        run.get("run_id").and_then(Value::as_str) == Some("run-artifact-metadata")
+            && run.get("artifact_count").and_then(Value::as_u64) == Some(1)
+    }));
+    let trace = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "trace",
+            instance_id,
+        ],
+    );
+    assert!(trace
+        .get("runs")
+        .and_then(Value::as_array)
+        .expect("trace runs")
+        .iter()
+        .any(|run| {
+            run.get("run_id").and_then(Value::as_str) == Some("run-artifact-metadata")
+                && run.get("artifact_count").and_then(Value::as_u64) == Some(1)
+        }));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(workflow_path);
 }
 
 #[test]
@@ -1287,7 +1495,337 @@ rule noop_v2
 }
 
 #[test]
+fn operator_incident_bundle_has_stable_status_trace_and_diagnostics_shape() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("operator-incident-v1");
+    let v2 = temp_workflow_path("operator-incident-v2");
+    fs::write(
+        &v1,
+        r#"
+workflow OperatorIncident
+
+agent worker {
+  profile "repo-writer"
+  capacity 1
+}
+
+rule start_work
+  when started
+  when worker is available
+=> {
+  tell worker "running work"
+}
+"#,
+    )
+    .expect("write v1 workflow");
+    fs::write(
+        &v2,
+        r#"
+workflow OperatorIncident
+
+rule noop_v2
+  when started
+=> {
+}
+"#,
+    )
+    .expect("write v2 workflow");
+
+    let started = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "run",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "step",
+            instance_id,
+            "--program",
+            v1.to_str().expect("utf-8 workflow path"),
+        ],
+    );
+    let effects = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "effects",
+            instance_id,
+        ],
+    );
+    let effect_id = effects
+        .as_array()
+        .expect("effects array")
+        .iter()
+        .find(|effect| effect.get("kind").and_then(Value::as_str) == Some("agent.tell"))
+        .and_then(|effect| effect.get("effect_id"))
+        .and_then(Value::as_str)
+        .expect("agent effect id")
+        .to_owned();
+
+    let mut store = SqliteStore::open(&store_path).expect("open store");
+    store
+        .start_run(RunStart {
+            instance_id,
+            effect_id: &effect_id,
+            run_id: "run-operator-incident",
+            provider: "fixture",
+            worker_id: "worker-1",
+            lease_id: "lease-operator-incident",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        })
+        .expect("run starts");
+    store
+        .record_artifact(ArtifactRecord {
+            run_id: "run-operator-incident",
+            kind: "transcript",
+            path: "provider://fixture/runs/run-operator-incident/transcript",
+            content_hash: Some("sha256:operatorincident0000000000000000000000000000000000000000"),
+            mime_type: Some("text/plain"),
+        })
+        .expect("artifact records");
+    drop(store);
+
+    run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "revise",
+            instance_id,
+            v2.to_str().expect("utf-8 workflow path"),
+            "--cancel",
+            "running",
+            "--json",
+        ],
+    );
+    run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "worker",
+            instance_id,
+        ],
+    );
+
+    let status = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "status",
+            instance_id,
+        ],
+    );
+    let runs = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "runs",
+            instance_id,
+        ],
+    );
+    let diagnostics = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "diagnostics",
+            instance_id,
+        ],
+    );
+    let trace = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "trace",
+            instance_id,
+            "--check",
+        ],
+    );
+    let artifacts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "artifacts",
+            "run-operator-incident",
+        ],
+    );
+
+    let run = runs
+        .as_array()
+        .expect("runs array")
+        .iter()
+        .find(|run| run.get("run_id").and_then(Value::as_str) == Some("run-operator-incident"))
+        .expect("incident run");
+    let diagnostic = diagnostics
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.get("code").and_then(Value::as_str)
+                == Some("provider.cancellation.unsupported")
+        })
+        .expect("provider cancellation diagnostic");
+    let artifact = artifacts
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .expect("artifact metadata");
+
+    let incident_bundle = json!({
+        "status": {
+            "instance_status": status.pointer("/instance/status").and_then(Value::as_str),
+            "active_runs": status.get("active_run_count").and_then(Value::as_u64),
+            "cancel_requests": status.get("cancellation_request_count").and_then(Value::as_u64),
+            "recent_event_types": status
+                .get("recent_events")
+                .and_then(Value::as_array)
+                .expect("recent events")
+                .iter()
+                .map(|event| event.get("event_type").and_then(Value::as_str).unwrap_or(""))
+                .collect::<Vec<_>>(),
+        },
+        "run": {
+            "status": run.get("status").and_then(Value::as_str),
+            "provider": run.get("provider").and_then(Value::as_str),
+            "cancel_requested": run.get("cancel_requested").and_then(Value::as_bool),
+            "artifact_count": run.get("artifact_count").and_then(Value::as_u64),
+        },
+        "diagnostic": {
+            "severity": diagnostic.get("severity").and_then(Value::as_str),
+            "code": diagnostic.get("code").and_then(Value::as_str),
+            "run_id": diagnostic.get("run_id").and_then(Value::as_str),
+        },
+        "trace": {
+            "schema": trace.get("schema").and_then(Value::as_str),
+            "conformance_ok": trace.pointer("/conformance/ok").and_then(Value::as_bool),
+            "abstract_event_types": trace
+                .get("abstract_trace")
+                .and_then(Value::as_array)
+                .expect("abstract trace")
+                .iter()
+                .map(|record| {
+                    record
+                        .get("event")
+                        .and_then(|event| event.get("type"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                })
+                .collect::<Vec<_>>(),
+            "trace_run_artifact_count": trace
+                .get("runs")
+                .and_then(Value::as_array)
+                .and_then(|runs| {
+                    runs.iter().find(|run| {
+                        run.get("run_id").and_then(Value::as_str)
+                            == Some("run-operator-incident")
+                    })
+                })
+                .and_then(|run| run.get("artifact_count"))
+                .and_then(Value::as_u64),
+        },
+        "artifact": {
+            "kind": artifact.get("kind").and_then(Value::as_str),
+            "mime_type": artifact.get("mime_type").and_then(Value::as_str),
+            "path": artifact.get("path").and_then(Value::as_str),
+            "content_hash": artifact.get("content_hash").and_then(Value::as_str),
+        },
+    });
+    assert_eq!(
+        incident_bundle,
+        json!({
+            "status": {
+                "instance_status": "running",
+                "active_runs": 1,
+                "cancel_requests": 1,
+                "recent_event_types": [
+                    "external.started",
+                    "rule.committed",
+                    "effect.run_started",
+                    "workflow.revision_activated",
+                    "effect.cancellation_requested"
+                ],
+            },
+            "run": {
+                "status": "running",
+                "provider": "fixture",
+                "cancel_requested": true,
+                "artifact_count": 1,
+            },
+            "diagnostic": {
+                "severity": "warning",
+                "code": "provider.cancellation.unsupported",
+                "run_id": "run-operator-incident",
+            },
+            "trace": {
+                "schema": "whipplescript.local_trace.v0",
+                "conformance_ok": true,
+                "abstract_event_types": [
+                    "effect_created",
+                    "effect_claimed",
+                    "run_started",
+                    "revision_activated",
+                    "effect_cancellation_requested"
+                ],
+                "trace_run_artifact_count": 1,
+            },
+            "artifact": {
+                "kind": "transcript",
+                "mime_type": "text/plain",
+                "path": "provider://fixture/runs/run-operator-incident/transcript",
+                "content_hash": "sha256:operatorincident0000000000000000000000000000000000000000",
+            },
+        })
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(v1);
+    let _ = fs::remove_file(v2);
+}
+
+#[test]
 fn running_cancel_supported_provider_acknowledges_cancellation() {
+    running_cancel_supported_provider_acknowledges_cancellation_case(
+        "fixture-cancellable",
+        "before_terminal",
+    );
+    running_cancel_supported_provider_acknowledges_cancellation_case(
+        "pi-main",
+        "after_terminal_allowed",
+    );
+}
+
+fn running_cancel_supported_provider_acknowledges_cancellation_case(
+    provider: &str,
+    expected_acknowledgement_order: &str,
+) {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let v1 = temp_workflow_path("running-cancel-ack-v1");
@@ -1375,7 +1913,7 @@ rule noop_v2
             instance_id,
             effect_id: &effect_id,
             run_id: "run-cancellable-provider",
-            provider: "fixture-cancellable",
+            provider,
             worker_id: "worker-1",
             lease_id: "lease-cancellable-provider",
             lease_expires_at: "2030-01-01T00:00:00Z",
@@ -1406,7 +1944,7 @@ rule noop_v2
             "worker",
             instance_id,
             "--provider",
-            "fixture-cancellable",
+            provider,
         ],
     );
     assert_eq!(worker.get("ran_effects").and_then(Value::as_u64), Some(0));
@@ -1418,6 +1956,30 @@ rule noop_v2
     );
     assert_eq!(
         worker
+            .get("cancellation_diagnostics")
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+    let duplicate_worker = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "worker",
+            instance_id,
+            "--provider",
+            provider,
+        ],
+    );
+    assert_eq!(
+        duplicate_worker
+            .get("cancellation_acknowledgements")
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        duplicate_worker
             .get("cancellation_diagnostics")
             .and_then(Value::as_u64),
         Some(0)
@@ -1454,6 +2016,52 @@ rule noop_v2
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].status, "terminal");
     drop(store);
+
+    let events = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "log",
+            instance_id,
+        ],
+    );
+    let terminal = events
+        .as_array()
+        .expect("events array")
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("effect.terminal")
+                && event.pointer("/payload/run_id").and_then(Value::as_str)
+                    == Some("run-cancellable-provider")
+        })
+        .expect("terminal event exists");
+    assert_eq!(
+        events
+            .as_array()
+            .expect("events array")
+            .iter()
+            .filter(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some("effect.terminal")
+                    && event.pointer("/payload/run_id").and_then(Value::as_str)
+                        == Some("run-cancellable-provider")
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        terminal
+            .pointer("/payload/metadata/acknowledgement_order")
+            .and_then(Value::as_str),
+        Some(expected_acknowledgement_order)
+    );
+    assert_eq!(
+        terminal
+            .pointer("/payload/metadata/cancellation_depth")
+            .and_then(Value::as_str),
+        Some("native_stop")
+    );
 
     let trace = run_json(
         bin,
@@ -1612,6 +2220,33 @@ rule noop_v2
             .and_then(Value::as_bool),
         Some(false)
     );
+    let log = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "log",
+            instance_id,
+        ],
+    );
+    let events = log.as_array().expect("event log array");
+    assert!(events.iter().any(|event| {
+        event.get("event_type").and_then(Value::as_str) == Some("effect.terminal")
+            && event
+                .get("payload")
+                .and_then(|payload| payload.get("effect_id"))
+                .and_then(Value::as_str)
+                == Some(effect_id.as_str())
+            && event
+                .get("payload")
+                .and_then(|payload| payload.get("status"))
+                .and_then(Value::as_str)
+                == Some("cancelled")
+    }));
+    assert!(!events.iter().any(|event| {
+        event.get("event_type").and_then(Value::as_str) == Some("effect.cancelled")
+    }));
 
     let trace = run_json(
         bin,
@@ -2183,6 +2818,434 @@ fn dev_phase_review_creates_requests_and_runs_fixture_turns() {
 }
 
 #[test]
+fn dev_native_fixture_records_provider_lifecycle_and_artifacts_from_source_workflow() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("native-fixture-provider-e2e");
+    fs::write(
+        &source_path,
+        r#"
+workflow NativeFixtureProviderE2E
+
+agent worker {
+  profile "repo-writer"
+  capacity 1
+}
+
+rule start_native_work
+  when started
+  when worker is available
+=> {
+  tell worker "create native fixture evidence"
+}
+"#,
+    )
+    .expect("write native fixture workflow");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "native-fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let workers = dev
+        .get("workers")
+        .and_then(Value::as_array)
+        .expect("workers");
+    assert_eq!(
+        workers
+            .iter()
+            .map(|worker| worker
+                .get("ran_effects")
+                .and_then(Value::as_u64)
+                .unwrap_or(0))
+            .collect::<Vec<_>>(),
+        vec![1, 0]
+    );
+
+    let log = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "log",
+            instance_id,
+        ],
+    );
+    let events = log.as_array().expect("event array");
+    for event_type in ["agent.turn.started", "agent.turn.artifact_captured"] {
+        assert!(
+            events.iter().any(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some(event_type)
+                    && event
+                        .get("payload")
+                        .and_then(|payload| payload.get("provider"))
+                        .and_then(Value::as_str)
+                        == Some("native-fixture")
+            }),
+            "missing native lifecycle event {event_type}: {events:#?}"
+        );
+    }
+
+    let runs = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "runs",
+            instance_id,
+        ],
+    );
+    let run = runs
+        .as_array()
+        .expect("runs array")
+        .iter()
+        .find(|run| run.get("provider").and_then(Value::as_str) == Some("native-fixture"))
+        .expect("native fixture run");
+    assert_eq!(run.get("status").and_then(Value::as_str), Some("completed"));
+    assert_eq!(run.get("artifact_count").and_then(Value::as_u64), Some(1));
+    let run_id = run.get("run_id").and_then(Value::as_str).expect("run id");
+
+    let artifacts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "artifacts",
+            run_id,
+        ],
+    );
+    assert_eq!(
+        artifacts
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    let recover = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "recover",
+            instance_id,
+        ],
+    );
+    assert_eq!(
+        recover.get("recovered_count").and_then(Value::as_u64),
+        Some(0)
+    );
+    let replayed_log = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "log",
+            instance_id,
+        ],
+    );
+    let replayed_events = replayed_log.as_array().expect("replayed event array");
+    assert_eq!(
+        replayed_events
+            .iter()
+            .filter(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some("agent.turn.completed")
+                    && event
+                        .get("payload")
+                        .and_then(|payload| payload.get("provider"))
+                        .and_then(Value::as_str)
+                        == Some("native-fixture")
+            })
+            .count(),
+        1
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn dev_native_provider_launch_failure_records_durable_boundary_failure() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("native-provider-unavailable");
+    fs::write(
+        &source_path,
+        r#"
+workflow NativeProviderUnavailable
+
+agent worker {
+  profile "repo-reader"
+  capacity 1
+}
+
+rule start_native_work
+  when started
+  when worker is available
+=> {
+  tell worker "read-only native provider launch failure"
+}
+"#,
+    )
+    .expect("write unavailable native provider workflow");
+
+    let output = Command::new(bin)
+        .env(
+            "WHIPPLESCRIPT_PI_RPC_COMMAND",
+            "__whipplescript_missing_pi_rpc_command__",
+        )
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "pi",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("dev command runs");
+    assert!(
+        output.status.success(),
+        "dev failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dev = serde_json::from_slice::<Value>(&output.stdout).expect("dev json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let workers = dev
+        .get("workers")
+        .and_then(Value::as_array)
+        .expect("workers");
+    assert_eq!(
+        workers
+            .iter()
+            .map(|worker| worker
+                .get("ran_effects")
+                .and_then(Value::as_u64)
+                .unwrap_or(0))
+            .collect::<Vec<_>>(),
+        vec![1, 0]
+    );
+
+    let runs = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "runs",
+            instance_id,
+        ],
+    );
+    let run = runs
+        .as_array()
+        .expect("runs array")
+        .iter()
+        .find(|run| run.get("provider").and_then(Value::as_str) == Some("pi"))
+        .expect("pi run");
+    assert_eq!(run.get("status").and_then(Value::as_str), Some("failed"));
+
+    let log = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "log",
+            instance_id,
+        ],
+    );
+    let events = log.as_array().expect("event array");
+    assert!(events.iter().any(|event| {
+        event.get("event_type").and_then(Value::as_str) == Some("agent.turn.failed")
+            && event
+                .get("payload")
+                .and_then(|payload| payload.get("provider_event_type"))
+                .and_then(Value::as_str)
+                == Some("whip.native.boundary_error.provider_health_unavailable")
+    }));
+
+    let diagnostics = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "diagnostics",
+            instance_id,
+        ],
+    );
+    let diagnostics = diagnostics.as_array().expect("diagnostics array");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(Value::as_str) == Some("native_provider_failed")
+            && diagnostic.get("subject_type").and_then(Value::as_str) == Some("effect")
+    }));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn dev_native_fixture_stress_records_one_terminal_per_effect() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("native-fixture-stress");
+    fs::write(
+        &source_path,
+        r#"
+workflow NativeFixtureStress
+
+agent worker {
+  profile "repo-writer"
+  capacity 2
+}
+
+rule start_native_work
+  when started
+  when worker is available
+=> {
+  tell worker "native fixture stress one"
+  tell worker "native fixture stress two"
+  tell worker "native fixture stress three"
+  tell worker "native fixture stress four"
+}
+"#,
+    )
+    .expect("write native fixture stress workflow");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "native-fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let ran_effects = dev
+        .get("workers")
+        .and_then(Value::as_array)
+        .expect("workers")
+        .iter()
+        .map(|worker| {
+            worker
+                .get("ran_effects")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+    assert_eq!(ran_effects, 4);
+
+    let runs = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "runs",
+            instance_id,
+        ],
+    );
+    let native_runs = runs
+        .as_array()
+        .expect("runs array")
+        .iter()
+        .filter(|run| run.get("provider").and_then(Value::as_str) == Some("native-fixture"))
+        .collect::<Vec<_>>();
+    assert_eq!(native_runs.len(), 4);
+    for run in &native_runs {
+        assert_eq!(run.get("status").and_then(Value::as_str), Some("completed"));
+        assert_eq!(run.get("artifact_count").and_then(Value::as_u64), Some(1));
+    }
+
+    let log = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "log",
+            instance_id,
+        ],
+    );
+    let events = log.as_array().expect("event array");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.get("event_type").and_then(Value::as_str)
+                == Some("agent.turn.completed")
+                && event
+                    .get("payload")
+                    .and_then(|payload| payload.get("provider"))
+                    .and_then(Value::as_str)
+                    == Some("native-fixture"))
+            .count(),
+        4
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.get("event_type").and_then(Value::as_str)
+                == Some("agent.turn.artifact_captured")
+                && event
+                    .get("payload")
+                    .and_then(|payload| payload.get("provider"))
+                    .and_then(Value::as_str)
+                    == Some("native-fixture"))
+            .count(),
+        4
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.get("event_type").and_then(Value::as_str)
+                == Some("effect.terminal")
+                && event
+                    .get("payload")
+                    .and_then(|payload| payload.get("provider"))
+                    .and_then(Value::as_str)
+                    == Some("native-fixture"))
+            .count(),
+        4
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
 fn dev_fixture_failure_reaches_event_stream() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
@@ -2265,7 +3328,7 @@ fn dev_fixture_failure_reaches_event_stream() {
             && diagnostic
                 .get("message")
                 .and_then(Value::as_str)
-                .is_some_and(|message| message.contains("fixture failure"))
+                .is_some_and(|message| message.contains("fixture failed"))
     }));
 
     let _ = fs::remove_file(store_path);
@@ -4207,7 +5270,7 @@ workflow Child {
     );
     let facts = facts.as_array().expect("facts array");
     assert!(facts.iter().any(|fact| {
-        fact.get("name").and_then(Value::as_str) == Some("workflow.invoke.failed")
+        fact.get("name").and_then(Value::as_str) == Some("workflow.invoke.timed_out")
             && fact
                 .get("value")
                 .and_then(|value| value.get("status"))
@@ -4380,17 +5443,17 @@ fn dev_codex_then_coerce_rehydrates_after_bound_baml_arguments() {
         .and_then(|metadata| metadata.get("arguments"))
         .expect("baml arguments");
     assert_eq!(
-        arguments.get("arg0").and_then(Value::as_str),
-        Some("rain over a city at night")
+        arguments.get("redacted").and_then(Value::as_bool),
+        Some(true)
     );
     assert_eq!(
-        arguments.get("arg1").and_then(Value::as_str),
-        Some("target/dogfood/coerce-french-poem.txt")
+        arguments.pointer("/shape/type").and_then(Value::as_str),
+        Some("object")
     );
-    assert_eq!(
-        arguments.get("arg2").and_then(Value::as_str),
-        Some("fixture completed")
-    );
+    let arguments_json = arguments.to_string();
+    assert!(!arguments_json.contains("rain over a city at night"));
+    assert!(!arguments_json.contains("target/dogfood/coerce-french-poem.txt"));
+    assert!(!arguments_json.contains("fixture completed"));
 
     let facts = run_json(
         bin,
@@ -4538,6 +5601,99 @@ fn dev_provider_language_e2e_runs_agent_matrix_and_baml_reviews() {
     );
 
     let _ = fs::remove_file(store_path);
+}
+
+#[test]
+fn dev_native_provider_records_policy_denial_from_source_required_capabilities() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let source_path = temp_workflow_path("native-policy-denial-e2e");
+    fs::write(
+        &source_path,
+        r#"
+workflow NativePolicyDenialE2E
+
+agent worker {
+  profile "repo-writer"
+  capacity 1
+  capabilities ["agent.tell", "repo.write"]
+}
+
+rule start_denied_work
+  when started
+  when worker is available
+=> {
+  tell worker requires ["repo.write"] "write in read-only native workflow"
+}
+"#,
+    )
+    .expect("write native policy denial workflow");
+
+    for provider in ["codex", "claude", "pi"] {
+        let store_path = temp_store_path();
+        let dev = run_json(
+            bin,
+            &[
+                "--store",
+                store_path.to_str().expect("utf-8 temp path"),
+                "--json",
+                "dev",
+                source_path.to_str().expect("utf-8 source path"),
+                "--provider",
+                provider,
+                "--until",
+                "idle",
+            ],
+        );
+        let instance_id = dev
+            .get("instance_id")
+            .and_then(Value::as_str)
+            .expect("instance id");
+        let runs = run_json(
+            bin,
+            &[
+                "--store",
+                store_path.to_str().expect("utf-8 temp path"),
+                "--json",
+                "runs",
+                instance_id,
+            ],
+        );
+        let run = runs
+            .as_array()
+            .expect("runs array")
+            .iter()
+            .find(|run| run.get("provider").and_then(Value::as_str) == Some(provider))
+            .expect("provider run");
+        assert_eq!(run.get("status").and_then(Value::as_str), Some("failed"));
+        assert_eq!(
+            run.pointer("/native_lifecycle/status")
+                .and_then(Value::as_str),
+            Some("failed")
+        );
+
+        let log = run_json(
+            bin,
+            &[
+                "--store",
+                store_path.to_str().expect("utf-8 temp path"),
+                "--json",
+                "log",
+                instance_id,
+            ],
+        );
+        let events = log.as_array().expect("event array");
+        assert!(events.iter().any(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("agent.turn.failed")
+                && event
+                    .get("payload")
+                    .and_then(|payload| payload.get("provider_event_type"))
+                    .and_then(Value::as_str)
+                    == Some("whip.native.boundary_error.workspace_denied")
+        }));
+        let _ = fs::remove_file(store_path);
+    }
+
+    let _ = fs::remove_file(source_path);
 }
 
 #[test]
@@ -4964,7 +6120,7 @@ rule classify_request
 fn dev_branches_on_all_terminal_union_payloads_and_branch_local_effects() {
     let bin = env!("CARGO_BIN_EXE_whip");
     run_terminal_branch_workflow(bin, None, "completed", "Fixture classification");
-    run_terminal_branch_workflow(bin, Some("--fail"), "failed", "fixture coerce failure");
+    run_terminal_branch_workflow(bin, Some("--fail"), "failed", "coerce failed");
     run_terminal_branch_workflow(bin, Some("--timeout"), "timed_out", "coerce timed out");
     run_terminal_branch_workflow(
         bin,
@@ -5236,6 +6392,7 @@ rule accept
         schema_id: Some("Window"),
         provenance_class: "external",
         correlation_id: None,
+        source_span_json: None,
     };
     store
         .commit_rule(RuleCommit {
@@ -5833,15 +6990,16 @@ rule review
         .and_then(|metadata| metadata.get("arguments"))
         .expect("baml arguments");
     assert_eq!(
-        arguments
-            .pointer("/arg0/owner/name")
-            .and_then(Value::as_str),
-        Some("Ada")
+        arguments.get("redacted").and_then(Value::as_bool),
+        Some(true)
     );
     assert_eq!(
-        arguments.pointer("/arg1/phase").and_then(Value::as_str),
-        Some("kernel")
+        arguments.pointer("/shape/type").and_then(Value::as_str),
+        Some("object")
     );
+    let arguments_json = arguments.to_string();
+    assert!(!arguments_json.contains("Ada"));
+    assert!(!arguments_json.contains("kernel"));
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(source_path);
@@ -5977,6 +7135,7 @@ rule seed
     assert!(diagnostics.iter().any(|diagnostic| {
         diagnostic.get("code").and_then(Value::as_str) == Some("assertion.failed")
             && diagnostic.get("subject_type").and_then(Value::as_str) == Some("assertion")
+            && diagnostic.get("event_id").and_then(Value::as_str).is_some()
             && diagnostic
                 .get("assertion_id")
                 .and_then(Value::as_str)
@@ -5993,6 +7152,24 @@ rule seed
                 .get("message")
                 .and_then(Value::as_str)
                 .is_some_and(|message| message.contains("count(Seen) == 2"))
+    }));
+    let log = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "log",
+            instance_id,
+        ],
+    );
+    assert!(log.as_array().expect("events").iter().any(|event| {
+        event.get("event_type").and_then(Value::as_str) == Some("assertion.failed")
+            && event.pointer("/payload/result").and_then(Value::as_str) == Some("fail")
+            && event
+                .pointer("/payload/assertion_text")
+                .and_then(Value::as_str)
+                == Some("count(Seen) == 2")
     }));
 
     let _ = fs::remove_file(store_path);

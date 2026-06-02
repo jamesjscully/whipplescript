@@ -147,24 +147,19 @@ recovery-replayable events. The store must reject duplicate terminal provider
 events and duplicate assertion result events with the same key.
 
 Provider and assertion event payloads are part of the stable store contract.
-Provider failure events use:
+Provider terminals use one canonical event:
 
 ```text
-provider.startup_failed
-provider.auth_failed
-provider.tool_failed
-provider.transport_failed
-provider.timed_out
-effect.failed
-effect.timed_out
-effect.cancelled
+effect.terminal
 ```
 
-Provider failure payloads must include `effect_id`, optional `run_id`,
-`provider`, `stage`, `error_code`, `message`, `retryable`, `attempt`,
-`max_attempts`, optional `next_retry_at`, `idempotency_key`, `correlation_id`,
-`diagnostic_ids`, `evidence_ids`, optional `artifact_ids`, and optional
-`source_span`.
+Terminal provider failures must include or link a durable diagnostic record with
+`effect_id`, optional `run_id`, `code`, `message`, `idempotency_key`,
+`correlation_id`, `evidence_ids`, optional `artifact_ids`, and optional
+`source_span`. The `effect.terminal` payload also carries provider failure
+metadata such as `provider`, `phase`, `error_kind`, `recoverable`, and optional
+`retry_after`. Attempt counters are run/effect policy metadata, not required
+diagnostic fields in the current store schema.
 
 Assertion result events use:
 
@@ -183,16 +178,16 @@ Assertion payloads must include `assertion_id`, `assertion_text`, `result`,
 Revision events use:
 
 ```text
-revision.activated
-effect.cancel_requested
+workflow.revision_activated
+effect.cancellation_requested
 ```
 
-`revision.activated` payloads must include `revision_id`, `instance_id`,
-`from_version_id`, `to_version_id`, `revision_epoch`, `cancellation_policy`,
-`diagnostic_ids`, `evidence_ids`, `correlation_id`, and `idempotency_key`.
-`effect.cancel_requested` payloads must include `cancellation_request_id`,
-`effect_id`, `revision_id`, `revision_epoch`, `reason`, `diagnostic_ids`,
-`evidence_ids`, `correlation_id`, and `idempotency_key`.
+`workflow.revision_activated` payloads must include `revision_id`,
+`instance_id`, `from_version_id`, `to_version_id`, `from_epoch`, `to_epoch`,
+`activation_policy`, `cancellation_policy`, `terminal_cancel_effects`, and
+`request_cancel_effects`.
+`effect.cancellation_requested` payloads must include `request_id`, `effect_id`,
+optional `revision_id`, `reason`, and `requested_by`.
 
 ## Facts
 
@@ -256,13 +251,14 @@ Effect status:
 ```text
 queued
 blocked_by_dependency
-claimed
 running
 completed
 failed
 timed_out
 cancelled
-blocked_by_policy
+blocked_by_capability
+blocked_by_profile
+blocked_by_capacity
 ```
 
 The store may compute `claimable` from `queued` effects whose dependencies,
@@ -291,9 +287,8 @@ requested_by_event_id
 requester?
 reason?
 idempotency_key
-status                       # requested | acknowledged | ignored | terminal_seen
+status                       # requested | terminal
 created_at
-acknowledged_at?
 terminal_event_id?
 diagnostic_ids?
 evidence_ids?
@@ -301,7 +296,7 @@ evidence_ids?
 
 `idempotency_key` is unique for the effect/revision pair. Replaying recovery
 must not create duplicate cancellation requests or convert a request into a
-terminal `effect.cancelled` event without provider, harness, timeout, or
+cancelled `effect.terminal` event without provider, harness, timeout, or
 recovery evidence.
 
 ## Effect Dependencies
@@ -563,7 +558,7 @@ update instance active-version cache
 record compatibility diagnostics
 record evidence links
 terminal-cancel queued/blocked/claimable old-version effects when requested
-insert cancellation requests for claimed/running old-version effects when requested
+insert cancellation requests for running old-version effects when requested
 ```
 
 If any part of revision activation fails, no active-version change,
@@ -575,7 +570,7 @@ must not write events, rows, diagnostics, evidence, or effect state.
 
 On startup, the control plane recovers:
 
-- claimed effects whose leases expired
+- running effects whose leases expired
 - instances with unprocessed events
 - provider runs that exited without recorded completion
 - diagnostics for failed rule commits

@@ -101,7 +101,7 @@ writing arbitrary TypeScript control loops
 using shell scripts as hidden workflow engines
 encoding issue tracking inside WhippleScript facts when Loft is available
 silently injecting memory/context without provenance
-starting agent turns before claims/capabilities are accepted
+starting agent turns before Loft claims and capability checks are accepted
 depending on source order to sequence effects
 depending on prompt text as a completion condition
 using one powerful profile for unrelated research and write tasks

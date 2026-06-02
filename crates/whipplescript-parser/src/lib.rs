@@ -8581,7 +8581,7 @@ impl Parser<'_> {
                         if workflow.is_some() {
                             self.diagnostics.push(Diagnostic {
                                 span: parsed_workflow.decl.name.span,
-                                message: "multiple legacy workflow headers are not supported"
+                                message: "multiple implicit workflow headers are not supported"
                                     .to_owned(),
                                 suggestion: Some(
                                     "use explicit `workflow Name { ... }` declarations with `--root`"
@@ -8813,14 +8813,14 @@ impl Parser<'_> {
     fn parse_use(&mut self) -> Option<UseDecl> {
         self.expect_keyword("use")?;
         if self.at_ident("plugin") || self.at_ident("skill") {
-            let legacy_kind = self.advance().clone();
-            let legacy_label = match &legacy_kind.kind {
+            let removed_kind = self.advance().clone();
+            let removed_label = match &removed_kind.kind {
                 TokenKind::Ident(value) => value.as_str(),
                 _ => "",
             };
             self.diagnostics.push(Diagnostic {
-                span: legacy_kind.span,
-                message: format!("`use {legacy_label}` is no longer supported"),
+                span: removed_kind.span,
+                message: format!("`use {removed_label}` is no longer supported"),
                 suggestion: Some(
                     "write `use memory` for plugins; attach skills with `agent { skills [...] }`"
                         .to_owned(),
@@ -9692,7 +9692,7 @@ rule start_ready_issue
     }
 
     #[test]
-    fn use_short_form_imports_plugins_and_rejects_legacy_kinds() {
+    fn use_short_form_imports_plugins_and_rejects_removed_kinds() {
         let parsed = parse_program("workflow Imports\n\nuse memory\n");
         assert_eq!(parsed.diagnostics, Vec::new());
         let use_decl = parsed.program.items.iter().find_map(|item| match item {
@@ -9704,17 +9704,17 @@ rule start_ready_issue
             Some("memory")
         );
 
-        let legacy_plugin = parse_program("workflow Imports\n\nuse plugin \"memory\"\n");
-        assert_eq!(legacy_plugin.diagnostics.len(), 1);
+        let removed_plugin = parse_program("workflow Imports\n\nuse plugin \"memory\"\n");
+        assert_eq!(removed_plugin.diagnostics.len(), 1);
         assert_eq!(
-            legacy_plugin.diagnostics[0].message,
+            removed_plugin.diagnostics[0].message,
             "`use plugin` is no longer supported"
         );
 
-        let legacy_skill = parse_program("workflow Imports\n\nuse skill \"loft-user\"\n");
-        assert_eq!(legacy_skill.diagnostics.len(), 1);
+        let removed_skill = parse_program("workflow Imports\n\nuse skill \"loft-user\"\n");
+        assert_eq!(removed_skill.diagnostics.len(), 1);
         assert_eq!(
-            legacy_skill.diagnostics[0].message,
+            removed_skill.diagnostics[0].message,
             "`use skill` is no longer supported"
         );
     }
@@ -10237,7 +10237,7 @@ workflow BadTerminalPayload {
     #[test]
     fn rejects_workflow_terminal_actions_outside_explicit_workflow_body() {
         let source = r#"
-workflow LegacyTerminal
+workflow ImplicitTerminal
 
 output result Result
 

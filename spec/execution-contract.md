@@ -153,9 +153,10 @@ Conceptual statuses:
 ```text
 queued
 blocked_by_dependency
-blocked_by_policy
+blocked_by_capability
+blocked_by_profile
+blocked_by_capacity
 claimable
-claimed
 running
 completed
 failed
@@ -163,9 +164,9 @@ timed_out
 cancelled
 ```
 
-The store may implement `claimable` as a query over `queued` effects plus
-dependencies and policy decisions. The status view should still expose the
-distinction.
+The store implements `claimable` as a scheduler query over `queued` effects plus
+dependencies and policy decisions. It is not a persisted effect status in the
+current inspection API.
 
 If an upstream dependency fails and no downstream edge listens for `fails` or
 `completes`, the dependent effect becomes `blocked_by_dependency`. It is not a
@@ -253,32 +254,52 @@ a mini workflow language inside the outbox.
 
 ## Completion Events And Facts
 
-Every terminal effect outcome appends an event:
+Every terminal provider-side effect outcome appends the canonical terminal
+event:
 
 ```text
-effect.completed
-effect.failed
-effect.timed_out
-effect.cancelled
-effect.blocked_by_dependency
-effect.blocked_by_policy
+effect.terminal
 ```
+
+Its payload carries `status` (`completed`, `failed`, `timed_out`, or
+`cancelled`) plus the provider, harness, artifact, and diagnostic references
+needed to explain the outcome. Blocked dependency and policy states remain
+durable effect states/events; they are not provider terminal outcomes.
 
 The runtime derives standard lifecycle facts from these events.
 
 Core effects may also define typed completion facts:
 
 ```text
+agent.turn.started
+agent.turn.streamed
+agent.turn.tool_requested
+agent.turn.artifact_captured
 agent.turn.completed
 agent.turn.failed
 agent.turn.timed_out
 agent.turn.cancelled
 loft.claim.succeeded
 loft.claim.failed
+loft.claim.timed_out
 baml.coerce.succeeded
 baml.coerce.failed
+baml.coerce.timed_out
+baml.coerce.cancelled
+human.ask.created
 human.answer.received
+workflow.invoke.succeeded
+workflow.invoke.failed
+workflow.invoke.timed_out
+workflow.invoke.cancelled
+workflow.invoke.completed
 ```
+
+Native provider adapters may append intermediate `agent.turn.*` lifecycle
+events before the terminal `effect.terminal` event. These observations are
+canonicalized from provider events and use redacted payload shapes. They are
+correlated by `run_id` and `effect_id`, but terminal effect state still changes
+only through `effect.terminal`.
 
 Domain-specific facts should be produced by rules unless a core effect contract
 explicitly defines them.
@@ -344,7 +365,7 @@ than being mixed into the output value unless the workflow contract explicitly
 includes it.
 
 Provider and harness failures are event-stream data, not side-channel logs.
-After an effect is claimed, each failed provider boundary must either append a
+After an effect run starts, each failed provider boundary must either append a
 terminal event or leave enough lease state for recovery to retry that append.
 This includes workspace preparation, adapter resolution, process/session launch,
 stdin/request submission, streaming, timeout, cancellation, result validation,
@@ -403,21 +424,21 @@ Cancellation policies have different terminal semantics:
 
 ```text
 keep             no old-version effects are changed
-cancel queued    queued, blocked, and claimable old-version effects receive effect.cancelled terminal events
-request running  queued effects are cancelled; claimed/running effects receive cancellation requests
+cancel queued    queued, blocked, and claimable old-version effects receive cancelled effect.terminal events
+request running  queued effects are cancelled; running effects receive cancellation requests
 ```
 
 Queued, blocked, and claimable effects have not crossed a provider boundary, so
-the control plane may terminal-cancel them immediately. Claimed and running
-effects have crossed or may have crossed a provider boundary, so revision only
-creates a durable cancellation request. A requested cancellation is not a
-terminal outcome. The effect becomes terminal only when the provider/harness
-acknowledges cancellation, completes, fails, times out, or recovery determines a
-real terminal state.
+the control plane may terminal-cancel them immediately. Running effects have
+crossed a provider boundary, so revision only creates a durable cancellation
+request. A requested cancellation is not a terminal outcome. The effect becomes
+terminal only when the provider/harness acknowledges cancellation, completes,
+fails, times out, or recovery determines a real terminal state.
 
 A late provider completion after a cancellation request records the real
 terminal outcome at most once. Recovery must not turn a request into a fake
-`effect.cancelled` event merely because a revision requested cancellation.
+cancelled `effect.terminal` event merely because a revision requested
+cancellation.
 
 Child workflow invocations preserve their parent/child links across revision.
 Revising the parent does not revise or terminate the child. Revising the child

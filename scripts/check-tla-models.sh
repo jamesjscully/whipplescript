@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODEL="$ROOT/models/tla/ControlPlaneLifecycle.tla"
 LENGTH="${WHIPPLESCRIPT_TLA_LENGTH:-6}"
 
 if command -v apalache-mc >/dev/null 2>&1; then
@@ -16,11 +15,13 @@ else
   fi
 fi
 
-"${APALACHE[@]}" typecheck "$MODEL"
-"${APALACHE[@]}" check \
-  --cinit=ConstInit \
-  --init=Init \
-  --next=Next \
-  --inv=SafetyInvariants \
-  --length="$LENGTH" \
-  "$MODEL"
+for MODEL in "$ROOT/models/tla/ControlPlaneLifecycle.tla" "$ROOT/models/tla/NativeProviderLifecycle.tla"; do
+  "${APALACHE[@]}" typecheck "$MODEL"
+  "${APALACHE[@]}" check \
+    --cinit=ConstInit \
+    --init=Init \
+    --next=Next \
+    --inv=SafetyInvariants \
+    --length="$LENGTH" \
+    "$MODEL"
+done

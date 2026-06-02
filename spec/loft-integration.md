@@ -174,7 +174,7 @@ failure fields such as `claim.issue_id`, `claim.reason`, and `claim.conflicts`.
 
 ```text
 Loft lease = this actor is working on issue X
-WhippleScript effect lease = this worker claimed effect Y
+WhippleScript effect lease = this worker is running effect Y
 Thoth lease = this actor may write governed resource Z
 ```
 
@@ -223,7 +223,7 @@ WhippleScript should add the Loft repository as `vendor/loft` once the Loft
 v0.1 spec and conformance fixtures are tracked in that repository. Until then,
 `scripts/check-real-providers.sh` accepts `WHIPPLESCRIPT_LOFT_REPO=/path/to/loft`
 and verifies that `spec/loft-v0.1.md` is tracked and the repo is clean before
-claiming real-provider readiness.
+declaring real-provider readiness.
 
 When the Loft repo is ready, use:
 

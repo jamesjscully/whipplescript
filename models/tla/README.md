@@ -21,6 +21,7 @@ Current model:
 
 ```text
 ControlPlaneLifecycle.tla
+NativeProviderLifecycle.tla
 ```
 
 It encodes a first-pass runtime lifecycle:
@@ -55,6 +56,15 @@ retry removing current terminal status before a new attempt
 projection cursor bounds
 recovery preserving event-log order
 basic type correctness
+```
+
+`NativeProviderLifecycle.tla` is a focused native-provider fixture for:
+
+```text
+cancellation acknowledgement not fabricating terminal cancellation
+provider terminal evidence recovery
+required artifact-capture failure preventing successful completion
+duplicate terminal outcome prevention
 ```
 
 It also names weak-fairness and liveness goals:

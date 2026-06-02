@@ -1,4 +1,0 @@
-interface:
-  display_name: "WhippleScript Statecharts"
-  short_description: "Author and inspect restricted WhippleScript .whip workflows"
-  default_prompt: "Use $whipplescript-statechart to author, validate, run, inspect, or repair WhippleScript .whip statechart workflows, adapter manifests, durable events, and formal checks."

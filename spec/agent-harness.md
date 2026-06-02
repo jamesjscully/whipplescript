@@ -4,8 +4,8 @@ Status: draft
 
 The harness layer turns durable `agent.tell` effects into real agent turns.
 
-WhippleScript must not pretend an agent turn exists until this layer can claim an
-effect, run a provider, capture evidence, and append a completion event.
+WhippleScript must not pretend an agent turn exists until this layer can start a
+provider run, capture evidence, and append a completion event.
 
 ## Harness Player
 
@@ -14,7 +14,7 @@ It is intentionally boring:
 
 ```text
 poll/subscribe for claimable agent.tell effects
-claim one effect under policy
+start one effect run under policy
 resolve the requested profile to a provider adapter
 prepare workspace and context
 run one provider turn
@@ -100,11 +100,11 @@ enterprise broker
 coding agents are wired.
 
 The first implementation exposes this boundary as a kernel `AgentHarness` trait
-with a deterministic `MockAgentHarness`. The kernel-owned runner claims the
-effect, records injected skill provenance, runs the adapter, stores artifacts
-and provider evidence, appends the terminal effect completion, and then emits an
-`agent.turn.*` event plus fact. Adapters return data; they do not receive store
-handles or mutate kernel state directly.
+with a deterministic `MockAgentHarness`. The kernel-owned runner starts an
+effect run, records injected skill provenance, runs the adapter, stores
+artifacts and provider evidence, appends the terminal effect completion, and
+then emits an `agent.turn.*` event plus fact. Adapters return data; they do not
+receive store handles or mutate kernel state directly.
 
 The real provider adapters are not interchangeable command wrappers. Each one
 must map WhippleScript's durable turn contract onto the provider's native session
@@ -144,9 +144,14 @@ Python and TypeScript. It also has explicit API-key and cloud-provider
 authentication modes; third-party products must not depend on a user's
 interactive Claude subscription login unless Anthropic explicitly permits it.
 
+The first Claude adapter boundary is a TypeScript sidecar around
+`@anthropic-ai/claude-agent-sdk`; see `spec/claude-agent-sdk-strategy.md`.
+Python remains a fallback/probe surface because it has a useful stateful
+`ClaudeSDKClient`, but it adds a second runtime packaging path.
+
 The Claude adapter therefore needs:
 
-- TypeScript or Python Agent SDK host process.
+- TypeScript Agent SDK host process with a small JSONL protocol.
 - API-key/provider authentication configuration.
 - Tool permission mapping from WhippleScript profiles to Claude SDK allowed
   tools, hooks, and working directories.
@@ -155,26 +160,25 @@ The Claude adapter therefore needs:
 
 ### Pi Provider
 
-Pi should integrate through the Pi extension system. That is the primary surface
-for WhippleScript, not a fallback. Compared with Codex App Server and Claude Agent
-SDK, Pi's integration shape is expected to be more extension-native: WhippleScript
-will likely provide an extension that receives durable turn requests, submits or
-routes them through Pi, observes conversation-thread updates, and reports
-structured completion metadata back to the harness.
+Pi should integrate first through `pi --mode rpc`. The extension and SDK surfaces
+remain important for custom resources and tools, but the validated native
+adapter boundary is the RPC subprocess protocol, not ordinary print mode or a
+WhippleScript-specific extension.
 
 The Pi adapter therefore needs:
 
-- A Pi extension that can receive WhippleScript turn requests.
-- A way to correlate WhippleScript `effect_id` / `run_id` with Pi conversation
-  thread ids.
-- Thread observation or export plumbing for transcripts and evidence.
-- Completion detection and summary extraction from Pi conversations.
+- A Pi RPC subprocess client that sends prompt, state, and abort commands.
+- A way to correlate WhippleScript `effect_id` / `run_id` with Pi session ids.
+- Event observation for `agent_start`, `turn_start`, message events, `turn_end`,
+  and `agent_end`.
+- Completion and cancellation detection from terminal event metadata, including
+  assistant `stopReason: "aborted"` for RPC aborts.
 - Artifact capture for thread snapshots, extension events, user-visible
   messages, and final outcome metadata.
 
-Pi stores conversation threads, so those thread ids and snapshots should be
-first-class evidence. A thread-export bridge is useful for audit and recovery,
-but it should complement the extension integration rather than replace it.
+Pi stores conversation sessions, so those session ids and snapshots should be
+first-class evidence. A thread/session export bridge is useful for audit and
+recovery, but it should complement the RPC adapter rather than replace it.
 
 Provider adapters are replaceable. The rule language addresses logical agents
 and profiles; the registry chooses whether that means Codex, Claude Code, Pi,
@@ -187,7 +191,7 @@ commits into durable outbox effects. A complete local validation loop needs both
 
 ```text
 source + instance event -> ready rule evaluation -> rule commit -> effect outbox
-effect outbox -> harness claim -> provider run -> completion event
+effect outbox -> harness run start -> provider run -> completion event
 completion event -> derived facts -> next ready rules
 ```
 
@@ -199,7 +203,7 @@ ready rules and runs configured local providers until idle, stopped, or blocked.
 
 ```text
 effect queued
-effect claimed
+effect run started
 provider session prepared
 turn started
 turn streaming/running
@@ -224,11 +228,22 @@ structured_result?
 Completion must also derive standard facts that later rules can match:
 
 ```text
+agent.turn.started
+agent.turn.streamed
+agent.turn.tool_requested
+agent.turn.artifact_captured
 agent.turn.completed
 agent.turn.failed
 agent.turn.timed_out
 agent.turn.cancelled
 ```
+
+Native adapters normalize provider-specific event names into these canonical
+events and facts. The canonical payload includes `effect_id`, `run_id`, `agent`,
+`provider`, `status`, `terminal`, provider session/turn ids when available, the
+provider event type, and only a redacted provider payload shape. Raw provider
+transcript, tool arguments, diffs, and error text belong in bounded evidence or
+artifact refs, not the lifecycle event payload.
 
 Harness failures are part of the event stream. A worker must not lose failures
 by returning only process stderr or CLI diagnostics.
@@ -249,19 +264,18 @@ provider.result.invalid
 artifact.capture.failed
 ```
 
-If a durable effect has been claimed, any adapter, launch, stream, provider, or
-artifact-capture failure must append a terminal effect event whenever the store
-is reachable:
+Once a provider run has started, any adapter, launch, stream, provider, or
+artifact-capture failure must append a canonical terminal effect event whenever
+the store is reachable:
 
 ```text
-effect.failed
-effect.timed_out
-effect.cancelled
+effect.terminal
 ```
 
 The terminal event payload must include:
 
 ```text
+status                 # failed | timed_out | cancelled
 phase
 provider
 adapter
@@ -291,11 +305,12 @@ failure vocabulary to target.
 
 If the failure happens before a provider run can be started, the effect should
 be marked blocked rather than silently skipped. Missing provider config,
-credentials, native enforcement, or capacity are `blocked_by_policy` or
-`effect.blocked` states with a structured reason such as
+credentials, or native enforcement are `blocked_by_capability` or
+`blocked_by_profile`; unavailable declared capacity is `blocked_by_capacity`.
+They also append `effect.blocked` with a structured reason such as
 `provider_config_missing` until corrected. Workspace and adapter failures after
-claim are provider runtime failures and should produce `agent.turn.failed` with
-evidence.
+a provider run starts are provider runtime failures and should produce
+`agent.turn.failed` with evidence.
 
 For convenience patterns, the runtime may also derive profile-specific aliases
 such as `worker completed turn` or relationship facts such as `worker completed
@@ -339,10 +354,12 @@ claude:
   hooks and cwd policy
 
 pi:
-  extension id/path
-  extension host configuration
-  thread store/export path
-  completion observation policy
+  RPC subprocess configuration
+  provider/model defaults
+  --tools allowlist mapped from WhippleScript profile
+  extension/skill/resource refs
+  session store/export path
+  completion and abort observation policy
 ```
 
 The status view for a blocked effect must distinguish missing provider config,

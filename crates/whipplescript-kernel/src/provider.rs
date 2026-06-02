@@ -1,0 +1,1465 @@
+//! Native provider capability and binding validation.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde_json::{json, Value};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderKind {
+    Codex,
+    Claude,
+    Pi,
+    Fixture,
+    Command,
+    Baml,
+    Loft,
+}
+
+impl ProviderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Pi => "pi",
+            Self::Fixture => "fixture",
+            Self::Command => "command",
+            Self::Baml => "baml",
+            Self::Loft => "loft",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            "pi" => Some(Self::Pi),
+            "fixture" => Some(Self::Fixture),
+            "command" => Some(Self::Command),
+            "baml" => Some(Self::Baml),
+            "loft" => Some(Self::Loft),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdapterSurface {
+    CodexAppServer,
+    ClaudeAgentSdk,
+    PiSdk,
+    PiRpc,
+    Fixture,
+    Command,
+    BamlHttp,
+    LoftCli,
+}
+
+impl AdapterSurface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexAppServer => "codex_app_server",
+            Self::ClaudeAgentSdk => "claude_agent_sdk",
+            Self::PiSdk => "pi_sdk",
+            Self::PiRpc => "pi_rpc",
+            Self::Fixture => "fixture",
+            Self::Command => "command",
+            Self::BamlHttp => "baml_http",
+            Self::LoftCli => "loft_cli",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "codex_app_server" => Some(Self::CodexAppServer),
+            "claude_agent_sdk" => Some(Self::ClaudeAgentSdk),
+            "pi_sdk" => Some(Self::PiSdk),
+            "pi_rpc" => Some(Self::PiRpc),
+            "fixture" => Some(Self::Fixture),
+            "command" => Some(Self::Command),
+            "baml_http" => Some(Self::BamlHttp),
+            "loft_cli" => Some(Self::LoftCli),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CancellationDepth {
+    None,
+    CooperativeRequest,
+    NativeStop,
+    HardProcessStop,
+    RemoteSessionCancel,
+}
+
+impl CancellationDepth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::CooperativeRequest => "cooperative_request",
+            Self::NativeStop => "native_stop",
+            Self::HardProcessStop => "hard_process_stop",
+            Self::RemoteSessionCancel => "remote_session_cancel",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "cooperative_request" => Some(Self::CooperativeRequest),
+            "native_stop" => Some(Self::NativeStop),
+            "hard_process_stop" => Some(Self::HardProcessStop),
+            "remote_session_cancel" => Some(Self::RemoteSessionCancel),
+            _ => None,
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::CooperativeRequest => 1,
+            Self::NativeStop => 2,
+            Self::HardProcessStop => 3,
+            Self::RemoteSessionCancel => 4,
+        }
+    }
+
+    pub fn allows(self, requested: Self) -> bool {
+        requested.rank() <= self.rank()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderValidationStatus {
+    Pass,
+    Fail,
+    Skip,
+}
+
+impl ProviderValidationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Skip => "skip",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderCapability {
+    pub provider_kind: ProviderKind,
+    pub surface: AdapterSurface,
+    pub protocol_version: Option<String>,
+    pub session_identity_fields: Vec<String>,
+    pub stream_event_kinds: Vec<String>,
+    pub tool_policy: String,
+    pub cancellation_depths: Vec<CancellationDepth>,
+    pub artifact_manifest: bool,
+    pub health_checks: Vec<String>,
+    pub auth_requirements: Vec<String>,
+}
+
+impl ProviderCapability {
+    pub fn supports_cancellation_depth(&self, depth: CancellationDepth) -> bool {
+        self.cancellation_depths.contains(&depth)
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "provider_kind": self.provider_kind.as_str(),
+            "surface": self.surface.as_str(),
+            "protocol_version": self.protocol_version,
+            "session_identity_fields": self.session_identity_fields,
+            "stream_event_kinds": self.stream_event_kinds,
+            "tool_policy": self.tool_policy,
+            "cancellation_depths": self
+                .cancellation_depths
+                .iter()
+                .map(|depth| depth.as_str())
+                .collect::<Vec<_>>(),
+            "artifact_manifest": self.artifact_manifest,
+            "health_checks": self.health_checks,
+            "auth_requirements": self.auth_requirements,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderBindingConfig {
+    pub provider_id: String,
+    pub provider_kind: ProviderKind,
+    pub surface: AdapterSurface,
+    pub credentials_ref: Option<String>,
+    pub profile_ids: Vec<String>,
+    pub default_model: Option<String>,
+    pub workspace_policy: String,
+    pub timeout_ms: Option<u64>,
+    pub cancellation_depth: CancellationDepth,
+    pub artifact_policy: String,
+    pub health_checks: Vec<String>,
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl ProviderBindingConfig {
+    pub fn from_json_str(config_json: &str) -> Result<Self, Vec<ProviderValidationResult>> {
+        let value = match serde_json::from_str::<Value>(config_json) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(vec![ProviderValidationResult::fail(
+                    "",
+                    "",
+                    "provider.config.invalid",
+                    "invalid_json",
+                    format!("provider config is not valid JSON: {error}"),
+                )])
+            }
+        };
+        Self::from_value(&value)
+    }
+
+    pub fn from_value(value: &Value) -> Result<Self, Vec<ProviderValidationResult>> {
+        let object = match value.as_object() {
+            Some(object) => object,
+            None => {
+                return Err(vec![ProviderValidationResult::fail(
+                    "",
+                    "",
+                    "provider.config.invalid",
+                    "invalid_shape",
+                    "provider config must be a JSON object",
+                )])
+            }
+        };
+        let provider_id = required_string(object, "provider_id");
+        let provider_kind = enum_string(object, "provider_kind", ProviderKind::from_str);
+        let surface = enum_string(object, "surface", AdapterSurface::from_str);
+        let workspace_policy = optional_workspace_policy(object, "workspace_policy")
+            .unwrap_or_else(|| Ok("shared".to_owned()));
+        let artifact_policy =
+            optional_string(object, "artifact_policy").unwrap_or_else(|| "optional".to_owned());
+        let cancellation_depth =
+            optional_enum_string(object, "cancellation_depth", CancellationDepth::from_str)
+                .unwrap_or(Ok(CancellationDepth::None));
+        let timeout_ms = optional_u64(object, "timeout_ms");
+        let profile_ids = optional_string_array(object, "profile_ids");
+        let health_checks = optional_string_array(object, "health_checks");
+
+        let mut errors = Vec::new();
+        let provider_id = match provider_id {
+            Ok(provider_id) => provider_id,
+            Err(error) => {
+                errors.push(*error);
+                String::new()
+            }
+        };
+        let provider_kind = match provider_kind {
+            Ok(provider_kind) => provider_kind,
+            Err(error) => {
+                errors.push(*error);
+                ProviderKind::Command
+            }
+        };
+        let surface = match surface {
+            Ok(surface) => surface,
+            Err(error) => {
+                errors.push(*error);
+                AdapterSurface::Command
+            }
+        };
+        let timeout_ms = match timeout_ms {
+            Ok(timeout_ms) => timeout_ms,
+            Err(error) => {
+                errors.push(*error);
+                None
+            }
+        };
+        let workspace_policy = match workspace_policy {
+            Ok(workspace_policy) => workspace_policy,
+            Err(error) => {
+                errors.push(*error);
+                String::new()
+            }
+        };
+        let cancellation_depth = match cancellation_depth {
+            Ok(cancellation_depth) => cancellation_depth,
+            Err(error) => {
+                errors.push(*error);
+                CancellationDepth::None
+            }
+        };
+        let profile_ids = match profile_ids {
+            Ok(profile_ids) => profile_ids,
+            Err(error) => {
+                errors.push(*error);
+                Vec::new()
+            }
+        };
+        let health_checks = match health_checks {
+            Ok(health_checks) => health_checks,
+            Err(error) => {
+                errors.push(*error);
+                Vec::new()
+            }
+        };
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        let known = [
+            "provider_id",
+            "provider_kind",
+            "surface",
+            "credentials_ref",
+            "profile_ids",
+            "default_model",
+            "workspace_policy",
+            "timeout_ms",
+            "cancellation_depth",
+            "artifact_policy",
+            "health_checks",
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let extra = object
+            .iter()
+            .filter(|(key, _)| !known.contains(key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+
+        Ok(Self {
+            provider_id,
+            provider_kind,
+            surface,
+            credentials_ref: optional_string(object, "credentials_ref"),
+            profile_ids,
+            default_model: optional_string(object, "default_model"),
+            workspace_policy,
+            timeout_ms,
+            cancellation_depth,
+            artifact_policy,
+            health_checks,
+            extra,
+        })
+    }
+
+    pub fn to_json_redacted(&self) -> Value {
+        json!({
+            "provider_id": self.provider_id,
+            "provider_kind": self.provider_kind.as_str(),
+            "surface": self.surface.as_str(),
+            "credentials_ref": self.credentials_ref,
+            "profile_ids": self.profile_ids,
+            "default_model": self.default_model,
+            "workspace_policy": self.workspace_policy,
+            "timeout_ms": self.timeout_ms,
+            "cancellation_depth": self.cancellation_depth.as_str(),
+            "artifact_policy": self.artifact_policy,
+            "health_checks": self.health_checks,
+            "extra_keys": self.extra.keys().cloned().collect::<Vec<_>>(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderValidationResult {
+    pub provider: String,
+    pub surface: String,
+    pub status: ProviderValidationStatus,
+    pub phase: String,
+    pub code: String,
+    pub message: String,
+    pub recoverable: bool,
+    pub missing_config_refs: Vec<String>,
+}
+
+impl ProviderValidationResult {
+    pub fn pass(
+        provider: impl Into<String>,
+        surface: impl Into<String>,
+        phase: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            surface: surface.into(),
+            status: ProviderValidationStatus::Pass,
+            phase: phase.into(),
+            code: code.into(),
+            message: message.into(),
+            recoverable: false,
+            missing_config_refs: Vec::new(),
+        }
+    }
+
+    pub fn fail(
+        provider: impl Into<String>,
+        surface: impl Into<String>,
+        phase: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            surface: surface.into(),
+            status: ProviderValidationStatus::Fail,
+            phase: phase.into(),
+            code: code.into(),
+            message: message.into(),
+            recoverable: true,
+            missing_config_refs: Vec::new(),
+        }
+    }
+
+    pub fn missing_ref(mut self, reference: impl Into<String>) -> Self {
+        self.missing_config_refs.push(reference.into());
+        self
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "provider": self.provider,
+            "surface": self.surface,
+            "status": self.status.as_str(),
+            "phase": self.phase,
+            "code": self.code,
+            "message": self.message,
+            "recoverable": self.recoverable,
+            "missing_config_refs": self.missing_config_refs,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeProviderTurnRequest {
+    pub provider_id: String,
+    pub provider_kind: ProviderKind,
+    pub surface: AdapterSurface,
+    pub run_id: String,
+    pub effect_id: String,
+    pub agent: String,
+    pub profile: Option<String>,
+    pub prompt_json: Value,
+    pub workspace_policy: String,
+    pub required_capabilities: Vec<String>,
+    pub cancellation_depth: CancellationDepth,
+    pub artifact_policy: String,
+    pub credential_ref: Option<String>,
+    pub provider_options: BTreeMap<String, Value>,
+}
+
+impl NativeProviderTurnRequest {
+    pub fn to_json_redacted(&self) -> Value {
+        json!({
+            "provider_id": self.provider_id,
+            "provider_kind": self.provider_kind.as_str(),
+            "surface": self.surface.as_str(),
+            "run_id": self.run_id,
+            "effect_id": self.effect_id,
+            "agent": self.agent,
+            "profile": self.profile,
+            "prompt_shape": json_shape(&self.prompt_json),
+            "workspace_policy": self.workspace_policy,
+            "required_capabilities": self.required_capabilities,
+            "cancellation_depth": self.cancellation_depth.as_str(),
+            "artifact_policy": self.artifact_policy,
+            "credential_ref": self.credential_ref,
+            "provider_option_keys": self.provider_options.keys().cloned().collect::<Vec<_>>(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeProviderEventKind {
+    Started,
+    Streamed,
+    ToolRequested,
+    ArtifactCaptured,
+    Completed,
+    Failed,
+    TimedOut,
+    Cancelled,
+    Diagnostic,
+}
+
+impl NativeProviderEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Streamed => "streamed",
+            Self::ToolRequested => "tool_requested",
+            Self::ArtifactCaptured => "artifact_captured",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::Diagnostic => "diagnostic",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::TimedOut | Self::Cancelled
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeProviderArtifactRef {
+    pub artifact_id: Option<String>,
+    pub kind: String,
+    pub uri: String,
+    pub content_hash: Option<String>,
+    pub mime_type: Option<String>,
+    pub required: bool,
+}
+
+impl NativeProviderArtifactRef {
+    pub fn to_json_redacted(&self) -> Value {
+        json!({
+            "artifact_id": self.artifact_id,
+            "kind": self.kind,
+            "uri": redact_sensitive_metadata(&self.uri),
+            "content_hash": self
+                .content_hash
+                .as_deref()
+                .map(redact_sensitive_metadata),
+            "mime_type": self.mime_type,
+            "required": self.required,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeProviderEvent {
+    pub provider_id: String,
+    pub run_id: String,
+    pub event_kind: NativeProviderEventKind,
+    pub provider_event_type: String,
+    pub provider_session_id: Option<String>,
+    pub provider_turn_id: Option<String>,
+    pub sequence: Option<u64>,
+    pub evidence: Value,
+    pub artifacts: Vec<NativeProviderArtifactRef>,
+}
+
+impl NativeProviderEvent {
+    pub fn to_json_redacted(&self) -> Value {
+        json!({
+            "provider_id": self.provider_id,
+            "run_id": self.run_id,
+            "event_kind": self.event_kind.as_str(),
+            "terminal": self.event_kind.is_terminal(),
+            "provider_event_type": self.provider_event_type,
+            "provider_session_id": self.provider_session_id,
+            "provider_turn_id": self.provider_turn_id,
+            "sequence": self.sequence,
+            "evidence_shape": json_shape(&self.evidence),
+            "artifacts": self
+                .artifacts
+                .iter()
+                .map(NativeProviderArtifactRef::to_json_redacted)
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeProviderCancellation {
+    pub run_id: String,
+    pub provider_session_id: Option<String>,
+    pub provider_turn_id: Option<String>,
+    pub requested_depth: CancellationDepth,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeProviderBoundaryError {
+    pub provider_id: String,
+    pub surface: AdapterSurface,
+    pub code: String,
+    pub message: String,
+    pub recoverable: bool,
+    pub evidence: Value,
+}
+
+impl NativeProviderBoundaryError {
+    pub fn to_json_redacted(&self) -> Value {
+        json!({
+            "provider_id": self.provider_id,
+            "surface": self.surface.as_str(),
+            "code": self.code,
+            "message": redact_sensitive_metadata(&self.message),
+            "recoverable": self.recoverable,
+            "evidence_shape": json_shape(&self.evidence),
+        })
+    }
+}
+
+pub trait NativeProviderAdapter {
+    fn provider_id(&self) -> &str;
+    fn capability(&self) -> &ProviderCapability;
+    fn start_turn(
+        &mut self,
+        request: NativeProviderTurnRequest,
+    ) -> Result<NativeProviderEvent, NativeProviderBoundaryError>;
+    fn next_event(
+        &mut self,
+        run_id: &str,
+    ) -> Result<Option<NativeProviderEvent>, NativeProviderBoundaryError>;
+    fn cancel_turn(
+        &mut self,
+        cancellation: NativeProviderCancellation,
+    ) -> Result<NativeProviderEvent, NativeProviderBoundaryError>;
+}
+
+pub fn validate_native_cancellation_depth(
+    config: &ProviderBindingConfig,
+    capabilities: &[ProviderCapability],
+    requested_depth: CancellationDepth,
+) -> Result<(), NativeProviderBoundaryError> {
+    let Some(capability) = capabilities.iter().find(|capability| {
+        capability.provider_kind == config.provider_kind && capability.surface == config.surface
+    }) else {
+        return Err(native_boundary_error(
+            config,
+            "unsupported_surface",
+            "provider kind and adapter surface do not match a registered capability",
+            true,
+            json!({}),
+        ));
+    };
+    if !capability.supports_cancellation_depth(config.cancellation_depth) {
+        return Err(native_boundary_error(
+            config,
+            "unsupported_configured_cancellation_depth",
+            format!(
+                "configured cancellation depth `{}` is not supported by provider capability",
+                config.cancellation_depth.as_str()
+            ),
+            true,
+            json!({
+                "configured_depth": config.cancellation_depth.as_str(),
+                "capability_depths": capability
+                    .cancellation_depths
+                    .iter()
+                    .map(|depth| depth.as_str())
+                    .collect::<Vec<_>>(),
+            }),
+        ));
+    }
+    if !config.cancellation_depth.allows(requested_depth) {
+        return Err(native_boundary_error(
+            config,
+            "cancellation_depth_denied",
+            format!(
+                "requested cancellation depth `{}` exceeds configured depth `{}`",
+                requested_depth.as_str(),
+                config.cancellation_depth.as_str()
+            ),
+            false,
+            json!({
+                "requested_depth": requested_depth.as_str(),
+                "configured_depth": config.cancellation_depth.as_str(),
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn native_boundary_error(
+    config: &ProviderBindingConfig,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    recoverable: bool,
+    evidence: Value,
+) -> NativeProviderBoundaryError {
+    NativeProviderBoundaryError {
+        provider_id: config.provider_id.clone(),
+        surface: config.surface,
+        code: code.into(),
+        message: message.into(),
+        recoverable,
+        evidence,
+    }
+}
+
+pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
+    vec![
+        ProviderCapability {
+            provider_kind: ProviderKind::Codex,
+            surface: AdapterSurface::CodexAppServer,
+            protocol_version: Some("codex-app-server-local-schema".to_owned()),
+            session_identity_fields: strings(&["thread_id", "turn_id", "item_id"]),
+            stream_event_kinds: strings(&[
+                "turn/started",
+                "turn/completed",
+                "turn/diff/updated",
+                "approval/requested",
+            ]),
+            tool_policy: "codex_approvals".to_owned(),
+            cancellation_depths: vec![CancellationDepth::NativeStop],
+            artifact_manifest: true,
+            health_checks: strings(&["codex_cli", "app_server_schema", "auth_status"]),
+            auth_requirements: strings(&["codex_login_or_openai_api_key"]),
+        },
+        ProviderCapability {
+            provider_kind: ProviderKind::Claude,
+            surface: AdapterSurface::ClaudeAgentSdk,
+            protocol_version: Some("anthropic-agent-sdk".to_owned()),
+            session_identity_fields: strings(&["session_id"]),
+            stream_event_kinds: strings(&["message", "tool_event", "hook_event", "result"]),
+            tool_policy: "claude_tools_permissions_hooks".to_owned(),
+            cancellation_depths: vec![CancellationDepth::CooperativeRequest],
+            artifact_manifest: true,
+            health_checks: strings(&["claude_sdk", "api_key", "tool_policy"]),
+            auth_requirements: strings(&["anthropic_api_key_or_provider_config_ref"]),
+        },
+        ProviderCapability {
+            provider_kind: ProviderKind::Pi,
+            surface: AdapterSurface::PiRpc,
+            protocol_version: Some("pi-rpc-0.73.0".to_owned()),
+            session_identity_fields: strings(&["session_id", "parent_session_id"]),
+            stream_event_kinds: strings(&[
+                "agent_start",
+                "turn_start",
+                "message_start",
+                "message_end",
+                "turn_end",
+                "agent_end",
+            ]),
+            tool_policy: "pi_tools_extensions_resources".to_owned(),
+            cancellation_depths: vec![CancellationDepth::NativeStop],
+            artifact_manifest: true,
+            health_checks: strings(&["pi_cli", "rpc_mode", "provider_model", "extensions"]),
+            auth_requirements: strings(&["pi_provider_api_key_or_auth_storage"]),
+        },
+        ProviderCapability {
+            provider_kind: ProviderKind::Fixture,
+            surface: AdapterSurface::Fixture,
+            protocol_version: Some("fixture".to_owned()),
+            session_identity_fields: Vec::new(),
+            stream_event_kinds: strings(&["completed", "failed", "timed_out", "cancelled"]),
+            tool_policy: "none".to_owned(),
+            cancellation_depths: vec![CancellationDepth::CooperativeRequest],
+            artifact_manifest: false,
+            health_checks: Vec::new(),
+            auth_requirements: Vec::new(),
+        },
+    ]
+}
+
+pub fn validate_provider_binding(
+    config: &ProviderBindingConfig,
+    capabilities: &[ProviderCapability],
+) -> Vec<ProviderValidationResult> {
+    let mut results = Vec::new();
+    let provider = config.provider_id.clone();
+    let surface = config.surface.as_str().to_owned();
+    let capability = capabilities.iter().find(|capability| {
+        capability.provider_kind == config.provider_kind && capability.surface == config.surface
+    });
+
+    let Some(capability) = capability else {
+        return vec![ProviderValidationResult::fail(
+            provider,
+            surface,
+            "provider.surface.unsupported",
+            "unsupported_surface",
+            "provider kind and adapter surface do not match a registered capability",
+        )];
+    };
+
+    results.push(ProviderValidationResult::pass(
+        provider.clone(),
+        surface.clone(),
+        "provider.surface.valid",
+        "surface_supported",
+        "provider kind and adapter surface are supported",
+    ));
+
+    if capability.supports_cancellation_depth(config.cancellation_depth) {
+        results.push(ProviderValidationResult::pass(
+            provider.clone(),
+            surface.clone(),
+            "provider.cancellation.valid",
+            "cancellation_supported",
+            "configured cancellation depth is supported by provider capability",
+        ));
+    } else {
+        results.push(ProviderValidationResult::fail(
+            provider.clone(),
+            surface.clone(),
+            "provider.cancellation.unsupported",
+            "unsupported_cancellation_depth",
+            format!(
+                "configured cancellation depth `{}` is not supported by provider capability",
+                config.cancellation_depth.as_str()
+            ),
+        ));
+    }
+
+    if capability.auth_requirements.is_empty() || config.credentials_ref.is_some() {
+        results.push(ProviderValidationResult::pass(
+            provider,
+            surface,
+            "provider.config.valid",
+            "credentials_ref_available",
+            "provider credential reference is available or not required",
+        ));
+    } else {
+        results.push(
+            ProviderValidationResult::fail(
+                provider,
+                surface,
+                "provider.config.missing",
+                "missing_credentials_ref",
+                "provider credential reference is required for this native surface",
+            )
+            .missing_ref("credentials_ref"),
+        );
+    }
+
+    results
+}
+
+pub fn validate_provider_binding_json(config_json: &str) -> Vec<ProviderValidationResult> {
+    match ProviderBindingConfig::from_json_str(config_json) {
+        Ok(config) => validate_provider_binding(&config, &builtin_provider_capabilities()),
+        Err(results) => results,
+    }
+}
+
+fn json_shape(value: &Value) -> Value {
+    match value {
+        Value::Null => json!({"type": "null"}),
+        Value::Bool(_) => json!({"type": "bool"}),
+        Value::Number(_) => json!({"type": "number"}),
+        Value::String(value) => json!({"type": "string", "chars": value.chars().count()}),
+        Value::Array(values) => json!({"type": "array", "items": values.len()}),
+        Value::Object(object) => json!({
+            "type": "object",
+            "keys": object.keys().cloned().collect::<Vec<_>>(),
+        }),
+    }
+}
+
+pub(crate) fn redact_sensitive_metadata(value: &str) -> String {
+    if value.contains("sk-")
+        || value.contains("ANTHROPIC_API_KEY")
+        || value.contains("OPENAI_API_KEY")
+        || value.contains("PI_API_KEY")
+        || value.contains("token")
+        || value.contains("secret")
+    {
+        "[REDACTED]".to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn required_string(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<String, Box<ProviderValidationResult>> {
+    match object.get(key).and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => Ok(value.to_owned()),
+        _ => Err(Box::new(
+            ProviderValidationResult::fail(
+                "",
+                "",
+                "provider.config.invalid",
+                "missing_required_field",
+                format!("provider config missing required string `{key}`"),
+            )
+            .missing_ref(key),
+        )),
+    }
+}
+
+fn optional_string(object: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
+
+fn optional_workspace_policy(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<Result<String, Box<ProviderValidationResult>>> {
+    optional_string(object, key).map(|value| match value.as_str() {
+        "shared"
+        | "read_only"
+        | "per_effect_worktree"
+        | "per_issue_worktree"
+        | "remote_sandbox" => Ok(value),
+        _ => Err(Box::new(ProviderValidationResult::fail(
+            "",
+            "",
+            "provider.config.invalid",
+            "unsupported_workspace_policy",
+            format!("provider config `{key}` has unsupported value `{value}`"),
+        ))),
+    })
+}
+
+fn enum_string<T>(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> Result<T, Box<ProviderValidationResult>> {
+    let value = required_string(object, key)?;
+    parse(&value).ok_or_else(|| {
+        Box::new(ProviderValidationResult::fail(
+            "",
+            "",
+            "provider.config.invalid",
+            "unknown_enum_value",
+            format!("provider config `{key}` has unknown value `{value}`"),
+        ))
+    })
+}
+
+fn optional_enum_string<T>(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> Option<Result<T, Box<ProviderValidationResult>>> {
+    optional_string(object, key).map(|value| {
+        parse(&value).ok_or_else(|| {
+            Box::new(ProviderValidationResult::fail(
+                "",
+                "",
+                "provider.config.invalid",
+                "unknown_enum_value",
+                format!("provider config `{key}` has unknown value `{value}`"),
+            ))
+        })
+    })
+}
+
+fn optional_u64(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<u64>, Box<ProviderValidationResult>> {
+    match object.get(key) {
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            Box::new(ProviderValidationResult::fail(
+                "",
+                "",
+                "provider.config.invalid",
+                "invalid_integer",
+                format!("provider config `{key}` must be an unsigned integer"),
+            ))
+        }),
+        None => Ok(None),
+    }
+}
+
+fn optional_string_array(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Vec<String>, Box<ProviderValidationResult>> {
+    let Some(value) = object.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        return Err(Box::new(ProviderValidationResult::fail(
+            "",
+            "",
+            "provider.config.invalid",
+            "invalid_array",
+            format!("provider config `{key}` must be an array of strings"),
+        )));
+    };
+    let mut output = Vec::new();
+    for item in values {
+        let Some(item) = item.as_str() else {
+            return Err(Box::new(ProviderValidationResult::fail(
+                "",
+                "",
+                "provider.config.invalid",
+                "invalid_array_item",
+                format!("provider config `{key}` must contain only strings"),
+            )));
+        };
+        output.push(item.to_owned());
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_capabilities_capture_distinct_native_surfaces() {
+        let capabilities = builtin_provider_capabilities();
+
+        assert!(capabilities.iter().any(|capability| {
+            capability.provider_kind == ProviderKind::Codex
+                && capability.surface == AdapterSurface::CodexAppServer
+                && capability
+                    .stream_event_kinds
+                    .contains(&"turn/diff/updated".to_owned())
+        }));
+        assert!(capabilities.iter().any(|capability| {
+            capability.provider_kind == ProviderKind::Claude
+                && capability.surface == AdapterSurface::ClaudeAgentSdk
+                && capability.tool_policy == "claude_tools_permissions_hooks"
+        }));
+        assert!(capabilities.iter().any(|capability| {
+            capability.provider_kind == ProviderKind::Pi
+                && capability.surface == AdapterSurface::PiRpc
+                && capability
+                    .session_identity_fields
+                    .contains(&"session_id".to_owned())
+        }));
+    }
+
+    #[test]
+    fn parses_valid_codex_provider_binding_config() {
+        let config = ProviderBindingConfig::from_json_str(
+            r#"{
+              "provider_id": "codex-main",
+              "provider_kind": "codex",
+              "surface": "codex_app_server",
+              "credentials_ref": "secret:codex",
+              "profile_ids": ["repo-writer"],
+              "default_model": "gpt-5.5",
+              "workspace_policy": "per_effect_worktree",
+              "timeout_ms": 600000,
+              "cancellation_depth": "native_stop",
+              "artifact_policy": "required",
+              "health_checks": ["schema", "auth"],
+              "secret_value": "do-not-print"
+            }"#,
+        )
+        .expect("config parses");
+
+        assert_eq!(config.provider_id, "codex-main");
+        assert_eq!(config.provider_kind, ProviderKind::Codex);
+        assert_eq!(config.surface, AdapterSurface::CodexAppServer);
+        assert_eq!(config.cancellation_depth, CancellationDepth::NativeStop);
+        assert_eq!(
+            config.to_json_redacted()["extra_keys"],
+            json!(["secret_value"])
+        );
+        assert!(!config
+            .to_json_redacted()
+            .to_string()
+            .contains("do-not-print"));
+    }
+
+    #[test]
+    fn rejects_mixed_provider_kind_and_surface() {
+        let config = ProviderBindingConfig::from_json_str(
+            r#"{
+              "provider_id": "bad-claude",
+              "provider_kind": "claude",
+              "surface": "codex_app_server",
+              "credentials_ref": "secret:claude"
+            }"#,
+        )
+        .expect("config shape parses");
+
+        let results = validate_provider_binding(&config, &builtin_provider_capabilities());
+
+        assert!(results.iter().any(|result| {
+            result.status == ProviderValidationStatus::Fail && result.code == "unsupported_surface"
+        }));
+    }
+
+    #[test]
+    fn rejects_unknown_workspace_policy() {
+        let results = ProviderBindingConfig::from_json_str(
+            r#"{
+              "provider_id": "codex-main",
+              "provider_kind": "codex",
+              "surface": "codex_app_server",
+              "workspace_policy": "host_everything"
+            }"#,
+        )
+        .expect_err("workspace policy is invalid");
+
+        assert!(results.iter().any(|result| {
+            result.status == ProviderValidationStatus::Fail
+                && result.code == "unsupported_workspace_policy"
+        }));
+    }
+
+    #[test]
+    fn accepts_validated_pi_native_stop_cancellation_depth() {
+        let config = ProviderBindingConfig::from_json_str(
+            r#"{
+              "provider_id": "pi-main",
+              "provider_kind": "pi",
+              "surface": "pi_rpc",
+              "credentials_ref": "secret:pi",
+              "cancellation_depth": "native_stop"
+            }"#,
+        )
+        .expect("config shape parses");
+
+        let results = validate_provider_binding(&config, &builtin_provider_capabilities());
+
+        assert!(results.iter().any(|result| {
+            result.status == ProviderValidationStatus::Pass
+                && result.code == "cancellation_supported"
+        }));
+    }
+
+    #[test]
+    fn reports_missing_credentials_without_secret_values() {
+        let results = validate_provider_binding_json(
+            r#"{
+              "provider_id": "claude-main",
+              "provider_kind": "claude",
+              "surface": "claude_agent_sdk"
+            }"#,
+        );
+
+        let missing = results
+            .iter()
+            .find(|result| result.code == "missing_credentials_ref")
+            .expect("missing credentials reported");
+        assert_eq!(missing.missing_config_refs, vec!["credentials_ref"]);
+        assert!(!missing.to_json().to_string().contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn rejects_unknown_required_enum_values() {
+        let results = ProviderBindingConfig::from_json_str(
+            r#"{
+              "provider_id": "codex-main",
+              "provider_kind": "codex",
+              "surface": "plain_command"
+            }"#,
+        )
+        .expect_err("unknown surface fails");
+
+        assert!(results.iter().any(|result| {
+            result.status == ProviderValidationStatus::Fail && result.code == "unknown_enum_value"
+        }));
+    }
+
+    #[test]
+    fn native_turn_request_redacts_prompt_and_provider_options() {
+        let mut provider_options = BTreeMap::new();
+        provider_options.insert("api_token".to_owned(), json!("sk-never-print"));
+        let request = NativeProviderTurnRequest {
+            provider_id: "codex-main".to_owned(),
+            provider_kind: ProviderKind::Codex,
+            surface: AdapterSurface::CodexAppServer,
+            run_id: "run-1".to_owned(),
+            effect_id: "tell".to_owned(),
+            agent: "worker".to_owned(),
+            profile: Some("repo-writer".to_owned()),
+            prompt_json: json!({"prompt": "contains sk-never-print"}),
+            workspace_policy: "per_effect_worktree".to_owned(),
+            required_capabilities: vec!["repo.write".to_owned()],
+            cancellation_depth: CancellationDepth::NativeStop,
+            artifact_policy: "required".to_owned(),
+            credential_ref: Some("secret:codex".to_owned()),
+            provider_options,
+        };
+
+        let redacted = request.to_json_redacted();
+
+        assert_eq!(
+            redacted
+                .pointer("/prompt_shape/type")
+                .and_then(Value::as_str),
+            Some("object")
+        );
+        assert_eq!(
+            redacted
+                .pointer("/provider_option_keys/0")
+                .and_then(Value::as_str),
+            Some("api_token")
+        );
+        assert!(!redacted.to_string().contains("sk-never-print"));
+    }
+
+    #[test]
+    fn native_provider_event_preserves_shape_without_raw_payload() {
+        let event = NativeProviderEvent {
+            provider_id: "pi-main".to_owned(),
+            run_id: "run-1".to_owned(),
+            event_kind: NativeProviderEventKind::Cancelled,
+            provider_event_type: "turn_end".to_owned(),
+            provider_session_id: Some("session-1".to_owned()),
+            provider_turn_id: None,
+            sequence: Some(7),
+            evidence: json!({
+                "message": {
+                    "content": "raw provider text with sk-never-print"
+                }
+            }),
+            artifacts: vec![NativeProviderArtifactRef {
+                artifact_id: Some("artifact-1".to_owned()),
+                kind: "transcript".to_owned(),
+                uri: "provider://pi/runs/run-1/secret/transcript".to_owned(),
+                content_hash: Some("sha256:secret-token".to_owned()),
+                mime_type: Some("text/plain".to_owned()),
+                required: true,
+            }],
+        };
+
+        let redacted = event.to_json_redacted();
+
+        assert_eq!(
+            redacted.get("terminal").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            redacted
+                .pointer("/evidence_shape/type")
+                .and_then(Value::as_str),
+            Some("object")
+        );
+        assert_eq!(
+            redacted.pointer("/artifacts/0/uri").and_then(Value::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            redacted
+                .pointer("/artifacts/0/content_hash")
+                .and_then(Value::as_str),
+            Some("[REDACTED]")
+        );
+        assert!(!redacted.to_string().contains("sk-never-print"));
+    }
+
+    #[test]
+    fn native_provider_boundary_error_redacts_message_and_evidence() {
+        let error = NativeProviderBoundaryError {
+            provider_id: "claude-main".to_owned(),
+            surface: AdapterSurface::ClaudeAgentSdk,
+            code: "auth_failed".to_owned(),
+            message: "ANTHROPIC_API_KEY sk-never-print failed".to_owned(),
+            recoverable: true,
+            evidence: json!({"headers": {"Authorization": "sk-never-print"}}),
+        };
+
+        let redacted = error.to_json_redacted();
+
+        assert_eq!(
+            redacted.get("message").and_then(Value::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            redacted
+                .pointer("/evidence_shape/type")
+                .and_then(Value::as_str),
+            Some("object")
+        );
+        assert!(!redacted.to_string().contains("sk-never-print"));
+    }
+
+    #[test]
+    fn native_adapter_trait_supports_distinct_start_stream_and_cancel_events() {
+        struct FakeNativeAdapter {
+            capability: ProviderCapability,
+            started: bool,
+        }
+
+        impl NativeProviderAdapter for FakeNativeAdapter {
+            fn provider_id(&self) -> &str {
+                "fake-pi"
+            }
+
+            fn capability(&self) -> &ProviderCapability {
+                &self.capability
+            }
+
+            fn start_turn(
+                &mut self,
+                request: NativeProviderTurnRequest,
+            ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+                self.started = true;
+                Ok(NativeProviderEvent {
+                    provider_id: request.provider_id,
+                    run_id: request.run_id,
+                    event_kind: NativeProviderEventKind::Started,
+                    provider_event_type: "turn_start".to_owned(),
+                    provider_session_id: Some("session-1".to_owned()),
+                    provider_turn_id: None,
+                    sequence: Some(1),
+                    evidence: json!({"pi_shape": "turn_start"}),
+                    artifacts: Vec::new(),
+                })
+            }
+
+            fn next_event(
+                &mut self,
+                run_id: &str,
+            ) -> Result<Option<NativeProviderEvent>, NativeProviderBoundaryError> {
+                assert!(self.started);
+                Ok(Some(NativeProviderEvent {
+                    provider_id: "fake-pi".to_owned(),
+                    run_id: run_id.to_owned(),
+                    event_kind: NativeProviderEventKind::Streamed,
+                    provider_event_type: "message_end".to_owned(),
+                    provider_session_id: Some("session-1".to_owned()),
+                    provider_turn_id: None,
+                    sequence: Some(2),
+                    evidence: json!({"pi_shape": "message_end"}),
+                    artifacts: Vec::new(),
+                }))
+            }
+
+            fn cancel_turn(
+                &mut self,
+                cancellation: NativeProviderCancellation,
+            ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+                Ok(NativeProviderEvent {
+                    provider_id: "fake-pi".to_owned(),
+                    run_id: cancellation.run_id,
+                    event_kind: NativeProviderEventKind::Cancelled,
+                    provider_event_type: "turn_end".to_owned(),
+                    provider_session_id: cancellation.provider_session_id,
+                    provider_turn_id: cancellation.provider_turn_id,
+                    sequence: Some(3),
+                    evidence: json!({"stopReason": "aborted"}),
+                    artifacts: Vec::new(),
+                })
+            }
+        }
+
+        let capability = builtin_provider_capabilities()
+            .into_iter()
+            .find(|capability| capability.provider_kind == ProviderKind::Pi)
+            .expect("pi capability exists");
+        let mut adapter = FakeNativeAdapter {
+            capability,
+            started: false,
+        };
+        let request = NativeProviderTurnRequest {
+            provider_id: "fake-pi".to_owned(),
+            provider_kind: ProviderKind::Pi,
+            surface: AdapterSurface::PiRpc,
+            run_id: "run-1".to_owned(),
+            effect_id: "tell".to_owned(),
+            agent: "worker".to_owned(),
+            profile: Some("repo-reader".to_owned()),
+            prompt_json: json!({"prompt": "go"}),
+            workspace_policy: "read_only".to_owned(),
+            required_capabilities: vec!["repo.read".to_owned()],
+            cancellation_depth: CancellationDepth::NativeStop,
+            artifact_policy: "optional".to_owned(),
+            credential_ref: Some("secret:pi".to_owned()),
+            provider_options: BTreeMap::new(),
+        };
+
+        let started = adapter.start_turn(request).expect("start event");
+        let streamed = adapter
+            .next_event("run-1")
+            .expect("stream result")
+            .expect("stream event");
+        let cancelled = adapter
+            .cancel_turn(NativeProviderCancellation {
+                run_id: "run-1".to_owned(),
+                provider_session_id: Some("session-1".to_owned()),
+                provider_turn_id: None,
+                requested_depth: CancellationDepth::NativeStop,
+                reason: "operator".to_owned(),
+            })
+            .expect("cancel event");
+
+        assert_eq!(adapter.provider_id(), "fake-pi");
+        assert_eq!(adapter.capability().surface, AdapterSurface::PiRpc);
+        assert_eq!(started.event_kind, NativeProviderEventKind::Started);
+        assert_eq!(streamed.provider_event_type, "message_end");
+        assert_eq!(cancelled.event_kind, NativeProviderEventKind::Cancelled);
+        assert!(cancelled.event_kind.is_terminal());
+    }
+
+    #[test]
+    fn cancellation_depth_guard_allows_requests_within_configured_depth() {
+        let config = ProviderBindingConfig::from_json_str(
+            r#"{
+              "provider_id": "pi-main",
+              "provider_kind": "pi",
+              "surface": "pi_rpc",
+              "credentials_ref": "secret:pi",
+              "cancellation_depth": "native_stop"
+            }"#,
+        )
+        .expect("config parses");
+
+        validate_native_cancellation_depth(
+            &config,
+            &builtin_provider_capabilities(),
+            CancellationDepth::CooperativeRequest,
+        )
+        .expect("cooperative request is within native-stop depth");
+        validate_native_cancellation_depth(
+            &config,
+            &builtin_provider_capabilities(),
+            CancellationDepth::NativeStop,
+        )
+        .expect("native stop request matches configured depth");
+    }
+
+    #[test]
+    fn cancellation_depth_guard_rejects_requests_deeper_than_configured_depth() {
+        let config = ProviderBindingConfig::from_json_str(
+            r#"{
+              "provider_id": "claude-main",
+              "provider_kind": "claude",
+              "surface": "claude_agent_sdk",
+              "credentials_ref": "secret:claude",
+              "cancellation_depth": "cooperative_request"
+            }"#,
+        )
+        .expect("config parses");
+
+        let error = validate_native_cancellation_depth(
+            &config,
+            &builtin_provider_capabilities(),
+            CancellationDepth::NativeStop,
+        )
+        .expect_err("native stop exceeds configured depth");
+
+        assert_eq!(error.code, "cancellation_depth_denied");
+        assert_eq!(error.provider_id, "claude-main");
+        assert_eq!(
+            error
+                .to_json_redacted()
+                .pointer("/evidence_shape/type")
+                .and_then(Value::as_str),
+            Some("object")
+        );
+    }
+
+    #[test]
+    fn cancellation_depth_guard_rejects_configured_depth_not_supported_by_capability() {
+        let config = ProviderBindingConfig::from_json_str(
+            r#"{
+              "provider_id": "fixture-main",
+              "provider_kind": "fixture",
+              "surface": "fixture",
+              "cancellation_depth": "native_stop"
+            }"#,
+        )
+        .expect("config parses");
+
+        let error = validate_native_cancellation_depth(
+            &config,
+            &builtin_provider_capabilities(),
+            CancellationDepth::NativeStop,
+        )
+        .expect_err("fixture does not support native stop");
+
+        assert_eq!(error.code, "unsupported_configured_cancellation_depth");
+    }
+}

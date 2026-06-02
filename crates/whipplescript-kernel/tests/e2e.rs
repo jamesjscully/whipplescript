@@ -31,6 +31,7 @@ fn e2e_compiles_and_runs_minimal_workflow() {
         schema_id: Some("StartupSeen"),
         provenance_class: "rule",
         correlation_id: None,
+        source_span_json: None,
     }];
 
     kernel
@@ -339,6 +340,7 @@ fn e2e_concurrent_instances_do_not_cross_contaminate_facts() {
             schema_id: Some("StartupSeen"),
             provenance_class: "rule",
             correlation_id: None,
+            source_span_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {

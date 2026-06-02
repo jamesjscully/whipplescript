@@ -1,15 +1,30 @@
 //! Deterministic runtime kernel scaffold.
 
+pub mod artifact_manifest;
+pub mod claude_agent_sdk;
+pub mod codex_app_server;
 pub mod coerce;
 pub mod harness;
 pub mod loft;
+pub mod native_lifecycle;
+pub mod pi_rpc;
+pub mod provider;
 pub mod trace;
 
+use artifact_manifest::{
+    artifact_capture_failed_payload, provider_artifact_manifest, validate_artifact_manifest,
+    ArtifactCaptureFailure,
+};
 use coerce::{BamlClient, BamlCoerceRequest, BamlCoerceResult, BamlCoerceStatus};
 use harness::{
     AgentHarness, AgentTurnRequest, ProviderFailure, ProviderRunResult, ProviderRunStatus,
 };
 use loft::{LoftAction, LoftClient, LoftEffectRequest, LoftEffectResult, LoftEffectStatus};
+use native_lifecycle::{AgentTurnLifecycleKind, NativeAgentTurnObservation};
+use provider::{
+    NativeProviderAdapter, NativeProviderArtifactRef, NativeProviderEvent, NativeProviderEventKind,
+    NativeProviderTurnRequest,
+};
 use serde_json::{json, Value};
 use trace::{DependencyEdge, EffectStatus, TraceEvent, TraceRecord};
 use whipplescript_parser::{
@@ -17,12 +32,12 @@ use whipplescript_parser::{
     IrWorkflowContractKind, SourceSpan,
 };
 use whipplescript_store::{
-    ArtifactRecord, ClaimableEffect, DerivedFact, EffectCancellation, EffectCompletion,
-    EvidenceRecord, ExpiredLease, InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent,
-    NewFact, NewInboxItem, NewInstance, NewProgramVersion, NewWorkflowInvocation,
-    ProgramVersionRecord, RetryEffect, RevisionActivation, RuleCommit, RuleCommitRevisionGuard,
-    RunStart, SkillEvidence, SqliteStore, StoreError, StoreResult, StoredEvent,
-    TerminalDiagnosticRecord, WorkflowInvocationView, WorkflowRevisionView,
+    ArtifactRecord, ClaimableEffect, DerivedFact, DiagnosticRecord, EffectCancellation,
+    EffectCompletion, EvidenceRecord, ExpiredLease, InstanceTransition, LeaseRenewal,
+    NewEffectDependency, NewEvent, NewFact, NewInboxItem, NewInstance, NewProgramVersion,
+    NewWorkflowInvocation, ProgramVersionRecord, RetryEffect, RevisionActivation, RuleCommit,
+    RuleCommitRevisionGuard, RunStart, SkillEvidence, SqliteStore, StoreError, StoreResult,
+    StoredEvent, TerminalDiagnosticRecord, WorkflowInvocationView, WorkflowRevisionView,
 };
 
 pub struct RuntimeKernel {
@@ -223,6 +238,7 @@ impl RuntimeKernel {
                 schema_id: None,
                 provenance_class: "external",
                 correlation_id: None,
+                source_span_json: None,
             },
             source: "kernel",
             causation_id,
@@ -620,15 +636,18 @@ impl RuntimeKernel {
             });
         }
 
-        let result = harness.run(request);
+        let mut result = harness.run(request);
+        enforce_required_artifact_capture_failure(&mut result);
         let evidence = self.record_provider_result(execution, &result)?;
-        let metadata_json = provider_metadata(&result);
+        let (metadata_json, terminal_hash, provider_correlation_id) =
+            provider_terminal_metadata(execution.instance_id, execution.run_id, &result);
+        let safe_summary = redacted_provider_summary(&result.summary);
         self.emit_provider_diagnostic(
             execution.run_id,
             execution.effect_id,
             execution.provider,
             provider_effect_status(&result.status),
-            &result.summary,
+            &safe_summary,
             &metadata_json,
         );
         let completion = EffectCompletion {
@@ -639,13 +658,14 @@ impl RuntimeKernel {
             worker_id: execution.worker_id,
             status: provider_status(&result.status),
             exit_code: result.exit_code,
-            summary: Some(&result.summary),
+            summary: Some(&safe_summary),
             metadata_json: &metadata_json,
-            idempotency_key: Some(&idempotency_key(&[
+            idempotency_key: Some(&terminal_completion_idempotency_key(
                 execution.instance_id,
                 execution.run_id,
-                "terminal",
-            ])),
+                &provider_correlation_id,
+                &terminal_hash,
+            )),
         };
         let diagnostic = self.provider_terminal_diagnostic(
             execution.instance_id,
@@ -653,7 +673,7 @@ impl RuntimeKernel {
             execution.run_id,
             execution.provider,
             provider_effect_status(&result.status),
-            &result.summary,
+            &safe_summary,
             provider_failure_code(result.failure.as_ref(), provider_status(&result.status)),
             &metadata_json,
             &evidence,
@@ -668,6 +688,333 @@ impl RuntimeKernel {
         };
         self.append_agent_turn_event_and_fact(execution, &result)?;
         Ok(event)
+    }
+
+    pub fn run_native_agent_turn(
+        &mut self,
+        execution: AgentTurnExecution<'_>,
+        request: NativeProviderTurnRequest,
+        adapter: &mut dyn NativeProviderAdapter,
+        max_events: usize,
+    ) -> StoreResult<StoredEvent> {
+        self.start_run(RunStart {
+            instance_id: execution.instance_id,
+            effect_id: execution.effect_id,
+            run_id: execution.run_id,
+            provider: execution.provider,
+            worker_id: execution.worker_id,
+            lease_id: execution.lease_id,
+            lease_expires_at: execution.lease_expires_at,
+            metadata_json: &json!({
+                "native_provider": request.to_json_redacted(),
+                "adapter_provider_id": adapter.provider_id(),
+                "adapter_capability": {
+                    "provider_kind": adapter.capability().provider_kind.as_str(),
+                    "surface": adapter.capability().surface.as_str(),
+                },
+            })
+            .to_string(),
+        })?;
+        self.store.record_skill_evidence(SkillEvidence {
+            instance_id: execution.instance_id,
+            run_id: execution.run_id,
+            effect_id: execution.effect_id,
+            skill_names: execution.skill_names,
+            idempotency_key: Some(&idempotency_key(&[
+                execution.instance_id,
+                execution.run_id,
+                "skills",
+            ])),
+        })?;
+
+        let started = match adapter.start_turn(request) {
+            Ok(event) => event,
+            Err(error) => {
+                let failed = native_boundary_error_event(execution, error);
+                let evidence = self.record_native_provider_event(
+                    execution,
+                    &failed,
+                    "native-provider-boundary-start",
+                )?;
+                return self.complete_native_agent_turn(execution, &failed, &evidence);
+            }
+        };
+        let mut latest_evidence =
+            self.record_native_provider_event(execution, &started, "native-provider-started")?;
+        if started.event_kind.is_terminal() {
+            return self.complete_native_agent_turn(execution, &started, &latest_evidence);
+        }
+
+        for index in 0..max_events {
+            let event = match adapter.next_event(execution.run_id) {
+                Ok(Some(event)) => event,
+                Ok(None) => continue,
+                Err(error) => {
+                    let failed = native_boundary_error_event(execution, error);
+                    latest_evidence = self.record_native_provider_event(
+                        execution,
+                        &failed,
+                        &format!("native-provider-boundary-event-{index}"),
+                    )?;
+                    return self.complete_native_agent_turn(execution, &failed, &latest_evidence);
+                }
+            };
+            latest_evidence = self.record_native_provider_event(
+                execution,
+                &event,
+                &format!("native-provider-event-{index}"),
+            )?;
+            if event.event_kind.is_terminal() {
+                return self.complete_native_agent_turn(execution, &event, &latest_evidence);
+            }
+        }
+
+        let timed_out = NativeProviderEvent {
+            provider_id: execution.provider.to_owned(),
+            run_id: execution.run_id.to_owned(),
+            event_kind: NativeProviderEventKind::TimedOut,
+            provider_event_type: "whip.native.timeout".to_owned(),
+            provider_session_id: None,
+            provider_turn_id: None,
+            sequence: None,
+            evidence: json!({"max_events": max_events}),
+            artifacts: Vec::new(),
+        };
+        latest_evidence =
+            self.record_native_provider_event(execution, &timed_out, "native-provider-timeout")?;
+        self.complete_native_agent_turn(execution, &timed_out, &latest_evidence)
+    }
+
+    pub fn record_native_agent_turn_observation(
+        &mut self,
+        execution: AgentTurnExecution<'_>,
+        observation: &NativeAgentTurnObservation,
+        occurrence_key: &str,
+    ) -> StoreResult<StoredEvent> {
+        self.append_native_agent_turn_observation(execution, observation, occurrence_key)
+    }
+
+    pub fn record_artifact_capture_failure(
+        &mut self,
+        execution: AgentTurnExecution<'_>,
+        failure: ArtifactCaptureFailure<'_>,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        let payload = artifact_capture_failed_payload(failure).map_err(StoreError::Conflict)?;
+        let payload_json = payload.to_string();
+        let event = self.store.append_event(NewEvent {
+            instance_id: execution.instance_id,
+            event_type: artifact_manifest::ARTIFACT_CAPTURE_FAILED_EVENT,
+            payload_json: &payload_json,
+            source: "kernel",
+            causation_id: Some(execution.effect_id),
+            correlation_id: Some(execution.run_id),
+            idempotency_key,
+        })?;
+        let diagnostic_message = format!(
+            "artifact capture failed for {}: {}",
+            failure.artifact_ref, failure.error_kind
+        );
+        self.store.record_diagnostic(DiagnosticRecord {
+            instance_id: Some(execution.instance_id),
+            program_id: None,
+            program_version_id: None,
+            severity: "error",
+            code: Some(artifact_manifest::ARTIFACT_CAPTURE_FAILED_EVENT),
+            message: &diagnostic_message,
+            source_span_json: None,
+            subject_type: Some("effect"),
+            subject_id: Some(execution.effect_id),
+            event_id: Some(&event.event_id),
+            effect_id: Some(execution.effect_id),
+            run_id: Some(execution.run_id),
+            assertion_id: None,
+            evidence_ids_json: "[]",
+            artifact_ids_json: "[]",
+            causation_id: Some(execution.effect_id),
+            correlation_id: Some(execution.run_id),
+            idempotency_key,
+        })?;
+        Ok(event)
+    }
+
+    pub fn recover_provider_terminal_from_evidence(
+        &mut self,
+        execution: AgentTurnExecution<'_>,
+    ) -> StoreResult<Option<StoredEvent>> {
+        let Some(run) = self
+            .store
+            .list_runs(execution.instance_id)?
+            .into_iter()
+            .find(|run| run.run_id == execution.run_id)
+        else {
+            return Ok(None);
+        };
+        if run.status != "running" {
+            return Ok(None);
+        }
+
+        let evidence = self.store.list_evidence(execution.instance_id)?;
+        if let Some(native_evidence) = evidence.iter().rev().find(|evidence| {
+            evidence.kind == "agent.turn.native_provider"
+                && evidence.subject_type == "run"
+                && evidence.subject_id == execution.run_id
+                && evidence
+                    .metadata_json
+                    .parse::<Value>()
+                    .ok()
+                    .and_then(|metadata| metadata.get("native_event").cloned())
+                    .and_then(|event| event.get("terminal").and_then(Value::as_bool))
+                    == Some(true)
+        }) {
+            let metadata = serde_json::from_str::<Value>(&native_evidence.metadata_json)?;
+            let native_event = recover_native_provider_event(&metadata, execution)?;
+            let artifact_ids = metadata
+                .get("artifact_ids")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let provider_evidence = ProviderEvidence {
+                evidence_id: Some(native_evidence.evidence_id.clone()),
+                artifact_ids,
+            };
+            return self
+                .complete_native_agent_turn(execution, &native_event, &provider_evidence)
+                .map(Some);
+        }
+
+        let Some(evidence) = evidence.into_iter().rev().find(|evidence| {
+            evidence.kind == "agent.turn.provider"
+                && evidence.subject_type == "run"
+                && evidence.subject_id == execution.run_id
+        }) else {
+            return Ok(None);
+        };
+
+        let metadata = serde_json::from_str::<Value>(&evidence.metadata_json)?;
+        let status = recover_provider_status(&metadata);
+        let failure = metadata.get("failure").and_then(provider_failure_from_json);
+        let result = ProviderRunResult {
+            status,
+            summary: evidence
+                .summary
+                .clone()
+                .unwrap_or_else(|| "recovered provider terminal outcome".to_owned()),
+            stdout: String::new(),
+            stderr: String::new(),
+            transcript: String::new(),
+            exit_code: metadata.get("exit_code").and_then(Value::as_i64),
+            usage_json: "{}".to_owned(),
+            artifacts: Vec::new(),
+            failure,
+        };
+        let artifact_ids = metadata
+            .get("artifact_ids")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let provider_evidence = ProviderEvidence {
+            evidence_id: Some(evidence.evidence_id.clone()),
+            artifact_ids,
+        };
+        let provider_correlation_id = evidence.correlation_id.clone().unwrap_or_else(|| {
+            provider_terminal_correlation_id(execution.instance_id, execution.run_id)
+        });
+        let terminal_metadata_base = json!({
+            "recovery": "provider_evidence_terminal",
+            "evidence_id": evidence.evidence_id,
+            "provider_metadata": metadata,
+            "provider_correlation_id": provider_correlation_id,
+        });
+        let terminal_hash = terminal_payload_hash(
+            provider_status(&result.status),
+            result.exit_code,
+            Some(&result.summary),
+            &terminal_metadata_base.to_string(),
+        );
+        let terminal_metadata = add_terminal_payload_hash(terminal_metadata_base, &terminal_hash);
+        let safe_summary = redacted_provider_summary(&result.summary);
+        let completion = EffectCompletion {
+            instance_id: execution.instance_id,
+            effect_id: execution.effect_id,
+            run_id: execution.run_id,
+            provider: execution.provider,
+            worker_id: execution.worker_id,
+            status: provider_status(&result.status),
+            exit_code: result.exit_code,
+            summary: Some(&safe_summary),
+            metadata_json: &terminal_metadata,
+            idempotency_key: Some(&terminal_completion_idempotency_key(
+                execution.instance_id,
+                execution.run_id,
+                &provider_correlation_id,
+                &terminal_hash,
+            )),
+        };
+        let diagnostic = self.provider_terminal_diagnostic(
+            execution.instance_id,
+            execution.effect_id,
+            execution.run_id,
+            execution.provider,
+            provider_effect_status(&result.status),
+            &safe_summary,
+            provider_failure_code(result.failure.as_ref(), provider_status(&result.status)),
+            &terminal_metadata,
+            &provider_evidence,
+        );
+        let event = match result.status {
+            ProviderRunStatus::Completed => self.complete_run(completion)?,
+            ProviderRunStatus::Failed => self.fail_run_with_diagnostic(completion, diagnostic)?,
+            ProviderRunStatus::TimedOut => {
+                self.timeout_run_with_diagnostic(completion, diagnostic)?
+            }
+        };
+        self.append_agent_turn_event_and_fact(execution, &result)?;
+        Ok(Some(event))
+    }
+
+    pub fn recover_running_provider_runs(
+        &mut self,
+        instance_id: &str,
+    ) -> StoreResult<Vec<StoredEvent>> {
+        let runs = self.store.list_runs(instance_id)?;
+        let effects = self.store.list_effects(instance_id)?;
+        let mut recovered = Vec::new();
+        for run in runs.into_iter().filter(|run| run.status == "running") {
+            let Some(effect) = effects
+                .iter()
+                .find(|effect| effect.effect_id == run.effect_id)
+            else {
+                continue;
+            };
+            let execution = AgentTurnExecution {
+                instance_id,
+                effect_id: &run.effect_id,
+                run_id: &run.run_id,
+                provider: &run.provider,
+                worker_id: &run.worker_id,
+                lease_id: "",
+                lease_expires_at: "",
+                agent: effect.target.as_deref().unwrap_or("worker"),
+                profile: effect.profile.as_deref(),
+                input_json: &effect.input_json,
+                skill_names: &[],
+            };
+            if let Some(event) = self.recover_provider_terminal_from_evidence(execution)? {
+                recovered.push(event);
+            }
+        }
+        Ok(recovered)
     }
 
     pub fn run_baml_coerce(
@@ -689,12 +1036,13 @@ impl RuntimeKernel {
         let result = client.coerce(execution.request);
         let evidence = self.record_baml_result(execution, &result)?;
         let metadata_json = baml_metadata(&result);
+        let safe_summary = redacted_provider_summary(&result.summary);
         self.emit_provider_diagnostic(
             execution.run_id,
             execution.effect_id,
             execution.provider,
             baml_effect_status(&result.status),
-            &result.summary,
+            &safe_summary,
             &metadata_json,
         );
         let completion = EffectCompletion {
@@ -705,7 +1053,7 @@ impl RuntimeKernel {
             worker_id: execution.worker_id,
             status: baml_status(&result.status),
             exit_code: baml_exit_code(&result.status),
-            summary: Some(&result.summary),
+            summary: Some(&safe_summary),
             metadata_json: &metadata_json,
             idempotency_key: Some(&idempotency_key(&[
                 execution.instance_id,
@@ -719,9 +1067,9 @@ impl RuntimeKernel {
             execution.run_id,
             execution.provider,
             baml_effect_status(&result.status),
-            &result.summary,
+            &safe_summary,
             Some(match result.status {
-                BamlCoerceStatus::Succeeded => "baml.coerce.completed",
+                BamlCoerceStatus::Succeeded => "baml.coerce.succeeded",
                 BamlCoerceStatus::Failed => "baml.coerce.failed",
                 BamlCoerceStatus::TimedOut => "baml.coerce.timed_out",
             }),
@@ -759,12 +1107,13 @@ impl RuntimeKernel {
         let result = client.execute(execution.request);
         let evidence = self.record_loft_result(execution, &result)?;
         let metadata_json = loft_metadata(&result);
+        let safe_summary = redacted_provider_summary(&result.summary);
         self.emit_provider_diagnostic(
             execution.run_id,
             execution.effect_id,
             execution.provider,
             loft_effect_status(&result.status),
-            &result.summary,
+            &safe_summary,
             &metadata_json,
         );
         let completion = EffectCompletion {
@@ -775,7 +1124,7 @@ impl RuntimeKernel {
             worker_id: execution.worker_id,
             status: loft_status(&result.status),
             exit_code: loft_exit_code(&result.status),
-            summary: Some(&result.summary),
+            summary: Some(&safe_summary),
             metadata_json: &metadata_json,
             idempotency_key: Some(&idempotency_key(&[
                 execution.instance_id,
@@ -783,6 +1132,7 @@ impl RuntimeKernel {
                 "loft-terminal",
             ])),
         };
+        let diagnostic_code = loft_fact_name(execution.request.action, &result.status);
         let diagnostic = self.provider_terminal_diagnostic(
             execution.instance_id,
             execution.effect_id,
@@ -790,11 +1140,7 @@ impl RuntimeKernel {
             execution.provider,
             loft_effect_status(&result.status),
             &result.summary,
-            Some(match result.status {
-                LoftEffectStatus::Succeeded => "loft.completed",
-                LoftEffectStatus::Failed => "loft.failed",
-                LoftEffectStatus::TimedOut => "loft.timed_out",
-            }),
+            Some(&diagnostic_code),
             &metadata_json,
             &evidence,
         );
@@ -929,6 +1275,7 @@ impl RuntimeKernel {
                 schema_id: Some("HumanAsk"),
                 provenance_class: "effect",
                 correlation_id: Some(execution.effect_id),
+                source_span_json: None,
             },
             source: "kernel",
             causation_id: Some(execution.run_id),
@@ -952,19 +1299,19 @@ impl RuntimeKernel {
             "actor": execution.request.actor,
             "lease_duration_seconds": execution.request.lease_duration_seconds,
             "command_id": execution.request.command_id,
-            "note": execution.request.note,
+            "note": execution.request.note.as_deref().map(redacted_text_metadata),
             "target_status": execution.request.target_status,
-            "evidence": execution.request.evidence_json.as_deref().map(json_from_str),
+            "evidence": execution.request.evidence_json.as_deref().map(json_payload_summary),
             "evidence_kind": execution.request.evidence_kind,
             "evidence_artifact": execution.request.evidence_artifact,
             "evidence_data_path": execution.request.evidence_data_path,
-            "resource_intent": execution.request.resource_intent_json.as_deref().map(json_from_str),
+            "resource_intent": execution.request.resource_intent_json.as_deref().map(json_payload_summary),
             "release_after_failure": execution.request.release_after_failure,
             "expect_heads": execution.request.expect_heads,
-            "request_metadata": json_from_str(&execution.request.metadata_json),
-            "value": result.value_json.as_deref().map(json_from_str),
-            "error": result.error_json.as_deref().map(json_from_str),
-            "transcript": result.transcript,
+            "request_metadata": json_payload_summary(&execution.request.metadata_json),
+            "value": result.value_json.as_deref().map(json_payload_summary),
+            "error": result_error_payload(result.error_json.as_deref()),
+            "transcript": redacted_text_metadata(&result.transcript),
         })
         .to_string();
         let evidence_id = self.store.record_evidence(EvidenceRecord {
@@ -978,7 +1325,7 @@ impl RuntimeKernel {
                 execution.run_id,
                 "loft-provider",
             ])),
-            summary: Some(&result.summary),
+            summary: Some(&redacted_provider_summary(&result.summary)),
             metadata_json: &metadata,
         })?;
         Ok(ProviderEvidence {
@@ -1002,9 +1349,12 @@ impl RuntimeKernel {
             "lease_id": execution.request.lease_id,
             "command_id": execution.request.command_id,
             "status": status,
-            "value": result.value_json.as_deref().map(json_from_str),
-            "error": result.error_json.as_deref().map(json_from_str),
-            "summary": result.summary,
+            "value": result_value_payload(
+                matches!(result.status, LoftEffectStatus::Succeeded),
+                result.value_json.as_deref(),
+            ),
+            "error": result_error_payload(result.error_json.as_deref()),
+            "summary": redacted_provider_summary(&result.summary),
         })
         .to_string();
         self.store.append_event(NewEvent {
@@ -1032,6 +1382,7 @@ impl RuntimeKernel {
                 schema_id: loft_schema(execution.request.action, &result.status),
                 provenance_class: "effect",
                 correlation_id: Some(execution.effect_id),
+                source_span_json: None,
             },
             source: "kernel",
             causation_id: Some(execution.run_id),
@@ -1048,14 +1399,14 @@ impl RuntimeKernel {
         let metadata = json!({
             "effect_id": execution.effect_id,
             "function_name": execution.request.function_name,
-            "arguments": json_from_str(&execution.request.arguments_json),
+            "arguments": json_payload_summary(&execution.request.arguments_json),
             "output_type": execution.request.output_type,
             "generated_baml_source_hash": execution.request.generated_baml_source_hash,
             "input_schema_hash": execution.request.input_schema_hash,
             "output_schema_hash": execution.request.output_schema_hash,
-            "value": result.value_json.as_deref().map(json_from_str),
-            "error": result.error_json.as_deref().map(json_from_str),
-            "transcript": result.transcript,
+            "value": result.value_json.as_deref().map(json_payload_summary),
+            "error": result_error_payload(result.error_json.as_deref()),
+            "transcript": redacted_text_metadata(&result.transcript),
             "usage": json_from_str(&result.usage_json),
         })
         .to_string();
@@ -1070,7 +1421,7 @@ impl RuntimeKernel {
                 execution.run_id,
                 "baml-provider",
             ])),
-            summary: Some(&result.summary),
+            summary: Some(&redacted_provider_summary(&result.summary)),
             metadata_json: &metadata,
         })?;
         Ok(ProviderEvidence {
@@ -1096,9 +1447,12 @@ impl RuntimeKernel {
             "function_name": execution.request.function_name,
             "status": status,
             "output_type": execution.request.output_type,
-            "value": result.value_json.as_deref().map(json_from_str),
-            "error": result.error_json.as_deref().map(json_from_str),
-            "summary": result.summary,
+            "value": result_value_payload(
+                matches!(result.status, BamlCoerceStatus::Succeeded),
+                result.value_json.as_deref(),
+            ),
+            "error": result_error_payload(result.error_json.as_deref()),
+            "summary": redacted_provider_summary(&result.summary),
         })
         .to_string();
         self.store.append_event(NewEvent {
@@ -1126,6 +1480,7 @@ impl RuntimeKernel {
                 schema_id: Some(&execution.request.output_type),
                 provenance_class: "effect",
                 correlation_id: Some(execution.effect_id),
+                source_span_json: None,
             },
             source: "kernel",
             causation_id: Some(execution.run_id),
@@ -1134,13 +1489,147 @@ impl RuntimeKernel {
         Ok(())
     }
 
+    fn record_native_provider_event(
+        &mut self,
+        execution: AgentTurnExecution<'_>,
+        event: &NativeProviderEvent,
+        occurrence_key: &str,
+    ) -> StoreResult<ProviderEvidence> {
+        let artifact_ids = event
+            .artifacts
+            .iter()
+            .map(|artifact| {
+                let artifact = redacted_native_artifact_ref(artifact);
+                self.store.record_artifact(ArtifactRecord {
+                    run_id: execution.run_id,
+                    kind: &artifact.kind,
+                    path: &artifact.uri,
+                    content_hash: artifact.content_hash.as_deref(),
+                    mime_type: artifact.mime_type.as_deref(),
+                })
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        let metadata = json!({
+            "effect_id": execution.effect_id,
+            "agent": execution.agent,
+            "profile": execution.profile,
+            "provider": execution.provider,
+            "native_event": event.to_json_redacted(),
+            "artifact_ids": artifact_ids,
+        })
+        .to_string();
+        let evidence_id = self.store.record_evidence(EvidenceRecord {
+            instance_id: execution.instance_id,
+            kind: "agent.turn.native_provider",
+            subject_type: "run",
+            subject_id: execution.run_id,
+            causation_id: Some(execution.effect_id),
+            correlation_id: Some(occurrence_key),
+            summary: Some(&format!(
+                "{} native provider event from {}",
+                event.event_kind.as_str(),
+                event.provider_event_type
+            )),
+            metadata_json: &metadata,
+        })?;
+        let observation = native_provider_event_observation(event);
+        self.append_native_agent_turn_observation(execution, &observation, occurrence_key)?;
+        Ok(ProviderEvidence {
+            evidence_id: Some(evidence_id),
+            artifact_ids,
+        })
+    }
+
+    fn complete_native_agent_turn(
+        &mut self,
+        execution: AgentTurnExecution<'_>,
+        event: &NativeProviderEvent,
+        evidence: &ProviderEvidence,
+    ) -> StoreResult<StoredEvent> {
+        let status = native_terminal_status(event.event_kind);
+        let summary = format!(
+            "{} native provider event from {}",
+            event.event_kind.as_str(),
+            event.provider_event_type
+        );
+        let provider_correlation_id =
+            provider_terminal_correlation_id(execution.instance_id, execution.run_id);
+        let metadata_base = add_provider_correlation_id(
+            json!({
+                "native_provider": event.to_json_redacted(),
+                "artifact_ids": evidence.artifact_ids,
+            }),
+            &provider_correlation_id,
+        );
+        let terminal_hash =
+            terminal_payload_hash(status, Some(0), Some(&summary), &metadata_base.to_string());
+        let metadata = add_terminal_payload_hash(metadata_base, &terminal_hash);
+        let completion = EffectCompletion {
+            instance_id: execution.instance_id,
+            effect_id: execution.effect_id,
+            run_id: execution.run_id,
+            provider: execution.provider,
+            worker_id: execution.worker_id,
+            status,
+            exit_code: Some(0),
+            summary: Some(&summary),
+            metadata_json: &metadata,
+            idempotency_key: Some(&terminal_completion_idempotency_key(
+                execution.instance_id,
+                execution.run_id,
+                &provider_correlation_id,
+                &terminal_hash,
+            )),
+        };
+        match event.event_kind {
+            NativeProviderEventKind::Completed => self.complete_run(completion),
+            NativeProviderEventKind::Failed => {
+                let diagnostic = self.provider_terminal_diagnostic(
+                    execution.instance_id,
+                    execution.effect_id,
+                    execution.run_id,
+                    execution.provider,
+                    EffectStatus::Failed,
+                    &summary,
+                    Some("native_provider_failed"),
+                    &metadata,
+                    evidence,
+                );
+                self.fail_run_with_diagnostic(completion, diagnostic)
+            }
+            NativeProviderEventKind::TimedOut => {
+                let diagnostic = self.provider_terminal_diagnostic(
+                    execution.instance_id,
+                    execution.effect_id,
+                    execution.run_id,
+                    execution.provider,
+                    EffectStatus::TimedOut,
+                    &summary,
+                    Some("native_provider_timed_out"),
+                    &metadata,
+                    evidence,
+                );
+                self.timeout_run_with_diagnostic(completion, diagnostic)
+            }
+            NativeProviderEventKind::Cancelled => self.cancel_run(completion),
+            _ => Err(StoreError::Conflict(format!(
+                "native provider event `{}` is not terminal",
+                event.event_kind.as_str()
+            ))),
+        }
+    }
+
     fn record_provider_result(
         &self,
         execution: AgentTurnExecution<'_>,
         result: &ProviderRunResult,
     ) -> StoreResult<ProviderEvidence> {
-        let artifact_ids = result
+        let artifacts = result
             .artifacts
+            .iter()
+            .map(sanitized_provider_artifact_metadata)
+            .collect::<Vec<_>>();
+        let artifact_ids = artifacts
             .iter()
             .map(|artifact| {
                 self.store.record_artifact(ArtifactRecord {
@@ -1152,16 +1641,20 @@ impl RuntimeKernel {
                 })
             })
             .collect::<StoreResult<Vec<_>>>()?;
+        let artifact_manifest = provider_artifact_manifest(&artifact_ids, &artifacts);
+        validate_artifact_manifest(&artifact_manifest).map_err(StoreError::Conflict)?;
         let metadata = json!({
             "effect_id": execution.effect_id,
             "agent": execution.agent,
             "profile": execution.profile,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "transcript": result.transcript,
+            "status": provider_status(&result.status),
+            "stdout": redacted_text_metadata(&result.stdout),
+            "stderr": redacted_text_metadata(&result.stderr),
+            "transcript": redacted_text_metadata(&result.transcript),
             "exit_code": result.exit_code,
             "usage": json_from_str(&result.usage_json),
             "artifact_ids": artifact_ids,
+            "artifact_manifest": artifact_manifest,
             "failure": result.failure.as_ref().map(provider_failure_json),
         })
         .to_string();
@@ -1176,7 +1669,7 @@ impl RuntimeKernel {
                 execution.run_id,
                 "provider",
             ])),
-            summary: Some(&result.summary),
+            summary: Some(&redacted_provider_summary(&result.summary)),
             metadata_json: &metadata,
         })?;
         Ok(ProviderEvidence {
@@ -1198,7 +1691,7 @@ impl RuntimeKernel {
             "agent": execution.agent,
             "provider": execution.provider,
             "status": status,
-            "summary": result.summary,
+            "summary": redacted_provider_summary(&result.summary),
             "exit_code": result.exit_code,
             "failure": result.failure.as_ref().map(provider_failure_json),
         })
@@ -1229,12 +1722,107 @@ impl RuntimeKernel {
                 schema_id: None,
                 provenance_class: "effect",
                 correlation_id: Some(execution.effect_id),
+                source_span_json: None,
             },
             source: "kernel",
             causation_id: Some(execution.run_id),
             idempotency_key: Some(&fact_event_key),
         })?;
         Ok(())
+    }
+
+    fn append_native_agent_turn_observation(
+        &mut self,
+        execution: AgentTurnExecution<'_>,
+        observation: &NativeAgentTurnObservation,
+        occurrence_key: &str,
+    ) -> StoreResult<StoredEvent> {
+        let event_type = observation.kind.event_type();
+        let evidence_metadata = json!({
+            "effect_id": execution.effect_id,
+            "run_id": execution.run_id,
+            "provider": execution.provider,
+            "status": observation.kind.status(),
+            "terminal": observation.terminal,
+            "provider_event_type": observation.provider_event_type,
+            "provider_session_id": observation.provider_session_id,
+            "provider_turn_id": observation.provider_turn_id,
+            "provider_payload_shape": observation.provider_payload_shape,
+        })
+        .to_string();
+        let evidence_summary = format!(
+            "{} observation from {}",
+            observation.kind.status(),
+            observation.provider_event_type
+        );
+        let evidence_id = self.store.record_evidence(EvidenceRecord {
+            instance_id: execution.instance_id,
+            kind: "agent.turn.native_event",
+            subject_type: "run",
+            subject_id: execution.run_id,
+            causation_id: Some(execution.effect_id),
+            correlation_id: Some(occurrence_key),
+            summary: Some(&evidence_summary),
+            metadata_json: &evidence_metadata,
+        })?;
+        let payload = json!({
+            "effect_id": execution.effect_id,
+            "run_id": execution.run_id,
+            "agent": execution.agent,
+            "provider": execution.provider,
+            "status": observation.kind.status(),
+            "terminal": observation.terminal,
+            "provider_event_type": observation.provider_event_type,
+            "provider_session_id": observation.provider_session_id,
+            "provider_turn_id": observation.provider_turn_id,
+            "provider_payload_shape": observation.provider_payload_shape,
+            "evidence_id": evidence_id,
+        })
+        .to_string();
+        let event = self.store.append_event(NewEvent {
+            instance_id: execution.instance_id,
+            event_type,
+            payload_json: &payload,
+            source: "kernel.native_provider",
+            causation_id: Some(execution.run_id),
+            correlation_id: Some(execution.effect_id),
+            idempotency_key: Some(&idempotency_key(&[
+                execution.instance_id,
+                execution.run_id,
+                occurrence_key,
+                "native-lifecycle-event",
+            ])),
+        })?;
+        let fact_id = idempotency_key(&[
+            execution.instance_id,
+            "native-agent-turn",
+            execution.run_id,
+            occurrence_key,
+        ]);
+        let fact_key = idempotency_key(&[
+            execution.instance_id,
+            execution.run_id,
+            occurrence_key,
+            "native-lifecycle-fact",
+        ]);
+        let fact_record_key = format!("{}:{occurrence_key}", execution.run_id);
+        self.store.derive_fact(DerivedFact {
+            instance_id: execution.instance_id,
+            fact: NewFact {
+                fact_id: &fact_id,
+                name: event_type,
+                key: &fact_record_key,
+                value_json: &payload,
+                schema_id: None,
+                provenance_class: "effect",
+                correlation_id: Some(execution.effect_id),
+                source_span_json: None,
+            },
+            source: "kernel.native_provider",
+            causation_id: Some(execution.run_id),
+            idempotency_key: Some(&fact_key),
+        })?;
+        Ok(event)
     }
 
     fn emit(&mut self, event: TraceEvent) {
@@ -1745,12 +2333,417 @@ fn stable_hash_hex(value: &str) -> String {
     format!("{:016x}", stable_hash(value))
 }
 
+fn redacted_text_metadata(value: &str) -> Value {
+    json!({
+        "redacted": true,
+        "bytes": value.len(),
+        "chars": value.chars().count(),
+    })
+}
+
+fn json_payload_summary(source: &str) -> Value {
+    json!({
+        "redacted": true,
+        "bytes": source.len(),
+        "shape": json_shape(&json_from_str(source)),
+    })
+}
+
+fn json_shape(value: &Value) -> Value {
+    match value {
+        Value::Null => json!({ "type": "null" }),
+        Value::Bool(_) => json!({ "type": "bool" }),
+        Value::Number(_) => json!({ "type": "number" }),
+        Value::String(value) => json!({
+            "type": "string",
+            "chars": value.chars().count(),
+        }),
+        Value::Array(items) => json!({
+            "type": "array",
+            "items": items.len(),
+        }),
+        Value::Object(object) => json!({
+            "type": "object",
+            "keys": object.len(),
+        }),
+    }
+}
+
+fn result_value_payload(succeeded: bool, source: Option<&str>) -> Option<Value> {
+    source.map(|source| {
+        if succeeded {
+            json_from_str(source)
+        } else {
+            json_payload_summary(source)
+        }
+    })
+}
+
+fn result_error_payload(source: Option<&str>) -> Option<Value> {
+    source.map(json_payload_summary)
+}
+
+fn sanitized_provider_artifact_metadata(
+    artifact: &harness::ProviderArtifact,
+) -> harness::ProviderArtifact {
+    harness::ProviderArtifact {
+        kind: redact_log_text(&artifact.kind),
+        path: redact_log_text(&artifact.path),
+        content_hash: artifact
+            .content_hash
+            .as_ref()
+            .map(|hash| redact_log_text(hash)),
+        mime_type: artifact
+            .mime_type
+            .as_ref()
+            .map(|mime_type| redact_log_text(mime_type)),
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "authorization",
+        "api_key",
+        "apikey",
+        "credential",
+        "password",
+        "secret",
+        "token",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+}
+
+fn redact_log_text(value: &str) -> String {
+    let mut tokens = Vec::new();
+    let mut redact_next = false;
+    for token in value.split_whitespace() {
+        if redact_next {
+            tokens.push("[REDACTED]".to_owned());
+            redact_next = false;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("bearer") {
+            tokens.push(token.to_owned());
+            redact_next = true;
+            continue;
+        }
+        if let Some((key, _)) = token.split_once('=') {
+            if is_sensitive_key(key) {
+                tokens.push(format!("{key}=[REDACTED]"));
+                continue;
+            }
+        }
+        if looks_like_secret_token(token) || contains_secret_token_pattern(token) {
+            tokens.push("[REDACTED]".to_owned());
+        } else {
+            tokens.push(token.to_owned());
+        }
+    }
+    let redacted = tokens.join(" ");
+    const MAX_MESSAGE_CHARS: usize = 512;
+    if redacted.chars().count() <= MAX_MESSAGE_CHARS {
+        return redacted;
+    }
+    let mut truncated = redacted.chars().take(MAX_MESSAGE_CHARS).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn looks_like_secret_token(token: &str) -> bool {
+    let token = token.trim_matches(|ch: char| {
+        matches!(ch, '"' | '\'' | ',' | ';' | ':' | ')' | '(' | '[' | ']')
+    });
+    (token.starts_with("sk-") && token.len() >= 20)
+        || (token.starts_with("ghp_") && token.len() >= 20)
+        || token.starts_with("github_pat_")
+        || (token.starts_with("AKIA") && token.len() >= 20)
+}
+
+fn contains_secret_token_pattern(token: &str) -> bool {
+    let token = token.trim_matches(|ch: char| {
+        matches!(ch, '"' | '\'' | ',' | ';' | ':' | ')' | '(' | '[' | ']')
+    });
+    token.contains("github_pat_")
+        || token
+            .find("sk-")
+            .is_some_and(|start| token[start..].len() >= 20)
+        || token
+            .find("ghp_")
+            .is_some_and(|start| token[start..].len() >= 20)
+        || token
+            .find("AKIA")
+            .is_some_and(|start| token[start..].len() >= 20)
+}
+
 fn provider_status(status: &ProviderRunStatus) -> &'static str {
     match status {
         ProviderRunStatus::Completed => "completed",
         ProviderRunStatus::Failed => "failed",
         ProviderRunStatus::TimedOut => "timed_out",
     }
+}
+
+fn native_terminal_status(kind: NativeProviderEventKind) -> &'static str {
+    match kind {
+        NativeProviderEventKind::Completed => "completed",
+        NativeProviderEventKind::Failed => "failed",
+        NativeProviderEventKind::TimedOut => "timed_out",
+        NativeProviderEventKind::Cancelled => "cancelled",
+        _ => "running",
+    }
+}
+
+fn native_event_kind_from_str(value: &str) -> Option<NativeProviderEventKind> {
+    match value {
+        "started" => Some(NativeProviderEventKind::Started),
+        "streamed" => Some(NativeProviderEventKind::Streamed),
+        "tool_requested" => Some(NativeProviderEventKind::ToolRequested),
+        "artifact_captured" => Some(NativeProviderEventKind::ArtifactCaptured),
+        "completed" => Some(NativeProviderEventKind::Completed),
+        "failed" => Some(NativeProviderEventKind::Failed),
+        "timed_out" => Some(NativeProviderEventKind::TimedOut),
+        "cancelled" => Some(NativeProviderEventKind::Cancelled),
+        "diagnostic" => Some(NativeProviderEventKind::Diagnostic),
+        _ => None,
+    }
+}
+
+fn recover_native_provider_event(
+    metadata: &Value,
+    execution: AgentTurnExecution<'_>,
+) -> StoreResult<NativeProviderEvent> {
+    let event = metadata.get("native_event").ok_or_else(|| {
+        StoreError::Conflict("native provider evidence is missing event".to_owned())
+    })?;
+    let kind = event
+        .get("event_kind")
+        .and_then(Value::as_str)
+        .and_then(native_event_kind_from_str)
+        .ok_or_else(|| {
+            StoreError::Conflict("native provider evidence has invalid event kind".to_owned())
+        })?;
+    if !kind.is_terminal() {
+        return Err(StoreError::Conflict(
+            "native provider recovery requires terminal evidence".to_owned(),
+        ));
+    }
+    Ok(NativeProviderEvent {
+        provider_id: event
+            .get("provider_id")
+            .and_then(Value::as_str)
+            .unwrap_or(execution.provider)
+            .to_owned(),
+        run_id: event
+            .get("run_id")
+            .and_then(Value::as_str)
+            .unwrap_or(execution.run_id)
+            .to_owned(),
+        event_kind: kind,
+        provider_event_type: event
+            .get("provider_event_type")
+            .and_then(Value::as_str)
+            .unwrap_or("whip.native.recovered")
+            .to_owned(),
+        provider_session_id: event
+            .get("provider_session_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        provider_turn_id: event
+            .get("provider_turn_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        sequence: event.get("sequence").and_then(Value::as_u64),
+        evidence: json!({
+            "recovery": "native_provider_terminal_evidence",
+            "provider_payload_shape": event.get("evidence_shape").cloned().unwrap_or(Value::Null),
+        }),
+        artifacts: Vec::new(),
+    })
+}
+
+fn native_boundary_error_event(
+    execution: AgentTurnExecution<'_>,
+    error: provider::NativeProviderBoundaryError,
+) -> NativeProviderEvent {
+    let redacted = error.to_json_redacted();
+    NativeProviderEvent {
+        provider_id: error.provider_id,
+        run_id: execution.run_id.to_owned(),
+        event_kind: NativeProviderEventKind::Failed,
+        provider_event_type: format!("whip.native.boundary_error.{}", error.code),
+        provider_session_id: None,
+        provider_turn_id: None,
+        sequence: None,
+        evidence: json!({
+            "boundary_error": redacted,
+            "recoverable": error.recoverable,
+        }),
+        artifacts: Vec::new(),
+    }
+}
+
+fn redacted_native_artifact_ref(artifact: &NativeProviderArtifactRef) -> NativeProviderArtifactRef {
+    let redacted = artifact.to_json_redacted();
+    NativeProviderArtifactRef {
+        artifact_id: redacted
+            .get("artifact_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        kind: redacted
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("artifact")
+            .to_owned(),
+        uri: redacted
+            .get("uri")
+            .and_then(Value::as_str)
+            .unwrap_or("provider://redacted/artifact")
+            .to_owned(),
+        content_hash: redacted
+            .get("content_hash")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        mime_type: redacted
+            .get("mime_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        required: redacted
+            .get("required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+fn native_provider_event_observation(event: &NativeProviderEvent) -> NativeAgentTurnObservation {
+    let kind = match event.event_kind {
+        NativeProviderEventKind::Started => AgentTurnLifecycleKind::Started,
+        NativeProviderEventKind::Streamed | NativeProviderEventKind::Diagnostic => {
+            AgentTurnLifecycleKind::Streamed
+        }
+        NativeProviderEventKind::ToolRequested => AgentTurnLifecycleKind::ToolRequested,
+        NativeProviderEventKind::ArtifactCaptured => AgentTurnLifecycleKind::ArtifactCaptured,
+        NativeProviderEventKind::Completed => AgentTurnLifecycleKind::Completed,
+        NativeProviderEventKind::Failed => AgentTurnLifecycleKind::Failed,
+        NativeProviderEventKind::TimedOut => AgentTurnLifecycleKind::TimedOut,
+        NativeProviderEventKind::Cancelled => AgentTurnLifecycleKind::Cancelled,
+    };
+    NativeAgentTurnObservation::fixture(
+        kind,
+        event.provider_event_type.clone(),
+        event.provider_session_id.clone(),
+        event.provider_turn_id.clone(),
+        json!({
+            "type": "object",
+            "keys": event
+                .evidence
+                .as_object()
+                .map(serde_json::Map::len)
+                .unwrap_or(0),
+        }),
+    )
+}
+
+fn enforce_required_artifact_capture_failure(result: &mut ProviderRunResult) {
+    let required_artifact_capture_failed = result
+        .failure
+        .as_ref()
+        .is_some_and(|failure| failure.phase == artifact_manifest::ARTIFACT_CAPTURE_FAILED_EVENT);
+    if result.status == ProviderRunStatus::Completed && required_artifact_capture_failed {
+        result.status = ProviderRunStatus::Failed;
+        if !result.summary.contains("artifact capture failed") {
+            result.summary = format!("artifact capture failed: {}", result.summary);
+        }
+    }
+}
+
+fn recover_provider_status(metadata: &Value) -> ProviderRunStatus {
+    match metadata.get("status").and_then(Value::as_str) {
+        Some("completed") => ProviderRunStatus::Completed,
+        Some("timed_out") => ProviderRunStatus::TimedOut,
+        Some("failed") => ProviderRunStatus::Failed,
+        _ => {
+            let failure_phase = metadata
+                .pointer("/failure/phase")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if failure_phase == "provider.timeout" {
+                ProviderRunStatus::TimedOut
+            } else if metadata
+                .get("failure")
+                .is_some_and(|failure| !failure.is_null())
+            {
+                ProviderRunStatus::Failed
+            } else {
+                ProviderRunStatus::Completed
+            }
+        }
+    }
+}
+
+fn provider_failure_from_json(value: &Value) -> Option<ProviderFailure> {
+    if value.is_null() {
+        return None;
+    }
+    Some(ProviderFailure {
+        provider: value
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        adapter: value
+            .get("adapter")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        phase: value
+            .get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or("provider.recovered.failed")
+            .to_owned(),
+        error_kind: value
+            .get("error_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("recovered_failure")
+            .to_owned(),
+        message: value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("recovered provider failure")
+            .to_owned(),
+        recoverable: value
+            .get("recoverable")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        retry_after: value
+            .get("retry_after")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        workspace_id: value
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        provider_session_id: value
+            .get("provider_session_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        provider_thread_id: value
+            .get("provider_thread_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        missing_config_keys: value
+            .get("missing_config_keys")
+            .and_then(Value::as_array)
+            .map(|keys| {
+                keys.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        raw_json: None,
+    })
 }
 
 fn provider_failure_code<'a>(
@@ -1772,13 +2765,97 @@ fn provider_effect_status(status: &ProviderRunStatus) -> EffectStatus {
 
 fn provider_metadata(result: &ProviderRunResult) -> String {
     json!({
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "transcript": result.transcript,
+        "stdout": redacted_text_metadata(&result.stdout),
+        "stderr": redacted_text_metadata(&result.stderr),
+        "transcript": redacted_text_metadata(&result.transcript),
         "usage": json_from_str(&result.usage_json),
         "failure": result.failure.as_ref().map(provider_failure_json),
     })
     .to_string()
+}
+
+fn provider_terminal_metadata(
+    instance_id: &str,
+    run_id: &str,
+    result: &ProviderRunResult,
+) -> (String, String, String) {
+    let provider_correlation_id = provider_terminal_correlation_id(instance_id, run_id);
+    let metadata = add_provider_correlation_id(
+        serde_json::from_str::<Value>(&provider_metadata(result))
+            .expect("provider metadata is generated from JSON values"),
+        &provider_correlation_id,
+    );
+    let terminal_hash = terminal_payload_hash(
+        provider_status(&result.status),
+        result.exit_code,
+        Some(&result.summary),
+        &metadata.to_string(),
+    );
+    (
+        add_terminal_payload_hash(metadata, &terminal_hash),
+        terminal_hash,
+        provider_correlation_id,
+    )
+}
+
+fn provider_terminal_correlation_id(instance_id: &str, run_id: &str) -> String {
+    idempotency_key(&[instance_id, run_id, "provider"])
+}
+
+fn terminal_completion_idempotency_key(
+    instance_id: &str,
+    run_id: &str,
+    provider_correlation_id: &str,
+    terminal_hash: &str,
+) -> String {
+    idempotency_key(&[
+        instance_id,
+        run_id,
+        provider_correlation_id,
+        terminal_hash,
+        "terminal",
+    ])
+}
+
+fn terminal_payload_hash(
+    status: &str,
+    exit_code: Option<i64>,
+    summary: Option<&str>,
+    metadata_json: &str,
+) -> String {
+    stable_hash_hex(
+        &json!({
+            "status": status,
+            "exit_code": exit_code,
+            "summary": summary,
+            "metadata": json_from_str(metadata_json),
+        })
+        .to_string(),
+    )
+}
+
+fn add_provider_correlation_id(mut metadata: Value, provider_correlation_id: &str) -> Value {
+    if let Value::Object(ref mut object) = metadata {
+        object.insert(
+            "provider_correlation_id".to_owned(),
+            Value::String(provider_correlation_id.to_owned()),
+        );
+    }
+    metadata
+}
+
+fn add_terminal_payload_hash(mut metadata: Value, terminal_hash: &str) -> String {
+    if let Value::Object(ref mut object) = metadata {
+        object.insert(
+            "terminal_payload_hash".to_owned(),
+            Value::String(terminal_hash.to_owned()),
+        );
+    }
+    metadata.to_string()
+}
+
+fn redacted_provider_summary(summary: &str) -> String {
+    redact_log_text(summary)
 }
 
 fn provider_failure_json(failure: &ProviderFailure) -> serde_json::Value {
@@ -1787,15 +2864,22 @@ fn provider_failure_json(failure: &ProviderFailure) -> serde_json::Value {
         "adapter": failure.adapter,
         "phase": failure.phase,
         "error_kind": failure.error_kind,
-        "message": failure.message,
+        "message": provider_failure_summary_message(&failure.message),
         "recoverable": failure.recoverable,
         "retry_after": failure.retry_after,
         "workspace_id": failure.workspace_id,
         "provider_session_id": failure.provider_session_id,
         "provider_thread_id": failure.provider_thread_id,
         "missing_config_keys": failure.missing_config_keys,
-        "raw": failure.raw_json.as_deref().map(json_from_str),
+        "raw": failure.raw_json.as_deref().map(json_payload_summary),
     })
+}
+
+fn provider_failure_summary_message(message: &str) -> String {
+    let summary = message
+        .split_once(':')
+        .map_or(message, |(summary, _)| summary);
+    redact_log_text(summary.trim())
 }
 
 fn provider_diagnostic_message(provider: &str, summary: &str, diagnostics_json: &str) -> String {
@@ -1835,7 +2919,7 @@ fn provider_diagnostic_message(provider: &str, summary: &str, diagnostics_json: 
             message.push_str(stderr);
         }
     }
-    message
+    redact_log_text(&message)
 }
 
 fn baml_status(status: &BamlCoerceStatus) -> &'static str {
@@ -1864,9 +2948,9 @@ fn baml_exit_code(status: &BamlCoerceStatus) -> Option<i64> {
 
 fn baml_metadata(result: &BamlCoerceResult) -> String {
     json!({
-        "value": result.value_json.as_deref().map(json_from_str),
-        "error": result.error_json.as_deref().map(json_from_str),
-        "transcript": result.transcript,
+        "value": result.value_json.as_deref().map(json_payload_summary),
+        "error": result_error_payload(result.error_json.as_deref()),
+        "transcript": redacted_text_metadata(&result.transcript),
         "usage": json_from_str(&result.usage_json),
     })
     .to_string()
@@ -1898,9 +2982,9 @@ fn loft_exit_code(status: &LoftEffectStatus) -> Option<i64> {
 
 fn loft_metadata(result: &LoftEffectResult) -> String {
     json!({
-        "value": result.value_json.as_deref().map(json_from_str),
-        "error": result.error_json.as_deref().map(json_from_str),
-        "transcript": result.transcript,
+        "value": result.value_json.as_deref().map(json_payload_summary),
+        "error": result_error_payload(result.error_json.as_deref()),
+        "transcript": redacted_text_metadata(&result.transcript),
     })
     .to_string()
 }
@@ -1984,6 +3068,7 @@ mod tests {
         PiStyleAgentHarness,
     };
     use loft::{FakeLoftClient, LoftAction, LoftEffectRequest};
+    use native_lifecycle::{normalize_pi_rpc_event, AgentTurnLifecycleKind};
     use std::{fs, path::PathBuf, process::Command};
     use trace::check_trace;
     use whipplescript_parser::compile_program;
@@ -2429,6 +3514,7 @@ rule wait
             schema_id: Some("WorkItem"),
             provenance_class: "derived",
             correlation_id: None,
+            source_span_json: None,
         }];
         let effects = [NewEffect {
             effect_id: "tell",
@@ -2523,6 +3609,185 @@ rule wait
         assert_eq!(started.sequence, 2);
         assert_eq!(completed.sequence, 3);
         check_trace(kernel.trace()).expect("kernel trace conforms");
+    }
+
+    #[test]
+    fn run_native_agent_turn_records_lifecycle_artifacts_and_terminal() {
+        struct FakeAdapter {
+            capability: provider::ProviderCapability,
+            events: Vec<NativeProviderEvent>,
+        }
+
+        impl NativeProviderAdapter for FakeAdapter {
+            fn provider_id(&self) -> &str {
+                "native-fixture"
+            }
+
+            fn capability(&self) -> &provider::ProviderCapability {
+                &self.capability
+            }
+
+            fn start_turn(
+                &mut self,
+                request: NativeProviderTurnRequest,
+            ) -> Result<NativeProviderEvent, provider::NativeProviderBoundaryError> {
+                Ok(NativeProviderEvent {
+                    provider_id: "native-fixture".to_owned(),
+                    run_id: request.run_id,
+                    event_kind: NativeProviderEventKind::Started,
+                    provider_event_type: "fixture.turn.started".to_owned(),
+                    provider_session_id: Some("session-1".to_owned()),
+                    provider_turn_id: Some("turn-1".to_owned()),
+                    sequence: Some(1),
+                    evidence: json!({"started": true}),
+                    artifacts: Vec::new(),
+                })
+            }
+
+            fn next_event(
+                &mut self,
+                _run_id: &str,
+            ) -> Result<Option<NativeProviderEvent>, provider::NativeProviderBoundaryError>
+            {
+                Ok((!self.events.is_empty()).then(|| self.events.remove(0)))
+            }
+
+            fn cancel_turn(
+                &mut self,
+                _cancellation: provider::NativeProviderCancellation,
+            ) -> Result<NativeProviderEvent, provider::NativeProviderBoundaryError> {
+                unreachable!("cancel not used in this regression")
+            }
+        }
+
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let effects = [NewEffect {
+            effect_id: "tell",
+            kind: "agent.tell",
+            target: Some("worker"),
+            input_json: r#"{"prompt":"go"}"#,
+            status: "queued",
+            idempotency_key: "rule=start;effect=tell",
+            required_capabilities_json: "[]",
+            profile: Some("repo-writer"),
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commits");
+
+        let capability = provider::ProviderCapability {
+            provider_kind: provider::ProviderKind::Fixture,
+            surface: provider::AdapterSurface::Fixture,
+            protocol_version: Some("fixture.v1".to_owned()),
+            session_identity_fields: vec!["session".to_owned()],
+            stream_event_kinds: vec!["fixture.turn.started".to_owned()],
+            tool_policy: "fixture".to_owned(),
+            cancellation_depths: vec![provider::CancellationDepth::CooperativeRequest],
+            artifact_manifest: true,
+            health_checks: Vec::new(),
+            auth_requirements: Vec::new(),
+        };
+        let mut adapter = FakeAdapter {
+            capability,
+            events: vec![
+                NativeProviderEvent {
+                    provider_id: "native-fixture".to_owned(),
+                    run_id: "run-tell".to_owned(),
+                    event_kind: NativeProviderEventKind::ArtifactCaptured,
+                    provider_event_type: "fixture.artifact.captured".to_owned(),
+                    provider_session_id: Some("session-1".to_owned()),
+                    provider_turn_id: Some("turn-1".to_owned()),
+                    sequence: Some(2),
+                    evidence: json!({"artifact": true}),
+                    artifacts: vec![NativeProviderArtifactRef {
+                        artifact_id: Some("artifact-1".to_owned()),
+                        kind: "diff".to_owned(),
+                        uri: "provider://native-fixture/runs/run-tell/diff".to_owned(),
+                        content_hash: Some("sha256:abc".to_owned()),
+                        mime_type: Some("text/x-diff".to_owned()),
+                        required: true,
+                    }],
+                },
+                NativeProviderEvent {
+                    provider_id: "native-fixture".to_owned(),
+                    run_id: "run-tell".to_owned(),
+                    event_kind: NativeProviderEventKind::Completed,
+                    provider_event_type: "fixture.turn.completed".to_owned(),
+                    provider_session_id: Some("session-1".to_owned()),
+                    provider_turn_id: Some("turn-1".to_owned()),
+                    sequence: Some(3),
+                    evidence: json!({"completed": true}),
+                    artifacts: Vec::new(),
+                },
+            ],
+        };
+
+        let request = NativeProviderTurnRequest {
+            provider_id: "native-fixture".to_owned(),
+            provider_kind: provider::ProviderKind::Fixture,
+            surface: provider::AdapterSurface::Fixture,
+            run_id: "run-tell".to_owned(),
+            effect_id: "tell".to_owned(),
+            agent: "worker".to_owned(),
+            profile: Some("repo-writer".to_owned()),
+            prompt_json: json!({"prompt": "go"}),
+            workspace_policy: "isolated".to_owned(),
+            required_capabilities: Vec::new(),
+            cancellation_depth: provider::CancellationDepth::CooperativeRequest,
+            artifact_policy: "metadata".to_owned(),
+            credential_ref: None,
+            provider_options: std::collections::BTreeMap::new(),
+        };
+
+        let terminal = kernel
+            .run_native_agent_turn(
+                AgentTurnExecution {
+                    instance_id: "instance-a",
+                    effect_id: "tell",
+                    run_id: "run-tell",
+                    provider: "native-fixture",
+                    worker_id: "worker-1",
+                    lease_id: "lease-tell",
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    agent: "worker",
+                    profile: Some("repo-writer"),
+                    input_json: r#"{"prompt":"go"}"#,
+                    skill_names: &[],
+                },
+                request,
+                &mut adapter,
+                8,
+            )
+            .expect("native turn completes");
+        assert!(terminal.sequence > 1);
+
+        let runs = kernel.store.list_runs("instance-a").expect("runs list");
+        assert_eq!(runs[0].status, "completed");
+        let artifacts = kernel
+            .store
+            .list_artifacts_for_run("run-tell")
+            .expect("artifacts list");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].kind, "diff");
+        let facts = kernel.store.list_facts("instance-a").expect("facts list");
+        assert!(facts.iter().any(|fact| fact.name == "agent.turn.started"));
+        assert!(facts
+            .iter()
+            .any(|fact| fact.name == "agent.turn.artifact_captured"));
+        assert!(facts.iter().any(|fact| fact.name == "agent.turn.completed"));
     }
 
     #[test]
@@ -2892,7 +4157,7 @@ rule wait
 
         assert_eq!(terminal.sequence, 3);
         check_trace(kernel.trace()).expect("kernel trace conforms");
-        let store = kernel.into_store();
+        let mut store = kernel.into_store();
         let artifacts = store
             .list_artifacts_for_run("run-tell")
             .expect("artifacts list");
@@ -2909,12 +4174,51 @@ rule wait
             .iter()
             .any(|evidence| evidence.kind == "skills.injected"
                 && evidence.metadata_json.contains("loft-user")));
-        assert!(evidence
+        let provider_evidence = evidence
             .iter()
-            .any(|evidence| evidence.kind == "agent.turn.provider"
-                && evidence.metadata_json.contains("mock stdout")
-                && evidence.metadata_json.contains("mock transcript")
-                && evidence.metadata_json.contains("artifact_ids")));
+            .find(|evidence| evidence.kind == "agent.turn.provider")
+            .expect("provider evidence recorded");
+        let provider_metadata = serde_json::from_str::<Value>(&provider_evidence.metadata_json)
+            .expect("provider metadata json");
+        assert_eq!(
+            provider_metadata
+                .pointer("/stdout/redacted")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            provider_metadata
+                .pointer("/transcript/redacted")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(provider_metadata.get("artifact_ids").is_some());
+        assert_eq!(
+            provider_metadata
+                .pointer("/artifact_manifest/schema_version")
+                .and_then(Value::as_str),
+            Some(artifact_manifest::ARTIFACT_MANIFEST_SCHEMA_VERSION)
+        );
+        artifact_manifest::validate_artifact_manifest(
+            provider_metadata
+                .get("artifact_manifest")
+                .expect("artifact manifest"),
+        )
+        .expect("artifact manifest validates");
+        assert_eq!(
+            provider_metadata
+                .pointer("/artifact_manifest/entries/0/artifact_id")
+                .and_then(Value::as_str),
+            Some(artifacts[0].artifact_id.as_str())
+        );
+        assert_eq!(
+            provider_metadata
+                .pointer("/artifact_manifest/entries/0/retention_policy")
+                .and_then(Value::as_str),
+            Some("provider_default")
+        );
+        assert!(!provider_evidence.metadata_json.contains("mock stdout"));
+        assert!(!provider_evidence.metadata_json.contains("mock transcript"));
         let links = store
             .list_evidence_links(&instance_id)
             .expect("evidence links list");
@@ -2926,9 +4230,369 @@ rule wait
         assert!(facts.iter().any(|fact| fact.name == "agent.turn.completed"
             && fact.value_json.contains("\"provider\":\"mock\"")));
         let events = store.list_events(&instance_id).expect("events list");
+        let terminal_event = events
+            .iter()
+            .find(|event| event.event_type == "effect.terminal")
+            .expect("terminal event exists");
+        let terminal_payload =
+            serde_json::from_str::<Value>(&terminal_event.payload_json).expect("terminal payload");
+        assert!(terminal_payload
+            .pointer("/metadata/provider_correlation_id")
+            .and_then(Value::as_str)
+            .is_some());
+        assert!(terminal_payload
+            .pointer("/metadata/terminal_payload_hash")
+            .and_then(Value::as_str)
+            .is_some());
         assert!(events
             .iter()
             .any(|event| event.event_type == "agent.turn.completed"));
+
+        store
+            .rebuild_projections(&instance_id)
+            .expect("projections rebuild");
+        let replayed_artifacts = store
+            .list_artifacts_for_run("run-tell")
+            .expect("replayed artifacts list");
+        assert_eq!(replayed_artifacts.len(), 1);
+        assert_eq!(replayed_artifacts[0].artifact_id, artifacts[0].artifact_id);
+    }
+
+    #[test]
+    fn native_provider_lifecycle_observation_records_event_and_fact() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version(ProgramVersionInput {
+                program_name: "NativeLifecycle",
+                source_hash: "source",
+                ir_hash: "ir",
+                compiler_version: "test",
+            })
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        let observation = normalize_pi_rpc_event(&json!({
+            "type": "turn_end",
+            "message": {
+                "role": "assistant",
+                "stopReason": "aborted",
+                "content": [{"type": "text", "text": "secret"}],
+            },
+        }))
+        .expect("Pi event normalizes");
+        assert_eq!(observation.kind, AgentTurnLifecycleKind::Cancelled);
+
+        kernel
+            .record_native_agent_turn_observation(
+                AgentTurnExecution {
+                    instance_id: &instance_id,
+                    effect_id: "tell",
+                    run_id: "run-tell",
+                    provider: "pi-main",
+                    worker_id: "worker-1",
+                    lease_id: "lease-tell",
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    agent: "worker",
+                    profile: Some("repo-reader"),
+                    input_json: r#"{"prompt":"go"}"#,
+                    skill_names: &[],
+                },
+                &observation,
+                "pi-turn-end-1",
+            )
+            .expect("native lifecycle records");
+
+        let store = kernel.into_store();
+        let events = store.list_events(&instance_id).expect("events list");
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "agent.turn.cancelled")
+            .expect("cancelled event recorded");
+        let payload = serde_json::from_str::<Value>(&event.payload_json).expect("payload json");
+        assert_eq!(
+            payload.get("provider_event_type").and_then(Value::as_str),
+            Some("turn_end")
+        );
+        assert_eq!(payload.get("terminal").and_then(Value::as_bool), Some(true));
+        let evidence_id = payload
+            .get("evidence_id")
+            .and_then(Value::as_str)
+            .expect("event links evidence");
+        assert!(!event.payload_json.contains("secret"));
+
+        let facts = store.list_facts(&instance_id).expect("facts list");
+        assert!(facts.iter().any(|fact| {
+            fact.name == "agent.turn.cancelled"
+                && fact.key == "run-tell"
+                && !fact.value_json.contains("secret")
+        }));
+        let evidence = store.list_evidence(&instance_id).expect("evidence lists");
+        let native_evidence = evidence
+            .iter()
+            .find(|evidence| evidence.evidence_id == evidence_id)
+            .expect("native lifecycle evidence recorded");
+        assert_eq!(native_evidence.kind, "agent.turn.native_event");
+        assert_eq!(native_evidence.subject_type, "run");
+        assert_eq!(native_evidence.subject_id, "run-tell");
+        assert!(!native_evidence.metadata_json.contains("secret"));
+    }
+
+    #[test]
+    fn artifact_capture_failure_records_redacted_event_and_diagnostic() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version(ProgramVersionInput {
+                program_name: "ArtifactFailure",
+                source_hash: "source",
+                ir_hash: "ir",
+                compiler_version: "test",
+            })
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+
+        let event = kernel
+            .record_artifact_capture_failure(
+                AgentTurnExecution {
+                    instance_id: &instance_id,
+                    effect_id: "tell",
+                    run_id: "run-tell",
+                    provider: "codex",
+                    worker_id: "worker-1",
+                    lease_id: "lease-tell",
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    agent: "worker",
+                    profile: Some("repo-writer"),
+                    input_json: "{}",
+                    skill_names: &[],
+                },
+                ArtifactCaptureFailure {
+                    provider: "codex",
+                    adapter: "app_server",
+                    run_id: "run-tell",
+                    artifact_ref: "provider://codex/runs/run-tell/diff",
+                    error_kind: "hash_mismatch",
+                    recoverable: false,
+                    message: "secret hash mismatch details",
+                    transcript_ref: Some("provider://codex/runs/run-tell/transcript_ref"),
+                    stderr_ref: None,
+                },
+                Some("artifact-capture-failed-run-tell"),
+            )
+            .expect("artifact capture failure records");
+
+        let store = kernel.into_store();
+        let events = store.list_events(&instance_id).expect("events list");
+        let capture_event = events
+            .iter()
+            .find(|stored| stored.event_id == event.event_id)
+            .expect("capture failure event exists");
+        assert_eq!(
+            capture_event.event_type,
+            artifact_manifest::ARTIFACT_CAPTURE_FAILED_EVENT
+        );
+        assert!(capture_event
+            .payload_json
+            .contains("\"error_kind\":\"hash_mismatch\""));
+        assert!(!capture_event
+            .payload_json
+            .contains("secret hash mismatch details"));
+        let diagnostics = store
+            .list_diagnostics(Some(&instance_id))
+            .expect("diagnostics list");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code.as_deref(),
+            Some(artifact_manifest::ARTIFACT_CAPTURE_FAILED_EVENT)
+        );
+        assert_eq!(
+            diagnostics[0].event_id.as_deref(),
+            Some(event.event_id.as_str())
+        );
+        assert_eq!(diagnostics[0].effect_id.as_deref(), Some("tell"));
+        assert_eq!(diagnostics[0].run_id.as_deref(), Some("run-tell"));
+    }
+
+    #[test]
+    fn provider_secret_seed_never_reaches_durable_records() {
+        struct SecretSeedHarness;
+
+        impl AgentHarness for SecretSeedHarness {
+            fn run(&self, _request: AgentTurnRequest) -> ProviderRunResult {
+                let secret = "sk-test-secret-token-1234567890";
+                ProviderRunResult {
+                    status: ProviderRunStatus::Failed,
+                    summary: format!("provider failed with token={secret}"),
+                    stdout: format!("stdout {secret}\n"),
+                    stderr: format!("stderr Bearer {secret}\n"),
+                    transcript: format!("transcript api_key={secret}\n"),
+                    exit_code: Some(1),
+                    usage_json: r#"{"input_tokens":1,"output_tokens":0}"#.to_owned(),
+                    artifacts: vec![harness::ProviderArtifact {
+                        kind: "transcript".to_owned(),
+                        path: format!("provider://codex/runs/run-tell/{secret}/transcript_ref"),
+                        content_hash: Some(format!("sha256:{secret}")),
+                        mime_type: Some("text/plain".to_owned()),
+                    }],
+                    failure: Some(
+                        ProviderFailure::new(
+                            "provider.fixture.failed",
+                            "fixture_failure",
+                            format!("failure token={secret}: stderr {secret}"),
+                        )
+                        .provider("codex")
+                        .adapter("fixture")
+                        .raw_json(format!(r#"{{"api_key":"{secret}","shape":"object"}}"#)),
+                    ),
+                }
+            }
+        }
+
+        let secret = "sk-test-secret-token-1234567890";
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version(ProgramVersionInput {
+                program_name: "SecretSeed",
+                source_hash: "source",
+                ir_hash: "ir",
+                compiler_version: "test",
+            })
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        let effects = [NewEffect {
+            effect_id: "tell",
+            kind: "agent.tell",
+            target: Some("worker"),
+            input_json: "{}",
+            status: "queued",
+            idempotency_key: "effect-tell",
+            required_capabilities_json: "[]",
+            profile: Some("repo-writer"),
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start-secret-seed"),
+            })
+            .expect("rule commits");
+
+        kernel
+            .run_agent_turn(
+                AgentTurnExecution {
+                    instance_id: &instance_id,
+                    effect_id: "tell",
+                    run_id: "run-tell",
+                    provider: "codex",
+                    worker_id: "worker-1",
+                    lease_id: "lease-tell",
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    agent: "worker",
+                    profile: Some("repo-writer"),
+                    input_json: r#"{"prompt":"go"}"#,
+                    skill_names: &[],
+                },
+                &SecretSeedHarness,
+            )
+            .expect("secret-seeded turn runs");
+
+        let store = kernel.into_store();
+        let events = store.list_events(&instance_id).expect("events list");
+        for event in &events {
+            assert!(
+                !event.payload_json.contains(secret),
+                "event {} leaked secret: {}",
+                event.event_type,
+                event.payload_json
+            );
+        }
+        let terminal_event = events
+            .iter()
+            .find(|event| event.event_type == "effect.terminal")
+            .expect("terminal event exists");
+        let terminal_payload =
+            serde_json::from_str::<Value>(&terminal_event.payload_json).expect("terminal payload");
+        assert_eq!(
+            terminal_payload.pointer("/summary").and_then(Value::as_str),
+            Some("provider failed with token=[REDACTED]")
+        );
+        assert_eq!(
+            terminal_payload
+                .pointer("/metadata/stderr/redacted")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        for fact in store.list_facts(&instance_id).expect("facts list") {
+            assert!(
+                !fact.value_json.contains(secret),
+                "fact {} leaked secret: {}",
+                fact.name,
+                fact.value_json
+            );
+        }
+        for evidence in store.list_evidence(&instance_id).expect("evidence list") {
+            assert!(
+                !evidence
+                    .summary
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(secret),
+                "evidence {} summary leaked secret",
+                evidence.kind
+            );
+            assert!(
+                !evidence.metadata_json.contains(secret),
+                "evidence {} metadata leaked secret: {}",
+                evidence.kind,
+                evidence.metadata_json
+            );
+        }
+        for artifact in store
+            .list_artifacts_for_run("run-tell")
+            .expect("artifacts list")
+        {
+            assert!(
+                !artifact.path.contains(secret),
+                "artifact path leaked secret: {}",
+                artifact.path
+            );
+            assert_eq!(artifact.path, "[REDACTED]");
+            assert!(
+                !artifact
+                    .content_hash
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(secret),
+                "artifact content hash leaked secret: {:?}",
+                artifact.content_hash
+            );
+        }
+        for diagnostic in store
+            .list_diagnostics(Some(&instance_id))
+            .expect("diagnostics list")
+        {
+            assert!(
+                !diagnostic.message.contains(secret),
+                "diagnostic leaked secret: {}",
+                diagnostic.message
+            );
+        }
     }
 
     #[test]
@@ -3205,6 +4869,652 @@ rule wait
     }
 
     #[test]
+    fn required_artifact_capture_failure_prevents_successful_terminal_completion() {
+        struct CompletedWithArtifactFailureHarness;
+
+        impl AgentHarness for CompletedWithArtifactFailureHarness {
+            fn run(&self, _request: AgentTurnRequest) -> ProviderRunResult {
+                ProviderRunResult {
+                    status: ProviderRunStatus::Completed,
+                    summary: "provider completed before required artifact capture failed"
+                        .to_owned(),
+                    stdout: String::new(),
+                    stderr: "artifact capture stderr".to_owned(),
+                    transcript: "artifact capture transcript".to_owned(),
+                    exit_code: Some(0),
+                    usage_json: "{}".to_owned(),
+                    artifacts: Vec::new(),
+                    failure: Some(
+                        ProviderFailure::new(
+                            artifact_manifest::ARTIFACT_CAPTURE_FAILED_EVENT,
+                            "missing",
+                            "required artifact was missing",
+                        )
+                        .provider("codex")
+                        .adapter("app_server"),
+                    ),
+                }
+            }
+        }
+
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version(ProgramVersionInput {
+                program_name: "RequiredArtifactFailure",
+                source_hash: "source",
+                ir_hash: "ir",
+                compiler_version: "test",
+            })
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[NewEffect {
+                    effect_id: "tell",
+                    kind: "agent.tell",
+                    target: Some("worker"),
+                    input_json: r#"{"prompt":"go"}"#,
+                    status: "queued",
+                    idempotency_key: "rule=start;effect=tell",
+                    required_capabilities_json: "[]",
+                    profile: Some("repo-writer"),
+                    correlation_id: None,
+                    source_span_json: None,
+                }],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start-artifact-failure"),
+            })
+            .expect("rule commits");
+
+        kernel
+            .run_agent_turn(
+                AgentTurnExecution {
+                    instance_id: &instance_id,
+                    effect_id: "tell",
+                    run_id: "run-tell",
+                    provider: "codex",
+                    worker_id: "worker-1",
+                    lease_id: "lease-tell",
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    agent: "worker",
+                    profile: Some("repo-writer"),
+                    input_json: r#"{"prompt":"go"}"#,
+                    skill_names: &[],
+                },
+                &CompletedWithArtifactFailureHarness,
+            )
+            .expect("turn records artifact capture failure");
+
+        check_trace(kernel.trace()).expect("kernel trace conforms");
+        let store = kernel.into_store();
+        let effect = store
+            .list_effects(&instance_id)
+            .expect("effects list")
+            .pop()
+            .expect("effect exists");
+        assert_eq!(effect.status, "failed");
+        let events = store.list_events(&instance_id).expect("events list");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "effect.terminal"
+                && event.payload_json.contains("\"status\":\"failed\"")
+                && event
+                    .payload_json
+                    .contains("\"phase\":\"artifact.capture.failed\"")));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "agent.turn.failed"
+                && event.payload_json.contains("\"error_kind\":\"missing\"")));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "agent.turn.completed"));
+    }
+
+    #[test]
+    fn recovery_appends_terminal_from_provider_evidence_once_after_append_gap() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version(ProgramVersionInput {
+                program_name: "ProviderTerminalRecovery",
+                source_hash: "source",
+                ir_hash: "ir",
+                compiler_version: "test",
+            })
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[NewEffect {
+                    effect_id: "tell",
+                    kind: "agent.tell",
+                    target: Some("worker"),
+                    input_json: r#"{"prompt":"go"}"#,
+                    status: "queued",
+                    idempotency_key: "rule=start;effect=tell",
+                    required_capabilities_json: "[]",
+                    profile: Some("repo-writer"),
+                    correlation_id: None,
+                    source_span_json: None,
+                }],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start-recovery"),
+            })
+            .expect("rule commits");
+        kernel
+            .start_run(RunStart {
+                instance_id: &instance_id,
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "codex",
+                worker_id: "worker-1",
+                lease_id: "lease-tell",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        let provider_metadata = json!({
+            "effect_id": "tell",
+            "agent": "worker",
+            "profile": "repo-writer",
+            "status": "completed",
+            "stdout": {"redacted": true, "bytes": 0, "chars": 0},
+            "stderr": {"redacted": true, "bytes": 0, "chars": 0},
+            "transcript": {"redacted": true, "bytes": 0, "chars": 0},
+            "exit_code": 0,
+            "usage": {},
+            "artifact_ids": [],
+            "failure": null,
+        })
+        .to_string();
+        let evidence_id = kernel
+            .store
+            .record_evidence(EvidenceRecord {
+                instance_id: &instance_id,
+                kind: "agent.turn.provider",
+                subject_type: "run",
+                subject_id: "run-tell",
+                causation_id: Some("tell"),
+                correlation_id: Some("provider-terminal-gap"),
+                summary: Some("provider completed before terminal append gap"),
+                metadata_json: &provider_metadata,
+            })
+            .expect("provider evidence records");
+
+        let recovered = kernel
+            .recover_provider_terminal_from_evidence(AgentTurnExecution {
+                instance_id: &instance_id,
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "codex",
+                worker_id: "worker-1",
+                lease_id: "lease-tell",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                agent: "worker",
+                profile: Some("repo-writer"),
+                input_json: r#"{"prompt":"go"}"#,
+                skill_names: &[],
+            })
+            .expect("terminal recovery succeeds");
+        assert!(recovered.is_some());
+        let duplicate = kernel
+            .recover_provider_terminal_from_evidence(AgentTurnExecution {
+                instance_id: &instance_id,
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "codex",
+                worker_id: "worker-1",
+                lease_id: "lease-tell",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                agent: "worker",
+                profile: Some("repo-writer"),
+                input_json: r#"{"prompt":"go"}"#,
+                skill_names: &[],
+            })
+            .expect("duplicate recovery is idempotent");
+        assert!(duplicate.is_none());
+
+        check_trace(kernel.trace()).expect("kernel trace conforms");
+        let store = kernel.into_store();
+        let effects = store.list_effects(&instance_id).expect("effects list");
+        assert_eq!(effects[0].status, "completed");
+        let events = store.list_events(&instance_id).expect("events list");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "effect.terminal"
+                    && event.payload_json.contains("\"run_id\":\"run-tell\""))
+                .count(),
+            1
+        );
+        let terminal = events
+            .iter()
+            .find(|event| event.event_type == "effect.terminal")
+            .expect("terminal event exists");
+        assert!(terminal
+            .payload_json
+            .contains("\"recovery\":\"provider_evidence_terminal\""));
+        assert!(terminal.payload_json.contains(&evidence_id));
+        let terminal_payload =
+            serde_json::from_str::<Value>(&terminal.payload_json).expect("terminal payload");
+        assert_eq!(
+            terminal_payload
+                .pointer("/metadata/provider_correlation_id")
+                .and_then(Value::as_str),
+            Some("provider-terminal-gap")
+        );
+        assert!(terminal_payload
+            .pointer("/metadata/terminal_payload_hash")
+            .and_then(Value::as_str)
+            .is_some());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "agent.turn.completed")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_artifact_evidence_after_capture_before_terminal_gap() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version(ProgramVersionInput {
+                program_name: "ArtifactRecovery",
+                source_hash: "source",
+                ir_hash: "ir",
+                compiler_version: "test",
+            })
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[NewEffect {
+                    effect_id: "tell",
+                    kind: "agent.tell",
+                    target: Some("worker"),
+                    input_json: r#"{"prompt":"go"}"#,
+                    status: "queued",
+                    idempotency_key: "rule=start;effect=tell",
+                    required_capabilities_json: "[]",
+                    profile: Some("repo-writer"),
+                    correlation_id: None,
+                    source_span_json: None,
+                }],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start-artifact-recovery"),
+            })
+            .expect("rule commits");
+        kernel
+            .start_run(RunStart {
+                instance_id: &instance_id,
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "codex",
+                worker_id: "worker-1",
+                lease_id: "lease-tell",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        let artifact_id = kernel
+            .store
+            .record_artifact(ArtifactRecord {
+                run_id: "run-tell",
+                kind: "transcript_ref",
+                path: "provider://codex/runs/run-tell/transcript_ref",
+                content_hash: None,
+                mime_type: Some("text/plain"),
+            })
+            .expect("artifact records before terminal gap");
+        let provider_metadata = json!({
+            "effect_id": "tell",
+            "agent": "worker",
+            "profile": "repo-writer",
+            "status": "completed",
+            "stdout": {"redacted": true, "bytes": 0, "chars": 0},
+            "stderr": {"redacted": true, "bytes": 0, "chars": 0},
+            "transcript": {"redacted": true, "bytes": 0, "chars": 0},
+            "exit_code": 0,
+            "usage": {},
+            "artifact_ids": [artifact_id],
+            "artifact_manifest": {
+                "schema_version": artifact_manifest::ARTIFACT_MANIFEST_SCHEMA_VERSION,
+                "entry_count": 1,
+                "entries": [{
+                    "artifact_id": artifact_id,
+                    "kind": "transcript_ref",
+                    "uri": {
+                        "type": "ref",
+                        "value": "provider://codex/runs/run-tell/transcript_ref"
+                    },
+                    "content_hash": null,
+                    "mime_type": "text/plain",
+                    "size_bytes": null,
+                    "redaction_status": "unredacted_metadata_only",
+                    "retention_policy": "provider_default",
+                    "required": false,
+                    "source_provider_event": null
+                }]
+            },
+            "failure": null,
+        })
+        .to_string();
+        kernel
+            .store
+            .record_evidence(EvidenceRecord {
+                instance_id: &instance_id,
+                kind: "agent.turn.provider",
+                subject_type: "run",
+                subject_id: "run-tell",
+                causation_id: Some("tell"),
+                correlation_id: Some("provider-artifact-terminal-gap"),
+                summary: Some("provider completed with artifact before terminal append gap"),
+                metadata_json: &provider_metadata,
+            })
+            .expect("provider evidence records");
+
+        let recovered = kernel
+            .recover_provider_terminal_from_evidence(AgentTurnExecution {
+                instance_id: &instance_id,
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "codex",
+                worker_id: "worker-1",
+                lease_id: "lease-tell",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                agent: "worker",
+                profile: Some("repo-writer"),
+                input_json: r#"{"prompt":"go"}"#,
+                skill_names: &[],
+            })
+            .expect("terminal recovery succeeds");
+        assert!(recovered.is_some());
+
+        let store = kernel.into_store();
+        let artifacts = store
+            .list_artifacts_for_run("run-tell")
+            .expect("artifacts list");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].artifact_id, artifact_id);
+        let terminal = store
+            .list_events(&instance_id)
+            .expect("events list")
+            .into_iter()
+            .find(|event| event.event_type == "effect.terminal")
+            .expect("terminal exists");
+        assert!(terminal.payload_json.contains(&artifact_id));
+    }
+
+    #[test]
+    fn restart_reconciles_running_provider_run_with_persisted_terminal_evidence() {
+        let store_path = std::env::temp_dir().join(format!(
+            "whip-kernel-provider-recovery-{}.sqlite",
+            idempotency_key(&["provider-recovery", "store"])
+        ));
+        let _ = fs::remove_file(&store_path);
+        let store = SqliteStore::open(&store_path).expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version(ProgramVersionInput {
+                program_name: "RestartProviderRecovery",
+                source_hash: "source",
+                ir_hash: "ir",
+                compiler_version: "test",
+            })
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[NewEffect {
+                    effect_id: "tell",
+                    kind: "agent.tell",
+                    target: Some("worker"),
+                    input_json: r#"{"prompt":"go"}"#,
+                    status: "queued",
+                    idempotency_key: "rule=start;effect=tell",
+                    required_capabilities_json: "[]",
+                    profile: Some("repo-writer"),
+                    correlation_id: None,
+                    source_span_json: None,
+                }],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start-restart-provider-recovery"),
+            })
+            .expect("rule commits");
+        kernel
+            .start_run(RunStart {
+                instance_id: &instance_id,
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "codex",
+                worker_id: "worker-1",
+                lease_id: "lease-tell",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        let provider_metadata = json!({
+            "effect_id": "tell",
+            "agent": "worker",
+            "profile": "repo-writer",
+            "status": "completed",
+            "stdout": {"redacted": true, "bytes": 0, "chars": 0},
+            "stderr": {"redacted": true, "bytes": 0, "chars": 0},
+            "transcript": {"redacted": true, "bytes": 0, "chars": 0},
+            "exit_code": 0,
+            "usage": {},
+            "artifact_ids": [],
+            "failure": null,
+        })
+        .to_string();
+        kernel
+            .store
+            .record_evidence(EvidenceRecord {
+                instance_id: &instance_id,
+                kind: "agent.turn.provider",
+                subject_type: "run",
+                subject_id: "run-tell",
+                causation_id: Some("tell"),
+                correlation_id: Some("provider-restart-terminal-gap"),
+                summary: Some("provider completed before worker restart"),
+                metadata_json: &provider_metadata,
+            })
+            .expect("provider evidence records");
+        drop(kernel);
+
+        let store = SqliteStore::open(&store_path).expect("store reopens after restart");
+        let mut restarted = RuntimeKernel::new(store);
+        let recovered = restarted
+            .recover_running_provider_runs(&instance_id)
+            .expect("running provider runs recover");
+        assert_eq!(recovered.len(), 1);
+        let duplicate = restarted
+            .recover_running_provider_runs(&instance_id)
+            .expect("duplicate restart recovery is idempotent");
+        assert!(duplicate.is_empty());
+
+        let store = restarted.into_store();
+        let effects = store.list_effects(&instance_id).expect("effects list");
+        assert_eq!(effects[0].status, "completed");
+        let events = store.list_events(&instance_id).expect("events list");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "effect.terminal"
+                    && event.payload_json.contains("\"run_id\":\"run-tell\""))
+                .count(),
+            1
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "agent.turn.completed"));
+
+        let _ = fs::remove_file(store_path);
+    }
+
+    #[test]
+    fn restart_recovers_running_pi_native_run_from_terminal_evidence() {
+        let store_path = std::env::temp_dir().join(format!(
+            "whip-kernel-pi-native-recovery-{}.sqlite",
+            idempotency_key(&["pi-native-provider-recovery", "store"])
+        ));
+        let _ = fs::remove_file(&store_path);
+        let store = SqliteStore::open(&store_path).expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version(ProgramVersionInput {
+                program_name: "RestartPiNativeRecovery",
+                source_hash: "source",
+                ir_hash: "ir",
+                compiler_version: "test",
+            })
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[NewEffect {
+                    effect_id: "tell",
+                    kind: "agent.tell",
+                    target: Some("pi"),
+                    input_json: r#"{"prompt":"go"}"#,
+                    status: "queued",
+                    idempotency_key: "rule=start;effect=tell",
+                    required_capabilities_json: "[]",
+                    profile: Some("repo-reader"),
+                    correlation_id: None,
+                    source_span_json: None,
+                }],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start-pi-native-recovery"),
+            })
+            .expect("rule commits");
+        kernel
+            .start_run(RunStart {
+                instance_id: &instance_id,
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "pi",
+                worker_id: "worker-1",
+                lease_id: "lease-tell",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        let native_metadata = json!({
+            "effect_id": "tell",
+            "agent": "pi",
+            "profile": "repo-reader",
+            "provider": "pi",
+            "native_event": {
+                "provider_id": "pi",
+                "run_id": "run-tell",
+                "event_kind": "completed",
+                "terminal": true,
+                "provider_event_type": "turn_end",
+                "provider_session_id": "pi-session-1",
+                "provider_turn_id": "pi-turn-1",
+                "sequence": 4,
+                "evidence_shape": {"type": "object", "keys": 2},
+                "artifacts": []
+            },
+            "artifact_ids": []
+        })
+        .to_string();
+        kernel
+            .store
+            .record_evidence(EvidenceRecord {
+                instance_id: &instance_id,
+                kind: "agent.turn.native_provider",
+                subject_type: "run",
+                subject_id: "run-tell",
+                causation_id: Some("tell"),
+                correlation_id: Some("native-pi-terminal-gap"),
+                summary: Some("completed native provider event from turn_end"),
+                metadata_json: &native_metadata,
+            })
+            .expect("native provider evidence records");
+        drop(kernel);
+
+        let store = SqliteStore::open(&store_path).expect("store reopens after restart");
+        let mut restarted = RuntimeKernel::new(store);
+        let recovered = restarted
+            .recover_running_provider_runs(&instance_id)
+            .expect("running native provider runs recover");
+        assert_eq!(recovered.len(), 1);
+        let duplicate = restarted
+            .recover_running_provider_runs(&instance_id)
+            .expect("duplicate native provider recovery is idempotent");
+        assert!(duplicate.is_empty());
+
+        let store = restarted.into_store();
+        let effects = store.list_effects(&instance_id).expect("effects list");
+        assert_eq!(effects[0].status, "completed");
+        let events = store.list_events(&instance_id).expect("events list");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "effect.terminal"
+                    && event.payload_json.contains("\"run_id\":\"run-tell\""))
+                .count(),
+            1
+        );
+        let terminal = events
+            .iter()
+            .find(|event| event.event_type == "effect.terminal")
+            .expect("terminal event exists");
+        assert!(terminal
+            .payload_json
+            .contains("\"provider_event_type\":\"turn_end\""));
+        assert!(terminal.payload_json.contains("pi-session-1"));
+
+        let _ = fs::remove_file(store_path);
+    }
+
+    #[test]
     fn real_codex_failure_reaches_event_stream() {
         if !command_exists("codex") {
             eprintln!("skipping real Codex failure smoke: codex not found on PATH");
@@ -3328,11 +5638,27 @@ rule wait
         let store = kernel.into_store();
         let evidence = store.list_evidence(&instance_id).expect("evidence lists");
         assert_eq!(evidence.len(), 2);
-        assert!(evidence
+        let baml_evidence = evidence
             .iter()
-            .any(|evidence| evidence.kind == "baml.coerce.provider"
-                && evidence.metadata_json.contains("reviewWork")
-                && evidence.metadata_json.contains("baml-source")));
+            .find(|evidence| evidence.kind == "baml.coerce.provider")
+            .expect("baml provider evidence recorded");
+        assert!(baml_evidence.metadata_json.contains("reviewWork"));
+        assert!(baml_evidence.metadata_json.contains("baml-source"));
+        let baml_metadata = serde_json::from_str::<Value>(&baml_evidence.metadata_json)
+            .expect("baml metadata json");
+        assert_eq!(
+            baml_metadata
+                .pointer("/arguments/redacted")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            baml_metadata
+                .pointer("/arguments/shape/type")
+                .and_then(Value::as_str),
+            Some("object")
+        );
+        assert!(!baml_evidence.metadata_json.contains(r#""summary":"done""#));
         let facts = store.list_facts(&instance_id).expect("facts list");
         assert!(facts.iter().any(|fact| fact.name == "baml.coerce.succeeded"
             && fact.value_json.contains("\"status\":\"Accept\"")));
@@ -3416,7 +5742,8 @@ rule wait
                 && effect_id == "review"
                 && provider == "fake-baml"
                 && *status == EffectStatus::Failed
-                && diagnostics_json.contains("invalid output")
+                && diagnostics_json.contains("\"redacted\":true")
+                && !diagnostics_json.contains("invalid output")
         )));
         check_trace(kernel.trace()).expect("kernel trace conforms");
         let store = kernel.into_store();
@@ -3427,13 +5754,15 @@ rule wait
         assert_eq!(diagnostics[0].code.as_deref(), Some("baml.coerce.failed"));
         assert_eq!(diagnostics[0].subject_id.as_deref(), Some("review"));
         assert_eq!(diagnostics[0].run_id.as_deref(), Some("run-review"));
-        assert!(diagnostics[0].message.contains("invalid output"));
+        assert!(!diagnostics[0].message.contains("invalid output"));
 
         let facts = store.list_facts(&instance_id).expect("facts list");
-        assert!(facts
+        let failed_fact = facts
             .iter()
-            .any(|fact| fact.name == "baml.coerce.failed"
-                && fact.value_json.contains("invalid output")));
+            .find(|fact| fact.name == "baml.coerce.failed")
+            .expect("failed baml fact");
+        assert!(failed_fact.value_json.contains("\"redacted\":true"));
+        assert!(!failed_fact.value_json.contains("invalid output"));
     }
 
     #[test]
@@ -3624,7 +5953,8 @@ rule wait
                 && effect_id == "claim"
                 && provider == "fake-loft"
                 && *status == EffectStatus::Failed
-                && diagnostics_json.contains("issue already leased")
+                && diagnostics_json.contains("\"redacted\":true")
+                && !diagnostics_json.contains("issue already leased")
         )));
         check_trace(kernel.trace()).expect("kernel trace conforms");
         let store = kernel.into_store();
@@ -3632,14 +5962,18 @@ rule wait
             .list_diagnostics(Some(&instance_id))
             .expect("diagnostics list");
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code.as_deref(), Some("loft.failed"));
+        assert_eq!(diagnostics[0].code.as_deref(), Some("loft.claim.failed"));
         assert_eq!(diagnostics[0].subject_id.as_deref(), Some("claim"));
         assert_eq!(diagnostics[0].run_id.as_deref(), Some("run-claim"));
-        assert!(diagnostics[0].message.contains("issue already leased"));
+        assert!(!diagnostics[0].message.contains("issue already leased"));
 
         let facts = store.list_facts(&instance_id).expect("facts list");
-        assert!(facts.iter().any(|fact| fact.name == "loft.claim.failed"
-            && fact.value_json.contains("issue already leased")));
+        let failed_fact = facts
+            .iter()
+            .find(|fact| fact.name == "loft.claim.failed")
+            .expect("failed loft fact");
+        assert!(failed_fact.value_json.contains("\"redacted\":true"));
+        assert!(!failed_fact.value_json.contains("issue already leased"));
     }
 
     #[test]
@@ -3888,20 +6222,35 @@ rule wait
 
         let store = kernel.into_store();
         let events = store.list_events(&instance_id).expect("events list");
-        assert!(
-            events
-                .iter()
-                .any(|event| event.event_type == "effect.terminal"
-                    && event.payload_json.contains("\"status\":\"failed\"")
-                    && event
-                        .payload_json
-                        .contains("\"phase\":\"provider.exit.failed\"")
-                    && event
-                        .payload_json
-                        .contains("\"error_kind\":\"nonzero_exit\"")
-                    && event.payload_json.contains(expected_stderr)),
-            "missing failed terminal event for {provider}: {events:#?}"
+        let terminal_event = events
+            .iter()
+            .find(|event| event.event_type == "effect.terminal")
+            .expect("failed terminal event");
+        let terminal_payload = serde_json::from_str::<Value>(&terminal_event.payload_json)
+            .expect("terminal payload json");
+        assert_eq!(
+            terminal_payload.get("status").and_then(Value::as_str),
+            Some("failed")
         );
+        assert_eq!(
+            terminal_payload
+                .pointer("/metadata/failure/phase")
+                .and_then(Value::as_str),
+            Some("provider.exit.failed")
+        );
+        assert_eq!(
+            terminal_payload
+                .pointer("/metadata/failure/error_kind")
+                .and_then(Value::as_str),
+            Some("nonzero_exit")
+        );
+        assert_eq!(
+            terminal_payload
+                .pointer("/metadata/stderr/redacted")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(!terminal_event.payload_json.contains(expected_stderr));
         assert!(
             events
                 .iter()
@@ -3918,20 +6267,32 @@ rule wait
             && fact.value_json.contains("\"error_kind\":\"nonzero_exit\"")));
 
         let evidence = store.list_evidence(&instance_id).expect("evidence lists");
-        assert!(evidence
+        let provider_evidence = evidence
             .iter()
-            .any(|evidence| evidence.kind == "agent.turn.provider"
-                && evidence
-                    .metadata_json
-                    .contains("\"phase\":\"provider.exit.failed\"")
-                && evidence.metadata_json.contains(expected_stderr)));
-
+            .find(|evidence| evidence.kind == "agent.turn.provider")
+            .expect("provider evidence recorded");
+        let provider_metadata = serde_json::from_str::<Value>(&provider_evidence.metadata_json)
+            .expect("provider metadata json");
+        assert_eq!(
+            provider_metadata
+                .pointer("/failure/phase")
+                .and_then(Value::as_str),
+            Some("provider.exit.failed")
+        );
+        assert_eq!(
+            provider_metadata
+                .pointer("/stderr/redacted")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(!provider_evidence.metadata_json.contains(expected_stderr));
         let diagnostics = store
             .list_diagnostics(Some(&instance_id))
             .expect("diagnostics list");
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.code.as_deref() == Some("nonzero_exit")
-                && diagnostic.message.contains(expected_stderr)
+                && diagnostic.message.contains(provider)
+                && !diagnostic.message.contains(expected_stderr)
                 && diagnostic.event_id.is_some()
                 && diagnostic.run_id.as_deref() == Some("run-tell")
         }));

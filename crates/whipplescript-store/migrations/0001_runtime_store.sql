@@ -77,6 +77,8 @@ CREATE UNIQUE INDEX events_instance_idempotency_key_idx
 CREATE TABLE facts (
     fact_id TEXT PRIMARY KEY,
     instance_id TEXT NOT NULL,
+    program_version_id TEXT REFERENCES program_versions(version_id),
+    revision_epoch INTEGER NOT NULL DEFAULT 0,
     name TEXT NOT NULL,
     key TEXT NOT NULL,
     value_json TEXT NOT NULL,
@@ -89,6 +91,7 @@ CREATE TABLE facts (
     external_system TEXT,
     external_id TEXT,
     correlation_id TEXT,
+    source_span_json TEXT,
     consumed_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -200,6 +203,21 @@ CREATE TABLE artifacts (
     content_hash TEXT,
     mime_type TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE workspaces (
+    workspace_id TEXT PRIMARY KEY,
+    instance_id TEXT REFERENCES instances(instance_id),
+    effect_id TEXT REFERENCES effects(effect_id),
+    run_id TEXT REFERENCES runs(run_id),
+    provider TEXT,
+    policy TEXT NOT NULL,
+    uri TEXT NOT NULL,
+    status TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(instance_id, effect_id, run_id, policy)
 );
 
 CREATE TABLE evidence (

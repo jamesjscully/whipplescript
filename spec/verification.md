@@ -45,7 +45,7 @@ asynchronous and temporal:
 ```text
 event log append
 projection catch-up
-effect claim
+effect run start
 lease expiry
 worker crash
 retry
@@ -183,7 +183,7 @@ diagnostics
 
 Trace conformance should reject:
 
-- effect claimed while dependency unsatisfied
+- run started while dependency unsatisfied
 - completion for unknown effect
 - duplicate terminal completion
 - run started after cancellation
@@ -254,7 +254,7 @@ For every assertion checkpoint, generated searches should assert:
 
 - assertion `pass` preserves the normal reachable state space
 - assertion `fail` cannot create, consume, or mutate user facts
-- assertion `fail` cannot enqueue, release, claim, or complete effects
+- assertion `fail` cannot enqueue, release, start, or complete effects
 - assertion `error` has the same non-mutation guarantees as `fail`
 - failure/error diagnostics or evidence are allowed only on diagnostic/evidence
   surfaces, not as workflow-state commits
@@ -321,7 +321,7 @@ Initial expression-kernel searches:
 - a true guard permits the same effect graph checks already used by dependency
   searches
 - an assertion failure cannot create, consume, or mutate user facts or enqueue,
-  release, claim, or complete effects
+  release, start, or complete effects
 - an assertion error has the same workflow-state non-mutation guarantee as
   assertion failure
 - an undeclared dynamic agent target cannot create an `agent.tell` effect

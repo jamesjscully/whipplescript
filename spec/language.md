@@ -930,8 +930,10 @@ class LanguageTask {
 }
 
 rule run_language_task
-  when LanguageTask as task
-  when task.provider is available
+  when {
+    LanguageTask as task
+    task.provider is available
+  }
 => {
   tell task.provider requires ["agent.tell"] as turn """
   Write {{ task.language }} text to {{ task.artifactPath }}.

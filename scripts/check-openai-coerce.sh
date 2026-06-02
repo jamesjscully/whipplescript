@@ -7,16 +7,52 @@ PORT="${WHIPPLESCRIPT_OPENAI_COERCE_PORT:-18765}"
 ENDPOINT="http://$HOST:$PORT"
 LOG="$ROOT/target/openai-coerce-server.log"
 
+load_openai_key_from_dotenv() {
+  local file="$1"
+  local line key value
+
+  [[ -f "$file" ]] || return
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    [[ "$key" == "OPENAI_API_KEY" ]] || continue
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+    if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+      export OPENAI_API_KEY="$value"
+    fi
+  done <"$file"
+}
+
+generate_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+  else
+    dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n'
+  fi
+}
+
 if [[ -f "$ROOT/.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$ROOT/.env"
-  set +a
+  load_openai_key_from_dotenv "$ROOT/.env"
 fi
 
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
   echo "OPENAI_API_KEY is required in the environment or .env" >&2
   exit 2
+fi
+
+if [[ -z "${WHIPPLESCRIPT_OPENAI_COERCE_TOKEN:-}" ]]; then
+  WHIPPLESCRIPT_OPENAI_COERCE_TOKEN="$(generate_token)"
+  export WHIPPLESCRIPT_OPENAI_COERCE_TOKEN
 fi
 
 mkdir -p "$ROOT/target"
@@ -50,6 +86,7 @@ fi
 
 WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \
 WHIPPLESCRIPT_REAL_PROVIDERS=baml \
+WHIPPLESCRIPT_BAML_AUTH_TOKEN="$WHIPPLESCRIPT_OPENAI_COERCE_TOKEN" \
 WHIPPLESCRIPT_BAML_SKIP_CLI=1 \
 WHIPPLESCRIPT_BAML_TEST_ENDPOINT="$ENDPOINT" \
 WHIPPLESCRIPT_BAML_HEALTH_PATH=/health \

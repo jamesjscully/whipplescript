@@ -16,8 +16,8 @@ completion event returns typed value
 rules consume the completed value
 ```
 
-This differs from the legacy statechart design, where `coerce` was described as
-a synchronous value effect within one transition. The old type and expression
+This differs from the earlier statechart design, where `coerce` was described as
+a synchronous value effect within one transition. The type and expression
 discipline still mostly transfers; the synchronous execution model does not.
 
 See [type-system.md](type-system.md) for the shared boundary type system used by
@@ -159,7 +159,7 @@ after review completes {
 
 ## Data Operations
 
-WhippleScript should keep the legacy expression rule, now formalized in
+WhippleScript should keep the boundary-type expression rule, now formalized in
 [type-system.md](type-system.md):
 
 ```text
@@ -264,17 +264,18 @@ Current implementation:
   decodes JSON status, value, error, transcript, and usage fields.
 - `scripts/openai-coerce-server.mjs` is a local BAML-compatible `/coerce`
   bridge backed by the OpenAI Responses API. It loads `OPENAI_API_KEY` from
-  `.env` or the environment, uses Structured Outputs, and defaults to
-  `gpt-5.4-mini` unless `WHIPPLESCRIPT_OPENAI_MODEL` is set.
+  `.env` or the environment, requires `WHIPPLESCRIPT_OPENAI_COERCE_TOKEN` for
+  `/coerce`, uses Structured Outputs, and defaults to `gpt-5.4-mini` unless
+  `WHIPPLESCRIPT_OPENAI_MODEL` is set.
 - `scripts/check-openai-coerce.sh` starts that bridge and runs the no-mock
   Coerce smoke test through the same `HttpBamlClient` path used for external
-  BAML-compatible endpoints.
+  BAML-compatible endpoints. It generates a per-run token when one is not set.
 - `FakeBamlClient` provides deterministic CI coverage for success and failure
   branches without credentials.
 - A no-mock smoke test runs when `WHIPPLESCRIPT_BAML_TEST_ENDPOINT`,
   `WHIPPLESCRIPT_BAML_TEST_FUNCTION`, `WHIPPLESCRIPT_BAML_TEST_ARGUMENTS_JSON`, and
   `WHIPPLESCRIPT_BAML_TEST_OUTPUT_TYPE` are set. `scripts/check-real-providers.sh`
-  requires those variables before claiming real-provider readiness.
+  requires those variables before declaring real-provider readiness.
 
 The built-in HTTP transport intentionally covers plain `http://` endpoints only.
 TLS and BAML SDK-specific transport are tracked separately.

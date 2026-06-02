@@ -34,6 +34,8 @@ retry, doctor
 ```sh
 whip doctor
 whip --json doctor
+whip --json doctor --providers
+whip --json doctor --provider-config examples/provider-configs/native/native.example.json
 ```
 
 Opens or creates the configured store, reports schema version, and checks
@@ -46,8 +48,16 @@ apalache-mc or apalache
 baml-cli or baml
 codex
 claude
+pi
 loft
 ```
+
+With `--provider-config`, JSON output includes `provider_config_checks`. Each
+check contains the config path and redacted validation `results`.
+With `--providers`, JSON output includes `provider_health_checks`, a
+deterministic non-live posture for Codex, Claude, and Pi. It reports CLI
+availability, credential-reference posture, and deeper checks that require
+explicit real-provider validation without printing credential values.
 
 ### `check`
 
@@ -400,6 +410,11 @@ Common event types:
 | `agent.turn.failed` | Agent turn failure projection. |
 | `agent.turn.timed_out` | Agent turn timeout projection. |
 | `agent.turn.cancelled` | Agent turn cancellation projection. |
+| `agent.turn.started` | Native provider turn start observation. |
+| `agent.turn.streamed` | Native provider stream observation. |
+| `agent.turn.tool_requested` | Native provider tool/approval observation. |
+| `agent.turn.artifact_captured` | Native provider artifact/diff observation. |
+| `artifact.capture.failed` | Provider artifact capture failed before or during terminal completion. |
 | `human.ask.created` | Human review request was created. |
 | `human.answer.received` | Human answered an inbox item. |
 
@@ -489,6 +504,232 @@ optional `workflow_invocations.parent` / `workflow_invocations.children` links.
   "conformance": {"ok": true}
 }
 ```
+
+### Provider Binding Config
+
+Provider binding config JSON is consumed by `whip doctor --provider-config` and
+`scripts/check-native-provider-configs.sh`.
+
+```json
+{
+  "provider_id": "codex-main",
+  "provider_kind": "codex",
+  "surface": "codex_app_server",
+  "credentials_ref": "env:OPENAI_API_KEY",
+  "profile_ids": ["repo-reader", "repo-writer"],
+  "default_model": "gpt-5.4-mini",
+  "workspace_policy": "read_only",
+  "timeout_ms": 60000,
+  "cancellation_depth": "native_stop",
+  "artifact_policy": "required",
+  "health_checks": ["codex_cli", "app_server_schema"]
+}
+```
+
+Enums:
+
+| Field | Values |
+| --- | --- |
+| `provider_kind` | `codex`, `claude`, `pi`, `fixture`, `command`, `baml`, `loft` |
+| `surface` | `codex_app_server`, `claude_agent_sdk`, `pi_sdk`, `pi_rpc`, `fixture`, `command`, `baml_http`, `loft_cli` |
+| `cancellation_depth` | `none`, `cooperative_request`, `native_stop`, `hard_process_stop`, `remote_session_cancel` |
+
+Unknown config fields are preserved as `extra` for validation/reporting but
+must not contain secret values.
+
+### Provider Capability JSON
+
+The kernel exposes built-in capability descriptions for native and fixture
+providers:
+
+```json
+{
+  "provider_kind": "pi",
+  "surface": "pi_rpc",
+  "protocol_version": "pi-cli-rpc",
+  "session_identity_fields": ["session_id", "parent_id"],
+  "stream_event_kinds": ["agent_start", "turn_start", "message_start", "message_end", "turn_end", "agent_end"],
+  "tool_policy": "pi_tools_extensions_skills",
+  "cancellation_depths": ["none", "cooperative_request", "native_stop"],
+  "artifact_manifest": true,
+  "health_checks": ["pi_cli", "rpc_mode", "provider_model", "extensions"],
+  "auth_requirements": ["pi_provider_api_key_or_auth_storage"]
+}
+```
+
+Capability JSON is descriptive. Runtime policy must still validate a concrete
+binding before a provider turn starts.
+
+### Provider Validation Result
+
+Provider validation results are redacted:
+
+```json
+{
+  "provider": "codex-main",
+  "surface": "codex_app_server",
+  "status": "pass",
+  "phase": "provider.surface.valid",
+  "code": "surface_supported",
+  "message": "provider kind and adapter surface are supported",
+  "retryable": false,
+  "missing_config_keys": []
+}
+```
+
+`status` is `pass`, `fail`, or `skip`. Failures use `phase` values such as
+`provider.config.invalid`, `provider.surface.unsupported`, or
+`provider.config.missing`.
+
+### Native Lifecycle Observation
+
+Native provider observations normalize into `agent.turn.*` events and same-name
+facts. Event payloads use this shape:
+
+```json
+{
+  "effect_id": "tell",
+  "run_id": "run-tell",
+  "agent": "worker",
+  "provider": "codex",
+  "profile": "repo-writer",
+  "status": "tool_requested",
+  "provider_event_type": "item/tool/call",
+  "provider_session_id": "thread-1",
+  "provider_turn_id": "turn-1",
+  "terminal": false,
+  "provider_payload_shape": {"type": "object", "keys": 6},
+  "evidence_id": "ev_..."
+}
+```
+
+Canonical statuses:
+
+```text
+started
+streamed
+tool_requested
+artifact_captured
+completed
+failed
+timed_out
+cancelled
+```
+
+The linked evidence kind is `agent.turn.native_event`. It stores provider event
+type, session/turn ids, terminal flag, status, and redacted payload shape, not
+raw provider payload text.
+
+### Provider Terminal Metadata
+
+`effect.terminal` payloads for provider runs include provider metadata under
+`payload.metadata`. Agent terminal metadata includes redacted stdout, stderr,
+transcript, usage shape, failure shape, provider correlation id, and terminal
+payload hash:
+
+```json
+{
+  "stdout": {"redacted": true, "bytes": 0, "chars": 0},
+  "stderr": {"redacted": true, "bytes": 0, "chars": 0},
+  "transcript": {"redacted": true, "bytes": 128, "chars": 128},
+  "usage": {},
+  "failure": null,
+  "provider_correlation_id": "key_...",
+  "terminal_payload_hash": "f8311b4ed0a2c641"
+}
+```
+
+Recovery-generated terminal metadata wraps the persisted provider evidence:
+
+```json
+{
+  "recovery": "provider_evidence_terminal",
+  "evidence_id": "ev_...",
+  "provider_metadata": {},
+  "provider_correlation_id": "key_...",
+  "terminal_payload_hash": "..."
+}
+```
+
+The terminal idempotency key is derived from instance id, run id, provider
+correlation id, terminal payload hash, and the terminal marker. The store still
+rejects any second terminal completion for the same running run, even if the
+second attempt has a distinct idempotency key.
+
+Artifact metadata can be inspected without reading artifact contents:
+
+```sh
+whip --json artifacts <run-id>
+```
+
+The JSON response contains `run_id` and an `artifacts` array with artifact id,
+kind, redacted path/ref, redacted content hash, MIME type, and creation time.
+The command does not read or emit raw artifact files.
+`whip runs <instance> --json` and `whip trace <instance> --json` include
+`artifact_count` per run so operators can discover runs with artifact metadata
+before calling `whip artifacts`.
+
+### Artifact Manifest
+
+Provider evidence may include an artifact manifest:
+
+```json
+{
+  "schema_version": "whipplescript.artifact_manifest.v1",
+  "entry_count": 1,
+  "entries": [
+    {
+      "artifact_id": "art_...",
+      "kind": "transcript",
+      "uri": {
+        "type": "ref",
+        "value": "provider://codex/runs/run-tell/transcript_ref"
+      },
+      "content_hash": {
+        "algorithm": "provider",
+        "value": "..."
+      },
+      "mime_type": "text/plain",
+      "size_bytes": null,
+      "redaction_status": "unredacted_metadata_only",
+      "retention_policy": "provider_default",
+      "required": false,
+      "source_provider_event": null
+    }
+  ]
+}
+```
+
+Allowed `uri.type` values are `path` and `ref`. Allowed `redaction_status`
+values are `redacted`, `unredacted_metadata_only`, and `reference_only`.
+Allowed `retention_policy` values are `ephemeral`, `provider_default`,
+`retain`, and `delete_after_run`.
+
+### Artifact Capture Failure
+
+Artifact capture failures append `artifact.capture.failed`:
+
+```json
+{
+  "event_type": "artifact.capture.failed",
+  "provider": "codex",
+  "adapter": "codex_app_server",
+  "run_id": "run-tell",
+  "artifact_ref": {
+    "type": "ref",
+    "value": "provider://codex/runs/run-tell/diff"
+  },
+  "error_kind": "missing",
+  "recoverable": true,
+  "message": {"redacted": true, "bytes": 24, "chars": 24},
+  "transcript_ref": "provider://codex/runs/run-tell/transcript_ref",
+  "stderr_ref": null
+}
+```
+
+Allowed `error_kind` values are `missing`, `unreadable`, `oversized`,
+`hash_mismatch`, and `redaction_failed`. Required artifact capture failure
+prevents a provider result from being marked successful.
 
 ## Rust Crate APIs
 
@@ -664,6 +905,10 @@ Provider execution methods:
 
 ```text
 run_agent_turn
+record_native_agent_turn_observation
+record_artifact_capture_failure
+recover_provider_terminal_from_evidence
+recover_running_provider_runs
 run_baml_coerce
 run_loft_effect
 run_human_ask
@@ -681,6 +926,17 @@ Provider traits and helpers:
 | `MockAgentHarness` | Deterministic test harness. |
 | `BamlClient` / `HttpBamlClient` / `FakeBamlClient` | BAML coerce provider abstraction. |
 | `LoftClient` / `CommandLoftClient` / `FakeLoftClient` | Loft effect provider abstraction. |
+
+Native provider modules:
+
+| Module | Meaning |
+| --- | --- |
+| `provider` | Provider capability/config validation and built-in native capabilities. |
+| `codex_app_server` | Codex app-server transport and evidence summaries. |
+| `claude_agent_sdk` | Claude Agent SDK sidecar client, policy mapping, and evidence summaries. |
+| `pi_rpc` | Pi RPC client, policy mapping, and event summaries. |
+| `native_lifecycle` | Codex/Claude/Pi event normalization into `agent.turn.*`. |
+| `artifact_manifest` | Artifact manifest and capture-failure payload helpers. |
 
 Trace API:
 

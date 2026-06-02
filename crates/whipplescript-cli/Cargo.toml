@@ -1,5 +1,5 @@
 [package]
-name = "whipplescript-cli"
+name = "whipplescript"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

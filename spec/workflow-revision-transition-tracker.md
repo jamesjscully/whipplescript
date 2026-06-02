@@ -162,7 +162,7 @@ semantics.
   - [x] `keep`: do not cancel old-version effects
   - [x] `cancel queued`: terminal-cancel queued, blocked, and claimable effects
   - [x] `request running`: cancel queued effects and request cancellation for
-    claimed/running effects
+    running effects
 - [x] Define revision compatibility checks:
   - [x] same root workflow name unless an explicit retarget operation is later
     designed
@@ -571,7 +571,7 @@ Stage 5 audit notes:
   to `terminal` while the effect records `completed`.
 - A supported fixture provider can acknowledge an out-of-band running
   cancellation request; the worker records a normal cancelled terminal outcome
-  and resolves the cancellation request without a fake `effect.cancelled`
+  and resolves the cancellation request without a fake cancelled terminal
   event.
 - The worker now records an idempotent warning diagnostic when it sees a running
   cancellation request for a provider without out-of-band cancellation support;

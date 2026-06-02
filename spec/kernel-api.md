@@ -63,21 +63,21 @@ record evidence/diagnostics
 advance rule cursor
 ```
 
-Atomic effect claim:
+Atomic effect run start:
 
 ```text
 verify effect is claimable
 verify dependency predicates are satisfied
 verify policy/capability/profile binding
 create/renew lease
-transition effect to claimed
+transition effect to running
 record evidence
 ```
 
 Atomic run completion:
 
 ```text
-verify run belongs to claimed/running effect
+verify run belongs to running effect
 validate provider output against effect contract
 write artifacts/evidence
 transition effect to terminal status
@@ -117,6 +117,6 @@ The control plane may not:
 
 - insert facts without a kernel-mediated event or rule commit
 - mark effects completed without validation
-- claim blocked effects
+- start blocked effects
 - infer prompt semantics as workflow facts
 - let plugins bypass rule commits or effect events

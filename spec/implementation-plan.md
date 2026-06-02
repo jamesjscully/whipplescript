@@ -45,28 +45,27 @@ WhippleScript v0 should provide:
 
 ## Stage 0: Repository Reset And Project Skeleton
 
-Goal: make the repo coherent after the redesign and isolate old systems.
+Goal: make the repo coherent after the redesign and remove inactive systems.
 
-- [x] Move the previous statechart workflow runtime into
-  `legacy/statechart-workflows-runtime/`.
-- [x] Keep the earlier v0.3 runtime in `legacy/v0.3-runtime/`.
+- [x] Remove inactive runtime implementation trees from the active repository.
+- [x] Remove inactive package, skill, model, and example trees from the active
+  repository.
 - [x] Create the new `spec/` suite for the rule-machine design.
 - [x] Create the new `models/` suite for formal validation.
 - [x] Restore a root-level `scripts/check-formal-models.sh`.
 - [x] Add the new Rust workspace skeleton at the repo root.
 - [x] Add CI for formatting, Rust tests, formal checks, and e2e smoke tests.
-- [x] Add a top-level developer README that points to the new specs, not the
-  legacy systems.
+- [x] Add a top-level developer README that points to the new specs.
 - [x] Audit Stage 0 against the repo layout, specs, tests, and docs; record
   gaps for the final audit stage.
   - Active implementation is rooted in the new Rust workspace and spec/model
     tree.
-  - Legacy implementations are isolated under `legacy/`.
+  - Previous implementations have been removed from the active tree.
   - No blocking Stage 0 gaps remain.
 
 Acceptance:
 
-- [x] `git status` shows no accidental old runtime files outside `legacy/`.
+- [x] `git status` shows no accidental inactive runtime files.
 - [x] `scripts/check-formal-models.sh` runs from the repo root.
 - [x] A new contributor can find the active spec set from `README.md`.
 
@@ -479,7 +478,7 @@ Goal: wire the built-in effect families through the same contract system.
     artifact-capture failure coverage.
 - [ ] Normalize real provider lifecycle into `agent.turn.*` facts/events.
 - [ ] Implement a control-plane driver that materializes ready rules into facts
-  and effect outbox entries before providers try to claim effects.
+  and effect outbox entries before providers try to start runs.
 - [ ] Implement workspace records and workspace policy enforcement for shared
   checkout, per-effect worktree, per-issue worktree, and remote sandbox modes.
 - [ ] Derive standard `agent.turn.*` completion facts and deterministic
@@ -497,7 +496,7 @@ Goal: wire the built-in effect families through the same contract system.
   - `real_baml_coerce_endpoint_smoke` runs against a configured
     `WHIPPLESCRIPT_BAML_TEST_ENDPOINT` and function contract.
   - `scripts/check-real-providers.sh` requires the BAML smoke-test environment
-    before claiming real-provider readiness.
+    before declaring real-provider readiness.
   - `scripts/openai-coerce-server.mjs` provides a local BAML-compatible
     `/coerce` bridge backed by OpenAI Structured Outputs for local validation.
   - `scripts/check-openai-coerce.sh` loads `OPENAI_API_KEY` from `.env`, starts
@@ -789,14 +788,14 @@ Goal: make the system usable by coding agents and non-expert operators.
 - [x] Write plugin author guide.
 - [x] Write troubleshooting guide.
 - [x] Add release checklist.
-- [x] Add migration notes explaining why legacy systems were moved aside.
-- [x] Audit Stage 12 against the companion skill, docs, operator guidance,
-  release checklist, and migration notes; record gaps for the final audit stage.
+- [x] Remove standalone transition notes after previous implementations were
+  deleted from the repository.
+- [x] Audit Stage 12 against the companion skill, docs, operator guidance, and
+  release checklist; record gaps for the final audit stage.
   - Companion skill lives at `skills/whipplescript-author/SKILL.md`.
   - User/operator docs live in `spec/quickstart.md`, `spec/operator-guide.md`,
     `spec/plugin-author-guide.md`, and `spec/troubleshooting.md`.
-  - Release and migration docs live in `spec/release-checklist.md` and
-    `spec/migration-notes.md`.
+  - Release docs live in `spec/release-checklist.md`.
   - Fixed during final audit: `scripts/install-whipplescript-skill.sh` installs the
     companion skill into a local skill directory.
 
@@ -865,8 +864,7 @@ Acceptance:
     Coerce bridge using `OPENAI_API_KEY` from `.env`.
 - [x] Trace conformance runs over every e2e test.
 - [x] Companion skill is installed or documented.
-- [x] The repo has no active implementation outside the new root workspace
-  except documented legacy folders.
+- [x] The repo has no active implementation outside the new root workspace.
 
 ## Immediate Next Slice
 

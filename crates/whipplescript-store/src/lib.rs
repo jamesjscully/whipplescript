@@ -183,6 +183,7 @@ pub struct NewFact<'a> {
     pub schema_id: Option<&'a str>,
     pub provenance_class: &'a str,
     pub correlation_id: Option<&'a str>,
+    pub source_span_json: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -347,6 +348,50 @@ pub struct EvidenceLinkView {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderValidationEvidence<'a> {
+    pub instance_id: &'a str,
+    pub provider_id: &'a str,
+    pub provider_kind: &'a str,
+    pub surface: &'a str,
+    pub status: &'a str,
+    pub config_json: &'a str,
+    pub capability_json: &'a str,
+    pub validation_results_json: &'a str,
+    pub source_path: Option<&'a str>,
+    pub correlation_id: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CodexAppServerEvidence<'a> {
+    pub instance_id: &'a str,
+    pub provider_id: &'a str,
+    pub thread_id: &'a str,
+    pub turn_id: &'a str,
+    pub metadata_json: &'a str,
+    pub correlation_id: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClaudeAgentSdkEvidence<'a> {
+    pub instance_id: &'a str,
+    pub provider_id: &'a str,
+    pub session_id: &'a str,
+    pub run_id: &'a str,
+    pub metadata_json: &'a str,
+    pub correlation_id: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PiRpcEvidence<'a> {
+    pub instance_id: &'a str,
+    pub provider_id: &'a str,
+    pub session_id: &'a str,
+    pub run_id: &'a str,
+    pub metadata_json: &'a str,
+    pub correlation_id: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactRecord<'a> {
     pub run_id: &'a str,
     pub kind: &'a str,
@@ -364,6 +409,33 @@ pub struct ArtifactView {
     pub content_hash: Option<String>,
     pub mime_type: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkspaceRecord<'a> {
+    pub instance_id: Option<&'a str>,
+    pub effect_id: Option<&'a str>,
+    pub run_id: Option<&'a str>,
+    pub provider: Option<&'a str>,
+    pub policy: &'a str,
+    pub uri: &'a str,
+    pub status: &'a str,
+    pub metadata_json: &'a str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceView {
+    pub workspace_id: String,
+    pub instance_id: Option<String>,
+    pub effect_id: Option<String>,
+    pub run_id: Option<String>,
+    pub provider: Option<String>,
+    pub policy: String,
+    pub uri: String,
+    pub status: String,
+    pub metadata_json: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -534,6 +606,7 @@ pub struct ClaimableEffect {
     pub target: Option<String>,
     pub profile: Option<String>,
     pub input_json: String,
+    pub required_capabilities_json: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -549,10 +622,13 @@ pub struct EventView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FactView {
     pub fact_id: String,
+    pub program_version_id: Option<String>,
+    pub revision_epoch: i64,
     pub name: String,
     pub key: String,
     pub value_json: String,
     pub provenance_class: String,
+    pub source_span_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -756,8 +832,12 @@ pub fn store_stage() -> &'static str {
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let path = path.as_ref();
         let mut connection = Connection::open(path)?;
         apply_migrations(&mut connection)?;
+        if path.to_string_lossy() != ":memory:" {
+            harden_store_file_permissions(path)?;
+        }
         Ok(Self { connection })
     }
 
@@ -1285,6 +1365,7 @@ impl SqliteStore {
         for effect_id in &queued_effects_for_policy {
             let cancel_payload = json!({
                 "effect_id": effect_id,
+                "status": "cancelled",
                 "revision_id": &revision_id,
                 "reason": "workflow revision",
             })
@@ -1294,7 +1375,7 @@ impl SqliteStore {
                 &tx,
                 NewEvent {
                     instance_id: activation.instance_id,
-                    event_type: "effect.cancelled",
+                    event_type: "effect.terminal",
                     payload_json: &cancel_payload,
                     source: "kernel",
                     causation_id: Some(&event.event_id),
@@ -1326,6 +1407,9 @@ impl SqliteStore {
                 effect_id,
                 &cancel_event.event_id,
             )?;
+        }
+        if !queued_effects_for_policy.is_empty() {
+            satisfy_dependencies_on(&tx, activation.instance_id)?;
         }
         let mut cancellation_request_ids = Vec::new();
         for effect_id in &running_effects_for_policy {
@@ -1785,7 +1869,15 @@ impl SqliteStore {
         )?;
 
         for fact in commit.facts {
-            insert_fact(&tx, commit.instance_id, commit.rule, &event.event_id, fact)?;
+            insert_fact(
+                &tx,
+                commit.instance_id,
+                commit.rule,
+                &event.event_id,
+                program_version_id.as_deref(),
+                revision_epoch,
+                fact,
+            )?;
         }
         consume_facts(&tx, commit.instance_id, commit.consumed_fact_ids)?;
         for effect in commit.effects {
@@ -1965,11 +2057,14 @@ impl SqliteStore {
                 idempotency_key: derived.idempotency_key,
             },
         )?;
+        let (program_version_id, revision_epoch) = active_revision_on(&tx, derived.instance_id)?;
         insert_fact(
             &tx,
             derived.instance_id,
             derived.source,
             &event.event_id,
+            program_version_id.as_deref(),
+            revision_epoch,
             &derived.fact,
         )?;
         tx.commit()?;
@@ -2119,7 +2214,7 @@ impl SqliteStore {
         }
         let mut statement = self.connection.prepare(
             r#"
-            SELECT effect_id, kind, target, profile, input_json
+            SELECT effect_id, kind, target, profile, input_json, required_capabilities
             FROM effects AS candidate
             WHERE candidate.instance_id = ?1
               AND (
@@ -2158,6 +2253,7 @@ impl SqliteStore {
                     target: row.get(2)?,
                     profile: row.get(3)?,
                     input_json: row.get(4)?,
+                    required_capabilities_json: row.get(5)?,
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()
@@ -2598,6 +2694,217 @@ impl SqliteStore {
         insert_evidence_on(&self.connection, evidence)
     }
 
+    pub fn record_provider_validation_evidence(
+        &self,
+        evidence: ProviderValidationEvidence<'_>,
+    ) -> StoreResult<String> {
+        let config = serde_json::from_str::<Value>(evidence.config_json)?;
+        let capability = serde_json::from_str::<Value>(evidence.capability_json)?;
+        let validation_results = serde_json::from_str::<Value>(evidence.validation_results_json)?;
+        let metadata = json!({
+            "provider_id": evidence.provider_id,
+            "provider_kind": evidence.provider_kind,
+            "surface": evidence.surface,
+            "status": evidence.status,
+            "source_path": evidence.source_path,
+            "config": config,
+            "capability": capability,
+            "validation_results": validation_results,
+        })
+        .to_string();
+        let summary = format!(
+            "provider `{}` validation {} on {}",
+            evidence.provider_id, evidence.status, evidence.surface
+        );
+        let evidence_id = insert_evidence_on(
+            &self.connection,
+            EvidenceRecord {
+                instance_id: evidence.instance_id,
+                kind: "provider.validation",
+                subject_type: "provider_config",
+                subject_id: evidence.provider_id,
+                causation_id: None,
+                correlation_id: evidence.correlation_id,
+                summary: Some(&summary),
+                metadata_json: &metadata,
+            },
+        )?;
+        insert_evidence_link_on(
+            &self.connection,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider",
+                target_id: evidence.provider_id,
+                relation: "validates",
+            },
+        )?;
+        insert_evidence_link_on(
+            &self.connection,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider_capability",
+                target_id: &format!("{}:{}", evidence.provider_kind, evidence.surface),
+                relation: "uses",
+            },
+        )?;
+        Ok(evidence_id)
+    }
+
+    pub fn record_codex_app_server_evidence(
+        &self,
+        evidence: CodexAppServerEvidence<'_>,
+    ) -> StoreResult<String> {
+        let metadata = serde_json::from_str::<Value>(evidence.metadata_json)?;
+        let metadata = json!({
+            "provider_id": evidence.provider_id,
+            "thread_id": evidence.thread_id,
+            "turn_id": evidence.turn_id,
+            "evidence": metadata,
+        })
+        .to_string();
+        let summary = format!(
+            "Codex app-server evidence for provider `{}` turn `{}`",
+            evidence.provider_id, evidence.turn_id
+        );
+        let evidence_id = insert_evidence_on(
+            &self.connection,
+            EvidenceRecord {
+                instance_id: evidence.instance_id,
+                kind: "codex.app_server.evidence",
+                subject_type: "provider_turn",
+                subject_id: evidence.turn_id,
+                causation_id: None,
+                correlation_id: evidence.correlation_id,
+                summary: Some(&summary),
+                metadata_json: &metadata,
+            },
+        )?;
+        insert_evidence_link_on(
+            &self.connection,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider",
+                target_id: evidence.provider_id,
+                relation: "observes",
+            },
+        )?;
+        insert_evidence_link_on(
+            &self.connection,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider_thread",
+                target_id: evidence.thread_id,
+                relation: "observes",
+            },
+        )?;
+        Ok(evidence_id)
+    }
+
+    pub fn record_claude_agent_sdk_evidence(
+        &self,
+        evidence: ClaudeAgentSdkEvidence<'_>,
+    ) -> StoreResult<String> {
+        let metadata = serde_json::from_str::<Value>(evidence.metadata_json)?;
+        let metadata = json!({
+            "provider_id": evidence.provider_id,
+            "session_id": evidence.session_id,
+            "run_id": evidence.run_id,
+            "evidence": metadata,
+        })
+        .to_string();
+        let summary = format!(
+            "Claude Agent SDK evidence for provider `{}` session `{}`",
+            evidence.provider_id, evidence.session_id
+        );
+        let evidence_id = insert_evidence_on(
+            &self.connection,
+            EvidenceRecord {
+                instance_id: evidence.instance_id,
+                kind: "claude.agent_sdk.evidence",
+                subject_type: "provider_session",
+                subject_id: evidence.session_id,
+                causation_id: Some(evidence.run_id),
+                correlation_id: evidence.correlation_id,
+                summary: Some(&summary),
+                metadata_json: &metadata,
+            },
+        )?;
+        insert_evidence_link_on(
+            &self.connection,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider",
+                target_id: evidence.provider_id,
+                relation: "observes",
+            },
+        )?;
+        insert_evidence_link_on(
+            &self.connection,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider_run",
+                target_id: evidence.run_id,
+                relation: "observes",
+            },
+        )?;
+        Ok(evidence_id)
+    }
+
+    pub fn record_pi_rpc_evidence(&self, evidence: PiRpcEvidence<'_>) -> StoreResult<String> {
+        let metadata = serde_json::from_str::<Value>(evidence.metadata_json)?;
+        let metadata = json!({
+            "provider_id": evidence.provider_id,
+            "session_id": evidence.session_id,
+            "run_id": evidence.run_id,
+            "evidence": metadata,
+        })
+        .to_string();
+        let summary = format!(
+            "Pi RPC evidence for provider `{}` session `{}`",
+            evidence.provider_id, evidence.session_id
+        );
+        let evidence_id = insert_evidence_on(
+            &self.connection,
+            EvidenceRecord {
+                instance_id: evidence.instance_id,
+                kind: "pi.rpc.evidence",
+                subject_type: "provider_session",
+                subject_id: evidence.session_id,
+                causation_id: Some(evidence.run_id),
+                correlation_id: evidence.correlation_id,
+                summary: Some(&summary),
+                metadata_json: &metadata,
+            },
+        )?;
+        insert_evidence_link_on(
+            &self.connection,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider",
+                target_id: evidence.provider_id,
+                relation: "observes",
+            },
+        )?;
+        insert_evidence_link_on(
+            &self.connection,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider_run",
+                target_id: evidence.run_id,
+                relation: "observes",
+            },
+        )?;
+        Ok(evidence_id)
+    }
+
     pub fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()> {
         insert_evidence_link_on(&self.connection, link)
     }
@@ -2664,6 +2971,81 @@ impl SqliteStore {
                     created_at: row.get(6)?,
                 })
             })?
+            .collect::<result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn record_workspace(&self, workspace: WorkspaceRecord<'_>) -> StoreResult<String> {
+        validate_workspace_policy(workspace.policy)?;
+        validate_workspace_status(workspace.status)?;
+        serde_json::from_str::<Value>(workspace.metadata_json)?;
+        self.connection
+            .query_row(
+                r#"
+                INSERT INTO workspaces (
+                    workspace_id,
+                    instance_id,
+                    effect_id,
+                    run_id,
+                    provider,
+                    policy,
+                    uri,
+                    status,
+                    metadata_json,
+                    updated_at
+                )
+                VALUES (
+                    'wsp_' || lower(hex(randomblob(16))),
+                    ?1,
+                    ?2,
+                    ?3,
+                    ?4,
+                    ?5,
+                    ?6,
+                    ?7,
+                    ?8,
+                    CURRENT_TIMESTAMP
+                )
+                ON CONFLICT(instance_id, effect_id, run_id, policy)
+                DO UPDATE SET
+                    provider = excluded.provider,
+                    uri = excluded.uri,
+                    status = excluded.status,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING workspace_id
+                "#,
+                params![
+                    workspace.instance_id,
+                    workspace.effect_id,
+                    workspace.run_id,
+                    workspace.provider,
+                    workspace.policy,
+                    workspace.uri,
+                    workspace.status,
+                    workspace.metadata_json,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn get_workspace(&self, workspace_id: &str) -> StoreResult<Option<WorkspaceView>> {
+        let sql = workspace_select_sql("WHERE workspace_id = ?1");
+        self.connection
+            .query_row(&sql, [workspace_id], workspace_from_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_workspaces_for_instance(
+        &self,
+        instance_id: &str,
+    ) -> StoreResult<Vec<WorkspaceView>> {
+        let sql = workspace_select_sql("WHERE instance_id = ?1 ORDER BY created_at, workspace_id");
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement
+            .query_map([instance_id], workspace_from_row)?
             .collect::<result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -3056,8 +3438,18 @@ impl SqliteStore {
             schema_id: Some("HumanAnswer"),
             provenance_class: "human",
             correlation_id: item.1.as_deref(),
+            source_span_json: None,
         };
-        insert_fact(&tx, &item.0, "human", &event.event_id, &fact)?;
+        let (program_version_id, revision_epoch) = active_revision_on(&tx, &item.0)?;
+        insert_fact(
+            &tx,
+            &item.0,
+            "human",
+            &event.event_id,
+            program_version_id.as_deref(),
+            revision_epoch,
+            &fact,
+        )?;
         tx.commit()?;
         Ok(event)
     }
@@ -3114,6 +3506,49 @@ impl SqliteStore {
         )?;
         let rows = statement
             .query_map([instance_id], |row| {
+                Ok(EvidenceView {
+                    evidence_id: row.get(0)?,
+                    instance_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    subject_type: row.get(3)?,
+                    subject_id: row.get(4)?,
+                    causation_id: row.get(5)?,
+                    correlation_id: row.get(6)?,
+                    summary: row.get(7)?,
+                    metadata_json: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })?
+            .collect::<result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_evidence_for_subject(
+        &self,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> StoreResult<Vec<EvidenceView>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT
+                evidence_id,
+                instance_id,
+                kind,
+                subject_type,
+                subject_id,
+                causation_id,
+                correlation_id,
+                summary,
+                metadata_json,
+                created_at
+            FROM evidence
+            WHERE subject_type = ?1
+              AND subject_id = ?2
+            ORDER BY created_at, evidence_id
+            "#,
+        )?;
+        let rows = statement
+            .query_map(params![subject_type, subject_id], |row| {
                 Ok(EvidenceView {
                     evidence_id: row.get(0)?,
                     instance_id: row.get(1)?,
@@ -3258,7 +3693,7 @@ impl SqliteStore {
     pub fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT fact_id, name, key, value_json, provenance_class
+            SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, provenance_class, source_span_json
             FROM facts
             WHERE instance_id = ?1
               AND consumed_at IS NULL
@@ -3269,10 +3704,13 @@ impl SqliteStore {
             .query_map([instance_id], |row| {
                 Ok(FactView {
                     fact_id: row.get(0)?,
-                    name: row.get(1)?,
-                    key: row.get(2)?,
-                    value_json: row.get(3)?,
-                    provenance_class: row.get(4)?,
+                    program_version_id: row.get(1)?,
+                    revision_epoch: row.get(2)?,
+                    name: row.get(3)?,
+                    key: row.get(4)?,
+                    value_json: row.get(5)?,
+                    provenance_class: row.get(6)?,
+                    source_span_json: row.get(7)?,
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
@@ -3282,7 +3720,7 @@ impl SqliteStore {
     pub fn list_facts_including_consumed(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT fact_id, name, key, value_json, provenance_class
+            SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, provenance_class, source_span_json
             FROM facts
             WHERE instance_id = ?1
             ORDER BY name, key
@@ -3292,10 +3730,13 @@ impl SqliteStore {
             .query_map([instance_id], |row| {
                 Ok(FactView {
                     fact_id: row.get(0)?,
-                    name: row.get(1)?,
-                    key: row.get(2)?,
-                    value_json: row.get(3)?,
-                    provenance_class: row.get(4)?,
+                    program_version_id: row.get(1)?,
+                    revision_epoch: row.get(2)?,
+                    name: row.get(3)?,
+                    key: row.get(4)?,
+                    value_json: row.get(5)?,
+                    provenance_class: row.get(6)?,
+                    source_span_json: row.get(7)?,
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
@@ -3727,6 +4168,7 @@ impl SqliteStore {
     ) -> StoreResult<StoredEvent> {
         let payload = json!({
             "effect_id": cancellation.effect_id,
+            "status": "cancelled",
             "reason": cancellation.reason,
         })
         .to_string();
@@ -3735,7 +4177,7 @@ impl SqliteStore {
             &tx,
             NewEvent {
                 instance_id: cancellation.instance_id,
-                event_type: "effect.cancelled",
+                event_type: "effect.terminal",
                 payload_json: &payload,
                 source: "kernel",
                 causation_id: Some(cancellation.effect_id),
@@ -3981,11 +4423,12 @@ impl SqliteStore {
         let events = {
             let mut statement = tx.prepare(
                 r#"
-                SELECT event_id, event_type, payload_json, idempotency_key, causation_id
+                SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source
                 FROM events
                 WHERE instance_id = ?1
                   AND event_type IN (
                       'rule.committed',
+                      'fact.derived',
                       'workflow.completed',
                       'workflow.failed',
                       'instance.transitioned',
@@ -4007,15 +4450,19 @@ impl SqliteStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 })?
                 .collect::<result::Result<Vec<_>, _>>()?;
             rows
         };
 
-        for (event_id, event_type, payload_json, idempotency_key, causation_id) in events {
+        for (event_id, event_type, payload_json, idempotency_key, causation_id, source) in events {
             match event_type.as_str() {
                 "rule.committed" => replay_rule_commit(&tx, instance_id, &event_id, &payload_json)?,
+                "fact.derived" => {
+                    replay_fact_derived(&tx, instance_id, &event_id, &source, &payload_json)?
+                }
                 "workflow.completed" | "workflow.failed" => replay_workflow_terminal(
                     &tx,
                     instance_id,
@@ -4087,6 +4534,23 @@ impl SqliteStore {
     }
 }
 
+#[cfg(unix)]
+fn harden_store_file_permissions(path: &Path) -> StoreResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    if permissions.mode() & 0o777 != 0o600 {
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_store_file_permissions(_path: &Path) -> StoreResult<()> {
+    Ok(())
+}
+
 fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
     connection
         .query_row(
@@ -4097,6 +4561,65 @@ fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
         .optional()
         .map(|row| row.is_some())
         .map_err(Into::into)
+}
+
+fn validate_workspace_policy(policy: &str) -> StoreResult<()> {
+    match policy {
+        "shared"
+        | "read_only"
+        | "per_effect_worktree"
+        | "per_issue_worktree"
+        | "remote_sandbox" => Ok(()),
+        _ => Err(StoreError::Conflict(format!(
+            "unsupported workspace policy `{policy}`"
+        ))),
+    }
+}
+
+fn validate_workspace_status(status: &str) -> StoreResult<()> {
+    match status {
+        "prepared" | "active" | "released" | "failed" => Ok(()),
+        _ => Err(StoreError::Conflict(format!(
+            "unsupported workspace status `{status}`"
+        ))),
+    }
+}
+
+fn workspace_select_sql(predicate: &str) -> String {
+    format!(
+        r#"
+        SELECT
+            workspace_id,
+            instance_id,
+            effect_id,
+            run_id,
+            provider,
+            policy,
+            uri,
+            status,
+            metadata_json,
+            created_at,
+            updated_at
+        FROM workspaces
+        {predicate}
+        "#
+    )
+}
+
+fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceView> {
+    Ok(WorkspaceView {
+        workspace_id: row.get(0)?,
+        instance_id: row.get(1)?,
+        effect_id: row.get(2)?,
+        run_id: row.get(3)?,
+        provider: row.get(4)?,
+        policy: row.get(5)?,
+        uri: row.get(6)?,
+        status: row.get(7)?,
+        metadata_json: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
 }
 
 fn append_event_on(connection: &Connection, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
@@ -4153,13 +4676,20 @@ fn insert_fact(
     instance_id: &str,
     rule: &str,
     event_id: &str,
+    program_version_id: Option<&str>,
+    revision_epoch: i64,
     fact: &NewFact<'_>,
 ) -> StoreResult<()> {
+    if let Some(source_span_json) = fact.source_span_json {
+        serde_json::from_str::<Value>(source_span_json)?;
+    }
     connection.execute(
         r#"
         INSERT INTO facts (
             fact_id,
             instance_id,
+            program_version_id,
+            revision_epoch,
             name,
             key,
             value_json,
@@ -4167,13 +4697,16 @@ fn insert_fact(
             source_rule,
             schema_id,
             provenance_class,
-            correlation_id
+            correlation_id,
+            source_span_json
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         "#,
         params![
             fact.fact_id,
             instance_id,
+            program_version_id,
+            revision_epoch,
             fact.name,
             fact.key,
             fact.value_json,
@@ -4182,6 +4715,7 @@ fn insert_fact(
             fact.schema_id,
             fact.provenance_class,
             fact.correlation_id,
+            fact.source_span_json,
         ],
     )?;
     Ok(())
@@ -6246,14 +6780,23 @@ fn rule_commit_payload(
         .facts
         .iter()
         .map(|fact| {
+            if let Some(source_span_json) = fact.source_span_json {
+                serde_json::from_str::<Value>(source_span_json)?;
+            }
             Ok(json!({
                 "fact_id": fact.fact_id,
                 "name": fact.name,
                 "key": fact.key,
                 "value": serde_json::from_str::<Value>(fact.value_json)?,
+                "program_version_id": program_version_id,
+                "revision_epoch": revision_epoch,
                 "schema_id": fact.schema_id,
                 "provenance_class": fact.provenance_class,
                 "correlation_id": fact.correlation_id,
+                "source_span": fact.source_span_json
+                    .map(serde_json::from_str::<Value>)
+                    .transpose()?
+                    .unwrap_or(Value::Null),
             }))
         })
         .collect::<StoreResult<Vec<_>>>()?;
@@ -6416,6 +6959,15 @@ fn replay_rule_commit(
             .get("value")
             .map(Value::to_string)
             .unwrap_or_else(|| "{}".to_owned());
+        let source_span_json = fact.get("source_span").map(Value::to_string);
+        let program_version_id = fact
+            .get("program_version_id")
+            .and_then(Value::as_str)
+            .or(commit_program_version_id);
+        let revision_epoch = fact
+            .get("revision_epoch")
+            .and_then(Value::as_i64)
+            .unwrap_or(commit_revision_epoch);
         let new_fact = NewFact {
             fact_id,
             name,
@@ -6427,8 +6979,17 @@ fn replay_rule_commit(
                 .and_then(Value::as_str)
                 .unwrap_or("replayed"),
             correlation_id: fact.get("correlation_id").and_then(Value::as_str),
+            source_span_json: source_span_json.as_deref(),
         };
-        insert_fact(connection, instance_id, rule, event_id, &new_fact)?;
+        insert_fact(
+            connection,
+            instance_id,
+            rule,
+            event_id,
+            program_version_id,
+            revision_epoch,
+            &new_fact,
+        )?;
     }
 
     let consumed_fact_ids = payload
@@ -6529,6 +7090,51 @@ fn replay_rule_commit(
     }
 
     Ok(())
+}
+
+fn replay_fact_derived(
+    connection: &Connection,
+    instance_id: &str,
+    event_id: &str,
+    source: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let fact_id = payload.get("fact_id").and_then(Value::as_str).unwrap_or("");
+    let name = payload.get("name").and_then(Value::as_str).unwrap_or("");
+    let key = payload.get("key").and_then(Value::as_str).unwrap_or("");
+    if fact_id.is_empty() || name.is_empty() || key.is_empty() {
+        return Ok(());
+    }
+
+    let value_json = payload
+        .get("value")
+        .cloned()
+        .unwrap_or(Value::Null)
+        .to_string();
+    let fact = NewFact {
+        fact_id,
+        name,
+        key,
+        value_json: &value_json,
+        schema_id: payload.get("schema_id").and_then(Value::as_str),
+        provenance_class: payload
+            .get("provenance_class")
+            .and_then(Value::as_str)
+            .unwrap_or("derived"),
+        correlation_id: payload.get("correlation_id").and_then(Value::as_str),
+        source_span_json: None,
+    };
+    let (program_version_id, revision_epoch) = active_revision_on(connection, instance_id)?;
+    insert_fact(
+        connection,
+        instance_id,
+        source,
+        event_id,
+        program_version_id.as_deref(),
+        revision_epoch,
+        &fact,
+    )
 }
 
 fn replay_workflow_terminal(
@@ -6805,7 +7411,7 @@ fn replay_effect_terminal(
         .and_then(Value::as_str)
         .unwrap_or("");
     let run_id = payload.get("run_id").and_then(Value::as_str).unwrap_or("");
-    if effect_id.is_empty() || run_id.is_empty() {
+    if effect_id.is_empty() {
         return Ok(());
     }
     let status = payload
@@ -6824,56 +7430,58 @@ fn replay_effect_terminal(
         .get("metadata")
         .map(Value::to_string)
         .unwrap_or_else(|| "{}".to_owned());
-    connection.execute(
-        r#"
-        INSERT INTO runs (
-            run_id,
-            effect_id,
-            instance_id,
-            provider,
-            worker_id,
-            status,
-            completed_at,
-            exit_code,
-            summary,
-            metadata_json
-        )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP, ?7, ?8, ?9)
-        ON CONFLICT(run_id) DO UPDATE SET
-            effect_id = excluded.effect_id,
-            instance_id = excluded.instance_id,
-            provider = excluded.provider,
-            worker_id = excluded.worker_id,
-            status = excluded.status,
-            completed_at = CURRENT_TIMESTAMP,
-            exit_code = excluded.exit_code,
-            summary = excluded.summary,
-            metadata_json = excluded.metadata_json
-        "#,
-        params![
-            run_id,
-            effect_id,
-            instance_id,
-            provider,
-            worker_id,
-            status,
-            payload.get("exit_code").and_then(Value::as_i64),
-            payload.get("summary").and_then(Value::as_str),
-            metadata_json,
-        ],
-    )?;
-    connection.execute(
-        r#"
-        UPDATE leases
-        SET status = 'released',
-            released_at = CURRENT_TIMESTAMP
-        WHERE run_id = ?1
-          AND effect_id = ?2
-          AND instance_id = ?3
-          AND status = 'active'
-        "#,
-        params![run_id, effect_id, instance_id],
-    )?;
+    if !run_id.is_empty() {
+        connection.execute(
+            r#"
+            INSERT INTO runs (
+                run_id,
+                effect_id,
+                instance_id,
+                provider,
+                worker_id,
+                status,
+                completed_at,
+                exit_code,
+                summary,
+                metadata_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP, ?7, ?8, ?9)
+            ON CONFLICT(run_id) DO UPDATE SET
+                effect_id = excluded.effect_id,
+                instance_id = excluded.instance_id,
+                provider = excluded.provider,
+                worker_id = excluded.worker_id,
+                status = excluded.status,
+                completed_at = CURRENT_TIMESTAMP,
+                exit_code = excluded.exit_code,
+                summary = excluded.summary,
+                metadata_json = excluded.metadata_json
+            "#,
+            params![
+                run_id,
+                effect_id,
+                instance_id,
+                provider,
+                worker_id,
+                status,
+                payload.get("exit_code").and_then(Value::as_i64),
+                payload.get("summary").and_then(Value::as_str),
+                metadata_json,
+            ],
+        )?;
+        connection.execute(
+            r#"
+            UPDATE leases
+            SET status = 'released',
+                released_at = CURRENT_TIMESTAMP
+            WHERE run_id = ?1
+              AND effect_id = ?2
+              AND instance_id = ?3
+              AND status = 'active'
+            "#,
+            params![run_id, effect_id, instance_id],
+        )?;
+    }
     connection.execute(
         r#"
         UPDATE effects
@@ -6915,6 +7523,7 @@ fn replay_effect_cancelled(
         params![instance_id, effect_id],
     )?;
     mark_cancellation_requests_terminal_on(connection, instance_id, effect_id, event_id)?;
+    satisfy_dependencies_on(connection, instance_id)?;
     Ok(())
 }
 
@@ -7074,6 +7683,29 @@ fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
     ensure_diagnostics_schema(connection)?;
     ensure_workflow_invocation_schema(connection)?;
     ensure_revision_schema(connection)?;
+    ensure_workspace_schema(connection)?;
+    Ok(())
+}
+
+fn ensure_workspace_schema(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS workspaces (
+            workspace_id TEXT PRIMARY KEY,
+            instance_id TEXT REFERENCES instances(instance_id),
+            effect_id TEXT REFERENCES effects(effect_id),
+            run_id TEXT REFERENCES runs(run_id),
+            provider TEXT,
+            policy TEXT NOT NULL,
+            uri TEXT NOT NULL,
+            status TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(instance_id, effect_id, run_id, policy)
+        );
+        "#,
+    )?;
     Ok(())
 }
 
@@ -7217,6 +7849,18 @@ fn ensure_fact_schema(connection: &Connection) -> StoreResult<()> {
     if !column_exists(connection, "facts", "consumed_at")? {
         connection.execute("ALTER TABLE facts ADD COLUMN consumed_at TEXT", [])?;
     }
+    for (column, definition) in [
+        ("program_version_id", "TEXT"),
+        ("revision_epoch", "INTEGER NOT NULL DEFAULT 0"),
+        ("source_span_json", "TEXT"),
+    ] {
+        if !column_exists(connection, "facts", column)? {
+            connection.execute(
+                &format!("ALTER TABLE facts ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -7314,6 +7958,35 @@ mod tests {
         ] {
             assert!(store.table_exists(table).expect("table lookup"), "{table}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_file_store_hardens_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "whipplescript-store-permissions-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+        ));
+        fs::write(&path, "").expect("precreated store file writes");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("precreated permissions set");
+
+        let store = SqliteStore::open(&path).expect("file store opens");
+        let mode = fs::metadata(&path)
+            .expect("store metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        drop(store);
+        fs::remove_file(path).expect("store file removes");
     }
 
     #[test]
@@ -7551,6 +8224,24 @@ mod tests {
             })
             .expect("rule commit succeeds");
         store
+            .derive_fact(DerivedFact {
+                instance_id: "instance-a",
+                fact: NewFact {
+                    fact_id: "fact-derived",
+                    name: "derived",
+                    key: "derived-1",
+                    value_json: r#"{"ok":true}"#,
+                    schema_id: None,
+                    provenance_class: "derived",
+                    correlation_id: Some("claim"),
+                    source_span_json: None,
+                },
+                source: "kernel",
+                causation_id: None,
+                idempotency_key: Some("derive-fact"),
+            })
+            .expect("derived fact succeeds");
+        store
             .connection
             .execute("DELETE FROM effect_dependencies", [])
             .expect("dependencies clear");
@@ -7567,10 +8258,16 @@ mod tests {
             .rebuild_projections("instance-a")
             .expect("projections rebuild");
 
-        assert_eq!(row_count(&store, "events"), 1);
-        assert_eq!(row_count(&store, "facts"), 1);
+        assert_eq!(row_count(&store, "events"), 2);
+        assert_eq!(row_count(&store, "facts"), 2);
         assert_eq!(row_count(&store, "effects"), 2);
         assert_eq!(row_count(&store, "effect_dependencies"), 1);
+        let rebuilt_facts = store.list_facts("instance-a").expect("facts list");
+        assert!(rebuilt_facts.iter().any(|fact| {
+            fact.fact_id == "fact-derived"
+                && fact.name == "derived"
+                && fact.value_json.contains(r#""ok":true"#)
+        }));
     }
 
     #[test]
@@ -7678,6 +8375,70 @@ mod tests {
         assert!(duplicate.is_err());
         assert_eq!(row_count(&store, "events"), 3);
         assert_eq!(row_count(&store, "runs"), 1);
+    }
+
+    #[test]
+    fn contradictory_terminal_completion_rolls_back_event_even_with_distinct_key() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let effects = [test_effect("tell", "agent.tell", "rule=start;effect=tell")];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commit succeeds");
+
+        store
+            .start_run(RunStart {
+                instance_id: "instance-a",
+                effect_id: "tell",
+                run_id: "run-1",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-1",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        store
+            .complete_effect(EffectCompletion {
+                idempotency_key: Some("provider-session-a:turn-a:terminal-hash-ok"),
+                ..test_completion("run-1")
+            })
+            .expect("completion succeeds");
+        let contradictory = store.complete_effect(EffectCompletion {
+            status: "failed",
+            exit_code: Some(1),
+            summary: Some("provider reported a later failure"),
+            metadata_json: r#"{"terminal_payload_hash":"different"}"#,
+            idempotency_key: Some("provider-session-a:turn-a:terminal-hash-different"),
+            ..test_completion("run-1")
+        });
+
+        assert!(contradictory.is_err());
+        assert_eq!(row_count(&store, "events"), 3);
+        let runs = store.list_runs("instance-a").expect("runs list");
+        assert_eq!(runs[0].status, "completed");
+        let terminal_events = store
+            .list_events("instance-a")
+            .expect("events list")
+            .into_iter()
+            .filter(|event| event.event_type == "effect.terminal")
+            .collect::<Vec<_>>();
+        assert_eq!(terminal_events.len(), 1);
+        assert!(terminal_events[0]
+            .payload_json
+            .contains("\"summary\":\"done\""));
+        assert!(!terminal_events[0]
+            .payload_json
+            .contains("provider reported a later failure"));
     }
 
     #[test]
@@ -8720,6 +9481,181 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_request_after_terminal_completion_is_rejected() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version(
+                "RequestCancelAfterTerminal",
+                "source-1",
+                "ir-1",
+            ))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("tell", "agent.tell", "tell-key")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-request-cancel-after-terminal"),
+            })
+            .expect("rule commits");
+        store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-tell",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        store
+            .complete_effect(EffectCompletion {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "test",
+                worker_id: "worker-1",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some("done"),
+                metadata_json: "{}",
+                idempotency_key: Some("complete-before-cancel-request"),
+            })
+            .expect("completion succeeds");
+
+        let request = store.request_effect_cancellation(EffectCancellationRequest {
+            instance_id: &instance.instance_id,
+            effect_id: "tell",
+            revision_id: None,
+            reason: Some("too late"),
+            requested_by: "test",
+            causation_event_id: None,
+            idempotency_key: Some("request-cancel-after-terminal"),
+        });
+
+        assert!(matches!(request, Err(StoreError::Conflict(_))));
+        assert!(store
+            .list_effect_cancellation_requests(&instance.instance_id)
+            .expect("requests load")
+            .is_empty());
+        assert_eq!(effect_status(&store, "tell"), "completed");
+    }
+
+    #[test]
+    fn cancellation_request_resolves_on_timeout_and_rejects_late_completion() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version(
+                "RequestCancelThenTimeout",
+                "source-1",
+                "ir-1",
+            ))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("tell", "agent.tell", "tell-timeout-key")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-request-cancel-timeout"),
+            })
+            .expect("rule commits");
+        store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                run_id: "run-tell-timeout",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-tell-timeout",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        store
+            .request_effect_cancellation(EffectCancellationRequest {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                revision_id: None,
+                reason: Some("operator"),
+                requested_by: "operator",
+                causation_event_id: None,
+                idempotency_key: Some("request-cancel-before-timeout"),
+            })
+            .expect("cancellation requests");
+
+        let timeout = store
+            .complete_effect(EffectCompletion {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                run_id: "run-tell-timeout",
+                provider: "test",
+                worker_id: "worker-1",
+                status: "timed_out",
+                exit_code: Some(124),
+                summary: Some("provider timed out after cancellation request"),
+                metadata_json: r#"{"cancellation":"timeout_after_request"}"#,
+                idempotency_key: Some("timeout-after-cancel-request"),
+            })
+            .expect("timeout terminal succeeds");
+
+        let requests = store
+            .list_effect_cancellation_requests(&instance.instance_id)
+            .expect("requests load");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].status, "terminal");
+        assert_eq!(
+            requests[0].resolved_by_event_id.as_deref(),
+            Some(timeout.event_id.as_str())
+        );
+        assert_eq!(effect_status(&store, "tell"), "timed_out");
+        assert_eq!(lease_status(&store, "lease-tell-timeout"), "released");
+
+        let late_completion = store.complete_effect(EffectCompletion {
+            instance_id: &instance.instance_id,
+            effect_id: "tell",
+            run_id: "run-tell-timeout",
+            provider: "test",
+            worker_id: "worker-1",
+            status: "completed",
+            exit_code: Some(0),
+            summary: Some("late success"),
+            metadata_json: "{}",
+            idempotency_key: Some("late-success-after-timeout"),
+        });
+        assert!(matches!(
+            late_completion,
+            Err(StoreError::Conflict(message))
+                if message == "run already has a terminal completion"
+        ));
+    }
+
+    #[test]
     fn workflow_invocations_preserve_parent_and_child_revision_attribution() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let parent_version = store
@@ -9166,6 +10102,7 @@ mod tests {
                         schema_id: Some("State"),
                         provenance_class: "derived",
                         correlation_id: None,
+                        source_span_json: None,
                     },
                 ],
                 consumed_fact_ids: &[],
@@ -10188,9 +11125,9 @@ mod tests {
     }
 
     #[test]
-    fn opening_legacy_v1_store_adds_diagnostic_columns() {
+    fn opening_v1_store_adds_diagnostic_columns() {
         let path = std::env::temp_dir().join(format!(
-            "whipplescript-store-legacy-{}-{}.sqlite",
+            "whipplescript-store-v1-{}-{}.sqlite",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -10198,7 +11135,7 @@ mod tests {
                 .as_nanos()
         ));
         {
-            let connection = Connection::open(&path).expect("legacy db opens");
+            let connection = Connection::open(&path).expect("v1 db opens");
             connection
                 .execute_batch(
                     r#"
@@ -10209,6 +11146,17 @@ mod tests {
                     );
                     INSERT INTO schema_migrations (version, name)
                     VALUES (1, 'runtime-store-schema');
+                    CREATE TABLE instances (
+                        instance_id TEXT PRIMARY KEY,
+                        version_id TEXT
+                    );
+                    CREATE TABLE effects (
+                        effect_id TEXT PRIMARY KEY,
+                        instance_id TEXT
+                    );
+                    CREATE TABLE runs (
+                        run_id TEXT PRIMARY KEY
+                    );
                     CREATE TABLE diagnostics (
                         diagnostic_id TEXT PRIMARY KEY,
                         instance_id TEXT,
@@ -10220,21 +11168,21 @@ mod tests {
                     );
                     "#,
                 )
-                .expect("legacy schema creates");
+                .expect("v1 schema creates");
         }
 
-        let store = SqliteStore::open(&path).expect("store opens legacy schema");
+        let store = SqliteStore::open(&path).expect("store opens v1 schema");
         let diagnostic_id = store
             .record_diagnostic(DiagnosticRecord {
                 instance_id: None,
-                program_id: Some("program-legacy"),
-                program_version_id: Some("version-legacy"),
+                program_id: Some("program-v1"),
+                program_version_id: Some("version-v1"),
                 severity: "warning",
                 code: Some("compile.unused"),
                 message: "unused binding",
                 source_span_json: None,
                 subject_type: Some("program_version"),
-                subject_id: Some("version-legacy"),
+                subject_id: Some("version-v1"),
                 event_id: None,
                 effect_id: None,
                 run_id: None,
@@ -10250,13 +11198,207 @@ mod tests {
         let diagnostics = store.list_diagnostics(None).expect("diagnostics list");
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].diagnostic_id, diagnostic_id);
-        assert_eq!(diagnostics[0].program_id.as_deref(), Some("program-legacy"));
+        assert_eq!(diagnostics[0].program_id.as_deref(), Some("program-v1"));
         assert_eq!(
             diagnostics[0].program_version_id.as_deref(),
-            Some("version-legacy")
+            Some("version-v1")
         );
 
-        fs::remove_file(path).expect("legacy db removes");
+        fs::remove_file(path).expect("v1 db removes");
+    }
+
+    #[test]
+    fn records_and_updates_workspace_records_for_provider_runs() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("WorkspaceRecords", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("tell", "agent.tell", "workspace-record-effect")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-workspace-record"),
+            })
+            .expect("rule commits");
+        store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                run_id: "run-workspace",
+                provider: "codex-main",
+                worker_id: "worker-1",
+                lease_id: "lease-workspace",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+
+        let workspace_id = store
+            .record_workspace(WorkspaceRecord {
+                instance_id: Some(&instance.instance_id),
+                effect_id: Some("tell"),
+                run_id: Some("run-workspace"),
+                provider: Some("codex-main"),
+                policy: "per_effect_worktree",
+                uri: "file:///tmp/whipplescript/worktrees/run-workspace",
+                status: "prepared",
+                metadata_json: r#"{"source":"test"}"#,
+            })
+            .expect("workspace records");
+        let same_workspace_id = store
+            .record_workspace(WorkspaceRecord {
+                instance_id: Some(&instance.instance_id),
+                effect_id: Some("tell"),
+                run_id: Some("run-workspace"),
+                provider: Some("codex-main"),
+                policy: "per_effect_worktree",
+                uri: "file:///tmp/whipplescript/worktrees/run-workspace",
+                status: "active",
+                metadata_json: r#"{"source":"test","updated":true}"#,
+            })
+            .expect("workspace upserts");
+
+        assert_eq!(workspace_id, same_workspace_id);
+        let workspace = store
+            .get_workspace(&workspace_id)
+            .expect("workspace loads")
+            .expect("workspace exists");
+        assert_eq!(workspace.policy, "per_effect_worktree");
+        assert_eq!(workspace.status, "active");
+        assert_eq!(workspace.run_id.as_deref(), Some("run-workspace"));
+        assert!(workspace.metadata_json.contains("\"updated\":true"));
+        let workspaces = store
+            .list_workspaces_for_instance(&instance.instance_id)
+            .expect("workspaces list");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].workspace_id, workspace_id);
+    }
+
+    #[test]
+    fn workspace_records_reject_unknown_policy_status_and_invalid_metadata() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+
+        let bad_policy = store.record_workspace(WorkspaceRecord {
+            instance_id: None,
+            effect_id: None,
+            run_id: None,
+            provider: Some("codex-main"),
+            policy: "host_everything",
+            uri: "file:///tmp/workspace",
+            status: "prepared",
+            metadata_json: "{}",
+        });
+        assert!(
+            matches!(bad_policy, Err(StoreError::Conflict(message)) if message.contains("unsupported workspace policy"))
+        );
+
+        let bad_status = store.record_workspace(WorkspaceRecord {
+            instance_id: None,
+            effect_id: None,
+            run_id: None,
+            provider: Some("codex-main"),
+            policy: "shared",
+            uri: "file:///tmp/workspace",
+            status: "teleported",
+            metadata_json: "{}",
+        });
+        assert!(
+            matches!(bad_status, Err(StoreError::Conflict(message)) if message.contains("unsupported workspace status"))
+        );
+
+        let bad_metadata = store.record_workspace(WorkspaceRecord {
+            instance_id: None,
+            effect_id: None,
+            run_id: None,
+            provider: Some("codex-main"),
+            policy: "shared",
+            uri: "file:///tmp/workspace",
+            status: "prepared",
+            metadata_json: "{not json",
+        });
+        assert!(matches!(bad_metadata, Err(StoreError::Json(_))));
+    }
+
+    #[test]
+    fn opening_v1_store_adds_workspace_table() {
+        let path = std::env::temp_dir().join(format!(
+            "whipplescript-store-workspace-v1-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        {
+            let connection = Connection::open(&path).expect("v1 db opens");
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO schema_migrations (version, name)
+                    VALUES (1, 'runtime-store-schema');
+                    CREATE TABLE instances (
+                        instance_id TEXT PRIMARY KEY,
+                        version_id TEXT
+                    );
+                    CREATE TABLE effects (
+                        effect_id TEXT PRIMARY KEY,
+                        instance_id TEXT
+                    );
+                    CREATE TABLE runs (
+                        run_id TEXT PRIMARY KEY
+                    );
+                    CREATE TABLE diagnostics (
+                        diagnostic_id TEXT PRIMARY KEY,
+                        instance_id TEXT,
+                        severity TEXT NOT NULL,
+                        code TEXT,
+                        message TEXT NOT NULL,
+                        source_span_json TEXT,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    "#,
+                )
+                .expect("v1 schema creates");
+        }
+
+        let store = SqliteStore::open(&path).expect("store opens v1 schema");
+        assert!(store.table_exists("workspaces").expect("table check"));
+        let workspace_id = store
+            .record_workspace(WorkspaceRecord {
+                instance_id: None,
+                effect_id: None,
+                run_id: None,
+                provider: Some("fixture"),
+                policy: "shared",
+                uri: "file:///tmp/shared",
+                status: "prepared",
+                metadata_json: "{}",
+            })
+            .expect("workspace records on upgraded schema");
+        assert!(store
+            .get_workspace(&workspace_id)
+            .expect("workspace loads")
+            .is_some());
+
+        fs::remove_file(path).expect("v1 db removes");
     }
 
     #[test]
@@ -10848,6 +11990,359 @@ mod tests {
             .contains("loft-user@1.0.0"));
     }
 
+    #[test]
+    fn provider_validation_evidence_records_refs_and_reopens() {
+        let path = std::env::temp_dir().join(format!(
+            "whipplescript-provider-validation-evidence-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        {
+            let mut store = SqliteStore::open(&path).expect("store opens");
+            let version = store
+                .create_program_version(test_program_version("ProviderEvidence", "source", "ir"))
+                .expect("program version creates");
+            let instance = store
+                .create_instance(NewInstance {
+                    program_id: &version.program_id,
+                    version_id: &version.version_id,
+                    input_json: "{}",
+                })
+                .expect("instance creates");
+            let evidence_id = store
+                .record_provider_validation_evidence(ProviderValidationEvidence {
+                    instance_id: &instance.instance_id,
+                    provider_id: "codex-main",
+                    provider_kind: "codex",
+                    surface: "codex_app_server",
+                    status: "pass",
+                    config_json: r#"{"provider_id":"codex-main","provider_kind":"codex","surface":"codex_app_server","credentials_ref":"secret:codex","extra_keys":["api_key"]}"#,
+                    capability_json: r#"{"provider_kind":"codex","surface":"codex_app_server","cancellation_depths":["native_stop"]}"#,
+                    validation_results_json: r#"[{"provider":"codex-main","surface":"codex_app_server","status":"pass","phase":"provider.surface.valid","code":"surface_supported","message":"ok","recoverable":false,"missing_config_refs":[]}]"#,
+                    source_path: Some("providers/native.json"),
+                    correlation_id: Some("provider-validation:codex-main"),
+                })
+                .expect("provider validation evidence records");
+            assert!(evidence_id.starts_with("evd_"));
+            let evidence = store
+                .list_evidence(&instance.instance_id)
+                .expect("evidence lists");
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(evidence[0].kind, "provider.validation");
+            assert_eq!(evidence[0].subject_type, "provider_config");
+            assert_eq!(evidence[0].subject_id, "codex-main");
+            let metadata =
+                serde_json::from_str::<Value>(&evidence[0].metadata_json).expect("metadata json");
+            assert_eq!(
+                metadata.get("provider_kind").and_then(Value::as_str),
+                Some("codex")
+            );
+            assert_eq!(
+                metadata
+                    .pointer("/config/extra_keys/0")
+                    .and_then(Value::as_str),
+                Some("api_key")
+            );
+            assert_eq!(
+                metadata
+                    .pointer("/validation_results/0/code")
+                    .and_then(Value::as_str),
+                Some("surface_supported")
+            );
+            let links = store
+                .list_evidence_links(&instance.instance_id)
+                .expect("evidence links list");
+            assert!(links.iter().any(|link| {
+                link.evidence_id == evidence_id
+                    && link.target_type == "provider_config"
+                    && link.target_id == "codex-main"
+                    && link.relation == "subject"
+            }));
+            assert!(links.iter().any(|link| {
+                link.evidence_id == evidence_id
+                    && link.target_type == "provider"
+                    && link.target_id == "codex-main"
+                    && link.relation == "validates"
+            }));
+            assert!(links.iter().any(|link| {
+                link.evidence_id == evidence_id
+                    && link.target_type == "provider_capability"
+                    && link.target_id == "codex:codex_app_server"
+                    && link.relation == "uses"
+            }));
+        }
+        {
+            let store = SqliteStore::open(&path).expect("store reopens");
+            let evidence = store
+                .list_evidence_for_subject("provider_config", "codex-main")
+                .expect("subject evidence lists");
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(evidence[0].kind, "provider.validation");
+            assert_eq!(
+                evidence[0].correlation_id.as_deref(),
+                Some("provider-validation:codex-main")
+            );
+        }
+        fs::remove_file(path).expect("provider evidence db removes");
+    }
+
+    #[test]
+    fn codex_app_server_evidence_records_refs_and_reopens() {
+        let path = std::env::temp_dir().join(format!(
+            "whipplescript-codex-app-server-evidence-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        {
+            let mut store = SqliteStore::open(&path).expect("store opens");
+            let version = store
+                .create_program_version(test_program_version("CodexEvidence", "source", "ir"))
+                .expect("program version creates");
+            let instance = store
+                .create_instance(NewInstance {
+                    program_id: &version.program_id,
+                    version_id: &version.version_id,
+                    input_json: "{}",
+                })
+                .expect("instance creates");
+            let evidence_id = store
+                .record_codex_app_server_evidence(CodexAppServerEvidence {
+                    instance_id: &instance.instance_id,
+                    provider_id: "codex-main",
+                    thread_id: "thread-1",
+                    turn_id: "turn-1",
+                    metadata_json: r#"{"approvalRequests":[{"method":"item/commandExecution/requestApproval","commandBytes":14}],"toolRequests":[],"diffNotifications":[{"method":"turn/diff/updated","diffBytes":42}],"itemNotifications":[]}"#,
+                    correlation_id: Some("codex-app-server:turn-1"),
+                })
+                .expect("codex evidence records");
+            assert!(evidence_id.starts_with("evd_"));
+            let evidence = store
+                .list_evidence(&instance.instance_id)
+                .expect("evidence lists");
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(evidence[0].kind, "codex.app_server.evidence");
+            assert_eq!(evidence[0].subject_type, "provider_turn");
+            assert_eq!(evidence[0].subject_id, "turn-1");
+            let metadata =
+                serde_json::from_str::<Value>(&evidence[0].metadata_json).expect("metadata json");
+            assert_eq!(
+                metadata.get("provider_id").and_then(Value::as_str),
+                Some("codex-main")
+            );
+            assert_eq!(
+                metadata
+                    .pointer("/evidence/diffNotifications/0/diffBytes")
+                    .and_then(Value::as_i64),
+                Some(42)
+            );
+            let links = store
+                .list_evidence_links(&instance.instance_id)
+                .expect("evidence links list");
+            assert!(links.iter().any(|link| {
+                link.evidence_id == evidence_id
+                    && link.target_type == "provider"
+                    && link.target_id == "codex-main"
+                    && link.relation == "observes"
+            }));
+            assert!(links.iter().any(|link| {
+                link.evidence_id == evidence_id
+                    && link.target_type == "provider_thread"
+                    && link.target_id == "thread-1"
+                    && link.relation == "observes"
+            }));
+        }
+        {
+            let store = SqliteStore::open(&path).expect("store reopens");
+            let evidence = store
+                .list_evidence_for_subject("provider_turn", "turn-1")
+                .expect("subject evidence lists");
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(evidence[0].kind, "codex.app_server.evidence");
+            assert_eq!(
+                evidence[0].correlation_id.as_deref(),
+                Some("codex-app-server:turn-1")
+            );
+        }
+        fs::remove_file(path).expect("codex evidence db removes");
+    }
+
+    #[test]
+    fn claude_agent_sdk_evidence_records_refs_and_reopens() {
+        let path = std::env::temp_dir().join(format!(
+            "whipplescript-claude-agent-sdk-evidence-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        {
+            let mut store = SqliteStore::open(&path).expect("store opens");
+            let version = store
+                .create_program_version(test_program_version("ClaudeEvidence", "source", "ir"))
+                .expect("program version creates");
+            let instance = store
+                .create_instance(NewInstance {
+                    program_id: &version.program_id,
+                    version_id: &version.version_id,
+                    input_json: "{}",
+                })
+                .expect("instance creates");
+            let evidence_id = store
+                .record_claude_agent_sdk_evidence(ClaudeAgentSdkEvidence {
+                    instance_id: &instance.instance_id,
+                    provider_id: "claude-main",
+                    session_id: "session-1",
+                    run_id: "run-1",
+                    metadata_json: r#"{"session_id":"session-1","event_counts":{"claude.stream.message":2,"claude.turn.completed":1},"terminal_type":"claude.turn.completed","terminal_payload":{"subtype":"success","result_shape":{"type":"string","chars":12},"usage_shape":{"type":"object","keys":2}}}"#,
+                    correlation_id: Some("claude-agent-sdk:run-1"),
+                })
+                .expect("claude evidence records");
+            assert!(evidence_id.starts_with("evd_"));
+            let evidence = store
+                .list_evidence(&instance.instance_id)
+                .expect("evidence lists");
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(evidence[0].kind, "claude.agent_sdk.evidence");
+            assert_eq!(evidence[0].subject_type, "provider_session");
+            assert_eq!(evidence[0].subject_id, "session-1");
+            assert_eq!(evidence[0].causation_id.as_deref(), Some("run-1"));
+            let metadata =
+                serde_json::from_str::<Value>(&evidence[0].metadata_json).expect("metadata json");
+            assert_eq!(
+                metadata.get("provider_id").and_then(Value::as_str),
+                Some("claude-main")
+            );
+            assert_eq!(
+                metadata
+                    .pointer("/evidence/event_counts/claude.turn.completed")
+                    .and_then(Value::as_i64),
+                Some(1)
+            );
+            let links = store
+                .list_evidence_links(&instance.instance_id)
+                .expect("evidence links list");
+            assert!(links.iter().any(|link| {
+                link.evidence_id == evidence_id
+                    && link.target_type == "provider"
+                    && link.target_id == "claude-main"
+                    && link.relation == "observes"
+            }));
+            assert!(links.iter().any(|link| {
+                link.evidence_id == evidence_id
+                    && link.target_type == "provider_run"
+                    && link.target_id == "run-1"
+                    && link.relation == "observes"
+            }));
+        }
+        {
+            let store = SqliteStore::open(&path).expect("store reopens");
+            let evidence = store
+                .list_evidence_for_subject("provider_session", "session-1")
+                .expect("subject evidence lists");
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(evidence[0].kind, "claude.agent_sdk.evidence");
+            assert_eq!(
+                evidence[0].correlation_id.as_deref(),
+                Some("claude-agent-sdk:run-1")
+            );
+        }
+        fs::remove_file(path).expect("claude evidence db removes");
+    }
+
+    #[test]
+    fn pi_rpc_evidence_records_refs_and_reopens() {
+        let path = std::env::temp_dir().join(format!(
+            "whipplescript-pi-rpc-evidence-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        {
+            let mut store = SqliteStore::open(&path).expect("store opens");
+            let version = store
+                .create_program_version(test_program_version("PiEvidence", "source", "ir"))
+                .expect("program version creates");
+            let instance = store
+                .create_instance(NewInstance {
+                    program_id: &version.program_id,
+                    version_id: &version.version_id,
+                    input_json: "{}",
+                })
+                .expect("instance creates");
+            let evidence_id = store
+                .record_pi_rpc_evidence(PiRpcEvidence {
+                    instance_id: &instance.instance_id,
+                    provider_id: "pi-main",
+                    session_id: "session-1",
+                    run_id: "run-1",
+                    metadata_json: r#"{"session_id":"session-1","model_provider":"openai-codex","model_id":"gpt-5.5","event_counts":{"message":2,"tool_call":1},"terminal_type":"completed","terminal_payload":{"result_shape":{"type":"string","chars":12}}}"#,
+                    correlation_id: Some("pi-rpc:run-1"),
+                })
+                .expect("pi evidence records");
+            assert!(evidence_id.starts_with("evd_"));
+            let evidence = store
+                .list_evidence(&instance.instance_id)
+                .expect("evidence lists");
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(evidence[0].kind, "pi.rpc.evidence");
+            assert_eq!(evidence[0].subject_type, "provider_session");
+            assert_eq!(evidence[0].subject_id, "session-1");
+            assert_eq!(evidence[0].causation_id.as_deref(), Some("run-1"));
+            let metadata =
+                serde_json::from_str::<Value>(&evidence[0].metadata_json).expect("metadata json");
+            assert_eq!(
+                metadata.get("provider_id").and_then(Value::as_str),
+                Some("pi-main")
+            );
+            assert_eq!(
+                metadata
+                    .pointer("/evidence/event_counts/tool_call")
+                    .and_then(Value::as_i64),
+                Some(1)
+            );
+            assert_eq!(
+                metadata
+                    .pointer("/evidence/model_provider")
+                    .and_then(Value::as_str),
+                Some("openai-codex")
+            );
+            let links = store
+                .list_evidence_links(&instance.instance_id)
+                .expect("evidence links list");
+            assert!(links.iter().any(|link| {
+                link.evidence_id == evidence_id
+                    && link.target_type == "provider"
+                    && link.target_id == "pi-main"
+                    && link.relation == "observes"
+            }));
+            assert!(links.iter().any(|link| {
+                link.evidence_id == evidence_id
+                    && link.target_type == "provider_run"
+                    && link.target_id == "run-1"
+                    && link.relation == "observes"
+            }));
+        }
+        {
+            let store = SqliteStore::open(&path).expect("store reopens");
+            let evidence = store
+                .list_evidence_for_subject("provider_session", "session-1")
+                .expect("subject evidence lists");
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(evidence[0].kind, "pi.rpc.evidence");
+            assert_eq!(evidence[0].correlation_id.as_deref(), Some("pi-rpc:run-1"));
+        }
+        fs::remove_file(path).expect("pi evidence db removes");
+    }
+
     fn new_event<'a>(
         instance_id: &'a str,
         event_type: &'a str,
@@ -10873,6 +12368,7 @@ mod tests {
             schema_id: Some("WorkItem"),
             provenance_class: "derived",
             correlation_id: None,
+            source_span_json: None,
         }
     }
 

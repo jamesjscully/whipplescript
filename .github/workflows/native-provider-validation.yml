@@ -1,0 +1,153 @@
+name: Native Provider Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      strict:
+        description: "Require strict native Codex, Claude, and Pi validation."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      native_provider_configs:
+        description: "Colon-separated provider config paths for strict mode."
+        required: false
+        default: ""
+        type: string
+      live_codex:
+        description: "Run live Codex app-server smokes."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      live_claude:
+        description: "Run live Claude Agent SDK smokes."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      live_pi:
+        description: "Run live Pi in-flight abort smoke."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  provider:
+    name: ${{ matrix.provider }} native validation
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [codex, claude, pi]
+    env:
+      WHIPPLESCRIPT_E2E_REAL_PROVIDERS: "1"
+      WHIPPLESCRIPT_REAL_PROVIDERS: ${{ matrix.provider }}
+      WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_SURFACE: "1"
+      WHIPPLESCRIPT_REAL_PROVIDER_REPORT: target/native-provider-ci/${{ matrix.provider }}/real-provider-smoke-report.md
+      WHIPPLESCRIPT_REAL_PROVIDER_PREFLIGHT_REPORT: target/native-provider-ci/${{ matrix.provider }}/real-provider-preflight.jsonl
+      WHIPPLESCRIPT_REAL_PROVIDER_REPORT_DIR: target/native-provider-ci/${{ matrix.provider }}/reports
+      WHIPPLESCRIPT_CODEX_APP_SERVER_LIVE: ${{ inputs.live_codex == 'true' && matrix.provider == 'codex' && '1' || '0' }}
+      WHIPPLESCRIPT_CODEX_APP_SERVER_ARTIFACT_LIVE: ${{ inputs.live_codex == 'true' && matrix.provider == 'codex' && '1' || '0' }}
+      WHIPPLESCRIPT_CODEX_APP_SERVER_ARTIFACT_REPORT: target/native-provider-ci/${{ matrix.provider }}/codex-app-server-artifact-smoke.json
+      WHIPPLESCRIPT_CODEX_NATIVE_WORKFLOW_LIVE: ${{ inputs.live_codex == 'true' && matrix.provider == 'codex' && '1' || '0' }}
+      WHIPPLESCRIPT_CODEX_NATIVE_WORKFLOW_REPORT: target/native-provider-ci/${{ matrix.provider }}/codex-native-workflow-smoke.json
+      WHIPPLESCRIPT_CODEX_DISPOSABLE_TARGET: ${{ inputs.live_codex == 'true' && matrix.provider == 'codex' && 'codex-artifact-fixture' || '' }}
+      WHIPPLESCRIPT_CODEX_DISPOSABLE_ACK: ${{ inputs.live_codex == 'true' && matrix.provider == 'codex' && 'I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE' || '' }}
+      WHIPPLESCRIPT_CLAUDE_AGENT_SDK_LIVE: ${{ inputs.live_claude == 'true' && matrix.provider == 'claude' && '1' || '0' }}
+      WHIPPLESCRIPT_CLAUDE_AGENT_SDK_ARTIFACT_LIVE: ${{ inputs.live_claude == 'true' && matrix.provider == 'claude' && '1' || '0' }}
+      WHIPPLESCRIPT_CLAUDE_AGENT_SDK_ARTIFACT_REPORT: target/native-provider-ci/${{ matrix.provider }}/claude-agent-sdk-artifact-smoke.json
+      WHIPPLESCRIPT_CLAUDE_NATIVE_WORKFLOW_LIVE: ${{ inputs.live_claude == 'true' && matrix.provider == 'claude' && '1' || '0' }}
+      WHIPPLESCRIPT_CLAUDE_NATIVE_WORKFLOW_REPORT: target/native-provider-ci/${{ matrix.provider }}/claude-native-workflow-smoke.json
+      WHIPPLESCRIPT_CLAUDE_DISPOSABLE_TARGET: ${{ inputs.live_claude == 'true' && matrix.provider == 'claude' && 'claude-artifact-fixture' || '' }}
+      WHIPPLESCRIPT_CLAUDE_DISPOSABLE_ACK: ${{ inputs.live_claude == 'true' && matrix.provider == 'claude' && 'I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE' || '' }}
+      WHIPPLESCRIPT_PI_RPC_INTERRUPT_LIVE: ${{ inputs.live_pi == 'true' && matrix.provider == 'pi' && '1' || '0' }}
+      WHIPPLESCRIPT_PI_RPC_ARTIFACT_LIVE: ${{ inputs.live_pi == 'true' && matrix.provider == 'pi' && '1' || '0' }}
+      WHIPPLESCRIPT_PI_RPC_ARTIFACT_REPORT: target/native-provider-ci/${{ matrix.provider }}/pi-rpc-artifact-smoke.json
+      WHIPPLESCRIPT_PI_NATIVE_WORKFLOW_LIVE: ${{ inputs.live_pi == 'true' && matrix.provider == 'pi' && '1' || '0' }}
+      WHIPPLESCRIPT_PI_NATIVE_WORKFLOW_REPORT: target/native-provider-ci/${{ matrix.provider }}/pi-native-workflow-smoke.json
+      WHIPPLESCRIPT_PI_DISPOSABLE_TARGET: ${{ inputs.live_pi == 'true' && matrix.provider == 'pi' && 'pi-artifact-fixture' || '' }}
+      WHIPPLESCRIPT_PI_DISPOSABLE_ACK: ${{ inputs.live_pi == 'true' && matrix.provider == 'pi' && 'I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Run provider validation report
+        run: scripts/check-real-providers-report.sh
+
+      - name: Upload provider reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-provider-${{ matrix.provider }}-reports
+          path: target/native-provider-ci/${{ matrix.provider }}/
+
+  strict:
+    name: strict native provider gate
+    if: ${{ inputs.strict == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      WHIPPLESCRIPT_E2E_REAL_PROVIDERS: "1"
+      WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_STRICT: "1"
+      WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS: ${{ inputs.native_provider_configs }}
+      WHIPPLESCRIPT_REAL_PROVIDER_PREFLIGHT_ONLY: "1"
+      WHIPPLESCRIPT_REAL_PROVIDER_REPORT: target/native-provider-ci/strict/real-provider-smoke-report.md
+      WHIPPLESCRIPT_REAL_PROVIDER_PREFLIGHT_REPORT: target/native-provider-ci/strict/real-provider-preflight.jsonl
+      WHIPPLESCRIPT_REAL_PROVIDER_REPORT_DIR: target/native-provider-ci/strict/reports
+      WHIPPLESCRIPT_CODEX_APP_SERVER_LIVE: ${{ inputs.live_codex == 'true' && '1' || '0' }}
+      WHIPPLESCRIPT_CODEX_APP_SERVER_ARTIFACT_LIVE: ${{ inputs.live_codex == 'true' && '1' || '0' }}
+      WHIPPLESCRIPT_CODEX_APP_SERVER_ARTIFACT_REPORT: target/native-provider-ci/strict/codex-app-server-artifact-smoke.json
+      WHIPPLESCRIPT_CODEX_NATIVE_WORKFLOW_LIVE: ${{ inputs.live_codex == 'true' && '1' || '0' }}
+      WHIPPLESCRIPT_CODEX_NATIVE_WORKFLOW_REPORT: target/native-provider-ci/strict/codex-native-workflow-smoke.json
+      WHIPPLESCRIPT_CODEX_DISPOSABLE_TARGET: ${{ inputs.live_codex == 'true' && 'codex-artifact-fixture' || '' }}
+      WHIPPLESCRIPT_CODEX_DISPOSABLE_ACK: ${{ inputs.live_codex == 'true' && 'I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE' || '' }}
+      WHIPPLESCRIPT_CLAUDE_AGENT_SDK_LIVE: ${{ inputs.live_claude == 'true' && '1' || '0' }}
+      WHIPPLESCRIPT_CLAUDE_AGENT_SDK_ARTIFACT_LIVE: ${{ inputs.live_claude == 'true' && '1' || '0' }}
+      WHIPPLESCRIPT_CLAUDE_AGENT_SDK_ARTIFACT_REPORT: target/native-provider-ci/strict/claude-agent-sdk-artifact-smoke.json
+      WHIPPLESCRIPT_CLAUDE_NATIVE_WORKFLOW_LIVE: ${{ inputs.live_claude == 'true' && '1' || '0' }}
+      WHIPPLESCRIPT_CLAUDE_NATIVE_WORKFLOW_REPORT: target/native-provider-ci/strict/claude-native-workflow-smoke.json
+      WHIPPLESCRIPT_CLAUDE_DISPOSABLE_TARGET: ${{ inputs.live_claude == 'true' && 'claude-artifact-fixture' || '' }}
+      WHIPPLESCRIPT_CLAUDE_DISPOSABLE_ACK: ${{ inputs.live_claude == 'true' && 'I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE' || '' }}
+      WHIPPLESCRIPT_PI_RPC_INTERRUPT_LIVE: ${{ inputs.live_pi == 'true' && '1' || '0' }}
+      WHIPPLESCRIPT_PI_RPC_ARTIFACT_LIVE: ${{ inputs.live_pi == 'true' && '1' || '0' }}
+      WHIPPLESCRIPT_PI_RPC_ARTIFACT_REPORT: target/native-provider-ci/strict/pi-rpc-artifact-smoke.json
+      WHIPPLESCRIPT_PI_NATIVE_WORKFLOW_LIVE: ${{ inputs.live_pi == 'true' && '1' || '0' }}
+      WHIPPLESCRIPT_PI_NATIVE_WORKFLOW_REPORT: target/native-provider-ci/strict/pi-native-workflow-smoke.json
+      WHIPPLESCRIPT_PI_DISPOSABLE_TARGET: ${{ inputs.live_pi == 'true' && 'pi-artifact-fixture' || '' }}
+      WHIPPLESCRIPT_PI_DISPOSABLE_ACK: ${{ inputs.live_pi == 'true' && 'I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Run strict native provider validation
+        run: scripts/check-real-providers-report.sh
+
+      - name: Upload strict native reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-provider-strict-reports
+          path: target/native-provider-ci/strict/

@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check:claude-agent-sdk": "scripts/check-claude-agent-sdk-live-smoke.sh"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.159"
+  }
+}

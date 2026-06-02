@@ -89,6 +89,9 @@ mod WHIPPLESCRIPT-KERNEL is
   op effectVersion : EffectId ProgramVersion RevisionEpoch -> Cfg .
   op requestable : EffectId -> Cfg .
   op cancellationRequested : EffectId -> Cfg .
+  op cancellationAcknowledged : EffectId -> Cfg .
+  op providerEvidence : EffectId EffectStatus -> Cfg .
+  op requiredArtifactCaptureFailure : EffectId -> Cfg .
   op correlates : EffectId FactId -> Cfg .
   op projection : EventId FactId ProjectionStatus -> Cfg .
   op completionProjection : EffectId EffectStatus FactId ProjectionStatus -> Cfg .
@@ -741,6 +744,12 @@ mod WHIPPLESCRIPT-KERNEL is
   rl [complete-run] : effect(E, running) providerRun(E) => effect(E, completed) providerRun(E) .
   rl [fail-run] : effect(E, running) providerRun(E) => effect(E, failed) providerRun(E) .
   rl [timeout-run] : effect(E, running) providerRun(E) => effect(E, timedOut) providerRun(E) .
+  rl [recover-provider-terminal] :
+    effect(E, running) providerRun(E) providerEvidence(E, S)
+    => effect(E, S) providerRun(E) providerEvidence(E, S) .
+  rl [required-artifact-capture-failure] :
+    effect(E, running) providerRun(E) requiredArtifactCaptureFailure(E)
+    => effect(E, failed) providerRun(E) requiredArtifactCaptureFailure(E) .
 
   --- Cancellation is available before an effect starts running.
   rl [cancel-queued] : effect(E, queued) => effect(E, cancelled) .
@@ -796,6 +805,10 @@ mod WHIPPLESCRIPT-KERNEL is
     => effect(E, running) effectVersion(E, PV, Ep)
        revisionCancellationPolicy(I, PV, Ep, requestRunning)
        cancellationRequested(E) .
+
+  rl [acknowledge-running-cancellation] :
+    effect(E, running) cancellationRequested(E)
+    => effect(E, running) cancellationAcknowledged(E) .
 
   --- Policy and capacity are modeled separately from dependency blocking so
   --- status and diagnostics can explain why work did not start.

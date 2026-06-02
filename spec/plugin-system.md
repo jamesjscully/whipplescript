@@ -130,8 +130,8 @@ instance.started
 instance.paused
 instance.completed
 effect.queued
-effect.claimed
-effect.completed
+effect.run_started
+effect.terminal
 agent.turn.before
 agent.turn.after
 status.render

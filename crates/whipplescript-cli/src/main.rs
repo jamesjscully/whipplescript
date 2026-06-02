@@ -7,11 +7,21 @@ use std::{
 
 use serde_json::{json, Value};
 use whipplescript_kernel::{
+    claude_agent_sdk::{ClaudeAgentSdkAdapter, ClaudeAgentSdkClient, StdioClaudeAgentSdkTransport},
+    codex_app_server::{CodexAppServerAdapter, CodexAppServerClient, StdioCodexAppServerTransport},
     coerce::{BamlCoerceRequest, FakeBamlClient},
     harness::{CommandAgentHarness, CommandLaunchPlan},
     idempotency_key,
     loft::{FakeLoftClient, LoftAction, LoftEffectRequest},
+    pi_rpc::{PiRpcAdapter, PiRpcClient, StdioPiRpcTransport},
     program_analysis_summary_json,
+    provider::{
+        builtin_provider_capabilities, validate_provider_binding, validate_provider_binding_json,
+        AdapterSurface, CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
+        NativeProviderBoundaryError, NativeProviderCancellation, NativeProviderEvent,
+        NativeProviderEventKind, NativeProviderTurnRequest, ProviderBindingConfig,
+        ProviderCapability, ProviderKind, ProviderValidationResult, ProviderValidationStatus,
+    },
     trace::{
         check_trace, DependencyEdge, DependencyPredicate, EffectStatus, TraceEvent, TraceRecord,
     },
@@ -25,11 +35,12 @@ use whipplescript_parser::{
     IrWorkflowContract, IrWorkflowContractKind, Item, QueryKind, SourceSpan, UnaryOp,
 };
 use whipplescript_store::{
-    ClaimableEffect, DiagnosticRecord, DiagnosticView, EffectCancellation, EffectCompletion,
-    EffectView, EventView, EvidenceLink, EvidenceLinkView, EvidenceRecord, EvidenceView, FactView,
-    HumanAnswer, InboxItemView, InstanceView, NewEffect, NewEffectDependency, NewEvent, NewFact,
-    NewWorkflowInvocation, RetryEffect, RevisionActivation, RevisionCancellationImpact,
-    RevisionCandidate, RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RuleCommit,
+    ArtifactView, ClaimableEffect, DiagnosticRecord, DiagnosticView, EffectCancellation,
+    EffectCompletion, EffectView, EventView, EvidenceLink, EvidenceLinkView, EvidenceRecord,
+    EvidenceView, FactView, HumanAnswer, InboxItemView, InstanceView, NewEffect,
+    NewEffectDependency, NewEvent, NewFact, NewWorkflowInvocation, ProviderValidationEvidence,
+    RetryEffect, RevisionActivation, RevisionCancellationImpact, RevisionCandidate,
+    RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RuleCommit,
     RuleCommitRevisionGuard, RunStart, RunView, SqliteStore, StatusView, StoreError,
     WorkflowInvocationView, WorkflowRevisionView, WorkflowTerminal, WorkflowTerminalKind,
 };
@@ -67,6 +78,7 @@ fn main() -> ExitCode {
         Some("facts") => facts(&options),
         Some("effects") => effects(&options),
         Some("runs") => runs(&options),
+        Some("artifacts") => artifacts(&options),
         Some("inbox") => inbox(&options),
         Some("evidence") => evidence(&options),
         Some("diagnostics") => diagnostics(&options),
@@ -75,6 +87,7 @@ fn main() -> ExitCode {
         Some("resume") => resume(&options),
         Some("cancel") => cancel(&options),
         Some("retry") => retry(&options),
+        Some("recover") => recover(&options),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             ExitCode::SUCCESS
@@ -145,10 +158,19 @@ fn print_usage() {
     println!("whipplescript {}", whipplescript_core::IMPLEMENTATION_STAGE);
     println!("usage: whip [--store path] [--json] <command> [args]");
     println!("commands: check, compile, run, revise, step, worker, dev, instances, status, log, facts, effects, runs");
-    println!("          inbox, evidence, diagnostics, trace, pause, resume, cancel, retry, doctor");
+    println!(
+        "          artifacts, inbox, evidence, diagnostics, trace, pause, resume, cancel, retry, recover, doctor"
+    );
 }
 
 fn doctor(options: &CliOptions) -> ExitCode {
+    let doctor_options = match DoctorOptions::parse(&options.args) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
     let store_status = match open_store(&options.store_path) {
         Ok(store) => match store.schema_version() {
             Ok(version) => json!({
@@ -169,11 +191,56 @@ fn doctor(options: &CliOptions) -> ExitCode {
         }),
     };
     let tools = doctor_tool_checks();
+    let provider_capabilities = builtin_provider_capabilities();
+    let provider_configs = doctor_provider_config_checks(
+        &doctor_options.provider_config_paths,
+        &provider_capabilities,
+    );
+    let provider_health_checks = if doctor_options.providers {
+        doctor_provider_health_checks(&provider_capabilities, &tools)
+    } else {
+        Vec::new()
+    };
+    let provider_validation_evidence_recorded = if let Some(instance_id) = doctor_options
+        .record_provider_evidence_instance_id
+        .as_deref()
+    {
+        let store = match open_store_or_exit(options) {
+            Ok(store) => store,
+            Err(code) => return code,
+        };
+        match record_doctor_provider_validation_evidence(
+            &store,
+            instance_id,
+            &provider_configs,
+            &provider_capabilities,
+        ) {
+            Ok(count) => count,
+            Err(error) => {
+                return report_store_error("failed to record provider validation evidence", error)
+            }
+        }
+    } else {
+        0
+    };
     if options.json {
         emit_json(json!({
             "stage": whipplescript_kernel::kernel_stage(),
             "store": store_status,
             "tools": tools.iter().map(tool_check_to_json).collect::<Vec<_>>(),
+            "provider_capabilities": provider_capabilities
+                .iter()
+                .map(|capability| capability.to_json())
+                .collect::<Vec<_>>(),
+            "provider_config_checks": provider_configs
+                .iter()
+                .map(provider_config_check_to_json)
+                .collect::<Vec<_>>(),
+            "provider_health_checks": provider_health_checks
+                .iter()
+                .map(provider_health_check_to_json)
+                .collect::<Vec<_>>(),
+            "provider_validation_evidence_recorded": provider_validation_evidence_recorded,
         }))
     } else {
         println!("whip doctor: {}", whipplescript_kernel::kernel_stage());
@@ -204,8 +271,374 @@ fn doctor(options: &CliOptions) -> ExitCode {
                 println!("    {}", tool.note);
             }
         }
+        println!("provider capabilities:");
+        for capability in provider_capabilities {
+            println!(
+                "  {:<8} {:<20} cancellation={}",
+                capability.provider_kind.as_str(),
+                capability.surface.as_str(),
+                capability
+                    .cancellation_depths
+                    .iter()
+                    .map(|depth| depth.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+        if !provider_configs.is_empty() {
+            println!("provider config checks:");
+            for config in provider_configs {
+                println!("  {}", config.path.display());
+                for result in config.results {
+                    println!(
+                        "    {:<5} {:<32} {}",
+                        result.status.as_str(),
+                        result.code,
+                        result.message
+                    );
+                }
+            }
+        }
+        if !provider_health_checks.is_empty() {
+            println!("provider health checks:");
+            for check in provider_health_checks {
+                println!(
+                    "  {:<8} {:<20} {:<8} {}",
+                    check.provider,
+                    check.check,
+                    check.status.as_str(),
+                    check.message
+                );
+            }
+        }
+        if provider_validation_evidence_recorded > 0 {
+            println!(
+                "provider validation evidence recorded: {provider_validation_evidence_recorded}"
+            );
+        }
         ExitCode::SUCCESS
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DoctorOptions {
+    provider_config_paths: Vec<PathBuf>,
+    record_provider_evidence_instance_id: Option<String>,
+    providers: bool,
+}
+
+impl DoctorOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut provider_config_paths = Vec::new();
+        let mut record_provider_evidence_instance_id = None;
+        let mut providers = false;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--providers" => providers = true,
+                "--provider-config" => {
+                    let Some(path) = iter.next() else {
+                        return Err("expected path after `--provider-config`".to_owned());
+                    };
+                    provider_config_paths.push(PathBuf::from(path));
+                }
+                "--record-provider-evidence" => {
+                    let Some(instance_id) = iter.next() else {
+                        return Err(
+                            "expected instance id after `--record-provider-evidence`".to_owned()
+                        );
+                    };
+                    record_provider_evidence_instance_id = Some(instance_id.clone());
+                }
+                other => {
+                    return Err(format!(
+                        "unknown doctor option `{other}`; expected --providers, --provider-config, or --record-provider-evidence"
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            provider_config_paths,
+            record_provider_evidence_instance_id,
+            providers,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DoctorProviderConfigCheck {
+    path: PathBuf,
+    results: Vec<ProviderValidationResult>,
+    bindings: Vec<DoctorProviderBindingCheck>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DoctorProviderBindingCheck {
+    config: ProviderBindingConfig,
+    results: Vec<ProviderValidationResult>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DoctorProviderHealthCheck {
+    provider: String,
+    surface: String,
+    check: String,
+    status: ProviderValidationStatus,
+    message: String,
+}
+
+fn doctor_provider_health_checks(
+    capabilities: &[ProviderCapability],
+    tools: &[ToolCheck],
+) -> Vec<DoctorProviderHealthCheck> {
+    capabilities
+        .iter()
+        .filter(|capability| matches!(capability.provider_kind.as_str(), "codex" | "claude" | "pi"))
+        .flat_map(|capability| {
+            let mut checks = Vec::new();
+            let provider = capability.provider_kind.as_str().to_owned();
+            let surface = capability.surface.as_str().to_owned();
+            checks.push(command_health_check(capability, tools));
+            for requirement in &capability.auth_requirements {
+                checks.push(auth_health_check(&provider, &surface, requirement));
+            }
+            for health_check in &capability.health_checks {
+                if !matches!(
+                    health_check.as_str(),
+                    "codex_cli" | "claude_sdk" | "pi_cli" | "api_key"
+                ) {
+                    checks.push(DoctorProviderHealthCheck {
+                        provider: provider.clone(),
+                        surface: surface.clone(),
+                        check: health_check.clone(),
+                        status: ProviderValidationStatus::Skip,
+                        message: "live provider check requires explicit real-provider validation"
+                            .to_owned(),
+                    });
+                }
+            }
+            checks
+        })
+        .collect()
+}
+
+fn command_health_check(
+    capability: &ProviderCapability,
+    tools: &[ToolCheck],
+) -> DoctorProviderHealthCheck {
+    let provider = capability.provider_kind.as_str();
+    let tool = tools.iter().find(|tool| tool.id == provider);
+    let available = tool.is_some_and(|tool| tool.available);
+    DoctorProviderHealthCheck {
+        provider: provider.to_owned(),
+        surface: capability.surface.as_str().to_owned(),
+        check: format!("{provider}_cli"),
+        status: if available {
+            ProviderValidationStatus::Pass
+        } else {
+            ProviderValidationStatus::Fail
+        },
+        message: if available {
+            format!("{provider} CLI is available")
+        } else {
+            format!("{provider} CLI is not on PATH")
+        },
+    }
+}
+
+fn auth_health_check(
+    provider: &str,
+    surface: &str,
+    requirement: &str,
+) -> DoctorProviderHealthCheck {
+    let env_name = match provider {
+        "codex" => Some("OPENAI_API_KEY"),
+        "claude" => Some("ANTHROPIC_API_KEY"),
+        "pi" => Some("PI_API_KEY"),
+        _ => None,
+    };
+    let env_set = env_name.is_some_and(|name| env::var_os(name).is_some());
+    DoctorProviderHealthCheck {
+        provider: provider.to_owned(),
+        surface: surface.to_owned(),
+        check: requirement.to_owned(),
+        status: if env_set {
+            ProviderValidationStatus::Pass
+        } else {
+            ProviderValidationStatus::Skip
+        },
+        message: if let Some(env_name) = env_name {
+            if env_set {
+                format!("{env_name} is set; value redacted")
+            } else {
+                format!("{env_name} is unset; credential reference may come from provider config")
+            }
+        } else {
+            "credential reference posture unavailable".to_owned()
+        },
+    }
+}
+
+fn doctor_provider_config_checks(
+    paths: &[PathBuf],
+    capabilities: &[ProviderCapability],
+) -> Vec<DoctorProviderConfigCheck> {
+    paths
+        .iter()
+        .map(|path| {
+            let (results, bindings) = match fs::read_to_string(path) {
+                Ok(config_json) => {
+                    validate_doctor_provider_config_json_with_bindings(&config_json, capabilities)
+                }
+                Err(error) => (
+                    vec![ProviderValidationResult::fail(
+                        "",
+                        "",
+                        "provider.config.unreadable",
+                        "read_error",
+                        format!("could not read provider config: {error}"),
+                    )],
+                    Vec::new(),
+                ),
+            };
+            DoctorProviderConfigCheck {
+                path: path.clone(),
+                results,
+                bindings,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn validate_doctor_provider_config_json(config_json: &str) -> Vec<ProviderValidationResult> {
+    validate_doctor_provider_config_json_with_bindings(
+        config_json,
+        &builtin_provider_capabilities(),
+    )
+    .0
+}
+
+fn validate_doctor_provider_config_json_with_bindings(
+    config_json: &str,
+    capabilities: &[ProviderCapability],
+) -> (
+    Vec<ProviderValidationResult>,
+    Vec<DoctorProviderBindingCheck>,
+) {
+    let value = match serde_json::from_str::<Value>(config_json) {
+        Ok(value) => value,
+        Err(_) => return (validate_provider_binding_json(config_json), Vec::new()),
+    };
+    let provider_values = if let Some(providers) = value.get("providers").and_then(Value::as_array)
+    {
+        providers.iter().collect::<Vec<_>>()
+    } else if let Some(providers) = value.as_array() {
+        providers.iter().collect::<Vec<_>>()
+    } else {
+        vec![&value]
+    };
+
+    let mut all_results = Vec::new();
+    let mut bindings = Vec::new();
+    for provider in provider_values {
+        match ProviderBindingConfig::from_value(provider) {
+            Ok(config) => {
+                let results = validate_provider_binding(&config, capabilities);
+                all_results.extend(results.iter().cloned());
+                bindings.push(DoctorProviderBindingCheck { config, results });
+            }
+            Err(results) => all_results.extend(results),
+        }
+    }
+    (all_results, bindings)
+}
+
+fn record_doctor_provider_validation_evidence(
+    store: &SqliteStore,
+    instance_id: &str,
+    provider_configs: &[DoctorProviderConfigCheck],
+    capabilities: &[ProviderCapability],
+) -> Result<usize, StoreError> {
+    let mut count = 0usize;
+    for config_check in provider_configs {
+        for binding in &config_check.bindings {
+            let status = if binding
+                .results
+                .iter()
+                .any(|result| result.status == ProviderValidationStatus::Fail)
+            {
+                "fail"
+            } else {
+                "pass"
+            };
+            let capability = capabilities
+                .iter()
+                .find(|capability| {
+                    capability.provider_kind == binding.config.provider_kind
+                        && capability.surface == binding.config.surface
+                })
+                .map(ProviderCapability::to_json)
+                .unwrap_or_else(|| {
+                    json!({
+                        "provider_kind": binding.config.provider_kind.as_str(),
+                        "surface": binding.config.surface.as_str(),
+                        "registered": false,
+                    })
+                });
+            let config_json = binding.config.to_json_redacted().to_string();
+            let capability_json = capability.to_string();
+            let validation_results_json = Value::Array(
+                binding
+                    .results
+                    .iter()
+                    .map(ProviderValidationResult::to_json)
+                    .collect::<Vec<_>>(),
+            )
+            .to_string();
+            let correlation_id = format!(
+                "provider-validation:{}:{}",
+                binding.config.provider_id,
+                binding.config.surface.as_str()
+            );
+            let source_path = config_check.path.display().to_string();
+            store.record_provider_validation_evidence(ProviderValidationEvidence {
+                instance_id,
+                provider_id: &binding.config.provider_id,
+                provider_kind: binding.config.provider_kind.as_str(),
+                surface: binding.config.surface.as_str(),
+                status,
+                config_json: &config_json,
+                capability_json: &capability_json,
+                validation_results_json: &validation_results_json,
+                source_path: Some(&source_path),
+                correlation_id: Some(&correlation_id),
+            })?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn provider_config_check_to_json(check: &DoctorProviderConfigCheck) -> Value {
+    json!({
+        "path": check.path.display().to_string(),
+        "results": check
+            .results
+            .iter()
+            .map(ProviderValidationResult::to_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn provider_health_check_to_json(check: &DoctorProviderHealthCheck) -> Value {
+    json!({
+        "provider": check.provider,
+        "surface": check.surface,
+        "check": check.check,
+        "status": check.status.as_str(),
+        "message": check.message,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -263,6 +696,13 @@ fn doctor_tool_checks() -> Vec<ToolCheck> {
             &["claude"][..],
             false,
             "needed for Claude Code agent harness provider runs",
+        ),
+        (
+            "pi",
+            "provider",
+            &["pi"][..],
+            false,
+            "needed for Pi RPC provider runs",
         ),
         (
             "loft",
@@ -1593,6 +2033,41 @@ fn step_instance(
                 report
                     .branch_reports
                     .extend(lowering.branch_reports.iter().cloned());
+                if !lowering.errors.is_empty() {
+                    let message = format!(
+                        "rule `{}` lowering failed: {}",
+                        rule.name,
+                        lowering.errors.join("; ")
+                    );
+                    store.record_diagnostic(DiagnosticRecord {
+                        instance_id: Some(instance_id),
+                        program_id: None,
+                        program_version_id: Some(&active_version_id),
+                        severity: "error",
+                        code: Some("rule.lowering.unresolved"),
+                        message: &message,
+                        source_span_json: None,
+                        subject_type: Some("rule"),
+                        subject_id: Some(&rule.name),
+                        event_id: None,
+                        effect_id: None,
+                        run_id: None,
+                        assertion_id: None,
+                        evidence_ids_json: "[]",
+                        artifact_ids_json: "[]",
+                        causation_id: context.trigger_event_id.as_deref(),
+                        correlation_id: context.identity.as_deref(),
+                        idempotency_key: Some(&idempotency_key(&[
+                            instance_id,
+                            &active_version_id,
+                            &active_revision_epoch_key,
+                            &rule.name,
+                            "lowering-error",
+                            &lowering.errors.join("|"),
+                        ])),
+                    })?;
+                    return Err(StoreError::Conflict(message));
+                }
                 if lowering.facts.is_empty()
                     && lowering.consumed_fact_ids.is_empty()
                     && lowering.effects.is_empty()
@@ -1847,6 +2322,29 @@ struct RunningCancellationReport {
     diagnostics: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderCancellationPolicy {
+    Unsupported,
+    NativeStop {
+        acknowledgement_order: CancellationAcknowledgementOrder,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CancellationAcknowledgementOrder {
+    BeforeTerminal,
+    AfterTerminalAllowed,
+}
+
+impl CancellationAcknowledgementOrder {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeTerminal => "before_terminal",
+            Self::AfterTerminalAllowed => "after_terminal_allowed",
+        }
+    }
+}
+
 fn process_running_cancellations(
     store_path: &Path,
     instance_id: &str,
@@ -1872,9 +2370,14 @@ fn process_running_cancellations(
         let Some(request) = open_requests.get(run.effect_id.as_str()) else {
             continue;
         };
-        if provider_supports_out_of_band_cancellation(provider) {
+        if let ProviderCancellationPolicy::NativeStop {
+            acknowledgement_order,
+        } = provider_cancellation_policy(provider)
+        {
             let metadata_json = json!({
                 "cancellation": "provider_acknowledged",
+                "cancellation_depth": "native_stop",
+                "acknowledgement_order": acknowledgement_order.as_str(),
                 "request_id": request.request_id,
                 "revision_id": request.revision_id,
                 "reason": request.reason,
@@ -1937,8 +2440,22 @@ fn process_running_cancellations(
     Ok(report)
 }
 
-fn provider_supports_out_of_band_cancellation(provider: &str) -> bool {
-    matches!(provider, "fixture-cancellable")
+fn provider_cancellation_policy(provider: &str) -> ProviderCancellationPolicy {
+    let normalized = provider.to_ascii_lowercase();
+    if normalized == "fixture-cancellable"
+        || normalized == "codex"
+        || normalized.starts_with("codex-")
+    {
+        return ProviderCancellationPolicy::NativeStop {
+            acknowledgement_order: CancellationAcknowledgementOrder::BeforeTerminal,
+        };
+    }
+    if normalized == "pi" || normalized.starts_with("pi-") {
+        return ProviderCancellationPolicy::NativeStop {
+            acknowledgement_order: CancellationAcknowledgementOrder::AfterTerminalAllowed,
+        };
+    }
+    ProviderCancellationPolicy::Unsupported
 }
 
 fn run_agent_effect(
@@ -1952,23 +2469,624 @@ fn run_agent_effect(
     let mut kernel = RuntimeKernel::new(store);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "lease"]);
+    let execution = AgentTurnExecution {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: &options.provider,
+        worker_id: "whip-worker",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        agent: effect.target.as_deref().unwrap_or("agent"),
+        profile: effect.profile.as_deref(),
+        input_json: &input_json,
+        skill_names: &[],
+    };
+    if options.provider == "native-fixture" {
+        let mut adapter =
+            NativeFixtureAdapter::new(&options.provider, &run_id, options.outcome.is_failed());
+        return kernel.run_native_agent_turn(
+            execution,
+            native_fixture_turn_request(execution, &input_json),
+            &mut adapter,
+            8,
+        );
+    }
+    if is_codex_native_provider(&options.provider) {
+        let request = codex_native_turn_request(execution, effect, &input_json)?;
+        let mut unavailable_adapter;
+        let mut adapter;
+        let native_adapter: &mut dyn NativeProviderAdapter =
+            match codex_app_server_adapter(&options.provider) {
+                Ok(healthy_adapter) => {
+                    adapter = healthy_adapter;
+                    &mut adapter
+                }
+                Err(error) => {
+                    unavailable_adapter = unavailable_native_provider_adapter(
+                        &options.provider,
+                        ProviderKind::Codex,
+                        AdapterSurface::CodexAppServer,
+                        error,
+                    )?;
+                    &mut unavailable_adapter
+                }
+            };
+        return kernel.run_native_agent_turn(
+            execution,
+            request,
+            native_adapter,
+            native_provider_max_events(),
+        );
+    }
+    if is_claude_native_provider(&options.provider) {
+        let request = claude_native_turn_request(execution, effect, &input_json)?;
+        let mut unavailable_adapter;
+        let mut adapter;
+        let native_adapter: &mut dyn NativeProviderAdapter =
+            match claude_agent_sdk_adapter(&options.provider) {
+                Ok(healthy_adapter) => {
+                    adapter = healthy_adapter;
+                    &mut adapter
+                }
+                Err(error) => {
+                    unavailable_adapter = unavailable_native_provider_adapter(
+                        &options.provider,
+                        ProviderKind::Claude,
+                        AdapterSurface::ClaudeAgentSdk,
+                        error,
+                    )?;
+                    &mut unavailable_adapter
+                }
+            };
+        return kernel.run_native_agent_turn(
+            execution,
+            request,
+            native_adapter,
+            native_provider_max_events(),
+        );
+    }
+    if is_pi_native_provider(&options.provider) {
+        let request = pi_native_turn_request(execution, effect, &input_json)?;
+        let mut unavailable_adapter;
+        let mut adapter;
+        let native_adapter: &mut dyn NativeProviderAdapter = match pi_rpc_adapter(&options.provider)
+        {
+            Ok(healthy_adapter) => {
+                adapter = healthy_adapter;
+                &mut adapter
+            }
+            Err(error) => {
+                unavailable_adapter = unavailable_native_provider_adapter(
+                    &options.provider,
+                    ProviderKind::Pi,
+                    AdapterSurface::PiRpc,
+                    error,
+                )?;
+                &mut unavailable_adapter
+            }
+        };
+        return kernel.run_native_agent_turn(
+            execution,
+            request,
+            native_adapter,
+            native_provider_max_events(),
+        );
+    }
+
     let harness = fixture_harness(options.outcome.is_failed());
-    kernel.run_agent_turn(
-        AgentTurnExecution {
-            instance_id,
-            effect_id: &effect.effect_id,
-            run_id: &run_id,
-            provider: &options.provider,
-            worker_id: "whip-worker",
-            lease_id: &lease_id,
-            lease_expires_at: "2030-01-01T00:00:00Z",
-            agent: effect.target.as_deref().unwrap_or("agent"),
-            profile: effect.profile.as_deref(),
-            input_json: &input_json,
-            skill_names: &[],
-        },
-        &harness,
-    )
+    kernel.run_agent_turn(execution, &harness)
+}
+
+fn is_codex_native_provider(provider: &str) -> bool {
+    let normalized = provider.to_ascii_lowercase();
+    normalized == "codex" || normalized.starts_with("codex-")
+}
+
+fn is_claude_native_provider(provider: &str) -> bool {
+    let normalized = provider.to_ascii_lowercase();
+    normalized == "claude" || normalized.starts_with("claude-")
+}
+
+fn is_pi_native_provider(provider: &str) -> bool {
+    let normalized = provider.to_ascii_lowercase();
+    normalized == "pi" || normalized.starts_with("pi-")
+}
+
+fn codex_app_server_adapter(
+    provider: &str,
+) -> Result<CodexAppServerAdapter<StdioCodexAppServerTransport>, StoreError> {
+    let model = env::var("WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL")
+        .unwrap_or_else(|_| "gpt-5.4-mini".to_owned());
+    let model_config = format!("model={model:?}");
+    let args = [
+        "app-server",
+        "--listen",
+        "stdio://",
+        "-c",
+        model_config.as_str(),
+        "-c",
+        "sandbox_mode=\"read-only\"",
+        "-c",
+        "approval_policy=\"never\"",
+    ];
+    let command =
+        env::var("WHIPPLESCRIPT_CODEX_APP_SERVER_COMMAND").unwrap_or_else(|_| "codex".to_owned());
+    let transport = StdioCodexAppServerTransport::spawn(&command, &args).map_err(|error| {
+        StoreError::Conflict(format!("failed to launch Codex app-server: {error:?}"))
+    })?;
+    let capability = builtin_provider_capabilities()
+        .into_iter()
+        .find(|capability| {
+            capability.provider_kind == ProviderKind::Codex
+                && capability.surface == AdapterSurface::CodexAppServer
+        })
+        .ok_or_else(|| StoreError::Conflict("missing built-in Codex capability".to_owned()))?;
+    Ok(CodexAppServerAdapter::new(
+        provider,
+        capability,
+        CodexAppServerClient::new(transport),
+    ))
+}
+
+fn codex_native_turn_request(
+    execution: AgentTurnExecution<'_>,
+    effect: &ClaimableEffect,
+    input_json: &str,
+) -> Result<NativeProviderTurnRequest, StoreError> {
+    let input = serde_json::from_str::<Value>(input_json)?;
+    let prompt_json = input
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(|prompt| Value::String(prompt.to_owned()))
+        .unwrap_or(input);
+    let mut provider_options = BTreeMap::new();
+    provider_options.insert(
+        "cwd".to_owned(),
+        Value::String(
+            env::current_dir()
+                .map_err(StoreError::Io)?
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
+    provider_options.insert(
+        "model".to_owned(),
+        Value::String(
+            env::var("WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL")
+                .unwrap_or_else(|_| "gpt-5.4-mini".to_owned()),
+        ),
+    );
+    Ok(NativeProviderTurnRequest {
+        provider_id: execution.provider.to_owned(),
+        provider_kind: ProviderKind::Codex,
+        surface: AdapterSurface::CodexAppServer,
+        run_id: execution.run_id.to_owned(),
+        effect_id: execution.effect_id.to_owned(),
+        agent: execution.agent.to_owned(),
+        profile: execution.profile.map(str::to_owned),
+        prompt_json,
+        workspace_policy: "read_only".to_owned(),
+        required_capabilities: native_required_capabilities(effect)?,
+        cancellation_depth: CancellationDepth::NativeStop,
+        artifact_policy: "metadata".to_owned(),
+        credential_ref: None,
+        provider_options,
+    })
+}
+
+fn claude_agent_sdk_adapter(
+    provider: &str,
+) -> Result<ClaudeAgentSdkAdapter<StdioClaudeAgentSdkTransport>, StoreError> {
+    let sidecar = env::var("WHIPPLESCRIPT_CLAUDE_AGENT_SDK_SIDECAR")
+        .unwrap_or_else(|_| "scripts/claude-agent-sdk-sidecar.mjs".to_owned());
+    let command =
+        env::var("WHIPPLESCRIPT_CLAUDE_AGENT_SDK_COMMAND").unwrap_or_else(|_| "node".to_owned());
+    let transport =
+        StdioClaudeAgentSdkTransport::spawn(&command, &[sidecar.as_str()]).map_err(|error| {
+            StoreError::Conflict(format!(
+                "failed to launch Claude Agent SDK sidecar: {error:?}"
+            ))
+        })?;
+    let capability = builtin_provider_capabilities()
+        .into_iter()
+        .find(|capability| {
+            capability.provider_kind == ProviderKind::Claude
+                && capability.surface == AdapterSurface::ClaudeAgentSdk
+        })
+        .ok_or_else(|| StoreError::Conflict("missing built-in Claude capability".to_owned()))?;
+    Ok(ClaudeAgentSdkAdapter::new(
+        provider,
+        capability,
+        ClaudeAgentSdkClient::new(transport),
+    ))
+}
+
+fn claude_native_turn_request(
+    execution: AgentTurnExecution<'_>,
+    effect: &ClaimableEffect,
+    input_json: &str,
+) -> Result<NativeProviderTurnRequest, StoreError> {
+    let input = serde_json::from_str::<Value>(input_json)?;
+    let prompt_json = input
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(|prompt| Value::String(prompt.to_owned()))
+        .unwrap_or(input);
+    let mut provider_options = BTreeMap::new();
+    provider_options.insert(
+        "cwd".to_owned(),
+        Value::String(
+            env::current_dir()
+                .map_err(StoreError::Io)?
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
+    provider_options.insert(
+        "model".to_owned(),
+        Value::String(
+            env::var("WHIPPLESCRIPT_CLAUDE_AGENT_SDK_MODEL")
+                .unwrap_or_else(|_| "sonnet".to_owned()),
+        ),
+    );
+    Ok(NativeProviderTurnRequest {
+        provider_id: execution.provider.to_owned(),
+        provider_kind: ProviderKind::Claude,
+        surface: AdapterSurface::ClaudeAgentSdk,
+        run_id: execution.run_id.to_owned(),
+        effect_id: execution.effect_id.to_owned(),
+        agent: execution.agent.to_owned(),
+        profile: execution
+            .profile
+            .map(str::to_owned)
+            .or_else(|| Some("repo-reader".to_owned())),
+        prompt_json,
+        workspace_policy: "read_only".to_owned(),
+        required_capabilities: native_required_capabilities(effect)?,
+        cancellation_depth: CancellationDepth::CooperativeRequest,
+        artifact_policy: "metadata".to_owned(),
+        credential_ref: None,
+        provider_options,
+    })
+}
+
+fn pi_rpc_adapter(provider: &str) -> Result<PiRpcAdapter<StdioPiRpcTransport>, StoreError> {
+    let args = ["--mode", "rpc", "--no-session"];
+    let command = env::var("WHIPPLESCRIPT_PI_RPC_COMMAND").unwrap_or_else(|_| "pi".to_owned());
+    let transport = StdioPiRpcTransport::spawn(&command, &args)
+        .map_err(|error| StoreError::Conflict(format!("failed to launch Pi RPC: {error:?}")))?;
+    let capability = builtin_provider_capabilities()
+        .into_iter()
+        .find(|capability| {
+            capability.provider_kind == ProviderKind::Pi
+                && capability.surface == AdapterSurface::PiRpc
+        })
+        .ok_or_else(|| StoreError::Conflict("missing built-in Pi capability".to_owned()))?;
+    Ok(PiRpcAdapter::new(
+        provider,
+        capability,
+        PiRpcClient::new(transport),
+    ))
+}
+
+fn pi_native_turn_request(
+    execution: AgentTurnExecution<'_>,
+    effect: &ClaimableEffect,
+    input_json: &str,
+) -> Result<NativeProviderTurnRequest, StoreError> {
+    let input = serde_json::from_str::<Value>(input_json)?;
+    let prompt_json = input
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(|prompt| Value::String(prompt.to_owned()))
+        .unwrap_or(input);
+    let mut provider_options = BTreeMap::new();
+    if let Ok(provider) = env::var("WHIPPLESCRIPT_PI_RPC_PROVIDER") {
+        provider_options.insert("provider".to_owned(), Value::String(provider));
+    }
+    if let Ok(model) = env::var("WHIPPLESCRIPT_PI_RPC_MODEL") {
+        provider_options.insert("model".to_owned(), Value::String(model));
+    }
+    Ok(NativeProviderTurnRequest {
+        provider_id: execution.provider.to_owned(),
+        provider_kind: ProviderKind::Pi,
+        surface: AdapterSurface::PiRpc,
+        run_id: execution.run_id.to_owned(),
+        effect_id: execution.effect_id.to_owned(),
+        agent: execution.agent.to_owned(),
+        profile: execution
+            .profile
+            .map(str::to_owned)
+            .or_else(|| Some("repo-reader".to_owned())),
+        prompt_json,
+        workspace_policy: "read_only".to_owned(),
+        required_capabilities: native_required_capabilities(effect)?,
+        cancellation_depth: CancellationDepth::NativeStop,
+        artifact_policy: "metadata".to_owned(),
+        credential_ref: None,
+        provider_options,
+    })
+}
+
+fn native_required_capabilities(effect: &ClaimableEffect) -> Result<Vec<String>, StoreError> {
+    let value = serde_json::from_str::<Value>(&effect.required_capabilities_json)?;
+    let mut capabilities = value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if !capabilities.iter().any(|capability| {
+        matches!(
+            capability.as_str(),
+            "repo.read" | "repo.write" | "command.run"
+        )
+    }) {
+        capabilities.push("repo.read".to_owned());
+    }
+    capabilities.sort();
+    capabilities.dedup();
+    Ok(capabilities)
+}
+
+fn native_provider_max_events() -> usize {
+    env::var("WHIPPLESCRIPT_NATIVE_PROVIDER_MAX_EVENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(256)
+}
+
+struct UnavailableNativeProviderAdapter {
+    provider_id: String,
+    capability: ProviderCapability,
+    message: String,
+}
+
+fn unavailable_native_provider_adapter(
+    provider_id: &str,
+    provider_kind: ProviderKind,
+    surface: AdapterSurface,
+    error: StoreError,
+) -> Result<UnavailableNativeProviderAdapter, StoreError> {
+    let capability = builtin_provider_capabilities()
+        .into_iter()
+        .find(|capability| {
+            capability.provider_kind == provider_kind && capability.surface == surface
+        })
+        .ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "missing built-in {} {} capability",
+                provider_kind.as_str(),
+                surface.as_str()
+            ))
+        })?;
+    Ok(UnavailableNativeProviderAdapter {
+        provider_id: provider_id.to_owned(),
+        capability,
+        message: format!("{error:?}"),
+    })
+}
+
+impl NativeProviderAdapter for UnavailableNativeProviderAdapter {
+    fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    fn capability(&self) -> &ProviderCapability {
+        &self.capability
+    }
+
+    fn start_turn(
+        &mut self,
+        request: NativeProviderTurnRequest,
+    ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+        Err(NativeProviderBoundaryError {
+            provider_id: self.provider_id.clone(),
+            surface: request.surface,
+            code: "provider_health_unavailable".to_owned(),
+            message: self.message.clone(),
+            recoverable: true,
+            evidence: json!({
+                "provider_kind": request.provider_kind.as_str(),
+                "surface": request.surface.as_str(),
+                "request": request.to_json_redacted(),
+            }),
+        })
+    }
+
+    fn next_event(
+        &mut self,
+        _run_id: &str,
+    ) -> Result<Option<NativeProviderEvent>, NativeProviderBoundaryError> {
+        Ok(None)
+    }
+
+    fn cancel_turn(
+        &mut self,
+        cancellation: NativeProviderCancellation,
+    ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+        Err(NativeProviderBoundaryError {
+            provider_id: self.provider_id.clone(),
+            surface: self.capability.surface,
+            code: "provider_health_unavailable".to_owned(),
+            message: self.message.clone(),
+            recoverable: true,
+            evidence: json!({
+                "run_id": cancellation.run_id,
+                "requested_depth": cancellation.requested_depth.as_str(),
+            }),
+        })
+    }
+}
+
+struct NativeFixtureAdapter {
+    provider_id: String,
+    run_id: String,
+    failed: bool,
+    next_index: usize,
+    capability: ProviderCapability,
+}
+
+impl NativeFixtureAdapter {
+    fn new(provider_id: &str, run_id: &str, failed: bool) -> Self {
+        Self {
+            provider_id: provider_id.to_owned(),
+            run_id: run_id.to_owned(),
+            failed,
+            next_index: 0,
+            capability: ProviderCapability {
+                provider_kind: ProviderKind::Fixture,
+                surface: AdapterSurface::Fixture,
+                protocol_version: Some("native-fixture.v1".to_owned()),
+                session_identity_fields: vec!["session_id".to_owned(), "turn_id".to_owned()],
+                stream_event_kinds: vec![
+                    "fixture.turn.started".to_owned(),
+                    "fixture.artifact.captured".to_owned(),
+                    "fixture.turn.completed".to_owned(),
+                    "fixture.turn.failed".to_owned(),
+                ],
+                tool_policy: "fixture".to_owned(),
+                cancellation_depths: vec![CancellationDepth::CooperativeRequest],
+                artifact_manifest: true,
+                health_checks: Vec::new(),
+                auth_requirements: Vec::new(),
+            },
+        }
+    }
+
+    fn session_id(&self) -> String {
+        format!("{}-session-{}", self.provider_id, self.run_id)
+    }
+
+    fn turn_id(&self) -> String {
+        format!("{}-turn-{}", self.provider_id, self.run_id)
+    }
+}
+
+impl NativeProviderAdapter for NativeFixtureAdapter {
+    fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    fn capability(&self) -> &ProviderCapability {
+        &self.capability
+    }
+
+    fn start_turn(
+        &mut self,
+        request: NativeProviderTurnRequest,
+    ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+        Ok(NativeProviderEvent {
+            provider_id: self.provider_id.clone(),
+            run_id: request.run_id.clone(),
+            event_kind: NativeProviderEventKind::Started,
+            provider_event_type: "fixture.turn.started".to_owned(),
+            provider_session_id: Some(self.session_id()),
+            provider_turn_id: Some(self.turn_id()),
+            sequence: Some(1),
+            evidence: json!({
+                "prompt_shape": request.to_json_redacted().get("prompt_shape").cloned(),
+                "workspace_policy": request.workspace_policy,
+            }),
+            artifacts: Vec::new(),
+        })
+    }
+
+    fn next_event(
+        &mut self,
+        run_id: &str,
+    ) -> Result<Option<NativeProviderEvent>, NativeProviderBoundaryError> {
+        self.next_index += 1;
+        match self.next_index {
+            1 => Ok(Some(NativeProviderEvent {
+                provider_id: self.provider_id.clone(),
+                run_id: run_id.to_owned(),
+                event_kind: NativeProviderEventKind::ArtifactCaptured,
+                provider_event_type: "fixture.artifact.captured".to_owned(),
+                provider_session_id: Some(self.session_id()),
+                provider_turn_id: Some(self.turn_id()),
+                sequence: Some(2),
+                evidence: json!({"artifact": "metadata-only"}),
+                artifacts: vec![NativeProviderArtifactRef {
+                    artifact_id: Some("native-fixture-artifact-1".to_owned()),
+                    kind: "transcript".to_owned(),
+                    uri: format!("provider://{}/runs/{run_id}/transcript", self.provider_id),
+                    content_hash: Some("sha256:native-fixture-transcript".to_owned()),
+                    mime_type: Some("text/plain".to_owned()),
+                    required: true,
+                }],
+            })),
+            2 => {
+                let event_kind = if self.failed {
+                    NativeProviderEventKind::Failed
+                } else {
+                    NativeProviderEventKind::Completed
+                };
+                Ok(Some(NativeProviderEvent {
+                    provider_id: self.provider_id.clone(),
+                    run_id: run_id.to_owned(),
+                    event_kind,
+                    provider_event_type: if self.failed {
+                        "fixture.turn.failed"
+                    } else {
+                        "fixture.turn.completed"
+                    }
+                    .to_owned(),
+                    provider_session_id: Some(self.session_id()),
+                    provider_turn_id: Some(self.turn_id()),
+                    sequence: Some(3),
+                    evidence: json!({"terminal": event_kind.as_str()}),
+                    artifacts: Vec::new(),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn cancel_turn(
+        &mut self,
+        cancellation: NativeProviderCancellation,
+    ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+        Ok(NativeProviderEvent {
+            provider_id: self.provider_id.clone(),
+            run_id: cancellation.run_id,
+            event_kind: NativeProviderEventKind::Cancelled,
+            provider_event_type: "fixture.turn.cancelled".to_owned(),
+            provider_session_id: cancellation
+                .provider_session_id
+                .or_else(|| Some(self.session_id())),
+            provider_turn_id: cancellation
+                .provider_turn_id
+                .or_else(|| Some(self.turn_id())),
+            sequence: Some(99),
+            evidence: json!({"reason": cancellation.reason}),
+            artifacts: Vec::new(),
+        })
+    }
+}
+
+fn native_fixture_turn_request(
+    execution: AgentTurnExecution<'_>,
+    input_json: &str,
+) -> NativeProviderTurnRequest {
+    NativeProviderTurnRequest {
+        provider_id: execution.provider.to_owned(),
+        provider_kind: ProviderKind::Fixture,
+        surface: AdapterSurface::Fixture,
+        run_id: execution.run_id.to_owned(),
+        effect_id: execution.effect_id.to_owned(),
+        agent: execution.agent.to_owned(),
+        profile: execution.profile.map(str::to_owned),
+        prompt_json: serde_json::from_str(input_json).unwrap_or_else(|_| json!({"raw": "invalid"})),
+        workspace_policy: "isolated".to_owned(),
+        required_capabilities: Vec::new(),
+        cancellation_depth: CancellationDepth::CooperativeRequest,
+        artifact_policy: "metadata".to_owned(),
+        credential_ref: None,
+        provider_options: BTreeMap::new(),
+    }
 }
 
 fn run_baml_effect(
@@ -2234,10 +3352,13 @@ fn resolve_effect_input_after_bindings(
         binding.to_owned(),
         FactView {
             fact_id: upstream_effect_id.to_owned(),
+            program_version_id: None,
+            revision_epoch: 0,
             name: binding.to_owned(),
             key: upstream_effect_id.to_owned(),
             value_json: binding_value.to_string(),
             provenance_class: "effect".to_owned(),
+            source_span_json: None,
         },
     ));
     if let Some(argument_exprs) = input.get("argument_exprs").and_then(Value::as_array) {
@@ -2278,10 +3399,13 @@ fn context_from_input_bindings(input: &Value) -> RuleContext {
             binding.clone(),
             FactView {
                 fact_id: binding.clone(),
+                program_version_id: None,
+                revision_epoch: 0,
                 name: binding.clone(),
                 key: binding.clone(),
                 value_json: value.to_string(),
                 provenance_class: "input".to_owned(),
+                source_span_json: None,
             },
         ));
     }
@@ -2490,13 +3614,23 @@ fn run_event_effect(
             "terminal",
         ])),
     })?;
+    let mut emitted_value = payload.as_object().cloned().unwrap_or_default();
+    emitted_value.insert(
+        "event_id".to_owned(),
+        Value::String(emitted.event_id.clone()),
+    );
+    emitted_value.insert(
+        "event_type".to_owned(),
+        Value::String(event_type.to_owned()),
+    );
+    emitted_value.insert("payload".to_owned(), payload.clone());
     let value_json = json!({
         "effect_id": effect.effect_id,
         "run_id": run_id,
         "event_id": emitted.event_id,
         "event_type": event_type,
         "status": "completed",
-        "value": payload,
+        "value": Value::Object(emitted_value),
         "summary": "fixture event emitted",
     })
     .to_string();
@@ -2753,7 +3887,7 @@ fn run_workflow_invoke_effect(
             "child workflow cancelled",
         ),
         _ => (
-            "workflow.invoke.failed",
+            "workflow.invoke.timed_out",
             "timed_out",
             json!({
                 "reason": format!("child workflow did not reach terminal state: {}", child.status),
@@ -3122,12 +4256,24 @@ fn dev(options: &CliOptions) -> ExitCode {
         &effects,
         Some(Path::new(&dev_options.program_path)),
     );
+    let assertion_events = match persist_assertion_events(
+        &store,
+        &started.instance_id,
+        &started.version_id,
+        &facts,
+        &effects,
+        &assertions,
+    ) {
+        Ok(events) => events,
+        Err(error) => return report_store_error("failed to record assertion events", error),
+    };
     if let Err(error) = persist_assertion_diagnostics(
         &store,
         &started.instance_id,
         &started.program_id,
         &started.version_id,
         &assertions,
+        &assertion_events,
     ) {
         return report_store_error("failed to record assertion diagnostics", error);
     }
@@ -3309,6 +4455,7 @@ struct OwnedLowering {
     dependencies: Vec<OwnedDependency>,
     terminal: Option<OwnedWorkflowTerminal>,
     branch_reports: Vec<BranchReport>,
+    errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3339,6 +4486,7 @@ struct OwnedFact {
     schema_id: Option<String>,
     provenance_class: String,
     correlation_id: Option<String>,
+    source_span_json: Option<String>,
 }
 
 impl OwnedFact {
@@ -3351,6 +4499,7 @@ impl OwnedFact {
             schema_id: self.schema_id.as_deref(),
             provenance_class: &self.provenance_class,
             correlation_id: self.correlation_id.as_deref(),
+            source_span_json: self.source_span_json.as_deref(),
         }
     }
 }
@@ -3602,12 +4751,98 @@ fn eval_assertions(
         .collect()
 }
 
+fn persist_assertion_events(
+    store: &SqliteStore,
+    instance_id: &str,
+    version_id: &str,
+    facts: &[FactView],
+    effects: &[EffectView],
+    assertions: &[AssertionReport],
+) -> Result<BTreeMap<String, String>, StoreError> {
+    let mut events = BTreeMap::new();
+    let read_set = json!({
+        "facts": facts
+            .iter()
+            .map(|fact| json!({
+                "fact_id": fact.fact_id,
+                "name": fact.name,
+                "key": fact.key,
+                "program_version_id": fact.program_version_id,
+                "revision_epoch": fact.revision_epoch,
+            }))
+            .collect::<Vec<_>>(),
+        "effects": effects
+            .iter()
+            .map(|effect| json!({
+                "effect_id": effect.effect_id,
+                "kind": effect.kind,
+                "status": effect.status,
+                "program_version_id": effect.program_version_id,
+                "revision_epoch": effect.revision_epoch,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let read_set_json = read_set.to_string();
+    for assertion in assertions {
+        let assertion_id = idempotency_key(&[instance_id, "assertion", &assertion.expr]);
+        let result = match assertion.status {
+            AssertionStatus::Passed => "pass",
+            AssertionStatus::Failed => "fail",
+            AssertionStatus::Error => "error",
+        };
+        let event_type = match assertion.status {
+            AssertionStatus::Passed => "assertion.passed",
+            AssertionStatus::Failed => "assertion.failed",
+            AssertionStatus::Error => "assertion.errored",
+        };
+        let idempotency = idempotency_key(&[
+            instance_id,
+            version_id,
+            "assertion-event",
+            &assertion.expr,
+            result,
+            &assertion.actual.to_string(),
+            &read_set_json,
+        ]);
+        let payload = json!({
+            "assertion_id": assertion_id,
+            "assertion_text": assertion.expr,
+            "result": result,
+            "program_version_id": version_id,
+            "rule_name": null,
+            "source_span": assertion.source_span_json.as_deref().map(json_from_str),
+            "read_set": read_set.clone(),
+            "actual_json": assertion.actual,
+            "expected_json": assertion.expected,
+            "error_code": assertion.error.as_ref().map(|_| "assertion.eval_error"),
+            "message": assertion.failure_reason,
+            "diagnostic_ids": [],
+            "evidence_ids": [],
+            "correlation_id": assertion_id,
+            "idempotency_key": idempotency,
+        })
+        .to_string();
+        let event = store.append_event(NewEvent {
+            instance_id,
+            event_type,
+            payload_json: &payload,
+            source: "assertion",
+            causation_id: None,
+            correlation_id: Some(&assertion_id),
+            idempotency_key: Some(&idempotency),
+        })?;
+        events.insert(assertion.expr.clone(), event.event_id);
+    }
+    Ok(events)
+}
+
 fn persist_assertion_diagnostics(
     store: &SqliteStore,
     instance_id: &str,
     program_id: &str,
     version_id: &str,
     assertions: &[AssertionReport],
+    assertion_events: &BTreeMap<String, String>,
 ) -> Result<(), StoreError> {
     for assertion in assertions.iter().filter(|assertion| !assertion.passed) {
         let assertion_id = idempotency_key(&[instance_id, "assertion", &assertion.expr]);
@@ -3632,14 +4867,14 @@ fn persist_assertion_diagnostics(
             severity: "error",
             code: Some(match assertion.status {
                 AssertionStatus::Failed => "assertion.failed",
-                AssertionStatus::Error => "assertion.error",
+                AssertionStatus::Error => "assertion.errored",
                 AssertionStatus::Passed => unreachable!("passed assertions filtered out"),
             }),
             message: &message,
             source_span_json: assertion.source_span_json.as_deref(),
             subject_type: Some("assertion"),
             subject_id: Some(&assertion.expr),
-            event_id: None,
+            event_id: assertion_events.get(&assertion.expr).map(String::as_str),
             effect_id: None,
             run_id: None,
             assertion_id: Some(&assertion_id),
@@ -4346,7 +5581,12 @@ fn lower_rule(
     append_workflow_terminal(&mut lowering, ir, rule, &pre_terminal_body, &context, None);
 
     for block in top_level_record_blocks(&pre_terminal_body) {
-        let value = parse_record_fields(&block.body, &context, block.from_binding.as_deref());
+        let value = parse_record_fields(
+            &block.body,
+            &context,
+            block.from_binding.as_deref(),
+            &mut lowering.errors,
+        );
         let value_json = Value::Object(value).to_string();
         let fact_key = record_fact_key(&block.schema, &value_json);
         let fact_id = idempotency_key(&[&rule.name, &block.schema, &fact_key, &value_json]);
@@ -4364,6 +5604,7 @@ fn lower_rule(
             schema_id: Some(block.schema),
             provenance_class: "rule".to_owned(),
             correlation_id: context.identity.clone(),
+            source_span_json: None,
         });
     }
 
@@ -4402,8 +5643,24 @@ fn lower_rule(
         {
             continue;
         }
-        let input_json =
-            parsed_effect_input_json(ir, rule, parsed, &context, &binding_to_effect_id);
+        if parsed
+            .prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("{{"))
+        {
+            lowering.errors.push(format!(
+                "unresolved interpolation in `{}` effect `{node_id}`",
+                parsed.kind
+            ));
+        }
+        let input_json = parsed_effect_input_json(
+            ir,
+            rule,
+            parsed,
+            &context,
+            &binding_to_effect_id,
+            &mut lowering.errors,
+        );
         let profile = parsed
             .target
             .as_deref()
@@ -4489,8 +5746,12 @@ fn lower_rule(
             Some((&after.binding, &after.predicate)),
         );
         for record in top_level_record_blocks(&selected_after_body) {
-            let value =
-                parse_record_fields(&record.body, &after_context, record.from_binding.as_deref());
+            let value = parse_record_fields(
+                &record.body,
+                &after_context,
+                record.from_binding.as_deref(),
+                &mut lowering.errors,
+            );
             let value_json = Value::Object(value).to_string();
             let fact_key = record_fact_key(&record.schema, &value_json);
             let fact_id = idempotency_key(&[
@@ -4516,6 +5777,7 @@ fn lower_rule(
                 schema_id: Some(record.schema),
                 provenance_class: "rule".to_owned(),
                 correlation_id: context.identity.clone(),
+                source_span_json: None,
             });
         }
         let mut selected_effects = parse_effect_statements(&selected_after_body, &after_context);
@@ -4570,12 +5832,23 @@ fn lower_rule(
             {
                 continue;
             }
+            if parsed
+                .prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.contains("{{"))
+            {
+                lowering.errors.push(format!(
+                    "unresolved interpolation in `{}` effect `{node_id}`",
+                    parsed.kind
+                ));
+            }
             let input_json = parsed_effect_input_json(
                 ir,
                 rule,
                 parsed,
                 &after_context,
                 &selected_binding_to_effect_id,
+                &mut lowering.errors,
             );
             let profile = parsed
                 .target
@@ -4627,10 +5900,13 @@ fn push_effect_binding(context: &mut RuleContext, binding: &str, effect_id: &str
         binding.to_owned(),
         FactView {
             fact_id: effect_id.to_owned(),
+            program_version_id: None,
+            revision_epoch: 0,
             name: binding.to_owned(),
             key: effect_id.to_owned(),
             value_json: value.to_string(),
             provenance_class: "effect".to_owned(),
+            source_span_json: None,
         },
     ));
 }
@@ -4979,10 +6255,13 @@ fn case_pattern_matches(pattern: &str, value: &Value, context: &mut RuleContext)
                 binding.to_owned(),
                 FactView {
                     fact_id: format!("case:{binding}"),
+                    program_version_id: None,
+                    revision_epoch: 0,
                     name: binding.to_owned(),
                     key: binding.to_owned(),
                     value_json: payload.to_string(),
                     provenance_class: "case".to_owned(),
+                    source_span_json: None,
                 },
             ));
         }
@@ -4999,10 +6278,13 @@ fn case_pattern_matches(pattern: &str, value: &Value, context: &mut RuleContext)
             binding.to_owned(),
             FactView {
                 fact_id: format!("case:{binding}"),
+                program_version_id: None,
+                revision_epoch: 0,
                 name: binding.to_owned(),
                 key: binding.to_owned(),
                 value_json: value.to_string(),
                 provenance_class: "case".to_owned(),
+                source_span_json: None,
             },
         ));
         return true;
@@ -5041,6 +6323,8 @@ fn terminal_payload_for_tag(value: &Value, tag: &str) -> Value {
                 .get("error")
                 .cloned()
                 .or_else(|| value.get("failure").cloned())
+                .or_else(|| value.pointer("/metadata/error").cloned())
+                .or_else(|| value.pointer("/metadata/failure").cloned())
                 .and_then(|value| value.as_object().cloned())
                 .unwrap_or_default();
             for field in ["summary", "effect_id", "run_id"] {
@@ -5076,7 +6360,12 @@ fn append_workflow_terminal(
     if !workflow_contract_exists(ir, terminal.kind, &terminal.name) {
         return;
     }
-    let payload = Value::Object(parse_record_fields(&terminal.body, context, None));
+    let payload = Value::Object(parse_record_fields(
+        &terminal.body,
+        context,
+        None,
+        &mut lowering.errors,
+    ));
     let payload_json = payload.to_string();
     let mut key_parts = vec![
         rule.name.as_str(),
@@ -5389,6 +6678,7 @@ fn parsed_effect_input_json(
     effect: &ParsedEffect,
     context: &RuleContext,
     effect_bindings: &std::collections::BTreeMap<String, String>,
+    errors: &mut Vec<String>,
 ) -> String {
     let mut input = match effect.kind.as_str() {
         "agent.tell" => json!({
@@ -5446,7 +6736,7 @@ fn parsed_effect_input_json(
             let body = effect.args.first().map(String::as_str).unwrap_or_default();
             json!({
                 "target_workflow": effect.target,
-                "input": Value::Object(parse_record_fields(body, context, None)),
+                "input": Value::Object(parse_record_fields(body, context, None, errors)),
                 "bindings": context_bindings_json(context),
                 "rule": rule.name,
             })
@@ -5877,6 +7167,7 @@ fn parse_record_fields(
     body: &str,
     context: &RuleContext,
     from_binding: Option<&str>,
+    errors: &mut Vec<String>,
 ) -> serde_json::Map<String, Value> {
     let mut object = serde_json::Map::new();
     for assignment in collect_field_assignments(body) {
@@ -5884,13 +7175,13 @@ fn parse_record_fields(
             FieldAssignment::Value { name, value } => {
                 object.insert(
                     name.clone(),
-                    parse_record_field_value(&name, &value, context, from_binding),
+                    parse_record_field_value(&name, &value, context, from_binding, errors),
                 );
             }
             FieldAssignment::Shorthand { name } => {
                 object.insert(
                     name.clone(),
-                    parse_record_shorthand_value(&name, context, from_binding),
+                    parse_record_shorthand_value(&name, context, from_binding, errors),
                 );
             }
         }
@@ -5903,6 +7194,7 @@ fn parse_record_field_value(
     value: &str,
     context: &RuleContext,
     from_binding: Option<&str>,
+    errors: &mut Vec<String>,
 ) -> Value {
     if let Some(binding) = from_binding {
         if is_identifier(value)
@@ -5914,6 +7206,19 @@ fn parse_record_field_value(
             if let Some(copied) = context_field_value(context, binding, value) {
                 return copied;
             }
+            errors.push(format!("could not resolve `{binding}.{value}`"));
+            return Value::Null;
+        }
+    }
+    if let Some((binding, field)) = value.split_once('.') {
+        if context
+            .bindings
+            .iter()
+            .any(|(candidate, _)| candidate == binding)
+            && context_field_value(context, binding, field).is_none()
+        {
+            errors.push(format!("could not resolve `{value}`"));
+            return Value::Null;
         }
     }
     parse_field_value(value, context)
@@ -5923,11 +7228,14 @@ fn parse_record_shorthand_value(
     field: &str,
     context: &RuleContext,
     from_binding: Option<&str>,
+    errors: &mut Vec<String>,
 ) -> Value {
     if let Some(binding) = from_binding {
         if let Some(value) = context_field_value(context, binding, field) {
             return value;
         }
+        errors.push(format!("could not resolve `{binding}.{field}`"));
+        return Value::Null;
     }
     let matches = context
         .bindings
@@ -5937,6 +7245,11 @@ fn parse_record_shorthand_value(
     if matches.len() == 1 {
         matches.into_iter().next().unwrap_or(Value::Null)
     } else {
+        if matches.is_empty() {
+            errors.push(format!("could not resolve shorthand field `{field}`"));
+        } else {
+            errors.push(format!("shorthand field `{field}` is ambiguous"));
+        }
         Value::Null
     }
 }
@@ -5963,6 +7276,11 @@ fn parse_field_value(value: &str, context: &RuleContext) -> Value {
     if let Ok(number) = value.parse::<i64>() {
         return Value::Number(number.into());
     }
+    if let Some((binding, field)) = value.split_once('.') {
+        if let Some(value) = context_field_value(context, binding, field) {
+            return value;
+        }
+    }
     if let Ok(expr) = whipplescript_parser::parse_expression(value) {
         if !matches!(expr, Expr::Literal(ExprLiteral::Ident(_))) {
             let empty_ir = empty_ir_program();
@@ -5974,9 +7292,6 @@ fn parse_field_value(value: &str, context: &RuleContext) -> Value {
         if let Some(parsed) = parse_inline_object_literal(value, context) {
             return parsed;
         }
-    }
-    if let Some((binding, field)) = value.split_once('.') {
-        return context_field_value(context, binding, field).unwrap_or(Value::Null);
     }
     context
         .bindings
@@ -6179,6 +7494,73 @@ fn worker_report_to_json(report: &WorkerReport) -> Value {
         "cancellation_acknowledgements": report.cancellation_acknowledgements,
         "cancellation_diagnostics": report.cancellation_diagnostics,
         "terminal_events": report.terminal_events,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecoverReport {
+    instance_id: String,
+    recovered_events: Vec<RecoveredEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecoveredEvent {
+    event_id: String,
+    event_type: String,
+}
+
+fn recover(options: &CliOptions) -> ExitCode {
+    let Some(instance_id) = options.args.first() else {
+        eprintln!("usage: whip recover <instance>");
+        return ExitCode::from(2);
+    };
+    if options.args.len() != 1 {
+        eprintln!("usage: whip recover <instance>");
+        return ExitCode::from(2);
+    }
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let mut kernel = RuntimeKernel::new(store);
+    let recovered = match kernel.recover_running_provider_runs(instance_id) {
+        Ok(events) => events,
+        Err(error) => return report_store_error("failed to recover provider runs", error),
+    };
+    let report = RecoverReport {
+        instance_id: instance_id.clone(),
+        recovered_events: recovered
+            .into_iter()
+            .map(|event| RecoveredEvent {
+                event_id: event.event_id,
+                event_type: "effect.terminal".to_owned(),
+            })
+            .collect(),
+    };
+    if options.json {
+        emit_json(recover_report_to_json(&report))
+    } else {
+        println!(
+            "recover {} recovered={}",
+            report.instance_id,
+            report.recovered_events.len()
+        );
+        ExitCode::SUCCESS
+    }
+}
+
+fn recover_report_to_json(report: &RecoverReport) -> Value {
+    json!({
+        "instance_id": report.instance_id,
+        "recovered_count": report.recovered_events.len(),
+        "recovered_events": report
+            .recovered_events
+            .iter()
+            .map(|event| json!({
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+            }))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -6472,21 +7854,78 @@ fn runs(options: &CliOptions) -> ExitCode {
         Ok(runs) => runs,
         Err(error) => return report_store_error("failed to load runs", error),
     };
+    let events = match store.list_events(instance_id) {
+        Ok(events) => events,
+        Err(error) => return report_store_error("failed to load events", error),
+    };
+    let artifact_counts = match artifact_counts_for_runs(&store, &runs) {
+        Ok(counts) => counts,
+        Err(error) => return report_store_error("failed to load artifacts", error),
+    };
 
     if options.json {
         emit_json(Value::Array(
-            runs.iter().map(run_to_json).collect::<Vec<_>>(),
+            runs.iter()
+                .map(|run| run_to_json_with_lifecycle_and_artifacts(run, &events, &artifact_counts))
+                .collect::<Vec<_>>(),
         ))
     } else {
         for run in runs {
+            let lifecycle = latest_native_lifecycle_for_run(&events, &run.run_id);
             println!(
-                "{} effect={} status={} worker={} started={} cancel_requested={}",
+                "{} effect={} status={} worker={} started={} cancel_requested={} artifacts={} native_status={}",
                 run.run_id,
                 run.effect_id,
                 run.status,
                 run.worker_id,
                 run.started_at,
-                run.cancel_requested
+                run.cancel_requested,
+                artifact_counts.get(&run.run_id).copied().unwrap_or(0),
+                lifecycle
+                    .as_ref()
+                    .and_then(|value| value.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+            );
+        }
+        ExitCode::SUCCESS
+    }
+}
+
+fn artifacts(options: &CliOptions) -> ExitCode {
+    let Some(run_id) = single_arg(options, "usage: whip artifacts <run-id>") else {
+        return ExitCode::from(2);
+    };
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let artifacts = match store.list_artifacts_for_run(run_id) {
+        Ok(artifacts) => artifacts,
+        Err(error) => return report_store_error("failed to list artifacts", error),
+    };
+
+    if options.json {
+        emit_json(json!({
+            "run_id": run_id,
+            "artifacts": artifacts.iter().map(artifact_to_json).collect::<Vec<_>>(),
+        }))
+    } else {
+        for artifact in artifacts {
+            let path = redact_cli_metadata(&artifact.path);
+            let content_hash = artifact
+                .content_hash
+                .as_deref()
+                .map(redact_cli_metadata)
+                .unwrap_or_else(|| "-".to_owned());
+            println!(
+                "{} {} path={} hash={} mime={} created={}",
+                artifact.artifact_id,
+                artifact.kind,
+                path,
+                content_hash,
+                artifact.mime_type.as_deref().unwrap_or("-"),
+                artifact.created_at
             );
         }
         ExitCode::SUCCESS
@@ -6763,6 +8202,10 @@ fn trace(options: &CliOptions) -> ExitCode {
         Ok(links) => links,
         Err(error) => return report_store_error("failed to list evidence links", error),
     };
+    let artifact_counts = match artifact_counts_for_runs(&store, &runs) {
+        Ok(counts) => counts,
+        Err(error) => return report_store_error("failed to load artifacts", error),
+    };
     let abstract_records = reconstruct_trace_records(&events);
     let conformance = if trace_options.check {
         Some(check_trace(&abstract_records))
@@ -6775,7 +8218,8 @@ fn trace(options: &CliOptions) -> ExitCode {
         "events": events.iter().map(event_to_json).collect::<Vec<_>>(),
         "facts": facts.iter().map(fact_to_json).collect::<Vec<_>>(),
         "effects": effects.iter().map(effect_to_json).collect::<Vec<_>>(),
-        "runs": runs.iter().map(run_to_json).collect::<Vec<_>>(),
+        "runs": runs.iter().map(|run| run_to_json_with_lifecycle_and_artifacts(run, &events, &artifact_counts)).collect::<Vec<_>>(),
+        "native_lifecycle": native_lifecycle_events(&events),
         "evidence": evidence.iter().map(evidence_to_json).collect::<Vec<_>>(),
         "evidence_links": links.iter().map(evidence_link_to_json).collect::<Vec<_>>(),
     });
@@ -6953,23 +8397,29 @@ fn reconstruct_trace_records(events: &[EventView]) -> Vec<TraceRecord> {
                 let Some(effect_id) = payload.get("effect_id").and_then(Value::as_str) else {
                     continue;
                 };
-                let Some(run_id) = payload.get("run_id").and_then(Value::as_str) else {
-                    continue;
-                };
                 let status = trace_effect_status(
                     payload
                         .get("status")
                         .and_then(Value::as_str)
                         .unwrap_or("failed"),
                 );
-                push_trace_record(
-                    &mut records,
-                    TraceEvent::EffectTerminal {
-                        run_id: run_id.to_owned(),
-                        effect_id: effect_id.to_owned(),
-                        status,
-                    },
-                );
+                if let Some(run_id) = payload.get("run_id").and_then(Value::as_str) {
+                    push_trace_record(
+                        &mut records,
+                        TraceEvent::EffectTerminal {
+                            run_id: run_id.to_owned(),
+                            effect_id: effect_id.to_owned(),
+                            status,
+                        },
+                    );
+                } else if matches!(status, EffectStatus::Cancelled) {
+                    push_trace_record(
+                        &mut records,
+                        TraceEvent::EffectCancelled {
+                            effect_id: effect_id.to_owned(),
+                        },
+                    );
+                }
             }
             "effect.blocked" => {
                 let Some(effect_id) = payload.get("effect_id").and_then(Value::as_str) else {
@@ -7271,6 +8721,12 @@ fn open_store(path: &Path) -> Result<SqliteStore, String> {
                     parent.display()
                 )
             })?;
+            harden_store_directory(parent).map_err(|error| {
+                format!(
+                    "failed to set private permissions on store directory `{}`: {error}",
+                    parent.display()
+                )
+            })?;
         }
     }
 
@@ -7281,6 +8737,26 @@ fn open_store(path: &Path) -> Result<SqliteStore, String> {
             store_error(error)
         )
     })
+}
+
+#[cfg(unix)]
+fn harden_store_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    if permissions.mode() & 0o1000 != 0 {
+        return Ok(());
+    }
+    if permissions.mode() & 0o777 != 0o700 {
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_store_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 enum CompileFailure {
@@ -8940,10 +10416,13 @@ fn trace_predicate_name(predicate: &DependencyPredicate) -> &'static str {
 fn fact_to_json(fact: &FactView) -> Value {
     json!({
         "fact_id": fact.fact_id,
+        "program_version_id": fact.program_version_id,
+        "revision_epoch": fact.revision_epoch,
         "name": fact.name,
         "key": fact.key,
         "value": json_from_str(&fact.value_json),
         "provenance_class": fact.provenance_class,
+        "source_span": fact.source_span_json.as_deref().map(json_from_str),
     })
 }
 
@@ -8975,6 +10454,77 @@ fn run_to_json(run: &RunView) -> Value {
         "completed_at": run.completed_at,
         "cancel_requested": run.cancel_requested,
     })
+}
+
+fn run_to_json_with_lifecycle_and_artifacts(
+    run: &RunView,
+    events: &[EventView],
+    artifact_counts: &BTreeMap<String, usize>,
+) -> Value {
+    let mut value = run_to_json(run);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "native_lifecycle".to_owned(),
+            latest_native_lifecycle_for_run(events, &run.run_id).unwrap_or(Value::Null),
+        );
+        object.insert(
+            "artifact_count".to_owned(),
+            json!(artifact_counts.get(&run.run_id).copied().unwrap_or(0)),
+        );
+    }
+    value
+}
+
+fn artifact_counts_for_runs(
+    store: &SqliteStore,
+    runs: &[RunView],
+) -> Result<BTreeMap<String, usize>, StoreError> {
+    let mut counts = BTreeMap::new();
+    for run in runs {
+        counts.insert(
+            run.run_id.clone(),
+            store.list_artifacts_for_run(&run.run_id)?.len(),
+        );
+    }
+    Ok(counts)
+}
+
+fn latest_native_lifecycle_for_run(events: &[EventView], run_id: &str) -> Option<Value> {
+    events.iter().rev().find_map(|event| {
+        let lifecycle = native_lifecycle_event_to_json(event)?;
+        (lifecycle.get("run_id").and_then(Value::as_str) == Some(run_id)).then_some(lifecycle)
+    })
+}
+
+fn native_lifecycle_events(events: &[EventView]) -> Value {
+    Value::Array(
+        events
+            .iter()
+            .filter_map(native_lifecycle_event_to_json)
+            .collect(),
+    )
+}
+
+fn native_lifecycle_event_to_json(event: &EventView) -> Option<Value> {
+    if !event.event_type.starts_with("agent.turn.") {
+        return None;
+    }
+    let payload = json_from_str(&event.payload_json);
+    let provider_event_type = payload.get("provider_event_type")?;
+    Some(json!({
+        "event_id": event.event_id,
+        "sequence": event.sequence,
+        "event_type": event.event_type,
+        "run_id": payload.get("run_id").cloned().unwrap_or(Value::Null),
+        "effect_id": payload.get("effect_id").cloned().unwrap_or(Value::Null),
+        "provider": payload.get("provider").cloned().unwrap_or(Value::Null),
+        "status": payload.get("status").cloned().unwrap_or(Value::Null),
+        "terminal": payload.get("terminal").cloned().unwrap_or(Value::Bool(false)),
+        "provider_event_type": provider_event_type.clone(),
+        "provider_session_id": payload.get("provider_session_id").cloned().unwrap_or(Value::Null),
+        "provider_turn_id": payload.get("provider_turn_id").cloned().unwrap_or(Value::Null),
+        "evidence_id": payload.get("evidence_id").cloned().unwrap_or(Value::Null),
+    }))
 }
 
 fn workflow_invocation_to_json(invocation: &WorkflowInvocationView) -> Value {
@@ -9360,6 +10910,69 @@ fn evidence_to_json(evidence: &EvidenceView) -> Value {
     })
 }
 
+fn artifact_to_json(artifact: &ArtifactView) -> Value {
+    json!({
+        "artifact_id": artifact.artifact_id,
+        "run_id": artifact.run_id,
+        "kind": artifact.kind,
+        "path": redact_cli_metadata(&artifact.path),
+        "content_hash": artifact.content_hash.as_deref().map(redact_cli_metadata),
+        "mime_type": artifact.mime_type,
+        "created_at": artifact.created_at,
+    })
+}
+
+fn redact_cli_metadata(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|token| {
+            if token_has_secret_pattern(token) {
+                "[REDACTED]".to_owned()
+            } else if let Some((key, _)) = token.split_once('=') {
+                if key_is_sensitive(key) {
+                    format!("{key}=[REDACTED]")
+                } else {
+                    token.to_owned()
+                }
+            } else {
+                token.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn key_is_sensitive(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "authorization",
+        "api_key",
+        "apikey",
+        "credential",
+        "password",
+        "secret",
+        "token",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+}
+
+fn token_has_secret_pattern(token: &str) -> bool {
+    let token = token.trim_matches(|ch: char| {
+        matches!(ch, '"' | '\'' | ',' | ';' | ':' | ')' | '(' | '[' | ']')
+    });
+    token.contains("github_pat_")
+        || token
+            .find("sk-")
+            .is_some_and(|start| token[start..].len() >= 20)
+        || token
+            .find("ghp_")
+            .is_some_and(|start| token[start..].len() >= 20)
+        || token
+            .find("AKIA")
+            .is_some_and(|start| token[start..].len() >= 20)
+}
+
 fn evidence_link_to_json(link: &EvidenceLinkView) -> Value {
     json!({
         "evidence_id": link.evidence_id,
@@ -9422,6 +11035,7 @@ fn status_to_json(status: &StatusView) -> Value {
             "parent": status.parent_invocation.as_ref().map(workflow_invocation_to_json),
             "children": status.child_invocations.iter().map(workflow_invocation_to_json).collect::<Vec<_>>(),
         },
+        "native_lifecycle": native_lifecycle_events(&status.recent_events),
         "recent_events": status.recent_events.iter().map(event_to_json).collect::<Vec<_>>(),
     })
 }
@@ -9684,10 +11298,13 @@ assert exists(Window where elapsed < limit)
             .expect("compile");
         let facts = vec![FactView {
             fact_id: "fact-invalid-duration".to_owned(),
+            program_version_id: None,
+            revision_epoch: 0,
             name: "Window".to_owned(),
             key: "fact-invalid-duration".to_owned(),
             value_json: r#"{"elapsed":"bad-duration","limit":"PT1H"}"#.to_owned(),
             provenance_class: "external".to_owned(),
+            source_span_json: None,
         }];
 
         let assertions = eval_assertions(&ir, &facts, &[], None);
@@ -9731,10 +11348,13 @@ rule finish
             .expect("compile");
         let fact = FactView {
             fact_id: "fact-task".to_owned(),
+            program_version_id: None,
+            revision_epoch: 0,
             name: "Task".to_owned(),
             key: "Task:queued".to_owned(),
             value_json: r#"{"status":"queued"}"#.to_owned(),
             provenance_class: "rule".to_owned(),
+            source_span_json: None,
         };
         let facts = vec![fact];
         let effects = Vec::new();
@@ -9776,10 +11396,13 @@ rule claim_ready
             .expect("compile");
         let fact = FactView {
             fact_id: "fact-loft-issue".to_owned(),
+            program_version_id: None,
+            revision_epoch: 0,
             name: "LoftIssue".to_owned(),
             key: "LoftIssue:ready".to_owned(),
             value_json: r#"{"id":"ISS-1","title":"Ready issue","body":"Do work"}"#.to_owned(),
             provenance_class: "rule".to_owned(),
+            source_span_json: None,
         };
         let facts = vec![fact];
         let effects = Vec::new();
@@ -9812,30 +11435,39 @@ rule claim_ready
                     "task".to_owned(),
                     FactView {
                         fact_id: "fact-task".to_owned(),
+                        program_version_id: None,
+                        revision_epoch: 0,
                         name: "Task".to_owned(),
                         key: "Task:queued".to_owned(),
                         value_json: r#"{"topic":"rain","status":"queued"}"#.to_owned(),
                         provenance_class: "rule".to_owned(),
+                        source_span_json: None,
                     },
                 ),
                 (
                     "turn".to_owned(),
                     FactView {
                         fact_id: "turn".to_owned(),
+                        program_version_id: None,
+                        revision_epoch: 0,
                         name: "turn".to_owned(),
                         key: "turn".to_owned(),
                         value_json: r#"{"summary":"wrote"}"#.to_owned(),
                         provenance_class: "effect".to_owned(),
+                        source_span_json: None,
                     },
                 ),
                 (
                     "review".to_owned(),
                     FactView {
                         fact_id: "review".to_owned(),
+                        program_version_id: None,
+                        revision_epoch: 0,
                         name: "review".to_owned(),
                         key: "review".to_owned(),
                         value_json: r#"{"summary":"reviewed"}"#.to_owned(),
                         provenance_class: "effect".to_owned(),
+                        source_span_json: None,
                     },
                 ),
             ],
@@ -9853,6 +11485,7 @@ rule claim_ready
             &record.body,
             &context,
             record.from_binding.as_deref(),
+            &mut Vec::new(),
         ));
         assert_eq!(value.get("topic").and_then(Value::as_str), Some("rain"));
         assert_eq!(value.get("status").and_then(Value::as_str), Some("done"));
@@ -10644,6 +12277,165 @@ rule accept
 
         assert_eq!(found, Some(executable.display().to_string()));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn parses_doctor_provider_config_option() {
+        let options = DoctorOptions::parse(&[
+            "--providers".to_owned(),
+            "--provider-config".to_owned(),
+            "providers.json".to_owned(),
+            "--record-provider-evidence".to_owned(),
+            "ins_123".to_owned(),
+        ])
+        .expect("doctor options parse");
+
+        assert_eq!(
+            options.provider_config_paths,
+            vec![PathBuf::from("providers.json")]
+        );
+        assert_eq!(
+            options.record_provider_evidence_instance_id.as_deref(),
+            Some("ins_123")
+        );
+        assert!(options.providers);
+    }
+
+    #[test]
+    fn doctor_provider_config_validation_redacts_extra_values() {
+        let results = validate_doctor_provider_config_json(
+            r#"{
+              "providers": [
+                {
+                  "provider_id": "codex-main",
+                  "provider_kind": "codex",
+                  "surface": "codex_app_server",
+                  "credentials_ref": "secret:codex",
+                  "cancellation_depth": "native_stop",
+                  "api_key": "sk-should-not-appear"
+                },
+                {
+                  "provider_id": "pi-main",
+                  "provider_kind": "pi",
+                  "surface": "pi_rpc",
+                  "credentials_ref": "secret:pi",
+                  "cancellation_depth": "native_stop"
+                }
+              ]
+            }"#,
+        );
+
+        assert!(results.iter().any(|result| {
+            result.status == whipplescript_kernel::provider::ProviderValidationStatus::Pass
+                && result.provider == "codex-main"
+                && result.code == "surface_supported"
+        }));
+        assert!(results.iter().any(|result| {
+            result.status == whipplescript_kernel::provider::ProviderValidationStatus::Pass
+                && result.provider == "pi-main"
+                && result.code == "cancellation_supported"
+        }));
+        assert!(!json!(results
+            .iter()
+            .map(ProviderValidationResult::to_json)
+            .collect::<Vec<_>>())
+        .to_string()
+        .contains("sk-should-not-appear"));
+    }
+
+    #[test]
+    fn native_lifecycle_summary_exposes_redacted_status_for_runs() {
+        let events = vec![
+            event_view(
+                1,
+                "agent.turn.streamed",
+                json!({
+                    "run_id": "run-1",
+                    "effect_id": "tell",
+                    "provider": "pi-main",
+                    "status": "streamed",
+                    "terminal": false,
+                    "provider_event_type": "message_end",
+                    "provider_payload_shape": {"type":"object","keys":2},
+                    "evidence_id": "evd_stream",
+                }),
+            ),
+            event_view(
+                2,
+                "agent.turn.cancelled",
+                json!({
+                    "run_id": "run-1",
+                    "effect_id": "tell",
+                    "provider": "pi-main",
+                    "status": "cancelled",
+                    "terminal": true,
+                    "provider_event_type": "turn_end",
+                    "provider_payload_shape": {"type":"object","keys":3},
+                    "evidence_id": "evd_cancel",
+                }),
+            ),
+            event_view(3, "workflow.completed", json!({"status":"completed"})),
+        ];
+        let lifecycle = native_lifecycle_events(&events);
+        assert_eq!(lifecycle.as_array().expect("array").len(), 2);
+        assert_eq!(
+            lifecycle
+                .pointer("/1/provider_event_type")
+                .and_then(Value::as_str),
+            Some("turn_end")
+        );
+        assert!(lifecycle.to_string().contains("evd_cancel"));
+        assert!(!lifecycle.to_string().contains("provider_payload_shape"));
+
+        let run = RunView {
+            run_id: "run-1".to_owned(),
+            effect_id: "tell".to_owned(),
+            provider: "pi-main".to_owned(),
+            worker_id: "worker-1".to_owned(),
+            status: "running".to_owned(),
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
+            completed_at: None,
+            cancel_requested: true,
+        };
+        let run_json = run_to_json_with_lifecycle_and_artifacts(&run, &events, &BTreeMap::new());
+        assert_eq!(
+            run_json
+                .pointer("/native_lifecycle/status")
+                .and_then(Value::as_str),
+            Some("cancelled")
+        );
+        assert_eq!(
+            run_json
+                .pointer("/native_lifecycle/evidence_id")
+                .and_then(Value::as_str),
+            Some("evd_cancel")
+        );
+    }
+
+    #[test]
+    fn provider_cancellation_policy_tracks_validated_native_shapes() {
+        assert_eq!(
+            provider_cancellation_policy("codex-main"),
+            ProviderCancellationPolicy::NativeStop {
+                acknowledgement_order: CancellationAcknowledgementOrder::BeforeTerminal,
+            }
+        );
+        assert_eq!(
+            provider_cancellation_policy("pi-main"),
+            ProviderCancellationPolicy::NativeStop {
+                acknowledgement_order: CancellationAcknowledgementOrder::AfterTerminalAllowed,
+            }
+        );
+        assert_eq!(
+            provider_cancellation_policy("fixture-cancellable"),
+            ProviderCancellationPolicy::NativeStop {
+                acknowledgement_order: CancellationAcknowledgementOrder::BeforeTerminal,
+            }
+        );
+        assert_eq!(
+            provider_cancellation_policy("claude-main"),
+            ProviderCancellationPolicy::Unsupported
+        );
     }
 
     fn event_view(sequence: i64, event_type: &str, payload: Value) -> EventView {

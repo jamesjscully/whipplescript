@@ -9,22 +9,24 @@ Every fact has a provenance class.
 
 ## Provenance Classes
 
-### Runtime Facts
+### Runtime Projections
 
 Owned by the kernel/control plane.
 
 Examples:
 
 ```text
-instance.started
-agent.available
-effect.claimable
-effect.running
-turn.active
+claimable effects
+running effects
+active turns
+available agents
 ```
 
-Runtime facts are derived from events, effects, dependencies, runs, leases, and
-control metadata. User rules may read them but should not record them directly.
+Runtime projections are derived from events, effects, dependencies, runs,
+leases, and control metadata. They are exposed through status, scheduler queries,
+and trace output, not automatically persisted as durable facts. A projection only
+becomes a fact when the kernel appends a documented event/fact pair such as
+`agent.turn.completed` or `human.ask.created`.
 
 ### Rule-Recorded Facts
 
@@ -51,6 +53,7 @@ Examples:
 agent.turn.completed
 loft.claim.succeeded
 baml.coerce.succeeded
+human.ask.created
 human.answer.received
 ```
 

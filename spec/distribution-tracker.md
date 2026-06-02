@@ -25,16 +25,16 @@ The release goal is that a user on macOS, Windows, or Linux can install the
 ## Phase 0: Source Install And Package Identity
 
 - [x] Choose the first public install command:
-  `cargo install --git https://github.com/jamesjscully/whipplescript.git --package whipplescript-cli --locked`.
+  `cargo install --git https://github.com/jamesjscully/whipplescript.git --package whipplescript --locked`.
 - [x] Add package metadata needed for source installs and future registry
   publishing.
 - [x] Document source install, local checkout install, and the installed binary
   smoke check.
 - [x] Verify `cargo install --path crates/whipplescript-cli --locked` in a temp
   root.
-- [ ] Decide whether to keep the package name `whipplescript-cli` or rename the
-  publishable CLI crate to `whipplescript` while preserving the binary name
-  `whip`.
+- [x] Decide package identity: the publishable package is `whipplescript`; the
+  installed binary remains `whip`; the crate source path remains
+  `crates/whipplescript-cli`.
 
 Latest verification:
 
@@ -51,7 +51,7 @@ default SQLite store, and checked `examples/minimal-noop.whip`.
 ## Phase 1: GitHub Release Backbone
 
 - [x] Add `cargo-dist` / `dist` release metadata.
-- [ ] Generate and review the release workflow.
+- [x] Generate and review the release workflow.
 - [x] Configure release artifact targets for:
   - [x] `aarch64-apple-darwin`
   - [x] `x86_64-apple-darwin`
@@ -61,32 +61,32 @@ default SQLite store, and checked `examples/minimal-noop.whip`.
   - [ ] optional `x86_64-unknown-linux-musl`
 - [x] Build and smoke-test a local `x86_64-unknown-linux-gnu` release archive.
 - [x] Generate local shell and PowerShell installer artifacts.
+- [x] Add a `dist` custom CI job that smoke-tests the packaged Linux x64 archive
+  before publish.
 - [ ] Build all configured platform artifacts in CI.
 - [ ] Publish archive assets with checksums.
 - [ ] Publish shell and PowerShell installers.
-- [ ] Add packaged-binary smoke checks:
-  - [ ] `whip --version`
-  - [ ] `whip doctor --json`
-  - [ ] `whip check examples/minimal-noop.whip`
+- [x] Add packaged-binary smoke checks:
+  - [x] `whip --version`
+  - [x] `whip doctor --json`
+  - [x] `whip check examples/minimal-noop.whip`
 
 Latest local `dist` verification:
 
 ```text
-dist plan --allow-dirty --output-format=json --no-local-paths
-dist build --artifacts=local --target=x86_64-unknown-linux-gnu --allow-dirty
-dist build --artifacts=global --allow-dirty
-/tmp/whipplescript-dist-smoke/whipplescript-cli-x86_64-unknown-linux-gnu/whip --version
-/tmp/whipplescript-dist-smoke/whipplescript-cli-x86_64-unknown-linux-gnu/whip doctor --json
-/tmp/whipplescript-dist-smoke/whipplescript-cli-x86_64-unknown-linux-gnu/whip check examples/minimal-noop.whip
+dist plan --output-format=json --no-local-paths
+dist build --artifacts=local --target=x86_64-unknown-linux-gnu
+dist build --artifacts=global
+scripts/check-dist-archive.sh target/distrib/whipplescript-x86_64-unknown-linux-gnu.tar.xz
 ```
 
 Result: passed for the local Linux x64 archive, global source archive, shell
-installer artifact, PowerShell installer artifact, and checksum files.
+installer artifact, PowerShell installer artifact, checksum files, and extracted
+`whip` smoke checks.
 
-Open issue: `dist 0.32.0` planned the GitHub CI release matrix, but
-`dist generate --mode ci --check` produced no `.github/workflows/release.yml`.
-Keep release workflow generation pending until that behavior is explained or a
-reviewed workflow is added manually.
+Correction from setup: `dist generate --mode ci --allow-dirty` intentionally
+skips CI regeneration because the generated CI is allowed to be out of date.
+Running `dist generate --mode ci` produced `.github/workflows/release.yml`.
 
 ## Phase 2: Friendly Package Managers
 
@@ -95,7 +95,7 @@ reviewed workflow is added manually.
 - [ ] Add Homebrew install docs.
 - [ ] Prepare crates for crates.io publishing by replacing internal path-only
   dependencies with versioned path dependencies.
-- [ ] Publish `whipplescript` or `whipplescript-cli` to crates.io.
+- [ ] Publish `whipplescript` to crates.io.
 - [ ] Revisit Windows package managers after GitHub release assets are stable:
   - [ ] WinGet
   - [ ] Scoop
@@ -112,20 +112,18 @@ reviewed workflow is added manually.
 
 ## Phase 4: Documentation And Operations
 
-- [ ] Add `docs/install.md` as the canonical install guide.
-- [ ] Update README to prefer installed `whip` commands.
-- [ ] Update `spec/quickstart.md` so the default path is installed `whip`, with
-  `cargo run -p whipplescript-cli --` kept as the checkout fallback.
-- [ ] Update `docs/manual.md`, `docs/language-reference.md`, and
+- [x] Add `docs/install.md` as the canonical install guide.
+- [x] Update README to prefer installed `whip` commands.
+- [x] Update `spec/quickstart.md` so the default path is installed `whip`, with
+  `cargo run -p whipplescript --` kept as the checkout fallback.
+- [x] Update `docs/manual.md`, `docs/language-reference.md`, and
   `docs/runtime-operations.md` examples to avoid requiring `cargo run`.
-- [ ] Add a release checklist section for distribution artifacts.
-- [ ] Add troubleshooting notes for PATH issues, Gatekeeper quarantine,
+- [x] Add a release checklist section for distribution artifacts.
+- [x] Add troubleshooting notes for PATH issues, Gatekeeper quarantine,
   PowerShell execution policy, and Linux libc compatibility.
 
 ## Open Decisions
 
-- Should the crates.io package be named `whipplescript` even though the current
-  workspace package is `whipplescript-cli`?
 - Should Linux default to GNU libc artifacts only, or should musl be promoted to
   a first-class target?
 - Should the Nix flake eventually expose a `whip` package, or remain a dev-shell

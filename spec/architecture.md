@@ -114,14 +114,14 @@ capability(name, input)
 ```
 
 The runtime writes effect records to `Q` and dependency edges to `D`. A harness
-may claim an effect only after its dependencies are satisfied and policy accepts
-the requested capability/profile. The harness runs the provider, writes
+may start a run only after the effect's dependencies are satisfied and policy
+accepts the requested capability/profile. The harness runs the provider, writes
 artifacts, and appends a completion event.
 
 This gives every external action the same durable lifecycle:
 
 ```text
-requested -> claimed -> running -> completed | failed | timed_out | cancelled
+queued -> running -> completed | failed | timed_out | cancelled
 ```
 
 ## Why This Shape

@@ -1,0 +1,43 @@
+{
+  "providers": [
+    {
+      "provider_id": "codex-main",
+      "provider_kind": "codex",
+      "surface": "codex_app_server",
+      "credentials_ref": "env:OPENAI_API_KEY",
+      "profile_ids": ["repo-reader", "repo-writer"],
+      "default_model": "gpt-5.4-mini",
+      "workspace_policy": "read_only",
+      "timeout_ms": 60000,
+      "cancellation_depth": "native_stop",
+      "artifact_policy": "required",
+      "health_checks": ["codex_cli", "app_server_schema", "auth_status"]
+    },
+    {
+      "provider_id": "claude-main",
+      "provider_kind": "claude",
+      "surface": "claude_agent_sdk",
+      "credentials_ref": "env:ANTHROPIC_API_KEY",
+      "profile_ids": ["repo-reader", "repo-writer"],
+      "default_model": "sonnet",
+      "workspace_policy": "read_only",
+      "timeout_ms": 60000,
+      "cancellation_depth": "cooperative_request",
+      "artifact_policy": "required",
+      "health_checks": ["claude_sdk", "api_key", "tool_policy"]
+    },
+    {
+      "provider_id": "pi-main",
+      "provider_kind": "pi",
+      "surface": "pi_rpc",
+      "credentials_ref": "env:PI_API_KEY",
+      "profile_ids": ["repo-reader", "repo-writer"],
+      "default_model": "provider/default",
+      "workspace_policy": "read_only",
+      "timeout_ms": 60000,
+      "cancellation_depth": "native_stop",
+      "artifact_policy": "required",
+      "health_checks": ["pi_cli", "rpc_mode", "provider_model", "extensions"]
+    }
+  ]
+}

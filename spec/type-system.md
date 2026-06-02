@@ -414,19 +414,21 @@ Static checking rules:
 Dynamic target checking still runs after static checking. When a rule fires,
 the runtime validates that the selected JSON string is one of the IR
 `agent_ref.agents`, that the selected agent still has the required profile,
-capacity, and capabilities, and that the caller is authorized to address or
-claim that agent. Runtime failure to authorize or claim a target is a typed
-effect failure; it must not silently fall back to another agent or reinterpret
-the value as a plain string.
+capacity, and capabilities, and that the caller is authorized to address that
+agent. Runtime failure to authorize a target is a typed effect failure; it must
+not silently fall back to another agent or reinterpret the value as a plain
+string.
 
 Runtime authorization and claimability are separate from type membership:
 
 - authorization answers "may this workflow/rule/session address this declared
   agent?"
-- claimability answers "may this rule instance reserve work for this agent now,
-  given current capacity, leases, and availability?"
-- both checks must run before enqueueing `tell`, assignment, or other agent
-  work-claiming effects
+- claimability answers "may this queued effect start a provider run now, given
+  current capacity, leases, and availability?"
+- target membership and authorization must run before enqueueing `tell`,
+  assignment, or other agent work effects
+- capacity and lease claimability run before provider start, when the worker
+  atomically starts the durable effect run
 - failed checks preserve the original target value and diagnostic metadata in
   evidence records
 

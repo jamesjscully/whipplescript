@@ -53,18 +53,22 @@ and status UX; it does not grant plugins new control-flow semantics.
 All effects share the same terminal lifecycle:
 
 ```text
-queued -> claimed -> running -> completed | failed | timed_out | cancelled
+queued -> running -> completed | failed | timed_out | cancelled
 ```
 
 An effect is claimable only when dependencies are satisfied, policy allows it,
 retry/backoff allows it, and any capacity constraint is available. The store may
-represent claimable as a query rather than a persisted status.
+represent claimable as a query rather than a persisted status. Traces may expose
+a synthetic claim step immediately before a provider run starts, but `claimed`
+is not a current durable effect status.
 
 Scheduling and policy may also mark an effect:
 
 ```text
 blocked_by_dependency
-blocked_by_policy
+blocked_by_capability
+blocked_by_profile
+blocked_by_capacity
 ```
 
 ## Effect Contract

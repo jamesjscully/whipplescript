@@ -86,14 +86,16 @@ which creates a child instance or equivalent durable invocation record.
 An instance has a durable state:
 
 ```text
-created
 running
 paused
-blocked
 completed
 failed
 cancelled
 ```
+
+Instances are created directly in `running` state. Older stores or future
+control-plane extensions may still need to cancel a `blocked` instance, but
+`blocked` is not a current durable instance lifecycle state.
 
 The control plane may process multiple instances concurrently, but each
 instance's rule commits are serialized. External effects may run concurrently
@@ -102,7 +104,7 @@ according to policy and capacity.
 Pausing an instance means:
 
 - no new effectful rule rewrites are committed
-- already claimed provider runs may continue unless cancellation is requested
+- already running provider runs may continue unless cancellation is requested
 - incoming events are still recorded
 - status explains the pause boundary
 
@@ -170,11 +172,11 @@ effects:
 ```text
 keep             do not cancel old-version effects
 cancel queued    terminal-cancel queued, blocked, and claimable old-version effects
-request running  cancel queued old-version effects and request cancellation for claimed/running effects
+request running  cancel queued old-version effects and request cancellation for running effects
 ```
 
 Queued/blocked/claimable effects can be terminal-cancelled by the control plane
-because no provider work is in flight. Claimed or running effects receive a
+because no provider work is in flight. Running effects receive a
 durable `CancellationRequest`; they become terminal only after provider/harness
 confirmation, timeout, or recovery. Revision must not fabricate a terminal
 provider result for work that already crossed the provider boundary.
@@ -248,8 +250,8 @@ whip dev workflow.whip --input input.json --provider codex --until idle
 
 `whip step` should evaluate ready rules from the compiled IR, commit their fact
 and effect rewrites transactionally, and stop before running external effects.
-`whip worker` should claim already-materialized effects and execute configured
-providers. `whip dev` may compose those loops for an operator-facing
+`whip worker` should start runs for already-materialized effects and execute
+configured providers. `whip dev` may compose those loops for an operator-facing
 single-command experience.
 
 For production stepping, the compiled IR comes from the instance's active
@@ -264,7 +266,7 @@ separate makes testing and recovery tractable.
 ```text
 starter: create instance and append external input events
 stepper: evaluate ready rules and commit fact/effect rewrites
-worker: claim effects and run providers
+worker: start effect runs and run providers
 ```
 
 `whip step` is deterministic. Given a program version, instance id, and store
@@ -337,54 +339,51 @@ terminal event append
 fact derivation
 ```
 
-Failures before claim should leave a blocked effect with explainable status and
-diagnostics. Failures after claim should append a durable event, update the run,
-and link evidence/artifacts before the worker reports completion. If the store
-cannot append a terminal event, the worker must leave the lease/run recoverable
-instead of reporting success out of band.
+Failures before a provider run starts should leave a blocked effect with
+explainable status and diagnostics. Failures after a provider run starts should
+append a durable event, update the run, and link evidence/artifacts before the
+worker reports completion. If the store cannot append a terminal event, the
+worker must leave the lease/run recoverable instead of reporting success out of
+band.
 
-Provider and harness failures use these event types:
+Provider and harness failures use one canonical terminal event type:
 
 ```text
-provider.startup_failed
-provider.auth_failed
-provider.tool_failed
-provider.transport_failed
-provider.timed_out
-effect.failed
-effect.timed_out
-effect.cancelled
+effect.terminal
 ```
 
-Provider failure event payloads must include:
+The terminal payload must include the effect status (`completed`, `failed`,
+`timed_out`, or `cancelled`) and link or embed diagnostics that classify the
+provider boundary. Provider failure metadata uses stable `phase`/`error_kind`
+values rather than fragmenting the event stream into provider-specific terminal
+event names. Linked durable diagnostics use the store's `code` field.
+
+Provider terminal payloads and linked diagnostics must make the failure boundary
+inspectable:
 
 ```text
 effect_id
 run_id?
 provider
-stage                 # binding | auth | workspace | startup | submit | stream | tool | transport | timeout | artifact | terminal_append
-error_code
+phase                 # binding | auth | workspace | startup | submit | stream | tool | transport | timeout | artifact | terminal_append
+error_kind
 message
-retryable
-attempt
-max_attempts
-next_retry_at?
+recoverable
+retry_after?
 idempotency_key
 correlation_id
-diagnostic_ids
 evidence_ids
 artifact_ids
 source_span?
 ```
 
-`provider.startup_failed` covers adapter/session launch and harness bootstrap
-failures. `provider.auth_failed` covers missing, expired, denied, or
-mis-scoped credentials. `provider.tool_failed` covers provider-reported tool or
-command failures after a request was accepted. `provider.transport_failed`
-covers network, IPC, protocol, broken stream, and malformed provider response
-failures. `provider.timed_out` covers queue, startup, request, stream, tool, and
-overall run deadlines; its payload must name the timeout boundary and elapsed
-duration.
+Diagnostic phases classify the boundary: `startup` covers adapter/session launch
+and harness bootstrap failures; `auth` covers missing, expired, denied, or
+mis-scoped credentials; `tool` covers provider-reported tool or command
+failures after a request was accepted; `transport` covers network, IPC,
+protocol, broken stream, and malformed provider response failures; `timeout`
+covers queue, startup, request, stream, tool, and overall run deadlines and must
+name the timeout boundary and elapsed duration.
 
 Retry decisions are policy decisions, not hidden worker behavior. A retryable
 failure keeps or returns the effect to a retry-pending/queued state with the
@@ -459,7 +458,8 @@ missing, ambiguous, or unauthorized dynamic target blocks or fails before any
 provider run starts.
 
 Workflow assertions are deterministic checks over projections. They may run as
-part of `whip check`, `whip step --assert`, `whip dev`, and e2e scripts. Failed
+part of `whip check`, explicit `whip step --assert`, `whip dev`, and e2e
+scripts. Ordinary `whip step` does not implicitly evaluate assertions. Failed
 assertions should be emitted as diagnostics/evidence tied to the assertion's
 source span; they must not mutate user facts or enqueue effects.
 
@@ -531,7 +531,7 @@ The control plane owns mechanical reliability:
 - recover abandoned leases
 
 It calls the kernel operations defined in [kernel-api.md](kernel-api.md) for
-instance transitions. It should not duplicate rule-commit, effect-claim, or
+instance transitions. It should not duplicate rule-commit, effect-run-start, or
 completion semantics in ad hoc operational code.
 
 The source language owns policy:

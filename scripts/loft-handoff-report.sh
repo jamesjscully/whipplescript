@@ -9,6 +9,7 @@ LOG_DIR="$(mktemp -d)"
 printf -v LOFT_REPO_Q "%q" "$LOFT_REPO"
 printf -v ROOT_Q "%q" "$ROOT"
 
+# shellcheck disable=SC2329
 cleanup() {
   rm -rf "$LOG_DIR"
 }
@@ -85,6 +86,7 @@ mkdir -p "$(dirname "$REPORT")"
     echo "- Exit: ${PROBE_STATUSES[$index]}"
     echo
     echo '```text'
+    # shellcheck disable=SC2016
     sed 's/```/` ` `/g' "${PROBE_LOGS[$index]}"
     echo '```'
     echo

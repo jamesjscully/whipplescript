@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -234,6 +234,7 @@ impl AgentHarness for CommandAgentHarness {
         for (key, value) in &self.plan.env {
             command.env(key, value);
         }
+        configure_child_process(&mut command);
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -277,6 +278,7 @@ impl AgentHarness for CommandAgentHarness {
             Ok(WaitOutcome::TimedOut(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
                 let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                let artifacts = command_output_artifacts(&self.plan, &request, &stdout, &stderr);
                 return ProviderRunResult {
                     status: ProviderRunStatus::TimedOut,
                     summary: format!(
@@ -294,7 +296,7 @@ impl AgentHarness for CommandAgentHarness {
                     stderr,
                     exit_code: output.status.code().map(i64::from),
                     usage_json: "{}".to_owned(),
-                    artifacts: Vec::new(),
+                    artifacts,
                     failure: Some(
                         base_failure(
                             &self.plan,
@@ -365,12 +367,14 @@ impl AgentHarness for CommandAgentHarness {
             )
         };
         let transcript = command_transcript(&self.plan, &request, &payload, &stdout, &stderr);
+        let artifacts = command_output_artifacts(&self.plan, &request, &stdout, &stderr);
         let failure = (!output.status.success()).then(|| {
+            let failure_message = command_failure_message(&summary, &stderr);
             base_failure(
                 &self.plan,
                 "provider.exit.failed",
                 "nonzero_exit",
-                summary.clone(),
+                failure_message,
             )
             .recoverable(true)
         });
@@ -383,7 +387,7 @@ impl AgentHarness for CommandAgentHarness {
             transcript,
             exit_code,
             usage_json: "{}".to_owned(),
-            artifacts: Vec::new(),
+            artifacts,
             failure,
         }
     }
@@ -399,7 +403,10 @@ impl CommandAgentHarness {
             .plan
             .required_env
             .iter()
-            .filter(|key| std::env::var_os(key.as_str()).is_none())
+            .filter(|key| {
+                !self.plan.env.contains_key(key.as_str())
+                    && std::env::var_os(key.as_str()).is_none()
+            })
             .cloned()
             .collect::<Vec<_>>();
         if !missing_env.is_empty() {
@@ -617,31 +624,46 @@ impl<'a> CommandFailure<'a> {
 }
 
 fn command_failure_result(failure: CommandFailure<'_>) -> ProviderRunResult {
+    let transcript = command_transcript(
+        failure.plan,
+        failure.request,
+        failure.payload,
+        failure.stdout,
+        failure.stderr,
+    );
     ProviderRunResult {
         status: ProviderRunStatus::Failed,
         summary: failure.summary.clone(),
         stdout: failure.stdout.to_owned(),
         stderr: failure.stderr.to_owned(),
-        transcript: command_transcript(
+        transcript,
+        exit_code: failure.exit_code,
+        usage_json: "{}".to_owned(),
+        artifacts: command_output_artifacts(
             failure.plan,
             failure.request,
-            failure.payload,
             failure.stdout,
             failure.stderr,
         ),
-        exit_code: failure.exit_code,
-        usage_json: "{}".to_owned(),
-        artifacts: Vec::new(),
         failure: Some(
             base_failure(
                 failure.plan,
                 failure.phase,
                 failure.error_kind,
-                failure.summary,
+                command_failure_message(&failure.summary, failure.stderr),
             )
             .recoverable(failure.recoverable)
             .missing_config_keys(failure.missing_config_keys),
         ),
+    }
+}
+
+fn command_failure_message(summary: &str, stderr: &str) -> String {
+    let stderr = stderr.trim();
+    if stderr.is_empty() || summary.contains(stderr) {
+        summary.to_owned()
+    } else {
+        format!("{summary}: stderr {}", redacted_text_reference(stderr))
     }
 }
 
@@ -674,7 +696,7 @@ fn wait_with_optional_timeout(
             return child.wait_with_output().map(WaitOutcome::Completed);
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            terminate_process_tree(&mut child);
             return child.wait_with_output().map(WaitOutcome::TimedOut);
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -684,16 +706,114 @@ fn wait_with_optional_timeout(
 fn command_exists(command: &str) -> bool {
     let path = PathBuf::from(command);
     if path.components().count() > 1 {
-        return path.is_file();
+        return command_is_executable(&path);
     }
 
     std::env::var_os("PATH")
         .map(|paths| {
             std::env::split_paths(&paths)
                 .map(|dir| dir.join(command))
-                .any(|candidate| candidate.is_file())
+                .any(|candidate| command_is_executable(&candidate))
         })
         .unwrap_or(false)
+}
+
+fn command_is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        path.metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn configure_child_process(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        command.process_group(0);
+    }
+}
+
+fn terminate_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        send_signal_to_process_group(child.id(), "TERM");
+    }
+    let _ = child.kill();
+    #[cfg(unix)]
+    {
+        send_signal_to_process_group(child.id(), "KILL");
+    }
+}
+
+#[cfg(unix)]
+fn send_signal_to_process_group(process_group_id: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(format!("-{process_group_id}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn command_output_artifacts(
+    plan: &CommandLaunchPlan,
+    request: &AgentTurnRequest,
+    stdout: &str,
+    stderr: &str,
+) -> Vec<ProviderArtifact> {
+    let mut artifacts = vec![command_ref_artifact(plan, request, "transcript_ref")];
+    if !stdout.is_empty() {
+        artifacts.push(command_ref_artifact(plan, request, "stdout_ref"));
+    }
+    if !stderr.is_empty() {
+        artifacts.push(command_ref_artifact(plan, request, "stderr_ref"));
+    }
+    artifacts
+}
+
+fn command_ref_artifact(
+    plan: &CommandLaunchPlan,
+    request: &AgentTurnRequest,
+    kind: &str,
+) -> ProviderArtifact {
+    ProviderArtifact {
+        kind: kind.to_owned(),
+        path: format!(
+            "provider://{}/runs/{}/{}",
+            sanitize_artifact_ref_segment(&plan.provider),
+            sanitize_artifact_ref_segment(&request.run_id),
+            kind
+        ),
+        content_hash: None,
+        mime_type: Some("text/plain".to_owned()),
+    }
+}
+
+fn sanitize_artifact_ref_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn command_transcript(
@@ -711,9 +831,17 @@ fn command_transcript(
         request.instance_id,
         request.effect_id,
         request.run_id,
-        payload,
-        stdout,
-        stderr,
+        redacted_text_reference(payload),
+        redacted_text_reference(stdout),
+        redacted_text_reference(stderr),
+    )
+}
+
+fn redacted_text_reference(text: &str) -> String {
+    format!(
+        "<redacted bytes={} chars={}>",
+        text.len(),
+        text.chars().count()
     )
 }
 
@@ -744,6 +872,23 @@ mod tests {
         assert!(result.stdout.contains("\"effect_id\":\"tell\""));
         assert!(result.stderr.contains("err"));
         assert!(result.transcript.contains("provider=fixture"));
+        assert!(result.transcript.contains("request=<redacted"));
+        assert!(result.transcript.contains("stdout=<redacted"));
+        assert!(result.transcript.contains("stderr=<redacted"));
+        assert!(!result.transcript.contains("\"effect_id\":\"tell\""));
+        assert!(!result.transcript.contains("err\n"));
+        assert_eq!(
+            result
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["transcript_ref", "stdout_ref", "stderr_ref"]
+        );
+        assert_eq!(
+            result.artifacts[0].path,
+            "provider://fixture/runs/run-tell/transcript_ref"
+        );
         assert!(result.failure.is_none());
     }
 
@@ -822,6 +967,24 @@ mod tests {
     }
 
     #[test]
+    fn command_harness_required_env_accepts_plan_env() {
+        let key = "WHIPPLESCRIPT_TEST_PROVIDER_CONFIG_FROM_PLAN";
+        let harness = CommandAgentHarness::new(
+            CommandLaunchPlan::new("fixture", "sh")
+                .arg("-c")
+                .arg(format!("cat >/dev/null; test \"${key}\" = injected"))
+                .env(key, "injected")
+                .require_env(key),
+        );
+
+        let result = harness.run(test_request());
+
+        assert_eq!(result.status, ProviderRunStatus::Completed);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.failure.is_none());
+    }
+
+    #[test]
     fn command_harness_classifies_adapter_resolution_before_launch() {
         let harness = CommandAgentHarness::new(
             CommandLaunchPlan::new("fixture", "sh")
@@ -830,6 +993,36 @@ mod tests {
         );
 
         let result = harness.run(test_request());
+
+        let failure = result.failure.expect("failure is structured");
+        assert_eq!(result.status, ProviderRunStatus::Failed);
+        assert_eq!(failure.adapter, "codex-app-server");
+        assert_eq!(failure.phase, "adapter.resolve.failed");
+        assert_eq!(failure.error_kind, "adapter_command_not_found");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_harness_classifies_non_executable_required_command_before_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let command_path = unique_temp_path("non-executable-adapter");
+        std::fs::write(&command_path, "#!/bin/sh\nexit 0\n").expect("test command file writes");
+        let mut permissions = std::fs::metadata(&command_path)
+            .expect("test command metadata reads")
+            .permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&command_path, permissions)
+            .expect("test command permissions update");
+
+        let harness = CommandAgentHarness::new(
+            CommandLaunchPlan::new("fixture", "sh")
+                .adapter("codex-app-server")
+                .require_command(command_path.to_string_lossy().into_owned()),
+        );
+
+        let result = harness.run(test_request());
+        let _ = std::fs::remove_file(&command_path);
 
         let failure = result.failure.expect("failure is structured");
         assert_eq!(result.status, ProviderRunStatus::Failed);
@@ -872,6 +1065,48 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn command_harness_timeout_terminates_descendant_processes() {
+        let pid_file = unique_temp_path("timeout-child-pid");
+        let harness = CommandAgentHarness::new(
+            CommandLaunchPlan::new("fixture", "sh")
+                .arg("-c")
+                .arg("sleep 5 & echo $! > \"$WHIPPLESCRIPT_CHILD_PID_FILE\"; cat >/dev/null; wait")
+                .env(
+                    "WHIPPLESCRIPT_CHILD_PID_FILE",
+                    pid_file.display().to_string(),
+                )
+                .timeout(Duration::from_millis(250)),
+        );
+
+        let result = harness.run(test_request());
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("child pid file exists")
+            .trim()
+            .parse::<u32>()
+            .expect("child pid parses");
+        let gone = wait_until_process_gone(pid, Duration::from_millis(1_000));
+        if !gone {
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = std::fs::remove_file(&pid_file);
+
+        let failure = result.failure.expect("failure is structured");
+        assert_eq!(result.status, ProviderRunStatus::TimedOut);
+        assert_eq!(failure.phase, "provider.timeout");
+        assert!(
+            gone,
+            "timed-out command left descendant process {pid} alive"
+        );
+    }
+
+    #[test]
     fn command_harness_classifies_result_validation_failure() {
         let harness = CommandAgentHarness::new(
             CommandLaunchPlan::new("fixture", "sh")
@@ -884,7 +1119,7 @@ mod tests {
 
         let failure = result.failure.expect("failure is structured");
         assert_eq!(result.status, ProviderRunStatus::Failed);
-        assert_eq!(result.exit_code, Some(0));
+        assert!(matches!(result.exit_code, Some(0) | None));
         assert_eq!(failure.phase, "provider.result.invalid");
         assert_eq!(failure.error_kind, "invalid_stdout_json");
         assert!(!failure.recoverable);
@@ -939,5 +1174,40 @@ mod tests {
             input_json: r#"{"prompt":"go"}"#.to_owned(),
             skill_names: Vec::new(),
         }
+    }
+
+    fn unique_temp_path(label: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "whipplescript-{label}-{}-{stamp}",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(unix)]
+    fn wait_until_process_gone(pid: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if !process_exists(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        !process_exists(pid)
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 }

@@ -10,9 +10,15 @@ const host = process.env.WHIPPLESCRIPT_OPENAI_COERCE_HOST || "127.0.0.1";
 const port = Number(process.env.WHIPPLESCRIPT_OPENAI_COERCE_PORT || "18765");
 const model = process.env.WHIPPLESCRIPT_OPENAI_MODEL || "gpt-5.4-mini";
 const apiKey = process.env.OPENAI_API_KEY;
+const authToken = process.env.WHIPPLESCRIPT_OPENAI_COERCE_TOKEN;
 
 if (!apiKey) {
   console.error("OPENAI_API_KEY is required for the OpenAI coerce server");
+  process.exit(2);
+}
+
+if (!authToken || authToken.length < 16) {
+  console.error("WHIPPLESCRIPT_OPENAI_COERCE_TOKEN with at least 16 characters is required");
   process.exit(2);
 }
 
@@ -25,6 +31,11 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method !== "POST" || request.url !== "/coerce") {
       writeJson(response, 404, { error: "not_found" });
+      return;
+    }
+
+    if (!isAuthorized(request)) {
+      writeJson(response, 401, { error: "unauthorized" });
       return;
     }
 
@@ -51,6 +62,10 @@ server.listen(port, host, () => {
 
 process.on("SIGTERM", () => server.close(() => process.exit(0)));
 process.on("SIGINT", () => server.close(() => process.exit(130)));
+
+function isAuthorized(request) {
+  return request.headers.authorization === `Bearer ${authToken}`;
+}
 
 async function coerce(request) {
   const outputType = String(request.output_type || "CoerceResult");

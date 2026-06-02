@@ -118,7 +118,7 @@ pre-kernel behavior:
   status and JSON shape
 - tests that inspect prompt text to recover route identity should use typed
   correlation metadata, effect projections, or recorded result facts
-- legacy guard string tests should be replaced by typed expression parser,
+- older guard string tests should be replaced by typed expression parser,
   golden IR, validation, and runtime/e2e coverage
 - model-judged exact-script checks should be paired with deterministic
   validator-capability coverage before being treated as CI signal
@@ -172,6 +172,24 @@ WHIPPLESCRIPT_LOFT_SKIP_REPO_PREFLIGHT=1
 WHIPPLESCRIPT_BAML_HEALTH_PATH=/health
 ```
 
+Destructive provider tests are refused unless the target is explicitly marked
+disposable. Set `WHIPPLESCRIPT_REAL_PROVIDER_DESTRUCTIVE_TESTS=1` for all
+selected providers, or `WHIPPLESCRIPT_CODEX_DESTRUCTIVE_TESTS=1`,
+`WHIPPLESCRIPT_CLAUDE_DESTRUCTIVE_TESTS=1`,
+`WHIPPLESCRIPT_PI_DESTRUCTIVE_TESTS=1`,
+`WHIPPLESCRIPT_LOFT_DESTRUCTIVE_TESTS=1`, or
+`WHIPPLESCRIPT_BAML_DESTRUCTIVE_TESTS=1` for one provider. The matching run must
+also set either provider-specific disposable marker variables, such as
+`WHIPPLESCRIPT_CODEX_DISPOSABLE_TARGET` and
+`WHIPPLESCRIPT_CODEX_DISPOSABLE_ACK`, or the global
+`WHIPPLESCRIPT_REAL_PROVIDER_DISPOSABLE_TARGET` and
+`WHIPPLESCRIPT_REAL_PROVIDER_DISPOSABLE_ACK`. The acknowledgement value must be
+exactly:
+
+```text
+I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE
+```
+
 For local validation with only an OpenAI API key, put `OPENAI_API_KEY` in
 `.env` and run:
 
@@ -181,7 +199,9 @@ scripts/check-openai-coerce.sh
 
 That starts `scripts/openai-coerce-server.mjs`, a local BAML-compatible bridge
 that serves `/coerce` on `http://127.0.0.1:18765` by default, then runs the same
-real-provider Coerce smoke path against it.
+real-provider Coerce smoke path against it. The wrapper generates a per-run
+bearer token for `/coerce` unless `WHIPPLESCRIPT_OPENAI_COERCE_TOKEN` is already
+set.
 
 Required tools:
 
@@ -209,6 +229,20 @@ set `WHIPPLESCRIPT_REAL_PROVIDER_PREFLIGHT_REPORT` to choose another path. Each
 record names the provider, boundary phase, check id, status, and a redacted
 message, so config, adapter resolution, workspace preparation, launch, health,
 and result-validation failures are visible without scraping free-form output.
+The report wrapper also writes per-provider JSON reports under
+`target/real-provider-reports/` by default. Set
+`WHIPPLESCRIPT_REAL_PROVIDER_REPORT_DIR` to choose another directory. Those
+provider reports contain redacted environment posture, evidence refs, check
+counts, and the provider's own preflight records.
+
+Native provider compatibility checks can be requested without the all-provider
+strict gate by setting `WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_SURFACE=1`. This
+selects the native Codex app-server, Claude Agent SDK, and Pi RPC validation
+paths for whichever providers are listed in `WHIPPLESCRIPT_REAL_PROVIDERS`.
+The optional GitHub Actions workflow `Native Provider Validation` runs a
+Codex/Claude/Pi matrix in that mode and uploads the generated reports. Its
+`strict=true` dispatch input runs the all-provider strict gate; missing native
+provider config paths or required live prerequisites then fail the workflow.
 
 The real-provider script verifies prerequisite tools, required environment,
 Loft fixture repo readiness when Loft is selected, including tracked spec
@@ -216,7 +250,8 @@ and fixture files, non-destructive BAML endpoint reachability when BAML is
 selected, `doctor`, example compilation, a read-only no-mock `loft.show`
 smoke call, a no-mock `baml.coerce` smoke call against the configured endpoint,
 and a one-message Codex smoke when `codex` is selected. Provider-destructive
-Loft flows stay manual until isolated test fixtures exist for external systems.
+flows must pass the disposable-target marker gate before any provider test is
+allowed to run.
 
 Loft fixture shape checks are available separately:
 

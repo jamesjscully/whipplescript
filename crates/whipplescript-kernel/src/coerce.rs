@@ -109,6 +109,7 @@ pub trait BamlClient {
 pub struct HttpBamlClient {
     endpoint: String,
     timeout: Duration,
+    bearer_token: Option<String>,
 }
 
 impl HttpBamlClient {
@@ -116,11 +117,20 @@ impl HttpBamlClient {
         Self {
             endpoint: endpoint.into(),
             timeout: Duration::from_secs(30),
+            bearer_token: None,
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        if !token.is_empty() {
+            self.bearer_token = Some(token);
+        }
         self
     }
 
@@ -136,7 +146,7 @@ impl HttpBamlClient {
                 json!({
                     "function_name": request.function_name,
                     "reason": reason.into(),
-                    "endpoint": self.endpoint,
+                    "endpoint": redacted_text_reference(&self.endpoint),
                     "recoverable": true,
                 })
                 .to_string(),
@@ -242,9 +252,15 @@ impl BamlClient for HttpBamlClient {
         .to_string();
         let path = endpoint.path_for("coerce");
         let transcript = format!("POST http://{}{}", endpoint.host_header, path);
+        let authorization_header = self
+            .bearer_token
+            .as_ref()
+            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
         let http_request = format!(
-            "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {length}\r\n\r\n{body}",
+            "POST {path} HTTP/1.1\r\nHost: {host}\r\n{authorization_header}Content-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {length}\r\n\r\n{body}",
             host = endpoint.host_header,
+            authorization_header = authorization_header,
             length = body.len(),
         );
 
@@ -288,9 +304,18 @@ impl ParsedHttpEndpoint {
         let Some(rest) = endpoint.strip_prefix("http://") else {
             return Err("BAML HTTP client currently supports only http:// endpoints".to_owned());
         };
+        if endpoint.chars().any(|ch| ch.is_ascii_control()) {
+            return Err("BAML endpoint contains invalid control characters".to_owned());
+        }
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
         if authority.is_empty() {
             return Err("BAML endpoint is missing a host".to_owned());
+        }
+        if !valid_authority(authority) {
+            return Err("BAML endpoint contains an invalid host or port".to_owned());
+        }
+        if path.chars().any(|ch| ch.is_ascii_whitespace()) || path.contains(['?', '#']) {
+            return Err("BAML endpoint contains an invalid path".to_owned());
         }
         let address = if authority.contains(':') {
             authority.to_owned()
@@ -313,6 +338,18 @@ impl ParsedHttpEndpoint {
     }
 }
 
+fn valid_authority(authority: &str) -> bool {
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        && port.is_none_or(|port| !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()))
+}
+
 fn parse_status_code(head: &str) -> Option<u16> {
     head.lines()
         .next()?
@@ -324,6 +361,14 @@ fn parse_status_code(head: &str) -> Option<u16> {
 
 fn extract_json_field(body: &Value, field: &str) -> Option<String> {
     body.get(field).map(Value::to_string)
+}
+
+fn redacted_text_reference(text: &str) -> String {
+    format!(
+        "<redacted bytes={} chars={}>",
+        text.len(),
+        text.chars().count()
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -448,6 +493,7 @@ mod tests {
             let count = stream.read(&mut buffer).expect("reads request");
             let request = String::from_utf8_lossy(&buffer[..count]);
             assert!(request.starts_with("POST /coerce HTTP/1.1"));
+            assert!(request.contains("Authorization: Bearer test-token-123456\r\n"));
             assert!(request.contains(r#""function_name":"reviewWork""#));
             assert!(request.contains(r#""arguments":{"summary":"done"}"#));
 
@@ -469,7 +515,9 @@ mod tests {
                 .expect("writes response");
         });
 
-        let client = HttpBamlClient::new(endpoint).with_timeout(Duration::from_secs(1));
+        let client = HttpBamlClient::new(endpoint)
+            .with_timeout(Duration::from_secs(1))
+            .with_bearer_token("test-token-123456");
         let result = client.coerce(&BamlCoerceRequest {
             function_name: "reviewWork".to_owned(),
             arguments_json: r#"{"summary":"done"}"#.to_owned(),
@@ -491,6 +539,25 @@ mod tests {
     }
 
     #[test]
+    fn http_client_rejects_endpoint_control_characters_without_echoing_endpoint() {
+        let endpoint = "http://127.0.0.1:1/base\r\nX-Injected: true";
+        let client = HttpBamlClient::new(endpoint).with_timeout(Duration::from_millis(10));
+        let result = client.coerce(&BamlCoerceRequest {
+            function_name: "reviewWork".to_owned(),
+            arguments_json: r#"{"summary":"done"}"#.to_owned(),
+            output_type: "WorkReview".to_owned(),
+            generated_baml_source_hash: "baml".to_owned(),
+            input_schema_hash: "input".to_owned(),
+            output_schema_hash: "output".to_owned(),
+        });
+
+        assert_eq!(result.status, BamlCoerceStatus::Failed);
+        let error = result.error_json.expect("error json");
+        assert!(error.contains("\"endpoint\":\"<redacted"));
+        assert!(!error.contains("X-Injected"));
+    }
+
+    #[test]
     fn real_baml_coerce_endpoint_smoke() {
         let Ok(endpoint) = std::env::var("WHIPPLESCRIPT_BAML_TEST_ENDPOINT") else {
             return;
@@ -505,7 +572,10 @@ mod tests {
             return;
         };
 
-        let client = HttpBamlClient::new(endpoint).with_timeout(Duration::from_secs(10));
+        let mut client = HttpBamlClient::new(endpoint).with_timeout(Duration::from_secs(10));
+        if let Ok(token) = std::env::var("WHIPPLESCRIPT_BAML_AUTH_TOKEN") {
+            client = client.with_bearer_token(token);
+        }
         let result = client.coerce(&BamlCoerceRequest {
             function_name,
             arguments_json,
@@ -518,10 +588,9 @@ mod tests {
         assert_eq!(
             result.status,
             BamlCoerceStatus::Succeeded,
-            "real BAML coerce smoke failed: summary={} error={:?} transcript={}",
+            "real BAML coerce smoke failed: status={:?} summary={}",
+            result.status,
             result.summary,
-            result.error_json,
-            result.transcript
         );
         assert!(
             result.value_json.is_some(),

@@ -12,7 +12,8 @@ whip check workflow.whip
 
 Common issues:
 
-- Equality guards such as `when status == Done` are not implemented yet.
+- Equality guards must be written in `where` clauses, for example
+  `when task where task.status == Done`.
 - Effect outputs must be used inside a matching `after <effect> ...` block.
 - `as binding` must be on the effect line.
 - Unknown record fields are rejected.
