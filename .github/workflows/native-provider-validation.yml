@@ -78,7 +78,7 @@ jobs:
       WHIPPLESCRIPT_PI_DISPOSABLE_TARGET: ${{ inputs.live_pi == 'true' && matrix.provider == 'pi' && 'pi-artifact-fixture' || '' }}
       WHIPPLESCRIPT_PI_DISPOSABLE_ACK: ${{ inputs.live_pi == 'true' && matrix.provider == 'pi' && 'I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE' || '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -93,7 +93,7 @@ jobs:
 
       - name: Upload provider reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: native-provider-${{ matrix.provider }}-reports
           path: target/native-provider-ci/${{ matrix.provider }}/
@@ -132,7 +132,7 @@ jobs:
       WHIPPLESCRIPT_PI_DISPOSABLE_TARGET: ${{ inputs.live_pi == 'true' && 'pi-artifact-fixture' || '' }}
       WHIPPLESCRIPT_PI_DISPOSABLE_ACK: ${{ inputs.live_pi == 'true' && 'I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE' || '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -147,7 +147,7 @@ jobs:
 
       - name: Upload strict native reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: native-provider-strict-reports
           path: target/native-provider-ci/strict/
