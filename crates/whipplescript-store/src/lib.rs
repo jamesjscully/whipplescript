@@ -1,5 +1,8 @@
 //! Durable SQLite store for event logs, facts, effects, and evidence.
 
+pub mod coordination;
+pub mod items;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -207,6 +210,9 @@ pub struct NewEffect<'a> {
     pub profile: Option<&'a str>,
     pub correlation_id: Option<&'a str>,
     pub source_span_json: Option<&'a str>,
+    /// Creation-anchored deadline in seconds; for `timer.wait` effects this
+    /// is the timer duration.
+    pub timeout_seconds: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -647,6 +653,14 @@ pub struct EffectView {
     pub declared_profiles_json: String,
     pub policy_block_reason: Option<String>,
     pub cancel_requested: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DueTimeEffect {
+    pub effect_id: String,
+    pub kind: String,
+    pub status: String,
+    pub timeout_seconds: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2232,6 +2246,7 @@ impl SqliteStore {
             LEFT JOIN program_versions AS effect_versions
               ON effect_versions.version_id = candidate.program_version_id
             WHERE candidate.instance_id = ?1
+              AND candidate.kind != 'timer.wait'
               AND (
                   candidate.status IN ('queued', 'blocked_by_dependency', 'blocked_by_capacity')
                   OR (candidate.kind = 'workflow.invoke' AND candidate.status = 'running')
@@ -3425,11 +3440,23 @@ impl SqliteStore {
             "#,
             params![answer.inbox_item_id, answer.answer_json, answer.answered_by],
         )?;
+        let choice = answer_value
+            .get("choice")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let text = answer_value
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
         let payload = json!({
             "inbox_item_id": answer.inbox_item_id,
             "effect_id": item.1,
             "prompt": item.2,
             "answered_by": answer.answered_by,
+            "choice": choice,
+            "text": text,
             "answer": answer_value,
         })
         .to_string();
@@ -4187,6 +4214,151 @@ impl SqliteStore {
         Ok(event)
     }
 
+    /// Effects whose creation-anchored time has arrived: due `timer.wait`
+    /// effects (dependency-cleared) and effects whose `timeout` deadline has
+    /// expired. Resolved on worker passes; rule evaluation never reads the
+    /// clock.
+    pub fn due_time_effects(&self, instance_id: &str) -> StoreResult<Vec<DueTimeEffect>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT
+                candidate.effect_id,
+                candidate.kind,
+                candidate.status,
+                COALESCE(candidate.timeout_seconds, 0)
+            FROM effects AS candidate
+            WHERE candidate.instance_id = ?1
+              AND candidate.status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')
+              AND (
+                  -- relative deadline: created + timeout_seconds
+                  (candidate.timeout_seconds IS NOT NULL
+                   AND (strftime('%s', 'now') - strftime('%s', candidate.created_at)) >= candidate.timeout_seconds)
+                  -- absolute deadline (timer until): input_json.deadline_at
+                  -- (cast to integer: strftime returns text, and `>=` on text
+                  -- compares lexicographically)
+                  OR (json_extract(candidate.input_json, '$.deadline_at') IS NOT NULL
+                      AND CAST(strftime('%s', 'now') AS INTEGER)
+                          >= CAST(strftime('%s', json_extract(candidate.input_json, '$.deadline_at')) AS INTEGER))
+              )
+              AND (
+                  candidate.kind != 'timer.wait'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM effect_dependencies AS dependency
+                      JOIN effects AS upstream
+                        ON upstream.effect_id = dependency.upstream_effect_id
+                       AND upstream.instance_id = dependency.instance_id
+                      WHERE dependency.instance_id = candidate.instance_id
+                        AND dependency.downstream_effect_id = candidate.effect_id
+                        AND NOT (
+                            (dependency.predicate = 'succeeds' AND upstream.status = 'completed')
+                            OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out'))
+                            OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled'))
+                        )
+                  )
+              )
+            ORDER BY candidate.created_at, candidate.effect_id
+            "#,
+        )?;
+        let rows = statement
+            .query_map([instance_id], |row| {
+                Ok(DueTimeEffect {
+                    effect_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    status: row.get(2)?,
+                    timeout_seconds: row.get(3)?,
+                })
+            })?
+            .collect::<result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Pending time obligations (queued timers, unexpired deadlines) for
+    /// status reporting.
+    pub fn pending_time_effects(&self, instance_id: &str) -> StoreResult<Vec<DueTimeEffect>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT effect_id, kind, status, timeout_seconds
+            FROM effects
+            WHERE instance_id = ?1
+              AND timeout_seconds IS NOT NULL
+              AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')
+            ORDER BY created_at, effect_id
+            "#,
+        )?;
+        let rows = statement
+            .query_map([instance_id], |row| {
+                Ok(DueTimeEffect {
+                    effect_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    status: row.get(2)?,
+                    timeout_seconds: row.get(3)?,
+                })
+            })?
+            .collect::<result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Marks a never-run effect `timed_out` when its creation-anchored
+    /// deadline expires. Running effects go through run-level timeout plus a
+    /// cancellation request instead.
+    pub fn expire_effect(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        let payload = json!({
+            "effect_id": effect_id,
+            "status": "timed_out",
+            "reason": "deadline exceeded",
+        })
+        .to_string();
+        let tx = self.connection.transaction()?;
+        let event = append_event_on(
+            &tx,
+            NewEvent {
+                instance_id,
+                event_type: "effect.terminal",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(effect_id),
+                correlation_id: None,
+                idempotency_key,
+            },
+        )?;
+        let changed = tx.execute(
+            r#"
+            UPDATE effects
+            SET status = 'timed_out',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE instance_id = ?1
+              AND effect_id = ?2
+              AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')
+            "#,
+            params![instance_id, effect_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict("effect cannot expire".to_owned()));
+        }
+        tx.commit()?;
+        Ok(event)
+    }
+
+    /// Marks a projection fact consumed outside a rule commit (used when a
+    /// projected work item stops being ready).
+    pub fn retire_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
+        self.connection.execute(
+            r#"
+            UPDATE facts
+            SET consumed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE instance_id = ?1 AND fact_id = ?2 AND consumed_at IS NULL
+            "#,
+            params![instance_id, fact_id],
+        )?;
+        Ok(())
+    }
+
     pub fn cancel_effect(
         &mut self,
         cancellation: EffectCancellation<'_>,
@@ -4793,9 +4965,10 @@ fn insert_effect(
             correlation_id,
             idempotency_key,
             required_capabilities,
-            profile
+            profile,
+            timeout_seconds
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
         "#,
         params![
             effect.effect_id,
@@ -4812,6 +4985,7 @@ fn insert_effect(
             effect.idempotency_key,
             effect.required_capabilities_json,
             effect.profile,
+            effect.timeout_seconds,
         ],
     )?;
     Ok(())
@@ -5217,6 +5391,25 @@ fn policy_block_on(
         return Ok(Some(block));
     }
 
+    // Timers, builtin-queue verbs, and coordination verbs
+    // (spec/coordination.md) are resolved by the runtime itself on worker
+    // passes: no provider, capability, or profile applies.
+    if effect.kind == "timer.wait"
+        || effect.kind.starts_with("queue.")
+        || effect.kind.starts_with("lease.")
+        || effect.kind.starts_with("ledger.")
+        || effect.kind.starts_with("counter.")
+        || effect.kind == "event.notify"
+    {
+        return Ok(None);
+    }
+
+    if effect.kind == "exec.command" {
+        let capabilities = explicit_required_capabilities(&effect)?;
+        return policy_block_for_capabilities(connection, &effect, &capabilities);
+    }
+
+    let capabilities = required_capabilities(&effect)?;
     if !effect_provider_exists(connection, &effect.kind)? {
         return Ok(Some(PolicyBlock {
             status: "blocked_by_capability",
@@ -5224,8 +5417,15 @@ fn policy_block_on(
         }));
     }
 
-    let capabilities = required_capabilities(&effect)?;
-    for capability in &capabilities {
+    policy_block_for_capabilities(connection, &effect, &capabilities)
+}
+
+fn policy_block_for_capabilities(
+    connection: &Connection,
+    effect: &PolicyEffect,
+    capabilities: &[String],
+) -> StoreResult<Option<PolicyBlock>> {
+    for capability in capabilities {
         if !capability_schema_exists(connection, capability)? {
             return Ok(Some(PolicyBlock {
                 status: "blocked_by_capability",
@@ -5252,7 +5452,7 @@ fn policy_block_on(
             }));
         };
         if enforcement_mode != "audit" {
-            for capability in &capabilities {
+            for capability in capabilities {
                 if !capability_allowed(&allowed_capabilities, capability) {
                     return Ok(Some(PolicyBlock {
                         status: "blocked_by_profile",
@@ -5404,6 +5604,7 @@ fn declared_agents_present(declared_profiles_json: &str) -> StoreResult<bool> {
                             || entry.contains_key("capacity")
                             || entry.contains_key("capabilities")
                             || entry.contains_key("harness")
+                            || entry.contains_key("provider")
                     })
                 })
         }
@@ -7072,6 +7273,7 @@ fn replay_rule_commit(
             .and_then(Value::as_i64)
             .unwrap_or(commit_revision_epoch);
         let new_effect = NewEffect {
+            timeout_seconds: None,
             effect_id,
             kind,
             target: effect.get("target").and_then(Value::as_str),
@@ -7722,6 +7924,47 @@ fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
     ensure_workflow_invocation_schema(connection)?;
     ensure_revision_schema(connection)?;
     ensure_workspace_schema(connection)?;
+    ensure_effect_time_columns(connection)?;
+    ensure_lookup_indexes(connection)?;
+    Ok(())
+}
+
+fn ensure_effect_time_columns(connection: &Connection) -> StoreResult<()> {
+    let effects_table_exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'effects'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !effects_table_exists {
+        return Ok(());
+    }
+    if !column_exists(connection, "effects", "timeout_seconds")? {
+        connection.execute("ALTER TABLE effects ADD COLUMN timeout_seconds INTEGER", [])?;
+    }
+    Ok(())
+}
+
+fn ensure_lookup_indexes(connection: &Connection) -> StoreResult<()> {
+    {
+        let (table, statement) = (
+            "facts",
+            "CREATE INDEX IF NOT EXISTS idx_facts_instance_name ON facts(instance_id, name)",
+        );
+        let table_exists = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if table_exists {
+            connection.execute(statement, [])?;
+        }
+    }
     Ok(())
 }
 
@@ -8511,6 +8754,7 @@ mod tests {
         let effects = [
             test_effect("claim", "loft.claim", "rule=start;effect=claim"),
             NewEffect {
+                timeout_seconds: None,
                 effect_id: "tell",
                 kind: "agent.tell",
                 target: Some("worker"),
@@ -8591,6 +8835,7 @@ mod tests {
         let effects = [
             test_effect("claim", "loft.claim", "rule=start;effect=claim"),
             NewEffect {
+                timeout_seconds: None,
                 effect_id: "tell",
                 kind: "agent.tell",
                 target: Some("worker"),
@@ -10599,6 +10844,7 @@ mod tests {
         let effects = [
             test_effect("cleanup", "agent.tell", "rule=start;effect=cleanup"),
             NewEffect {
+                timeout_seconds: None,
                 effect_id: "notify",
                 kind: "agent.tell",
                 target: Some("worker"),
@@ -11084,6 +11330,7 @@ mod tests {
         let source_span_json =
             r#"{"path":"workflow.whip","start":42,"end":73,"construct":"effect"}"#;
         let effects = [NewEffect {
+            timeout_seconds: None,
             source_span_json: Some(source_span_json),
             ..test_effect("tell", "agent.tell", "rule=start;effect=tell")
         }];
@@ -11459,6 +11706,7 @@ mod tests {
             })
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             required_capabilities_json: r#"["plugin.memory"]"#,
             ..test_effect("memory", "agent.tell", "rule=start;effect=memory")
         }];
@@ -11528,6 +11776,7 @@ mod tests {
             })
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "write",
             kind: "agent.tell",
             target: Some("worker"),
@@ -11595,6 +11844,7 @@ mod tests {
             })
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             required_capabilities_json: r#"["plugin.memory"]"#,
             ..test_effect("memory", "agent.tell", "rule=start;effect=memory")
         }];
@@ -11762,6 +12012,7 @@ mod tests {
             })
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             target: Some("rogue"),
             ..test_effect("tell-rogue", "agent.tell", "rule=start;effect=tell-rogue")
         }];
@@ -11825,6 +12076,7 @@ mod tests {
             })
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             required_capabilities_json: r#"["repo.write"]"#,
             ..test_effect("tell-write", "agent.tell", "rule=start;effect=tell-write")
         }];
@@ -11890,6 +12142,7 @@ mod tests {
         assert_eq!(plugin_id, "plugin-memory");
 
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "query",
             kind: "memory.query",
             target: None,
@@ -12463,6 +12716,7 @@ mod tests {
         idempotency_key: &'a str,
     ) -> NewEffect<'a> {
         NewEffect {
+            timeout_seconds: None,
             effect_id,
             kind,
             target: Some("worker"),

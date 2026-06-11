@@ -1,0 +1,84 @@
+workflow GastownLite
+source_tags
+@service workflow GastownLite
+schemas
+  class Workspace
+    name string
+  class Ticket
+    id string
+    title string
+    area union<literal<"frontend"> | literal<"backend">>
+    worker agentref<frontend | backend>
+    workspace ref<Workspace>
+    status literal<"ready">
+  class ReviewDecision
+    ticketId string
+    area string
+    verdict union<literal<"merge"> | literal<"revise"> | literal<"blocked">>
+  class MergeRecord
+    ticketId string
+    verdict literal<"merge">
+  class WorkspaceReady
+    workspace ref<Workspace>
+queues
+  queue backlog tracker=builtin
+agents
+  agent frontend harness=<fallback> provider=codex profile=repo-writer capacity=1 skills=[] capabilities=[]
+  agent backend harness=<fallback> provider=codex profile=repo-writer capacity=1 skills=[] capabilities=[]
+coerces
+  coerce reviewPatch(ticketId string, summary string) -> ref<ReviewDecision>
+rules
+  rule table_workspaces
+    when started
+    reads
+      pattern:started
+    writes
+      schema:WorkspaceReady
+    record_sources
+      schema:WorkspaceReady construct=table_row span=881..920
+    body_hash be140b933c7ae3a2
+  rule file_ticket
+    when started
+    reads
+      pattern:started
+    effects
+      effect1 kind=queue.file binding=- key=86894c0bca5b2ae5
+    body_hash 338d6ad789f3a0b1
+  rule implement_ready_ticket
+    when backlog has ready item as item
+    when WorkspaceReady as ready
+    when frontend is available
+    reads
+      pattern:backlog has ready item as item
+      pattern:frontend is available
+      schema:WorkspaceReady
+    writes
+      schema:MergeRecord
+    effects
+      claimed kind=queue.claim binding=claimed key=c1f22dc3c78ab3dd
+      slot kind=lease.acquire binding=slot key=7e41121b2b82c668
+      turn kind=agent.tell binding=turn key=0f484580de9b735e
+      effect4 kind=queue.release binding=- key=c073a6ab53599798
+      effect5 kind=human.ask binding=- key=22a2e9667ad9099f
+      review kind=baml.coerce binding=review key=06b1101194f13e5d
+      log_entry kind=ledger.append binding=log_entry key=486742921bd48ea1
+      effect8 kind=queue.finish binding=- key=3d9ec6b22e572e38
+      effect9 kind=queue.release binding=- key=e9dc4bfff08a3011
+      effect10 kind=human.ask binding=- key=d025b57c989c4a71
+    dependencies
+      claimed --succeeds--> slot
+      slot --completes--> turn
+      slot --completes--> effect4
+      slot --completes--> effect5
+      turn --succeeds--> review
+      review --succeeds--> log_entry
+      log_entry --succeeds--> effect8
+      log_entry --succeeds--> effect9
+      log_entry --succeeds--> effect10
+    case_branches
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"merge" guard=- body_hash=37fd2c0ced334e60 span=2245..2252
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"revise" guard=- body_hash=9d28cc8c79a2b851 span=2427..2435
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"blocked" guard=- body_hash=5740253f987ec22b span=2476..2485
+    body_hash 7f3227538e459837
+rule_dependencies
+  table_workspaces --schema:WorkspaceReady--> implement_ready_ticket

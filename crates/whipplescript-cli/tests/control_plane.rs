@@ -16,15 +16,20 @@ fn checks_all_example_workflows() {
     let examples = [
         "minimal-noop.whip",
         "ralph.whip",
-        "loft-worker-with-review.whip",
+        "queue-worker-with-review.whip",
+        "queue-gated-smoke.whip",
         "coerce-branch.whip",
-        "codex-french-poem-dogfood.whip",
-        "codex-poem-coerce-review.whip",
-        "codex-claude-harness-review.whip",
-        "companion-skill-dogfood.whip",
+        "terminal-output-union.whip",
+        "triage-flow.whip",
+        "incident-router.whip",
+        "scheduled-escalation.whip",
+        "event-bridge.whip",
+        "reusable-review-pattern.whip",
+        "exec-json-ingest.whip",
+        "autoresearch-lite.whip",
+        "gastown-lite.whip",
+        "circuit-breaker.whip",
         "human-review.whip",
-        "implementation-plan-phase-review.whip",
-        "multi-provider-poem-review.whip",
         "multi-agent-bounded-concurrency.whip",
         "openclaw-lite.whip",
         "plugin-memory.whip",
@@ -46,6 +51,588 @@ fn checks_all_example_workflows() {
     for example in examples {
         assert!(output.contains(example), "{output}");
     }
+}
+
+#[test]
+fn check_json_reports_source_metadata() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let example = example_path("provider-language-e2e.whip");
+
+    let report = run_json(
+        bin,
+        &[
+            "--json",
+            "check",
+            example.to_str().expect("utf-8 example path"),
+        ],
+    );
+    let reports = report.as_array().expect("check json report array");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].get("schema").and_then(Value::as_str),
+        Some("whipplescript.check_report.v0")
+    );
+    let source_metadata = reports[0].get("source_metadata").expect("source metadata");
+    let targets = source_metadata
+        .get("targets")
+        .and_then(Value::as_object)
+        .expect("metadata targets");
+
+    let workflow = targets
+        .get("workflow:ProviderLanguageE2E")
+        .expect("workflow metadata");
+    assert_eq!(
+        workflow.get("description").and_then(Value::as_str),
+        Some("Fixture-backed provider x language acceptance workflow")
+    );
+    assert!(workflow
+        .get("tags")
+        .and_then(Value::as_array)
+        .expect("workflow tags")
+        .iter()
+        .any(|tag| tag.as_str() == Some("acceptance")));
+
+    let table = targets.get("table:language_tasks").expect("table metadata");
+    assert_eq!(
+        table.get("description").and_then(Value::as_str),
+        Some("Static provider x language task rows")
+    );
+    assert!(table
+        .get("tags")
+        .and_then(Value::as_array)
+        .expect("table tags")
+        .iter()
+        .any(|tag| tag.as_str() == Some("fixture")));
+
+    let rule = targets
+        .get("rule:run_language_task")
+        .expect("rule metadata");
+    assert_eq!(
+        rule.get("description").and_then(Value::as_str),
+        Some("Route one queued language task to its selected provider")
+    );
+}
+
+#[test]
+fn compile_json_reports_source_metadata() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let example = example_path("provider-language-e2e.whip");
+
+    let report = run_json(
+        bin,
+        &[
+            "--json",
+            "compile",
+            example.to_str().expect("utf-8 example path"),
+        ],
+    );
+
+    assert_eq!(
+        report.get("schema").and_then(Value::as_str),
+        Some("whipplescript.compile_report.v0")
+    );
+    assert_eq!(
+        report.get("workflow").and_then(Value::as_str),
+        Some("ProviderLanguageE2E")
+    );
+    assert!(report
+        .get("source_metadata")
+        .and_then(|metadata| metadata.get("descriptions"))
+        .and_then(Value::as_array)
+        .expect("descriptions")
+        .iter()
+        .any(
+            |description| description.get("target_kind").and_then(Value::as_str) == Some("rule")
+                && description.get("target").and_then(Value::as_str) == Some("run_language_task")
+        ));
+}
+
+#[test]
+fn dev_table_rows_report_fact_provenance_and_source_spans() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("table-row-report");
+    fs::write(
+        &source_path,
+        r#"
+workflow TableRowReport
+
+class Task {
+  title string
+  status "queued"
+}
+
+table tasks as Task [
+  {
+    title "Review parser"
+    status "queued"
+  }
+
+  {
+    title "Review runtime"
+    status "queued"
+  }
+]
+"#,
+    )
+    .expect("write source");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let task_facts = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("Task"))
+        .collect::<Vec<_>>();
+    assert_eq!(task_facts.len(), 2);
+    assert!(task_facts.iter().all(|fact| {
+        fact.get("provenance_class").and_then(Value::as_str) == Some("table")
+            && fact
+                .pointer("/source_span/construct")
+                .and_then(Value::as_str)
+                == Some("table_row")
+            && fact.pointer("/source_span/path").and_then(Value::as_str) == source_path.to_str()
+            && fact
+                .pointer("/source_span/start")
+                .and_then(Value::as_u64)
+                .is_some()
+            && fact
+                .pointer("/source_span/end")
+                .and_then(Value::as_u64)
+                .is_some()
+    }));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn human_answer_fires_dependent_rule() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let example = example_path("human-review.whip");
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let source = example.to_str().expect("utf-8 example path");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            source,
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    let inbox = run_json(bin, &["--store", store, "--json", "inbox"]);
+    let items = inbox.as_array().expect("inbox items");
+    assert_eq!(items.len(), 1, "one pending human review item");
+    let inbox_item_id = items[0]
+        .get("inbox_item_id")
+        .and_then(Value::as_str)
+        .expect("inbox item id")
+        .to_owned();
+
+    run_text(
+        bin,
+        &[
+            "--store",
+            store,
+            "inbox",
+            "answer",
+            &inbox_item_id,
+            "--choice",
+            "accept",
+        ],
+    );
+    run_text(
+        bin,
+        &["--store", store, "step", &instance_id, "--program", source],
+    );
+
+    let facts = run_json(bin, &["--store", store, "--json", "facts", &instance_id]);
+    let decisions = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("HumanDecision"))
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 1, "answer fires record_manual_review");
+    assert_eq!(
+        decisions[0]
+            .pointer("/value/decision")
+            .and_then(Value::as_str),
+        Some("accept")
+    );
+
+    let _ = fs::remove_file(store_path);
+}
+
+#[test]
+fn completed_turn_pattern_fires_dependent_rule() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("completed-turn");
+    fs::write(
+        &source_path,
+        r#"
+workflow CompletedTurn
+
+output result TurnSeen
+
+class TurnSeen {
+  agent string
+  summary string
+}
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule begin
+  when started
+  when worker is available
+=> {
+  tell worker "Do the task."
+}
+
+rule observe
+  when worker completed turn as turn
+=> {
+  record TurnSeen {
+    agent turn.agent
+    summary turn.summary
+  }
+
+  complete result {
+    agent turn.agent
+    summary turn.summary
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let seen = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("TurnSeen"))
+        .collect::<Vec<_>>();
+    assert_eq!(seen.len(), 1, "completed turn fires observe rule");
+    assert_eq!(
+        seen[0].pointer("/value/agent").and_then(Value::as_str),
+        Some("worker")
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn dev_same_workflow_twice_in_one_store_creates_distinct_instances() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("repeat-run");
+    fs::write(
+        &source_path,
+        r#"
+workflow RepeatRun
+
+class Task {
+  title string
+  status string
+}
+
+class Finished {
+  title string
+  status "finished"
+}
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+table tasks as Task [
+  {
+    title "Review parser"
+    status "queued"
+  }
+]
+
+rule run_task
+  when Task as task where task.status == "queued"
+  when worker is available
+=> {
+  tell worker as turn "Do {{ task.title }}"
+
+  after turn succeeds as completed {
+    done task -> record Finished {
+      title task.title
+      status "finished"
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let mut instance_ids = Vec::new();
+    for _ in 0..2 {
+        let dev = run_json(
+            bin,
+            &[
+                "--store",
+                store_path.to_str().expect("utf-8 temp path"),
+                "--json",
+                "dev",
+                source_path.to_str().expect("utf-8 source path"),
+                "--provider",
+                "fixture",
+                "--until",
+                "idle",
+            ],
+        );
+        let instance_id = dev
+            .get("instance_id")
+            .and_then(Value::as_str)
+            .expect("instance id")
+            .to_owned();
+        instance_ids.push(instance_id);
+    }
+
+    assert_ne!(instance_ids[0], instance_ids[1]);
+    for instance_id in &instance_ids {
+        let facts = run_json(
+            bin,
+            &[
+                "--store",
+                store_path.to_str().expect("utf-8 temp path"),
+                "--json",
+                "facts",
+                instance_id,
+            ],
+        );
+        let finished = facts
+            .as_array()
+            .expect("facts")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("Finished"))
+            .count();
+        assert_eq!(finished, 1, "instance {instance_id} completed its task");
+    }
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn dev_include_tag_filters_assertions_without_skipping_runtime() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("tag-filter");
+    fs::write(
+        &source_path,
+        r#"
+workflow TagFilter
+
+class Seen {
+  status "ok"
+}
+
+@smoke
+description "Selected smoke assertion passes"
+assert count(Seen) == 1
+
+@slow
+description "Unselected slow assertion would fail"
+assert count(Seen) == 2
+
+rule seed
+  when started
+=> {
+  record Seen {
+    status "ok"
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+            "--include-tag",
+            "smoke",
+        ],
+    );
+    assert_eq!(
+        dev.pointer("/assertion_filter/total")
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        dev.pointer("/assertion_filter/selected")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        dev.pointer("/executable_spec/status")
+            .and_then(Value::as_str),
+        Some("passed")
+    );
+    let assertions = dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("assertions");
+    assert_eq!(assertions.len(), 1);
+    assert_eq!(
+        assertions[0].get("description").and_then(Value::as_str),
+        Some("Selected smoke assertion passes")
+    );
+    assert!(assertions[0]
+        .get("tags")
+        .and_then(Value::as_array)
+        .expect("tags")
+        .iter()
+        .any(|tag| tag.as_str() == Some("smoke")));
+
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    assert_eq!(
+        facts
+            .as_array()
+            .expect("facts")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("Seen"))
+            .count(),
+        1
+    );
+
+    let exclude_store_path = temp_store_path();
+    let exclude_dev = run_json(
+        bin,
+        &[
+            "--store",
+            exclude_store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+            "--exclude-tag",
+            "slow",
+        ],
+    );
+    assert_eq!(
+        exclude_dev
+            .pointer("/assertion_filter/selected")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        exclude_dev
+            .pointer("/assertions/0/description")
+            .and_then(Value::as_str),
+        Some("Selected smoke assertion passes")
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(exclude_store_path);
+    let _ = fs::remove_file(source_path);
 }
 
 #[test]
@@ -71,6 +658,7 @@ fn check_resolves_relative_whip_includes() {
         format!(
             r#"include "{}"
 
+@service
 workflow IncludeRoot
 
 rule noop
@@ -146,6 +734,7 @@ fn check_root_option_validates_current_workflow_name() {
     fs::write(
         &source_path,
         r#"
+@service
 workflow SelectedRoot
 
 rule noop
@@ -244,6 +833,7 @@ class Selected {
   id string
 }
 
+@service
 workflow Alpha {
   rule alpha
     when started
@@ -254,6 +844,7 @@ workflow Alpha {
   }
 }
 
+@service
 workflow Beta {
   rule beta
     when started
@@ -449,6 +1040,7 @@ fn artifacts_command_lists_metadata_without_raw_content() {
 workflow ArtifactMetadata
 
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
 }
@@ -1057,6 +1649,7 @@ fn old_effect_runs_after_keep_revision_with_old_attribution() {
 workflow OldEffectKeep
 
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
 }
@@ -1212,6 +1805,7 @@ fn running_cancel_revision_requests_without_terminal_cancellation() {
 workflow RunningCancelRevision
 
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
 }
@@ -1507,6 +2101,7 @@ fn operator_incident_bundle_has_stable_status_trace_and_diagnostics_shape() {
 workflow OperatorIncident
 
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
 }
@@ -1837,6 +2432,7 @@ fn running_cancel_supported_provider_acknowledges_cancellation_case(
 workflow RunningCancelAck
 
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
 }
@@ -2100,6 +2696,7 @@ fn queued_cancel_revision_terminal_cancels_old_effect() {
 workflow QueuedCancelRevision
 
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
 }
@@ -2737,10 +3334,10 @@ fn step_materializes_minimal_noop_fact() {
 }
 
 #[test]
-fn dev_phase_review_creates_requests_and_runs_fixture_turns() {
+fn dev_openclaw_lite_observes_heartbeat_and_files_work() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
-    let example = example_path("implementation-plan-phase-review.whip");
+    let example = example_path("openclaw-lite.whip");
     let dev = run_json(
         bin,
         &[
@@ -2766,11 +3363,11 @@ fn dev_phase_review_creates_requests_and_runs_fixture_turns() {
         .expect("first step");
     assert_eq!(
         first_step.get("facts_created").and_then(Value::as_u64),
-        Some(14)
+        Some(1)
     );
     assert_eq!(
         first_step.get("effects_created").and_then(Value::as_u64),
-        Some(14)
+        Some(1)
     );
     let first_worker = dev
         .get("workers")
@@ -2779,7 +3376,7 @@ fn dev_phase_review_creates_requests_and_runs_fixture_turns() {
         .expect("first worker");
     assert_eq!(
         first_worker.get("ran_effects").and_then(Value::as_u64),
-        Some(14)
+        Some(1)
     );
 
     let facts = run_json(
@@ -2796,23 +3393,23 @@ fn dev_phase_review_creates_requests_and_runs_fixture_turns() {
     assert_eq!(
         facts
             .iter()
-            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("PhaseReviewRequest"))
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("Heartbeat"))
             .count(),
-        0
+        1
     );
     assert_eq!(
         facts
             .iter()
-            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("PhaseReviewDispatch"))
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("Plan"))
             .count(),
-        14
+        1
     );
     assert_eq!(
         facts
             .iter()
             .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("agent.turn.completed"))
             .count(),
-        14
+        1
     );
 
     let _ = fs::remove_file(store_path);
@@ -2829,6 +3426,7 @@ fn dev_native_fixture_records_provider_lifecycle_and_artifacts_from_source_workf
 workflow NativeFixtureProviderE2E
 
 agent worker {
+  provider native-fixture
   profile "repo-writer"
   capacity 1
 }
@@ -2865,6 +3463,96 @@ rule start_native_work
         .get("workers")
         .and_then(Value::as_array)
         .expect("workers");
+    let report_diagnostics = dev
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .expect("dev report diagnostics");
+    assert_eq!(
+        dev.get("schema").and_then(Value::as_str),
+        Some("whipplescript.dev_report.v0")
+    );
+    assert_eq!(
+        dev.pointer("/provider_runs/summary/total")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        dev.pointer("/provider_runs/summary/artifact_count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        dev.pointer("/provider_runs/groups/0/provider")
+            .and_then(Value::as_str),
+        Some("native-fixture")
+    );
+    assert_eq!(
+        dev.pointer("/provider_artifacts/summary/total")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        dev.pointer("/provider_artifacts/groups/0/kind")
+            .and_then(Value::as_str),
+        Some("transcript")
+    );
+    assert_eq!(
+        dev.pointer("/provider_artifacts/groups/0/mime_type")
+            .and_then(Value::as_str),
+        Some("text/plain")
+    );
+    let provider_artifact_items = dev
+        .pointer("/provider_artifacts/items")
+        .and_then(Value::as_array)
+        .expect("provider artifact items");
+    let transcript_artifact = provider_artifact_items
+        .iter()
+        .find(|item| item.get("kind").and_then(Value::as_str) == Some("transcript"))
+        .expect("transcript artifact item");
+    assert!(transcript_artifact
+        .get("artifact_id")
+        .and_then(Value::as_str)
+        .is_some_and(|artifact_id| !artifact_id.is_empty()));
+    assert!(transcript_artifact
+        .get("run_id")
+        .and_then(Value::as_str)
+        .is_some_and(|run_id| !run_id.is_empty()));
+    assert_eq!(
+        transcript_artifact.get("mime_type").and_then(Value::as_str),
+        Some("text/plain")
+    );
+    assert_eq!(
+        dev.pointer("/provider_evidence/summary/total")
+            .and_then(Value::as_u64),
+        Some(8)
+    );
+    assert_eq!(
+        dev.pointer("/provider_evidence/groups/0/kind")
+            .and_then(Value::as_str),
+        Some("agent.turn.native_event")
+    );
+    let provider_evidence_items = dev
+        .pointer("/provider_evidence/items")
+        .and_then(Value::as_array)
+        .expect("provider evidence items");
+    let native_event_evidence = provider_evidence_items
+        .iter()
+        .find(|item| item.get("kind").and_then(Value::as_str) == Some("agent.turn.native_event"))
+        .expect("native event evidence item");
+    assert_eq!(
+        native_event_evidence
+            .get("subject_type")
+            .and_then(Value::as_str),
+        Some("run")
+    );
+    assert!(native_event_evidence
+        .get("subject_id")
+        .and_then(Value::as_str)
+        .is_some_and(|subject_id| !subject_id.is_empty()));
+    assert!(native_event_evidence
+        .get("summary")
+        .and_then(Value::as_str)
+        .is_some_and(|summary| !summary.is_empty()));
     assert_eq!(
         workers
             .iter()
@@ -2875,6 +3563,7 @@ rule start_native_work
             .collect::<Vec<_>>(),
         vec![1, 0]
     );
+    assert!(report_diagnostics.is_empty());
 
     let log = run_json(
         bin,
@@ -2993,6 +3682,7 @@ fn dev_native_provider_launch_failure_records_durable_boundary_failure() {
 workflow NativeProviderUnavailable
 
 agent worker {
+  provider pi
   profile "repo-reader"
   capacity 1
 }
@@ -3040,6 +3730,14 @@ rule start_native_work
         .get("workers")
         .and_then(Value::as_array)
         .expect("workers");
+    let report_diagnostics = dev
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .expect("dev report diagnostics");
+    assert_eq!(
+        dev.get("schema").and_then(Value::as_str),
+        Some("whipplescript.dev_report.v0")
+    );
     assert_eq!(
         workers
             .iter()
@@ -3050,6 +3748,12 @@ rule start_native_work
             .collect::<Vec<_>>(),
         vec![1, 0]
     );
+    assert!(report_diagnostics.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(Value::as_str) == Some("native_provider_failed")
+            && diagnostic.get("subject_type").and_then(Value::as_str) == Some("effect")
+            && diagnostic.get("event_id").and_then(Value::as_str).is_some()
+            && diagnostic.get("run_id").and_then(Value::as_str).is_some()
+    }));
 
     let runs = run_json(
         bin,
@@ -3120,6 +3824,7 @@ fn dev_native_fixture_stress_records_one_terminal_per_effect() {
 workflow NativeFixtureStress
 
 agent worker {
+  provider native-fixture
   profile "repo-writer"
   capacity 2
 }
@@ -3403,6 +4108,10 @@ rule classify_request
         .and_then(Value::as_array)
         .expect("workers");
     assert_eq!(
+        dev.get("schema").and_then(Value::as_str),
+        Some("whipplescript.dev_report.v0")
+    );
+    assert_eq!(
         workers
             .iter()
             .map(|worker| worker
@@ -3439,45 +4148,26 @@ rule classify_request
 }
 
 #[test]
-fn dev_loft_claim_success_releases_agent_turn_dependency() {
+fn dev_reports_human_prompt_content_type_in_assertion_effect_matches() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
-    let workflow_path = temp_workflow_path("loft-claim");
+    let workflow_path = temp_workflow_path("human-prompt-content-type");
     fs::write(
         &workflow_path,
         r#"
-workflow LoftClaim
+workflow HumanPromptContentType
 
-class WorkItem {
-  title string
-  body string
-}
+@acceptance
+assert count(effect kind human.ask where status == completed) == 1
 
-agent worker {
-  profile "repo-writer"
-  capacity 1
-}
-
-rule seed
+rule start
   when started
 => {
-  record WorkItem {
-    title "Fix it"
-    body "Please"
+  askHuman """application/json
+  {
+    "question": "Approve this release?"
   }
-}
-
-rule start_issue
-  when WorkItem as issue
-  when worker is available
-=> {
-  claim issue with loft as claim
-
-  after claim succeeds {
-    tell worker """
-    Implement {{ issue.title }}
-    """
-  }
+  """
 }
 "#,
     )
@@ -3495,22 +4185,119 @@ rule start_issue
             "fixture",
             "--until",
             "idle",
+            "--include-tag",
+            "acceptance",
         ],
     );
-    let workers = dev
-        .get("workers")
-        .and_then(Value::as_array)
-        .expect("workers");
     assert_eq!(
-        workers
-            .iter()
-            .map(|worker| worker
-                .get("ran_effects")
-                .and_then(Value::as_u64)
-                .unwrap_or(0))
-            .collect::<Vec<_>>(),
-        vec![1, 1, 0]
+        dev.pointer("/executable_spec/status")
+            .and_then(Value::as_str),
+        Some("passed")
     );
+    let assertions = dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("assertions");
+    assert_eq!(assertions.len(), 1);
+    assert_eq!(
+        assertions[0]
+            .pointer("/reads/0/kind")
+            .and_then(Value::as_str),
+        Some("effect")
+    );
+    assert_eq!(
+        assertions[0]
+            .pointer("/reads/0/head")
+            .and_then(Value::as_str),
+        Some("kind human.ask")
+    );
+    assert_eq!(
+        assertions[0]
+            .pointer("/reads/0/matches/0/prompt_content_type")
+            .and_then(Value::as_str),
+        Some("application/json")
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
+#[test]
+fn dev_queue_claim_success_releases_agent_turn_dependency() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let items_path = temp_store_path();
+    let workflow_path = temp_workflow_path("queue-claim");
+    fs::write(
+        &workflow_path,
+        r#"
+@service
+workflow QueueClaim
+
+queue backlog {
+  tracker builtin
+}
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule seed
+  when started
+=> {
+  file item into backlog {
+    title "Fix it"
+    body "Please"
+  }
+}
+
+rule start_item
+  when backlog has ready item as item
+  when worker is available
+=> {
+  claim item as lease
+
+  after lease succeeds {
+    tell worker as turn """
+    Implement {{ item.title }}
+    """
+  }
+
+  after turn succeeds as outcome {
+    finish item {
+      summary outcome.summary
+    }
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let output = Command::new(bin)
+        .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(
+        output.status.success(),
+        "dev failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("dev json");
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -3528,12 +4315,16 @@ rule start_issue
     let facts = facts.as_array().expect("facts array");
     assert!(facts
         .iter()
-        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("loft.claim.succeeded")));
+        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("queue.claim.completed")));
     assert!(facts
         .iter()
         .any(|fact| fact.get("name").and_then(Value::as_str) == Some("agent.turn.completed")));
+    assert!(facts
+        .iter()
+        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("queue.finish.completed")));
 
     let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(items_path);
     let _ = fs::remove_file(workflow_path);
 }
 
@@ -3669,6 +4460,7 @@ class WorkItem {
 }
 
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
 }
@@ -3752,10 +4544,9 @@ rule recall_before_work
 }
 
 #[test]
-fn dev_event_emit_fixture_materializes_heartbeat_fact() {
+fn check_rejects_removed_emit_statement() {
     let bin = env!("CARGO_BIN_EXE_whip");
-    let store_path = temp_store_path();
-    let workflow_path = temp_workflow_path("event-emit");
+    let workflow_path = temp_workflow_path("event-emit-removed");
     fs::write(
         &workflow_path,
         r#"
@@ -3765,84 +4556,29 @@ class Tick {
   status "ready"
 }
 
-class HeartbeatSeen {
-  event string
-  status "observed"
-}
-
-assert none(Tick where status == "ready")
-assert one(HeartbeatSeen where status == "observed")
-assert one(effect kind event.emit where status == completed)
-
-rule seed
-  when started
-=> {
-  record Tick {
-    status "ready"
-  }
-}
-
 rule emit_heartbeat
   when Tick as tick where tick.status == "ready"
 => {
   emit openclaw.heartbeat as heartbeat
-
-  after heartbeat succeeds as emitted => {
-    done tick -> record HeartbeatSeen {
-      event emitted.event_type
-      status "observed"
-    }
-  }
 }
 "#,
     )
     .expect("workflow writes");
 
-    let dev = run_json(
-        bin,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "dev",
+    let output = Command::new(bin)
+        .args([
+            "check",
             workflow_path.to_str().expect("utf-8 workflow path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
-    assert!(dev
-        .get("assertions")
-        .and_then(Value::as_array)
-        .expect("assertions")
-        .iter()
-        .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
-
-    let instance_id = dev
-        .get("instance_id")
-        .and_then(Value::as_str)
-        .expect("instance id");
-    let events = run_json(
-        bin,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "log",
-            instance_id,
-        ],
-    );
+        ])
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        events
-            .as_array()
-            .expect("events array")
-            .iter()
-            .any(|event| event.get("event_type").and_then(Value::as_str)
-                == Some("openclaw.heartbeat"))
+        stderr.contains("`emit` was removed from the language"),
+        "{stderr}"
     );
 
-    let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(workflow_path);
 }
 
@@ -3964,13 +4700,18 @@ workflow WorkflowInput {
     title string
   }
 
+  class PhaseAccepted {
+    phaseId string
+    title string
+  }
+
   rule accept_input
     when PhaseRequest as phase
   => {
-    emit phaseAccepted {
+    record PhaseAccepted {
       phaseId phase.phaseId
       title phase.title
-    } as accepted
+    }
   }
 }
 "#,
@@ -4016,12 +4757,9 @@ workflow WorkflowInput {
                 == Some("Review parser")
     }));
     assert!(facts.iter().any(|fact| {
-        fact.get("name").and_then(Value::as_str) == Some("phaseAccepted")
+        fact.get("name").and_then(Value::as_str) == Some("PhaseAccepted")
             && fact
                 .get("value")
-                .and_then(|value| value.get("value"))
-                .and_then(|value| value.get("bindings"))
-                .and_then(|value| value.get("phase"))
                 .and_then(|value| value.get("phaseId"))
                 .and_then(Value::as_str)
                 == Some("p1")
@@ -4059,11 +4797,13 @@ fn dev_runs_rule_generated_by_pattern_application() {
     fs::write(
         &workflow_path,
         r#"
-pattern EmitSeen<Input> {
+pattern RecordSeen<Input, Output> {
   rule dispatch
     when Input as item
   => {
-    emit eventName as seen
+    done item -> record Output {
+      title item.title
+    }
   }
 }
 
@@ -4074,8 +4814,11 @@ workflow PatternApplication {
     title string
   }
 
-  apply EmitSeen<Task> as taskSeen {
-    eventName seen
+  class TaskSeen {
+    title string
+  }
+
+  apply RecordSeen<Task, TaskSeen> as taskSeen {
   }
 }
 "#,
@@ -4112,12 +4855,9 @@ workflow PatternApplication {
     );
     let facts = facts.as_array().expect("facts array");
     assert!(facts.iter().any(|fact| {
-        fact.get("name").and_then(Value::as_str) == Some("seen")
+        fact.get("name").and_then(Value::as_str) == Some("TaskSeen")
             && fact
                 .get("value")
-                .and_then(|value| value.get("value"))
-                .and_then(|value| value.get("bindings"))
-                .and_then(|value| value.get("item"))
                 .and_then(|value| value.get("title"))
                 .and_then(Value::as_str)
                 == Some("Pattern smoke")
@@ -4899,6 +5639,10 @@ workflow Child {
     title string
   }
 
+  class MissingFact {
+    title string
+  }
+
   rule wait_forever
     when MissingFact as missing
   => {
@@ -5213,6 +5957,10 @@ workflow Child {
     title string
   }
 
+  class MissingFact {
+    title string
+  }
+
   rule never_ready
     when MissingFact as missing
   => {
@@ -5385,10 +6133,10 @@ workflow WorkflowFail {
 }
 
 #[test]
-fn dev_codex_then_coerce_rehydrates_after_bound_baml_arguments() {
+fn dev_provider_language_rehydrates_after_bound_baml_arguments() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
-    let example = example_path("codex-poem-coerce-review.whip");
+    let example = example_path("provider-language-e2e.whip");
     let dev = run_json(
         bin,
         &[
@@ -5415,7 +6163,7 @@ fn dev_codex_then_coerce_rehydrates_after_bound_baml_arguments() {
                 .and_then(Value::as_u64)
                 .unwrap_or(0))
             .collect::<Vec<_>>(),
-        vec![1, 1, 0, 0]
+        vec![6, 6, 0, 0]
     );
     let instance_id = dev
         .get("instance_id")
@@ -5452,8 +6200,7 @@ fn dev_codex_then_coerce_rehydrates_after_bound_baml_arguments() {
         Some("object")
     );
     let arguments_json = arguments.to_string();
-    assert!(!arguments_json.contains("rain over a city at night"));
-    assert!(!arguments_json.contains("target/dogfood/coerce-french-poem.txt"));
+    assert!(!arguments_json.contains("target/dogfood/language/codex-french.txt"));
     assert!(!arguments_json.contains("fixture completed"));
 
     let facts = run_json(
@@ -5468,11 +6215,11 @@ fn dev_codex_then_coerce_rehydrates_after_bound_baml_arguments() {
     );
     let facts = facts.as_array().expect("facts array");
     assert!(facts.iter().any(|fact| {
-        fact.get("name").and_then(Value::as_str) == Some("ReviewedPoem")
+        fact.get("name").and_then(Value::as_str) == Some("LanguageE2EResult")
             && fact
                 .get("value")
                 .and_then(|value| value.get("review"))
-                .and_then(|review| review.get("isFrench"))
+                .and_then(|review| review.get("isTargetLanguage"))
                 .and_then(Value::as_bool)
                 == Some(true)
     }));
@@ -5481,7 +6228,7 @@ fn dev_codex_then_coerce_rehydrates_after_bound_baml_arguments() {
 }
 
 #[test]
-fn dev_provider_language_e2e_runs_agent_matrix_and_baml_reviews() {
+fn dev_provider_language_e2e_runs_agent_table_and_baml_reviews() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let example = example_path("provider-language-e2e.whip");
@@ -5504,6 +6251,10 @@ fn dev_provider_language_e2e_runs_agent_matrix_and_baml_reviews() {
         .and_then(Value::as_array)
         .expect("workers");
     assert_eq!(
+        dev.get("schema").and_then(Value::as_str),
+        Some("whipplescript.dev_report.v0")
+    );
+    assert_eq!(
         workers
             .iter()
             .map(|worker| worker
@@ -5521,6 +6272,129 @@ fn dev_provider_language_e2e_runs_agent_matrix_and_baml_reviews() {
     assert!(assertions
         .iter()
         .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
+    assert!(assertions.iter().all(|assertion| assertion
+        .get("tags")
+        .and_then(Value::as_array)
+        .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some("acceptance")))));
+    assert!(assertions.iter().all(|assertion| assertion
+        .get("target_id")
+        .and_then(Value::as_str)
+        .is_some_and(|target_id| !target_id.is_empty())));
+    assert!(assertions.iter().all(|assertion| assertion
+        .get("event_id")
+        .and_then(Value::as_str)
+        .is_some_and(|event_id| !event_id.is_empty())));
+    assert!(assertions.iter().all(|assertion| assertion
+        .get("reads")
+        .and_then(Value::as_array)
+        .is_some_and(|reads| !reads.is_empty())));
+    assert!(assertions.iter().any(|assertion| assertion
+        .get("reads")
+        .and_then(Value::as_array)
+        .is_some_and(|reads| reads.iter().any(|read| {
+            read.get("kind").and_then(Value::as_str) == Some("effect")
+                && read.get("head").and_then(Value::as_str) == Some("kind agent.tell")
+                && read.get("match_count").and_then(Value::as_u64) == Some(6)
+                && read
+                    .get("matches")
+                    .and_then(Value::as_array)
+                    .is_some_and(|matches| {
+                        matches.len() == 6
+                            && matches.iter().all(|matched| {
+                                matched.get("prompt_content_type").and_then(Value::as_str)
+                                    == Some("markdown")
+                            })
+                    })
+        }))));
+    assert!(assertions.iter().any(|assertion| assertion
+        .get("reads")
+        .and_then(Value::as_array)
+        .is_some_and(|reads| reads.iter().any(|read| {
+            read.get("kind").and_then(Value::as_str) == Some("fact")
+                && read.get("head").and_then(Value::as_str) == Some("LanguageE2EResult")
+                && read.get("match_count").and_then(Value::as_u64) == Some(2)
+                && read
+                    .get("matches")
+                    .and_then(Value::as_array)
+                    .is_some_and(|matches| {
+                        matches
+                            .iter()
+                            .all(|matched| matched.get("id").and_then(Value::as_str).is_some())
+                    })
+        }))));
+    let executable_spec = dev.get("executable_spec").expect("executable spec");
+    assert_eq!(
+        executable_spec.get("status").and_then(Value::as_str),
+        Some("passed")
+    );
+    assert_eq!(
+        executable_spec
+            .get("summary")
+            .and_then(|summary| summary.get("total"))
+            .and_then(Value::as_u64),
+        Some(6)
+    );
+    assert_eq!(
+        executable_spec
+            .get("summary")
+            .and_then(|summary| summary.get("passed"))
+            .and_then(Value::as_u64),
+        Some(6)
+    );
+    let acceptance_group = executable_spec
+        .get("tags")
+        .and_then(Value::as_array)
+        .expect("executable spec tags")
+        .iter()
+        .find(|group| group.get("tag").and_then(Value::as_str) == Some("acceptance"))
+        .expect("acceptance executable spec group");
+    assert_eq!(
+        acceptance_group
+            .get("summary")
+            .and_then(|summary| summary.get("total"))
+            .and_then(Value::as_u64),
+        Some(6)
+    );
+    assert_eq!(
+        acceptance_group
+            .get("assertions")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(6)
+    );
+    assert!(acceptance_group
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("acceptance assertions")
+        .iter()
+        .all(|assertion| assertion
+            .get("description")
+            .and_then(Value::as_str)
+            .is_some_and(|description| !description.is_empty())));
+    assert!(acceptance_group
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("acceptance assertions")
+        .iter()
+        .all(|assertion| assertion
+            .get("event_id")
+            .and_then(Value::as_str)
+            .is_some_and(|event_id| !event_id.is_empty())));
+    assert!(acceptance_group
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("acceptance assertions")
+        .iter()
+        .all(|assertion| assertion
+            .get("reads")
+            .and_then(Value::as_array)
+            .is_some_and(|reads| !reads.is_empty())));
+    let source_metadata = dev.get("source_metadata").expect("source metadata");
+    assert!(source_metadata
+        .get("targets")
+        .and_then(Value::as_object)
+        .expect("metadata targets")
+        .contains_key("workflow:ProviderLanguageE2E"));
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -5607,13 +6481,15 @@ fn dev_provider_language_e2e_runs_agent_matrix_and_baml_reviews() {
 #[test]
 fn dev_native_provider_records_policy_denial_from_source_required_capabilities() {
     let bin = env!("CARGO_BIN_EXE_whip");
-    let source_path = temp_workflow_path("native-policy-denial-e2e");
-    fs::write(
-        &source_path,
-        r#"
+    for provider in ["codex", "claude", "pi"] {
+        let source_path = temp_workflow_path(&format!("native-policy-denial-e2e-{provider}"));
+        fs::write(
+            &source_path,
+            r#"
 workflow NativePolicyDenialE2E
 
 agent worker {
+  provider __PROVIDER__
   profile "repo-writer"
   capacity 1
   capabilities ["agent.tell", "repo.write"]
@@ -5625,11 +6501,10 @@ rule start_denied_work
 => {
   tell worker requires ["repo.write"] "write in read-only native workflow"
 }
-"#,
-    )
-    .expect("write native policy denial workflow");
-
-    for provider in ["codex", "claude", "pi"] {
+"#
+            .replace("__PROVIDER__", provider),
+        )
+        .expect("write native policy denial workflow");
         let store_path = temp_store_path();
         let dev = run_json(
             bin,
@@ -5699,16 +6574,15 @@ rule start_denied_work
             "expected native boundary failure event for {provider}: {events:#?}"
         );
         let _ = fs::remove_file(store_path);
+        let _ = fs::remove_file(source_path);
     }
-
-    let _ = fs::remove_file(source_path);
 }
 
 #[test]
-fn dev_companion_skill_dogfood_routes_with_agentref_metadata() {
+fn dev_incident_router_routes_with_agentref_metadata() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
-    let example = example_path("companion-skill-dogfood.whip");
+    let example = example_path("incident-router.whip");
     let dev = run_json(
         bin,
         &[
@@ -5727,7 +6601,7 @@ fn dev_companion_skill_dogfood_routes_with_agentref_metadata() {
         .get("assertions")
         .and_then(Value::as_array)
         .expect("assertions");
-    assert_eq!(assertions.len(), 6);
+    assert_eq!(assertions.len(), 4);
     assert!(assertions
         .iter()
         .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
@@ -5748,7 +6622,7 @@ fn dev_companion_skill_dogfood_routes_with_agentref_metadata() {
     let facts = facts.as_array().expect("facts array");
     let providers = facts
         .iter()
-        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("CompanionReviewDispatch"))
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("RoutedIncident"))
         .map(|fact| {
             fact.get("value")
                 .and_then(|value| value.get("provider"))
@@ -5759,7 +6633,7 @@ fn dev_companion_skill_dogfood_routes_with_agentref_metadata() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         providers,
-        ["codex", "claude", "pi"]
+        ["codex", "pi"]
             .into_iter()
             .map(str::to_owned)
             .collect::<std::collections::BTreeSet<_>>()
@@ -6162,10 +7036,10 @@ class ExprResult {
 
 assert count(ExprResult) == 1
 assert exists(ExprResult where provider == codex && priority >= 3)
-assert empty(ExprResult where provider == pi)
+assert count(ExprResult where provider == pi) == 0
 assert count(ExprResult where priority > 1 && provider in ["codex", "claude"]) == 1
 assert ("codex" in ["codex", "claude"]) && !("pi" in ["codex"])
-assert empty([])
+assert count([]) == 0
 
 rule seed
   when started
@@ -6228,6 +7102,7 @@ fn check_accepts_duration_and_time_ordering() {
     fs::write(
         &source_path,
         r#"
+@service
 workflow DurationTimeOrderingCheck
 
 class Window {
@@ -6237,11 +7112,13 @@ class Window {
   due_at time
 }
 
+@external
 rule duration_guard
   when Window as window where window.elapsed < window.limit
 => {
 }
 
+@external
 rule time_guard
   when Window as window where window.opened_at < window.due_at
 => {
@@ -6581,7 +7458,7 @@ class Result {
   status "accepted"
 }
 
-assert empty(Result)
+assert count(Result) == 0
 
 rule seed
   when started
@@ -6814,8 +7691,8 @@ class MaybeOwner {
 
 assert count(MaybeOwner) == 1
 assert exists(MaybeOwner where owner == null)
-assert empty(MaybeOwner where metadata["missing"] == null)
-assert empty(MaybeOwner where exists metadata["missing"])
+assert count(MaybeOwner where metadata["missing"] == null) == 0
+assert count(MaybeOwner where exists metadata["missing"]) == 0
 
 rule seed
   when started
@@ -7069,6 +7946,25 @@ rule seed
         assertion.get("passed").and_then(Value::as_bool),
         Some(false)
     );
+    let assertion_event_id = assertion
+        .get("event_id")
+        .and_then(Value::as_str)
+        .expect("assertion event id")
+        .to_owned();
+    let assertion_diagnostic_id = assertion
+        .pointer("/diagnostic_ids/0")
+        .and_then(Value::as_str)
+        .expect("assertion diagnostic id")
+        .to_owned();
+    assert!(dev
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .expect("dev report diagnostics")
+        .iter()
+        .any(
+            |diagnostic| diagnostic.get("diagnostic_id").and_then(Value::as_str)
+                == Some(assertion_diagnostic_id.as_str())
+        ));
     assert_eq!(
         assertion
             .pointer("/expected/predicate")
@@ -7104,6 +8000,72 @@ rule seed
     assert_eq!(
         assertion.get("failure_reason").and_then(Value::as_str),
         Some("predicate `==` evaluated to false")
+    );
+    assert_eq!(
+        assertion.pointer("/reads/0/kind").and_then(Value::as_str),
+        Some("fact")
+    );
+    assert_eq!(
+        assertion.pointer("/reads/0/head").and_then(Value::as_str),
+        Some("Seen")
+    );
+    assert_eq!(
+        assertion
+            .pointer("/reads/0/match_count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        assertion
+            .pointer("/reads/0/matches/0/name")
+            .and_then(Value::as_str),
+        Some("Seen")
+    );
+    let executable_spec = dev.get("executable_spec").expect("executable spec");
+    assert_eq!(
+        executable_spec.get("status").and_then(Value::as_str),
+        Some("failed")
+    );
+    assert_eq!(
+        executable_spec
+            .pointer("/summary/total")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        executable_spec
+            .pointer("/summary/failed")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    let untagged = executable_spec.get("untagged").expect("untagged group");
+    assert_eq!(
+        untagged.get("status").and_then(Value::as_str),
+        Some("failed")
+    );
+    assert_eq!(
+        untagged
+            .pointer("/assertions/0/status")
+            .and_then(Value::as_str),
+        Some("failed")
+    );
+    assert_eq!(
+        untagged
+            .pointer("/assertions/0/event_id")
+            .and_then(Value::as_str),
+        Some(assertion_event_id.as_str())
+    );
+    assert_eq!(
+        untagged
+            .pointer("/assertions/0/diagnostic_ids/0")
+            .and_then(Value::as_str),
+        Some(assertion_diagnostic_id.as_str())
+    );
+    assert_eq!(
+        untagged
+            .pointer("/assertions/0/reads/0/source")
+            .and_then(Value::as_str),
+        Some("fact:Seen")
     );
 
     let instance_id = dev
@@ -7141,9 +8103,13 @@ rule seed
     );
     let diagnostics = diagnostics.as_array().expect("diagnostics array");
     assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.get("code").and_then(Value::as_str) == Some("assertion.failed")
+        diagnostic.get("diagnostic_id").and_then(Value::as_str)
+            == Some(assertion_diagnostic_id.as_str())
+            && diagnostic.get("code").and_then(Value::as_str) == Some("assertion.failed")
             && diagnostic.get("subject_type").and_then(Value::as_str) == Some("assertion")
             && diagnostic.get("event_id").and_then(Value::as_str).is_some()
+            && diagnostic.get("event_id").and_then(Value::as_str)
+                == Some(assertion_event_id.as_str())
             && diagnostic
                 .get("assertion_id")
                 .and_then(Value::as_str)
@@ -7173,6 +8139,7 @@ rule seed
     );
     assert!(log.as_array().expect("events").iter().any(|event| {
         event.get("event_type").and_then(Value::as_str) == Some("assertion.failed")
+            && event.get("event_id").and_then(Value::as_str) == Some(assertion_event_id.as_str())
             && event.pointer("/payload/result").and_then(Value::as_str) == Some("fail")
             && event
                 .pointer("/payload/assertion_text")
@@ -7182,6 +8149,1957 @@ rule seed
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn dev_streams_ndjson_progress_and_final_report() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("dev-stream");
+    fs::write(
+        &source_path,
+        r#"
+workflow DevStream
+
+class Seen {
+  status "ok"
+}
+
+assert count(Seen) == 1
+
+rule seed
+  when started
+=> {
+  record Seen {
+    status "ok"
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+            "--stream",
+            "ndjson",
+        ])
+        .output()
+        .expect("command runs");
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    assert!(!stdout.contains("\ndev inst_"), "{stdout}");
+    let events = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("ndjson line"))
+        .collect::<Vec<_>>();
+    assert!(events.len() >= 6, "{stdout}");
+    assert!(events
+        .iter()
+        .all(|event| event.get("schema").and_then(Value::as_str)
+            == Some("whipplescript.dev_stream.v0")));
+    assert_eq!(
+        events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| (index, event.get("sequence").and_then(Value::as_u64)))
+            .collect::<Vec<_>>(),
+        events
+            .iter()
+            .enumerate()
+            .map(|(index, _)| (index, Some(index as u64)))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        events
+            .first()
+            .and_then(|event| event.get("event"))
+            .and_then(Value::as_str),
+        Some("dev.started")
+    );
+    assert!(events
+        .iter()
+        .any(|event| event.get("event").and_then(Value::as_str) == Some("dev.step")));
+    let event_batches = events
+        .iter()
+        .filter(|event| event.get("event").and_then(Value::as_str) == Some("dev.events"))
+        .collect::<Vec<_>>();
+    assert!(!event_batches.is_empty(), "{stdout}");
+    let raw_event_sequences = event_batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .pointer("/data/events")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|event| event.get("sequence").and_then(Value::as_i64))
+        .collect::<Vec<_>>();
+    assert!(!raw_event_sequences.is_empty(), "{stdout}");
+    assert_eq!(
+        raw_event_sequences,
+        raw_event_sequences
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+    for batch in event_batches {
+        let count = batch.pointer("/data/count").and_then(Value::as_u64);
+        let events = batch
+            .pointer("/data/events")
+            .and_then(Value::as_array)
+            .expect("dev.events data.events");
+        assert_eq!(count, Some(events.len() as u64));
+    }
+    assert!(events
+        .iter()
+        .any(|event| event.get("event").and_then(Value::as_str) == Some("dev.worker")));
+    assert!(events
+        .iter()
+        .any(|event| event.get("event").and_then(Value::as_str) == Some("dev.idle")));
+    let assertion_event = events
+        .iter()
+        .find(|event| event.get("event").and_then(Value::as_str) == Some("dev.assertions"))
+        .expect("dev.assertions event");
+    assert_eq!(
+        assertion_event
+            .pointer("/data/status")
+            .and_then(Value::as_str),
+        Some("passed")
+    );
+    assert_eq!(
+        assertion_event
+            .pointer("/data/summary/total")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    let report = events
+        .last()
+        .filter(|event| event.get("event").and_then(Value::as_str) == Some("dev.report"))
+        .and_then(|event| event.get("data"))
+        .expect("final report");
+    assert_eq!(
+        report.get("schema").and_then(Value::as_str),
+        Some("whipplescript.dev_report.v0")
+    );
+    assert_eq!(
+        report
+            .pointer("/executable_spec/status")
+            .and_then(Value::as_str),
+        Some("passed")
+    );
+    assert_eq!(
+        report
+            .get("assertions")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn accept_runs_json_fixture_through_dev_report_contract() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("accept-fixture-workflow");
+    let fixture_path = temp_workflow_path("accept-fixture").with_extension("json");
+    fs::write(
+        &source_path,
+        r#"
+@fixture
+@acceptance
+description "Fixture-backed acceptance workflow"
+workflow AcceptFixture
+
+class Seen {
+  status "ok"
+}
+
+@acceptance
+assert count(Seen) == 1
+
+rule seed
+  when started
+=> {
+  record Seen {
+    status "ok"
+  }
+}
+"#,
+    )
+    .expect("write source");
+    fs::write(
+        &fixture_path,
+        json!({
+            "schema": "whipplescript.acceptance_fixture.v0",
+            "workflow": source_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("workflow filename"),
+            "provider": "fixture",
+            "actions": [
+                {"type": "pause", "reason": "exercise fixture control-plane action"},
+                {"type": "resume"}
+            ],
+            "include_tags": ["acceptance"],
+            "expect": {
+                "dev_status": "success",
+                "workflow": "AcceptFixture",
+                "status": "passed",
+                "source_metadata": {
+                    "targets": [
+                        {
+                            "target_kind": "workflow",
+                            "target": "AcceptFixture",
+                            "tags": ["fixture", "acceptance"],
+                            "description": "Fixture-backed acceptance workflow"
+                        }
+                    ]
+                },
+                "diagnostics": 0,
+                "actions": [
+                    {"type": "pause", "count": 1},
+                    {"type": "resume", "count": 1}
+                ],
+                "trace": {
+                    "conformance": {"ok": true},
+                    "groups": [
+                        {"type": "instance_paused", "count": 1},
+                        {"type": "instance_resumed", "count": 1}
+                    ]
+                },
+                "assertions": {
+                    "total": 1,
+                    "passed": 1,
+                    "failed": 0,
+                    "error": 0
+                },
+                "assertion_tags": [
+                    {"tag": "acceptance", "total": 1, "passed": 1, "failed": 0, "error": 0}
+                ],
+                "summary": {
+                    "facts": 1,
+                    "effects": 0
+                },
+                "facts": [
+                    {"name": "Seen", "count": 1}
+                ],
+                "runs": [
+                    {"provider": "fixture", "status": "completed", "count": 0, "artifact_count": 0}
+                ],
+                "artifacts": [
+                    {"kind": "transcript", "count": 0}
+                ]
+            }
+        })
+        .to_string(),
+    )
+    .expect("write fixture");
+
+    let report = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "accept",
+            fixture_path.to_str().expect("utf-8 fixture path"),
+        ],
+    );
+
+    assert_eq!(
+        report.get("schema").and_then(Value::as_str),
+        Some("whipplescript.acceptance_report.v0")
+    );
+    assert_eq!(report.get("passed").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        report
+            .get("failures")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        report
+            .pointer("/dev_report/workflow")
+            .and_then(Value::as_str),
+        Some("AcceptFixture")
+    );
+    assert_eq!(
+        report
+            .pointer("/dev_report/assertion_filter/selected")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/dev_report/executable_spec/tags/0/tag")
+            .and_then(Value::as_str),
+        Some("acceptance")
+    );
+    assert_eq!(
+        report
+            .pointer("/dev_report/executable_spec/tags/0/summary/total")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/facts/0/name")
+            .and_then(Value::as_str),
+        Some("Seen")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/summary/facts")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/summary/effects")
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/facts/0/count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/executable_spec/status")
+            .and_then(Value::as_str),
+        Some("passed")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/executable_spec/summary/total")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/executable_spec/tags/0/tag")
+            .and_then(Value::as_str),
+        Some("acceptance")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/diagnostics_by_code")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/assertion_reads/0/source")
+            .and_then(Value::as_str),
+        Some("fact:Seen")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/assertion_reads/0/match_count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/assertion_reads/0/matches/0/name")
+            .and_then(Value::as_str),
+        Some("Seen")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/assertion_reads/0/matches/0/count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/actions/0/type")
+            .and_then(Value::as_str),
+        Some("pause")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/actions/1/type")
+            .and_then(Value::as_str),
+        Some("resume")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/source_metadata/summary/targets")
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+    let observed_targets = report
+        .pointer("/observed/source_metadata/targets")
+        .and_then(Value::as_array)
+        .expect("observed source metadata targets");
+    let workflow_target = observed_targets
+        .iter()
+        .find(|target| target.get("key").and_then(Value::as_str) == Some("workflow:AcceptFixture"))
+        .expect("workflow source metadata target");
+    assert_eq!(
+        workflow_target.get("description").and_then(Value::as_str),
+        Some("Fixture-backed acceptance workflow")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/runs/summary/total")
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/runs/summary/artifact_count")
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/artifacts/summary/total")
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/trace/conformance/ok")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(report
+        .pointer("/observed/trace/summary/events")
+        .and_then(Value::as_u64)
+        .is_some_and(|count| count > 0));
+    assert!(report
+        .pointer("/observed/trace/summary/abstract_events")
+        .and_then(Value::as_u64)
+        .is_some_and(|count| count > 0));
+    let trace_items = report
+        .pointer("/observed/trace/items")
+        .and_then(Value::as_array)
+        .expect("trace items");
+    assert!(
+        trace_items
+            .iter()
+            .any(|item| item.pointer("/event/type").and_then(Value::as_str)
+                == Some("instance_paused"))
+    );
+    assert!(trace_items.iter().any(
+        |item| item.pointer("/event/type").and_then(Value::as_str) == Some("instance_resumed")
+    ));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(fixture_path);
+}
+
+#[test]
+fn accept_fixture_input_seeds_workflow_start_facts() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("accept-fixture-input-workflow");
+    let fixture_path = temp_workflow_path("accept-fixture-input").with_extension("json");
+    fs::write(
+        &source_path,
+        r#"
+workflow AcceptFixtureInput {
+  input request Request
+}
+
+class Request {
+  title "Review parser"
+}
+
+class SeenRequest {
+  title "Review parser"
+}
+
+@acceptance
+assert count(SeenRequest) == 1
+
+rule seedFromInput
+  when Request as request
+=> {
+  record SeenRequest {
+    title request.title
+  }
+}
+"#,
+    )
+    .expect("write source");
+    fs::write(
+        &fixture_path,
+        json!({
+            "schema": "whipplescript.acceptance_fixture.v0",
+            "workflow": source_path,
+            "provider": "fixture",
+            "include_tags": ["acceptance"],
+            "input": {
+                "request": {
+                    "title": "Review parser"
+                }
+            },
+            "expect": {
+                "dev_status": "success",
+                "workflow": "AcceptFixtureInput",
+                "status": "passed",
+                "diagnostics": 0,
+                "assertions": {
+                    "total": 1,
+                    "passed": 1,
+                    "failed": 0,
+                    "error": 0
+                },
+                "assertion_tags": [
+                    {"tag": "acceptance", "total": 1, "passed": 1, "failed": 0, "error": 0}
+                ],
+                "summary": {
+                    "facts": 2,
+                    "effects": 0
+                },
+                "facts": [
+                    {"name": "Request", "count": 1},
+                    {"name": "SeenRequest", "count": 1}
+                ]
+            }
+        })
+        .to_string(),
+    )
+    .expect("write fixture");
+
+    let report = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "accept",
+            fixture_path.to_str().expect("utf-8 fixture path"),
+        ],
+    );
+
+    assert_eq!(report.get("passed").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        report
+            .pointer("/observed/summary/facts")
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+    let observed_facts = report
+        .pointer("/observed/facts")
+        .and_then(Value::as_array)
+        .expect("observed facts");
+    assert!(observed_facts.iter().any(|fact| {
+        fact.get("name").and_then(Value::as_str) == Some("Request")
+            && fact.get("count").and_then(Value::as_u64) == Some(1)
+    }));
+    assert!(observed_facts.iter().any(|fact| {
+        fact.get("name").and_then(Value::as_str) == Some("SeenRequest")
+            && fact.get("count").and_then(Value::as_u64) == Some(1)
+    }));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(fixture_path);
+}
+
+#[test]
+fn accept_fixture_setup_facts_seed_active_facts() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("accept-fixture-setup-facts-workflow");
+    let fixture_path = temp_workflow_path("accept-fixture-setup-facts").with_extension("json");
+    fs::write(
+        &source_path,
+        r#"
+workflow AcceptFixtureSetupFacts
+
+class ExternalTask {
+  title string
+  status "queued"
+}
+
+class SetupResult {
+  title string
+  status "done"
+}
+
+@acceptance
+assert count(SetupResult) == 1
+
+@acceptance
+assert count(ExternalTask where status == "queued") == 0
+
+rule handle_setup_fact
+  when ExternalTask as task where task.status == "queued"
+=> {
+  done task
+
+  record SetupResult {
+    title task.title
+    status "done"
+  }
+}
+"#,
+    )
+    .expect("write source");
+    fs::write(
+        &fixture_path,
+        json!({
+            "schema": "whipplescript.acceptance_fixture.v0",
+            "workflow": source_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("workflow filename"),
+            "provider": "fixture",
+            "setup": {
+                "facts": [
+                    {
+                        "name": "ExternalTask",
+                        "value": {
+                            "title": "Seeded from fixture setup",
+                            "status": "queued"
+                        }
+                    }
+                ]
+            },
+            "include_tags": ["acceptance"],
+            "expect": {
+                "dev_status": "success",
+                "workflow": "AcceptFixtureSetupFacts",
+                "status": "passed",
+                "diagnostics": 0,
+                "assertions": {
+                    "total": 2,
+                    "passed": 2,
+                    "failed": 0,
+                    "error": 0
+                },
+                "assertion_tags": [
+                    {"tag": "acceptance", "total": 2, "passed": 2, "failed": 0, "error": 0}
+                ],
+                "assertion_reads": [
+                    {
+                        "source": "fact:SetupResult",
+                        "match_count": 1,
+                        "matches": [
+                            {"name": "SetupResult", "provenance_class": "rule", "count": 1}
+                        ]
+                    },
+                    {
+                        "source": "fact:ExternalTask where status == \"queued\"",
+                        "match_count": 0
+                    }
+                ],
+                "summary": {
+                    "facts": 1,
+                    "effects": 0
+                },
+                "facts": [
+                    {"name": "SetupResult", "count": 1}
+                ],
+                "runs": [
+                    {"provider": "fixture", "status": "completed", "count": 0, "artifact_count": 0}
+                ]
+            }
+        })
+        .to_string(),
+    )
+    .expect("write fixture");
+
+    let report = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "accept",
+            fixture_path.to_str().expect("utf-8 fixture path"),
+        ],
+    );
+    assert_eq!(report.get("passed").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        report
+            .pointer("/observed/facts/0/name")
+            .and_then(Value::as_str),
+        Some("SetupResult")
+    );
+    assert_eq!(
+        report
+            .pointer("/dev_report/steps/0/facts_consumed")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/dev_report/steps/0/facts_created")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(fixture_path);
+}
+
+#[test]
+fn accept_fixture_cancel_action_records_trace() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("accept-fixture-cancel-workflow");
+    let fixture_path = temp_workflow_path("accept-fixture-cancel").with_extension("json");
+    fs::write(
+        &source_path,
+        r#"
+workflow AcceptFixtureCancel
+
+class Seen {
+  status "ok"
+}
+
+rule seed
+  when started
+=> {
+  record Seen {
+    status "ok"
+  }
+}
+"#,
+    )
+    .expect("write source");
+    fs::write(
+        &fixture_path,
+        json!({
+            "schema": "whipplescript.acceptance_fixture.v0",
+            "workflow": source_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("workflow filename"),
+            "provider": "fixture",
+            "actions": [
+                {"type": "cancel", "reason": "exercise fixture control-plane cancel"}
+            ],
+            "expect": {
+                "dev_status": "success",
+                "workflow": "AcceptFixtureCancel",
+                "status": "passed",
+                "diagnostics": 0,
+                "actions": [
+                    {"type": "cancel", "count": 1}
+                ],
+                "trace": {
+                    "conformance": {"ok": true},
+                    "summary": {
+                        "abstract_events": 1
+                    },
+                    "groups": [
+                        {"type": "instance_cancelled", "count": 1}
+                    ]
+                },
+                "assertions": {
+                    "total": 0,
+                    "passed": 0,
+                    "failed": 0,
+                    "error": 0
+                },
+                "summary": {
+                    "facts": 0,
+                    "effects": 0
+                },
+                "runs": [
+                    {"provider": "fixture", "status": "completed", "count": 0, "artifact_count": 0}
+                ]
+            }
+        })
+        .to_string(),
+    )
+    .expect("write fixture");
+
+    let report = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "accept",
+            fixture_path.to_str().expect("utf-8 fixture path"),
+        ],
+    );
+    assert_eq!(report.get("passed").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        report
+            .pointer("/observed/actions/0/type")
+            .and_then(Value::as_str),
+        Some("cancel")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/trace/groups/0/type")
+            .and_then(Value::as_str),
+        Some("instance_cancelled")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/summary/facts")
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/summary/effects")
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(fixture_path);
+}
+
+#[test]
+fn accept_observes_provider_runs_and_artifacts() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("accept-fixture-native-provider-workflow");
+    let fixture_path = temp_workflow_path("accept-fixture-native-provider").with_extension("json");
+    fs::write(
+        &source_path,
+        r#"
+workflow AcceptFixtureNativeProvider
+
+agent worker {
+  provider native-fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule startNativeWork
+  when started
+  when worker is available
+=> {
+  tell worker "create native fixture evidence"
+}
+"#,
+    )
+    .expect("write source");
+    fs::write(
+        &fixture_path,
+        json!({
+            "schema": "whipplescript.acceptance_fixture.v0",
+            "workflow": source_path,
+            "provider": "native-fixture",
+            "expect": {
+                "dev_status": "success",
+                "workflow": "AcceptFixtureNativeProvider",
+                "status": "passed",
+                "diagnostics": 0,
+                "assertions": {
+                    "total": 0,
+                    "passed": 0,
+                    "failed": 0,
+                    "error": 0
+                },
+                "summary": {
+                    "facts": 3,
+                    "effects": 1
+                },
+                "facts": [
+                    {"name": "agent.turn.started", "count": 1},
+                    {"name": "agent.turn.artifact_captured", "count": 1},
+                    {"name": "agent.turn.completed", "count": 1}
+                ],
+                "effects": [
+                    {"kind": "agent.tell", "status": "completed", "count": 1}
+                ],
+                "runs": [
+                    {"provider": "native-fixture", "status": "completed", "count": 1, "artifact_count": 1}
+                ],
+                "artifacts": [
+                    {"kind": "transcript", "mime_type": "text/plain", "count": 1}
+                ],
+                "evidence": [
+                    {"kind": "agent.turn.native_event", "subject_type": "run", "count": 3},
+                    {"kind": "agent.turn.native_provider", "subject_type": "run", "count": 3},
+                    {"kind": "skills.injected", "subject_type": "run", "count": 1},
+                    {"kind": "rule.committed", "subject_type": "rule_commit", "count": 1}
+                ]
+            }
+        })
+        .to_string(),
+    )
+    .expect("write fixture");
+
+    let report = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "accept",
+            fixture_path.to_str().expect("utf-8 fixture path"),
+        ],
+    );
+
+    assert_eq!(report.get("passed").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        report
+            .pointer("/observed/runs/summary/total")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/runs/summary/artifact_count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/runs/groups/0/provider")
+            .and_then(Value::as_str),
+        Some("native-fixture")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/runs/groups/0/artifact_count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/artifacts/summary/total")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/artifacts/groups/0/kind")
+            .and_then(Value::as_str),
+        Some("transcript")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/artifacts/groups/0/mime_type")
+            .and_then(Value::as_str),
+        Some("text/plain")
+    );
+    let artifact_items = report
+        .pointer("/observed/artifacts/items")
+        .and_then(Value::as_array)
+        .expect("observed artifact items");
+    let transcript_artifact = artifact_items
+        .iter()
+        .find(|item| item.get("kind").and_then(Value::as_str) == Some("transcript"))
+        .expect("transcript artifact item");
+    assert!(transcript_artifact
+        .get("artifact_id")
+        .and_then(Value::as_str)
+        .is_some_and(|artifact_id| !artifact_id.is_empty()));
+    assert!(transcript_artifact
+        .get("run_id")
+        .and_then(Value::as_str)
+        .is_some_and(|run_id| !run_id.is_empty()));
+    assert_eq!(
+        transcript_artifact.get("mime_type").and_then(Value::as_str),
+        Some("text/plain")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/evidence/summary/total")
+            .and_then(Value::as_u64),
+        Some(8)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/evidence/groups/0/kind")
+            .and_then(Value::as_str),
+        Some("agent.turn.native_event")
+    );
+    let evidence_items = report
+        .pointer("/observed/evidence/items")
+        .and_then(Value::as_array)
+        .expect("observed evidence items");
+    let native_event_evidence = evidence_items
+        .iter()
+        .find(|item| item.get("kind").and_then(Value::as_str) == Some("agent.turn.native_event"))
+        .expect("native event evidence item");
+    assert_eq!(
+        native_event_evidence
+            .get("subject_type")
+            .and_then(Value::as_str),
+        Some("run")
+    );
+    assert!(native_event_evidence
+        .get("subject_id")
+        .and_then(Value::as_str)
+        .is_some_and(|subject_id| !subject_id.is_empty()));
+    assert!(native_event_evidence
+        .get("summary")
+        .and_then(Value::as_str)
+        .is_some_and(|summary| !summary.is_empty()));
+    let trace_items = report
+        .pointer("/observed/trace/items")
+        .and_then(Value::as_array)
+        .expect("trace items");
+    let run_started = trace_items
+        .iter()
+        .find(|item| item.pointer("/event/type").and_then(Value::as_str) == Some("run_started"))
+        .expect("run_started trace item");
+    assert!(run_started
+        .pointer("/event/run_id")
+        .and_then(Value::as_str)
+        .is_some_and(|run_id| !run_id.is_empty()));
+    assert!(run_started
+        .pointer("/event/effect_id")
+        .and_then(Value::as_str)
+        .is_some_and(|effect_id| !effect_id.is_empty()));
+    assert!(
+        trace_items
+            .iter()
+            .any(|item| item.pointer("/event/type").and_then(Value::as_str)
+                == Some("effect_terminal"))
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(fixture_path);
+}
+
+#[test]
+fn accept_observes_human_inbox_requests() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("accept-fixture-human-inbox-workflow");
+    let fixture_path = temp_workflow_path("accept-fixture-human-inbox").with_extension("json");
+    fs::write(
+        &source_path,
+        r#"
+workflow AcceptFixtureHumanInbox
+
+@acceptance
+assert count(effect kind human.ask where status == completed) == 1
+
+rule ask
+  when started
+=> {
+  askHuman """application/json
+  {
+    "question": "Approve this release?"
+  }
+  """
+}
+"#,
+    )
+    .expect("write source");
+    fs::write(
+        &fixture_path,
+        json!({
+            "schema": "whipplescript.acceptance_fixture.v0",
+            "workflow": source_path,
+            "provider": "fixture",
+            "setup": {
+                "inbox": [
+                    {
+                        "prompt": "Pre-existing release note review",
+                        "severity": "urgent",
+                        "choices": ["approve", "reject"],
+                        "freeform_allowed": false
+                    }
+                ]
+            },
+            "include_tags": ["acceptance"],
+            "expect": {
+                "dev_status": "success",
+                "workflow": "AcceptFixtureHumanInbox",
+                "status": "passed",
+                "diagnostics": 0,
+                "assertions": {
+                    "total": 1,
+                    "passed": 1,
+                    "failed": 0,
+                    "error": 0
+                },
+                "effects": [
+                    {"kind": "human.ask", "status": "completed", "count": 1}
+                ],
+                "inbox": [
+                    {"status": "pending", "severity": "normal", "count": 1},
+                    {"status": "pending", "severity": "urgent", "count": 1}
+                ],
+                "runs": [
+                    {"provider": "fixture", "status": "completed", "count": 1}
+                ]
+            }
+        })
+        .to_string(),
+    )
+    .expect("write fixture");
+
+    let report = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "accept",
+            fixture_path.to_str().expect("utf-8 fixture path"),
+        ],
+    );
+
+    assert_eq!(report.get("passed").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        report
+            .pointer("/observed/inbox/summary/total")
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/inbox/groups/0/status")
+            .and_then(Value::as_str),
+        Some("pending")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/inbox/groups/0/severity")
+            .and_then(Value::as_str),
+        Some("normal")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/inbox/groups/0/count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/inbox/groups/1/status")
+            .and_then(Value::as_str),
+        Some("pending")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/inbox/groups/1/severity")
+            .and_then(Value::as_str),
+        Some("urgent")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/inbox/groups/1/count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    let assertion_match = report
+        .pointer("/observed/assertion_reads/0/matches/0")
+        .expect("human.ask assertion match");
+    let trace_sequences = assertion_match
+        .get("trace_sequences")
+        .and_then(Value::as_array)
+        .expect("trace sequences");
+    let evidence_ids = assertion_match
+        .get("evidence_ids")
+        .and_then(Value::as_array)
+        .expect("evidence ids");
+    assert_eq!(
+        assertion_match.get("trace_items").and_then(Value::as_u64),
+        Some(trace_sequences.len() as u64)
+    );
+    assert_eq!(
+        assertion_match
+            .get("evidence_items")
+            .and_then(Value::as_u64),
+        Some(evidence_ids.len() as u64)
+    );
+    assert!(trace_sequences
+        .iter()
+        .all(|sequence| sequence.as_i64().is_some_and(|sequence| sequence > 0)));
+    assert!(evidence_ids
+        .iter()
+        .all(|evidence_id| evidence_id.as_str().is_some_and(|id| !id.is_empty())));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(fixture_path);
+}
+
+#[test]
+fn accept_rejects_invalid_setup_inbox_items() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("accept-fixture-invalid-inbox-workflow");
+    let fixture_path = temp_workflow_path("accept-fixture-invalid-inbox").with_extension("json");
+    fs::write(
+        &source_path,
+        r#"
+workflow AcceptFixtureInvalidInbox
+
+rule noop
+  when started
+=> {}
+"#,
+    )
+    .expect("write source");
+    fs::write(
+        &fixture_path,
+        json!({
+            "schema": "whipplescript.acceptance_fixture.v0",
+            "workflow": source_path,
+            "setup": {
+                "inbox": [
+                    {
+                        "prompt": "Review this before running",
+                        "choices": {"approve": true}
+                    }
+                ]
+            },
+            "expect": {
+                "dev_status": "success"
+            }
+        })
+        .to_string(),
+    )
+    .expect("write fixture");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "accept",
+            fixture_path.to_str().expect("utf-8 fixture path"),
+        ])
+        .output()
+        .expect("command runs");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("setup.inbox[0].choices must be an array"),
+        "{stderr}"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(fixture_path);
+}
+
+#[test]
+fn accept_rejects_unsupported_setup_collections() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    for key in ["effects", "artifacts"] {
+        let store_path = temp_store_path();
+        let source_path = temp_workflow_path(&format!("accept-fixture-unsupported-setup-{key}"));
+        let fixture_path = temp_workflow_path(&format!("accept-fixture-unsupported-setup-{key}"))
+            .with_extension("json");
+        fs::write(
+            &source_path,
+            r#"
+workflow AcceptFixtureUnsupportedSetup
+
+rule noop
+  when started
+=> {}
+"#,
+        )
+        .expect("write source");
+        let mut setup = serde_json::Map::new();
+        setup.insert(key.to_owned(), json!([]));
+        fs::write(
+            &fixture_path,
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "setup": setup,
+                "expect": {
+                    "dev_status": "success"
+                }
+            })
+            .to_string(),
+        )
+        .expect("write fixture");
+
+        let output = Command::new(bin)
+            .args([
+                "--store",
+                store_path.to_str().expect("utf-8 temp path"),
+                "accept",
+                fixture_path.to_str().expect("utf-8 fixture path"),
+            ])
+            .output()
+            .expect("command runs");
+
+        assert_eq!(output.status.code(), Some(2));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "setup.{key} is not supported in acceptance_fixture.v0"
+            )),
+            "{stderr}"
+        );
+
+        let _ = fs::remove_file(store_path);
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(fixture_path);
+    }
+}
+
+#[test]
+fn accept_rejects_zero_max_iterations() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("accept-fixture-zero-max-iterations-workflow");
+    let fixture_path =
+        temp_workflow_path("accept-fixture-zero-max-iterations").with_extension("json");
+    fs::write(
+        &source_path,
+        r#"
+workflow AcceptFixtureZeroMaxIterations
+
+rule noop
+  when started
+=> {}
+"#,
+    )
+    .expect("write source");
+    fs::write(
+        &fixture_path,
+        json!({
+            "schema": "whipplescript.acceptance_fixture.v0",
+            "workflow": source_path,
+            "max_iterations": 0,
+            "expect": {
+                "dev_status": "success"
+            }
+        })
+        .to_string(),
+    )
+    .expect("write fixture");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "accept",
+            fixture_path.to_str().expect("utf-8 fixture path"),
+        ])
+        .output()
+        .expect("command runs");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`max_iterations` must be at least 1"),
+        "{stderr}"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(fixture_path);
+}
+
+#[test]
+fn accept_rejects_invalid_fixture_shape_before_start() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let source_path = temp_workflow_path("accept-fixture-invalid-shape-workflow");
+    fs::write(
+        &source_path,
+        r#"
+workflow AcceptFixtureInvalidShape
+
+rule noop
+  when started
+=> {}
+"#,
+    )
+    .expect("write source");
+
+    let cases = [
+        (
+            "missing-expect",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path
+            }),
+            "requires object field `expect`",
+        ),
+        (
+            "non-object-expect",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "expect": []
+            }),
+            "expect must be an object",
+        ),
+        (
+            "non-array-actions",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "actions": {"type": "pause"},
+                "expect": {}
+            }),
+            "actions must be an array",
+        ),
+        (
+            "non-array-provider-config-paths",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "provider_config_paths": "providers.json",
+                "expect": {}
+            }),
+            "`provider_config_paths` must be an array of strings",
+        ),
+        (
+            "non-string-provider",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "provider": ["fixture"],
+                "expect": {}
+            }),
+            "`provider` must be a string",
+        ),
+        (
+            "non-string-root",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "root": ["AcceptFixtureInvalidShape"],
+                "expect": {}
+            }),
+            "`root` must be a string",
+        ),
+        (
+            "non-string-outcome",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "outcome": ["completed"],
+                "expect": {}
+            }),
+            "`outcome` must be a string",
+        ),
+        (
+            "unknown-expect-dev-status",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "expect": {
+                    "dev_status": "maybe"
+                }
+            }),
+            "unknown expect.dev_status `maybe`",
+        ),
+        (
+            "non-integer-expect-diagnostics",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "expect": {
+                    "diagnostics": "0"
+                }
+            }),
+            "`expect.diagnostics` must be a non-negative integer",
+        ),
+        (
+            "non-array-expect-facts",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "expect": {
+                    "facts": {}
+                }
+            }),
+            "`expect.facts` must be an array",
+        ),
+        (
+            "non-object-expect-summary",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "expect": {
+                    "summary": []
+                }
+            }),
+            "`expect.summary` must be an object",
+        ),
+        (
+            "non-integer-expect-assertions-total",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "expect": {
+                    "assertions": {
+                        "total": "1"
+                    }
+                }
+            }),
+            "`expect.assertions.total` must be a non-negative integer",
+        ),
+        (
+            "non-array-source-metadata-targets",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "expect": {
+                    "source_metadata": {
+                        "targets": {}
+                    }
+                }
+            }),
+            "`expect.source_metadata.targets` must be an array",
+        ),
+        (
+            "non-object-trace-summary",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "expect": {
+                    "trace": {
+                        "summary": []
+                    }
+                }
+            }),
+            "`expect.trace.summary` must be an object",
+        ),
+        (
+            "non-bool-trace-conformance-ok",
+            json!({
+                "schema": "whipplescript.acceptance_fixture.v0",
+                "workflow": source_path,
+                "expect": {
+                    "trace": {
+                        "conformance": {
+                            "ok": "true"
+                        }
+                    }
+                }
+            }),
+            "`expect.trace.conformance.ok` must be a boolean",
+        ),
+    ];
+
+    for (label, fixture, expected_error) in cases {
+        let store_path = temp_store_path();
+        let fixture_path = temp_workflow_path(&format!("accept-fixture-invalid-shape-{label}"))
+            .with_extension("json");
+        fs::write(&fixture_path, fixture.to_string()).expect("write fixture");
+
+        let output = Command::new(bin)
+            .args([
+                "--store",
+                store_path.to_str().expect("utf-8 temp path"),
+                "accept",
+                fixture_path.to_str().expect("utf-8 fixture path"),
+            ])
+            .output()
+            .expect("command runs");
+
+        assert_eq!(output.status.code(), Some(2));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected_error), "{stderr}");
+
+        let _ = fs::remove_file(store_path);
+        let _ = fs::remove_file(fixture_path);
+    }
+
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn accept_reports_observation_expectation_mismatches() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("accept-fixture-mismatch-workflow");
+    let fixture_path = temp_workflow_path("accept-fixture-mismatch").with_extension("json");
+    fs::write(
+        &source_path,
+        r#"
+workflow AcceptFixtureMismatch
+
+class Seen {
+  status "ok"
+}
+
+assert count(Seen) == 1
+
+rule seed
+  when started
+=> {
+  record Seen {
+    status "ok"
+  }
+}
+"#,
+    )
+    .expect("write source");
+    fs::write(
+        &fixture_path,
+        json!({
+            "schema": "whipplescript.acceptance_fixture.v0",
+            "workflow": source_path,
+            "provider": "fixture",
+            "expect": {
+                "dev_status": "success",
+                "workflow": "AcceptFixtureMismatch",
+                "summary": {
+                    "facts": 2,
+                    "effects": 1
+                },
+                "actions": [
+                    {"type": "pause", "count": 1}
+                ],
+                "trace": {
+                    "conformance": {"ok": true},
+                    "summary": {
+                        "events": 999,
+                        "abstract_events": 999
+                    },
+                    "groups": [
+                        {"type": "instance_paused", "count": 1}
+                    ],
+                    "items": [
+                        {},
+                        {"sequence": 1, "type": "effect_terminal", "status": "completed"}
+                    ]
+                },
+                "assertion_reads": [
+                    {},
+                    {
+                        "source": "effect:kind agent.tell where status == completed",
+                        "match_count": 1
+                    }
+                ],
+                "assertion_tags": [
+                    {"tag": "acceptance", "total": 1}
+                ],
+                "source_metadata": {
+                    "targets": [
+                        {
+                            "target_kind": "workflow",
+                            "target": "AcceptFixtureMismatch",
+                            "tags": ["acceptance"]
+                        }
+                    ]
+                },
+                "assertion_untagged": {
+                    "total": 2,
+                    "passed": 2
+                },
+                "facts": [
+                    {"name": "Seen", "count": 2}
+                ],
+                "runs": [
+                    {"provider": "fixture", "status": "completed", "count": 1}
+                ],
+                "artifacts": [
+                    {"kind": "transcript", "mime_type": "text/plain", "count": 1}
+                ],
+                "evidence": [
+                    {"kind": "agent.turn.native_event", "subject_type": "run", "count": 1}
+                ],
+                "inbox": [
+                    {"status": "pending", "severity": "normal", "count": 1}
+                ]
+            }
+        })
+        .to_string(),
+    )
+    .expect("write fixture");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "accept",
+            fixture_path.to_str().expect("utf-8 fixture path"),
+        ])
+        .output()
+        .expect("command runs");
+    assert!(
+        !output.status.success(),
+        "acceptance mismatch should fail\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("valid JSON report");
+    assert_eq!(report.get("passed").and_then(Value::as_bool), Some(false));
+    let failures = report
+        .get("failures")
+        .and_then(Value::as_array)
+        .expect("failures");
+    assert!(failures.iter().any(|failure| failure
+        .as_str()
+        .is_some_and(|failure| failure.contains("expected facts[0] name=\"Seen\" count=2"))));
+    assert!(failures.iter().any(|failure| failure
+        .as_str()
+        .is_some_and(|failure| failure.contains("expected summary.facts=2, got 1"))));
+    assert!(failures.iter().any(|failure| failure
+        .as_str()
+        .is_some_and(|failure| failure.contains("expected summary.effects=1, got 0"))));
+    assert!(failures
+        .iter()
+        .any(|failure| failure.as_str().is_some_and(|failure| failure
+            .contains("expected assertion_tags[0] tag=\"acceptance\", got no matching"))));
+    assert!(failures.iter().any(|failure| failure.as_str().is_some_and(
+        |failure| failure.contains("expected source_metadata.targets[0] \"workflow:AcceptFixtureMismatch\", got no matching target")
+    )));
+    assert!(failures.iter().any(|failure| failure
+        .as_str()
+        .is_some_and(|failure| failure.contains("expected assertion_untagged.total=2, got 1"))));
+    assert!(failures.iter().any(|failure| failure
+        .as_str()
+        .is_some_and(|failure| failure.contains("expected assertion_untagged.passed=2, got 1"))));
+    assert!(failures
+        .iter()
+        .any(
+            |failure| failure.as_str().is_some_and(|failure| failure.contains(
+                "expected runs[0] provider=\"fixture\" status=\"completed\" count=1, got 0"
+            ))
+        ));
+    assert!(failures.iter().any(|failure| failure
+        .as_str()
+        .is_some_and(|failure| failure.contains(
+            "expected artifacts[0] kind=\"transcript\" mime_type=\"text/plain\" count=1, got 0"
+        ))));
+    assert!(failures.iter().any(|failure| failure.as_str().is_some_and(
+        |failure| failure.contains("expected evidence[0] kind=\"agent.turn.native_event\" subject_type=\"run\" count=1, got 0")
+    )));
+    assert!(failures
+        .iter()
+        .any(|failure| failure.as_str().is_some_and(|failure| failure
+            .contains("expected inbox[0] status=\"pending\" severity=\"normal\" count=1, got 0"))));
+    assert!(failures.iter().any(|failure| failure.as_str().is_some_and(
+        |failure| failure.contains("expected actions[0] type=\"pause\" count=1, got 0")
+    )));
+    assert!(failures
+        .iter()
+        .any(|failure| failure.as_str().is_some_and(|failure| failure
+            .contains("expected trace.groups[0] type=\"instance_paused\" count=1, got 0"))));
+    assert!(failures.iter().any(|failure| failure.as_str().is_some_and(
+        |failure| failure.contains("expect.trace.items[0] must include at least one selector")
+    )));
+    assert!(failures.iter().any(|failure| failure.as_str().is_some_and(
+        |failure| failure.contains(
+            "expected trace.items[1] sequence=1 type=\"effect_terminal\" status=\"completed\", got no matching trace item"
+        )
+    )));
+    assert!(failures.iter().any(|failure| failure
+        .as_str()
+        .is_some_and(|failure| failure.contains("expected trace.summary.events=999"))));
+    assert!(failures.iter().any(|failure| failure
+        .as_str()
+        .is_some_and(|failure| failure.contains("expected trace.summary.abstract_events=999"))));
+    assert!(failures
+        .iter()
+        .any(|failure| failure.as_str().is_some_and(|failure| failure
+            .contains("expect.assertion_reads[0] must include at least one selector"))));
+    assert!(failures.iter().any(|failure| failure.as_str().is_some_and(
+        |failure| failure.contains(
+            "expected assertion_reads[1] source=\"effect:kind agent.tell where status == completed\", got no matching assertion read"
+        )
+    )));
+    assert_eq!(
+        report
+            .pointer("/observed/facts/0/count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/summary/facts")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/summary/effects")
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/executable_spec/summary/total")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/executable_spec/untagged/summary/total")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/actions")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(fixture_path);
+}
+
+#[test]
+fn accept_can_expect_failed_executable_spec_diagnostics() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("accept-fixture-expected-failure-workflow");
+    let fixture_path = temp_workflow_path("accept-fixture-expected-failure").with_extension("json");
+    fs::write(
+        &source_path,
+        r#"
+workflow AcceptFixtureExpectedFailure
+
+class Seen {
+  status "ok"
+}
+
+@acceptance
+assert count(Seen) == 2
+
+rule seed
+  when started
+=> {
+  record Seen {
+    status "ok"
+  }
+}
+"#,
+    )
+    .expect("write source");
+    fs::write(
+        &fixture_path,
+        json!({
+            "schema": "whipplescript.acceptance_fixture.v0",
+            "workflow": source_path,
+            "provider": "fixture",
+            "include_tags": ["acceptance"],
+            "expect": {
+                "dev_status": "failure",
+                "workflow": "AcceptFixtureExpectedFailure",
+                "status": "failed",
+                "diagnostics": 1,
+                "diagnostics_by_code": [
+                    {"code": "assertion.failed", "count": 1}
+                ],
+                "assertions": {
+                    "total": 1,
+                    "passed": 0,
+                    "failed": 1,
+                    "error": 0
+                },
+                "assertion_tags": [
+                    {"tag": "acceptance", "total": 1, "passed": 0, "failed": 1, "error": 0}
+                ],
+                "summary": {
+                    "facts": 1,
+                    "effects": 0
+                },
+                "facts": [
+                    {"name": "Seen", "count": 1}
+                ]
+            }
+        })
+        .to_string(),
+    )
+    .expect("write fixture");
+
+    let report = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "accept",
+            fixture_path.to_str().expect("utf-8 fixture path"),
+        ],
+    );
+
+    assert_eq!(
+        report.get("schema").and_then(Value::as_str),
+        Some("whipplescript.acceptance_report.v0")
+    );
+    assert_eq!(report.get("passed").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        report
+            .get("failures")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        report
+            .pointer("/dev_report/executable_spec/status")
+            .and_then(Value::as_str),
+        Some("failed")
+    );
+    assert_eq!(
+        report
+            .pointer("/dev_report/diagnostics/0/code")
+            .and_then(Value::as_str),
+        Some("assertion.failed")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/executable_spec/status")
+            .and_then(Value::as_str),
+        Some("failed")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/executable_spec/tags/0/summary/failed")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/diagnostics_by_code/0/code")
+            .and_then(Value::as_str),
+        Some("assertion.failed")
+    );
+    assert_eq!(
+        report
+            .pointer("/observed/diagnostics_by_code/0/count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .pointer("/dev_report/executable_spec/tags/0/summary/failed")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(fixture_path);
 }
 
 #[test]

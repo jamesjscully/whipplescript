@@ -29,6 +29,7 @@ workflow RevisionTicket {
   }
 
   agent worker {
+  provider codex
     profile "repo-writer"
     capacity 1
     skills ["whipplescript-author"]
@@ -49,7 +50,7 @@ workflow RevisionTicket {
     when TicketWork as work where work.status == "queued"
     when worker is available
   => {
-    tell worker as turn """
+    tell worker as turn """markdown
     Implement this ticket using the revised workflow prompt.
 
     Title:

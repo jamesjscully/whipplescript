@@ -1,5 +1,9 @@
 workflow BadRecord
 
+class ReviewRequest {
+  subject string
+}
+
 enum ReviewStatus {
   Accept
   Revise
@@ -14,7 +18,7 @@ class HumanDecision {
 }
 
 rule bad_record
-  when manual review requested as request
+  when ReviewRequest as request
 => {
   record HumanDecision {
     subject request.missing

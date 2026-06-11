@@ -1,101 +1,85 @@
 # Troubleshooting
 
-This page covers common failures in the first few minutes.
+Common problems in roughly the order new users hit them.
 
-## `cargo` Or `rustc` Is Missing
+## `whip` is not found
 
-Install Rust from <https://rustup.rs/>, then open a new shell:
-
-```sh
-rustc --version
-cargo --version
-```
-
-## `whip` Is Not Found
-
-Cargo installs binaries into `~/.cargo/bin` by default. Add it to `PATH`:
+Cargo installs to `~/.cargo/bin`. Add it to `PATH` and open a new shell:
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
-```
-
-Then open a new shell and run:
-
-```sh
 whip --version
-whip doctor
 ```
 
-## `run` Produced No Facts
+If `cargo` itself is missing, install Rust from <https://rustup.rs/>.
 
-That is expected. `run` starts an instance and records `external.started`; it
-does not evaluate rules or execute providers.
+## `run` produced no facts
 
-For first experiments, use:
+Expected: `run` only starts the instance and records `external.started`.
+Use `dev` for the full local loop, or advance the instance yourself:
 
 ```sh
-whip --store .whipplescript/quickstart.sqlite \
-  dev examples/minimal-noop.whip \
-  --provider fixture \
-  --until idle \
-  --json
+whip --store <store> step <instance_id> --program <workflow.whip>
 ```
 
-If you already used `run`, step the instance:
+## I lost the instance id / used the wrong store
 
-```sh
-whip --store .whipplescript/quickstart.sqlite \
-  step <instance_id> --program examples/minimal-noop.whip
-```
-
-## I Lost The Instance ID
-
-List instances in the store:
+Instances live in the store file that created them. List what a store holds:
 
 ```sh
 whip --store .whipplescript/quickstart.sqlite instances
 ```
 
-Then inspect one:
+Every command that reads an instance needs that same `--store`, or set it
+once with `export WHIPPLESCRIPT_STORE=<path>`.
 
-```sh
-whip --store .whipplescript/quickstart.sqlite status <instance_id>
-```
+## Multiple workflows need `--root`
 
-## I Used The Wrong Store
-
-Every command that reads an instance must use the same store path that created
-it. If you ran with:
-
-```sh
---store .whipplescript/tutorial.sqlite
-```
-
-use that same `--store` for `status`, `facts`, `effects`, and `trace`.
-
-You can also set:
-
-```sh
-export WHIPPLESCRIPT_STORE=.whipplescript/tutorial.sqlite
-```
-
-## Multiple Workflows Need `--root`
-
-If a source bundle exposes multiple workflows, select the root workflow:
+When a source bundle declares several workflows, name the root:
 
 ```sh
 whip check examples/revision-ticket-v1.whip --root RevisionTicket
 ```
 
-The same applies to `run`, `dev`, `step`, and `revise` where a root workflow is
-ambiguous.
+The same applies to `run`, `dev`, `step`, and `revise`.
 
-## Real Provider Checks Are Skipped Or Fail
+## `whip check` reports a liveness error
 
-Real provider smoke tests are opt-in. Start with the fixture provider unless
-you are intentionally testing external integrations.
+```text
+error: workflow `X` has no rule that reaches `complete` or `fail`
+```
 
-When using real-provider scripts, check the required environment variables:
+Add a rule that runs `complete` or `fail`, or tag the workflow `@service` if
+it intentionally runs forever.
+
+```text
+error: rule `X` can never fire: nothing produces `Y`
+```
+
+Make `Y` producible — seed it from a `table`, `record` it in another rule, or
+declare it as a workflow `input`. If it arrives from outside the workflow,
+tag the rule `@external`.
+
+## `whip doctor` reports missing tools
+
+Most are optional. Fixture-backed development needs none of Maude, Apalache,
+BAML, Codex, Claude, Pi, or Loft. Install optional tools only for formal
+checks or real-provider work.
+
+## `cargo install --git` fails
+
+Install from a checkout instead; if that works, the Git path failure is a
+network, lockfile, or toolchain issue:
+
+```sh
+git clone https://github.com/jamesjscully/whipplescript.git
+cd whipplescript
+cargo install --path crates/whipplescript-cli --locked
+```
+
+## Real provider checks are skipped or fail
+
+Real-provider smoke tests are opt-in and gated by environment variables:
 
 ```sh
 WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \
@@ -103,24 +87,15 @@ WHIPPLESCRIPT_REAL_PROVIDERS=loft,baml,codex \
 scripts/check-real-providers.sh
 ```
 
-Provider failures should become diagnostics, evidence, run status, and effect
-status. They should not be hidden as generic command failures.
+Read the per-provider JSON report first —
+`target/real-provider-reports/<provider>.json` records environment posture,
+check counts, and redacted preflight results. Provider failures surface as
+diagnostics, evidence, and run/effect status, not as generic command
+failures.
 
-The report wrapper writes the combined report plus per-provider JSON reports:
+## Native provider strict mode fails
 
-```text
-target/real-provider-smoke-report.md
-target/real-provider-preflight.jsonl
-target/real-provider-reports/<provider>.json
-```
-
-Check the provider JSON report first. It records set/unset environment posture,
-evidence refs, check counts, and redacted preflight records.
-
-## Native Provider Strict Mode Fails
-
-Strict native validation is intentionally stricter than command-wrapper smoke
-coverage:
+Strict mode validates real native adapters, not compatibility wrappers:
 
 ```sh
 WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \
@@ -129,18 +104,16 @@ WHIPPLESCRIPT_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.j
 scripts/check-real-providers-report.sh
 ```
 
-Common failures:
+Common messages:
 
-- `WHIPPLESCRIPT_PROVIDER_CONFIGS is required in native strict mode`: set it to
-  a colon-separated list of provider config files. The legacy
-  `WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS` name is still accepted.
-- `command-wrapper provider is not accepted in native strict mode`: strict mode
-  requires Codex, Claude, and Pi native providers, not Loft/BAML compatibility
-  wrappers.
-- `missing required native provider config`: add native bindings for
-  `codex-main`, `claude-main`, and `pi-main`.
+- `WHIPPLESCRIPT_PROVIDER_CONFIGS is required in native strict mode` — set it
+  to a colon-separated list of provider config files.
+- `command-wrapper provider is not accepted in native strict mode` — strict
+  mode requires the Codex, Claude, and Pi native surfaces.
+- `missing required native provider config` — add bindings for `codex-main`,
+  `claude-main`, and `pi-main`.
 
-Use native-surface mode when you only need a provider-specific probe:
+For a single-provider probe, use surface mode instead:
 
 ```sh
 WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \
@@ -149,9 +122,9 @@ WHIPPLESCRIPT_REAL_PROVIDERS=codex \
 scripts/check-real-providers-report.sh
 ```
 
-## Destructive Provider Test Is Refused
+## Destructive provider tests are refused
 
-Destructive provider suites require an explicit disposable target marker and
+By design. They require an explicit disposable-target marker and
 acknowledgement:
 
 ```sh
@@ -161,38 +134,5 @@ WHIPPLESCRIPT_REAL_PROVIDER_DISPOSABLE_ACK=I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_
 scripts/check-real-providers-report.sh
 ```
 
-Provider-specific forms are accepted too, such as
-`WHIPPLESCRIPT_PI_DESTRUCTIVE_TESTS`,
-`WHIPPLESCRIPT_PI_DISPOSABLE_TARGET`, and
-`WHIPPLESCRIPT_PI_DISPOSABLE_ACK`. Reports record only whether markers are set,
-not their values.
-
-## `cargo install --git` Fails
-
-Use the checkout path first:
-
-```sh
-git clone https://github.com/jamesjscully/whipplescript.git
-cd whipplescript
-cargo install --path crates/whipplescript-cli --locked
-```
-
-If that works, the Git install failure is likely a network, lockfile, or remote
-toolchain issue.
-
-## `whip doctor` Reports Missing Tools
-
-Some tools are optional. For fixture-backed quickstart and tutorial flows, you
-do not need Maude, Apalache, BAML, Codex, Claude, Pi, or Loft.
-
-Install optional tools only when you need formal checks or real provider smoke
-tests.
-
-For native provider work, start with:
-
-```sh
-scripts/check-native-provider-surfaces.sh
-scripts/check-codex-app-server-schema.sh
-scripts/check-claude-agent-sdk-surface.sh
-scripts/check-pi-rpc-surface.sh
-```
+Provider-specific variants exist (for example `WHIPPLESCRIPT_PI_DESTRUCTIVE_TESTS`).
+Reports record only whether the markers are set, never their values.

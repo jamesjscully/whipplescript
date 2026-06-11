@@ -426,7 +426,7 @@ fi
 
 cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript -- doctor
 cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript -- check \
-  "$ROOT/examples/loft-worker-with-review.whip" \
+  "$ROOT/examples/queue-worker-with-review.whip" \
   "$ROOT/examples/coerce-branch.whip"
 
 if provider_enabled loft; then

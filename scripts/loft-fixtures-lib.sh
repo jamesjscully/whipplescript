@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 
+# shellcheck disable=SC2034 # Sourced by Loft fixture scripts as a shared default.
 LOFT_FIXTURE_DIR="fixtures/whipplescript/v0.1"
 LOFT_FIXTURE_MANIFEST="manifest.json"
 

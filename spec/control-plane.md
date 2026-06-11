@@ -280,7 +280,7 @@ state, it should:
    - `NewFact` records for `record ...` blocks
    - consumed fact ids for `consume binding` / `done binding`
    - `NewEffect` records for `tell`, `coerce`, `claim`, `askHuman`, `call`,
-     and `emit`
+     `notify`, `exec`, and `timer`
    - `NewEffectDependency` records for `after` blocks
    - evidence/diagnostic records for policy decisions and lowering details
 6. Commit each rule atomically through the kernel.
@@ -304,9 +304,10 @@ stepping and must not consult providers, BAML, plugins, the filesystem, the
 network, wall-clock time, or random sources.
 
 `when` is the only source-level introducer for rule readiness. `with` is not an
-alias for readiness; it is reserved for effect/action configuration such as
-`claim issue with loft`. The lowering pass must keep this distinction so a rule
-cannot make a world-touching provider choice look like a fact observation.
+alias for readiness; it is reserved for effect input/configuration such as
+`exec backup_repo with request -> Report`. The lowering pass must keep this
+distinction so a rule cannot make a world-touching provider choice look like a
+fact observation.
 Grouped readiness blocks, written as `when { ... }`, are parse-time sugar for
 ordinary `when` clauses. Each non-empty line in the block must become one
 readiness clause in IR before rule readiness and guard evaluation run.
@@ -413,17 +414,17 @@ done binding                -> alias for consume binding
 done binding -> record ...  -> consume plus result record in one commit
 tell agent ...              -> agent.tell effect with target/profile/skills
 coerce function(...)        -> baml.coerce effect with function and arguments
-claim issue with loft       -> loft.claim effect
+claim item                  -> queue.claim effect
 askHuman ...                -> human.ask effect
 call plugin.capability ...  -> capability.call effect
-emit event                  -> event.emit effect
+notify instance event ...   -> event.notify effect
+exec capability with input  -> exec.command effect requiring script.<capability>
 invoke Workflow             -> workflow.invoke effect or child invocation record
 after effect succeeds       -> dependency edge
 after effect succeeds as x  -> dependency edge with terminal-output alias
-then effect/done            -> success-chain sugar over after blocks
 complete output             -> workflow.completed terminal event
 fail failure                -> workflow.failed terminal event
-matrix rows                 -> typed fact records
+table rows                 -> typed fact records
 action/template expansion   -> ordinary facts/effects before commit
 assert expression           -> read-only assertion result
 ```
@@ -503,12 +504,12 @@ idempotency key so recovery does not duplicate assertion diagnostics.
 Validation acceptance for this layer:
 
 ```text
-whip dev examples/implementation-plan-phase-review.whip --provider codex --until idle
+whip dev examples/openclaw-lite.whip --provider fixture --until idle
 ```
 
-must create one `PhaseReviewRequest` fact for each implementation-plan phase,
-enqueue corresponding `agent.tell` effects, run configured Codex turns, and
-leave status/evidence sufficient to explain every dispatched or blocked phase.
+must observe a heartbeat, run a planner turn, file queue work, and leave
+status/evidence sufficient to explain every dispatched, queued, or blocked
+operation.
 
 ## Control Plane Responsibilities
 

@@ -9,84 +9,73 @@ remains a design sketchpad for example shapes.
 These examples are intentionally small. The goal is to feel the authoring model
 before committing to syntax.
 
-## Simple Loft Worker
+## Simple Queue Worker
 
 This is the best current v0 candidate for the smallest useful real workflow:
 
 ```whipplescript
-workflow SimpleLoftWorker
+workflow SimpleQueueWorker
 
+queue backlog {
+  tracker builtin
+}
 
 agent worker {
   profile "repo-writer"
   capacity 1
-  skills ["loft-user"]
 }
 
 rule start_ready_issue
   when {
-    loft has ready issue as issue
+    backlog has ready item as item
     worker is available
   }
 => {
-  claim issue with loft as claim
+  claim item as work
 
-  after claim succeeds {
-    tell worker """
-    Implement this Loft issue:
+  after work succeeds {
+    tell worker """markdown
+    Implement this work item:
 
-    {{ claim.issue.title }}
+    {{ item.title }}
 
-    {{ claim.issue.body }}
+    {{ item.body }}
 
-    When finished, update the Loft issue with a concise note and evidence.
+    Finish with a concise summary.
     """
   }
 
-  after claim fails {
-    askHuman """
-    WhippleScript could not claim this Loft issue:
-
-    {{ claim.issue_id }}
+  after work fails as failure {
+    askHuman """markdown
+    WhippleScript could not claim this work item.
 
     Reason:
-    {{ claim.reason }}
+    {{ failure.reason }}
 
-    Please inspect the issue state or retry later.
+    Please inspect the queue state or retry later.
     """
   }
-}
-
-rule recover_idle
-  when no active agent turns
-  when loft has unfinished issues
-  when no claimable effects
-=> {
-  askHuman """
-  There is unfinished Loft work, but WhippleScript has no active turns or
-  claimable effects. Inspect status and decide whether to resume, split, or
-  block the work.
-  """
 }
 ```
 
 Why this script is important:
 
 - `claim` and `tell` are not sequenced by source order.
-- `after claim succeeds` creates a durable dependency edge.
-- The worker prompt can use `claim.issue` only inside the success scope.
+- `after work succeeds` creates a durable dependency edge.
+- The worker prompt can use claim output only inside the success scope.
 - Claim failure is handled separately from worker failure.
-- The idle recovery rule reacts to facts; it does not run a hidden supervisor
-  loop.
 
-## Loft Worker With BAML Review
+## Queue Worker With BAML Review
 
 This example adds a typed model decision. It uses BAML-shaped `enum`, `class`,
 and `coerce` declarations, but keeps ordinary data operations small and pure.
 
 ```whipplescript
-workflow LoftWorkerWithReview
+workflow QueueWorkerWithReview
 
+queue backlog {
+  tracker builtin
+}
 
 enum ReviewStatus {
   Accept
@@ -102,22 +91,19 @@ class WorkReview {
 }
 
 class ReviewedWork {
-  turn AgentTurn
+  itemId string
   review WorkReview
 }
 
-coerce reviewWork(issueTitle string, agentSummary string, changedFiles string[]) -> WorkReview {
-  prompt """
-  Review this completed agent turn for the Loft issue.
+coerce reviewWork(itemTitle string, agentSummary string) -> WorkReview {
+  prompt """markdown
+  Review this completed agent turn for the work item.
 
-  Issue:
-  {{ issueTitle }}
+  Item:
+  {{ itemTitle }}
 
   Agent summary:
   {{ agentSummary }}
-
-  Changed files:
-  {{ changedFiles }}
 
   Return a structured review.
 
@@ -128,50 +114,45 @@ coerce reviewWork(issueTitle string, agentSummary string, changedFiles string[])
 agent worker {
   profile "repo-writer"
   capacity 1
-  skills ["loft-user"]
 }
 
 rule start_ready_issue
   when {
-    loft has ready issue as issue
+    backlog has ready item as item
     worker is available
   }
 => {
-  claim issue with loft as claim
+  claim item as work
 
-  after claim succeeds {
-    tell worker """
-    Implement this Loft issue:
+  after work succeeds {
+    tell worker """markdown
+    Implement this work item:
 
-    {{ claim.issue.title }}
+    {{ item.title }}
 
-    {{ claim.issue.body }}
+    {{ item.body }}
 
-    Finish with a concise summary and list of changed files.
+    Finish with a concise summary.
     """
   }
-}
 
-rule review_finished_turn
-  when worker completed turn for loft issue as turn
-=> {
-  coerce reviewWork(turn.issue.title, turn.summary, turn.changedFiles) as review
+  after turn succeeds as outcome {
+    coerce reviewWork(item.title, outcome.summary) as review
+  }
 
-  after review succeeds {
+  after review succeeds as verdict {
     record ReviewedWork {
-      turn turn
-      review review
+      itemId item.id
+      review verdict
     }
   }
 
   after review fails {
-    askHuman """
-    BAML review failed for this completed turn:
-
-    {{ turn.id }}
+    askHuman """markdown
+    BAML review failed for this completed turn.
 
     Please inspect the turn artifacts and decide whether to accept, revise, or
-    block the issue.
+    block the item.
     """
   }
 }
@@ -180,7 +161,10 @@ rule accept_reviewed_work
   when ReviewedWork as reviewed
   when reviewed.review.status == Accept
 => {
-  close reviewed.turn.issue with loft
+  record AcceptedWork {
+    itemId reviewed.itemId
+    reason reviewed.review.reason
+  }
 }
 
 rule request_revision
@@ -190,10 +174,8 @@ rule request_revision
     worker is available
   }
 => {
-  tell worker """
-  Revise this Loft issue:
-
-  {{ reviewed.turn.issue.title }}
+  tell worker """markdown
+  Revise this work item:
 
   Review reason:
   {{ reviewed.review.reason }}
@@ -207,10 +189,8 @@ rule escalate_blocked_review
   when ReviewedWork as reviewed
   when reviewed.review.status == Blocked
 => {
-  askHuman """
-  The model review says this issue is blocked:
-
-  {{ reviewed.turn.issue.title }}
+  askHuman """markdown
+  The model review says this work item is blocked:
 
   Reason:
   {{ reviewed.review.reason }}
@@ -307,7 +287,7 @@ rule implement_ready_work
     worker is available
   }
 => {
-  tell worker """
+  tell worker """markdown
   Claim and implement this work item:
 
   {{ item.goal }}
@@ -320,7 +300,7 @@ rule review_successful_work
     reviewer is available
   }
 => {
-  tell reviewer """
+  tell reviewer """markdown
   Review this work item:
 
   {{ item.goal }}
@@ -367,7 +347,7 @@ rule investigate
     researcher is available
   }
 => {
-  tell researcher """
+  tell researcher """markdown
   Research this question and return cited findings:
 
   {{ q.text }}
@@ -386,7 +366,7 @@ rule synthesize
     synthesizer is available
   }
 => {
-  tell synthesizer """
+  tell synthesizer """markdown
   Synthesize these findings into a concise answer:
 
   {{ d.findings }}
@@ -494,8 +474,8 @@ rule plan_ready_work
 => {
   call memory.query for item as context
 
-  after context succeeds as memory => {
-    tell planner as plan """
+  after context succeeds as memory {
+    tell planner as plan """markdown
     Use the attached skills and recalled memory to produce a short plan.
 
     Work:
@@ -522,7 +502,7 @@ rule plan_ready_work
 rule request_human_trace_review
   when OpenClawHeartbeat as beat where beat.status == "observed"
 => {
-  askHuman """
+  askHuman """markdown
   OpenClaw-lite heartbeat {{ beat.job }} fired at {{ beat.firedAt }}.
   Review the trace if the plan or memory context needs human attention.
   """
@@ -541,28 +521,31 @@ deterministic; it does not add an OpenClaw gateway or a hidden scheduler loop.
 
 ## Current Checked Fixtures
 
-The checked example fixtures in `examples/` are:
+The curated checked examples in `examples/` are documented in
+[`../docs/examples.md`](../docs/examples.md). The current learning path is:
 
-- `minimal-noop.whip`: smallest rule/fact shape with no external effect.
-- `ralph.whip`: recursive external-turn loop.
-- `loft-worker-with-review.whip`: Loft claim before agent turn, BAML
-  review, and human fallback.
-- `coerce-branch.whip`: typed model classification followed by explicit
-  routing.
-- Codex French poem fixture: Codex writes a French poem artifact, then a second
-  Codex turn judges whether it is a real French poem.
-- `codex-poem-coerce-review.whip`: Codex writes a French poem artifact, then a
-  typed BAML `coerce` reviews the completed turn.
-- `human-review.whip`: manual review request and answer recording.
-- `implementation-plan-phase-review.whip`: fan out implementation-plan phase
-  reviews to Codex/repo-reader turns and a visible tracker.
-- `multi-agent-bounded-concurrency.whip`: two agents with explicit capacity
-  bounds.
-- `openclaw-lite.whip`: planner, implementer, verifier, and human approval
-  composition.
-- `plugin-memory.whip`: memory plugin capability call before an agent turn.
-- `provider-language-e2e.whip`: Codex, Claude, and Pi language-generation
-  turns across six languages, each reviewed by typed BAML coercion.
+- `minimal-noop.whip`: smallest complete workflow.
+- `human-review.whip`: manual approval with typed answer facts.
+- `triage-flow.whip`: sequential flow with branching and terminal outcomes.
+- `coerce-branch.whip`: typed model decision and explicit routing.
+- `terminal-output-union.whip`: exhaustive effect-terminal handling.
+- `incident-router.whip`: rich guards, collection access, and `AgentRef`.
+- `scheduled-escalation.whip`: timeout, timer, cancellation, and escalation.
+- `exec-json-ingest.whip`: typed command output and JSON ingestion.
+- `event-bridge.whip`: external events and directed notifications.
+- `reusable-review-pattern.whip`: compile-time pattern reuse.
+- `queue-worker-with-review.whip`: queue claim, agent turn, typed review, and
+  finish/release policy.
+- `multi-agent-bounded-concurrency.whip`: capacity-bounded agent handoff.
+- `circuit-breaker.whip`: counter-driven resilience policy.
+- `ralph.whip`: minimal recurring service loop.
+- `openclaw-lite.whip`: heartbeat, planning, queue filing, and human review.
+- `autoresearch-lite.whip`: experiment budget and typed metric decision.
+- `gastown-lite.whip`: coding-agent queue/lease/review ledger.
+
+Runtime test fixtures such as `provider-language-e2e.whip`,
+`plugin-memory.whip`, and `queue-gated-smoke.whip` remain checked, but they are
+not the curated authoring path.
 
 Each checked source has a matching `.ir` snapshot consumed by parser tests.
 

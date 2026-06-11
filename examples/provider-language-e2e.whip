@@ -1,3 +1,7 @@
+@fixture
+@acceptance
+description "Fixture-backed provider x language acceptance workflow"
+@service
 workflow ProviderLanguageE2E
 
 
@@ -28,7 +32,7 @@ class LanguageE2EResult {
 }
 
 coerce reviewLanguageArtifact(language string, expectedScript string, artifactPath string, turnSummary string) -> LanguageQualityReview {
-  prompt """
+  prompt """markdown
   Review the completed language artifact.
 
   Language:
@@ -51,31 +55,46 @@ coerce reviewLanguageArtifact(language string, expectedScript string, artifactPa
 }
 
 agent codex {
+  provider codex
   profile "repo-writer"
   capacity 2
 }
 
 agent claude {
+  provider claude
   profile "repo-writer"
   capacity 2
 }
 
 agent pi {
+  provider pi
   profile "repo-writer"
   capacity 2
 }
 
+@acceptance
+description "Codex completes both assigned language tasks"
 assert count(LanguageE2EResult where provider == "codex") == 2
+@acceptance
+description "Claude completes both assigned language tasks"
 assert count(LanguageE2EResult where provider == "claude") == 2
+@acceptance
+description "Pi completes both assigned language tasks"
 assert count(LanguageE2EResult where provider == "pi") == 2
+@acceptance
+description "All seeded language tasks are consumed"
 assert count(LanguageTask where status == "queued") == 0
+@acceptance
+description "All agent turns complete"
 assert count(effect kind agent.tell where status == completed) == 6
+@acceptance
+description "All language reviews complete"
 assert count(effect kind baml.coerce where status == completed) == 6
 
-rule seed_language_matrix
-  when started
-=> {
-  record LanguageTask {
+@fixture
+description "Static provider x language task rows"
+table language_tasks as LanguageTask [
+  {
     provider codex
     language "French"
     expectedScript "Latin"
@@ -84,7 +103,7 @@ rule seed_language_matrix
     status "queued"
   }
 
-  record LanguageTask {
+  {
     provider codex
     language "Arabic"
     expectedScript "Arabic"
@@ -93,7 +112,7 @@ rule seed_language_matrix
     status "queued"
   }
 
-  record LanguageTask {
+  {
     provider claude
     language "Spanish"
     expectedScript "Latin"
@@ -102,7 +121,7 @@ rule seed_language_matrix
     status "queued"
   }
 
-  record LanguageTask {
+  {
     provider claude
     language "Hindi"
     expectedScript "Devanagari"
@@ -111,7 +130,7 @@ rule seed_language_matrix
     status "queued"
   }
 
-  record LanguageTask {
+  {
     provider pi
     language "Japanese"
     expectedScript "Kana and kanji"
@@ -120,7 +139,7 @@ rule seed_language_matrix
     status "queued"
   }
 
-  record LanguageTask {
+  {
     provider pi
     language "German"
     expectedScript "Latin"
@@ -128,13 +147,14 @@ rule seed_language_matrix
     artifactPath "target/dogfood/language/pi-german.txt"
     status "queued"
   }
-}
+]
 
+description "Route one queued language task to its selected provider"
 rule run_language_task
   when LanguageTask as task where task.status == "queued"
   when task.provider is available
 => {
-  tell task.provider as turn """
+  tell task.provider as turn """markdown
   Complete this language e2e task.
 
   Target language:

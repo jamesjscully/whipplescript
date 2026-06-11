@@ -1,4 +1,6 @@
 workflow CoerceBranch
+source_tags
+@service workflow CoerceBranch
 schemas
   enum Priority { Low, Normal, Urgent }
   class MessageClassification
@@ -22,13 +24,13 @@ rules
       effect2 kind=human.ask binding=- key=9cb792d395f3f9ce
     dependencies
       classification --fails--> effect2
-    body_hash 06ad008130ec0589
+    body_hash e5b9747dd84b9c04
   rule route_classified
     when ClassifiedMessage as message
     reads
       schema:ClassifiedMessage
     effects
       effect1 kind=human.ask binding=- key=f81bef02f1cb4990
-    body_hash b609c512cd3d7c19
+    body_hash 4bbde6eaaf7ce5f0
 rule_dependencies
   classify_request --schema:ClassifiedMessage--> route_classified

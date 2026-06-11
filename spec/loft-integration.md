@@ -1,6 +1,12 @@
 # Loft Integration
 
-Status: draft
+Status: legacy compatibility draft
+
+Current authoring should prefer the vendor-neutral work queue surface
+(`queue`, `when <queue> has ready item`, `claim`/`finish`) documented in
+[`work-queues.md`](work-queues.md). This file records the older Loft-specific
+integration shape and provider effect contract for compatibility and historical
+context; examples here are not the primary language surface.
 
 Loft is a separate kernel. It owns project work truth:
 
@@ -66,7 +72,7 @@ rule implement_ready_issue
   claim issue with loft as claim
 
   after claim succeeds {
-    tell worker """
+    tell worker """markdown
     Implement this Loft issue:
 
     {{ claim.issue.title }}

@@ -1,31 +1,48 @@
+@service
+description "Recall plugin memory before agent work and save context after each turn"
 workflow PluginMemory
 
 use memory
 
+queue backlog {
+  tracker builtin
+}
+
 agent worker {
+  provider codex
   profile "repo-writer"
   capacity 1
 }
 
 rule recall_before_work
-  when WorkItem as item
+  when backlog has ready item as item
   when worker is available
 => {
-  call memory.query for item as context
+  claim item as lease
 
-  after context succeeds {
-    tell worker """
+  after lease succeeds {
+    call memory.query for item as context
+  }
+
+  after context succeeds as recalled {
+    tell worker as turn """markdown
     Use the recalled project context explicitly while working:
 
     {{ item.title }}
 
-    {{ context.summary }}
+    {{ recalled.summary }}
     """
+  }
+
+  after turn succeeds as outcome {
+    finish item {
+      summary outcome.summary
+    }
   }
 }
 
 rule save_completed_context
-  when worker completed turn for loft issue as turn
+  when worker completed turn as turn
 => {
   call memory.write for turn
 }

@@ -18,7 +18,7 @@ assert <expr>
 record field values
 effect arguments
 string interpolation paths
-static matrix rows
+static table rows
 static action/template parameters
 ```
 
@@ -158,7 +158,7 @@ Expression checking is bidirectional where a context provides an expected type:
 
 ```text
 record/effect field       -> declared field type
-static matrix row field   -> declared row/schema field type
+static table row field   -> declared row/schema field type
 array element             -> target item type, if known
 object literal field      -> declared field type
 case branch result        -> common expected branch type, if required
@@ -613,7 +613,7 @@ record LanguageTask {
 }
 ```
 
-Static matrix rows are object construction with an explicit target class.
+Static table rows are object construction with an explicit target class.
 
 Expression-level object literals are valid only with an expected object schema
 from a record/effect argument, static row, action/template parameter, or another

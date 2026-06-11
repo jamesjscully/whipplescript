@@ -1,0 +1,45 @@
+@service
+workflow EventBridge
+
+# Event schemas let external systems notify a workflow without inventing facts.
+event deploy.finished {
+  service string
+  status "ok" | "failed"
+}
+
+class PeerInstance {
+  id string
+  service string
+}
+
+class DeploymentNotice {
+  service string
+  status "notified"
+}
+
+table peers as PeerInstance [
+  {
+    id "ins_peer"
+    service "api"
+  }
+]
+
+assert count(DeploymentNotice where status == "notified") == 1
+
+# External systems inject deploy.finished with `whip notify`.
+rule notify_peer_after_successful_deploy
+  when fact deploy.finished as deployed where deployed.status == "ok"
+  when PeerInstance as peer where peer.service == deployed.service
+=> {
+  notify peer.id event deploy.finished {
+    service deployed.service
+    status deployed.status
+  } as sent
+
+  after sent succeeds {
+    record DeploymentNotice {
+      service deployed.service
+      status "notified"
+    }
+  }
+}

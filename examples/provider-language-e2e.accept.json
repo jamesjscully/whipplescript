@@ -1,0 +1,122 @@
+{
+  "schema": "whipplescript.acceptance_fixture.v0",
+  "workflow": "provider-language-e2e.whip",
+  "provider": "fixture",
+  "actions": [
+    {"type": "pause", "reason": "exercise acceptance fixture control action"},
+    {"type": "resume"}
+  ],
+  "include_tags": ["acceptance"],
+  "expect": {
+    "dev_status": "success",
+    "workflow": "ProviderLanguageE2E",
+    "status": "passed",
+    "source_metadata": {
+      "targets": [
+        {
+          "target_kind": "workflow",
+          "target": "ProviderLanguageE2E",
+          "tags": ["fixture", "acceptance"],
+          "description": "Fixture-backed provider x language acceptance workflow"
+        },
+        {
+          "target_kind": "table",
+          "target": "language_tasks",
+          "tags": ["fixture"],
+          "description": "Static provider x language task rows"
+        },
+        {
+          "target_kind": "rule",
+          "target": "run_language_task",
+          "description": "Route one queued language task to its selected provider"
+        }
+      ]
+    },
+    "diagnostics": 0,
+    "actions": [
+      {"type": "pause", "count": 1},
+      {"type": "resume", "count": 1}
+    ],
+    "assertions": {
+      "total": 6,
+      "passed": 6,
+      "failed": 0,
+      "error": 0
+    },
+    "assertion_tags": [
+      {"tag": "acceptance", "total": 6, "passed": 6, "failed": 0, "error": 0}
+    ],
+    "assertion_reads": [
+      {
+        "source": "effect:kind agent.tell where status == completed",
+        "match_count": 6,
+        "matches": [
+          {
+            "name": "agent.tell",
+            "status": "completed",
+            "prompt_content_type": "markdown",
+            "trace_items": 24,
+            "evidence_items": 12,
+            "count": 6
+          }
+        ]
+      },
+      {
+        "source": "effect:kind baml.coerce where status == completed",
+        "match_count": 6,
+        "matches": [
+          {
+            "name": "baml.coerce",
+            "status": "completed",
+            "prompt_content_type": "markdown",
+            "trace_items": 24,
+            "evidence_items": 6,
+            "count": 6
+          }
+        ]
+      }
+    ],
+    "trace": {
+      "conformance": {"ok": true},
+      "summary": {
+        "events": 70,
+        "abstract_events": 50
+      },
+      "groups": [
+        {"type": "effect_created", "count": 12},
+        {"type": "effect_claimed", "count": 12},
+        {"type": "run_started", "count": 12},
+        {"type": "effect_terminal", "count": 12},
+        {"type": "instance_paused", "count": 1},
+        {"type": "instance_resumed", "count": 1}
+      ]
+    },
+    "summary": {
+      "facts": 18,
+      "effects": 12
+    },
+    "facts": [
+      {"name": "LanguageE2EResult", "count": 6}
+    ],
+    "effects": [
+      {"kind": "agent.tell", "status": "completed", "count": 6},
+      {"kind": "baml.coerce", "status": "completed", "count": 6}
+    ],
+    "runs": [
+      {"provider": "claude", "status": "completed", "count": 2, "artifact_count": 4},
+      {"provider": "codex", "status": "completed", "count": 2, "artifact_count": 4},
+      {"provider": "fixture", "status": "completed", "count": 6, "artifact_count": 0},
+      {"provider": "pi", "status": "completed", "count": 2, "artifact_count": 4}
+    ],
+    "artifacts": [
+      {"kind": "stdout_ref", "mime_type": "text/plain", "count": 6},
+      {"kind": "transcript_ref", "mime_type": "text/plain", "count": 6}
+    ],
+    "evidence": [
+      {"kind": "agent.turn.provider", "subject_type": "run", "count": 6},
+      {"kind": "baml.coerce.provider", "subject_type": "run", "count": 6},
+      {"kind": "skills.injected", "subject_type": "run", "count": 6},
+      {"kind": "rule.committed", "subject_type": "rule_commit", "count": 19}
+    ]
+  }
+}

@@ -1,0 +1,149 @@
+@service
+workflow GastownLite
+
+# Coding-agent coordination combines a queue, a workspace lease, typed review, and a ledger.
+class Workspace {
+  name string
+}
+
+class Ticket {
+  id string
+  title string
+  area "frontend" | "backend"
+  worker AgentRef<frontend | backend>
+  workspace Workspace
+  status "ready"
+}
+
+class ReviewDecision {
+  ticketId string
+  area string
+  verdict "merge" | "revise" | "blocked"
+}
+
+class MergeRecord {
+  ticketId string
+  verdict "merge"
+}
+
+class WorkspaceReady {
+  workspace Workspace
+}
+
+lease workspace_slot {
+  key Workspace
+  slots 1
+  ttl 30m
+}
+
+ledger review_log {
+  entry ReviewDecision
+  partition by area
+  retain 30d
+}
+
+queue backlog {
+  tracker builtin
+}
+
+agent frontend {
+  provider codex
+  profile "repo-writer"
+  capacity 1
+}
+
+agent backend {
+  provider codex
+  profile "repo-writer"
+  capacity 1
+}
+
+table workspaces as WorkspaceReady [
+  {
+    workspace { name "checkout" }
+  }
+]
+
+coerce reviewPatch(ticketId string, summary string) -> ReviewDecision {
+  prompt """markdown
+  Review this coding-agent turn.
+
+  Ticket: {{ ticketId }}
+  Summary: {{ summary }}
+
+  Return merge, revise, or blocked.
+
+  {{ ctx.output_format }}
+  """
+}
+
+rule file_ticket
+  when started
+=> {
+  file item into backlog {
+    title "Add retry telemetry"
+    body "Record retry count and final outcome for checkout requests."
+  }
+}
+
+rule implement_ready_ticket
+  when backlog has ready item as item
+  when WorkspaceReady as ready
+  when frontend is available
+=> {
+  claim item as claimed
+
+  after claimed succeeds {
+    acquire workspace_slot for ready.workspace until ttl as slot
+  }
+
+  after slot held {
+    tell frontend as turn """markdown
+    Implement this ticket in the checkout workspace:
+
+    {{ item.title }}
+    {{ item.body }}
+    """
+  }
+
+  after slot contended {
+    release item
+    askHuman """markdown
+    Checkout workspace is busy. Split or retry {{ item.id }}.
+    """
+  }
+
+  after turn succeeds as work {
+    coerce reviewPatch(item.id, work.summary) as review
+  }
+
+  after review succeeds as decision {
+    append ReviewDecision {
+      ticketId item.id
+      area "frontend"
+      verdict decision.verdict
+    } to review_log as log_entry
+  }
+
+  after log_entry succeeds {
+    case decision.verdict {
+      "merge" => {
+        finish item {
+          summary turn.summary
+        }
+        record MergeRecord {
+          ticketId item.id
+          verdict "merge"
+        }
+      }
+      "revise" => {
+        release item
+      }
+      "blocked" => {
+        askHuman """markdown
+        Review blocked {{ item.id }}. Inspect the turn before continuing.
+        """
+      }
+    }
+  }
+}

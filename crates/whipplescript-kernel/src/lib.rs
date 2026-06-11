@@ -246,6 +246,37 @@ impl RuntimeKernel {
         })
     }
 
+    /// Records a typed fact ingested from an effect's output bytes
+    /// (spec/json-ingestion.md): provenance `ingest`, stamped with the schema
+    /// it validated against.
+    pub fn ingest_fact(
+        &mut self,
+        instance_id: &str,
+        fact_name: &str,
+        key: &str,
+        value_json: &str,
+        causation_id: Option<&str>,
+        event_idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        let fact_id = idempotency_key(&[instance_id, "fact", fact_name, key]);
+        self.store.derive_fact(DerivedFact {
+            instance_id,
+            fact: NewFact {
+                fact_id: &fact_id,
+                name: fact_name,
+                key,
+                value_json,
+                schema_id: Some(fact_name),
+                provenance_class: "ingest",
+                correlation_id: None,
+                source_span_json: None,
+            },
+            source: "kernel",
+            causation_id,
+            idempotency_key: event_idempotency_key,
+        })
+    }
+
     pub fn evaluate_rules(
         &self,
         instance_id: &str,
@@ -1996,6 +2027,7 @@ fn declared_profiles_json(program: &IrProgram) -> String {
             json!({
                 "name": agent.name,
                 "harness": agent.harness,
+                "provider": agent.provider,
                 "profile": agent.profile,
                 "capacity": agent.capacity,
                 "skills": agent.skills,
@@ -2375,6 +2407,16 @@ fn effect_kind_name(kind: &IrEffectKind) -> &'static str {
         IrEffectKind::CapabilityCall => "capability.call",
         IrEffectKind::EventEmit => "event.emit",
         IrEffectKind::WorkflowInvoke => "workflow.invoke",
+        IrEffectKind::TimerWait => "timer.wait",
+        IrEffectKind::ExecCommand => "exec.command",
+        IrEffectKind::QueueFile => "queue.file",
+        IrEffectKind::QueueClaim => "queue.claim",
+        IrEffectKind::QueueRelease => "queue.release",
+        IrEffectKind::QueueFinish => "queue.finish",
+        IrEffectKind::LeaseAcquire => "lease.acquire",
+        IrEffectKind::LedgerAppend => "ledger.append",
+        IrEffectKind::CounterConsume => "counter.consume",
+        IrEffectKind::EventNotify => "event.notify",
     }
 }
 
@@ -3353,6 +3395,7 @@ rule noop
 workflow CapacityFromSource
 
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
   capabilities ["agent.tell"]
@@ -3385,6 +3428,7 @@ rule start
             .expect("instance creates");
         let effects = [
             NewEffect {
+                timeout_seconds: None,
                 effect_id: "tell-one",
                 kind: "agent.tell",
                 target: Some("worker"),
@@ -3397,6 +3441,7 @@ rule start
                 source_span_json: None,
             },
             NewEffect {
+                timeout_seconds: None,
                 effect_id: "tell-two",
                 kind: "agent.tell",
                 target: Some("worker"),
@@ -3475,6 +3520,7 @@ rule start
 workflow CapabilityFromSource
 
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
   capabilities ["agent.tell"]
@@ -3505,6 +3551,7 @@ rule start
             .create_instance(&version, "{}")
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "tell-write",
             kind: "agent.tell",
             target: Some("worker"),
@@ -3627,6 +3674,7 @@ rule wait
             source_span_json: None,
         }];
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "tell",
             kind: "agent.tell",
             target: Some("worker"),
@@ -3660,6 +3708,7 @@ rule wait
         let store = SqliteStore::open_in_memory().expect("store opens");
         let mut kernel = RuntimeKernel::new(store);
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "tell",
             kind: "agent.tell",
             target: Some("worker"),
@@ -3773,6 +3822,7 @@ rule wait
         let store = SqliteStore::open_in_memory().expect("store opens");
         let mut kernel = RuntimeKernel::new(store);
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "tell",
             kind: "agent.tell",
             target: Some("worker"),
@@ -3948,6 +3998,7 @@ rule wait
         let store = SqliteStore::open_in_memory().expect("store opens");
         let mut kernel = RuntimeKernel::new(store);
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "tell",
             kind: "agent.tell",
             target: Some("worker"),
@@ -4008,6 +4059,7 @@ rule wait
         let store = SqliteStore::open_in_memory().expect("store opens");
         let mut kernel = RuntimeKernel::new(store);
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "tell",
             kind: "agent.tell",
             target: Some("worker"),
@@ -4125,6 +4177,7 @@ rule wait
             .create_instance(&version, "{}")
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "tell",
             kind: "agent.tell",
             target: Some("worker"),
@@ -4191,6 +4244,7 @@ rule wait
             .create_instance(&version, "{}")
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "write",
             kind: "agent.tell",
             target: Some("worker"),
@@ -4264,6 +4318,7 @@ rule wait
             .create_instance(&version, "{}")
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "tell",
             kind: "agent.tell",
             target: Some("worker"),
@@ -4645,6 +4700,7 @@ rule wait
             .create_instance(&version, "{}")
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "tell",
             kind: "agent.tell",
             target: Some("worker"),
@@ -4826,6 +4882,7 @@ rule wait
                 facts: &[],
                 consumed_fact_ids: &[],
                 effects: &[NewEffect {
+                    timeout_seconds: None,
                     effect_id: "tell",
                     kind: "agent.tell",
                     target: Some("worker"),
@@ -4905,6 +4962,7 @@ rule wait
             .create_instance(&version, "{}")
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "tell",
             kind: "agent.tell",
             target: Some("worker"),
@@ -5096,6 +5154,7 @@ rule wait
                 facts: &[],
                 consumed_fact_ids: &[],
                 effects: &[NewEffect {
+                    timeout_seconds: None,
                     effect_id: "tell",
                     kind: "agent.tell",
                     target: Some("worker"),
@@ -5180,6 +5239,7 @@ rule wait
                 facts: &[],
                 consumed_fact_ids: &[],
                 effects: &[NewEffect {
+                    timeout_seconds: None,
                     effect_id: "tell",
                     kind: "agent.tell",
                     target: Some("worker"),
@@ -5334,6 +5394,7 @@ rule wait
                 facts: &[],
                 consumed_fact_ids: &[],
                 effects: &[NewEffect {
+                    timeout_seconds: None,
                     effect_id: "tell",
                     kind: "agent.tell",
                     target: Some("worker"),
@@ -5479,6 +5540,7 @@ rule wait
                 facts: &[],
                 consumed_fact_ids: &[],
                 effects: &[NewEffect {
+                    timeout_seconds: None,
                     effect_id: "tell",
                     kind: "agent.tell",
                     target: Some("worker"),
@@ -5594,6 +5656,7 @@ rule wait
                 facts: &[],
                 consumed_fact_ids: &[],
                 effects: &[NewEffect {
+                    timeout_seconds: None,
                     effect_id: "tell",
                     kind: "agent.tell",
                     target: Some("pi"),
@@ -5762,6 +5825,7 @@ rule wait
             .create_instance(&version, "{}")
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "review",
             kind: "baml.coerce",
             target: None,
@@ -5858,6 +5922,7 @@ rule wait
             .create_instance(&version, "{}")
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "review",
             kind: "baml.coerce",
             target: None,
@@ -5959,6 +6024,7 @@ rule wait
             .create_instance(&version, "{}")
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "claim",
             kind: "loft.claim",
             target: None,
@@ -6057,6 +6123,7 @@ rule wait
             .create_instance(&version, "{}")
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "claim",
             kind: "loft.claim",
             target: None,
@@ -6170,6 +6237,7 @@ rule wait
             .create_instance(&version, "{}")
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "renew",
             kind: "loft.renew",
             target: None,
@@ -6266,6 +6334,7 @@ rule wait
             .create_instance(&version, "{}")
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "ask",
             kind: "human.ask",
             target: None,
@@ -6354,6 +6423,7 @@ rule wait
             .create_instance(&version, "{}")
             .expect("instance creates");
         let effects = [NewEffect {
+            timeout_seconds: None,
             effect_id: "tell",
             kind: "agent.tell",
             target: Some("worker"),

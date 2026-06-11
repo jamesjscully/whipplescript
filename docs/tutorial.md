@@ -1,266 +1,278 @@
-# Tutorial: Route And Review Agent Work
+# Tutorial: build a triage workflow
 
-This tutorial runs a fixture-backed workflow that sends language tasks to three
-logical agents, reviews each result with a typed model-decision effect, and
-records inspectable facts.
+In this tutorial you write a workflow from an empty file and run it to a
+completed instance. The workflow seeds two bug tickets, has an agent propose
+a triage plan for each, asks a human to sign off on the high-severity one,
+and completes or fails depending on the answer.
 
-It does not require Codex, Claude, Pi, BAML, Loft, or external credentials. The
-fixture provider stands in for real providers so you can see the orchestration
-model first.
+Along the way you will use most of the language: typed facts, a seed table,
+an agent, effect sequencing with `after`, a human review gate, guards, and
+workflow terminals. The fixture provider stands in for a real agent, so no
+credentials are needed.
 
-## What You Will Run
+[Install the CLI](install.md) first if you have not.
 
-The tutorial uses
-[`examples/provider-language-e2e.whip`](../examples/provider-language-e2e.whip).
-The workflow does four things:
+## 1. Declare the data
 
-1. Seeds six language tasks.
-2. Routes each task to a logical provider agent: `codex`, `claude`, or `pi`.
-3. Reviews each completed turn with `reviewLanguageArtifact`.
-4. Records a `LanguageE2EResult` fact for each reviewed task.
-
-The workflow also has assertions that check the run reached the expected state:
-two reviewed results per provider, no queued tasks left, six completed
-`agent.tell` effects, and six completed `baml.coerce` effects.
-
-## 1. Install And Check
-
-From a checkout:
-
-```sh
-git clone https://github.com/jamesjscully/whipplescript.git
-cd whipplescript
-cargo install --path crates/whipplescript-cli --locked
-whip doctor
-```
-
-If you already have a checkout and prefer not to install, replace `whip` in the
-commands below with:
-
-```sh
-cargo run -p whipplescript --
-```
-
-## 2. Read The Workflow Shape
-
-The workflow declares task and result facts:
+Create `triage.whip`. Start with the workflow's name, its terminal
+contracts, and the fact types it works over:
 
 ```whip
-class LanguageTask {
-  provider AgentRef<codex | claude | pi>
-  language string
-  expectedScript string
-  prompt string
-  artifactPath string
-  status "queued"
+workflow TicketTriage
+
+output result TriageDecision
+failure error TriageBlocked
+
+class Ticket {
+  id string
+  title string
+  severity string
+  status string
 }
 
-class LanguageE2EResult {
-  provider string
-  language string
-  artifactPath string
-  turn AgentTurn
-  review LanguageQualityReview
-  status "reviewed"
-}
-```
-
-It declares three logical agents:
-
-```whip
-agent codex {
-  profile "repo-writer"
-  capacity 2
+class TriagedTicket {
+  id string
+  title string
+  severity string
+  plan string
+  status "triaged"
 }
 
-agent claude {
-  profile "repo-writer"
-  capacity 2
+class TriageDecision {
+  decision string
+  decidedBy string
 }
 
-agent pi {
-  profile "repo-writer"
-  capacity 2
+class TriageBlocked {
+  reason string
 }
 ```
 
-Then one rule routes each queued task to the task's selected agent:
+Two things to note:
+
+- `output` and `failure` declare what this workflow produces when it ends.
+  Every workflow must end (or be explicitly tagged as a service); the checker
+  enforces this below.
+- `status "triaged"` is a literal type: a `TriagedTicket` can only ever have
+  that status. Literal fields are the idiomatic way to model small state
+  machines.
+
+## 2. Declare the agent and seed data
 
 ```whip
-rule run_language_task
-  when {
-    LanguageTask as task where task.status == "queued"
-    task.provider is available
+agent triager {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+table tickets as Ticket [
+  {
+    id "T-31"
+    title "Login returns 500 on empty password"
+    severity "high"
+    status "open"
   }
+  {
+    id "T-32"
+    title "Typo in footer copyright"
+    severity "low"
+    status "open"
+  }
+]
+```
+
+The agent binds to the `fixture` provider for now; switching to a real
+provider later changes this one line, not the rules. The table seeds two
+`Ticket` facts when the instance starts.
+
+## 3. Write the triage rule
+
+```whip
+rule triage_open_ticket
+  when Ticket as ticket where ticket.status == "open"
+  when triager is available
 => {
-  tell task.provider as turn """
-  Complete this language e2e task.
+  tell triager as turn """markdown
+  Suggest an owner and a fix plan for this ticket:
 
-  Target language:
-  {{ task.language }}
-
-  Task:
-  {{ task.prompt }}
+  {{ ticket.title }} (severity: {{ ticket.severity }})
   """
 
-  after turn succeeds {
-    coerce reviewLanguageArtifact(task.language, task.expectedScript, task.artifactPath, turn.summary) as review
-  }
-
-  after review succeeds {
-    done task
-
-    record LanguageE2EResult {
-      provider task.provider
-      language task.language
-      artifactPath task.artifactPath
-      turn turn
-      review review
-      status "reviewed"
+  after turn succeeds as triaged {
+    done ticket -> record TriagedTicket {
+      id ticket.id
+      title ticket.title
+      severity ticket.severity
+      plan triaged.summary
+      status "triaged"
     }
   }
 }
 ```
 
-The important point is that agent work and review are durable effects. They do
-not run inside the rule commit. The runtime records the request, a worker
-executes it, and later rules continue from the effect result.
+This is the core pattern of the language:
 
-## 3. Check The Workflow
+- The `when` clauses say what the rule waits for: an open ticket, and free
+  capacity on the agent.
+- `tell` does not call the agent. It records a durable `agent.tell` effect;
+  a worker executes it later through the provider.
+- `after turn succeeds as triaged` runs when the effect completes
+  successfully — minutes or days later — with the turn's output bound to
+  `triaged`. Output is only visible inside the `after` block.
+- `done ticket -> record ...` consumes the open ticket and records its
+  replacement in the same atomic commit, so a ticket can never be both open
+  and triaged.
+
+## 4. Let the checker catch the missing ending
+
+Check what you have so far:
 
 ```sh
-whip check examples/provider-language-e2e.whip
+whip check triage.whip
 ```
 
-You should see the compiled workflow summary with agents, assertions, and rules.
-The exact hashes may differ, but the command should exit successfully.
+```text
+error: workflow `TicketTriage` has no rule that reaches `complete` or `fail`
+  = help: add a rule that runs `complete <output> { ... }` or `fail <failure> { ... }`,
+          or tag the workflow `@service` if it intentionally runs forever
+```
 
-## 4. Run With The Fixture Provider
+The checker is right: tickets get triaged, and then nothing ever finishes
+the workflow. Add the human gate and the two endings.
 
-Use `dev` for local validation:
+## 5. Add the human approval gate
+
+```whip
+rule request_signoff
+  when TriagedTicket as ticket where ticket.severity == "high"
+=> {
+  askHuman as signoff """markdown
+  {{ ticket.title }} was triaged with this plan:
+
+  {{ ticket.plan }}
+
+  Approve or reject the plan.
+  """
+}
+
+rule approve_plan
+  when human answered signoff as answer where answer.choice == "approve"
+=> {
+  complete result {
+    decision answer.choice
+    decidedBy answer.answered_by
+  }
+}
+
+rule reject_plan
+  when human answered signoff as answer where answer.choice == "reject"
+=> {
+  fail error {
+    reason "triage plan rejected"
+  }
+}
+```
+
+`askHuman` creates a `human.ask` effect that surfaces as an inbox item. When
+someone answers it, the runtime records a fact that `human answered ...`
+rules match; the answer payload carries `choice`, `text`, and `answered_by`.
+
+Finally, add assertions — executable claims about the finished run that
+`dev` evaluates for you:
+
+```whip
+assert count(Ticket where status == "open") == 0
+assert count(TriagedTicket) == 2
+```
+
+Check again; it should pass and print the compiled rule graph:
+
+```sh
+whip check triage.whip
+```
+
+## 6. Run it
 
 ```sh
 mkdir -p .whipplescript
-whip --store .whipplescript/tutorial.sqlite \
-  dev examples/provider-language-e2e.whip \
-  --provider fixture \
-  --until idle \
-  --json
+whip --store .whipplescript/triage.sqlite \
+  dev triage.whip --provider fixture --until idle
 ```
 
-Save the returned `instance_id`.
-
-A successful run has six passing assertions. The JSON is verbose, but the shape
-to look for is:
-
-```json
-{
-  "workflow": "ProviderLanguageE2E",
-  "assertions": [
-    {"status": "passed"},
-    {"status": "passed"}
-  ],
-  "steps": [
-    {"committed_rules": 7, "facts_created": 6, "effects_created": 6},
-    {"committed_rules": 6, "facts_created": 0, "effects_created": 6},
-    {"committed_rules": 6, "facts_created": 6, "effects_created": 0}
-  ],
-  "workers": [
-    {"provider": "fixture", "ran_effects": 6},
-    {"provider": "fixture", "ran_effects": 6}
-  ]
-}
-```
-
-## 5. Inspect Status
+`dev` reports both assertions passing, and `status` shows the instance is
+still `running` — it is waiting for the sign-off:
 
 ```sh
-whip --store .whipplescript/tutorial.sqlite status <instance_id>
+whip --store .whipplescript/triage.sqlite status <instance_id>
+whip --store .whipplescript/triage.sqlite inbox
 ```
-
-Expected shape:
 
 ```text
-instance ins_... running
-facts=24 queued_effects=0 blocked_effects=0 active_runs=0 failures=0
-recent events:
-  #... assertion.passed source=assertion
+key_... instance=ins_... severity=normal created=...
+  Login returns 500 on empty password was triaged with this plan: ...
 ```
 
-The instance is still `running` because this example validates assertions but
-does not declare a workflow terminal `complete` action. That is fine for this
-tutorial; the important part is that all expected work has become durable facts
-and completed effects.
+Only the high-severity ticket produced an inbox item; T-32 was triaged
+without ceremony.
 
-## 6. Inspect Facts
+## 7. Answer and finish
+
+Answer the review, then step the instance so the decision rules see it:
 
 ```sh
-whip --store .whipplescript/tutorial.sqlite facts <instance_id>
+whip --store .whipplescript/triage.sqlite inbox answer <item_id> --choice approve --by alice
+whip --store .whipplescript/triage.sqlite step <instance_id> --program triage.whip
+whip --store .whipplescript/triage.sqlite status <instance_id>
 ```
-
-You should see six `LanguageE2EResult` facts, plus projected completion facts.
-One result looks like:
 
 ```text
-LanguageE2EResult ... {
-  "artifactPath":"target/dogfood/language/codex-french.txt",
-  "language":"French",
-  "provider":"codex",
-  "review":{
-    "confidence":0.75,
-    "isTargetLanguage":true,
-    "isWellFormed":true,
-    "usesExpectedScript":true
-  },
-  "status":"reviewed"
-}
+instance ins_... completed
 ```
 
-This is the payoff: after the workflow runs, you can ask the runtime what
-happened without reconstructing it from a chat transcript.
-
-## 7. Inspect Effects
+The durable record of the whole run is now queryable:
 
 ```sh
-whip --store .whipplescript/tutorial.sqlite effects <instance_id>
+whip --store .whipplescript/triage.sqlite facts <instance_id>
 ```
-
-Expected shape:
 
 ```text
-key_... agent.tell status=completed target=codex profile=repo-writer
-key_... agent.tell status=completed target=claude profile=repo-writer
-key_... agent.tell status=completed target=pi profile=repo-writer
-key_... baml.coerce status=completed target=reviewLanguageArtifact
+TriagedTicket          {"id":"T-31","plan":"...","severity":"high","status":"triaged",...}
+TriagedTicket          {"id":"T-32","plan":"...","severity":"low","status":"triaged",...}
+agent.turn.completed   {"agent":"triager","provider":"fixture","status":"completed",...}
+agent.turn.completed   {"agent":"triager","provider":"fixture","status":"completed",...}
+human.answer.received  {"answer":{"answered_by":"alice","choice":"approve",...},...}
 ```
 
-The `agent.tell` rows are the routed agent turns. The `baml.coerce` rows are the
-typed review decisions. With real providers, these same effect records are where
-you would inspect provider status, failures, retries, and evidence.
+`effects` shows the two agent turns and the human ask, all `completed`;
+`trace --check` verifies the lifecycle conforms to the runtime model.
 
-## 8. What To Change Next
+## 8. Try the failure path
 
-Try editing `examples/provider-language-e2e.whip`:
-
-- Add another `LanguageTask` in `seed_language_matrix`.
-- Change an agent capacity.
-- Change an assertion and watch `dev` report the mismatch.
-- Add a new result field to `LanguageE2EResult`.
-
-Then run:
+Run a fresh instance and reject the plan:
 
 ```sh
-whip check examples/provider-language-e2e.whip
-whip --store .whipplescript/tutorial.sqlite \
-  dev examples/provider-language-e2e.whip \
-  --provider fixture \
-  --until idle
+whip --store .whipplescript/triage.sqlite \
+  dev triage.whip --provider fixture --until idle
+whip --store .whipplescript/triage.sqlite inbox
+whip --store .whipplescript/triage.sqlite inbox answer <item_id> --choice reject --by alice
+whip --store .whipplescript/triage.sqlite step <instance_id> --program triage.whip
+whip --store .whipplescript/triage.sqlite status <instance_id>
 ```
 
-## Where To Go Next
+```text
+instance ins_... failed
+```
 
-- [Concepts](concepts.md): the core terms behind this tutorial.
-- [Language Reference](language-reference.md): syntax and authoring details.
-- [Runtime And Operations Reference](runtime-operations.md): stores, effects,
-  workers, providers, failures, and inspection.
-- [Providers And Plugins](providers.md): how fixture and real providers fit.
+The `reject_plan` rule executed `fail error { ... }`. Both instances — one
+completed, one failed — coexist in the same store with full histories.
+
+## Where to go next
+
+- Swap `provider fixture` for a real provider once you have one configured:
+  [providers & plugins](providers.md).
+- Add a typed model review with `coerce` instead of trusting the turn
+  summary: see [`examples/queue-worker-with-review.whip`](../examples/queue-worker-with-review.whip).
+- Read the [manual](manual.md) for authoring guidance — retries, branching,
+  composition — and the [language reference](language-reference.md) for the
+  full construct list.

@@ -91,12 +91,14 @@ mkdir -p "$(dirname "$REPORT")"
   echo "## Events"
   echo
   echo '```jsonl'
+  # shellcheck disable=SC2016 # Literal Markdown fence escaping.
   sed 's/```/` ` `/g' "$EVENTS_JSONL"
   echo '```'
   echo
   echo "## Stderr"
   echo
   echo '```text'
+  # shellcheck disable=SC2016 # Literal Markdown fence escaping.
   sed 's/```/` ` `/g' "$STDERR_LOG"
   echo '```'
 } >"$REPORT"

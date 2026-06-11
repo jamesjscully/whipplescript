@@ -1,50 +1,57 @@
-# Current State
+# Current state
 
-WhippleScript is useful today for local experiments with durable agent
-orchestration, but it is not a stable production dependency yet.
+WhippleScript is pre-1.0. It is good for local experiments with durable agent
+orchestration; it is not yet a stable production dependency.
 
-## Works Today
+## Stable enough to rely on
 
-- Source install from a checkout or Git URL.
-- `whip check` and `whip compile` for checked `.whip` examples.
-- Local SQLite stores for runtime experiments.
-- `whip dev` with the fixture provider for deterministic local validation.
-- `run`, `step`, and `worker` as separate runtime boundaries.
-- Inspection commands: `status`, `log`, `facts`, `effects`, `runs`,
-  `evidence`, `diagnostics`, and `trace`.
-- Human review inbox shape through fixture-backed `human.ask` effects.
-- BAML-style typed coercion effects through fixture-backed local validation.
-- Workflow revision through `whip revise` for non-terminal running instances.
-- Formal and e2e checks used by maintainers.
+- The authoring loop: `check`, `compile`, `dev` with the fixture provider,
+  and the inspection commands (`status`, `log`, `facts`, `effects`, `runs`,
+  `evidence`, `diagnostics`, `trace --check`).
+- The execution model: durable facts, events, effects, atomic rule commits,
+  effect dependencies, leases, and replayable traces.
+- Static liveness checks: workflows must reach `complete`/`fail` (escape tag
+  `@service`), rule reads must be producible (escape tag `@external`).
+- The human review loop: `askHuman` effects (with source-declared `choices`),
+  `whip inbox`, answers matched by `when human answered ...` rules.
+- Sequential `flow` blocks, which lower to ordinary rules visible in
+  `whip check`.
+- Work queues with the `builtin` tracker (`queue`, `file`/`claim`/`release`/
+  `finish`, `when <queue> has ready item`) and the `whip items` command family.
+- Time effects: `timeout` clauses, `timer`, and `cancel`, fired on worker
+  passes.
+- Inline `decide` decisions, `case` over string-literal unions, the general
+  `when fact <dotted.name>` readiness form, dev-profile raw `exec` commands
+  (allow-listed via `WHIPPLESCRIPT_EXEC_ALLOW`), and hosted script capability
+  `exec <name> with <record> -> Type` backed by a SHA-256-pinned manifest.
+- Lifecycle controls: `pause`, `resume`, `cancel`, `retry`, and workflow
+  revision (`whip revise`) for non-terminal instances.
+- Acceptance fixtures (`whip accept`) and tag-filtered assertion reports for
+  validating workflows in CI.
 
-## Early Or Experimental
+"Stable enough" means the in-repo implementation and tests hold; it is not a
+semver promise. Syntax, CLI flags, and JSON field names may still change
+between releases.
 
-- Public language syntax and lowering behavior may change.
-- CLI and JSON output fields may change.
-- Native provider integration for Codex, Claude, Pi, Loft, and BAML is still
-  settling.
-- Plugin/provider packaging and configuration are not stable public contracts.
-- Prebuilt GitHub Release binaries are the v0.1 binary install path; source
-  install remains the fallback for unsigned or platform-specific issues.
-- Production automation is not recommended without project-specific review.
+## Experimental
 
-## Stability Language
+- Native provider adapters (Codex, Claude, Pi) and their cancellation,
+  artifact, and recovery behavior.
+- Plugin packaging and provider configuration formats.
+- Prebuilt release binaries (source install is the reliable fallback).
 
-Some spec trackers say an internal subsystem is stable. In those files, stable
-means the in-repo implementation and tests for that subsystem are stable enough
-for the current v0 work.
+## Deprecations and removals
 
-That does not mean the public WhippleScript language, CLI, runtime behavior, or
-provider/plugin interfaces are stable semver contracts.
+- `consume` is a deprecated alias for `done`; it compiles with a warning and
+  will be removed.
+- `emit` has been removed from the language; using it is now a check error.
+- Loft-specific syntax (`loft has ready issue`, `claim ... with loft`) is gone,
+  replaced by work queues. The builtin `AgentTurn` type no longer carries
+  `issue` or `changedFiles` fields.
 
-## Best Current Use
+## Recommended use today
 
-Use WhippleScript to prototype and inspect agent orchestration:
-
-- route tasks to logical agents
-- add review or human approval gates
-- test retry/failure branches
-- inspect facts, effects, runs, and evidence
-- explore provider/plugin boundaries before wiring real credentials
-
-Start with [Quickstart](quickstart.md), then [Tutorial](tutorial.md).
+Prototype and validate orchestration locally: route tasks to logical agents,
+add review and approval gates, exercise retry and failure branches with the
+fixture provider, and inspect the durable record. Treat real-provider runs
+as supervised experiments.

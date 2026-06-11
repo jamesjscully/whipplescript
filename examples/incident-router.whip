@@ -1,0 +1,92 @@
+@service
+workflow IncidentRouter
+
+class Owner {
+  name string
+}
+
+class Incident {
+  id string
+  title string
+  severity int
+  tags string[]
+  metadata map<string>
+  owner Owner?
+  assignee AgentRef<codex | claude | pi>
+  status "open"
+}
+
+class RoutedIncident {
+  id string
+  provider string
+  route "code" | "review" | "ops"
+  status "routed"
+}
+
+agent codex {
+  provider codex
+  profile "repo-writer"
+  capacity 1
+}
+
+agent claude {
+  provider claude
+  profile "repo-reader"
+  capacity 1
+}
+
+agent pi {
+  provider pi
+  profile "repo-reader"
+  capacity 1
+}
+
+# This table is intentionally small but exercises arrays, maps, optionals,
+# literal unions, nested objects, and dynamic AgentRef routing.
+table incidents as Incident [
+  {
+    id "INC-1"
+    title "API latency above SLO"
+    severity 3
+    tags ["api", "slo"]
+    metadata { route "ops" }
+    owner { name "Ada" }
+    assignee pi
+    status "open"
+  }
+  {
+    id "INC-2"
+    title "Regression in checkout"
+    severity 2
+    tags ["bug", "checkout"]
+    metadata { route "code" }
+    owner null
+    assignee codex
+    status "open"
+  }
+]
+
+assert count(Incident where status == "open") == 0
+assert count(RoutedIncident where route in ["code", "review", "ops"]) == 2
+assert exists(RoutedIncident where provider == "codex")
+assert exists(RoutedIncident where provider == "pi")
+
+rule route_incident
+  when Incident as incident where incident.severity >= 2 and "route" in incident.metadata and incident.metadata["route"] in ["code", "review", "ops"] and (incident.owner == null or exists incident.owner)
+  when incident.assignee is available
+=> {
+  tell incident.assignee as turn """markdown
+  Handle incident {{ incident.id }}.
+
+  Title: {{ incident.title }}
+  """
+
+  after turn succeeds {
+    done incident -> record RoutedIncident {
+      id incident.id
+      provider incident.assignee
+      route incident.metadata["route"]
+      status "routed"
+    }
+  }
+}

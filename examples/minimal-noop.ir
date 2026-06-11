@@ -1,4 +1,6 @@
 workflow MinimalNoop
+workflow_contracts
+  output result ref<StartupSeen>
 schemas
   class StartupSeen
     source string
@@ -10,4 +12,4 @@ rules
       pattern:started
     writes
       schema:StartupSeen
-    body_hash a9ab267aca9bad6e
+    body_hash 4c6d15b392e98296

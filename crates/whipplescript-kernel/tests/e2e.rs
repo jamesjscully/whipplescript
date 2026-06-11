@@ -58,8 +58,8 @@ fn e2e_compiles_and_runs_minimal_workflow() {
 
 #[test]
 fn e2e_loft_claim_success_runs_agent_after_claim() {
-    let source = include_str!("../../../examples/loft-worker-with-review.whip");
-    let (mut kernel, instance_id) = kernel_from_source("LoftWorkerWithReview", source);
+    let source = include_str!("../../../examples/queue-worker-with-review.whip");
+    let (mut kernel, instance_id) = kernel_from_source("QueueWorkerWithReview", source);
     let effects = [
         effect("claim", "loft.claim", r#"{"issue_id":"iss_abc"}"#),
         effect("tell", "agent.tell", r#"{"prompt":"implement"}"#),
@@ -130,8 +130,8 @@ fn e2e_loft_claim_success_runs_agent_after_claim() {
 
 #[test]
 fn e2e_loft_claim_failure_routes_to_human_review() {
-    let source = include_str!("../../../examples/loft-worker-with-review.whip");
-    let (mut kernel, instance_id) = kernel_from_source("LoftWorkerWithReview", source);
+    let source = include_str!("../../../examples/queue-worker-with-review.whip");
+    let (mut kernel, instance_id) = kernel_from_source("QueueWorkerWithReview", source);
     let effects = [
         effect("claim", "loft.claim", r#"{"issue_id":"iss_busy"}"#),
         effect("review", "human.ask", r#"{"prompt":"claim failed"}"#),
@@ -443,6 +443,7 @@ fn e2e_capability_denial_blocks_with_useful_status() {
     let source = include_str!("../../../examples/plugin-memory.whip");
     let (mut kernel, instance_id) = kernel_from_source("PluginMemory", source);
     let denied = NewEffect {
+        timeout_seconds: None,
         effect_id: "write",
         kind: "agent.tell",
         target: None,
@@ -501,6 +502,7 @@ fn e2e_plugin_registered_effect_runs_through_outbox() {
         .create_instance(&version, "{}")
         .expect("instance creates");
     let memory_query = NewEffect {
+        timeout_seconds: None,
         effect_id: "context",
         kind: "memory.query",
         target: None,
@@ -749,8 +751,8 @@ fn e2e_restart_rebuilds_projection_from_event_log() {
 #[test]
 fn e2e_repeated_dependency_claimability_stress() {
     for index in 0..25 {
-        let source = include_str!("../../../examples/loft-worker-with-review.whip");
-        let (mut kernel, instance_id) = kernel_from_source("LoftWorkerWithReview", source);
+        let source = include_str!("../../../examples/queue-worker-with-review.whip");
+        let (mut kernel, instance_id) = kernel_from_source("QueueWorkerWithReview", source);
         let effects = [
             effect("claim", "loft.claim", r#"{"issue_id":"iss_stress"}"#),
             effect("tell", "agent.tell", r#"{"prompt":"implement"}"#),
@@ -1302,6 +1304,7 @@ fn commit_single_effect(
 
 fn effect<'a>(effect_id: &'a str, kind: &'a str, input_json: &'a str) -> NewEffect<'a> {
     NewEffect {
+        timeout_seconds: None,
         effect_id,
         kind,
         target: None,

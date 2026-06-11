@@ -1,39 +1,94 @@
 # WhippleScript
 
-A whippletree distributes load from different sources. WhippleScript is a
-programming language for coordinating work across multiple AI agents.
+WhippleScript is a language for coordinating work across multiple AI agents.
+You declare typed facts, agents, and rules; the runtime turns matched rules
+into durable effects, executes them through providers, and records every
+event, fact, and provider run in an inspectable store.
 
-WhippleScript is for programmers who want agents to collaborate in a repeatable
-way: route work to specialized agents, wait for results, ask for review, retry
-failures, and inspect what happened afterward.
+A whippletree distributes load from different sources. So does this.
 
-> Warning: WhippleScript is early and not yet stable. The language, CLI, runtime
-> behavior, and provider/plugin interfaces may change as the project settles.
-> The current build is best for local experiments and prototype agent
-> orchestration, not stable production dependencies.
+> WhippleScript is pre-1.0. The language, CLI, and provider interfaces may
+> change between releases. See [current state](docs/current-state.md) for
+> what is stable enough to rely on today.
 
-## What You Can Use It For
+## Why
 
-- Split a goal across several agents with clear handoffs.
-- Put human review or approval in the middle of an agent workflow.
-- Keep a durable record of agent turns, facts, effects, logs, and traces.
-- Retry, resume, or audit long-running work instead of losing context in chat.
-- Connect agent turns to tools, skills, providers, schemas, and plugins.
-- Test orchestration rules locally before trusting them with real work.
+Chat transcripts make poor orchestration records. When several agents hand
+work to each other — with review gates, retries, and human approval in the
+middle — you want the process written down as code that can run again, and a
+durable record of what actually happened.
 
-The target use case is not "write one better prompt." It is "describe the way
-work should move between agents, tools, and people so the process can run again
-and be inspected afterward."
+WhippleScript separates the two concerns:
 
-## Try It
+- **Rules decide.** Deterministic policy: what happens next, given the current
+  facts. No I/O, no model calls.
+- **Effects do.** Agent turns, typed model decisions, human review requests,
+  and child workflows are durable effects, executed by workers through
+  providers, with results recorded as events.
 
-Install the released `whip` binary from GitHub Releases, or use Rust and Cargo
-to install the current source build.
+The result is a workflow you can step, pause, resume, revise, and audit.
 
-For prebuilt release installers and checksum verification, see
-[`docs/install.md`](docs/install.md).
+## A taste
 
-Clone the repo and install the CLI from the checkout:
+A triage workflow: an agent proposes a plan for each open ticket, and a human
+signs off on the high-severity ones.
+
+```whip
+rule triage_open_ticket
+  when Ticket as ticket where ticket.status == "open"
+  when triager is available
+=> {
+  tell triager as turn """markdown
+  Suggest an owner and a fix plan for this ticket:
+
+  {{ ticket.title }} (severity: {{ ticket.severity }})
+  """
+
+  after turn succeeds as triaged {
+    done ticket -> record TriagedTicket {
+      id ticket.id
+      title ticket.title
+      severity ticket.severity
+      plan triaged.summary
+      status "triaged"
+    }
+  }
+}
+
+rule request_signoff
+  when TriagedTicket as ticket where ticket.severity == "high"
+=> {
+  askHuman as signoff """markdown
+  {{ ticket.title }} was triaged with this plan:
+
+  {{ ticket.plan }}
+
+  Approve or reject the plan.
+  """
+}
+
+rule approve_plan
+  when human answered signoff as answer where answer.choice == "approve"
+=> {
+  complete result {
+    decision answer.choice
+    decidedBy answer.answered_by
+  }
+}
+```
+
+The [tutorial](docs/tutorial.md) builds this workflow from scratch and runs
+it end to end — including answering the human review from the CLI.
+
+## Install
+
+Prebuilt binaries are published on GitHub Releases:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/jamesjscully/whipplescript/releases/latest/download/whipplescript-installer.sh | sh
+```
+
+Or install from source:
 
 ```sh
 git clone https://github.com/jamesjscully/whipplescript.git
@@ -42,191 +97,68 @@ cargo install --path crates/whipplescript-cli --locked
 whip doctor
 ```
 
-Check a multi-agent workflow:
+See [install](docs/install.md) for Windows, checksums, and troubleshooting.
+
+## Run something
+
+The fixture provider executes workflows deterministically with no
+credentials, so you can validate orchestration before wiring up real agents:
 
 ```sh
-whip check examples/multi-agent-bounded-concurrency.whip
-```
-
-Run a no-credentials local workflow with the fixture provider:
-
-```sh
-mkdir -p .whipplescript
 whip --store .whipplescript/quickstart.sqlite \
-  dev examples/minimal-noop.whip \
-  --provider fixture \
-  --until idle \
-  --json
+  dev examples/minimal-noop.whip --provider fixture --until idle --json
 ```
 
-Inspect the result with the returned `instance_id`:
+Then inspect the run:
 
 ```sh
 whip --store .whipplescript/quickstart.sqlite status <instance_id>
-whip --store .whipplescript/quickstart.sqlite log <instance_id>
-whip --store .whipplescript/quickstart.sqlite facts <instance_id>
+whip --store .whipplescript/quickstart.sqlite facts  <instance_id>
+whip --store .whipplescript/quickstart.sqlite log    <instance_id>
 ```
 
-For the full walkthrough, use the [Quickstart](docs/quickstart.md).
-For a more useful first workflow, follow the [Tutorial](docs/tutorial.md).
+## Documentation
 
-## What A Workflow Looks Like
+| | |
+| --- | --- |
+| [Quickstart](docs/quickstart.md) | Install, run an example, inspect the result. |
+| [Tutorial](docs/tutorial.md) | Build a triage workflow with a human approval gate. |
+| [Concepts](docs/concepts.md) | The execution model: facts, rules, effects, workers. |
+| [Language reference](docs/language-reference.md) | Every construct in `.whip` source. |
+| [CLI & API reference](docs/api-reference.md) | Commands, JSON shapes, status values, crate APIs. |
+| [Runtime & operations](docs/runtime-operations.md) | Stores, lifecycle, failures, revision, recovery. |
+| [Providers & plugins](docs/providers.md) | Fixture and native providers, credentials, plugins. |
+| [Examples](docs/examples.md) | The checked example catalog. |
+| [Troubleshooting](docs/troubleshooting.md) | Common first-session problems. |
+| [Current state](docs/current-state.md) | What works today and what is still settling. |
 
-This is the shape of a simple multi-agent workflow:
-
-```whip
-workflow MultiAgentBoundedConcurrency
-
-agent implementer {
-  profile "repo-writer"
-  capacity 2
-}
-
-agent reviewer {
-  profile "repo-reader"
-  capacity 1
-}
-
-rule implement_ready_work
-  when {
-    WorkItem as item
-    implementer is available
-  }
-=> {
-  tell implementer """
-  Implement this work item:
-
-  {{ item.title }}
-
-  {{ item.body }}
-  """
-}
-
-rule review_completed_turn
-  when {
-    worker completed turn for loft issue as turn
-    reviewer is available
-  }
-=> {
-  tell reviewer """
-  Review this completed turn:
-
-  {{ turn.summary }}
-
-  Changed files:
-  {{ turn.changedFiles }}
-  """
-}
-```
-
-See the checked examples in [`examples/`](examples/), especially:
-
-- [`examples/multi-agent-bounded-concurrency.whip`](examples/multi-agent-bounded-concurrency.whip)
-- [`examples/loft-worker-with-review.whip`](examples/loft-worker-with-review.whip)
-- [`examples/codex-poem-coerce-review.whip`](examples/codex-poem-coerce-review.whip)
-- [`examples/multi-provider-poem-review.whip`](examples/multi-provider-poem-review.whip)
-
-## Docs By Goal
-
-- I want to install it: [`docs/install.md`](docs/install.md)
-- I want to run an example: [`docs/quickstart.md`](docs/quickstart.md)
-- I want the main tutorial: [`docs/tutorial.md`](docs/tutorial.md)
-- I want the core concepts: [`docs/concepts.md`](docs/concepts.md)
-- I want to choose an example: [`docs/examples.md`](docs/examples.md)
-- I want to write a workflow: [`docs/language-reference.md`](docs/language-reference.md)
-- I want the full guide: [`docs/manual.md`](docs/manual.md)
-- I want to know what works today: [`docs/current-state.md`](docs/current-state.md)
-- I want to understand runtime state and failures:
-  [`docs/runtime-operations.md`](docs/runtime-operations.md)
-- I want exact CLI and API surfaces: [`docs/api-reference.md`](docs/api-reference.md)
-- I want to plug in capabilities or providers:
-  [`docs/providers.md`](docs/providers.md)
-- I hit a setup or runtime problem: [`docs/troubleshooting.md`](docs/troubleshooting.md)
-
-When asking a coding agent to author workflows, start with
+When pointing a coding agent at WhippleScript, start it with
 [`skills/whipplescript-author/SKILL.md`](skills/whipplescript-author/SKILL.md).
 
-## Good For / Not Yet Good For
+## Contributing
 
-Good for:
-
-- local experiments with multi-agent workflows
-- durable agent handoffs
-- human review gates
-- testing orchestration ideas
-- inspecting what happened after a run
-- building toward provider/plugin integrations
-
-Not yet good for:
-
-- depending on stable syntax
-- unattended production automation
-- assuming provider integrations will stay unchanged
-- plug-and-play hosted agent orchestration
-
-## How It Works
-
-You describe who should do what, when to wait, when to ask for review, and what
-counts as done. WhippleScript keeps the run durable and inspectable.
-
-At a high level:
+The workspace is plain Cargo:
 
 ```text
-facts/events + rules -> durable facts/effects
-effects + workers    -> provider runs
-provider results     -> events/facts
-workflow terminals   -> completed/failed instances
+crates/whipplescript-core     shared types and contracts
+crates/whipplescript-parser   .whip parser and typed IR
+crates/whipplescript-store    SQLite-backed runtime store
+crates/whipplescript-kernel   deterministic rule/effect kernel
+crates/whipplescript-cli      the whip CLI
+docs/                         user documentation
+spec/                         design records and implementation trackers
+models/                       formal models (Maude, TLA+)
 ```
 
-Source composition is split by role:
-
-- `include "schemas/common.whip"` composes source files.
-- `use memory` imports a plugin.
-- `pattern` and `apply` create reusable workflow fragments.
-- `invoke` starts durable child workflows.
-- skills are attached to agents or turns rather than imported as language
-  extensions.
-
-## For Contributors
-
-The active implementation starts at the repository root.
-
-```text
-Cargo.toml                      Rust workspace
-crates/whipplescript-core       shared types and contracts
-crates/whipplescript-parser     `.whip` source parser and typed IR
-crates/whipplescript-store      SQLite-backed runtime store
-crates/whipplescript-kernel     deterministic rule/effect runtime kernel
-crates/whipplescript-cli        control-plane CLI
-docs/                           user-facing documentation
-spec/                           design specs and implementation trackers
-models/                         formal models and checks
-scripts/                        root project checks
-```
-
-Run the current root checks:
+Before sending changes:
 
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-scripts/check-formal-models.sh
-scripts/check-tla-models.sh
-scripts/check-e2e.sh
 ```
 
-For a single readiness artifact, run:
-
-```sh
-scripts/check-release-readiness.sh
-```
-
-The source of truth for remaining work is
-[`spec/implementation-plan.md`](spec/implementation-plan.md). Distribution work
-is tracked in [`spec/distribution-tracker.md`](spec/distribution-tracker.md).
-
-The repo also includes a Nix dev shell for formal tooling:
-
-```sh
-nix develop
-```
+`scripts/check-release-readiness.sh` runs the full release gate, including the
+formal model checks (a Nix dev shell with the tooling is provided:
+`nix develop`). Remaining work is tracked in
+[`spec/implementation-plan.md`](spec/implementation-plan.md).

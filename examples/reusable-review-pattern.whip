@@ -1,0 +1,68 @@
+workflow ReusableReviewPattern
+
+output result ReviewBatch
+
+# Patterns remove repeated rule shape while keeping the lowered workflow explicit.
+class ChangeRequest {
+  id string
+  title string
+  status "queued"
+}
+
+class ReviewedChange {
+  id string
+  summary string
+  status "reviewed"
+}
+
+class ReviewBatch {
+  reviewed int
+}
+
+agent reviewer {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+table changes as ChangeRequest [
+  {
+    id "CR-1"
+    title "Simplify retry policy"
+    status "queued"
+  }
+]
+
+# Patterns expand at compile time; they are reuse, not runtime subroutines.
+pattern AgentReview<Input, Output> {
+  rule review
+    when Input as item
+    when reviewer is available
+  => {
+    tell reviewer as turn """markdown
+    Review {{ item.title }}.
+    """
+
+    after turn succeeds as reviewed {
+      done item -> record Output {
+        id item.id
+        summary reviewed.summary
+        status "reviewed"
+      }
+    }
+  }
+}
+
+apply AgentReview<ChangeRequest, ReviewedChange> as changeReview {
+}
+
+assert count(ChangeRequest where status == "queued") == 0
+assert count(ReviewedChange where status == "reviewed") == 1
+
+rule finish_batch
+  when ReviewedChange as reviewed where reviewed.status == "reviewed"
+=> {
+  complete result {
+    reviewed 1
+  }
+}

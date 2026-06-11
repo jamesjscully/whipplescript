@@ -1,126 +1,133 @@
 # Concepts
 
-This page explains the core WhippleScript terms before you need the full
-language reference.
+WhippleScript separates orchestration policy from execution. This page
+defines the handful of terms the rest of the documentation builds on.
+
+## The execution model
+
+```text
+facts/events + rules  ->  durable facts and effects
+effects + workers     ->  provider runs
+provider results      ->  events and facts
+workflow terminals    ->  completed or failed instances
+```
+
+Rules are deterministic: given the same facts, they commit the same changes.
+Everything external — an agent turn, a model decision, a human approval — is
+an effect, recorded durably before it runs and resolved by events after.
+That split is what makes a workflow steppable, resumable, and auditable.
 
 ## Workflow
 
-A workflow is the durable boundary for a unit of agent work. Starting a workflow
-creates an instance with its own event log, facts, effects, provider runs,
-evidence, and lifecycle state.
+The durable boundary for a unit of work. Starting a workflow creates an
+*instance* with its own event log, facts, effects, provider runs, evidence,
+and lifecycle state (`running`, `paused`, `completed`, `failed`,
+`cancelled`).
 
 ## Fact
 
-A fact is typed workflow state. Rules match facts, create new facts, and consume
-facts when work moves forward.
-
-Use facts for things like queued tasks, reviewed results, approvals, failures,
-and summaries.
+Typed workflow state. Rules match facts, create facts, and consume facts as
+work moves forward. Queued tasks, reviewed results, approvals, and failure
+records are all facts.
 
 ## Event
 
-An event records something that happened. The event log is append-only and is
-the source of truth for projections such as current facts, effects, runs, and
-status.
-
-Examples include `external.started`, `rule.committed`, `effect.terminal`,
-`workflow.completed`, and `human.answer.received`.
+An append-only record of something that happened: `external.started`,
+`rule.committed`, `effect.terminal`, `human.answer.received`,
+`workflow.completed`. The event log is the source of truth; facts, effects,
+status, and traces are projections over it.
 
 ## Rule
 
-A rule is deterministic orchestration policy:
+Deterministic policy. A rule names the facts and events it is waiting for,
+optionally filters them with a pure guard, and commits a rewrite — new facts,
+consumed facts, new effects, or a workflow terminal — atomically:
 
 ```whip
 rule dispatch
-  when {
-    WorkItem as item where item.status == "queued"
-    worker is available
-  }
+  when WorkItem as item where item.status == "queued"
+  when worker is available
 => {
   tell worker as turn "Do {{ item.title }}"
 }
 ```
 
-Rules decide what should happen next. They do not directly call external
-providers.
+Rules never perform I/O. If a decision needs a model or external data, the
+rule creates an effect and a later rule reacts to its completion.
+
+## Flow
+
+A sequential surface over rules. A flow reads top to bottom — do this step,
+then that one, then branch — and lowers to ordinary rules plus a generated
+await state. It adds no new runtime concept: the kernel still sees rules,
+facts, and effects, so a flow stays steppable and auditable like everything
+else. Use it when work is genuinely a fixed sequence; use plain rules when
+reactions are independent.
 
 ## Effect
 
-An effect is a durable request for external work. Agent turns, typed model
-decisions, human review requests, plugin calls, and child workflow invocations
-are all effects.
+A durable request for external work. `tell` (agent turn), `coerce`/`decide`
+(typed model decision), `askHuman` (review request), `call` (plugin
+capability), `exec` (dev raw command or hosted pinned script capability),
+`timer` (a delay), the queue verbs (`file`/`claim`/`release`/`finish`), and
+`invoke` (child workflow) all create effects. An effect records what was
+requested, which provider ran it, whether it finished, and what evidence was
+captured.
 
-Effects make agent workflows inspectable: you can see what was requested, which
-provider tried to run it, whether it completed, and what evidence was recorded.
+## Work queue
+
+A durable backlog of work items, declared in source and vendor-neutral. Where
+a fact is workflow state, a queue item is a unit of pending work to be
+claimed, worked, and finished — the `builtin` tracker persists it outside the
+event log so a backlog survives across instances. Rules pull from a queue with
+`claim`; a lost claim is an ordinary branchable failure, so contention needs no
+locks in source.
 
 ## Agent
 
-An agent is a logical target declared in source:
+A logical target declared in source:
 
 ```whip
-agent codex {
-  profile "repo-writer"
-  capacity 2
+agent triager {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
 }
 ```
 
-The workflow routes work to logical agents. Provider configuration decides how a
-logical agent maps to real execution.
+Source names the agent, its provider family, authority profile, and
+concurrency capacity. Runtime configuration supplies credentials and
+execution details — never the source file.
 
 ## Provider
 
-A provider executes effects. The fixture provider is deterministic and local.
-Real providers, such as Codex-style or Claude-style agent adapters, are the
-experimental bridge to actual agent systems.
-
-Use the fixture provider first so you can validate orchestration before
-debugging credentials or external tools.
+The thing that executes effects. The *fixture provider* is deterministic and
+local: it completes effects with synthetic results, which makes it the right
+default for development, tutorials, and tests. Native providers (Codex,
+Claude, Pi) bridge to real agent systems; see
+[providers & plugins](providers.md).
 
 ## Worker
 
-A worker claims ready effects and completes them through a provider. The worker
-does not invent workflow policy; it only executes effects that rules already
-materialized.
+The loop that claims ready effects, runs them through a provider under a
+lease, and records completions. Workers execute what rules already decided;
+they hold no policy of their own.
 
-## `run`, `step`, `worker`, And `dev`
+## The four runtime commands
 
-These commands are separate on purpose:
+| Command | Does | Does not |
+| --- | --- | --- |
+| `run` | Start an instance and record the start event. | Evaluate rules or providers. |
+| `step` | Evaluate rules and commit facts/effects. | Execute providers. |
+| `worker` | Execute ready effects through a provider. | Decide policy. |
+| `dev` | Compose all three in a loop, then evaluate assertions. | — |
 
-| Command | What it does |
-| --- | --- |
-| `run` | Starts an instance and records the start event. It does not evaluate rules or providers. |
-| `step` | Evaluates deterministic rules and materializes facts/effects. It does not execute providers. |
-| `worker` | Claims ready effects and completes them through a provider. |
-| `dev` | Local validation loop that composes `run`, `step`, and fixture workers, then evaluates assertions. |
+Use `dev` day to day. Use the separate commands when you want to observe one
+boundary at a time.
 
-For first experiments, use `dev`. Use `run`, `step`, and `worker` separately
-when you want to inspect each runtime boundary.
+## Skills and plugins
 
-## Fixture Provider Vs Real Providers
-
-The fixture provider gives deterministic completions for local validation. It is
-the right default for tutorials, tests, and workflow design.
-
-Real providers connect to external tools or agent systems. They are still
-experimental in this project, and their configuration and behavior may change.
-
-## Skills And Plugins
-
-A skill is context attached to an agent or turn. It does not extend the
-language.
-
-A plugin registers capabilities, providers, schemas, profiles, resources, and
-optional skills. Plugins should expose explicit effects rather than hidden
-control flow.
-
-## The Mental Model
-
-```text
-facts/events + rules -> durable facts/effects
-effects + workers    -> provider runs
-provider results     -> events/facts
-workflow terminals   -> completed/failed instances
-```
-
-WhippleScript is useful when the route, review, retry, and audit trail matter as
-much as the individual model response.
+A *skill* is a context bundle attached to an agent or a turn — it shapes what
+the agent knows, not what the language means. A *plugin* (imported with
+`use`) registers capabilities, providers, schemas, and resources; its
+capabilities are called as explicit effects, never as hidden control flow.

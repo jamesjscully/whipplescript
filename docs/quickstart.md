@@ -1,11 +1,12 @@
-# WhippleScript Quickstart
+# Quickstart
 
-This quickstart uses the deterministic fixture provider. It does not require
-real agent credentials.
+Run a workflow and inspect what happened, in about five minutes. Everything
+here uses the deterministic fixture provider — no agent credentials required.
 
-## 1. Install The CLI
+If facts, rules, and effects are new terms, skim [concepts](concepts.md)
+first; it is a two-minute read.
 
-From a checkout:
+## 1. Install
 
 ```sh
 git clone https://github.com/jamesjscully/whipplescript.git
@@ -14,35 +15,38 @@ cargo install --path crates/whipplescript-cli --locked
 whip doctor
 ```
 
-See [Install WhippleScript](install.md) for source install alternatives,
-planned binary releases, and troubleshooting.
+Prebuilt binaries and platform notes are in [install](install.md). For usage
+of any command, run `whip help <command>`.
 
-## 2. Check A Workflow
+## 2. Check a workflow
 
 ```sh
 whip check examples/multi-agent-bounded-concurrency.whip
 ```
 
-This verifies that the workflow parses, type-checks, and lowers to the current
-intermediate representation.
-
-Expected shape:
+`check` parses, type-checks, and lowers the source, then prints the compiled
+summary — declared agents, each rule's reads and writes, and the dependency
+edges between rules:
 
 ```text
 == examples/multi-agent-bounded-concurrency.whip
 workflow MultiAgentBoundedConcurrency
 agents
-  agent implementer profile=repo-writer capacity=2
-  agent reviewer profile=repo-reader capacity=1
+  agent implementer harness=<fallback> provider=codex profile=repo-writer capacity=2 ...
+  agent reviewer harness=<fallback> provider=claude profile=repo-reader capacity=1 ...
 rules
   rule implement_ready_work
   rule review_completed_turn
 ```
 
-## 3. Run A Local Workflow
+`check` also enforces two static liveness rules: every workflow must be able
+to reach `complete` or `fail`, and every rule's reads must be producible.
+See [liveness checks](language-reference.md#liveness-checks).
 
-Use `dev` first. It starts an instance, steps deterministic rules, runs fixture
-workers, and evaluates workflow assertions.
+## 3. Run a workflow
+
+`dev` starts an instance, steps rules, executes effects with the fixture
+provider, and evaluates assertions, in a loop until the instance is idle:
 
 ```sh
 mkdir -p .whipplescript
@@ -53,15 +57,14 @@ whip --store .whipplescript/quickstart.sqlite \
   --json
 ```
 
-Save the returned `instance_id`.
-
-Expected shape:
+Note the `instance_id` in the output. The interesting parts of the report:
 
 ```json
 {
   "workflow": "MinimalNoop",
+  "instance_id": "ins_...",
   "steps": [
-    {"committed_rules": 1, "facts_created": 1}
+    {"committed_rules": 1, "facts_created": 1, "effects_created": 0}
   ],
   "workers": [
     {"provider": "fixture", "ran_effects": 0}
@@ -69,68 +72,57 @@ Expected shape:
 }
 ```
 
-## 4. Inspect What Happened
+One rule fired and recorded one fact. The workflow then ran
+`complete result { ... }`, so the instance is finished.
+
+## 4. Inspect the run
+
+Every command that touches an instance takes the same `--store` that created
+it (or set `WHIPPLESCRIPT_STORE` once).
 
 ```sh
 whip --store .whipplescript/quickstart.sqlite status <instance_id>
-whip --store .whipplescript/quickstart.sqlite log <instance_id>
-whip --store .whipplescript/quickstart.sqlite facts <instance_id>
-whip --store .whipplescript/quickstart.sqlite trace <instance_id> --check --json
+whip --store .whipplescript/quickstart.sqlite facts  <instance_id>
+whip --store .whipplescript/quickstart.sqlite log    <instance_id>
+whip --store .whipplescript/quickstart.sqlite --json trace <instance_id> --check
 ```
 
-You should see a `StartupSeen` fact from `examples/minimal-noop.whip`.
-
-Expected `facts` shape:
+`status` reports the instance as `completed`. `facts` shows the recorded
+fact:
 
 ```text
 StartupSeen StartupSeen:... {"source":"external.started","state":"observed"}
 ```
 
-Expected `trace --check --json` shape:
+`trace --check` replays the effect lifecycle against the runtime's
+conformance model and reports `"conformance": {"ok": true}`.
 
-```json
-{
-  "schema": "whipplescript.local_trace.v0",
-  "conformance": {"ok": true}
-}
-```
+## 5. The pieces behind `dev`
 
-## 5. Understand `run`, `step`, And `dev`
-
-`run` starts an instance and records the start event. It does not evaluate rules
-or run providers.
+`dev` composes three commands you can also run separately:
 
 ```sh
+# start an instance (records the start event, nothing else)
 whip --store .whipplescript/quickstart.sqlite \
-  run examples/minimal-noop.whip \
-  --input '{"ticket":"quickstart"}' \
-  --json
-```
+  run examples/minimal-noop.whip --json
 
-Use `step` to advance deterministic rules for that instance:
-
-```sh
+# advance deterministic rules for that instance
 whip --store .whipplescript/quickstart.sqlite \
   step <instance_id> --program examples/minimal-noop.whip
+
+# execute any ready effects through a provider
+whip --store .whipplescript/quickstart.sqlite \
+  worker <instance_id> --provider fixture
 ```
 
-Use `worker` to run already-materialized effects through a provider. Use `dev`
-when you want the local validation loop to compose `run`, `step`, and fixture
-workers for you.
+This separation matters once workflows wait on real agents or human input:
+the instance is durable, so stepping and working can happen later, from
+another process, or after a restart.
 
-## 6. Try More Examples
+## Next
 
-Checked examples live in [`../examples/`](../examples/):
-
-- `multi-agent-bounded-concurrency.whip`
-- `loft-worker-with-review.whip`
-- `codex-poem-coerce-review.whip`
-- `multi-provider-poem-review.whip`
-- `human-review.whip`
-- `plugin-memory.whip`
-- `provider-language-e2e.whip`
-
-Use [Language Reference](language-reference.md) when you are ready to write a
-workflow, [Concepts](concepts.md) when you want the core terms, and
-[Runtime And Operations Reference](runtime-operations.md) when you want to
-understand stores, effects, workers, and failures.
+- The [tutorial](tutorial.md) builds a workflow from scratch: agent triage,
+  a human approval gate, and a completed instance.
+- The [examples catalog](examples.md) maps each shipped example to what it
+  demonstrates.
+- The [language reference](language-reference.md) covers every construct.

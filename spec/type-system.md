@@ -166,7 +166,7 @@ target must satisfy those static constraints before the rule is accepted.
 Agent-routing effects can declare their target capability contract directly:
 
 ```whipplescript
-tell task.provider requires ["repo.write"] as turn """
+tell task.provider requires ["repo.write"] as turn """markdown
 Update the implementation.
 """
 ```
@@ -371,7 +371,7 @@ rule route_codex
     codex is available
   }
 => {
-  tell codex """
+  tell codex """markdown
   {{ task.language }}
   """
 }

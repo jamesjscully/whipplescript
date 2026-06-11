@@ -67,7 +67,7 @@ workflow ChildRevisionExample {
     when ChildTask as task
     when childWorker is available
   => {
-    tell childWorker as turn """
+    tell childWorker as turn """markdown
     Complete child workflow work for the parent.
 
     Title:

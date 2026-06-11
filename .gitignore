@@ -7,4 +7,5 @@ _apalache-out/
 .env.local
 .env.*.local
 **/.whipplescript/workflows/*.sqlite
+**/.whipplescript/*.sqlite
 .whipplescript/*.sqlite

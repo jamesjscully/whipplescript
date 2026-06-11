@@ -1,0 +1,47 @@
+workflow QueueGatedSmoke
+source_tags
+@service workflow QueueGatedSmoke
+source_descriptions
+"The agent turn only runs after the work-item claim succeeds" workflow QueueGatedSmoke
+schemas
+  class QueueGatedResult
+    itemId string
+    itemTitle string
+    summary string
+    status literal<"done">
+queues
+  queue backlog tracker=builtin
+agents
+  agent worker harness=<fallback> provider=codex profile=repo-writer capacity=1 skills=[] capabilities=[]
+assertions
+  assert count(effect kind queue.claim where status == completed) == 1
+    reads
+      effect:kind queue.claim where status == completed
+  assert count(effect kind agent.tell where status == completed) == 1
+    reads
+      effect:kind agent.tell where status == completed
+  assert count(QueueGatedResult where status == "done") == 1
+    reads
+      fact:QueueGatedResult where status == "done"
+  assert count(effect kind human.ask) == 0
+    reads
+      effect:kind human.ask
+rules
+  rule implement_ready_item
+    when backlog has ready item as item
+    when worker is available
+    reads
+      pattern:backlog has ready item as item
+      pattern:worker is available
+    writes
+      schema:QueueGatedResult
+    effects
+      lease kind=queue.claim binding=lease key=d3aa32b90b607b00
+      turn kind=agent.tell binding=turn key=5d570b6e6c35c283
+      effect3 kind=queue.finish binding=- key=92c2c9125f74b92c
+      effect4 kind=human.ask binding=- key=eb8e38cee174b049
+    dependencies
+      lease --succeeds--> turn
+      turn --succeeds--> effect3
+      lease --fails--> effect4
+    body_hash 598c4d31111540e0

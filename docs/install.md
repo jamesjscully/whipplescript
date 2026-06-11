@@ -1,67 +1,26 @@
-# Install WhippleScript
+# Install
 
-The WhippleScript command-line binary is `whip`.
+The WhippleScript CLI is a single binary, `whip`.
 
-## Source Install
+## Prebuilt binaries
 
-If you want the current branch rather than a tagged release, install from source
-with Cargo. The beginner path is to clone the repository and install from the
-checkout:
+Releases publish archives, installers, and checksums for macOS
+(Apple Silicon and Intel), Windows x64, and Linux (x64 and ARM64, GNU libc).
 
-```sh
-git clone https://github.com/jamesjscully/whipplescript.git
-cd whipplescript
-cargo install --path crates/whipplescript-cli --locked
-```
-
-You can also install directly from Git:
-
-```sh
-cargo install --git https://github.com/jamesjscully/whipplescript.git --package whipplescript --locked
-```
-
-Cargo installs binaries into `~/.cargo/bin` by default. Make sure that directory
-is on `PATH`.
-
-Verify the install:
-
-```sh
-whip --version
-whip doctor
-```
-
-From a repository checkout, verify the example compiler path:
-
-```sh
-whip check examples/minimal-noop.whip
-```
-
-## Prebuilt Releases
-
-Prebuilt release artifacts are published from GitHub Releases. The release
-workflow publishes archives, shell installers, PowerShell installers, and
-checksums for:
-
-- Apple Silicon macOS: `aarch64-apple-darwin`
-- Intel macOS: `x86_64-apple-darwin`
-- x64 Windows: `x86_64-pc-windows-msvc`
-- x64 Linux: `x86_64-unknown-linux-gnu`
-- ARM64 Linux: `aarch64-unknown-linux-gnu`
-
-Install with the shell installer on macOS or Linux:
+macOS / Linux:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/jamesjscully/whipplescript/releases/latest/download/whipplescript-installer.sh | sh
 ```
 
+Windows:
+
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/jamesjscully/whipplescript/releases/latest/download/whipplescript-installer.ps1 | iex"
 ```
 
-Manual archive downloads will also be available from the matching GitHub Release.
-Each archive has a `.sha256` file and the release includes `sha256.sum`.
-
-Verify an archive against its adjacent checksum:
+To verify a manually downloaded archive, check it against its adjacent
+`.sha256` file (or the release-wide `sha256.sum`):
 
 ```sh
 curl -LO https://github.com/jamesjscully/whipplescript/releases/latest/download/whipplescript-x86_64-unknown-linux-gnu.tar.xz
@@ -69,55 +28,51 @@ curl -LO https://github.com/jamesjscully/whipplescript/releases/latest/download/
 sha256sum --check whipplescript-x86_64-unknown-linux-gnu.tar.xz.sha256
 ```
 
-Or verify every downloaded artifact against `sha256.sum`:
+On macOS use `shasum -a 256 -c` if `sha256sum` is unavailable.
+
+A Homebrew tap (`brew tap jamesjscully/tap && brew install whipplescript`)
+will be enabled once tagged releases stabilize.
+
+## From source
+
+Requires a Rust toolchain (<https://rustup.rs/>).
 
 ```sh
-curl -LO https://github.com/jamesjscully/whipplescript/releases/latest/download/sha256.sum
-sha256sum --check sha256.sum
+git clone https://github.com/jamesjscully/whipplescript.git
+cd whipplescript
+cargo install --path crates/whipplescript-cli --locked
 ```
 
-On macOS, use `shasum -a 256 -c <file>.sha256` if `sha256sum` is not installed.
-
-## Homebrew
-
-Homebrew installation will be enabled after the first tagged release publishes
-stable GitHub Release assets:
+Or directly from Git:
 
 ```sh
-brew tap jamesjscully/tap
-brew install whipplescript
+cargo install --git https://github.com/jamesjscully/whipplescript.git --package whipplescript --locked
 ```
 
-Until the tap formula is published, use the shell installer, manual archive, or
-Cargo source install path.
+Cargo installs to `~/.cargo/bin`; make sure it is on `PATH`.
 
-## Build From Checkout
-
-You can run the CLI directly from the repository without installing it:
+## Verify
 
 ```sh
-cargo run -p whipplescript -- doctor
-cargo run -p whipplescript -- check examples/minimal-noop.whip
+whip --version
+whip doctor
+whip check examples/minimal-noop.whip   # from a checkout
 ```
 
-Use this path for development, not for end-user setup.
+`doctor` reports optional tooling (Maude, Apalache, provider CLIs). None of
+it is needed for fixture-backed development.
 
-## Troubleshooting
+## Running without installing
 
-If `whip` is not found after source install, add Cargo's bin directory to
-`PATH`, then open a new shell:
+From a checkout, substitute `cargo run -p whipplescript --` for `whip` in any
+command. Use this for development on WhippleScript itself.
 
-```sh
-export PATH="$HOME/.cargo/bin:$PATH"
-```
+## Platform notes
 
-On Windows, restart the terminal after the installer updates `PATH`.
-
-On macOS, unsigned prebuilt binaries may be blocked by Gatekeeper until signing
-and notarization are enabled. If Gatekeeper blocks a v0.1 archive, use the
-source install path or remove quarantine only after verifying the release
-checksum.
-
-On Linux, the default binary artifacts target GNU libc. If a binary reports a
-glibc compatibility error, use source install or wait for the optional musl
-artifact tracked in [`../spec/distribution-tracker.md`](../spec/distribution-tracker.md).
+- **macOS Gatekeeper:** prebuilt binaries are not yet signed. If a download
+  is blocked, install from source, or remove quarantine only after verifying
+  the checksum.
+- **Linux libc:** binaries target GNU libc. On musl-based systems, install
+  from source (a musl artifact is tracked in
+  [`spec/distribution-tracker.md`](../spec/distribution-tracker.md)).
+- **Windows:** restart the terminal after the installer updates `PATH`.

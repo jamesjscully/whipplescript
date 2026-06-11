@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whipplescript.local/schemas/check_report_v0.schema.json",
+  "title": "WhippleScript check report v0",
+  "type": "array",
+  "items": {
+    "oneOf": [
+      {
+        "type": "object",
+        "required": [
+          "schema",
+          "path",
+          "status",
+          "workflow",
+          "source_hash",
+          "ir_hash",
+          "snapshot",
+          "source_metadata"
+        ],
+        "properties": {
+          "schema": {"const": "whipplescript.check_report.v0"},
+          "path": {"type": "string"},
+          "status": {"const": "ok"},
+          "workflow": {"type": "string"},
+          "source_hash": {"type": "string"},
+          "ir_hash": {"type": "string"},
+          "snapshot": {"type": "string"},
+          "source_metadata": {"$ref": "#/$defs/source_metadata"},
+          "model_search": {"type": "object"}
+        },
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "required": ["schema", "path", "status", "error"],
+        "properties": {
+          "schema": {"const": "whipplescript.check_report.v0"},
+          "path": {"type": "string"},
+          "status": {"const": "error"},
+          "error": {
+            "type": "object",
+            "required": ["kind"],
+            "properties": {
+              "kind": {"enum": ["io", "diagnostics"]},
+              "message": {"type": "string"},
+              "diagnostics": {
+                "type": "array",
+                "items": {"$ref": "#/$defs/diagnostic"}
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      }
+    ]
+  },
+  "$defs": {
+    "span": {
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "path": {"type": ["string", "null"]},
+        "start": {"type": "integer", "minimum": 0},
+        "end": {"type": "integer", "minimum": 0},
+        "construct": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "diagnostic": {
+      "type": "object",
+      "required": ["message", "source_span"],
+      "properties": {
+        "message": {"type": "string"},
+        "suggestion": {"type": ["string", "null"]},
+        "source_span": {"$ref": "#/$defs/span"}
+      },
+      "additionalProperties": true
+    },
+    "source_metadata": {
+      "type": "object",
+      "required": ["tags", "descriptions", "targets"],
+      "properties": {
+        "tags": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/source_tag"}
+        },
+        "descriptions": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/source_description"}
+        },
+        "targets": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/source_target"}
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_tag": {
+      "type": "object",
+      "required": ["name", "target_kind", "target", "source_span"],
+      "properties": {
+        "name": {"type": "string"},
+        "target_kind": {"type": "string"},
+        "target": {"type": "string"},
+        "source_span": {"$ref": "#/$defs/span"}
+      },
+      "additionalProperties": true
+    },
+    "source_description": {
+      "type": "object",
+      "required": ["value", "target_kind", "target", "source_span"],
+      "properties": {
+        "value": {"type": "string"},
+        "target_kind": {"type": "string"},
+        "target": {"type": "string"},
+        "source_span": {"$ref": "#/$defs/span"}
+      },
+      "additionalProperties": true
+    },
+    "source_target": {
+      "type": "object",
+      "required": ["target_kind", "target", "tags"],
+      "properties": {
+        "target_kind": {"type": "string"},
+        "target": {"type": "string"},
+        "tags": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "description": {"type": "string"}
+      },
+      "additionalProperties": true
+    }
+  }
+}

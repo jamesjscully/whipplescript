@@ -295,7 +295,7 @@ what instances are running?
 what effects are queued/running/failed?
 what agents are active?
 what human questions are pending?
-what Loft issues are claimed?
+what work items are claimed?
 what recent failures/blockers exist?
 what capabilities or policies blocked work?
 what evidence changed since last view?
@@ -335,9 +335,102 @@ records in event order so trace conformance can reject impossible sequences such
 as old-version rule commits after activation or fabricated terminal
 cancellation for running effects.
 
-## Open Question
+## OpenTelemetry export — the ambassador (DECIDED 2026-06-10)
 
-We should decide whether the first implementation writes OpenTelemetry spans
-directly or keeps a local evidence schema and exports traces later. The local
-schema is likely simpler for the first slice, but the fields should be chosen so
-export is straightforward.
+This resolves the former open question (direct spans vs. local schema + later
+export) and is the design record for
+[`language-ergonomics-tracker.md`](language-ergonomics-tracker.md) C8.
+Decision: **keep the local evidence store as the source of truth, and export to
+OpenTelemetry from it via a log-tailing sidecar.** The local schema above stays
+authoritative (it must work offline and in sandboxes); OTel is a read-side
+projection of it.
+
+### One target, fanned out at the Collector
+
+Do not integrate observability platforms individually — that is N bespoke
+exporters. Emit **OpenTelemetry (OTLP)** as the single target; the OpenTelemetry
+Collector routes to any backend (Datadog, New Relic, Honeycomb, Grafana/Tempo,
+Splunk, Dynatrace, Elastic, the clouds' native suites). One exporter; the
+ecosystem provides the rest, including platforms that do not exist yet. This is
+how "support a wide variety of enterprise platforms" is met.
+
+### The ambassador: a log-tailing exporter, not in-process hooks
+
+Telemetry is emitted by a **cursor-tracked sidecar** (`whip otel-export`) that
+tails the durable event log and emits OTLP — the event log is the buffer. It
+reuses the `TraceRecord` projection already specified in
+[Trace Shape](#trace-shape) and [Export Shape](#export-shape): read events ->
+build the trace (already implemented) -> map to OTLP. The new code is the OTLP
+mapping, the cursor, and the metric aggregations. This gives the three
+enterprise-hard properties by construction:
+
+- **Zero hot-path overhead** — execution emits nothing extra; telemetry is
+  derived from events already written.
+- **Failure isolation** — a down/slow collector never blocks or breaks
+  execution; the log persists and the exporter catches up.
+- **Emit-once / replay-safe** — the cursor exports each event exactly once;
+  recovery and replay never re-emit, so metrics are not double-counted.
+
+An in-process exporter was rejected: it couples export to execution and makes
+replay double-counting a hazard.
+
+### Ergonomics: honor the standard OTel environment
+
+Do not invent a config format. Honor the standard OpenTelemetry environment
+variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL`,
+`OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, and `OTEL_EXPORTER_OTLP_HEADERS`
+for auth, carried as credential *references* per the provider config model).
+Consequences: **authors write nothing** (observability is never in `.whip`
+source), **operators set the vars they already know**, and it is **off by
+default with zero overhead** when no OTel env is present.
+
+### The three pillars
+
+- **Traces (ship first).** An instance is a trace; the span hierarchy and
+  correlation fields are already specified above. Two distinctive properties:
+  spans are named after source constructs (`flow.triage.seg0`, `agent.tell`,
+  `coerce reviewWork`), so **traces read like the workflow**; and because the
+  log is durable, the exporter can emit **retroactive, long-lived traces**
+  (a human ask that waited overnight) that exceed any platform's live window.
+  Agent turns and `coerce` calls are aligned with OTel **GenAI semantic
+  conventions** (`gen_ai.system`, `gen_ai.request.model`,
+  `gen_ai.usage.input_tokens`/`output_tokens`) so they appear natively in
+  LLM-observability tools — fleet model usage, cost, and latency in the
+  operator's existing AI dashboards.
+- **Metrics (OTLP push v1; Prometheus pull fast-follow).** Projections over the
+  log: effect counts and latency histograms by kind/status, queue depth, and
+  the coordination primitives as first-class metrics — **lease contention,
+  counter consumption-vs-cap, ledger append rate** ([`coordination.md`](coordination.md)).
+  OTLP-push ships first; a Prometheus `/metrics` pull endpoint is a fast-follow.
+- **Logs (later).** Events as OTLP log records correlated to their span;
+  `whip log` already covers local inspection.
+
+### Semantic conventions (the clarity contract)
+
+The telemetry schema is a documented, versioned contract so dashboards do not
+break: a stable `whipplescript.*` convention (`whipplescript.instance_id`,
+`whipplescript.rule`, `whipplescript.effect.kind`/`status`,
+`whipplescript.provider`, ...) reusing the correlation fields above, plus
+**version-pinned** `gen_ai.*` alignment (tracking a still-stabilizing OTel
+spec).
+
+### Content policy: structural by default, operator allowlist for the rest
+
+The firm default protecting PII and cardinality: **export structural telemetry
+only — ids, kinds, statuses, timings, counts — never content (prompt bodies,
+fact field values).** Projecting fact values would leak sensitive data and
+explode cardinality. Richer business-dimension attributes (e.g. `customer_id`)
+are **opt-in via an operator-config allowlist** — not a source annotation, so
+the operator owns the cardinality/compliance budget and source stays clean. The
+allowlist may only name declared schema fields (an unknown field is a config
+error); this extends the existing artifact-redaction discipline.
+
+### Modeling notes
+
+- Emit-once: a crash mid-export resumes from the cursor without duplication.
+- Replay safety: recovery/replay does not re-emit telemetry; metrics counted
+  once.
+- Failure isolation: the execution trace is independent of exporter
+  availability.
+- Redaction: no content is emitted unless explicitly allowlisted; allowlisting
+  an unknown field is rejected.

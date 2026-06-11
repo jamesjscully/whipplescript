@@ -1,0 +1,30 @@
+workflow ExecJsonIngest
+workflow_contracts
+  output result ref<TestSummary>
+  failure error ref<TestFailure>
+schemas
+  class TestSummary
+    passed bool
+    failed int
+  class FailedTest
+    name string
+    reason string
+  class TestFailure
+    reason string
+rules
+  rule run_test_report
+    when started
+    reads
+      pattern:started
+    effects
+      report kind=exec.command binding=report key=2fc16e0bc5727815
+    body_hash dcb8311298d981c3
+  rule ingest_failed_tests
+    when started
+    reads
+      pattern:started
+    writes
+      schema:FailedTest
+    effects
+      effect1 kind=exec.command binding=- key=62319a228129080d
+    body_hash 3dbc8ed5c83d4f1c

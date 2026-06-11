@@ -1,0 +1,21 @@
+{
+  "name": "whipplescript-workflow-prototype",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "@solidjs/web": "2.0.0-beta.14",
+    "solid-js": "2.0.0-beta.14"
+  },
+  "devDependencies": {
+    "playwright": "^1.60.0",
+    "typescript": "5.9.3",
+    "vite": "8.0.16",
+    "vite-plugin-solid": "3.0.0-next.5"
+  }
+}

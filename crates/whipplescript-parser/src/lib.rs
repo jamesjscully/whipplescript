@@ -4,6 +4,9 @@
 //! hand-written parser. It preserves source spans and keeps rule/effect bodies
 //! as source text until the typed IR is ready to lower them.
 
+pub mod body;
+mod flow_expand;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -46,6 +49,8 @@ pub struct StringLiteral {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Program {
     pub workflow: Option<Ident>,
+    pub workflow_tags: Vec<TagDecl>,
+    pub workflow_description: Option<StringLiteral>,
     pub explicit_workflow_body: bool,
     pub workflows: Vec<WorkflowDecl>,
     pub patterns: Vec<PatternDecl>,
@@ -55,6 +60,8 @@ pub struct Program {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowDecl {
     pub name: Ident,
+    pub tags: Vec<TagDecl>,
+    pub description: Option<StringLiteral>,
     pub items: Vec<Item>,
     pub span: SourceSpan,
 }
@@ -67,9 +74,16 @@ pub enum Item {
     Apply(ApplyDecl),
     WorkflowContract(WorkflowContractDecl),
     Harness(HarnessDecl),
+    Queue(QueueDecl),
+    Flow(FlowDecl),
     Agent(AgentDecl),
     Enum(EnumDecl),
+    Event(EventDecl),
+    Lease(LeaseDecl),
+    Ledger(LedgerDecl),
+    Counter(CounterDecl),
     Class(ClassDecl),
+    Table(TableDecl),
     Coerce(CoerceDecl),
     Assert(AssertDecl),
     Rule(RuleDecl),
@@ -124,7 +138,15 @@ impl WorkflowContractKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssertDecl {
+    pub tags: Vec<TagDecl>,
+    pub description: Option<StringLiteral>,
     pub expr: String,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TagDecl {
+    pub name: String,
     pub span: SourceSpan,
 }
 
@@ -141,6 +163,23 @@ pub struct HarnessDecl {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueDecl {
+    pub name: Ident,
+    pub tracker: Ident,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlowDecl {
+    pub name: Ident,
+    pub tags: Vec<TagDecl>,
+    pub description: Option<StringLiteral>,
+    pub whens: Vec<WhenClause>,
+    pub body: BlockSource,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentDecl {
     pub name: Ident,
     pub harness: Option<Ident>,
@@ -150,6 +189,7 @@ pub struct AgentDecl {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentField {
+    Provider(Ident),
     Profile(StringLiteral),
     Capacity(u32, SourceSpan),
     Skills(Vec<StringLiteral>, SourceSpan),
@@ -160,7 +200,16 @@ pub enum AgentField {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnumDecl {
     pub name: Ident,
-    pub variants: Vec<Ident>,
+    pub variants: Vec<EnumVariantDecl>,
+    pub span: SourceSpan,
+}
+
+/// One enum variant: bare (`Accept`) or data-carrying with a brace body that
+/// reuses the class field grammar (sum types, spec/sum-types.md).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnumVariantDecl {
+    pub name: Ident,
+    pub fields: Vec<ClassField>,
     pub span: SourceSpan,
 }
 
@@ -171,10 +220,68 @@ pub struct ClassDecl {
     pub span: SourceSpan,
 }
 
+/// Coordination resources (spec/coordination.md): a closed family of shared,
+/// workspace-scoped resources with typed keys, atomic branchable operations,
+/// and mandatory bounds (`ttl`/`retain`/`cap`+`reset`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseDecl {
+    pub name: Ident,
+    pub key_type: Ident,
+    pub slots: u32,
+    pub ttl_seconds: u64,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LedgerDecl {
+    pub name: Ident,
+    pub entry_schema: Ident,
+    pub partition_field: Ident,
+    pub retain_seconds: u64,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CounterDecl {
+    pub name: Ident,
+    pub key_type: Ident,
+    pub cap: i64,
+    pub reset: String,
+    pub span: SourceSpan,
+}
+
+/// A typed external-event declaration (`event deploy.finished { ... }`):
+/// the ingress manifest naming a dotted event and its payload schema
+/// (spec/event-ingress.md).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventDecl {
+    /// Dotted lowercase event name (`deploy.finished`).
+    pub name: String,
+    pub name_span: SourceSpan,
+    pub fields: Vec<ClassField>,
+    pub span: SourceSpan,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClassField {
     pub name: Ident,
     pub ty: TypeSyntax,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableDecl {
+    pub name: Ident,
+    pub tags: Vec<TagDecl>,
+    pub description: Option<StringLiteral>,
+    pub schema: Ident,
+    pub rows: Vec<TableRow>,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableRow {
+    pub body: BlockSource,
     pub span: SourceSpan,
 }
 
@@ -247,6 +354,8 @@ impl TypeSyntax {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuleDecl {
     pub name: Ident,
+    pub tags: Vec<TagDecl>,
+    pub description: Option<StringLiteral>,
     pub whens: Vec<WhenClause>,
     pub body: BlockSource,
     pub span: SourceSpan,
@@ -274,6 +383,8 @@ pub struct ParseOutput {
 pub struct CompileOutput {
     pub ir: Option<IrProgram>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Non-fatal diagnostics (deprecations, style); never block compilation.
+    pub warnings: Vec<Diagnostic>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -285,17 +396,40 @@ pub struct FormatOutput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrProgram {
     pub workflow: String,
+    pub source_tags: Vec<IrSourceTag>,
+    pub source_descriptions: Vec<IrSourceDescription>,
     pub includes: Vec<IrInclude>,
     pub pattern_applications: Vec<IrPatternApplication>,
     pub workflow_contracts: Vec<IrWorkflowContract>,
     pub uses: Vec<IrUse>,
     pub harnesses: Vec<IrHarness>,
+    pub queues: Vec<IrQueue>,
+    pub events: Vec<IrEvent>,
+    pub leases: Vec<IrLease>,
+    pub ledgers: Vec<IrLedger>,
+    pub counters: Vec<IrCounter>,
     pub schemas: Vec<IrSchema>,
     pub agents: Vec<IrAgent>,
     pub coerces: Vec<IrCoerce>,
     pub assertions: Vec<IrAssertion>,
     pub rules: Vec<IrRule>,
     pub rule_dependencies: Vec<IrRuleDependency>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrSourceTag {
+    pub name: String,
+    pub target_kind: String,
+    pub target: String,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrSourceDescription {
+    pub value: String,
+    pub target_kind: String,
+    pub target: String,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -369,6 +503,13 @@ pub enum IrUseKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrQueue {
+    pub name: String,
+    pub tracker: String,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrHarness {
     pub name: String,
     pub kind: String,
@@ -392,6 +533,43 @@ pub struct IrEnum {
 pub struct IrClass {
     pub name: String,
     pub fields: Vec<IrClassField>,
+    pub span: SourceSpan,
+}
+
+/// A declared external event: the typed ingress manifest
+/// (spec/event-ingress.md). Dotted name, class-shaped payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrEvent {
+    pub name: String,
+    pub fields: Vec<IrClassField>,
+    pub span: SourceSpan,
+}
+
+/// Coordination resources (spec/coordination.md), lowered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrLease {
+    pub name: String,
+    pub key_type: String,
+    pub slots: u32,
+    pub ttl_seconds: u64,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrLedger {
+    pub name: String,
+    pub entry_schema: String,
+    pub partition_field: String,
+    pub retain_seconds: u64,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrCounter {
+    pub name: String,
+    pub key_type: String,
+    pub cap: i64,
+    pub reset: String,
     pub span: SourceSpan,
 }
 
@@ -434,6 +612,7 @@ pub enum IrPrimitiveType {
 pub struct IrAgent {
     pub name: String,
     pub harness: Option<String>,
+    pub provider: Option<String>,
     pub profile: Option<String>,
     pub capacity: Option<u32>,
     pub skills: Vec<String>,
@@ -482,12 +661,20 @@ pub struct IrRuleMetadata {
     pub fact_reads: Vec<String>,
     pub projection_reads: Vec<IrProjectionRead>,
     pub fact_writes: Vec<String>,
+    pub record_sources: Vec<IrRecordSource>,
     pub fact_consumes: Vec<String>,
     pub effects: Vec<IrEffectNode>,
     pub dependencies: Vec<IrEffectDependency>,
     pub case_branches: Vec<IrRuleCaseBranch>,
     pub terminal_outputs: Vec<IrTerminalOutput>,
     pub terminal_branches: Vec<IrTerminalCaseBranch>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrRecordSource {
+    pub schema: String,
+    pub construct: String,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -518,6 +705,8 @@ pub struct IrEffectNode {
     pub required_capabilities: Vec<String>,
     pub idempotency_key: String,
     pub span: SourceSpan,
+    /// Creation-anchored deadline from a `timeout <duration>` clause.
+    pub timeout_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -529,6 +718,16 @@ pub enum IrEffectKind {
     CapabilityCall,
     EventEmit,
     WorkflowInvoke,
+    TimerWait,
+    ExecCommand,
+    QueueFile,
+    QueueClaim,
+    QueueRelease,
+    QueueFinish,
+    LeaseAcquire,
+    LedgerAppend,
+    CounterConsume,
+    EventNotify,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -611,6 +810,10 @@ struct SemanticContext {
     coerce_outputs: BTreeMap<String, TypeSyntax>,
     coerce_params: BTreeMap<String, Vec<ParamDecl>>,
     workflow_inputs: BTreeMap<String, WorkflowInputSurface>,
+    /// Declared coordination resources (spec/coordination.md).
+    leases: BTreeSet<String>,
+    ledgers: BTreeSet<String>,
+    counters: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -623,6 +826,9 @@ struct WorkflowInputSurface {
 struct SchemaIndex {
     classes: BTreeMap<String, BTreeMap<String, TypeSyntax>>,
     enums: BTreeMap<String, BTreeSet<String>>,
+    /// Declared external events (spec/event-ingress.md); their payload
+    /// schemas live in `classes` keyed by the dotted event name.
+    events: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -722,6 +928,10 @@ pub enum BinaryOp {
     Ge,
     In,
     NotIn,
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -825,6 +1035,10 @@ impl BinaryOp {
             Self::Ge => ">=",
             Self::In => "in",
             Self::NotIn => "not in",
+            Self::Add => "+",
+            Self::Sub => "-",
+            Self::Mul => "*",
+            Self::Div => "/",
         }
     }
 }
@@ -859,6 +1073,7 @@ pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOut
         return CompileOutput {
             ir: None,
             diagnostics: parsed.diagnostics,
+            warnings: Vec::new(),
         };
     }
 
@@ -868,6 +1083,7 @@ pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOut
         Err(diagnostics) => CompileOutput {
             ir: None,
             diagnostics,
+            warnings: Vec::new(),
         },
     }
 }
@@ -958,9 +1174,13 @@ fn select_root_workflow(
 
     let selected = program.workflows.remove(selected_index);
     let mut items = program.items;
+    let workflow_tags = selected.tags;
+    let workflow_description = selected.description;
     items.extend(selected.items);
     Ok(Program {
         workflow: Some(selected.name),
+        workflow_tags,
+        workflow_description,
         explicit_workflow_body: true,
         workflows: Vec::new(),
         patterns: program.patterns,
@@ -972,6 +1192,29 @@ impl IrProgram {
     pub fn to_snapshot(&self) -> String {
         let mut snapshot = String::new();
         push_line(&mut snapshot, format!("workflow {}", self.workflow));
+
+        if !self.source_tags.is_empty() {
+            push_line(&mut snapshot, "source_tags");
+            for tag in &self.source_tags {
+                push_line(
+                    &mut snapshot,
+                    format!("@{} {} {}", tag.name, tag.target_kind, tag.target),
+                );
+            }
+        }
+
+        if !self.source_descriptions.is_empty() {
+            push_line(&mut snapshot, "source_descriptions");
+            for description in &self.source_descriptions {
+                push_line(
+                    &mut snapshot,
+                    format!(
+                        "{:?} {} {}",
+                        description.value, description.target_kind, description.target
+                    ),
+                );
+            }
+        }
 
         if !self.includes.is_empty() {
             push_line(&mut snapshot, "includes");
@@ -1077,12 +1320,22 @@ impl IrProgram {
                 );
             }
         }
+        if !self.queues.is_empty() {
+            push_line(&mut snapshot, "queues");
+            for queue in &self.queues {
+                push_line(
+                    &mut snapshot,
+                    format!("  queue {} tracker={}", queue.name, queue.tracker),
+                );
+            }
+        }
 
         if !self.agents.is_empty() {
             push_line(&mut snapshot, "agents");
             for agent in &self.agents {
                 let profile = agent.profile.as_deref().unwrap_or("<missing>");
                 let harness = agent.harness.as_deref().unwrap_or("<fallback>");
+                let provider = agent.provider.as_deref().unwrap_or("<fallback>");
                 let capacity = agent
                     .capacity
                     .map(|capacity| capacity.to_string())
@@ -1100,8 +1353,8 @@ impl IrProgram {
                 push_line(
                     &mut snapshot,
                     format!(
-                        "  agent {} harness={} profile={} capacity={} skills={} capabilities={}",
-                        agent.name, harness, profile, capacity, skills, capabilities
+                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={}",
+                        agent.name, harness, provider, profile, capacity, skills, capabilities
                     ),
                 );
             }
@@ -1177,6 +1430,18 @@ impl IrProgram {
                     push_line(&mut snapshot, "    writes");
                     for write in &rule.metadata.fact_writes {
                         push_line(&mut snapshot, format!("      {}", write));
+                    }
+                }
+                if !rule.metadata.record_sources.is_empty() {
+                    push_line(&mut snapshot, "    record_sources");
+                    for source in &rule.metadata.record_sources {
+                        push_line(
+                            &mut snapshot,
+                            format!(
+                                "      schema:{} construct={} span={}..{}",
+                                source.schema, source.construct, source.span.start, source.span.end
+                            ),
+                        );
                     }
                 }
                 if !rule.metadata.fact_consumes.is_empty() {
@@ -1321,6 +1586,16 @@ impl IrEffectKind {
             Self::CapabilityCall => "capability.call",
             Self::EventEmit => "event.emit",
             Self::WorkflowInvoke => "workflow.invoke",
+            Self::TimerWait => "timer.wait",
+            Self::ExecCommand => "exec.command",
+            Self::QueueFile => "queue.file",
+            Self::QueueClaim => "queue.claim",
+            Self::QueueRelease => "queue.release",
+            Self::QueueFinish => "queue.finish",
+            Self::LeaseAcquire => "lease.acquire",
+            Self::LedgerAppend => "ledger.append",
+            Self::CounterConsume => "counter.consume",
+            Self::EventNotify => "event.notify",
         }
     }
 }
@@ -1396,7 +1671,22 @@ fn lower_program(
     workflow_inputs: BTreeMap<String, WorkflowInputSurface>,
 ) -> CompileOutput {
     let mut diagnostics = Vec::new();
+    let mut warnings = Vec::new();
     let (program, pattern_applications) = expand_pattern_applications(program, &mut diagnostics);
+    let program = {
+        let mut program = program;
+        let mut expanded = Vec::with_capacity(program.items.len());
+        for item in program.items {
+            match item {
+                Item::Flow(flow) => {
+                    expanded.extend(flow_expand::expand_flow(flow, &mut diagnostics))
+                }
+                other => expanded.push(other),
+            }
+        }
+        program.items = expanded;
+        program
+    };
     let schema_names = collect_schema_names(&program, &mut diagnostics);
     let harness_names = collect_harness_names(&program, &mut diagnostics);
     let agent_names = collect_agent_names(&program, &mut diagnostics);
@@ -1416,11 +1706,18 @@ fn lower_program(
 
     let mut ir = IrProgram {
         workflow,
+        source_tags: Vec::new(),
+        source_descriptions: Vec::new(),
         includes: Vec::new(),
         pattern_applications,
         workflow_contracts: Vec::new(),
         uses: Vec::new(),
         harnesses: Vec::new(),
+        queues: Vec::new(),
+        events: Vec::new(),
+        leases: Vec::new(),
+        ledgers: Vec::new(),
+        counters: Vec::new(),
         schemas: Vec::new(),
         agents: Vec::new(),
         coerces: Vec::new(),
@@ -1428,6 +1725,19 @@ fn lower_program(
         rules: Vec::new(),
         rule_dependencies: Vec::new(),
     };
+    let workflow_tag_target = ir.workflow.clone();
+    lower_source_tags(
+        &program.workflow_tags,
+        "workflow",
+        &workflow_tag_target,
+        &mut ir,
+    );
+    lower_source_description(
+        program.workflow_description.as_ref(),
+        "workflow",
+        &workflow_tag_target,
+        &mut ir,
+    );
 
     for item in program.items {
         match item {
@@ -1440,6 +1750,11 @@ fn lower_program(
                 &mut diagnostics,
             ),
             Item::Use(use_decl) => lower_use(use_decl, &mut ir, &mut diagnostics),
+            // Flows are expanded into rules and classes before this loop;
+            // reaching one here is unreachable by construction.
+            Item::Flow(flow) => {
+                let _ = flow;
+            }
             Item::Pattern(pattern) => diagnostics.push(Diagnostic {
                 span: pattern.span,
                 message: format!(
@@ -1459,8 +1774,72 @@ fn lower_program(
                 ),
             }),
             Item::Harness(harness) => lower_harness(harness, &mut ir, &mut diagnostics),
+            Item::Queue(queue) => lower_queue(queue, &mut ir, &mut diagnostics),
             Item::Agent(agent) => lower_agent(agent, &mut ir, &harness_names, &mut diagnostics),
             Item::Enum(enum_decl) => lower_enum(enum_decl, &mut ir, &mut diagnostics),
+            Item::Event(event) => lower_event(event, &mut ir, &mut diagnostics),
+            Item::Lease(lease) => {
+                if !schema_names.contains(&lease.key_type.name) {
+                    diagnostics.push(Diagnostic {
+                        span: lease.key_type.span,
+                        message: format!(
+                            "lease `{}` keys on undeclared type `{}`",
+                            lease.name.name, lease.key_type.name
+                        ),
+                        suggestion: Some(
+                            "key a lease on an entity class the workflow already models".to_owned(),
+                        ),
+                    });
+                }
+                ir.leases.push(IrLease {
+                    name: lease.name.name,
+                    key_type: lease.key_type.name,
+                    slots: lease.slots.max(1),
+                    ttl_seconds: lease.ttl_seconds,
+                    span: lease.span,
+                });
+            }
+            Item::Ledger(ledger) => {
+                if !schema_names.contains(&ledger.entry_schema.name) {
+                    diagnostics.push(Diagnostic {
+                        span: ledger.entry_schema.span,
+                        message: format!(
+                            "ledger `{}` records undeclared entry type `{}`",
+                            ledger.name.name, ledger.entry_schema.name
+                        ),
+                        suggestion: Some("declare the entry class before the ledger".to_owned()),
+                    });
+                }
+                ir.ledgers.push(IrLedger {
+                    name: ledger.name.name,
+                    entry_schema: ledger.entry_schema.name,
+                    partition_field: ledger.partition_field.name,
+                    retain_seconds: ledger.retain_seconds,
+                    span: ledger.span,
+                });
+            }
+            Item::Counter(counter) => {
+                if !schema_names.contains(&counter.key_type.name) {
+                    diagnostics.push(Diagnostic {
+                        span: counter.key_type.span,
+                        message: format!(
+                            "counter `{}` keys on undeclared type `{}`",
+                            counter.name.name, counter.key_type.name
+                        ),
+                        suggestion: Some(
+                            "key a counter on an entity class the workflow already models"
+                                .to_owned(),
+                        ),
+                    });
+                }
+                ir.counters.push(IrCounter {
+                    name: counter.name.name,
+                    key_type: counter.key_type.name,
+                    cap: counter.cap,
+                    reset: counter.reset,
+                    span: counter.span,
+                });
+            }
             Item::Class(class_decl) => lower_class(
                 class_decl,
                 &mut ir,
@@ -1468,6 +1847,22 @@ fn lower_program(
                 &agent_names,
                 &mut diagnostics,
             ),
+            Item::Table(table) => {
+                lower_source_tags(&table.tags, "table", &table.name.name, &mut ir);
+                lower_source_description(
+                    table.description.as_ref(),
+                    "table",
+                    &table.name.name,
+                    &mut ir,
+                );
+                lower_table(
+                    table,
+                    &semantic,
+                    &workflow_contract_names,
+                    &mut ir,
+                    &mut diagnostics,
+                )
+            }
             Item::Coerce(coerce) => lower_coerce(
                 coerce,
                 &mut ir,
@@ -1476,16 +1871,33 @@ fn lower_program(
                 &mut diagnostics,
             ),
             Item::Assert(assertion) => {
+                let assertion_target = stable_hash(&assertion.expr);
+                lower_source_tags(&assertion.tags, "assertion", &assertion_target, &mut ir);
+                lower_source_description(
+                    assertion.description.as_ref(),
+                    "assertion",
+                    &assertion_target,
+                    &mut ir,
+                );
                 lower_assert(assertion, &semantic, &mut ir, &mut diagnostics)
             }
-            Item::Rule(rule) => lower_rule(
-                rule,
-                &semantic,
-                program.explicit_workflow_body,
-                &workflow_contract_names,
-                &mut ir,
-                &mut diagnostics,
-            ),
+            Item::Rule(rule) => {
+                lower_source_tags(&rule.tags, "rule", &rule.name.name, &mut ir);
+                lower_source_description(
+                    rule.description.as_ref(),
+                    "rule",
+                    &rule.name.name,
+                    &mut ir,
+                );
+                warn_deprecated_consume(&rule, &mut warnings);
+                lower_rule(
+                    rule,
+                    &semantic,
+                    &workflow_contract_names,
+                    &mut ir,
+                    &mut diagnostics,
+                )
+            }
         }
     }
 
@@ -1494,6 +1906,53 @@ fn lower_program(
     CompileOutput {
         ir: diagnostics.is_empty().then_some(ir),
         diagnostics,
+        warnings,
+    }
+}
+
+fn warn_deprecated_consume(rule: &RuleDecl, warnings: &mut Vec<Diagnostic>) {
+    for line in rule.body.text.lines() {
+        let line = line.trim().trim_end_matches(';');
+        let mut words = line.split_whitespace();
+        let is_counter_consume = words.next() == Some("consume")
+            && words.next().is_some()
+            && words.next() == Some("for");
+        if (line == "consume" || line.starts_with("consume ")) && !is_counter_consume {
+            warnings.push(Diagnostic {
+                span: rule.body.span,
+                message: format!("rule `{}` uses deprecated `consume`", rule.name.name),
+                suggestion: Some(
+                    "use `done` instead; `consume` will be removed in a future release".to_owned(),
+                ),
+            });
+        }
+    }
+}
+
+fn lower_source_tags(tags: &[TagDecl], target_kind: &str, target: &str, ir: &mut IrProgram) {
+    for tag in tags {
+        ir.source_tags.push(IrSourceTag {
+            name: tag.name.clone(),
+            target_kind: target_kind.to_owned(),
+            target: target.to_owned(),
+            span: tag.span,
+        });
+    }
+}
+
+fn lower_source_description(
+    description: Option<&StringLiteral>,
+    target_kind: &str,
+    target: &str,
+    ir: &mut IrProgram,
+) {
+    if let Some(description) = description {
+        ir.source_descriptions.push(IrSourceDescription {
+            value: description.value.clone(),
+            target_kind: target_kind.to_owned(),
+            target: target.to_owned(),
+            span: description.span,
+        });
     }
 }
 
@@ -1697,6 +2156,17 @@ fn expand_pattern_item(
             Item::Include(include),
         )),
         Item::Use(use_decl) => Some((format!("use:{}", use_decl.name.value), Item::Use(use_decl))),
+        Item::Queue(queue) => Some((format!("queue:{}", queue.name.name), Item::Queue(queue))),
+        Item::Event(event) => Some((format!("event:{}", event.name), Item::Event(event))),
+        Item::Lease(lease) => Some((format!("lease:{}", lease.name.name), Item::Lease(lease))),
+        Item::Ledger(ledger) => {
+            Some((format!("ledger:{}", ledger.name.name), Item::Ledger(ledger)))
+        }
+        Item::Counter(counter) => Some((
+            format!("counter:{}", counter.name.name),
+            Item::Counter(counter),
+        )),
+        Item::Flow(flow) => Some((format!("flow:{}", flow.name.name), Item::Flow(flow))),
         Item::Harness(mut harness) => {
             let name = rename_ident(harness.name, alias, local_names);
             let generated = format!("harness:{}", name.name);
@@ -1763,6 +2233,20 @@ fn expand_pattern_item(
                     substitute_pattern_type(field.ty.clone(), type_substitutions, local_names);
             }
             Some((generated, Item::Class(class_decl)))
+        }
+        Item::Table(mut table) => {
+            let name = rename_ident(table.name, alias, local_names);
+            let generated = format!("table:{}", name.name);
+            table.name = name;
+            for row in &mut table.rows {
+                row.body.text = substitute_pattern_text(
+                    &row.body.text,
+                    type_substitutions,
+                    value_substitutions,
+                    local_names,
+                );
+            }
+            Some((generated, Item::Table(table)))
         }
         Item::Coerce(mut coerce) => {
             let name = rename_ident(coerce.name, alias, local_names);
@@ -2133,6 +2617,9 @@ impl SemanticContext {
         let mut agent_capabilities = BTreeMap::new();
         let mut coerce_outputs = BTreeMap::new();
         let mut coerce_params = BTreeMap::new();
+        let mut leases = BTreeSet::new();
+        let mut ledgers = BTreeSet::new();
+        let mut counters = BTreeSet::new();
 
         for item in &program.items {
             schemas.insert_item(item);
@@ -2158,6 +2645,15 @@ impl SemanticContext {
                     coerce_outputs.insert(coerce.name.name.clone(), coerce.output.clone());
                     coerce_params.insert(coerce.name.name.clone(), coerce.params.clone());
                 }
+                Item::Lease(lease) => {
+                    leases.insert(lease.name.name.clone());
+                }
+                Item::Ledger(ledger) => {
+                    ledgers.insert(ledger.name.name.clone());
+                }
+                Item::Counter(counter) => {
+                    counters.insert(counter.name.name.clone());
+                }
                 _ => {}
             }
         }
@@ -2173,6 +2669,9 @@ impl SemanticContext {
             coerce_outputs,
             coerce_params,
             workflow_inputs,
+            leases,
+            ledgers,
+            counters,
         }
     }
 }
@@ -2234,26 +2733,23 @@ impl SchemaIndex {
             "AgentTurn",
             [
                 ("id", string_ty()),
-                ("issue", ref_ty("LoftIssue")),
                 ("summary", string_ty()),
-                ("changedFiles", array_ty(string_ty())),
+                ("agent", string_ty()),
+                ("provider", string_ty()),
+                ("status", string_ty()),
+                ("run_id", string_ty()),
+                ("effect_id", string_ty()),
             ],
         );
-        index.insert_class(
-            "LoftIssue",
-            [
-                ("id", string_ty()),
-                ("title", string_ty()),
-                ("body", string_ty()),
-            ],
-        );
-        index.insert_class("LoftClaim", [("issue", ref_ty("LoftIssue"))]);
         index.insert_class(
             "HumanAnswer",
             [
-                ("subject", string_ty()),
-                ("decision", string_ty()),
-                ("reason", string_ty()),
+                ("inbox_item_id", string_ty()),
+                ("effect_id", string_ty()),
+                ("prompt", string_ty()),
+                ("answered_by", string_ty()),
+                ("choice", string_ty()),
+                ("text", string_ty()),
             ],
         );
         index.insert_class(
@@ -2262,6 +2758,9 @@ impl SchemaIndex {
                 ("id", string_ty()),
                 ("title", string_ty()),
                 ("body", string_ty()),
+                ("queue", string_ty()),
+                ("status", string_ty()),
+                ("labels", array_ty(string_ty())),
             ],
         );
         index.insert_class(
@@ -2318,14 +2817,51 @@ impl SchemaIndex {
                     enum_decl
                         .variants
                         .iter()
-                        .map(|variant| variant.name.clone())
+                        .map(|variant| variant.name.name.clone())
                         .collect(),
                 );
+                // Data-carrying variants are visible as generated
+                // `<Enum>.<Variant>` classes (spec/sum-types.md), so case
+                // bindings type-check field access against them.
+                for variant in &enum_decl.variants {
+                    if variant.fields.is_empty() {
+                        continue;
+                    }
+                    let mut fields = BTreeMap::new();
+                    fields.insert(
+                        "variant".to_owned(),
+                        TypeSyntax::LiteralString {
+                            value: variant.name.name.clone(),
+                            span: variant.name.span,
+                        },
+                    );
+                    for field in &variant.fields {
+                        fields.insert(field.name.name.clone(), field.ty.clone());
+                    }
+                    self.classes.insert(
+                        format!("{}.{}", enum_decl.name.name, variant.name.name),
+                        fields,
+                    );
+                }
             }
             Item::Class(class_decl) => {
                 self.classes.insert(
                     class_decl.name.name.clone(),
                     class_decl
+                        .fields
+                        .iter()
+                        .map(|field| (field.name.name.clone(), field.ty.clone()))
+                        .collect(),
+                );
+            }
+            Item::Event(event) => {
+                self.events.insert(event.name.clone());
+                // The payload schema is indexed under the dotted event name,
+                // unreachable from user class declarations, so bare `when
+                // <event> as x` bindings type-check field access.
+                self.classes.insert(
+                    event.name.clone(),
+                    event
                         .fields
                         .iter()
                         .map(|field| (field.name.name.clone(), field.ty.clone()))
@@ -2346,6 +2882,18 @@ impl SchemaIndex {
     }
 
     fn resolve_field_path(&self, root_schema: &str, path: &[String]) -> Result<TypeSyntax, String> {
+        // Dotted runtime fact names (general `when fact <name>` matches) are
+        // untyped — unless a declared `event` (or generated `<Enum>.<Variant>`
+        // class) indexes a payload schema under the dotted name, in which
+        // case field paths are statically validated against it.
+        if root_schema.contains('.') && !self.classes.contains_key(root_schema) {
+            return Ok(TypeSyntax::Ref {
+                name: Ident {
+                    name: root_schema.to_owned(),
+                    span: zero_span(),
+                },
+            });
+        }
         let mut schema = root_schema.to_owned();
         let mut current = TypeSyntax::Ref {
             name: Ident {
@@ -2447,6 +2995,27 @@ fn lower_use(use_decl: UseDecl, ir: &mut IrProgram, _diagnostics: &mut Vec<Diagn
     });
 }
 
+fn lower_queue(queue: QueueDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    if queue.tracker.name != "builtin" {
+        diagnostics.push(Diagnostic {
+            span: queue.tracker.span,
+            message: format!(
+                "queue `{}` uses unavailable tracker `{}`",
+                queue.name.name, queue.tracker.name
+            ),
+            suggestion: Some(
+                "`builtin` is the available tracker; loft/github/linear/jira are deferred bindings"
+                    .to_owned(),
+            ),
+        });
+    }
+    ir.queues.push(IrQueue {
+        name: queue.name.name,
+        tracker: queue.tracker.name,
+        span: queue.span,
+    });
+}
+
 fn lower_harness(harness: HarnessDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
     if !is_supported_harness_kind(&harness.kind.name) {
         diagnostics.push(Diagnostic {
@@ -2470,7 +3039,10 @@ fn lower_harness(harness: HarnessDecl, ir: &mut IrProgram, diagnostics: &mut Vec
 }
 
 fn is_supported_harness_kind(kind: &str) -> bool {
-    matches!(kind, "codex" | "claude" | "pi" | "fixture" | "command")
+    matches!(
+        kind,
+        "codex" | "claude" | "pi" | "fixture" | "native-fixture" | "command"
+    )
 }
 
 fn lower_agent(
@@ -2482,6 +3054,7 @@ fn lower_agent(
     let mut lowered = IrAgent {
         name: agent.name.name.clone(),
         harness: agent.harness.as_ref().map(|harness| harness.name.clone()),
+        provider: None,
         profile: None,
         capacity: None,
         skills: Vec::new(),
@@ -2506,6 +3079,47 @@ fn lower_agent(
 
     for field in agent.fields {
         match field {
+            AgentField::Provider(provider) => {
+                if lowered.provider.is_some() {
+                    diagnostics.push(Diagnostic {
+                        span: provider.span,
+                        message: format!(
+                            "agent `{}` declares provider more than once",
+                            agent.name.name
+                        ),
+                        suggestion: Some(
+                            "keep exactly one `provider` field in the agent block".to_owned(),
+                        ),
+                    });
+                }
+                if agent.harness.is_some() {
+                    diagnostics.push(Diagnostic {
+                        span: provider.span,
+                        message: format!(
+                            "agent `{}` declares both `using` harness and direct provider `{}`",
+                            agent.name.name, provider.name
+                        ),
+                        suggestion: Some(
+                            "use either `agent name using harness { ... }` or `provider codex`, not both"
+                                .to_owned(),
+                        ),
+                    });
+                }
+                if !is_supported_harness_kind(&provider.name) {
+                    diagnostics.push(Diagnostic {
+                        span: provider.span,
+                        message: format!(
+                            "agent `{}` uses unsupported provider `{}`",
+                            agent.name.name, provider.name
+                        ),
+                        suggestion: Some(
+                            "supported providers are `codex`, `claude`, `pi`, `fixture`, `native-fixture`, and `command`"
+                                .to_owned(),
+                        ),
+                    });
+                }
+                lowered.provider = Some(provider.name);
+            }
             AgentField::Profile(profile) => lowered.profile = Some(profile.value),
             AgentField::Capacity(capacity, span) => {
                 if capacity == 0 {
@@ -2560,7 +3174,7 @@ fn lower_agent(
                         name.name, agent.name.name
                     ),
                     suggestion: Some(
-                        "supported agent fields are `profile`, `capacity`, `skills`, and `capabilities`".to_owned(),
+                        "supported agent fields are `provider`, `profile`, `capacity`, `skills`, and `capabilities`".to_owned(),
                     ),
                 });
             }
@@ -2572,6 +3186,14 @@ fn lower_agent(
             span: agent.name.span,
             message: format!("agent `{}` is missing a profile", agent.name.name),
             suggestion: Some("add `profile \"profile-name\"` inside the agent block".to_owned()),
+        });
+    }
+
+    if lowered.harness.is_none() && lowered.provider.is_none() {
+        diagnostics.push(Diagnostic {
+            span: agent.name.span,
+            message: format!("agent `{}` is missing provider binding", agent.name.name),
+            suggestion: Some("add `provider codex`, `provider claude`, `provider pi`, `provider fixture`, or use an explicit harness".to_owned()),
         });
     }
 
@@ -2589,18 +3211,59 @@ fn lower_agent(
 fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
     let mut variants = BTreeSet::new();
     for variant in &enum_decl.variants {
-        if !variants.insert(variant.name.clone()) {
+        if !variants.insert(variant.name.name.clone()) {
             diagnostics.push(Diagnostic {
                 span: variant.span,
                 message: format!(
                     "enum `{}` declares variant `{}` more than once",
-                    enum_decl.name.name, variant.name
+                    enum_decl.name.name, variant.name.name
                 ),
                 suggestion: Some(
                     "remove the duplicate variant or give it a distinct name".to_owned(),
                 ),
             });
         }
+        // The discriminant is synthesized from the variant name
+        // (spec/sum-types.md): `variant` is reserved inside variant bodies.
+        for field in &variant.fields {
+            if field.name.name == "variant" {
+                diagnostics.push(Diagnostic {
+                    span: field.name.span,
+                    message: format!(
+                        "variant `{}` of enum `{}` declares reserved field `variant`",
+                        variant.name.name, enum_decl.name.name
+                    ),
+                    suggestion: Some(
+                        "the discriminant is synthesized from the variant name; rename the field"
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+    }
+
+    // Each data-carrying variant lowers to a generated `<Enum>.<Variant>`
+    // class holding the literal `variant` discriminant plus its payload
+    // (spec/sum-types.md). The dotted name is unreachable from user source.
+    for variant in &enum_decl.variants {
+        if variant.fields.is_empty() {
+            continue;
+        }
+        let mut fields = vec![IrClassField {
+            name: "variant".to_owned(),
+            ty: IrType::LiteralString(variant.name.name.clone()),
+            span: variant.name.span,
+        }];
+        fields.extend(variant.fields.iter().map(|field| IrClassField {
+            name: field.name.name.clone(),
+            ty: lower_type(field.ty.clone()),
+            span: field.span,
+        }));
+        ir.schemas.push(IrSchema::Class(IrClass {
+            name: format!("{}.{}", enum_decl.name.name, variant.name.name),
+            fields,
+            span: variant.span,
+        }));
     }
 
     ir.schemas.push(IrSchema::Enum(IrEnum {
@@ -2608,10 +3271,48 @@ fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Dia
         variants: enum_decl
             .variants
             .into_iter()
-            .map(|variant| variant.name)
+            .map(|variant| variant.name.name)
             .collect(),
         span: enum_decl.span,
     }));
+}
+
+fn lower_event(event: EventDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    if ir.events.iter().any(|existing| existing.name == event.name) {
+        diagnostics.push(Diagnostic {
+            span: event.name_span,
+            message: format!("event `{}` is declared more than once", event.name),
+            suggestion: Some("remove the duplicate event declaration".to_owned()),
+        });
+    }
+    let mut fields = BTreeSet::new();
+    for field in &event.fields {
+        if !fields.insert(field.name.name.clone()) {
+            diagnostics.push(Diagnostic {
+                span: field.name.span,
+                message: format!(
+                    "event `{}` declares field `{}` more than once",
+                    event.name, field.name.name
+                ),
+                suggestion: Some(
+                    "remove the duplicate field or give it a distinct name".to_owned(),
+                ),
+            });
+        }
+    }
+    ir.events.push(IrEvent {
+        name: event.name,
+        fields: event
+            .fields
+            .into_iter()
+            .map(|field| IrClassField {
+                name: field.name.name,
+                ty: lower_type(field.ty),
+                span: field.span,
+            })
+            .collect(),
+        span: event.span,
+    });
 }
 
 fn lower_class(
@@ -2653,6 +3354,85 @@ fn lower_class(
     }));
 }
 
+fn lower_table(
+    table: TableDecl,
+    semantic: &SemanticContext,
+    workflow_contract_names: &WorkflowContractNames,
+    ir: &mut IrProgram,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !semantic.schemas.class_exists(&table.schema.name) {
+        diagnostics.push(Diagnostic {
+            span: table.schema.span,
+            message: format!(
+                "table `{}` targets unknown class `{}`",
+                table.name.name, table.schema.name
+            ),
+            suggestion: Some("declare the class before seeding rows for it".to_owned()),
+        });
+        return;
+    }
+
+    if table.rows.is_empty() {
+        diagnostics.push(Diagnostic {
+            span: table.span,
+            message: format!("table `{}` has no rows", table.name.name),
+            suggestion: Some("add at least one `{ ... }` row".to_owned()),
+        });
+        return;
+    }
+
+    let mut body = String::new();
+    for row in &table.rows {
+        push_line(&mut body, format!("record {} {{", table.schema.name));
+        push_block_body(&row.body.text, &mut body);
+        push_line(&mut body, "}");
+        body.push('\n');
+    }
+    if body.ends_with('\n') {
+        body.pop();
+    }
+
+    let rule = RuleDecl {
+        name: Ident {
+            name: format!("table_{}", table.name.name),
+            span: table.name.span,
+        },
+        tags: Vec::new(),
+        description: None,
+        whens: vec![WhenClause {
+            text: "started".to_owned(),
+            span: table.name.span,
+        }],
+        body: BlockSource {
+            text: body,
+            span: table.span,
+        },
+        span: table.span,
+    };
+
+    let record_sources = table
+        .rows
+        .iter()
+        .map(|row| IrRecordSource {
+            schema: table.schema.name.clone(),
+            construct: "table_row".to_owned(),
+            span: row.span,
+        })
+        .collect::<Vec<_>>();
+
+    let rule_name = rule.name.name.clone();
+    lower_rule(rule, semantic, workflow_contract_names, ir, diagnostics);
+    if let Some(rule) = ir
+        .rules
+        .iter_mut()
+        .rev()
+        .find(|rule| rule.name == rule_name)
+    {
+        rule.metadata.record_sources = record_sources;
+    }
+}
+
 fn lower_coerce(
     coerce: CoerceDecl,
     ir: &mut IrProgram,
@@ -2677,6 +3457,7 @@ fn lower_coerce(
         validate_type_refs(&param.ty, schema_names, agent_names, diagnostics);
     }
     validate_type_refs(&coerce.output, schema_names, agent_names, diagnostics);
+    validate_coerce_prompt_content_type_annotations(&coerce, diagnostics);
 
     ir.coerces.push(IrCoerce {
         name: coerce.name.name,
@@ -2755,8 +3536,6 @@ fn is_builtin_schema_ref(name: &str) -> bool {
         name,
         "AgentTurn"
             | "WorkItem"
-            | "LoftIssue"
-            | "LoftClaim"
             | "HumanAnswer"
             | "Evidence"
             | "TerminalFailed"
@@ -2766,20 +3545,18 @@ fn is_builtin_schema_ref(name: &str) -> bool {
 }
 
 fn lower_rule(
-    mut rule: RuleDecl,
+    rule: RuleDecl,
     semantic: &SemanticContext,
-    explicit_workflow_body: bool,
     workflow_contract_names: &WorkflowContractNames,
     ir: &mut IrProgram,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    rule.body.text = desugar_then_chains(&rule.body.text);
+    validate_canonical_rule_body_syntax(&rule, diagnostics);
     let metadata = analyze_rule(&rule, semantic, diagnostics);
     validate_workflow_terminal_actions(
         &rule,
         semantic,
         &binding_types_for_rule(&rule),
-        explicit_workflow_body,
         workflow_contract_names,
         diagnostics,
     );
@@ -2811,6 +3588,33 @@ fn lower_when_clause(when: WhenClause) -> IrWhen {
         pattern,
         guard,
         span: when.span,
+    }
+}
+
+fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Diagnostic>) {
+    for line in rule.body.text.lines().map(str::trim) {
+        if line.starts_with("then ") {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` uses unsupported `then` sequencing",
+                    rule.name.name
+                ),
+                suggestion: Some(
+                    "use `after <effect> succeeds { ... }` blocks for effect sequencing".to_owned(),
+                ),
+            });
+        }
+        if line.starts_with("after ") && line.contains("=>") {
+            diagnostics.push(Diagnostic {
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` uses unsupported `after ... =>` sequencing",
+                    rule.name.name
+                ),
+                suggestion: Some("write `after <effect> succeeds { ... }`".to_owned()),
+            });
+        }
     }
 }
 
@@ -2881,7 +3685,6 @@ fn validate_workflow_terminal_actions(
     rule: &RuleDecl,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
-    explicit_workflow_body: bool,
     contracts: &WorkflowContractNames,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -2896,20 +3699,6 @@ fn validate_workflow_terminal_actions(
         let Some((action, rest, declared)) = terminal else {
             continue;
         };
-        if !explicit_workflow_body {
-            diagnostics.push(Diagnostic {
-                span: rule.body.span,
-                message: format!(
-                    "rule `{}` uses `{action}` outside an explicit workflow body",
-                    rule.name.name
-                ),
-                suggestion: Some(
-                    "wrap the workflow declarations in `workflow Name { ... }` before using terminal actions"
-                        .to_owned(),
-                ),
-            });
-            continue;
-        }
         let Some(name) = rest.split('{').next().and_then(|header| {
             let mut parts = header.split_whitespace();
             match (parts.next(), parts.next()) {
@@ -3039,6 +3828,12 @@ fn analyze_rule(
     semantic: &SemanticContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> IrRuleMetadata {
+    // Statement-form gate: every body must parse into the body AST. Unknown
+    // statements, malformed modifiers, and unclosed blocks are spanned
+    // errors here rather than silent no-ops at lowering time.
+    let (body_ast, body_diagnostics) =
+        body::parse_rule_body(&rule.body.text, rule.body.span.start, body::BodyMode::Rule);
+    diagnostics.extend(body_diagnostics);
     let mut metadata = IrRuleMetadata {
         fact_reads: rule
             .whens
@@ -3050,7 +3845,58 @@ fn analyze_rule(
     let mut seen_bindings = BTreeSet::new();
     let mut binding_types = BTreeMap::new();
     for when in &rule.whens {
+        // A pattern that binds (`... as x`) but maps to no known readiness
+        // form would otherwise be a silently-dead rule.
+        let (pattern_text, _) = split_when_guard(&when.text);
+        if binding_after_as(pattern_text).is_some()
+            && binding_from_when(&when.text).is_none()
+            && !pattern_text.ends_with(" is available")
+        {
+            diagnostics.push(Diagnostic {
+                span: when.span,
+                message: format!(
+                    "rule `{}` has unknown readiness pattern `{pattern_text}`",
+                    rule.name.name
+                ),
+                suggestion: Some(
+                    "match a class (`when Class as x`) or a runtime fact (`when fact <name> as x`)"
+                        .to_owned(),
+                ),
+            });
+        }
         if let Some((binding, schema)) = binding_from_when(&when.text) {
+            validate_binding_name(rule, &binding, when.span, diagnostics);
+            if !schema.contains('.') && !semantic.schemas.class_exists(&schema) {
+                let suggestion = match closest_name(&schema, semantic.schemas.classes.keys()) {
+                    Some(candidate) => {
+                        format!("did you mean `{candidate}`? otherwise declare `class {schema}`")
+                    }
+                    None => format!("declare `class {schema}` before matching it"),
+                };
+                diagnostics.push(Diagnostic {
+                    span: when.span,
+                    message: format!("rule `{}` matches unknown class `{schema}`", rule.name.name),
+                    suggestion: Some(suggestion),
+                });
+            }
+            // The bare dotted form is the typed event reaction
+            // (spec/event-ingress.md): it requires a declared `event`;
+            // undeclared dotted facts keep the untyped `when fact` form.
+            if schema.contains('.')
+                && !pattern_text.trim_start().starts_with("fact ")
+                && !semantic.schemas.events.contains(&schema)
+            {
+                diagnostics.push(Diagnostic {
+                    span: when.span,
+                    message: format!(
+                        "rule `{}` reacts to undeclared event `{schema}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some(format!(
+                        "declare `event {schema} {{ ... }}` for a typed reaction, or use `when fact {schema} as ...` for an untyped one"
+                    )),
+                });
+            }
             binding_types.insert(binding, schema);
         }
     }
@@ -3058,6 +3904,30 @@ fn analyze_rule(
     for (binding, payload_type) in &effect_payload_types {
         if let IrType::Ref(schema) = payload_type {
             binding_types.insert(binding.clone(), schema.clone());
+        }
+    }
+    // `after <binding> <predicate> as <alias>`: the alias carries the
+    // effect's completed payload type, so case dispatch and field access
+    // through it type-check.
+    for line in rule.body.text.lines() {
+        let Some(rest) = line.trim().strip_prefix("after ") else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        let (Some(binding), Some(_predicate), Some(keyword), Some(alias)) =
+            (words.next(), words.next(), words.next(), words.next())
+        else {
+            continue;
+        };
+        if keyword != "as" {
+            continue;
+        }
+        let alias = alias.trim_end_matches('{').trim();
+        if alias.is_empty() {
+            continue;
+        }
+        if let Some(IrType::Ref(schema)) = effect_payload_types.get(binding) {
+            binding_types.insert(alias.to_owned(), schema.clone());
         }
     }
     for when in &rule.whens {
@@ -3087,6 +3957,15 @@ fn analyze_rule(
     validate_workflow_invocations(rule, semantic, &binding_types, diagnostics);
     let mut block_stack: Vec<BlockFrame> = Vec::new();
     let mut misplaced_effect_bindings = BTreeSet::new();
+    seed_ast_only_effect_bindings(&body_ast.statements, &mut seen_bindings, &mut binding_types);
+    validate_body_effect_operands(
+        rule,
+        &body_ast.statements,
+        semantic,
+        &binding_types,
+        diagnostics,
+    );
+    validate_coordination_discipline(rule, &body_ast.statements, diagnostics);
     let mut anonymous_effects = 0usize;
     let mut record_depth = 0i32;
 
@@ -3115,6 +3994,7 @@ fn analyze_rule(
             });
             continue;
         }
+        validate_rule_prompt_content_type_annotation(rule, line, diagnostics);
 
         if line.starts_with('}') {
             block_stack.pop();
@@ -3152,6 +4032,9 @@ fn analyze_rule(
         }
 
         if line.starts_with("after ") {
+            if let Some(alias) = binding_after_as(line) {
+                validate_binding_name(rule, &alias, rule.body.span, diagnostics);
+            }
             match parse_after_line(line) {
                 Some((binding, predicate)) => {
                     if !seen_bindings.contains(&binding) {
@@ -3210,6 +4093,7 @@ fn analyze_rule(
                 .clone()
                 .unwrap_or_else(|| format!("effect{anonymous_effects}"));
             if let Some(binding) = &binding {
+                validate_binding_name(rule, binding, rule.body.span, diagnostics);
                 seen_bindings.insert(binding.clone());
                 if let Some(schema) = effect_binding_schema(line, &kind, semantic) {
                     binding_types.insert(binding.clone(), schema);
@@ -3230,9 +4114,20 @@ fn analyze_rule(
                 required_capabilities: parse_required_capabilities(line),
                 idempotency_key,
                 span: rule.body.span,
+                timeout_seconds: None,
             });
         }
     }
+
+    let (ast_effects, ast_dependencies) =
+        collect_effects_from_ast(&body_ast.statements, &rule.name.name);
+    metadata.effects = ast_effects;
+    metadata.dependencies = ast_dependencies;
+
+    // `exec ... -> each Schema` produces one `Schema` fact per stream element
+    // (spec/json-ingestion.md) — a fact write for liveness and effect-graph
+    // analysis, like `record`.
+    push_ingest_fact_writes(&body_ast.statements, &mut metadata.fact_writes);
 
     metadata.fact_reads.sort();
     metadata.fact_reads.dedup();
@@ -3304,9 +4199,19 @@ fn terminal_completed_payload_type(
         IrEffectKind::LoftClaim => IrType::Ref("LoftClaim".to_owned()),
         IrEffectKind::HumanAsk => IrType::Ref("HumanAnswer".to_owned()),
         IrEffectKind::AgentTell => IrType::Ref("AgentTurn".to_owned()),
-        IrEffectKind::CapabilityCall | IrEffectKind::EventEmit | IrEffectKind::WorkflowInvoke => {
-            terminal_unknown_payload_type()
-        }
+        IrEffectKind::CapabilityCall
+        | IrEffectKind::EventEmit
+        | IrEffectKind::WorkflowInvoke
+        | IrEffectKind::TimerWait
+        | IrEffectKind::ExecCommand
+        | IrEffectKind::QueueFile
+        | IrEffectKind::QueueClaim
+        | IrEffectKind::QueueRelease
+        | IrEffectKind::QueueFinish
+        | IrEffectKind::LeaseAcquire
+        | IrEffectKind::LedgerAppend
+        | IrEffectKind::CounterConsume
+        | IrEffectKind::EventNotify => terminal_unknown_payload_type(),
     }
 }
 
@@ -3475,7 +4380,10 @@ fn lower_case_pattern(
     }
     match scrutinee_type {
         TypeSyntax::Ref { name } if semantic.schemas.enums.contains_key(&name.name) => {
-            Some(IrCasePattern::EnumVariant(pattern.to_owned()))
+            // The IR pattern is the variant name; the payload binding is a
+            // branch-scope concern, not part of dispatch identity.
+            let (variant, _) = sum_case_pattern_parts(pattern);
+            Some(IrCasePattern::EnumVariant(variant.to_owned()))
         }
         TypeSyntax::Union { .. } => parse_literal_expr(pattern).and_then(|literal| match literal {
             LiteralExpr::String(value) => Some(IrCasePattern::LiteralString(value.to_owned())),
@@ -3500,6 +4408,19 @@ fn case_branch_payload_binding(
     scrutinee_type: &TypeSyntax,
     semantic: &SemanticContext,
 ) -> Option<(String, String)> {
+    // Sum types: `Variant as b` binds the payload typed as the generated
+    // `<Enum>.<Variant>` class (spec/sum-types.md).
+    if let TypeSyntax::Ref { name } = scrutinee_type {
+        if semantic.schemas.enums.contains_key(&name.name) {
+            let (variant, binding) = sum_case_pattern_parts(pattern);
+            let binding = binding?;
+            let generated = format!("{}.{variant}", name.name);
+            if binding.is_empty() || !semantic.schemas.class_exists(&generated) {
+                return None;
+            }
+            return Some((binding.to_owned(), generated));
+        }
+    }
     let binding = pattern.strip_prefix("Some ").map(str::trim)?;
     if binding.is_empty() {
         return None;
@@ -3773,6 +4694,221 @@ fn ir_field(name: &str, ty: IrType) -> IrClassField {
     }
 }
 
+fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
+    match kind {
+        body::BodyEffectKind::Tell { .. } => IrEffectKind::AgentTell,
+        body::BodyEffectKind::Coerce { .. } | body::BodyEffectKind::Decide { .. } => {
+            IrEffectKind::BamlCoerce
+        }
+        body::BodyEffectKind::AskHuman { .. } => IrEffectKind::HumanAsk,
+        body::BodyEffectKind::Call { .. } => IrEffectKind::CapabilityCall,
+        body::BodyEffectKind::Invoke { .. } => IrEffectKind::WorkflowInvoke,
+        body::BodyEffectKind::Timer { .. } => IrEffectKind::TimerWait,
+        body::BodyEffectKind::Exec { .. } => IrEffectKind::ExecCommand,
+        body::BodyEffectKind::QueueFile { .. } => IrEffectKind::QueueFile,
+        body::BodyEffectKind::QueueClaim {
+            legacy_plugin: Some(_),
+            ..
+        } => IrEffectKind::LoftClaim,
+        body::BodyEffectKind::QueueClaim { .. } => IrEffectKind::QueueClaim,
+        body::BodyEffectKind::QueueRelease { .. } => IrEffectKind::QueueRelease,
+        body::BodyEffectKind::QueueFinish { .. } => IrEffectKind::QueueFinish,
+        body::BodyEffectKind::LeaseAcquire { .. } => IrEffectKind::LeaseAcquire,
+        body::BodyEffectKind::LedgerAppend { .. } => IrEffectKind::LedgerAppend,
+        body::BodyEffectKind::CounterConsume { .. } => IrEffectKind::CounterConsume,
+        body::BodyEffectKind::Notify { .. } => IrEffectKind::EventNotify,
+    }
+}
+
+fn is_ast_only_effect_kind(kind: &body::BodyEffectKind) -> bool {
+    matches!(
+        kind,
+        body::BodyEffectKind::Timer { .. }
+            | body::BodyEffectKind::Exec { .. }
+            | body::BodyEffectKind::Decide { .. }
+            | body::BodyEffectKind::QueueFile { .. }
+            | body::BodyEffectKind::QueueClaim {
+                legacy_plugin: None,
+                ..
+            }
+            | body::BodyEffectKind::QueueRelease { .. }
+            | body::BodyEffectKind::QueueFinish { .. }
+            | body::BodyEffectKind::LeaseAcquire { .. }
+            | body::BodyEffectKind::LedgerAppend { .. }
+            | body::BodyEffectKind::CounterConsume { .. }
+            | body::BodyEffectKind::Notify { .. }
+    )
+}
+
+/// Bindings introduced by AST-only effect kinds are unknown to the
+/// line-based scanner; seed them so sequence checks and `after` blocks see
+/// them. Binding types for typed outputs are registered where known.
+fn seed_ast_only_effect_bindings(
+    statements: &[body::BodyStmt],
+    seen_bindings: &mut BTreeSet<String>,
+    binding_types: &mut BTreeMap<String, String>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                if is_ast_only_effect_kind(&effect.kind) {
+                    if let Some(binding) = &effect.binding {
+                        seen_bindings.insert(binding.clone());
+                        let _ = binding_types;
+                    }
+                }
+            }
+            body::BodyStmt::After(after) => {
+                seed_ast_only_effect_bindings(&after.body, seen_bindings, binding_types)
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    seed_ast_only_effect_bindings(&branch.body, seen_bindings, binding_types);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                seed_ast_only_effect_bindings(&branch.then_body, seen_bindings, binding_types);
+                if let Some(else_body) = &branch.else_body {
+                    seed_ast_only_effect_bindings(else_body, seen_bindings, binding_types);
+                }
+            }
+            body::BodyStmt::Handler(handler) => {
+                seed_ast_only_effect_bindings(&handler.body, seen_bindings, binding_types)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Derives effect nodes and dependency edges from the body AST, in document
+/// order, with ids and idempotency keys identical to the historical
+/// line-scanner derivation.
+fn collect_effects_from_ast(
+    statements: &[body::BodyStmt],
+    rule_name: &str,
+) -> (Vec<IrEffectNode>, Vec<IrEffectDependency>) {
+    let mut effects = Vec::new();
+    let mut dependencies = Vec::new();
+    let mut counter = 0usize;
+    let mut after_stack: Vec<(String, DependencyPredicate)> = Vec::new();
+    walk_effects(
+        statements,
+        rule_name,
+        &mut counter,
+        &mut after_stack,
+        &mut effects,
+        &mut dependencies,
+    );
+    (effects, dependencies)
+}
+
+fn walk_effects(
+    statements: &[body::BodyStmt],
+    rule_name: &str,
+    counter: &mut usize,
+    after_stack: &mut Vec<(String, DependencyPredicate)>,
+    effects: &mut Vec<IrEffectNode>,
+    dependencies: &mut Vec<IrEffectDependency>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                *counter += 1;
+                let id = effect
+                    .binding
+                    .clone()
+                    .unwrap_or_else(|| format!("effect{counter}"));
+                let kind = ir_effect_kind_for_body(&effect.kind);
+                for (upstream, predicate) in after_stack.iter() {
+                    dependencies.push(IrEffectDependency {
+                        upstream: upstream.clone(),
+                        predicate: predicate.clone(),
+                        downstream: id.clone(),
+                    });
+                }
+                let idempotency_key =
+                    effect_idempotency_key(rule_name, &id, &kind, &effect.binding);
+                effects.push(IrEffectNode {
+                    id,
+                    kind,
+                    binding: effect.binding.clone(),
+                    required_capabilities: effect.requires.clone(),
+                    idempotency_key,
+                    span: effect.span,
+                    timeout_seconds: effect.timeout_seconds,
+                });
+            }
+            body::BodyStmt::After(after) => {
+                let predicate = match after.predicate {
+                    body::AfterPredicate::Succeeds => DependencyPredicate::Succeeds,
+                    body::AfterPredicate::Fails => DependencyPredicate::Fails,
+                    // Coordination outcomes are completion-valued: the
+                    // downstream effect depends on the op completing; which
+                    // arm runs is decided by the outcome variant at lowering.
+                    body::AfterPredicate::Completes
+                    | body::AfterPredicate::Held
+                    | body::AfterPredicate::Contended
+                    | body::AfterPredicate::Ok
+                    | body::AfterPredicate::Over => DependencyPredicate::Completes,
+                };
+                after_stack.push((after.binding.clone(), predicate));
+                walk_effects(
+                    &after.body,
+                    rule_name,
+                    counter,
+                    after_stack,
+                    effects,
+                    dependencies,
+                );
+                after_stack.pop();
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    walk_effects(
+                        &branch.body,
+                        rule_name,
+                        counter,
+                        after_stack,
+                        effects,
+                        dependencies,
+                    );
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                walk_effects(
+                    &branch.then_body,
+                    rule_name,
+                    counter,
+                    after_stack,
+                    effects,
+                    dependencies,
+                );
+                if let Some(else_body) = &branch.else_body {
+                    walk_effects(
+                        else_body,
+                        rule_name,
+                        counter,
+                        after_stack,
+                        effects,
+                        dependencies,
+                    );
+                }
+            }
+            body::BodyStmt::Handler(handler) => {
+                walk_effects(
+                    &handler.body,
+                    rule_name,
+                    counter,
+                    after_stack,
+                    effects,
+                    dependencies,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 fn effect_idempotency_key(
     rule_name: &str,
     effect_id: &str,
@@ -3852,7 +4988,9 @@ fn validate_effect_payloads(
         let trimmed = statement.trim();
         if trimmed.starts_with("coerce ") {
             validate_coerce_call(rule, trimmed, semantic, binding_types, diagnostics);
-        } else if trimmed.starts_with("claim ") {
+        } else if trimmed.starts_with("claim ") && trimmed.contains(" with ") {
+            // Legacy loft form only; plain `claim <item>` is a queue verb
+            // validated by the body AST.
             validate_loft_claim_payload(rule, trimmed, semantic, binding_types, diagnostics);
         }
     }
@@ -4196,7 +5334,7 @@ fn validate_expression(
         Err(message) => diagnostics.push(Diagnostic {
             span: rule.body.span,
             message: format!("rule `{}` has invalid {label} expression: {message}", rule.name.name),
-            suggestion: Some("use deterministic field paths, literals, boolean operators, comparisons, membership, or count/exists/empty".to_owned()),
+            suggestion: Some("use deterministic field paths, literals, boolean operators, comparisons, membership, count, or exists".to_owned()),
         }),
     }
 }
@@ -4531,36 +5669,6 @@ fn validate_function_call(
                 });
             }
         }
-        "one" | "none" => {
-            if args.len() != 1 {
-                diagnostics.push(Diagnostic {
-                    span: context.span,
-                    message: format!(
-                        "{} calls `{name}` with {} arguments, expected 1",
-                        context.subject,
-                        args.len()
-                    ),
-                    suggestion: Some(format!(
-                        "call `{name}` with exactly one fact or effect query argument"
-                    )),
-                });
-                return;
-            }
-            let ty = infer_expr_type(&args[0], semantic, scope, context, diagnostics);
-            if !matches!(ty, ExprType::Collection | ExprType::Unknown) {
-                diagnostics.push(Diagnostic {
-                    span: context.span,
-                    message: format!(
-                        "{} calls `{name}` with unsupported argument type `{}`",
-                        context.subject,
-                        expr_type_label(&ty)
-                    ),
-                    suggestion: Some(format!(
-                        "use `{name}` only with fact or effect projection queries"
-                    )),
-                });
-            }
-        }
         "exists" => {
             if args.len() != 1 {
                 diagnostics.push(Diagnostic {
@@ -4585,44 +5693,6 @@ fn validate_function_call(
                     ),
                     suggestion: Some(
                         "use `exists path` for optional/map presence checks or pass an array, map, fact query, or effect query"
-                            .to_owned(),
-                    ),
-                });
-            }
-        }
-        "empty" => {
-            if args.len() != 1 {
-                diagnostics.push(Diagnostic {
-                    span: context.span,
-                    message: format!(
-                        "{} calls `empty` with {} arguments, expected 1",
-                        context.subject,
-                        args.len()
-                    ),
-                    suggestion: Some("call `empty` with exactly one argument".to_owned()),
-                });
-                return;
-            }
-            let ty = infer_expr_type(&args[0], semantic, scope, context, diagnostics);
-            if !is_empty_type(&ty) {
-                let optional = matches!(ty, ExprType::Optional(_));
-                diagnostics.push(Diagnostic {
-                    span: context.span,
-                    message: if optional {
-                        format!(
-                            "{} calls `empty` with unsupported optional argument type `{}`",
-                            context.subject,
-                            expr_type_label(&ty)
-                        )
-                    } else {
-                        format!(
-                            "{} calls `empty` with unsupported argument type `{}`",
-                            context.subject,
-                            expr_type_label(&ty)
-                        )
-                    },
-                    suggestion: Some(
-                        "use `empty` only with arrays, maps, strings, fact queries, effect queries, null, or supported optional values"
                             .to_owned(),
                     ),
                 });
@@ -4887,7 +5957,7 @@ fn infer_expr_type(
         }
         Expr::Call { name, args } => match name.as_str() {
             "count" => ExprType::Int,
-            "exists" | "empty" | "one" | "none" => ExprType::Bool,
+            "exists" => ExprType::Bool,
             _ => {
                 diagnostics.push(Diagnostic {
                     span: context.span,
@@ -4895,7 +5965,7 @@ fn infer_expr_type(
                         "{} calls unsupported expression function `{name}`",
                         context.subject
                     ),
-                    suggestion: Some("use `count`, `exists`, `empty`, `one`, or `none`".to_owned()),
+                    suggestion: Some("use `count` or `exists`".to_owned()),
                 });
                 for arg in args {
                     infer_expr_type(arg, semantic, scope, context, diagnostics);
@@ -5012,6 +6082,28 @@ fn infer_binary_type(
             }
             ExprType::Bool
         }
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+            for ty in [&left_ty, &right_ty] {
+                if !matches!(ty, ExprType::Int | ExprType::Float | ExprType::Unknown) {
+                    diagnostics.push(Diagnostic {
+                        span: context.span,
+                        message: format!(
+                            "{} uses arithmetic with a non-numeric operand",
+                            context.subject
+                        ),
+                        suggestion: Some("use `+ - * /` only with int or float values".to_owned()),
+                    });
+                    break;
+                }
+            }
+            if matches!(left_ty, ExprType::Float) || matches!(right_ty, ExprType::Float) {
+                ExprType::Float
+            } else if matches!(left_ty, ExprType::Int) && matches!(right_ty, ExprType::Int) {
+                ExprType::Int
+            } else {
+                ExprType::Unknown
+            }
+        }
     }
 }
 
@@ -5053,6 +6145,10 @@ fn expr_path_type(
         return None;
     }
     if let Some(schema) = scope.binding_types.get(&path[0]) {
+        if schema.contains('.') {
+            // Untyped runtime fact binding (general `when fact <name>`).
+            return Some(ExprType::Unknown);
+        }
         return semantic
             .schemas
             .resolve_field_path(schema, &path[1..])
@@ -5060,6 +6156,9 @@ fn expr_path_type(
             .map(|ty| expr_type_from_type_syntax(&ty, semantic));
     }
     let schema = scope.implicit_schema.as_ref()?;
+    if schema.contains('.') {
+        return Some(ExprType::Unknown);
+    }
     semantic
         .schemas
         .resolve_field_path(schema, path)
@@ -5174,7 +6273,12 @@ fn is_orderable_pair(left: &ExprType, right: &ExprType) -> bool {
     (is_numeric_type(left) && is_numeric_type(right))
         || matches!(
             (left, right),
-            (ExprType::Duration, ExprType::Duration) | (ExprType::Time, ExprType::Time)
+            (ExprType::Duration, ExprType::Duration)
+                | (ExprType::Time, ExprType::Time)
+                // A quoted ISO-8601 string in a time-typed comparison is a
+                // time literal (spec/scheduled-time.md).
+                | (ExprType::Time, ExprType::String)
+                | (ExprType::String, ExprType::Time)
         )
 }
 
@@ -5194,19 +6298,6 @@ fn is_exists_type(ty: &ExprType) -> bool {
             | ExprType::Optional(_)
             | ExprType::Unknown
     )
-}
-
-fn is_empty_type(ty: &ExprType) -> bool {
-    match ty {
-        ExprType::String
-        | ExprType::Array(_)
-        | ExprType::Map(_)
-        | ExprType::Collection
-        | ExprType::Null
-        | ExprType::Unknown => true,
-        ExprType::Optional(inner) => is_empty_type(inner),
-        _ => false,
-    }
 }
 
 fn expr_type_label(ty: &ExprType) -> String {
@@ -5656,6 +6747,24 @@ fn expression_type(
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
 ) -> Option<TypeSyntax> {
+    // A bare enum-typed binding is a valid scrutinee: `case o` dispatches a
+    // sum-type payload (spec/sum-types.md). Class-typed bare bindings stay
+    // untyped here so the "match on a bound field" guidance still fires.
+    let is_bare_ident = !expr.is_empty()
+        && expr.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+        && expr.chars().next().is_some_and(char::is_alphabetic);
+    if is_bare_ident {
+        let schema = binding_types.get(expr)?;
+        if semantic.schemas.enums.contains_key(schema) {
+            return Some(TypeSyntax::Ref {
+                name: Ident {
+                    name: schema.clone(),
+                    span: zero_span(),
+                },
+            });
+        }
+        return None;
+    }
     let (root, path) = expression_path(expr)?;
     let schema = binding_types.get(&root)?;
     semantic.schemas.resolve_field_path(schema, &path).ok()
@@ -5706,14 +6815,32 @@ fn validate_case_pattern(
             let Some(variants) = semantic.schemas.enums.get(&name.name) else {
                 return;
             };
-            if !variants.contains(pattern) {
+            let (variant, binding) = sum_case_pattern_parts(pattern);
+            if !variants.contains(variant) {
                 diagnostics.push(Diagnostic {
                     span,
-                    message: format!("enum `{}` has no variant `{pattern}`", name.name),
+                    message: format!("enum `{}` has no variant `{variant}`", name.name),
                     suggestion: Some(format!(
                         "use one of: {}",
                         variants.iter().cloned().collect::<Vec<_>>().join(", ")
                     )),
+                });
+                return;
+            }
+            // `as` binds a data-carrying variant's payload (spec/sum-types.md);
+            // a bare variant has no payload to bind.
+            if binding.is_some()
+                && !semantic
+                    .schemas
+                    .class_exists(&format!("{}.{variant}", name.name))
+            {
+                diagnostics.push(Diagnostic {
+                    span,
+                    message: format!(
+                        "variant `{variant}` of enum `{}` carries no payload to bind",
+                        name.name
+                    ),
+                    suggestion: Some(format!("write `{variant} => {{ ... }}` without `as`")),
                 });
             }
         }
@@ -5969,6 +7096,15 @@ fn finite_case_domain(
     }
 }
 
+/// Splits a sum-type case pattern `Variant as binding` into variant and
+/// binding (spec/sum-types.md); a plain pattern returns no binding.
+fn sum_case_pattern_parts(pattern: &str) -> (&str, Option<&str>) {
+    match pattern.split_once(" as ") {
+        Some((variant, binding)) => (variant.trim(), Some(binding.trim())),
+        None => (pattern.trim(), None),
+    }
+}
+
 fn normalized_case_pattern(pattern: &str) -> Option<&str> {
     if is_fallback_pattern(pattern) {
         return None;
@@ -5979,6 +7115,8 @@ fn normalized_case_pattern(pattern: &str) -> Option<&str> {
     if pattern == "None" {
         return Some("None");
     }
+    // Coverage counts the variant, not its payload binding.
+    let (pattern, _) = sum_case_pattern_parts(pattern);
     parse_literal_expr(pattern).and_then(|literal| match literal {
         LiteralExpr::String(value) | LiteralExpr::Ident(value) => Some(value),
         _ => None,
@@ -6098,19 +7236,71 @@ fn after_scopes(block_stack: &[BlockFrame]) -> Vec<(String, DependencyPredicate)
         .collect()
 }
 
+/// The single lowering table for readiness sugar: maps a `when` pattern to
+/// the runtime fact name it matches. The general form is
+/// `when fact <name> as x`; the English phrases are documented abbreviations
+/// of it.
+pub fn runtime_fact_name_for_pattern(pattern: &str) -> Option<String> {
+    let pattern = pattern.trim();
+    if let Some(rest) = pattern.strip_prefix("fact ") {
+        let name = rest.split_whitespace().next()?;
+        return Some(name.to_owned());
+    }
+    if pattern.starts_with("human answered") {
+        return Some("human.answer.received".to_owned());
+    }
+    let mut words = pattern.split_whitespace();
+    let first = words.next()?;
+    if words.next() == Some("completed") && words.next() == Some("turn") {
+        let _ = first;
+        return Some("agent.turn.completed".to_owned());
+    }
+    {
+        let mut words = pattern.split_whitespace();
+        let _queue = words.next();
+        if words.next() == Some("has")
+            && words.next() == Some("ready")
+            && words.next() == Some("item")
+        {
+            return Some("queue.item.ready".to_owned());
+        }
+    }
+    if first.chars().next().is_some_and(char::is_uppercase) {
+        return Some(first.to_owned());
+    }
+    None
+}
+
+/// The schema used to type-check fields on the pattern's binding. Dotted
+/// runtime fact names are untyped (no class declares them); the sugar forms
+/// map to their builtin schemas.
 fn binding_from_when(when: &str) -> Option<(String, String)> {
     let (pattern, _) = split_when_guard(when);
     let binding = binding_after_as(pattern)?;
     let first = pattern.split_whitespace().next()?;
-    let schema = if first.chars().next().is_some_and(char::is_uppercase) {
+    let completed_turn = {
+        let mut words = pattern.split_whitespace();
+        words.next();
+        words.next() == Some("completed") && words.next() == Some("turn")
+    };
+    let schema = if let Some(rest) = pattern.strip_prefix("fact ") {
+        rest.split_whitespace().next()?.to_owned()
+    } else if first.chars().next().is_some_and(char::is_uppercase) {
         first.to_owned()
-    } else if pattern.starts_with("loft has ready issue ") {
-        "LoftIssue".to_owned()
-    } else if pattern.starts_with("worker completed turn ") {
+    } else if first.contains('.') {
+        // Bare dotted reaction `when deploy.finished as d` — typed against a
+        // declared `event` (validated at the call site,
+        // spec/event-ingress.md).
+        first.to_owned()
+    } else if completed_turn {
         "AgentTurn".to_owned()
     } else if pattern.starts_with("human answered ") {
         "HumanAnswer".to_owned()
-    } else if pattern.starts_with("manual review requested ") {
+    } else if {
+        let mut words = pattern.split_whitespace();
+        words.next();
+        words.next() == Some("has") && words.next() == Some("ready") && words.next() == Some("item")
+    } {
         "WorkItem".to_owned()
     } else {
         return None;
@@ -6143,7 +7333,17 @@ fn effect_binding_schema(
         IrEffectKind::AgentTell
         | IrEffectKind::CapabilityCall
         | IrEffectKind::EventEmit
-        | IrEffectKind::WorkflowInvoke => None,
+        | IrEffectKind::WorkflowInvoke
+        | IrEffectKind::TimerWait
+        | IrEffectKind::ExecCommand
+        | IrEffectKind::QueueFile
+        | IrEffectKind::QueueClaim
+        | IrEffectKind::QueueRelease
+        | IrEffectKind::QueueFinish
+        | IrEffectKind::LeaseAcquire
+        | IrEffectKind::LedgerAppend
+        | IrEffectKind::CounterConsume
+        | IrEffectKind::EventNotify => None,
     }
 }
 
@@ -6333,6 +7533,467 @@ fn paren_delta(line: &str) -> i32 {
     })
 }
 
+/// Collects the schemas an `exec ... -> each` stream records as facts.
+fn push_ingest_fact_writes(statements: &[body::BodyStmt], fact_writes: &mut Vec<String>) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                if let body::BodyEffectKind::Exec {
+                    parse_target: Some(parse),
+                    ..
+                } = &effect.kind
+                {
+                    if parse.each {
+                        fact_writes.push(format!("schema:{}", parse.schema));
+                    }
+                }
+            }
+            body::BodyStmt::After(after) => push_ingest_fact_writes(&after.body, fact_writes),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    push_ingest_fact_writes(&branch.body, fact_writes);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                push_ingest_fact_writes(&branch.then_body, fact_writes);
+                if let Some(else_body) = &branch.else_body {
+                    push_ingest_fact_writes(else_body, fact_writes);
+                }
+            }
+            body::BodyStmt::Handler(handler) => push_ingest_fact_writes(&handler.body, fact_writes),
+            _ => {}
+        }
+    }
+}
+
+/// Body-effect operand checks that need schema knowledge:
+/// - `timer until <operand>`: a non-literal operand must be a dotted path
+///   resolving to a `time`-typed field (spec/scheduled-time.md). Literals were
+///   format-validated by the body parser, so anything that still looks like an
+///   instant here is a valid literal and passes.
+/// - `exec ... -> Schema` / `-> each Schema`: the parse target must name a
+///   declared class (spec/json-ingestion.md).
+/// The coordination safety model (spec/coordination.md): at most one held
+/// lease per progression (hard default), exhaustive outcome handling, and
+/// the linear must-release discipline (instance terminals auto-release, so
+/// a path that ends in `complete`/`fail` is safe without an explicit
+/// `release`).
+fn validate_coordination_discipline(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut acquires = Vec::new();
+    let mut consumes = Vec::new();
+    collect_coordination_effects(statements, &mut acquires, &mut consumes);
+
+    if acquires.len() > 1 {
+        diagnostics.push(Diagnostic {
+            span: acquires[1].2,
+            message: format!(
+                "rule `{}` acquires more than one lease in a single progression",
+                rule.name.name
+            ),
+            suggestion: Some(
+                "the hard default is at most one held lease per progression (it breaks hold-and-wait); restructure into separate rules"
+                    .to_owned(),
+            ),
+        });
+    }
+    for (binding, until_ttl, span) in &acquires {
+        if *until_ttl {
+            continue;
+        }
+        let mut predicates = BTreeSet::new();
+        collect_after_predicates(statements, binding, &mut predicates);
+        for required in ["held", "contended"] {
+            if !predicates.contains(required) {
+                diagnostics.push(Diagnostic {
+                    span: *span,
+                    message: format!(
+                        "rule `{}` does not handle the `{required}` outcome of lease `{binding}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some(format!(
+                        "coordination outcomes are exhaustive: add `after {binding} {required} {{ ... }}`"
+                    )),
+                });
+            }
+        }
+        if let Some(held_body) = find_after_body(statements, binding, body::AfterPredicate::Held) {
+            if !releases_or_terminates(held_body, binding) {
+                diagnostics.push(Diagnostic {
+                    span: *span,
+                    message: format!(
+                        "rule `{}` can hold lease `{binding}` forever: the `held` branch neither releases it nor reaches a workflow terminal",
+                        rule.name.name
+                    ),
+                    suggestion: Some(format!(
+                        "add `release {binding}` on every non-terminal path, or use `acquire ... until ttl` for fire-and-forget"
+                    )),
+                });
+            }
+        }
+    }
+    for (binding, span) in &consumes {
+        let mut predicates = BTreeSet::new();
+        collect_after_predicates(statements, binding, &mut predicates);
+        for required in ["ok", "over"] {
+            if !predicates.contains(required) {
+                diagnostics.push(Diagnostic {
+                    span: *span,
+                    message: format!(
+                        "rule `{}` does not handle the `{required}` outcome of counter consume `{binding}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some(format!(
+                        "coordination outcomes are exhaustive: add `after {binding} {required} {{ ... }}`"
+                    )),
+                });
+            }
+        }
+    }
+}
+
+fn collect_coordination_effects(
+    statements: &[body::BodyStmt],
+    acquires: &mut Vec<(String, bool, SourceSpan)>,
+    consumes: &mut Vec<(String, SourceSpan)>,
+) {
+    for_each_body(statements, &mut |stmt| {
+        if let body::BodyStmt::Effect(effect) = stmt {
+            match &effect.kind {
+                body::BodyEffectKind::LeaseAcquire { until_ttl, .. } => {
+                    if let Some(binding) = &effect.binding {
+                        acquires.push((binding.clone(), *until_ttl, effect.span));
+                    }
+                }
+                body::BodyEffectKind::CounterConsume { .. } => {
+                    if let Some(binding) = &effect.binding {
+                        consumes.push((binding.clone(), effect.span));
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+fn collect_after_predicates(
+    statements: &[body::BodyStmt],
+    binding: &str,
+    predicates: &mut BTreeSet<&'static str>,
+) {
+    for_each_body(statements, &mut |stmt| {
+        if let body::BodyStmt::After(after) = stmt {
+            if after.binding == binding {
+                predicates.insert(after.predicate.as_str());
+            }
+        }
+    });
+}
+
+fn find_after_body<'a>(
+    statements: &'a [body::BodyStmt],
+    binding: &str,
+    predicate: body::AfterPredicate,
+) -> Option<&'a [body::BodyStmt]> {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::After(after) => {
+                if after.binding == binding && after.predicate == predicate {
+                    return Some(&after.body);
+                }
+                if let Some(found) = find_after_body(&after.body, binding, predicate) {
+                    return Some(found);
+                }
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    if let Some(found) = find_after_body(&branch.body, binding, predicate) {
+                        return Some(found);
+                    }
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                if let Some(found) = find_after_body(&branch.then_body, binding, predicate) {
+                    return Some(found);
+                }
+                if let Some(else_body) = &branch.else_body {
+                    if let Some(found) = find_after_body(else_body, binding, predicate) {
+                        return Some(found);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Linear must-release, prototype form: a statement list is safe if some
+/// statement guarantees release — an explicit `release <binding>`, a
+/// workflow terminal (instance-terminal auto-release), a nested after-block
+/// that is safe, or a branching construct ALL of whose branches are safe.
+fn releases_or_terminates(statements: &[body::BodyStmt], binding: &str) -> bool {
+    statements.iter().any(|statement| match statement {
+        body::BodyStmt::Effect(effect) => matches!(
+            &effect.kind,
+            body::BodyEffectKind::QueueRelease { item } if item == binding
+        ),
+        body::BodyStmt::Terminal(_) => true,
+        body::BodyStmt::After(after) => releases_or_terminates(&after.body, binding),
+        body::BodyStmt::Case(case) => {
+            !case.branches.is_empty()
+                && case
+                    .branches
+                    .iter()
+                    .all(|branch| releases_or_terminates(&branch.body, binding))
+        }
+        body::BodyStmt::Branch(branch) => {
+            releases_or_terminates(&branch.then_body, binding)
+                && branch
+                    .else_body
+                    .as_ref()
+                    .is_some_and(|else_body| releases_or_terminates(else_body, binding))
+        }
+        _ => false,
+    })
+}
+
+fn for_each_body(statements: &[body::BodyStmt], visit: &mut impl FnMut(&body::BodyStmt)) {
+    for statement in statements {
+        visit(statement);
+        match statement {
+            body::BodyStmt::After(after) => for_each_body(&after.body, visit),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    for_each_body(&branch.body, visit);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                for_each_body(&branch.then_body, visit);
+                if let Some(else_body) = &branch.else_body {
+                    for_each_body(else_body, visit);
+                }
+            }
+            body::BodyStmt::Handler(handler) => for_each_body(&handler.body, visit),
+            _ => {}
+        }
+    }
+}
+
+fn validate_body_effect_operands(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                match &effect.kind {
+                    body::BodyEffectKind::LeaseAcquire { resource, .. }
+                        if !semantic.leases.contains(resource) =>
+                    {
+                        diagnostics.push(Diagnostic {
+                            span: effect.span,
+                            message: format!(
+                                "rule `{}` acquires undeclared lease `{resource}`",
+                                rule.name.name
+                            ),
+                            suggestion: Some(format!(
+                                "declare `lease {resource} {{ key <Type>  slots <N>  ttl <duration> }}`"
+                            )),
+                        });
+                    }
+                    body::BodyEffectKind::LedgerAppend { ledger, schema, .. } => {
+                        if !semantic.ledgers.contains(ledger) {
+                            diagnostics.push(Diagnostic {
+                                span: effect.span,
+                                message: format!(
+                                    "rule `{}` appends to undeclared ledger `{ledger}`",
+                                    rule.name.name
+                                ),
+                                suggestion: Some(format!(
+                                    "declare `ledger {ledger} {{ entry <Type>  partition by <field>  retain <duration> }}`"
+                                )),
+                            });
+                        }
+                        if !semantic.schemas.class_exists(schema) {
+                            diagnostics.push(Diagnostic {
+                                span: effect.span,
+                                message: format!(
+                                    "rule `{}` appends unknown entry class `{schema}`",
+                                    rule.name.name
+                                ),
+                                suggestion: Some(format!("declare `class {schema}` first")),
+                            });
+                        }
+                    }
+                    body::BodyEffectKind::CounterConsume { counter, .. }
+                        if !semantic.counters.contains(counter) =>
+                    {
+                        diagnostics.push(Diagnostic {
+                            span: effect.span,
+                            message: format!(
+                                "rule `{}` consumes undeclared counter `{counter}`",
+                                rule.name.name
+                            ),
+                            suggestion: Some(format!(
+                                "declare `counter {counter} {{ key <Type>  cap <N>  reset <period> }}`"
+                            )),
+                        });
+                    }
+                    _ => {}
+                }
+                if let body::BodyEffectKind::Exec {
+                    parse_target: Some(parse),
+                    ..
+                } = &effect.kind
+                {
+                    if !semantic.schemas.class_exists(&parse.schema) {
+                        let suggestion =
+                            match closest_name(&parse.schema, semantic.schemas.classes.keys()) {
+                                Some(candidate) => format!(
+                                    "did you mean `{candidate}`? otherwise declare `class {}`",
+                                    parse.schema
+                                ),
+                                None => format!(
+                                    "declare `class {}` before parsing into it",
+                                    parse.schema
+                                ),
+                            };
+                        diagnostics.push(Diagnostic {
+                            span: effect.span,
+                            message: format!(
+                                "rule `{}` parses exec output into unknown schema `{}`",
+                                rule.name.name, parse.schema
+                            ),
+                            suggestion: Some(suggestion),
+                        });
+                    }
+                }
+                let body::BodyEffectKind::Timer {
+                    until: Some(until), ..
+                } = &effect.kind
+                else {
+                    continue;
+                };
+                if body::is_iso8601_instant(until) {
+                    continue;
+                }
+                let mut segments = until.split('.');
+                let root = segments.next().unwrap_or_default();
+                let path = segments.map(str::to_owned).collect::<Vec<_>>();
+                let Some(schema) = binding_types.get(root) else {
+                    diagnostics.push(Diagnostic {
+                        span: effect.span,
+                        message: format!(
+                            "rule `{}` uses unknown binding `{root}` in `timer until {until}`",
+                            rule.name.name
+                        ),
+                        suggestion: Some(
+                            "bind a fact in `when` and reference a `time` field on it, or use an ISO-8601 literal"
+                                .to_owned(),
+                        ),
+                    });
+                    continue;
+                };
+                // Dotted runtime fact bindings are untyped; their fields
+                // cannot be statically checked.
+                if schema.contains('.') {
+                    continue;
+                }
+                let resolved = if path.is_empty() {
+                    Err(format!(
+                        "`{root}` is a `{schema}` record, not a `time` value"
+                    ))
+                } else {
+                    semantic.schemas.resolve_field_path(schema, &path)
+                };
+                match resolved {
+                    Ok(TypeSyntax::Primitive { ref name, .. }) if name == "time" => {}
+                    Ok(_) => {
+                        diagnostics.push(Diagnostic {
+                            span: effect.span,
+                            message: format!(
+                                "rule `{}` uses non-time operand `{until}` in `timer until`",
+                                rule.name.name
+                            ),
+                            suggestion: Some(format!(
+                                "declare the field as `time` on `{schema}` or use an ISO-8601 literal"
+                            )),
+                        });
+                    }
+                    Err(message) => {
+                        diagnostics.push(Diagnostic {
+                            span: effect.span,
+                            message: format!(
+                                "rule `{}` has invalid `timer until` operand `{until}`: {message}",
+                                rule.name.name
+                            ),
+                            suggestion: Some(
+                                "reference a `time`-typed field on a bound fact, or use an ISO-8601 literal"
+                                    .to_owned(),
+                            ),
+                        });
+                    }
+                }
+            }
+            body::BodyStmt::After(after) => {
+                validate_body_effect_operands(
+                    rule,
+                    &after.body,
+                    semantic,
+                    binding_types,
+                    diagnostics,
+                );
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    validate_body_effect_operands(
+                        rule,
+                        &branch.body,
+                        semantic,
+                        binding_types,
+                        diagnostics,
+                    );
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                validate_body_effect_operands(
+                    rule,
+                    &branch.then_body,
+                    semantic,
+                    binding_types,
+                    diagnostics,
+                );
+                if let Some(else_body) = &branch.else_body {
+                    validate_body_effect_operands(
+                        rule,
+                        else_body,
+                        semantic,
+                        binding_types,
+                        diagnostics,
+                    );
+                }
+            }
+            body::BodyStmt::Handler(handler) => {
+                validate_body_effect_operands(
+                    rule,
+                    &handler.body,
+                    semantic,
+                    binding_types,
+                    diagnostics,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 fn validate_known_field_paths(
     rule: &RuleDecl,
     line: &str,
@@ -6443,6 +8104,63 @@ fn interpolation_roots(line: &str) -> Vec<String> {
     }
 
     roots
+}
+
+// `claim` stays bindable: `claim item as claim` is an established idiom and
+// the trailing binding position is unambiguous.
+const RESERVED_BINDING_KEYWORDS: &[&str] = &[
+    "after", "askHuman", "call", "case", "coerce", "complete", "consume", "done", "emit", "fail",
+    "invoke", "record", "tell", "when", "where",
+];
+
+fn validate_binding_name(
+    rule: &RuleDecl,
+    binding: &str,
+    span: SourceSpan,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if RESERVED_BINDING_KEYWORDS.contains(&binding) {
+        diagnostics.push(Diagnostic {
+            span,
+            message: format!(
+                "rule `{}` binds reserved keyword `{binding}`",
+                rule.name.name
+            ),
+            suggestion: Some(format!(
+                "`{binding}` is a rule body keyword; choose another binding name"
+            )),
+        });
+    }
+}
+
+fn closest_name<'a>(target: &str, candidates: impl Iterator<Item = &'a String>) -> Option<String> {
+    let target_lower = target.to_lowercase();
+    candidates
+        .map(|candidate| {
+            let distance = edit_distance(&target_lower, &candidate.to_lowercase());
+            (distance, candidate)
+        })
+        .filter(|(distance, candidate)| {
+            *distance <= 2 && *distance < target.len().min(candidate.len())
+        })
+        .min_by_key(|(distance, candidate)| (*distance, candidate.as_str().to_owned()))
+        .map(|(_, candidate)| candidate.clone())
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for (i, a_char) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, b_char) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(a_char != b_char);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
 }
 
 fn fact_read_from_when(when: &str) -> String {
@@ -7313,7 +9031,7 @@ impl<'a> ExprParser<'a> {
 
     fn parse_or(&mut self) -> Result<Expr, String> {
         let mut expr = self.parse_and()?;
-        while self.consume_op("||") {
+        while self.consume_op("||") || self.consume_ident("or") {
             let right = self.parse_and()?;
             expr = Expr::Binary {
                 op: BinaryOp::Or,
@@ -7326,7 +9044,7 @@ impl<'a> ExprParser<'a> {
 
     fn parse_and(&mut self) -> Result<Expr, String> {
         let mut expr = self.parse_comparison()?;
-        while self.consume_op("&&") {
+        while self.consume_op("&&") || self.consume_ident("and") {
             let right = self.parse_comparison()?;
             expr = Expr::Binary {
                 op: BinaryOp::And,
@@ -7338,7 +9056,7 @@ impl<'a> ExprParser<'a> {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, String> {
-        let mut expr = self.parse_unary()?;
+        let mut expr = self.parse_additive()?;
         loop {
             let op = if self.consume_op("==") {
                 Some(BinaryOp::Eq)
@@ -7365,6 +9083,50 @@ impl<'a> ExprParser<'a> {
             let Some(op) = op else {
                 return Ok(expr);
             };
+            let right = self.parse_additive()?;
+            expr = Expr::Binary {
+                op,
+                left: Box::new(expr),
+                right: Box::new(right),
+            };
+        }
+    }
+
+    fn parse_additive(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_multiplicative()?;
+        loop {
+            let op = if self.consume_symbol('+') {
+                Some(BinaryOp::Add)
+            } else if self.consume_symbol('-') {
+                Some(BinaryOp::Sub)
+            } else {
+                None
+            };
+            let Some(op) = op else {
+                return Ok(expr);
+            };
+            let right = self.parse_multiplicative()?;
+            expr = Expr::Binary {
+                op,
+                left: Box::new(expr),
+                right: Box::new(right),
+            };
+        }
+    }
+
+    fn parse_multiplicative(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_unary()?;
+        loop {
+            let op = if self.consume_symbol('*') {
+                Some(BinaryOp::Mul)
+            } else if self.consume_symbol('/') {
+                Some(BinaryOp::Div)
+            } else {
+                None
+            };
+            let Some(op) = op else {
+                return Ok(expr);
+            };
             let right = self.parse_unary()?;
             expr = Expr::Binary {
                 op,
@@ -7379,6 +9141,15 @@ impl<'a> ExprParser<'a> {
             return Ok(Expr::Unary {
                 op: UnaryOp::Not,
                 expr: Box::new(self.parse_unary()?),
+            });
+        }
+        // Prefix `not` binds looser than comparisons so `not x in y`
+        // reads as `not (x in y)`; binary `not in` is handled by
+        // parse_comparison before this prefix form is reached.
+        if self.consume_ident("not") {
+            return Ok(Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(self.parse_comparison()?),
             });
         }
         self.parse_postfix()
@@ -7462,10 +9233,7 @@ impl<'a> ExprParser<'a> {
                 })
             }
             Some(ExprTokenKind::Ident(value))
-                if matches!(
-                    value.as_str(),
-                    "count" | "exists" | "empty" | "one" | "none"
-                ) && self.at_symbol('(') =>
+                if matches!(value.as_str(), "count" | "exists") && self.at_symbol('(') =>
             {
                 self.expect_symbol('(')?;
                 if let Some(query) = self.try_parse_query()? {
@@ -7887,6 +9655,96 @@ fn binding_after_multiline_string_end(line: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn validate_rule_prompt_content_type_annotation(
+    rule: &RuleDecl,
+    line: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !(line.starts_with("tell ") || line.starts_with("askHuman") || line.starts_with("coerce ")) {
+        return;
+    }
+    let Some(annotation) = malformed_prompt_content_type_annotation(line) else {
+        return;
+    };
+    diagnostics.push(Diagnostic {
+        span: rule.body.span,
+        message: format!(
+            "rule `{}` has malformed multiline prompt content type `{annotation}`",
+            rule.name.name
+        ),
+        suggestion: Some(
+            "write a supported token such as `\"\"\"markdown` or put prompt text on the next line"
+                .to_owned(),
+        ),
+    });
+}
+
+fn validate_coerce_prompt_content_type_annotations(
+    coerce: &CoerceDecl,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for line in coerce.body.text.lines().map(str::trim) {
+        if !line.starts_with("prompt ") {
+            continue;
+        }
+        let Some(annotation) = malformed_prompt_content_type_annotation(line) else {
+            continue;
+        };
+        diagnostics.push(Diagnostic {
+            span: coerce.body.span,
+            message: format!(
+                "coerce `{}` has malformed multiline prompt content type `{annotation}`",
+                coerce.name.name
+            ),
+            suggestion: Some(
+                "write a supported token such as `\"\"\"markdown` or put prompt text on the next line"
+                    .to_owned(),
+            ),
+        });
+    }
+}
+
+fn malformed_prompt_content_type_annotation(line: &str) -> Option<String> {
+    let (_, tail) = line.split_once("\"\"\"")?;
+    let candidate = tail.trim();
+    if candidate.is_empty() || candidate.contains("\"\"\"") {
+        return None;
+    }
+    let mut parts = candidate.split_whitespace();
+    let first = parts.next()?;
+    let has_extra_text = parts.next().is_some();
+    let first_is_supported = is_supported_prompt_content_type(first);
+    let first_is_annotation_shaped = first_is_supported || first.contains('/');
+    if has_extra_text && first_is_annotation_shaped {
+        return Some(candidate.to_owned());
+    }
+    if first.contains('/') && !first_is_supported {
+        return Some(first.to_owned());
+    }
+    None
+}
+
+fn is_supported_prompt_content_type(candidate: &str) -> bool {
+    if !is_prompt_content_type_token(candidate) {
+        return false;
+    }
+    let normalized = candidate.to_ascii_lowercase();
+    normalized.contains('/')
+        || matches!(
+            normalized.as_str(),
+            "markdown" | "json" | "text" | "plain" | "html" | "xml" | "yaml" | "yml"
+        )
+}
+
+fn is_prompt_content_type_token(candidate: &str) -> bool {
+    let mut chars = candidate.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '+' | '-' | '_'))
+}
+
 fn binding_after_as(line: &str) -> Option<String> {
     let mut tokens = line.split_whitespace();
     while let Some(token) = tokens.next() {
@@ -7903,20 +9761,18 @@ fn binding_after_as(line: &str) -> Option<String> {
 
 fn parse_after_line(line: &str) -> Option<(String, DependencyPredicate)> {
     let rest = line.strip_prefix("after ")?;
-    let before_body = rest
-        .split('{')
-        .next()
-        .unwrap_or(rest)
-        .split("=>")
-        .next()
-        .unwrap_or(rest)
-        .trim();
+    if rest.contains("=>") {
+        return None;
+    }
+    let before_body = rest.split('{').next().unwrap_or(rest).trim();
     let mut parts = before_body.split_whitespace();
     let binding = parts.next()?.to_owned();
     let predicate = match parts.next()? {
         "succeeds" => DependencyPredicate::Succeeds,
         "fails" => DependencyPredicate::Fails,
-        "completes" => DependencyPredicate::Completes,
+        // Coordination outcomes (spec/coordination.md) are completion-valued;
+        // the arm dispatch happens on the outcome variant at lowering.
+        "completes" | "held" | "contended" | "ok" | "over" => DependencyPredicate::Completes,
         _ => return None,
     };
     match (parts.next(), parts.next(), parts.next()) {
@@ -7925,50 +9781,6 @@ fn parse_after_line(line: &str) -> Option<(String, DependencyPredicate)> {
         _ => return None,
     }
     Some((binding, predicate))
-}
-
-fn desugar_then_chains(body: &str) -> String {
-    let lines = body.lines().collect::<Vec<_>>();
-    let mut output = Vec::new();
-    let mut last_effect_binding: Option<String> = None;
-    let mut index = 0usize;
-    while index < lines.len() {
-        let trimmed = lines[index].trim();
-        if let (Some(statement), Some(upstream)) = (
-            trimmed.strip_prefix("then ").map(str::trim),
-            last_effect_binding.as_deref(),
-        ) {
-            output.push(format!("after {upstream} succeeds {{"));
-            output.push(format!("  {statement}"));
-            let mut depth = brace_delta(statement);
-            index += 1;
-            while depth > 0 && index < lines.len() {
-                let line = lines[index];
-                depth += brace_delta(line);
-                output.push(format!("  {line}"));
-                index += 1;
-            }
-            output.push("}".to_owned());
-            if let Some(binding) = effect_binding_from_statement(statement) {
-                last_effect_binding = Some(binding);
-            }
-            continue;
-        }
-        output.push(lines[index].to_owned());
-        if let Some(binding) = effect_binding_from_statement(trimmed) {
-            last_effect_binding = Some(binding);
-        }
-        index += 1;
-    }
-    output.join("\n")
-}
-
-fn effect_binding_from_statement(statement: &str) -> Option<String> {
-    if parse_effect_line(statement).is_some() {
-        binding_after_as(statement)
-    } else {
-        None
-    }
 }
 
 fn is_identifier(value: &str) -> bool {
@@ -8172,6 +9984,8 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 fn format_syntax(program: Program) -> String {
     let mut formatted = String::new();
     if let Some(workflow) = program.workflow {
+        format_tags(&program.workflow_tags, &mut formatted);
+        format_description(program.workflow_description.as_ref(), &mut formatted);
         push_line(&mut formatted, format!("workflow {}", workflow.name));
         formatted.push('\n');
     }
@@ -8213,6 +10027,14 @@ fn format_item(item: Item, formatted: &mut String) {
         Item::Use(use_decl) => {
             push_line(formatted, format!("use {}", use_decl.name.value));
         }
+        Item::Queue(queue) => {
+            push_line(formatted, format!("queue {} {{", queue.name.name));
+            push_line(formatted, format!("  tracker {}", queue.tracker.name));
+            push_line(formatted, "}");
+        }
+        Item::Flow(flow) => {
+            push_line(formatted, format!("flow {} {{ ... }}", flow.name.name));
+        }
         Item::Pattern(pattern) => format_pattern(pattern, formatted),
         Item::Apply(apply) => format_apply(apply, formatted),
         Item::WorkflowContract(contract) => {
@@ -8229,10 +10051,52 @@ fn format_item(item: Item, formatted: &mut String) {
         Item::Harness(harness) => format_harness(harness, formatted),
         Item::Agent(agent) => format_agent(agent, formatted),
         Item::Enum(enum_decl) => format_enum(enum_decl, formatted),
+        Item::Event(event) => format_event(event, formatted),
+        Item::Lease(lease) => {
+            push_line(formatted, format!("lease {} {{", lease.name.name));
+            push_line(formatted, format!("  key {}", lease.key_type.name));
+            push_line(formatted, format!("  slots {}", lease.slots));
+            push_line(formatted, format!("  ttl {}s", lease.ttl_seconds));
+            push_line(formatted, "}");
+        }
+        Item::Ledger(ledger) => {
+            push_line(formatted, format!("ledger {} {{", ledger.name.name));
+            push_line(formatted, format!("  entry {}", ledger.entry_schema.name));
+            push_line(
+                formatted,
+                format!("  partition by {}", ledger.partition_field.name),
+            );
+            push_line(formatted, format!("  retain {}s", ledger.retain_seconds));
+            push_line(formatted, "}");
+        }
+        Item::Counter(counter) => {
+            push_line(formatted, format!("counter {} {{", counter.name.name));
+            push_line(formatted, format!("  key {}", counter.key_type.name));
+            push_line(formatted, format!("  cap {}", counter.cap));
+            push_line(formatted, format!("  reset {}", counter.reset));
+            push_line(formatted, "}");
+        }
         Item::Class(class_decl) => format_class(class_decl, formatted),
+        Item::Table(table) => format_table(table, formatted),
         Item::Coerce(coerce) => format_coerce(coerce, formatted),
-        Item::Assert(assertion) => push_line(formatted, format!("assert {}", assertion.expr)),
+        Item::Assert(assertion) => {
+            format_tags(&assertion.tags, formatted);
+            format_description(assertion.description.as_ref(), formatted);
+            push_line(formatted, format!("assert {}", assertion.expr));
+        }
         Item::Rule(rule) => format_rule(rule, formatted),
+    }
+}
+
+fn format_tags(tags: &[TagDecl], formatted: &mut String) {
+    for tag in tags {
+        push_line(formatted, format!("@{}", tag.name));
+    }
+}
+
+fn format_description(description: Option<&StringLiteral>, formatted: &mut String) {
+    if let Some(description) = description {
+        push_line(formatted, format!("description {:?}", description.value));
     }
 }
 
@@ -8292,6 +10156,8 @@ fn format_apply(apply: ApplyDecl, formatted: &mut String) {
 }
 
 fn format_workflow(workflow: WorkflowDecl, formatted: &mut String) {
+    format_tags(&workflow.tags, formatted);
+    format_description(workflow.description.as_ref(), formatted);
     push_line(formatted, format!("workflow {} {{", workflow.name.name));
     let mut inner = String::new();
     format_items(workflow.items, &mut inner);
@@ -8324,6 +10190,9 @@ fn format_agent(agent: AgentDecl, formatted: &mut String) {
     );
     for field in agent.fields {
         match field {
+            AgentField::Provider(provider) => {
+                push_line(formatted, format!("  provider {}", provider.name));
+            }
             AgentField::Profile(profile) => {
                 push_line(formatted, format!("  profile {:?}", profile.value));
             }
@@ -8357,7 +10226,29 @@ fn format_agent(agent: AgentDecl, formatted: &mut String) {
 fn format_enum(enum_decl: EnumDecl, formatted: &mut String) {
     push_line(formatted, format!("enum {} {{", enum_decl.name.name));
     for variant in enum_decl.variants {
-        push_line(formatted, format!("  {}", variant.name));
+        if variant.fields.is_empty() {
+            push_line(formatted, format!("  {}", variant.name.name));
+            continue;
+        }
+        push_line(formatted, format!("  {} {{", variant.name.name));
+        for field in variant.fields {
+            push_line(
+                formatted,
+                format!("    {} {}", field.name.name, field.ty.to_source()),
+            );
+        }
+        push_line(formatted, "  }");
+    }
+    push_line(formatted, "}");
+}
+
+fn format_event(event: EventDecl, formatted: &mut String) {
+    push_line(formatted, format!("event {} {{", event.name));
+    for field in event.fields {
+        push_line(
+            formatted,
+            format!("  {} {}", field.name.name, field.ty.to_source()),
+        );
     }
     push_line(formatted, "}");
 }
@@ -8371,6 +10262,27 @@ fn format_class(class_decl: ClassDecl, formatted: &mut String) {
         );
     }
     push_line(formatted, "}");
+}
+
+fn format_table(table: TableDecl, formatted: &mut String) {
+    format_tags(&table.tags, formatted);
+    format_description(table.description.as_ref(), formatted);
+    push_line(
+        formatted,
+        format!("table {} as {} [", table.name.name, table.schema.name),
+    );
+    for row in table.rows {
+        push_line(formatted, "  {");
+        for line in row.body.text.lines() {
+            if line.trim().is_empty() {
+                formatted.push('\n');
+            } else {
+                push_line(formatted, format!("    {}", line.trim_end()));
+            }
+        }
+        push_line(formatted, "  }");
+    }
+    push_line(formatted, "]");
 }
 
 fn format_coerce(coerce: CoerceDecl, formatted: &mut String) {
@@ -8394,6 +10306,8 @@ fn format_coerce(coerce: CoerceDecl, formatted: &mut String) {
 }
 
 fn format_rule(rule: RuleDecl, formatted: &mut String) {
+    format_tags(&rule.tags, formatted);
+    format_description(rule.description.as_ref(), formatted);
     push_line(formatted, format!("rule {}", rule.name.name));
     for when in rule.whens {
         push_line(formatted, format!("  when {}", when.text));
@@ -8586,7 +10500,15 @@ fn lex(source: &str) -> Lexed {
             continue;
         }
 
-        if b"{}[]()<>,?|.+!:".contains(&byte) {
+        // Arithmetic operators appear inside guard and field-value
+        // expressions, which are re-parsed from raw source slices; the
+        // file-level lexer only needs to step over them.
+        if matches!(byte, b'*' | b'/' | b'-') {
+            index += 1;
+            continue;
+        }
+
+        if b"{}[]()<>,?|.+!:@".contains(&byte) {
             tokens.push(Token {
                 kind: TokenKind::Symbol(byte as char),
                 span: SourceSpan {
@@ -8703,14 +10625,27 @@ struct ParsedWorkflow {
 impl Parser<'_> {
     fn parse_program(&mut self) -> Program {
         let mut workflow = None;
+        let mut workflow_tags = Vec::new();
+        let mut workflow_description = None;
         let mut explicit_workflow_body = false;
         let mut workflows = Vec::new();
         let mut patterns = Vec::new();
         let mut items = Vec::new();
+        let mut pending_tags = Vec::new();
+        let mut pending_description = None;
 
         while !self.is_at_end() {
-            if self.at_ident("workflow") {
-                if let Some(parsed_workflow) = self.parse_workflow() {
+            if self.at_symbol('@') {
+                if let Some(tag) = self.parse_tag() {
+                    pending_tags.push(tag);
+                }
+            } else if self.at_ident("description") {
+                self.parse_pending_description(&mut pending_description);
+            } else if self.at_ident("workflow") {
+                if let Some(parsed_workflow) = self.parse_workflow(
+                    std::mem::take(&mut pending_tags),
+                    pending_description.take(),
+                ) {
                     if parsed_workflow.explicit_body {
                         workflows.push(parsed_workflow.decl);
                     } else {
@@ -8725,16 +10660,24 @@ impl Parser<'_> {
                                 ),
                             });
                         }
+                        workflow_tags = parsed_workflow.decl.tags;
+                        workflow_description = parsed_workflow.decl.description;
                         workflow = Some(parsed_workflow.decl.name);
                         explicit_workflow_body = false;
                     }
                 }
             } else if self.at_ident("pattern") {
+                self.reject_pending_tags(&mut pending_tags, "pattern");
+                self.reject_pending_description(&mut pending_description, "pattern");
                 if let Some(pattern) = self.parse_pattern() {
                     patterns.push(pattern);
                 }
-            } else if let Some(item) = self.parse_declaration_item() {
+            } else if let Some(item) =
+                self.parse_declaration_item(&mut pending_tags, &mut pending_description)
+            {
                 items.push(item);
+            } else if self.reject_gherkin_misuse() {
+                continue;
             } else {
                 if self.is_at_end() {
                     break;
@@ -8748,6 +10691,8 @@ impl Parser<'_> {
 
         Program {
             workflow,
+            workflow_tags,
+            workflow_description,
             explicit_workflow_body,
             workflows,
             patterns,
@@ -8755,7 +10700,11 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_workflow(&mut self) -> Option<ParsedWorkflow> {
+    fn parse_workflow(
+        &mut self,
+        tags: Vec<TagDecl>,
+        description: Option<StringLiteral>,
+    ) -> Option<ParsedWorkflow> {
         let start = self.expect_keyword("workflow")?.span.start;
         let name = self.expect_ident("workflow name")?;
         let mut explicit_body = false;
@@ -8764,18 +10713,44 @@ impl Parser<'_> {
         if self.at_symbol('{') {
             explicit_body = true;
             self.expect_symbol('{')?;
+            let mut pending_tags = Vec::new();
+            let mut pending_description = None;
             while !self.is_at_end() && !self.at_symbol('}') {
+                if self.at_symbol('@') {
+                    if let Some(tag) = self.parse_tag() {
+                        pending_tags.push(tag);
+                    }
+                    continue;
+                }
+                if self.at_ident("description") {
+                    self.parse_pending_description(&mut pending_description);
+                    continue;
+                }
                 if self.at_ident("workflow") || self.at_ident("pattern") {
+                    self.reject_pending_tags(&mut pending_tags, "workflow body declaration");
+                    self.reject_pending_description(
+                        &mut pending_description,
+                        "workflow body declaration",
+                    );
                     self.unexpected("workflow body declaration");
                     self.advance();
                     continue;
                 }
-                if let Some(item) = self.parse_declaration_item() {
+                if let Some(item) =
+                    self.parse_declaration_item(&mut pending_tags, &mut pending_description)
+                {
                     items.push(item);
+                } else if self.reject_gherkin_misuse() {
+                    continue;
                 } else {
                     if self.is_at_end() {
                         break;
                     }
+                    self.reject_pending_tags(&mut pending_tags, "workflow body declaration");
+                    self.reject_pending_description(
+                        &mut pending_description,
+                        "workflow body declaration",
+                    );
                     self.unexpected("workflow body declaration");
                     if !self.is_at_end() {
                         self.advance();
@@ -8789,6 +10764,8 @@ impl Parser<'_> {
         Some(ParsedWorkflow {
             decl: WorkflowDecl {
                 name,
+                tags,
+                description,
                 items,
                 span: SourceSpan { start, end },
             },
@@ -8796,31 +10773,215 @@ impl Parser<'_> {
         })
     }
 
-    fn parse_declaration_item(&mut self) -> Option<Item> {
+    fn parse_tag(&mut self) -> Option<TagDecl> {
+        let at = self.expect_symbol('@')?;
+        let name_start = at.span.end;
+        let mut name_end = name_start;
+        for (offset, ch) in self.source[name_start..].char_indices() {
+            if ch.is_whitespace() {
+                break;
+            }
+            name_end = name_start + offset + ch.len_utf8();
+        }
+        let name = self.source[name_start..name_end].to_owned();
+        while !self.is_at_end() && self.peek().is_some_and(|token| token.span.start < name_end) {
+            self.advance();
+        }
+        let span = SourceSpan {
+            start: at.span.start,
+            end: name_end,
+        };
+        if name.is_empty() {
+            self.diagnostics.push(Diagnostic {
+                span,
+                message: "tag is missing a name".to_owned(),
+                suggestion: Some("write a tag such as `@fixture`".to_owned()),
+            });
+            return None;
+        }
+        if !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.'))
+        {
+            self.diagnostics.push(Diagnostic {
+                span,
+                message: format!("tag `@{name}` contains unsupported characters"),
+                suggestion: Some(
+                    "use letters, digits, `_`, `-`, `.`, or `:` in tag names".to_owned(),
+                ),
+            });
+            return None;
+        }
+        Some(TagDecl { name, span })
+    }
+
+    fn reject_pending_tags(&mut self, pending_tags: &mut Vec<TagDecl>, target: &str) {
+        for tag in pending_tags.drain(..) {
+            self.diagnostics.push(Diagnostic {
+                span: tag.span,
+                message: format!("tag `@{}` cannot be attached to {target}", tag.name),
+                suggestion: Some(
+                    "place tags on workflows, matrices, assertions, or rules".to_owned(),
+                ),
+            });
+        }
+    }
+
+    fn parse_pending_description(&mut self, pending_description: &mut Option<StringLiteral>) {
+        let Some(description) = self.parse_description() else {
+            return;
+        };
+        if let Some(previous) = pending_description.replace(description) {
+            self.diagnostics.push(Diagnostic {
+                span: previous.span,
+                message: "description is not attached to a declaration".to_owned(),
+                suggestion: Some(
+                    "place only one `description \"...\"` immediately before the target declaration"
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+
+    fn parse_description(&mut self) -> Option<StringLiteral> {
+        let description = self.expect_keyword("description")?;
+        let Some(value) = self.expect_string("description string") else {
+            return Some(StringLiteral {
+                value: String::new(),
+                span: description.span,
+            });
+        };
+        Some(value)
+    }
+
+    fn reject_pending_description(
+        &mut self,
+        pending_description: &mut Option<StringLiteral>,
+        target: &str,
+    ) {
+        if let Some(description) = pending_description.take() {
+            self.diagnostics.push(Diagnostic {
+                span: description.span,
+                message: format!("description cannot be attached to {target}"),
+                suggestion: Some(
+                    "place descriptions on workflows, matrices, assertions, or rules".to_owned(),
+                ),
+            });
+        }
+    }
+
+    fn reject_gherkin_misuse(&mut self) -> bool {
+        let Some(token) = self.peek() else {
+            return false;
+        };
+        let TokenKind::Ident(keyword) = &token.kind else {
+            return false;
+        };
+        if !is_gherkin_keyword(keyword) {
+            return false;
+        }
+        let span = token.span;
+        self.diagnostics.push(Diagnostic {
+            span,
+            message: format!(
+                "Gherkin keyword `{keyword}` is not WhippleScript workflow syntax"
+            ),
+            suggestion: Some(
+                "use `workflow`, `table`, `rule ... when ... => { ... }`, and `assert` instead of free-text Given/When/Then steps"
+                    .to_owned(),
+            ),
+        });
+        self.advance_to_line_end(span.start);
+        true
+    }
+
+    fn advance_to_line_end(&mut self, line_start: usize) {
+        let line_end = self.source[line_start..]
+            .find('\n')
+            .map(|offset| line_start + offset)
+            .unwrap_or(self.source.len());
+        while self.peek().is_some_and(|token| token.span.start < line_end) {
+            self.advance();
+        }
+    }
+
+    fn parse_declaration_item(
+        &mut self,
+        pending_tags: &mut Vec<TagDecl>,
+        pending_description: &mut Option<StringLiteral>,
+    ) -> Option<Item> {
         if self.at_ident("include") {
+            self.reject_pending_tags(pending_tags, "include");
+            self.reject_pending_description(pending_description, "include");
             self.parse_include().map(Item::Include)
         } else if self.at_ident("use") {
+            self.reject_pending_tags(pending_tags, "use");
+            self.reject_pending_description(pending_description, "use");
             self.parse_use().map(Item::Use)
         } else if self.at_ident("pattern") {
+            self.reject_pending_tags(pending_tags, "pattern");
+            self.reject_pending_description(pending_description, "pattern");
             self.parse_pattern().map(Item::Pattern)
         } else if self.at_ident("apply") {
+            self.reject_pending_tags(pending_tags, "apply");
+            self.reject_pending_description(pending_description, "apply");
             self.parse_apply().map(Item::Apply)
         } else if self.at_ident("input") || self.at_ident("output") || self.at_ident("failure") {
+            self.reject_pending_tags(pending_tags, "workflow contract");
+            self.reject_pending_description(pending_description, "workflow contract");
             self.parse_workflow_contract().map(Item::WorkflowContract)
+        } else if self.at_ident("flow") {
+            self.parse_flow(std::mem::take(pending_tags), pending_description.take())
+                .map(Item::Flow)
+        } else if self.at_ident("queue") {
+            self.reject_pending_tags(pending_tags, "queue");
+            self.reject_pending_description(pending_description, "queue");
+            self.parse_queue().map(Item::Queue)
         } else if self.at_ident("harness") {
+            self.reject_pending_tags(pending_tags, "harness");
+            self.reject_pending_description(pending_description, "harness");
             self.parse_harness().map(Item::Harness)
         } else if self.at_ident("agent") {
+            self.reject_pending_tags(pending_tags, "agent");
+            self.reject_pending_description(pending_description, "agent");
             self.parse_agent().map(Item::Agent)
         } else if self.at_ident("enum") {
+            self.reject_pending_tags(pending_tags, "enum");
+            self.reject_pending_description(pending_description, "enum");
             self.parse_enum().map(Item::Enum)
+        } else if self.at_ident("event") {
+            self.reject_pending_tags(pending_tags, "event");
+            self.reject_pending_description(pending_description, "event");
+            self.parse_event().map(Item::Event)
+        } else if self.at_ident("lease") {
+            self.reject_pending_tags(pending_tags, "lease");
+            self.reject_pending_description(pending_description, "lease");
+            self.parse_lease().map(Item::Lease)
+        } else if self.at_ident("ledger") {
+            self.reject_pending_tags(pending_tags, "ledger");
+            self.reject_pending_description(pending_description, "ledger");
+            self.parse_ledger().map(Item::Ledger)
+        } else if self.at_ident("counter") {
+            self.reject_pending_tags(pending_tags, "counter");
+            self.reject_pending_description(pending_description, "counter");
+            self.parse_counter().map(Item::Counter)
         } else if self.at_ident("class") {
+            self.reject_pending_tags(pending_tags, "class");
+            self.reject_pending_description(pending_description, "class");
             self.parse_class().map(Item::Class)
+        } else if self.at_ident("table") {
+            self.parse_table(std::mem::take(pending_tags), pending_description.take())
+                .map(Item::Table)
         } else if self.at_ident("coerce") {
+            self.reject_pending_tags(pending_tags, "coerce");
+            self.reject_pending_description(pending_description, "coerce");
             self.parse_coerce().map(Item::Coerce)
         } else if self.at_ident("assert") {
-            self.parse_assert().map(Item::Assert)
+            self.parse_assert(std::mem::take(pending_tags), pending_description.take())
+                .map(Item::Assert)
         } else if self.at_ident("rule") {
-            self.parse_rule().map(Item::Rule)
+            self.parse_rule(std::mem::take(pending_tags), pending_description.take())
+                .map(Item::Rule)
         } else {
             None
         }
@@ -8832,18 +10993,44 @@ impl Parser<'_> {
         let type_params = self.parse_type_param_list().unwrap_or_default();
         let open = self.expect_symbol('{')?;
         let mut items = Vec::new();
+        let mut pending_tags = Vec::new();
+        let mut pending_description = None;
         while !self.is_at_end() && !self.at_symbol('}') {
+            if self.at_symbol('@') {
+                if let Some(tag) = self.parse_tag() {
+                    pending_tags.push(tag);
+                }
+                continue;
+            }
+            if self.at_ident("description") {
+                self.parse_pending_description(&mut pending_description);
+                continue;
+            }
             if self.at_ident("workflow") || self.at_ident("pattern") {
+                self.reject_pending_tags(&mut pending_tags, "pattern body declaration");
+                self.reject_pending_description(
+                    &mut pending_description,
+                    "pattern body declaration",
+                );
                 self.unexpected("pattern body declaration");
                 self.advance();
                 continue;
             }
-            if let Some(item) = self.parse_declaration_item() {
+            if let Some(item) =
+                self.parse_declaration_item(&mut pending_tags, &mut pending_description)
+            {
                 items.push(item);
+            } else if self.reject_gherkin_misuse() {
+                continue;
             } else {
                 if self.is_at_end() {
                     break;
                 }
+                self.reject_pending_tags(&mut pending_tags, "pattern body declaration");
+                self.reject_pending_description(
+                    &mut pending_description,
+                    "pattern body declaration",
+                );
                 self.unexpected("pattern body declaration");
                 self.advance();
             }
@@ -8970,6 +11157,266 @@ impl Parser<'_> {
         })
     }
 
+    /// Parses `<n><unit>` durations at declaration level (`ttl 10m`,
+    /// `retain 90d`) — the lexer splits them into a number and a unit ident.
+    fn parse_decl_duration_seconds(&mut self, label: &str) -> Option<u64> {
+        let (value, span) = self.expect_u32(label)?;
+        let unit = self.expect_ident(label)?;
+        match body::parse_short_duration_seconds(&format!("{value}{}", unit.name)) {
+            Some(seconds) if seconds > 0 => Some(seconds),
+            _ => {
+                self.diagnostics.push(Diagnostic {
+                    span: span.join(unit.span),
+                    message: format!("invalid duration `{value}{}`", unit.name),
+                    suggestion: Some("use `<n><unit>` with unit s, m, h, or d".to_owned()),
+                });
+                None
+            }
+        }
+    }
+
+    fn parse_lease(&mut self) -> Option<LeaseDecl> {
+        let start = self.expect_keyword("lease")?.span.start;
+        let name = self.expect_ident("lease name")?;
+        self.expect_symbol('{')?;
+        let mut key_type = None;
+        let mut slots = 1u32;
+        let mut ttl_seconds = None;
+        while !self.is_at_end() && !self.at_symbol('}') {
+            let Some(field) = self.expect_ident("lease field") else {
+                self.synchronize_to_block_item();
+                continue;
+            };
+            match field.name.as_str() {
+                "key" => key_type = self.expect_ident("key type"),
+                "slots" => {
+                    slots = self
+                        .expect_u32("slots value")
+                        .map(|(value, _)| value)
+                        .unwrap_or(1);
+                }
+                "ttl" => ttl_seconds = self.parse_decl_duration_seconds("ttl duration"),
+                other => {
+                    self.diagnostics.push(Diagnostic {
+                        span: field.span,
+                        message: format!("unknown lease field `{other}`"),
+                        suggestion: Some("lease fields are `key`, `slots`, and `ttl`".to_owned()),
+                    });
+                    self.synchronize_to_block_item();
+                }
+            }
+        }
+        let close = self.expect_symbol('}')?;
+        let span = SourceSpan {
+            start,
+            end: close.span.end,
+        };
+        let (Some(key_type), Some(ttl_seconds)) = (key_type, ttl_seconds) else {
+            self.diagnostics.push(Diagnostic {
+                span,
+                message: format!(
+                    "lease `{}` must declare a `key` type and a `ttl` backstop",
+                    name.name
+                ),
+                suggestion: Some(
+                    "every lease is bounded: declare `key <Type>` and `ttl <duration>`".to_owned(),
+                ),
+            });
+            return None;
+        };
+        Some(LeaseDecl {
+            name,
+            key_type,
+            slots,
+            ttl_seconds,
+            span,
+        })
+    }
+
+    fn parse_ledger(&mut self) -> Option<LedgerDecl> {
+        let start = self.expect_keyword("ledger")?.span.start;
+        let name = self.expect_ident("ledger name")?;
+        self.expect_symbol('{')?;
+        let mut entry_schema = None;
+        let mut partition_field = None;
+        let mut retain_seconds = None;
+        while !self.is_at_end() && !self.at_symbol('}') {
+            let Some(field) = self.expect_ident("ledger field") else {
+                self.synchronize_to_block_item();
+                continue;
+            };
+            match field.name.as_str() {
+                "entry" => entry_schema = self.expect_ident("entry schema"),
+                "partition" => {
+                    if self.at_ident("by") {
+                        self.advance();
+                    } else {
+                        self.diagnostics.push(Diagnostic {
+                            span: field.span,
+                            message: "expected `by` after `partition`".to_owned(),
+                            suggestion: Some("write `partition by <field>`".to_owned()),
+                        });
+                    }
+                    partition_field = self.expect_ident("partition field");
+                }
+                "retain" => retain_seconds = self.parse_decl_duration_seconds("retain duration"),
+                other => {
+                    self.diagnostics.push(Diagnostic {
+                        span: field.span,
+                        message: format!("unknown ledger field `{other}`"),
+                        suggestion: Some(
+                            "ledger fields are `entry`, `partition by`, and `retain`".to_owned(),
+                        ),
+                    });
+                    self.synchronize_to_block_item();
+                }
+            }
+        }
+        let close = self.expect_symbol('}')?;
+        let span = SourceSpan {
+            start,
+            end: close.span.end,
+        };
+        let (Some(entry_schema), Some(partition_field), Some(retain_seconds)) =
+            (entry_schema, partition_field, retain_seconds)
+        else {
+            self.diagnostics.push(Diagnostic {
+                span,
+                message: format!(
+                    "ledger `{}` must declare `entry`, `partition by`, and `retain`",
+                    name.name
+                ),
+                suggestion: Some(
+                    "every ledger is bounded and partitioned: declare all three fields".to_owned(),
+                ),
+            });
+            return None;
+        };
+        Some(LedgerDecl {
+            name,
+            entry_schema,
+            partition_field,
+            retain_seconds,
+            span,
+        })
+    }
+
+    fn parse_counter(&mut self) -> Option<CounterDecl> {
+        let start = self.expect_keyword("counter")?.span.start;
+        let name = self.expect_ident("counter name")?;
+        self.expect_symbol('{')?;
+        let mut key_type = None;
+        let mut cap = None;
+        let mut reset = None;
+        while !self.is_at_end() && !self.at_symbol('}') {
+            let Some(field) = self.expect_ident("counter field") else {
+                self.synchronize_to_block_item();
+                continue;
+            };
+            match field.name.as_str() {
+                "key" => key_type = self.expect_ident("key type"),
+                "cap" => {
+                    cap = self
+                        .expect_u32("cap value")
+                        .map(|(value, _)| i64::from(value))
+                }
+                "reset" => {
+                    let period = self.expect_ident("reset period")?;
+                    if !matches!(
+                        period.name.as_str(),
+                        "hourly" | "daily" | "weekly" | "monthly"
+                    ) {
+                        self.diagnostics.push(Diagnostic {
+                            span: period.span,
+                            message: format!("unknown reset period `{}`", period.name),
+                            suggestion: Some(
+                                "use `hourly`, `daily`, `weekly`, or `monthly`".to_owned(),
+                            ),
+                        });
+                    }
+                    reset = Some(period.name);
+                }
+                other => {
+                    self.diagnostics.push(Diagnostic {
+                        span: field.span,
+                        message: format!("unknown counter field `{other}`"),
+                        suggestion: Some("counter fields are `key`, `cap`, and `reset`".to_owned()),
+                    });
+                    self.synchronize_to_block_item();
+                }
+            }
+        }
+        let close = self.expect_symbol('}')?;
+        let span = SourceSpan {
+            start,
+            end: close.span.end,
+        };
+        let (Some(key_type), Some(cap), Some(reset)) = (key_type, cap, reset) else {
+            self.diagnostics.push(Diagnostic {
+                span,
+                message: format!(
+                    "counter `{}` must declare `key`, `cap`, and `reset`",
+                    name.name
+                ),
+                suggestion: Some("every counter is bounded: declare all three fields".to_owned()),
+            });
+            return None;
+        };
+        Some(CounterDecl {
+            name,
+            key_type,
+            cap,
+            reset,
+            span,
+        })
+    }
+
+    fn parse_queue(&mut self) -> Option<QueueDecl> {
+        let start = self.expect_keyword("queue")?.span.start;
+        let name = self.expect_ident("queue name")?;
+        self.expect_symbol('{')?;
+        let mut tracker = None;
+        while !self.is_at_end() && !self.at_symbol('}') {
+            let Some(field) = self.expect_ident("queue field") else {
+                self.synchronize_to_block_item();
+                continue;
+            };
+            match field.name.as_str() {
+                "tracker" => {
+                    tracker = self.expect_ident("tracker kind");
+                }
+                other => {
+                    self.diagnostics.push(Diagnostic {
+                        span: field.span,
+                        message: format!("unknown queue field `{other}`"),
+                        suggestion: Some("the only queue field is `tracker`".to_owned()),
+                    });
+                    self.synchronize_to_block_item();
+                }
+            }
+        }
+        let close = self.expect_symbol('}')?;
+        let Some(tracker) = tracker else {
+            self.diagnostics.push(Diagnostic {
+                span: SourceSpan {
+                    start,
+                    end: close.span.end,
+                },
+                message: format!("queue `{}` is missing a tracker", name.name),
+                suggestion: Some("add `tracker builtin` inside the queue block".to_owned()),
+            });
+            return None;
+        };
+        Some(QueueDecl {
+            name,
+            tracker,
+            span: SourceSpan {
+                start,
+                end: close.span.end,
+            },
+        })
+    }
+
     fn parse_harness(&mut self) -> Option<HarnessDecl> {
         let start = self.expect_keyword("harness")?.span.start;
         let name = self.expect_ident("harness name")?;
@@ -9001,6 +11448,13 @@ impl Parser<'_> {
             };
 
             match field_name.name.as_str() {
+                "provider" => {
+                    if let Some(provider) = self.expect_ident("provider name") {
+                        fields.push(AgentField::Provider(provider));
+                    } else {
+                        self.synchronize_to_block_item();
+                    }
+                }
                 "profile" => {
                     if let Some(value) = self.expect_string("profile string") {
                         fields.push(AgentField::Profile(value));
@@ -9060,11 +11514,44 @@ impl Parser<'_> {
         let mut variants = Vec::new();
 
         while !self.is_at_end() && !self.at_symbol('}') {
-            if let Some(variant) = self.expect_ident("enum variant") {
-                variants.push(variant);
-            } else {
+            let Some(variant) = self.expect_ident("enum variant") else {
                 self.synchronize_to_block_item();
+                continue;
+            };
+            // A brace body makes this a data-carrying variant; the body
+            // reuses the class field grammar (sum types, spec/sum-types.md).
+            let mut fields = Vec::new();
+            let mut end = variant.span.end;
+            if self.at_symbol('{') {
+                self.expect_symbol('{');
+                while !self.is_at_end() && !self.at_symbol('}') {
+                    let Some(field_name) = self.expect_ident("variant field name") else {
+                        self.synchronize_to_block_item();
+                        continue;
+                    };
+                    let Some(ty) = self.parse_type() else {
+                        self.synchronize_to_block_item();
+                        continue;
+                    };
+                    fields.push(ClassField {
+                        span: field_name.span.join(ty.span()),
+                        name: field_name,
+                        ty,
+                    });
+                }
+                if let Some(close) = self.expect_symbol('}') {
+                    end = close.span.end;
+                }
             }
+            let span = SourceSpan {
+                start: variant.span.start,
+                end,
+            };
+            variants.push(EnumVariantDecl {
+                name: variant,
+                fields,
+                span,
+            });
         }
 
         let end = self
@@ -9075,6 +11562,64 @@ impl Parser<'_> {
         Some(EnumDecl {
             name,
             variants,
+            span: SourceSpan { start, end },
+        })
+    }
+
+    fn parse_event(&mut self) -> Option<EventDecl> {
+        let start = self.expect_keyword("event")?.span.start;
+        // Dotted lowercase name (`deploy.finished`), matching the `when fact`
+        // convention and distinct from PascalCase classes.
+        let first = self.expect_ident("event name")?;
+        let mut name = first.name.clone();
+        let mut name_span = first.span;
+        while self.at_symbol('.') {
+            self.expect_symbol('.');
+            let Some(segment) = self.expect_ident("event name segment") else {
+                return None;
+            };
+            name.push('.');
+            name.push_str(&segment.name);
+            name_span = name_span.join(segment.span);
+        }
+        if !name.contains('.')
+            || name
+                .split('.')
+                .any(|segment| segment.chars().next().is_some_and(char::is_uppercase))
+        {
+            self.diagnostics.push(Diagnostic {
+                span: name_span,
+                message: format!("event name `{name}` must be dotted lowercase"),
+                suggestion: Some(
+                    "use a dotted lowercase name such as `deploy.finished`".to_owned(),
+                ),
+            });
+        }
+        let open = self.expect_symbol('{')?;
+        let mut fields = Vec::new();
+        while !self.is_at_end() && !self.at_symbol('}') {
+            let Some(field_name) = self.expect_ident("event field name") else {
+                self.synchronize_to_block_item();
+                continue;
+            };
+            let Some(ty) = self.parse_type() else {
+                self.synchronize_to_block_item();
+                continue;
+            };
+            fields.push(ClassField {
+                span: field_name.span.join(ty.span()),
+                name: field_name,
+                ty,
+            });
+        }
+        let end = self
+            .expect_symbol('}')
+            .map(|token| token.span.end)
+            .unwrap_or(open.span.end);
+        Some(EventDecl {
+            name,
+            name_span,
+            fields,
             span: SourceSpan { start, end },
         })
     }
@@ -9110,6 +11655,103 @@ impl Parser<'_> {
             name,
             fields,
             span: SourceSpan { start, end },
+        })
+    }
+
+    fn parse_table(
+        &mut self,
+        tags: Vec<TagDecl>,
+        description: Option<StringLiteral>,
+    ) -> Option<TableDecl> {
+        let start = self.expect_keyword("table")?.span.start;
+        let name = self.expect_ident("table name")?;
+        self.expect_keyword("as")?;
+        let schema = self.expect_ident("table row class")?;
+        let open = self.expect_symbol('[')?;
+        let mut rows = Vec::new();
+
+        while !self.is_at_end() && !self.at_symbol(']') {
+            if self.at_symbol(',') {
+                self.advance();
+                continue;
+            }
+            if !self.at_symbol('{') {
+                self.unexpected("table row `{ ... }`");
+                self.synchronize_to_table_row();
+                continue;
+            }
+            if let Some(row) = self.parse_table_row() {
+                rows.push(row);
+            }
+            if self.at_symbol(',') {
+                self.advance();
+            }
+        }
+
+        let end = self
+            .expect_symbol(']')
+            .map(|token| token.span.end)
+            .unwrap_or(open.span.end);
+        Some(TableDecl {
+            name,
+            tags,
+            description,
+            schema,
+            rows,
+            span: SourceSpan { start, end },
+        })
+    }
+
+    fn parse_table_row(&mut self) -> Option<TableRow> {
+        let open = self.expect_symbol('{')?;
+        let body_start = open.span.end;
+        let mut depth = 1usize;
+        let mut body_end = body_start;
+        let mut close_end = open.span.end;
+
+        while !self.is_at_end() {
+            let token = self.advance().clone();
+            match token.kind {
+                TokenKind::Symbol('{') => {
+                    depth += 1;
+                    body_end = token.span.end;
+                }
+                TokenKind::Symbol('}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = token.span.start;
+                        close_end = token.span.end;
+                        break;
+                    }
+                    body_end = token.span.end;
+                }
+                _ => body_end = token.span.end,
+            }
+        }
+
+        if depth != 0 {
+            self.diagnostics.push(Diagnostic {
+                span: SourceSpan {
+                    start: open.span.start,
+                    end: body_end,
+                },
+                message: "unterminated table row".to_owned(),
+                suggestion: Some("close the table row with `}`".to_owned()),
+            });
+            return None;
+        }
+
+        let body_span = SourceSpan {
+            start: body_start,
+            end: body_end,
+        };
+        let (text, span) = trimmed_source_text(self.source_text(body_span), body_span);
+        Some(TableRow {
+            body: BlockSource { text, span },
+            span: SourceSpan {
+                start: open.span.start,
+                end: close_end,
+            },
         })
     }
 
@@ -9160,7 +11802,47 @@ impl Parser<'_> {
         Some(params)
     }
 
-    fn parse_rule(&mut self) -> Option<RuleDecl> {
+    fn parse_flow(
+        &mut self,
+        tags: Vec<TagDecl>,
+        description: Option<StringLiteral>,
+    ) -> Option<FlowDecl> {
+        let start = self.expect_keyword("flow")?.span.start;
+        let name = self.expect_ident("flow name")?;
+        let mut whens = Vec::new();
+        while !self.is_at_end() && !self.at_symbol('{') {
+            if self.at_ident("when") {
+                let when = self.expect_keyword("when")?;
+                if self.at_symbol('{') {
+                    whens.extend(self.parse_grouped_when_clauses(when.span)?);
+                } else {
+                    whens.push(self.parse_when_clause_with_stop(when.span, true)?);
+                }
+            } else {
+                self.unexpected("`when` clause or `{`");
+                self.advance();
+            }
+        }
+        let body = self.parse_block_source()?;
+        let span = SourceSpan {
+            start,
+            end: body.span.end,
+        };
+        Some(FlowDecl {
+            name,
+            tags,
+            description,
+            whens,
+            body,
+            span,
+        })
+    }
+
+    fn parse_rule(
+        &mut self,
+        tags: Vec<TagDecl>,
+        description: Option<StringLiteral>,
+    ) -> Option<RuleDecl> {
         let start = self.expect_keyword("rule")?.span.start;
         let name = self.expect_ident("rule name")?;
         let mut whens = Vec::new();
@@ -9176,10 +11858,7 @@ impl Parser<'_> {
                 self.diagnostics.push(Diagnostic {
                     span,
                     message: "`with` is not a rule readiness clause".to_owned(),
-                    suggestion: Some(
-                        "use `when` for rule conditions; reserve `with` for effect configuration such as `claim issue with loft`"
-                            .to_owned(),
-                    ),
+                    suggestion: Some("use `when` for rule conditions".to_owned()),
                 });
                 self.advance();
             } else {
@@ -9196,6 +11875,8 @@ impl Parser<'_> {
         };
         Some(RuleDecl {
             name,
+            tags,
+            description,
             whens,
             body,
             span,
@@ -9211,7 +11892,11 @@ impl Parser<'_> {
         Some(vec![self.parse_when_clause_after_keyword(when.span)?])
     }
 
-    fn parse_assert(&mut self) -> Option<AssertDecl> {
+    fn parse_assert(
+        &mut self,
+        tags: Vec<TagDecl>,
+        description: Option<StringLiteral>,
+    ) -> Option<AssertDecl> {
         let assert = self.expect_keyword("assert")?;
         let expr_start = assert.span.end;
         let line_end = self.source[expr_start..]
@@ -9230,10 +11915,24 @@ impl Parser<'_> {
             end: expr_end,
         };
         let (expr, span) = trimmed_source_text(self.source_text(span), span);
-        Some(AssertDecl { expr, span })
+        Some(AssertDecl {
+            tags,
+            description,
+            expr,
+            span,
+        })
     }
 
     fn parse_when_clause_after_keyword(&mut self, when: SourceSpan) -> Option<WhenClause> {
+        self.parse_when_clause_with_stop(when, false)
+    }
+
+    /// Flow headers terminate at the body `{`; rule headers at `=>`.
+    fn parse_when_clause_with_stop(
+        &mut self,
+        when: SourceSpan,
+        stop_at_brace: bool,
+    ) -> Option<WhenClause> {
         let text_start = when.end;
         let mut text_end = text_start;
 
@@ -9241,6 +11940,7 @@ impl Parser<'_> {
             && !self.at_arrow()
             && !self.at_ident("when")
             && !self.at_ident("rule")
+            && !(stop_at_brace && self.at_symbol('{'))
         {
             text_end = self.peek()?.span.end;
             self.advance();
@@ -9693,10 +12393,20 @@ impl Parser<'_> {
         while !self.is_at_end() {
             if self.at_symbol('}')
                 || self.at_ident("profile")
+                || self.at_ident("provider")
                 || self.at_ident("capacity")
                 || self.at_ident("skills")
                 || self.at_ident("capabilities")
             {
+                return;
+            }
+            self.advance();
+        }
+    }
+
+    fn synchronize_to_table_row(&mut self) {
+        while !self.is_at_end() {
+            if self.at_symbol('{') || self.at_symbol(']') {
                 return;
             }
             self.advance();
@@ -9747,6 +12457,24 @@ fn is_primitive_type(name: &str) -> bool {
     )
 }
 
+fn is_gherkin_keyword(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "Feature"
+            | "Rule"
+            | "Background"
+            | "Scenario"
+            | "ScenarioOutline"
+            | "Scenario-Outline"
+            | "Examples"
+            | "Given"
+            | "When"
+            | "Then"
+            | "And"
+            | "But"
+    )
+}
+
 fn suggestion_for_expected(expected: &str) -> Option<String> {
     match expected {
         "`{`" => Some("add a `{ ... }` block".to_owned()),
@@ -9772,9 +12500,13 @@ mod tests {
     #[test]
     fn parses_schema_agent_and_rule_slice() {
         let source = r#"
-workflow LoftWorkerWithReview
+workflow QueueWorkerSlice
 
 use memory
+
+queue backlog {
+  tracker builtin
+}
 
 enum ReviewStatus {
   Accept
@@ -9796,20 +12528,21 @@ coerce reviewWork(issueTitle string, changedFiles string[]) -> WorkReview {
 }
 
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
   skills ["loft-user"]
 }
 
-rule start_ready_issue
-  when loft has ready issue as issue
+rule start_ready_item
+  when backlog has ready item as item
   when worker is available
 => {
-  claim issue with loft as claim
+  claim item as claim
 
   after claim succeeds {
     tell worker """
-    Implement {{ claim.issue.title }}
+    Implement {{ item.title }}
     """
   }
 }
@@ -9822,8 +12555,8 @@ rule start_ready_issue
             .workflow
             .as_ref()
             .map(|ident| ident.name.as_str());
-        assert_eq!(workflow, Some("LoftWorkerWithReview"));
-        assert_eq!(parsed.program.items.len(), 6);
+        assert_eq!(workflow, Some("QueueWorkerSlice"));
+        assert_eq!(parsed.program.items.len(), 7);
 
         let coerce = parsed.program.items.iter().find_map(|item| match item {
             Item::Coerce(coerce) => Some(coerce),
@@ -9844,8 +12577,341 @@ rule start_ready_issue
             None => panic!("expected rule item"),
         };
         assert_eq!(rule.whens.len(), 2);
-        assert_eq!(rule.whens[0].text, "loft has ready issue as issue");
+        assert_eq!(rule.whens[0].text, "backlog has ready item as item");
         assert!(rule.body.text.contains("after claim succeeds"));
+    }
+
+    #[test]
+    fn parses_and_lowers_static_table_rows() {
+        let source = r#"
+workflow TableSeed
+
+agent codex {
+  provider codex
+  profile "repo-writer"
+  capacity 1
+}
+
+class Task {
+  provider AgentRef<codex>
+  title string
+  priority int
+  status "queued"
+}
+
+table tasks as Task [
+  {
+    provider codex
+    title "Review parser"
+    priority 1
+    status "queued"
+  }
+
+  {
+    provider codex
+    title "Review runtime"
+    priority 2
+    status "queued"
+  }
+]
+"#;
+
+        let parsed = parse_program(source);
+        assert_eq!(parsed.diagnostics, Vec::new());
+        let table = parsed
+            .program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Table(table) => Some(table),
+                _ => None,
+            })
+            .expect("table item");
+        assert_eq!(table.rows.len(), 2);
+        let row_spans = table.rows.iter().map(|row| row.span).collect::<Vec<_>>();
+
+        let compiled = compile_program(source);
+        let ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("source compiles: {:?}", compiled.diagnostics));
+        let table_rule = ir
+            .rules
+            .iter()
+            .find(|rule| rule.name == "table_tasks")
+            .expect("table lowers to generated started rule");
+        assert_eq!(table_rule.whens[0].pattern, "started");
+        assert!(table_rule.body.contains("record Task"));
+        assert_eq!(table_rule.metadata.fact_writes, vec!["schema:Task"]);
+        assert_eq!(table_rule.metadata.record_sources.len(), 2);
+        assert_eq!(
+            table_rule
+                .metadata
+                .record_sources
+                .iter()
+                .map(|source| (
+                    source.schema.as_str(),
+                    source.construct.as_str(),
+                    source.span
+                ))
+                .collect::<Vec<_>>(),
+            row_spans
+                .iter()
+                .map(|span| ("Task", "table_row", *span))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rejects_old_matrix_declarations() {
+        let source = r#"
+workflow MatrixSeed
+
+class Task {
+  title string
+  status "queued"
+}
+
+matrix tasks as Task [
+  {
+    title "Review parser"
+    status "queued"
+  }
+]
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("expected top-level declaration, found identifier `matrix`")
+        }));
+    }
+
+    #[test]
+    fn rejects_table_rows_that_violate_row_schema() {
+        let source = r#"
+workflow BadTable
+
+agent codex {
+  provider codex
+  profile "repo-writer"
+  capacity 1
+}
+
+class Task {
+  provider AgentRef<codex>
+  status "queued"
+}
+
+table tasks as Task [
+  {
+    provider "codex"
+    status "done"
+  }
+]
+"#;
+
+        let compiled = compile_program(source);
+
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("expects an AgentRef value, not string `codex`")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("expects literal string `queued`")));
+    }
+
+    #[test]
+    fn parses_formats_and_lowers_source_tags_as_metadata() {
+        let source = r#"
+@fixture
+@release-gate
+workflow Tagged
+
+class Task {
+  status "queued"
+}
+
+@seed
+table tasks as Task [
+  {
+    status "queued"
+  }
+]
+
+@acceptance
+assert count(Task where status == "queued") == 1
+
+@dispatch
+rule consume_task
+  when Task as task
+=> {
+  done task
+}
+"#;
+
+        let parsed = parse_program(source);
+        assert_eq!(parsed.diagnostics, Vec::new());
+        assert_eq!(
+            parsed
+                .program
+                .workflow_tags
+                .iter()
+                .map(|tag| tag.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fixture", "release-gate"]
+        );
+
+        let formatted = format_program(source).formatted.expect("formats");
+        assert!(formatted.contains("@fixture\n@release-gate\nworkflow Tagged"));
+        assert!(formatted.contains("@seed\ntable tasks as Task"));
+        assert!(formatted.contains("@acceptance\nassert count"));
+        assert!(formatted.contains("@dispatch\nrule consume_task"));
+
+        let compiled = compile_program(source);
+        let ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("source compiles: {:?}", compiled.diagnostics));
+        let tags = ir
+            .source_tags
+            .iter()
+            .map(|tag| {
+                (
+                    tag.name.as_str(),
+                    tag.target_kind.as_str(),
+                    tag.target.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(tags.contains(&("fixture", "workflow", "Tagged")));
+        assert!(tags.contains(&("release-gate", "workflow", "Tagged")));
+        assert!(tags.contains(&("seed", "table", "tasks")));
+        assert!(tags.contains(&("dispatch", "rule", "consume_task")));
+        assert!(ir
+            .source_tags
+            .iter()
+            .any(|tag| tag.name == "acceptance" && tag.target_kind == "assertion"));
+    }
+
+    #[test]
+    fn parses_formats_and_lowers_source_descriptions_as_metadata() {
+        let source = r#"
+@fixture
+description "Fixture-backed acceptance workflow"
+workflow Described
+
+class Task {
+  status "queued"
+}
+
+description "Static task seed rows"
+table tasks as Task [
+  {
+    status "queued"
+  }
+]
+
+description "All seed tasks were consumed"
+assert count(Task where status == "queued") == 0
+
+description "Consume one queued task"
+rule consume_task
+  when Task as task
+=> {
+  done task
+}
+"#;
+
+        let parsed = parse_program(source);
+        assert_eq!(parsed.diagnostics, Vec::new());
+        assert_eq!(
+            parsed
+                .program
+                .workflow_description
+                .as_ref()
+                .map(|description| description.value.as_str()),
+            Some("Fixture-backed acceptance workflow")
+        );
+
+        let formatted = format_program(source).formatted.expect("formats");
+        assert!(formatted.contains(
+            "@fixture\ndescription \"Fixture-backed acceptance workflow\"\nworkflow Described"
+        ));
+        assert!(formatted.contains("description \"Static task seed rows\"\ntable tasks as Task"));
+        assert!(formatted.contains("description \"All seed tasks were consumed\"\nassert count"));
+        assert!(formatted.contains("description \"Consume one queued task\"\nrule consume_task"));
+
+        let compiled = compile_program(source);
+        let ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("source compiles: {:?}", compiled.diagnostics));
+        let descriptions = ir
+            .source_descriptions
+            .iter()
+            .map(|description| {
+                (
+                    description.value.as_str(),
+                    description.target_kind.as_str(),
+                    description.target.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(descriptions.contains(&(
+            "Fixture-backed acceptance workflow",
+            "workflow",
+            "Described"
+        )));
+        assert!(descriptions.contains(&("Static task seed rows", "table", "tasks")));
+        assert!(descriptions.contains(&("Consume one queued task", "rule", "consume_task")));
+        assert!(ir
+            .source_descriptions
+            .iter()
+            .any(
+                |description| description.value == "All seed tasks were consumed"
+                    && description.target_kind == "assertion"
+            ));
+    }
+
+    #[test]
+    fn rejects_descriptions_on_unsupported_declarations_for_now() {
+        let source = r#"
+workflow BadDescriptions
+
+description "Task schema"
+class Task {
+  status "queued"
+}
+"#;
+
+        let parsed = parse_program(source);
+
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(
+            parsed.diagnostics[0].message,
+            "description cannot be attached to class"
+        );
+    }
+
+    #[test]
+    fn rejects_tags_on_unsupported_declarations_for_now() {
+        let source = r#"
+workflow BadTags
+
+@schema
+class Task {
+  status "queued"
+}
+"#;
+
+        let parsed = parse_program(source);
+
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(
+            parsed.diagnostics[0].message,
+            "tag `@schema` cannot be attached to class"
+        );
     }
 
     #[test]
@@ -10324,6 +13390,7 @@ class Task {
 }
 
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
 }
@@ -10488,11 +13555,34 @@ workflow BadTerminalPayload {
     }
 
     #[test]
-    fn rejects_workflow_terminal_actions_outside_explicit_workflow_body() {
+    fn accepts_workflow_terminal_actions_in_header_style_workflows() {
         let source = r#"
 workflow ImplicitTerminal
 
 output result Result
+
+class Result {
+  status "ok"
+}
+
+rule finish
+  when started
+=> {
+  complete result {
+    status "ok"
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("header-style terminals compile");
+        assert_eq!(ir.workflow_contracts.len(), 1);
+    }
+
+    #[test]
+    fn rejects_header_style_terminal_for_undeclared_contract() {
+        let source = r#"
+workflow ImplicitTerminal
 
 class Result {
   status "ok"
@@ -10510,7 +13600,7 @@ rule bad
         assert!(compiled.ir.is_none());
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
-            .contains("uses `complete` outside an explicit workflow body")));
+            .contains("completes unknown workflow terminal `result`")));
     }
 
     #[test]
@@ -10583,6 +13673,7 @@ workflow Second {
 workflow Broken
 
 agent worker {
+  provider fixture
   profile 42
   capacity nope
 }
@@ -10619,12 +13710,14 @@ rule missing_body
 workflow AgentRefRouting
 
 agent codex {
+  provider codex
   profile "repo-writer"
   capacity 1
   capabilities ["agent.tell"]
 }
 
 agent claude {
+  provider claude
   profile "repo-writer"
   capacity 1
   capabilities ["agent.tell"]
@@ -10661,12 +13754,14 @@ rule run_task
 workflow BadAgentRefCapabilities
 
 agent codex {
+  provider codex
   profile "repo-writer"
   capacity 1
   capabilities ["agent.tell", "repo.write"]
 }
 
 agent claude {
+  provider claude
   profile "repo-reader"
   capacity 1
   capabilities ["agent.tell"]
@@ -10699,6 +13794,7 @@ rule run_task
 workflow BadAgentRefRouting
 
 agent codex {
+  provider codex
   profile "repo-writer"
   capacity 1
 }
@@ -10727,6 +13823,7 @@ rule run_task
 workflow BadAgentRefDomain
 
 agent codex {
+  provider codex
   profile "repo-writer"
   capacity 1
 }
@@ -10760,6 +13857,7 @@ rule seed
 workflow BadQuotedAgentRef
 
 agent codex {
+  provider codex
   profile "repo-writer"
   capacity 1
 }
@@ -10849,8 +13947,8 @@ rule safe_not_null
         let cases = [
             ("true || false && !ready", "true || (false && !ready)"),
             (
-                "empty(task.labels) || exists(Result where status == \"done\")",
-                "empty(task.labels) || exists(Result where status == \"done\")",
+                "count(task.labels) == 0 || exists(Result where status == \"done\")",
+                "(count(task.labels) == 0) || exists(Result where status == \"done\")",
             ),
             (
                 "task.labels[\"priority\"] == [\"high\", \"urgent\"][0]",
@@ -11271,7 +14369,13 @@ class Work {
   state "open" | "done"
 }
 
+class Result {
+  title string
+  files string[]
+}
+
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 2
   skills ["loft-user"]
@@ -11310,8 +14414,11 @@ schemas
     title string
     files array<string>
     state union<literal<\"open\"> | literal<\"done\">>
+  class Result
+    title string
+    files array<string>
 agents
-  agent worker harness=<fallback> profile=repo-writer capacity=2 skills=[loft-user] capabilities=[]
+  agent worker harness=<fallback> provider=fixture profile=repo-writer capacity=2 skills=[loft-user] capabilities=[]
 rules
   rule start
     when Work as work
@@ -11342,24 +14449,28 @@ rule_dependencies
                 include_str!("../../../examples/minimal-noop.ir"),
             ),
             (
-                include_str!("../../../examples/loft-worker-with-review.whip"),
-                include_str!("../../../examples/loft-worker-with-review.ir"),
+                include_str!("../../../examples/queue-worker-with-review.whip"),
+                include_str!("../../../examples/queue-worker-with-review.ir"),
+            ),
+            (
+                include_str!("../../../examples/circuit-breaker.whip"),
+                include_str!("../../../examples/circuit-breaker.ir"),
             ),
             (
                 include_str!("../../../examples/coerce-branch.whip"),
                 include_str!("../../../examples/coerce-branch.ir"),
             ),
             (
-                include_str!("../../../examples/codex-french-poem-dogfood.whip"),
-                include_str!("../../../examples/codex-french-poem-dogfood.ir"),
+                include_str!("../../../examples/terminal-output-union.whip"),
+                include_str!("../../../examples/terminal-output-union.ir"),
             ),
             (
-                include_str!("../../../examples/codex-poem-coerce-review.whip"),
-                include_str!("../../../examples/codex-poem-coerce-review.ir"),
+                include_str!("../../../examples/triage-flow.whip"),
+                include_str!("../../../examples/triage-flow.ir"),
             ),
             (
-                include_str!("../../../examples/codex-claude-harness-review.whip"),
-                include_str!("../../../examples/codex-claude-harness-review.ir"),
+                include_str!("../../../examples/incident-router.whip"),
+                include_str!("../../../examples/incident-router.ir"),
             ),
             (
                 include_str!("../../../examples/human-review.whip"),
@@ -11374,24 +14485,28 @@ rule_dependencies
                 include_str!("../../../examples/openclaw-lite.ir"),
             ),
             (
-                include_str!("../../../examples/plugin-memory.whip"),
-                include_str!("../../../examples/plugin-memory.ir"),
+                include_str!("../../../examples/scheduled-escalation.whip"),
+                include_str!("../../../examples/scheduled-escalation.ir"),
             ),
             (
-                include_str!("../../../examples/provider-language-e2e.whip"),
-                include_str!("../../../examples/provider-language-e2e.ir"),
+                include_str!("../../../examples/event-bridge.whip"),
+                include_str!("../../../examples/event-bridge.ir"),
             ),
             (
-                include_str!("../../../examples/companion-skill-dogfood.whip"),
-                include_str!("../../../examples/companion-skill-dogfood.ir"),
+                include_str!("../../../examples/reusable-review-pattern.whip"),
+                include_str!("../../../examples/reusable-review-pattern.ir"),
             ),
             (
-                include_str!("../../../examples/expression-kernel-dogfood.whip"),
-                include_str!("../../../examples/expression-kernel-dogfood.ir"),
+                include_str!("../../../examples/exec-json-ingest.whip"),
+                include_str!("../../../examples/exec-json-ingest.ir"),
             ),
             (
-                include_str!("../../../examples/terminal-output-union.whip"),
-                include_str!("../../../examples/terminal-output-union.ir"),
+                include_str!("../../../examples/autoresearch-lite.whip"),
+                include_str!("../../../examples/autoresearch-lite.ir"),
+            ),
+            (
+                include_str!("../../../examples/gastown-lite.whip"),
+                include_str!("../../../examples/gastown-lite.ir"),
             ),
             (
                 include_str!("../../../examples/ralph.whip"),
@@ -11493,7 +14608,6 @@ rule_dependencies
         let compiled = compile_program(source);
 
         assert!(compiled.ir.is_none());
-        assert_eq!(compiled.diagnostics.len(), 2);
         assert!(compiled
             .diagnostics
             .iter()
@@ -12011,11 +15125,165 @@ rule route
     }
 
     #[test]
+    fn rejects_malformed_multiline_prompt_content_type_on_rule_prompt() {
+        let source = r#"
+workflow PromptAnnotationGuess
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule ask
+  when started
+=> {
+  tell worker as turn """markdown extra
+  do work
+  """
+}
+"#;
+        let compiled = compile_program(source);
+
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("malformed multiline prompt content type `markdown extra`")
+                && diagnostic.suggestion.as_deref().is_some_and(|suggestion| {
+                    suggestion.contains("put prompt text on the next line")
+                })
+        }));
+    }
+
+    #[test]
+    fn rejects_malformed_multiline_prompt_content_type_on_coerce_prompt() {
+        let source = r#"
+workflow CoerceAnnotationGuess
+
+class Review {
+  status "ok"
+}
+
+coerce review() -> Review {
+  prompt """text/markdown extra
+  classify the review
+  """
+}
+
+rule run
+  when started
+=> {
+  coerce review() as result
+}
+"#;
+        let compiled = compile_program(source);
+
+        assert!(compiled.ir.is_none());
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains(
+                "coerce `review` has malformed multiline prompt content type `text/markdown extra`"
+            )));
+    }
+
+    #[test]
+    fn rejects_pasted_top_level_gherkin_with_targeted_diagnostic() {
+        let source = r#"
+Feature: provider language routing
+
+Scenario: fixture provider reviews every language task
+  Given a queued language task
+  When the provider turn completes
+  Then the language result is reviewed
+"#;
+        let compiled = compile_program(source);
+
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Gherkin keyword `Feature` is not WhippleScript workflow syntax")
+                && diagnostic.suggestion.as_deref().is_some_and(|suggestion| {
+                    suggestion.contains("use `workflow`, `table`, `rule")
+                        && suggestion.contains("instead of free-text Given/When/Then steps")
+                })
+        }));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("Gherkin keyword `Given` is not WhippleScript workflow syntax")));
+    }
+
+    #[test]
+    fn rejects_pasted_gherkin_inside_workflow_body_with_targeted_diagnostic() {
+        let source = r#"
+workflow PastedGherkin {
+  Scenario: fixture provider reviews every language task
+  Given a queued language task
+  When the provider turn completes
+  Then the language result is reviewed
+}
+"#;
+        let compiled = compile_program(source);
+
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("Gherkin keyword `Scenario` is not WhippleScript workflow syntax")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("Gherkin keyword `Then` is not WhippleScript workflow syntax")));
+    }
+
+    #[test]
+    fn rejects_pasted_gherkin_background_outline_examples_and_continuations() {
+        let source = r#"
+Feature: provider language routing
+
+Rule: provider execution remains explicit
+
+Background:
+  Given a seeded provider table
+  And all provider profiles are available
+
+Scenario Outline: provider reviews language task
+  When <provider> completes <language>
+  But the review is missing
+  Then the fixture fails
+
+Examples:
+  | provider | language |
+  | codex    | French   |
+"#;
+        let compiled = compile_program(source);
+
+        assert!(compiled.ir.is_none());
+        for keyword in ["Rule", "Background", "And", "Scenario", "But", "Examples"] {
+            assert!(
+                compiled
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains(&format!(
+                        "Gherkin keyword `{keyword}` is not WhippleScript workflow syntax"
+                    ))),
+                "missing diagnostic for {keyword}: {:?}",
+                compiled
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
     fn explains_multiline_string_binding_position() {
         let source = r#"
 workflow BindingGuess
 
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
 }
@@ -12320,9 +15588,9 @@ rule finish
     }
 
     #[test]
-    fn lowers_workflow_sugar_to_existing_metadata() {
+    fn rejects_then_sequencing() {
         let source = r#"
-workflow Sugar
+workflow NoThen
 
 class Task {
   topic string
@@ -12336,12 +15604,13 @@ class Result {
 }
 
 agent codex {
+  provider codex
   profile "repo-writer"
   capacity 1
 }
 
-assert none(Task where status == "queued")
-assert one(Result where status == "done")
+assert count(Task where status == "queued") == 0
+assert count(Result where status == "done") == 1
 
 rule finish
   when Task as task where task.status == "queued"
@@ -12356,16 +15625,42 @@ rule finish
 }
 "#;
         let compiled = compile_program(source);
-        let ir = compiled.ir.expect("program compiles");
-        let rule = &ir.rules[0];
+        assert!(compiled.ir.is_none());
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unsupported `then` sequencing")));
+    }
 
-        assert_eq!(ir.assertions.len(), 2);
-        assert_eq!(rule.metadata.fact_consumes, vec!["schema:Task"]);
-        assert_eq!(rule.metadata.fact_writes, vec!["schema:Result"]);
-        assert_eq!(rule.metadata.effects.len(), 1);
-        assert!(ir
-            .to_snapshot()
-            .contains("assert none(Task where status == \"queued\")"));
+    #[test]
+    fn rejects_after_arrow_sequencing() {
+        let source = r#"
+workflow NoAfterArrow
+
+agent codex {
+  provider codex
+  profile "repo-writer"
+  capacity 1
+}
+
+rule finish
+  when started
+  when codex is available
+=> {
+  tell codex as turn "write"
+
+  after turn succeeds => {
+    record Done {
+      status "done"
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("unsupported `after ... =>` sequencing")));
     }
 
     #[test]
@@ -12392,6 +15687,68 @@ when started
             "  when started\n",
             "=> {\n",
             "  tell worker \"hi\"\n",
+            "}\n",
+        );
+
+        assert_eq!(formatted.formatted.as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn formats_content_typed_multiline_prompts() {
+        let source = r#"workflow PromptFormat
+class Review {
+status "ok"
+}
+coerce review() -> Review {
+prompt """markdown
+classify
+"""
+}
+agent worker {
+  provider fixture
+profile "repo-writer"
+capacity 1
+}
+rule start
+when started
+=> {tell worker as turn """markdown
+write
+"""
+askHuman """application/json
+{"question":"approve?"}
+"""}
+"#;
+
+        let formatted = format_program(source);
+        assert_eq!(formatted.diagnostics, Vec::new());
+        let expected = concat!(
+            "workflow PromptFormat\n",
+            "\n",
+            "class Review {\n",
+            "  status \"ok\"\n",
+            "}\n",
+            "\n",
+            "coerce review() -> Review {\n",
+            "  prompt \"\"\"markdown\n",
+            "  classify\n",
+            "  \"\"\"\n",
+            "}\n",
+            "\n",
+            "agent worker {\n",
+            "  provider fixture\n",
+            "  profile \"repo-writer\"\n",
+            "  capacity 1\n",
+            "}\n",
+            "\n",
+            "rule start\n",
+            "  when started\n",
+            "=> {\n",
+            "  tell worker as turn \"\"\"markdown\n",
+            "  write\n",
+            "  \"\"\"\n",
+            "  askHuman \"\"\"application/json\n",
+            "  {\"question\":\"approve?\"}\n",
+            "  \"\"\"\n",
             "}\n",
         );
 

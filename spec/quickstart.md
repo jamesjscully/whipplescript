@@ -44,7 +44,7 @@ whip compile examples/minimal-noop.whip
 Use generated model searches when Maude is installed:
 
 ```sh
-whip check --model-search examples/loft-worker-with-review.whip
+whip check --model-search examples/queue-worker-with-review.whip
 ```
 
 ## 3. Run A Local Validation Loop
@@ -149,9 +149,17 @@ Checked examples live in `examples/`:
 - `revision-repair-planner.whip`
 - `revision-validation-approval.whip`
 - `ralph.whip`
-- `loft-worker-with-review.whip`
+- `queue-worker-with-review.whip`
 - `coerce-branch.whip`
 - `human-review.whip`
+- `triage-flow.whip`
+- `incident-router.whip`
+- `scheduled-escalation.whip`
+- `event-bridge.whip`
+- `reusable-review-pattern.whip`
+- `exec-json-ingest.whip`
+- `autoresearch-lite.whip`
+- `gastown-lite.whip`
 - `multi-agent-bounded-concurrency.whip`
 - `openclaw-lite.whip`
 - `plugin-memory.whip`

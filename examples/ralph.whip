@@ -1,6 +1,8 @@
+@service
 workflow Ralph
 
 agent ralph {
+  provider fixture
   profile "repo-writer"
   capacity 1
 }

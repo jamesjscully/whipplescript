@@ -1,6 +1,8 @@
+@service
 workflow CoerceBranch
 
 
+# `coerce` turns unstructured work into a typed decision with failure handling.
 enum Priority {
   Low
   Normal
@@ -19,7 +21,7 @@ class ClassifiedMessage {
 }
 
 coerce classifyMessage(title string, body string) -> MessageClassification {
-  prompt """
+  prompt """markdown
   Classify this work request.
 
   Title:
@@ -47,7 +49,7 @@ rule classify_request
   }
 
   after classification fails {
-    askHuman """
+    askHuman """markdown
     Could not classify this request:
 
     {{ request.title }}
@@ -60,7 +62,7 @@ rule classify_request
 rule route_classified
   when ClassifiedMessage as message
 => {
-  askHuman """
+  askHuman """markdown
   Classified request needs routing:
 
   {{ message.request.title }}

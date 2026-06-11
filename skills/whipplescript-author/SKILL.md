@@ -40,22 +40,43 @@ Run:
 
 ```sh
 whip check examples/minimal-noop.whip
-whip run examples/minimal-noop.whip --json
+whip --json run examples/minimal-noop.whip
 ```
 
 ## Common Patterns
 
-Loft claim before an agent turn:
+Claim a ready work item before an agent turn (declare `queue backlog {
+tracker builtin }`):
 
 ```whipplescript
-rule start_ready_issue
-  when loft has ready issue as issue
+rule work_ready_item
+  when backlog has ready item as item
   when worker is available
 => {
-  claim issue with loft as claim
+  claim item as lease
 
-  after claim succeeds {
-    tell worker "Implement {{ claim.issue.title }}"
+  after lease succeeds {
+    tell worker "Implement {{ item.title }}"
+  }
+
+  after turn succeeds as outcome {
+    finish item { summary outcome.summary }
+  }
+}
+```
+
+Sequential work reads better as a `flow`, which lowers to rules:
+
+```whipplescript
+flow triage
+  when Ticket as ticket
+{
+  tell triager as turn "Plan {{ ticket.title }}."
+  askHuman as signoff "Approve {{ turn.summary }}?"
+  when signoff.choice == "approve" {
+    complete result { decision signoff.choice }
+  } else {
+    fail error { reason "rejected" }
   }
 }
 ```
@@ -110,7 +131,7 @@ rule run_language_task
   when LanguageTask as task
   when task.provider is available
 => {
-  tell task.provider as turn """
+  tell task.provider as turn """markdown
   Write {{ task.language }} text to {{ task.artifactPath }}.
   """
 }
@@ -120,6 +141,86 @@ Use `AgentRef<...>` when the workflow data selects a logical agent. The value is
 source metadata, not a model decision. Do not ask BAML or a provider prompt to
 choose the provider, model, or route; only include provider fields in model
 outputs when reviewing observed provider evidence.
+
+Static validation table:
+
+```whipplescript
+table language_tasks as LanguageTask [
+  {
+    provider codex
+    language "French"
+    artifactPath "target/dogfood/language/codex-french.txt"
+    status "queued"
+  }
+
+  {
+    provider claude
+    language "Hindi"
+    artifactPath "target/dogfood/language/claude-hindi.txt"
+    status "queued"
+  }
+]
+```
+
+Use `table` for small deterministic seed data such as providers x languages or
+phases x reviewers. Table rows are typed and compile to ordinary `record`
+writes on `started`; they are not runtime loops and must not hide provider
+calls, model decisions, or external lookups.
+
+Tags for validation metadata:
+
+```whipplescript
+@fixture
+@acceptance
+workflow ProviderLanguageE2E
+
+@acceptance
+assert count(LanguageTask where status == "queued") == 0
+```
+
+Use tags to mark fixture-backed, acceptance, release-gate, slow, or provider
+specific source. Tags are metadata only; do not rely on them for routing,
+authority, rule readiness, or provider behavior.
+
+Descriptions for report prose:
+
+```whipplescript
+@fixture
+description "Fixture-backed provider x language acceptance workflow"
+workflow ProviderLanguageE2E
+
+description "Route one queued task to its selected provider"
+rule run_language_task
+  when LanguageTask as task
+=> {
+  done task
+}
+```
+
+Use descriptions on workflows, tables, assertions, and rules when reports need
+human-readable labels. Descriptions are metadata only and cannot attach to
+schemas, agents, harnesses, coerces, includes, plugins, workflow contracts,
+patterns, or applications.
+
+Content-typed prompt metadata:
+
+```whipplescript
+tell worker as turn """markdown
+Summarize the result.
+"""
+
+askHuman """application/json
+{
+  "question": "Approve this release?"
+}
+"""
+```
+
+Use a content type on multiline `tell`, `askHuman`, or `coerce` prompts when
+reports or renderers should know how to display the body. Treat it as metadata
+only: it does not validate JSON, change model behavior, or choose a provider.
+In `dev --json` reports, matched effect reads surface the preserved
+`prompt_content_type` when assertions read those effects.
 
 Fan-out with a visible tracker:
 
@@ -157,7 +258,7 @@ rule dispatch_review
   when ReviewRequest as request
   when reviewer is available
 => {
-  tell reviewer as turn """
+  tell reviewer as turn """markdown
   Review phase {{ request.number }}: {{ request.title }}.
 
   Update {{ request.trackerPath }} with status, findings, and evidence.
@@ -193,7 +294,7 @@ rule dispatch_review
   when ReviewTask as task where task.route in ["spec", "validation", "docs"]
   when task.reviewer is available
 => {
-  tell task.reviewer requires ["agent.tell"] as turn """
+  tell task.reviewer requires ["agent.tell"] as turn """markdown
   Use the whipplescript-author companion skill.
   Review phase {{ task.phase }} and update {{ task.trackerPath }}.
 
@@ -203,7 +304,7 @@ rule dispatch_review
 }
 ```
 
-Use this shape for provider/language/phased-review matrices. One shared task
+Use this shape for provider/language/phased-review tables. One shared task
 schema plus `AgentRef` metadata is preferred over one class per provider. Source
 assertions should check dispatch/result counts; BAML reviews should judge the
 artifact or evidence, not choose the route.
@@ -281,16 +382,52 @@ Use these commands first:
 whip doctor
 whip check workflow.whip
 whip check --model-search workflow.whip
-whip run workflow.whip --json
+whip --json run workflow.whip
+whip --json dev workflow.whip --provider fixture --until idle
+whip dev workflow.whip --provider fixture --until idle --stream ndjson
+whip --json dev workflow.whip --provider fixture --until idle --include-tag acceptance
+whip --json accept workflow.accept.json
 whip status <instance>
 whip effects <instance>
 whip runs <instance>
-whip evidence <instance> --json
-whip trace <instance> --check --json
+whip --json evidence <instance>
+whip --json diagnostics <instance>
+whip --json trace <instance> --check
 ```
 
+When writing `.accept.json` fixtures, keep `workflow` and
+`provider_config_paths` relative to the fixture file when possible. Use
+`input` for ordinary workflow start input and `setup.facts` for typed external
+setup facts validated against declared class schemas. Use `setup.inbox` for
+pre-existing human review items; do not fake those as workflow facts. Use
+`expect.assertion_tags` and `expect.assertion_untagged` for executable-spec groups,
+`expect.source_metadata` for source tag/description targets,
+`expect.diagnostics_by_code` for durable diagnostic checks, `expect.summary`
+for total final active fact/effect counts, and `expect.facts` or
+`expect.effects` for grouped counts. Use `expect.runs` when provider run status
+or artifact count is part of the contract, and `expect.artifacts` for
+metadata-only artifact counts by kind/MIME type. Use `expect.evidence` for
+metadata-only evidence counts by kind/subject type. Use `expect.assertion_reads`
+for deterministic assertion projections; effect match groups can assert prompt
+content type, trace/evidence link counts, and stable `trace_sequences`. Each
+assertion-read expectation must include at least one selector: `source`, `kind`,
+`head`, or `guard`.
+Observed `evidence_ids` are useful drilldown links, but avoid pinning them unless
+the ids are deliberately stable. Use `expect.trace.items` only for stable
+abstract trace records, such as sequence/type/status, not for incidental runtime
+ids; each trace item expectation must include at least one selector. Fixture and
+expectation fields are shape-checked before a workflow starts, so wrong-typed
+expectations are rejected rather than treated as absent. `setup.effects` and
+`setup.artifacts` are rejected in v0. `dev` and `accept` reports include compact
+artifact/evidence item links but omit raw artifact paths, content, and evidence
+payloads. `dev --stream ndjson` includes batched `dev.events` runtime event
+deltas and a `dev.assertions` event before the final report. Run suites by
+invoking one fixture per command with an isolated store per fixture.
+
 If an effect does not run, check its status and policy block reason before
-changing prompts.
+changing prompts. Prefer the single `dev --json` report for local validation:
+it includes source metadata, assertion groups, deterministic reads, durable
+diagnostics, assertion event/diagnostic links, and table provenance.
 
 ## Safety
 

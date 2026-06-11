@@ -38,6 +38,15 @@ timeouts, and replay. The language owns policy.
 - [type-system.md](type-system.md): boundary types, schemas, validation, and BAML lowering
 - [expression-kernel.md](expression-kernel.md): pure guard/assertion expression semantics
 - [expression-kernel-tracker.md](expression-kernel-tracker.md): implementation checklist for guard/assertion expression coverage
+- [gherkin-lessons-tracker.md](gherkin-lessons-tracker.md): tracker for incorporating useful Gherkin/Cucumber lessons into WhippleScript authoring, reports, and validation without adopting free-text BDD
+  execution
+- [acceptance-fixtures.md](acceptance-fixtures.md): test-only JSON fixture
+  format for running workflows through `dev` and validating final reports
+- [reporting.md](reporting.md): current JSON report contracts for source
+  metadata, validation summaries, assertion filters, and table provenance
+- [report-schemas/](report-schemas/): draft JSON Schema files for current
+  `check`, `compile`, `dev`, `trace`, `accept`, and `dev --stream` report
+  envelopes
 - [workflow-composition-transition-tracker.md](workflow-composition-transition-tracker.md): transition checklist for `workflow`, `pattern`, `apply`, `invoke`, `include`, and explicit terminal actions
 - [workflow-revision-transition-tracker.md](workflow-revision-transition-tracker.md): transition checklist for in-flight workflow revision, revision epochs, and cancellation policy
 - [workflow-revision-followups-tracker.md](workflow-revision-followups-tracker.md): vNext planning tracker for root retargeting, live fact migration, provider cancellation depth, and destructive confirmation policies
@@ -95,9 +104,9 @@ timeouts, and replay. The language owns policy.
   native providers, and plugin entry points
 - [../docs/troubleshooting.md](../docs/troubleshooting.md): first-10-minute
   setup and runtime fixes
-- [../docs/operator-guide.md](../docs/operator-guide.md): user-facing operator
+- [../docs/runtime-operations.md](../docs/runtime-operations.md): user-facing operator
   command map
-- [../docs/plugin-authoring.md](../docs/plugin-authoring.md): user-facing
+- [../docs/providers.md](../docs/providers.md): user-facing provider and
   plugin authoring orientation
 
 ## Design Commitments

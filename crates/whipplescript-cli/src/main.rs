@@ -1,12 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    process::{Command, ExitCode, Stdio},
     time::Duration,
 };
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use whipplescript_kernel::{
     claude_agent_sdk::{ClaudeAgentSdkAdapter, ClaudeAgentSdkClient, StdioClaudeAgentSdkTransport},
     codex_app_server::{CodexAppServerAdapter, CodexAppServerClient, StdioCodexAppServerTransport},
@@ -32,16 +34,18 @@ use whipplescript_kernel::{
 use whipplescript_parser::{
     parse_duration_seconds, parse_expression, parse_time_epoch_seconds, BinaryOp,
     DependencyPredicate as IrDependencyPredicate, Diagnostic, Expr, ExprLiteral, ExprObjectField,
-    IrEffectNode, IrInclude, IrPrimitiveType, IrProgram, IrRule, IrSchema, IrType,
-    IrWorkflowContract, IrWorkflowContractKind, Item, QueryKind, SourceSpan, UnaryOp,
+    IrEffectKind, IrEffectNode, IrInclude, IrPrimitiveType, IrProgram, IrProjectionRead, IrRule,
+    IrSchema, IrType, IrWorkflowContract, IrWorkflowContractKind, Item, QueryKind, SourceSpan,
+    UnaryOp,
 };
 use whipplescript_store::{
-    ArtifactView, ClaimableEffect, DiagnosticRecord, DiagnosticView, EffectCancellation,
+    ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, ClaimableEffect, DerivedFact,
+    DiagnosticRecord, DiagnosticView, EffectCancellation, EffectCancellationRequest,
     EffectCompletion, EffectView, EventView, EvidenceLink, EvidenceLinkView, EvidenceRecord,
     EvidenceView, FactView, HumanAnswer, InboxItemView, InstanceView, NewEffect,
-    NewEffectDependency, NewEvent, NewFact, NewWorkflowInvocation, ProviderValidationEvidence,
-    RetryEffect, RevisionActivation, RevisionCancellationImpact, RevisionCandidate,
-    RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RuleCommit,
+    NewEffectDependency, NewEvent, NewFact, NewInboxItem, NewWorkflowInvocation,
+    ProviderValidationEvidence, RetryEffect, RevisionActivation, RevisionCancellationImpact,
+    RevisionCandidate, RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RuleCommit,
     RuleCommitRevisionGuard, RunStart, RunView, SqliteStore, StatusView, StoreError,
     WorkflowInvocationView, WorkflowRevisionView, WorkflowTerminal, WorkflowTerminalKind,
 };
@@ -64,6 +68,30 @@ fn main() -> ExitCode {
         }
     };
 
+    if options
+        .args
+        .iter()
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
+        match options.command.as_deref().and_then(command_usage) {
+            Some(usage) => println!("{usage}"),
+            None => print_usage(),
+        }
+        return ExitCode::SUCCESS;
+    }
+    if options.command.as_deref() == Some("help") {
+        match options
+            .args
+            .first()
+            .map(String::as_str)
+            .and_then(command_usage)
+        {
+            Some(usage) => println!("{usage}"),
+            None => print_usage(),
+        }
+        return ExitCode::SUCCESS;
+    }
+
     match options.command.as_deref() {
         Some("doctor") => doctor(&options),
         Some("check") => check(&options),
@@ -73,6 +101,7 @@ fn main() -> ExitCode {
         Some("step") => step(&options),
         Some("worker") => worker(&options),
         Some("dev") => dev(&options),
+        Some("accept") => accept(&options),
         Some("instances") => instances(&options),
         Some("status") => status(&options),
         Some("log") => log(&options),
@@ -81,6 +110,12 @@ fn main() -> ExitCode {
         Some("runs") => runs(&options),
         Some("artifacts") => artifacts(&options),
         Some("inbox") => inbox(&options),
+        Some("notify") => notify(&options),
+        Some("otel-export") => otel_export(&options),
+        Some("leases") => coordination_list(&options, "leases"),
+        Some("ledger") => coordination_list(&options, "ledger"),
+        Some("counters") => coordination_list(&options, "counters"),
+        Some("items") => items(&options),
         Some("evidence") => evidence(&options),
         Some("diagnostics") => diagnostics(&options),
         Some("trace") => trace(&options),
@@ -158,10 +193,48 @@ impl CliOptions {
 fn print_usage() {
     println!("whipplescript {}", whipplescript_core::IMPLEMENTATION_STAGE);
     println!("usage: whip [--store path] [--json] <command> [args]");
-    println!("commands: check, compile, run, revise, step, worker, dev, instances, status, log, facts, effects, runs");
+    println!("commands: check, compile, run, revise, step, worker, dev, accept, instances, status, log, facts, effects, runs");
     println!(
-        "          artifacts, inbox, evidence, diagnostics, trace, pause, resume, cancel, retry, recover, doctor"
+        "          artifacts, inbox, items, evidence, diagnostics, trace, pause, resume, cancel, retry, recover, doctor"
     );
+    println!("run `whip <command> --help` or `whip help <command>` for command usage");
+}
+
+fn command_usage(command: &str) -> Option<&'static str> {
+    Some(match command {
+        "check" => "usage: whip check [--model-search] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] <workflow.whip>...",
+        "compile" => "usage: whip compile [--root <workflow>] <workflow.whip>...",
+        "run" => "usage: whip [--store path] [--input <json>] run <workflow.whip> [--root <workflow>]",
+        "revise" => "usage: whip revise <instance> <workflow.whip> [--root <workflow>] [--dry-run] [--cancel keep|queued|running]",
+        "step" => "usage: whip step <instance> --program <workflow.whip> [--root <workflow>]",
+        "worker" => "usage: whip worker <instance> [--provider <name>] [--provider-config <path>] [--program <path>] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--once] [--fail|--timeout|--cancel] [--max-child-iterations <n>]",
+        "dev" => "usage: whip dev <workflow.whip> [--provider <name>] [--provider-config <path>] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--include-tag <tag>] [--exclude-tag <tag>] [--stream ndjson] [--until idle] [--max-iterations <n>] [--fail|--timeout|--cancel]",
+        "accept" => "usage: whip accept <fixture.json>",
+        "instances" => "usage: whip [--store path] [--json] instances",
+        "status" => "usage: whip status <instance>",
+        "log" => "usage: whip log <instance>",
+        "facts" => "usage: whip facts <instance>",
+        "effects" => "usage: whip effects <instance>",
+        "runs" => "usage: whip runs <instance>",
+        "artifacts" => "usage: whip artifacts <run-id>",
+        "inbox" => "usage: whip inbox [<instance>|show <item>|answer <item> (--choice X|--text X) [--by NAME]]",
+        "notify" => "usage: whip notify <instance> --event <name> --data <json> --program <workflow.whip> [--root <workflow>]",
+        "otel-export" => "usage: whip otel-export <instance> [--dry-run] (reads OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME)",
+        "leases" => "usage: whip leases [<resource>]",
+        "ledger" => "usage: whip ledger [<ledger>] [--partition <value>]",
+        "counters" => "usage: whip counters [<counter>]",
+        "items" => "usage: whip items [list [--queue Q] [--status S]|add --queue Q --title T [--body B] [--label L]...|show <id>]",
+        "evidence" => "usage: whip evidence <instance>",
+        "diagnostics" => "usage: whip diagnostics <instance>",
+        "trace" => "usage: whip trace <instance> [--check]",
+        "pause" => "usage: whip pause <instance>",
+        "resume" => "usage: whip resume <instance>",
+        "cancel" => "usage: whip cancel <instance>",
+        "retry" => "usage: whip retry <instance> <effect>",
+        "recover" => "usage: whip recover <instance>",
+        "doctor" => "usage: whip doctor [--providers] [--provider-config <path>] [--record-provider-evidence <instance>]",
+        _ => return None,
+    })
 }
 
 fn doctor(options: &CliOptions) -> ExitCode {
@@ -793,31 +866,141 @@ fn check(options: &CliOptions) -> ExitCode {
     }
 
     let mut failed = false;
+    let mut reports = Vec::new();
+    let script_manifest = match load_script_manifest(check_options.script_manifest_path.as_deref())
+    {
+        Ok(manifest) => manifest,
+        Err(message) => {
+            if options.json {
+                let _ = emit_json(json!([{
+                    "schema": "whipplescript.check_report.v0",
+                    "status": "error",
+                    "error": {"kind": "script_manifest", "message": message},
+                }]));
+            } else {
+                eprintln!("{message}");
+            }
+            return ExitCode::from(2);
+        }
+    };
     for path in check_options.paths {
-        match compile_source_path_with_root(&path, check_options.root.as_deref()) {
+        match compile_source_path_for_validation(&path, check_options.root.as_deref()) {
             Ok((source, ir)) => {
-                println!("== {}", display_path(&path));
-                print!("{}", ir.to_snapshot());
+                let hosted_exec_diagnostics = lint_hosted_exec(
+                    &source,
+                    &ir,
+                    check_options.exec_profile,
+                    script_manifest.as_ref(),
+                );
+                if !hosted_exec_diagnostics.is_empty() {
+                    failed = true;
+                    if options.json {
+                        reports.push(json!({
+                            "schema": "whipplescript.check_report.v0",
+                            "path": display_path(&path),
+                            "status": "error",
+                            "error": {
+                                "kind": "diagnostics",
+                                "diagnostics": hosted_exec_diagnostics
+                                    .iter()
+                                    .map(parser_diagnostic_to_json)
+                                    .collect::<Vec<_>>(),
+                            },
+                        }));
+                    } else {
+                        for diagnostic in hosted_exec_diagnostics {
+                            eprint!("{}", render_diagnostic(&path, &source, &diagnostic));
+                        }
+                    }
+                    continue;
+                }
+                let snapshot = ir.to_snapshot();
+                let mut report = json!({
+                    "schema": "whipplescript.check_report.v0",
+                    "path": display_path(&path),
+                    "status": "ok",
+                    "workflow": ir.workflow.as_str(),
+                    "source_hash": stable_hash_hex(&source),
+                    "ir_hash": stable_hash_hex(&snapshot),
+                    "snapshot": snapshot,
+                    "source_metadata": source_metadata_json(&ir),
+                });
+                if !options.json {
+                    println!("== {}", display_path(&path));
+                    print!("{}", ir.to_snapshot());
+                }
                 if check_options.model_search {
                     match run_model_search(&path, &source, &ir) {
-                        Ok(report) if report.searches == 0 => {
-                            println!("model search: no generated checks");
+                        Ok(model_report) if model_report.searches == 0 => {
+                            if options.json {
+                                insert_json_field(
+                                    &mut report,
+                                    "model_search",
+                                    json!({
+                                        "status": "ok",
+                                        "searches": 0,
+                                        "solutions": 0,
+                                        "no_solutions": 0,
+                                    }),
+                                );
+                            } else {
+                                println!("model search: no generated checks");
+                            }
                         }
-                        Ok(report) => {
-                            println!(
-                                "model search: {} checks passed (solutions={}, no_solutions={})",
-                                report.searches, report.solutions, report.no_solutions
-                            );
+                        Ok(model_report) => {
+                            if options.json {
+                                insert_json_field(
+                                    &mut report,
+                                    "model_search",
+                                    json!({
+                                        "status": "ok",
+                                        "searches": model_report.searches,
+                                        "solutions": model_report.solutions,
+                                        "no_solutions": model_report.no_solutions,
+                                    }),
+                                );
+                            } else {
+                                println!(
+                                    "model search: {} checks passed (solutions={}, no_solutions={})",
+                                    model_report.searches,
+                                    model_report.solutions,
+                                    model_report.no_solutions
+                                );
+                            }
                         }
                         Err(message) => {
-                            eprintln!("{path}: model search failed: {message}");
+                            if options.json {
+                                insert_json_field(
+                                    &mut report,
+                                    "model_search",
+                                    json!({
+                                        "status": "error",
+                                        "message": message,
+                                    }),
+                                );
+                            } else {
+                                eprintln!("{path}: model search failed: {message}");
+                            }
                             failed = true;
                         }
                     }
                 }
+                reports.push(report);
             }
             Err(CompileFailure::Io(error)) => {
-                eprintln!("{path}: failed to read: {error}");
+                if options.json {
+                    reports.push(json!({
+                        "schema": "whipplescript.check_report.v0",
+                        "path": display_path(&path),
+                        "status": "error",
+                        "error": {
+                            "kind": "io",
+                            "message": error.to_string(),
+                        },
+                    }));
+                } else {
+                    eprintln!("{path}: failed to read: {error}");
+                }
                 failed = true;
             }
             Err(CompileFailure::Diagnostics {
@@ -825,11 +1008,36 @@ fn check(options: &CliOptions) -> ExitCode {
                 diagnostics,
             }) => {
                 failed = true;
-                for diagnostic in diagnostics {
-                    eprint!("{}", render_diagnostic(&path, &source, &diagnostic));
+                if options.json {
+                    reports.push(json!({
+                        "schema": "whipplescript.check_report.v0",
+                        "path": display_path(&path),
+                        "status": "error",
+                        "error": {
+                            "kind": "diagnostics",
+                            "diagnostics": diagnostics
+                                .iter()
+                                .map(parser_diagnostic_to_json)
+                                .collect::<Vec<_>>(),
+                        },
+                    }));
+                } else {
+                    for diagnostic in diagnostics {
+                        eprint!("{}", render_diagnostic(&path, &source, &diagnostic));
+                    }
                 }
             }
         }
+    }
+
+    if options.json {
+        let code = if failed {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
+        let _ = emit_json(Value::Array(reports));
+        return code;
     }
 
     if failed {
@@ -843,6 +1051,8 @@ fn check(options: &CliOptions) -> ExitCode {
 struct CheckOptions {
     model_search: bool,
     root: Option<String>,
+    exec_profile: ExecProfile,
+    script_manifest_path: Option<PathBuf>,
     paths: Vec<String>,
 }
 
@@ -850,6 +1060,8 @@ impl CheckOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut model_search = false;
         let mut root = None;
+        let mut exec_profile = ExecProfile::from_env();
+        let mut script_manifest_path = script_manifest_path_from_env();
         let mut paths = Vec::new();
         let mut index = 0;
         while index < args.len() {
@@ -862,6 +1074,20 @@ impl CheckOptions {
                     };
                     root = Some(value.clone());
                 }
+                "--exec-profile" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected profile after `--exec-profile`".to_owned());
+                    };
+                    exec_profile = ExecProfile::parse(value)?;
+                }
+                "--script-manifest" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected path after `--script-manifest`".to_owned());
+                    };
+                    script_manifest_path = Some(PathBuf::from(value));
+                }
                 "--" => {}
                 arg if arg.starts_with('-') => {
                     return Err(format!("unknown check option `{arg}`"));
@@ -873,9 +1099,354 @@ impl CheckOptions {
         Ok(Self {
             model_search,
             root,
+            exec_profile,
+            script_manifest_path,
             paths,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecProfile {
+    Dev,
+    Hosted,
+}
+
+impl ExecProfile {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "dev" => Ok(Self::Dev),
+            "hosted" => Ok(Self::Hosted),
+            other => Err(format!(
+                "unknown exec profile `{other}`; expected `dev` or `hosted`"
+            )),
+        }
+    }
+
+    fn from_env() -> Self {
+        env::var("WHIPPLESCRIPT_EXEC_PROFILE")
+            .ok()
+            .and_then(|value| Self::parse(&value).ok())
+            .unwrap_or(Self::Dev)
+    }
+
+    fn is_hosted(self) -> bool {
+        self == Self::Hosted
+    }
+}
+
+fn script_manifest_path_from_env() -> Option<PathBuf> {
+    env::var_os("WHIPPLESCRIPT_SCRIPT_MANIFEST").map(PathBuf::from)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScriptCapability {
+    name: String,
+    argv: Vec<String>,
+    sha256: String,
+    env: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ScriptManifest {
+    capabilities: BTreeMap<String, ScriptCapability>,
+}
+
+impl ScriptManifest {
+    fn load(path: &Path) -> Result<Self, String> {
+        let text = fs::read_to_string(path).map_err(|error| {
+            format!(
+                "failed to read script manifest `{}`: {error}",
+                path.display()
+            )
+        })?;
+        let value = serde_json::from_str::<Value>(&text).map_err(|error| {
+            format!(
+                "failed to parse script manifest `{}`: {error}",
+                path.display()
+            )
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            format!(
+                "script manifest `{}` must be a JSON object keyed by capability name",
+                path.display()
+            )
+        })?;
+        let mut capabilities = BTreeMap::new();
+        for (name, entry) in object {
+            let entry_object = entry
+                .as_object()
+                .ok_or_else(|| format!("script manifest entry `{name}` must be a JSON object"))?;
+            let argv = entry_object
+                .get("argv")
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("script manifest entry `{name}` must have argv array"))?
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        format!("script manifest entry `{name}` argv values must be strings")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if argv.is_empty() {
+                return Err(format!(
+                    "script manifest entry `{name}` argv must not be empty"
+                ));
+            }
+            let sha256 = entry_object
+                .get("sha256")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("script manifest entry `{name}` must have sha256 string"))?
+                .trim_start_matches("sha256:")
+                .to_ascii_lowercase();
+            if sha256.len() != 64 || !sha256.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "script manifest entry `{name}` sha256 must be a 64-character hex digest"
+                ));
+            }
+            let env = entry_object
+                .get("env")
+                .and_then(Value::as_object)
+                .map(|env_object| {
+                    env_object
+                        .iter()
+                        .map(|(key, value)| {
+                            value
+                                .as_str()
+                                .map(|value| (key.clone(), value.to_owned()))
+                                .ok_or_else(|| {
+                                    format!(
+                                        "script manifest entry `{name}` env value `{key}` must be a string reference"
+                                    )
+                                })
+                        })
+                        .collect::<Result<BTreeMap<_, _>, _>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            capabilities.insert(
+                name.clone(),
+                ScriptCapability {
+                    name: name.clone(),
+                    argv,
+                    sha256,
+                    env,
+                },
+            );
+        }
+        Ok(Self { capabilities })
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.capabilities.keys().cloned().collect()
+    }
+
+    fn get(&self, name: &str) -> Option<&ScriptCapability> {
+        self.capabilities.get(name)
+    }
+}
+
+fn load_script_manifest(path: Option<&Path>) -> Result<Option<ScriptManifest>, String> {
+    path.map(ScriptManifest::load).transpose()
+}
+
+fn register_script_manifest_capabilities(
+    store: &SqliteStore,
+    manifest: &ScriptManifest,
+    program_id: &str,
+) -> Result<(), StoreError> {
+    for name in manifest.capabilities.keys() {
+        let capability = format!("script.{name}");
+        store.register_capability_schema(CapabilitySchemaRegistration {
+            capability: &capability,
+            description: "Run an operator-pinned script capability.",
+            schema_json: "{}",
+            registered_by_plugin_id: None,
+        })?;
+        let binding_id = format!("binding_script_{}_{}", name, stable_hash_hex(program_id));
+        store.bind_capability(CapabilityBinding {
+            binding_id: &binding_id,
+            program_id: Some(program_id),
+            capability: &capability,
+            provider: "builtin-script",
+            config_json: "{}",
+        })?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExecSurface {
+    Raw,
+    Capability { name: String },
+}
+
+fn exec_surface_from_statement(statement: &str) -> Option<ExecSurface> {
+    let rest = statement.trim().strip_prefix("exec ")?.trim_start();
+    if rest.starts_with('"') {
+        return Some(ExecSurface::Raw);
+    }
+    let name = rest.split_whitespace().next()?.to_owned();
+    Some(ExecSurface::Capability { name })
+}
+
+fn lint_hosted_exec(
+    source: &str,
+    ir: &IrProgram,
+    exec_profile: ExecProfile,
+    script_manifest: Option<&ScriptManifest>,
+) -> Vec<Diagnostic> {
+    if !exec_profile.is_hosted() {
+        return Vec::new();
+    }
+    let available = script_manifest
+        .map(ScriptManifest::names)
+        .unwrap_or_default();
+    let mut diagnostics = Vec::new();
+    for rule in &ir.rules {
+        for line in rule.body.lines() {
+            let statement = line.trim();
+            if !statement.starts_with("exec ") {
+                continue;
+            }
+            let span = source
+                .find(statement)
+                .map(|start| SourceSpan {
+                    start,
+                    end: start + statement.len(),
+                })
+                .unwrap_or(SourceSpan { start: 0, end: 0 });
+            match exec_surface_from_statement(statement) {
+                Some(ExecSurface::Raw) => diagnostics.push(Diagnostic {
+                    span,
+                    message: "raw `exec \"...\"` is not allowed in hosted exec profile".to_owned(),
+                    suggestion: Some(
+                        "use `exec <capability> with <record> -> <Type> as <binding>` from the script manifest"
+                            .to_owned(),
+                    ),
+                }),
+                Some(ExecSurface::Capability { name }) => {
+                    if script_manifest
+                        .and_then(|manifest| manifest.get(&name))
+                        .is_none()
+                    {
+                        let declared = if available.is_empty() {
+                            "no script capabilities declared".to_owned()
+                        } else {
+                            format!("declared script capabilities: {}", available.join(", "))
+                        };
+                        diagnostics.push(Diagnostic {
+                            span,
+                            message: format!(
+                                "exec capability `{name}` is not declared in the script manifest"
+                            ),
+                            suggestion: Some(declared),
+                        });
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    diagnostics
+}
+
+fn insert_json_field(value: &mut Value, key: &str, field: Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(key.to_owned(), field);
+    }
+}
+
+fn source_metadata_json(ir: &IrProgram) -> Value {
+    let tags = ir
+        .source_tags
+        .iter()
+        .map(|tag| {
+            json!({
+                "name": tag.name,
+                "target_kind": tag.target_kind,
+                "target": tag.target,
+                "source_span": source_span_to_json(tag.span),
+            })
+        })
+        .collect::<Vec<_>>();
+    let descriptions = ir
+        .source_descriptions
+        .iter()
+        .map(|description| {
+            json!({
+                "value": description.value,
+                "target_kind": description.target_kind,
+                "target": description.target,
+                "source_span": source_span_to_json(description.span),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "tags": tags,
+        "descriptions": descriptions,
+        "targets": source_metadata_targets_json(ir),
+    })
+}
+
+fn source_metadata_targets_json(ir: &IrProgram) -> Value {
+    let mut targets = serde_json::Map::new();
+    for tag in &ir.source_tags {
+        let key = source_metadata_target_key(&tag.target_kind, &tag.target);
+        let entry = source_metadata_target_entry(&mut targets, &key, &tag.target_kind, &tag.target);
+        if let Some(tags) = entry.get_mut("tags").and_then(Value::as_array_mut) {
+            tags.push(Value::String(tag.name.clone()));
+        }
+    }
+    for description in &ir.source_descriptions {
+        let key = source_metadata_target_key(&description.target_kind, &description.target);
+        let entry = source_metadata_target_entry(
+            &mut targets,
+            &key,
+            &description.target_kind,
+            &description.target,
+        );
+        entry.insert(
+            "description".to_owned(),
+            Value::String(description.value.clone()),
+        );
+    }
+    Value::Object(targets)
+}
+
+fn source_metadata_target_entry<'a>(
+    targets: &'a mut serde_json::Map<String, Value>,
+    key: &str,
+    target_kind: &str,
+    target: &str,
+) -> &'a mut serde_json::Map<String, Value> {
+    let value = targets.entry(key.to_owned()).or_insert_with(|| {
+        json!({
+            "target_kind": target_kind,
+            "target": target,
+            "tags": [],
+        })
+    });
+    value.as_object_mut().expect("metadata target is object")
+}
+
+fn source_metadata_target_key(target_kind: &str, target: &str) -> String {
+    format!("{target_kind}:{target}")
+}
+
+fn parser_diagnostic_to_json(diagnostic: &Diagnostic) -> Value {
+    json!({
+        "message": diagnostic.message,
+        "suggestion": diagnostic.suggestion,
+        "source_span": source_span_to_json(diagnostic.span),
+    })
+}
+
+fn source_span_to_json(span: SourceSpan) -> Value {
+    json!({
+        "start": span.start,
+        "end": span.end,
+    })
 }
 
 fn compile(options: &CliOptions) -> ExitCode {
@@ -886,7 +1457,7 @@ fn compile(options: &CliOptions) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (source, ir) = match compile_source_path_with_root(
+    let (source, ir) = match compile_source_path_for_validation(
         &compile_options.program_path,
         compile_options.root.as_deref(),
     ) {
@@ -897,11 +1468,13 @@ fn compile(options: &CliOptions) -> ExitCode {
 
     if options.json {
         emit_json(json!({
+            "schema": "whipplescript.compile_report.v0",
             "path": display_path(&compile_options.program_path),
-            "workflow": ir.workflow,
+            "workflow": ir.workflow.as_str(),
             "source_hash": stable_hash_hex(&source),
             "ir_hash": stable_hash_hex(&snapshot),
             "snapshot": snapshot,
+            "source_metadata": source_metadata_json(&ir),
         }))
     } else {
         print!("{snapshot}");
@@ -1725,6 +2298,216 @@ fn json_matches_ir_type(ir: &IrProgram, value: &Value, ty: &IrType) -> bool {
     errors.is_empty()
 }
 
+/// Self-contained structural schema embedded in a parsing effect's input so
+/// the worker can validate ingested bytes without the program IR
+/// (spec/json-ingestion.md). The effect carries its own contract, which also
+/// keeps replay independent of later source edits.
+fn ingest_shape_json(ir: &IrProgram, ty: &IrType, depth: usize) -> Value {
+    if depth > 8 {
+        return json!("json");
+    }
+    let object_fields = |fields: &[whipplescript_parser::IrClassField]| -> Value {
+        Value::Object(
+            fields
+                .iter()
+                .map(|field| {
+                    (
+                        field.name.clone(),
+                        ingest_shape_json(ir, &field.ty, depth + 1),
+                    )
+                })
+                .collect(),
+        )
+    };
+    match ty {
+        IrType::Primitive(primitive) => {
+            json!(ir_type_name(&IrType::Primitive(primitive.clone())))
+        }
+        IrType::LiteralString(value) => json!({ "literal": value }),
+        IrType::AgentRef(_) => json!("string"),
+        IrType::Ref(name) => {
+            for schema in &ir.schemas {
+                match schema {
+                    IrSchema::Class(class) if class.name == *name => {
+                        return json!({ "class": name, "fields": object_fields(&class.fields) });
+                    }
+                    IrSchema::Enum(decl) if decl.name == *name => {
+                        return json!({ "enum": decl.variants });
+                    }
+                    _ => {}
+                }
+            }
+            json!("json")
+        }
+        IrType::Object(fields) => json!({ "fields": object_fields(fields) }),
+        IrType::Optional(inner) => json!({ "optional": ingest_shape_json(ir, inner, depth + 1) }),
+        IrType::Array(inner) => json!({ "array": ingest_shape_json(ir, inner, depth + 1) }),
+        IrType::Map(inner) => json!({ "map": ingest_shape_json(ir, inner, depth + 1) }),
+        IrType::Union(types) => json!({
+            "union": types
+                .iter()
+                .map(|candidate| ingest_shape_json(ir, candidate, depth + 1))
+                .collect::<Vec<_>>()
+        }),
+    }
+}
+
+/// Deterministic fixture value for an embedded structural shape: literal
+/// fields yield their literal (which is how a variant fixture carries its
+/// `variant` tag), enums pick the first variant, scalars get stable
+/// placeholders (spec/sum-types.md fixture).
+fn fixture_value_for_shape(shape: &Value) -> Value {
+    match shape {
+        Value::String(primitive) => match primitive.as_str() {
+            "int" => json!(1),
+            "float" => json!(0.5),
+            "bool" => json!(true),
+            "null" => Value::Null,
+            "time" => json!("2026-01-01T00:00:00Z"),
+            "json" => json!({}),
+            _ => json!("fixture"),
+        },
+        Value::Object(map) => {
+            if let Some(literal) = map.get("literal") {
+                return literal.clone();
+            }
+            if let Some(variants) = map.get("enum").and_then(Value::as_array) {
+                return variants
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| json!("fixture"));
+            }
+            if let Some(inner) = map.get("optional") {
+                return fixture_value_for_shape(inner);
+            }
+            if let Some(inner) = map.get("array") {
+                return json!([fixture_value_for_shape(inner)]);
+            }
+            if let Some(inner) = map.get("map") {
+                return json!({ "fixture": fixture_value_for_shape(inner) });
+            }
+            if let Some(options) = map.get("union").and_then(Value::as_array) {
+                return options
+                    .first()
+                    .map(fixture_value_for_shape)
+                    .unwrap_or_else(|| json!({}));
+            }
+            if let Some(fields) = map.get("fields").and_then(Value::as_object) {
+                return Value::Object(
+                    fields
+                        .iter()
+                        .map(|(name, field_shape)| {
+                            (name.clone(), fixture_value_for_shape(field_shape))
+                        })
+                        .collect(),
+                );
+            }
+            json!({})
+        }
+        _ => json!("fixture"),
+    }
+}
+
+/// Validates ingested JSON against the embedded structural shape — the
+/// worker-side mirror of `validate_json_for_ir_type`, reading the contract
+/// the effect carries instead of the program IR.
+fn validate_ingest_value(value: &Value, shape: &Value, path: &str, errors: &mut Vec<String>) {
+    match shape {
+        Value::String(primitive) => {
+            let valid = match primitive.as_str() {
+                "int" => value.as_i64().is_some(),
+                "float" => value.as_f64().is_some(),
+                "bool" => value.is_boolean(),
+                "null" => value.is_null(),
+                "time" => value
+                    .as_str()
+                    .is_some_and(whipplescript_parser::body::is_iso8601_instant),
+                "json" => true,
+                // string plus media/duration primitives serialize as strings
+                _ => value.is_string(),
+            };
+            if !valid {
+                errors.push(format!("{path} must be {primitive}"));
+            }
+        }
+        Value::Object(map) => {
+            if let Some(literal) = map.get("literal") {
+                if value != literal {
+                    errors.push(format!("{path} must be literal {literal}"));
+                }
+            } else if let Some(variants) = map.get("enum").and_then(Value::as_array) {
+                if !variants.iter().any(|candidate| candidate == value) {
+                    errors.push(format!(
+                        "{path} must be one of: {}",
+                        variants
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            } else if let Some(inner) = map.get("optional") {
+                if !value.is_null() {
+                    validate_ingest_value(value, inner, path, errors);
+                }
+            } else if let Some(inner) = map.get("array") {
+                match value.as_array() {
+                    Some(items) => {
+                        for (index, item) in items.iter().enumerate() {
+                            validate_ingest_value(item, inner, &format!("{path}[{index}]"), errors);
+                        }
+                    }
+                    None => errors.push(format!("{path} must be an array")),
+                }
+            } else if let Some(inner) = map.get("map") {
+                match value.as_object() {
+                    Some(entries) => {
+                        for (key, item) in entries {
+                            validate_ingest_value(item, inner, &format!("{path}.{key}"), errors);
+                        }
+                    }
+                    None => errors.push(format!("{path} must be an object map")),
+                }
+            } else if let Some(options) = map.get("union").and_then(Value::as_array) {
+                let matches_any = options.iter().any(|option| {
+                    let mut probe = Vec::new();
+                    validate_ingest_value(value, option, path, &mut probe);
+                    probe.is_empty()
+                });
+                if !matches_any {
+                    errors.push(format!("{path} matches no arm of the declared union"));
+                }
+            } else if let Some(fields) = map.get("fields").and_then(Value::as_object) {
+                let label = map
+                    .get("class")
+                    .and_then(Value::as_str)
+                    .map(|class| format!(" ({class})"))
+                    .unwrap_or_default();
+                let Some(object) = value.as_object() else {
+                    errors.push(format!("{path} must be an object{label}"));
+                    return;
+                };
+                for key in object.keys() {
+                    if !fields.contains_key(key) {
+                        errors.push(format!("{path}.{key} is not declared{label}"));
+                    }
+                }
+                for (name, field_shape) in fields {
+                    let field_path = format!("{path}.{name}");
+                    match object.get(name) {
+                        Some(field_value) => {
+                            validate_ingest_value(field_value, field_shape, &field_path, errors)
+                        }
+                        None if field_shape.get("optional").is_some() => {}
+                        None => errors.push(format!("{field_path} is required")),
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn step(options: &CliOptions) -> ExitCode {
     let step_options = match StepOptions::parse(&options.args) {
         Ok(options) => options,
@@ -1989,7 +2772,13 @@ impl BranchStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AssertionReport {
+    target_id: String,
+    event_id: Option<String>,
+    diagnostic_ids: Vec<String>,
     expr: String,
+    reads: Vec<AssertionReadReport>,
+    tags: Vec<String>,
+    description: Option<String>,
     source_span_json: Option<String>,
     status: AssertionStatus,
     passed: bool,
@@ -1998,6 +2787,28 @@ struct AssertionReport {
     expected: Value,
     failure_reason: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssertionReadReport {
+    kind: String,
+    head: String,
+    guard: Option<String>,
+    source: String,
+    match_count: usize,
+    matches: Vec<AssertionReadMatch>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssertionReadMatch {
+    id: String,
+    name: String,
+    key: Option<String>,
+    status: Option<String>,
+    prompt_content_type: Option<String>,
+    provenance_class: Option<String>,
+    source_span_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2049,6 +2860,9 @@ fn step_instance(
         let active_version_id = status.instance.version_id;
         let active_revision_epoch = status.instance.revision_epoch;
         let active_revision_epoch_key = active_revision_epoch.to_string();
+        drop(store);
+        project_queue_items(store_path, instance_id, ir)?;
+        let store = SqliteStore::open(store_path)?;
         let events = store.list_events(instance_id)?;
         let facts = store.list_facts(instance_id)?;
         let all_facts = store.list_facts_including_consumed(instance_id)?;
@@ -2062,7 +2876,15 @@ fn step_instance(
             let ready = ready_contexts(ir, rule, &facts, &effects, started_event_id.as_deref());
             report.guard_reports.extend(ready.guard_reports);
             for context in ready.contexts {
-                let lowering = lower_rule(ir, rule, &context, &all_facts, &effects, source_path);
+                let lowering = lower_rule(
+                    instance_id,
+                    ir,
+                    rule,
+                    &context,
+                    &all_facts,
+                    &effects,
+                    source_path,
+                );
                 report
                     .branch_reports
                     .extend(lowering.branch_reports.iter().cloned());
@@ -2164,11 +2986,28 @@ fn step_instance(
                 store = kernel.into_store();
                 drop(store);
                 match event {
-                    Ok(_) => {
+                    Ok(committed) => {
                         report.committed_rules += 1;
                         report.facts_created += new_facts.len();
                         report.facts_consumed += consumed_fact_ids.len();
                         report.effects_created += new_effects.len();
+                        // Holder-lifetime bound (spec/coordination.md): an
+                        // instance reaching a workflow terminal auto-releases
+                        // every lease it held.
+                        if lowering.terminal.is_some() {
+                            let mut coordination =
+                                whipplescript_store::coordination::CoordinationStore::open(
+                                    coordination_store_path(),
+                                )?;
+                            let _ = coordination.release_all_for_holder(instance_id)?;
+                        }
+                        apply_rule_cancels(
+                            store_path,
+                            instance_id,
+                            &rule.name,
+                            &lowering.cancels,
+                            &committed.event_id,
+                        )?;
                         made_progress = true;
                         break 'rules;
                     }
@@ -2209,7 +3048,12 @@ fn worker(options: &CliOptions) -> ExitCode {
 struct WorkerOptions {
     instance_id: String,
     provider: String,
+    exec_profile: ExecProfile,
+    script_manifest_path: Option<PathBuf>,
     outcome: FixtureOutcome,
+    /// Fixture knob: which sum-type variant a fixture coerce returns
+    /// (spec/sum-types.md); default is the first declared variant.
+    variant: Option<String>,
     program_path: Option<PathBuf>,
     root: Option<String>,
     provider_config_paths: Vec<PathBuf>,
@@ -2220,7 +3064,10 @@ impl WorkerOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut instance_id = None;
         let mut provider = "fixture".to_owned();
+        let mut exec_profile = ExecProfile::from_env();
+        let mut script_manifest_path = script_manifest_path_from_env();
         let mut outcome = FixtureOutcome::Completed;
+        let mut variant = None;
         let mut program_path = None;
         let mut root = None;
         let mut provider_config_paths = Vec::new();
@@ -2241,6 +3088,20 @@ impl WorkerOptions {
                         return Err("expected path after `--provider-config`".to_owned());
                     };
                     provider_config_paths.push(PathBuf::from(value));
+                }
+                "--exec-profile" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected profile after `--exec-profile`".to_owned());
+                    };
+                    exec_profile = ExecProfile::parse(value)?;
+                }
+                "--script-manifest" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected path after `--script-manifest`".to_owned());
+                    };
+                    script_manifest_path = Some(PathBuf::from(value));
                 }
                 "--program" => {
                     index += 1;
@@ -2267,6 +3128,13 @@ impl WorkerOptions {
                         .parse()
                         .map_err(|_| "`--max-child-iterations` must be a number".to_owned())?;
                 }
+                "--variant" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected variant name after `--variant`".to_owned());
+                    };
+                    variant = Some(value.clone());
+                }
                 "--fail" => outcome = FixtureOutcome::Failed,
                 "--timeout" => outcome = FixtureOutcome::TimedOut,
                 "--cancel" => outcome = FixtureOutcome::Cancelled,
@@ -2292,7 +3160,10 @@ impl WorkerOptions {
         Ok(Self {
             instance_id,
             provider,
+            exec_profile,
+            script_manifest_path,
             outcome,
+            variant,
             program_path,
             root,
             provider_config_paths,
@@ -2321,6 +3192,8 @@ struct WorkerReport {
     instance_id: String,
     provider: String,
     ran_effects: usize,
+    timers_fired: usize,
+    deadlines_expired: usize,
     cancellation_acknowledgements: usize,
     cancellation_diagnostics: usize,
     terminal_events: Vec<String>,
@@ -2336,8 +3209,43 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
         process_running_cancellations(store_path, &options.instance_id, &options.provider)?;
     report.cancellation_acknowledgements = cancellation_report.acknowledgements;
     report.cancellation_diagnostics = cancellation_report.diagnostics;
+    let time_report = resolve_due_time_effects(store_path, &options.instance_id)?;
+    report.timers_fired = time_report.timers_fired;
+    report.deadlines_expired = time_report.deadlines_expired;
+    report.terminal_events.extend(time_report.terminal_events);
+    let script_manifest = load_script_manifest(options.script_manifest_path.as_deref())
+        .map_err(StoreError::Conflict)?;
+    if let Some(manifest) = script_manifest.as_ref() {
+        let store = SqliteStore::open(store_path)?;
+        let instance = store
+            .get_instance(&options.instance_id)?
+            .ok_or_else(|| StoreError::Conflict("instance not found".to_owned()))?;
+        register_script_manifest_capabilities(&store, manifest, &instance.program_id)?;
+    }
     let store = SqliteStore::open(store_path)?;
-    let claimable = store.claimable_effects(&options.instance_id)?;
+    let mut claimable = store.claimable_effects(&options.instance_id)?;
+    let mut seen_claimable = claimable
+        .iter()
+        .map(|effect| effect.effect_id.clone())
+        .collect::<BTreeSet<_>>();
+    for effect in store.list_effects(&options.instance_id)? {
+        if effect.kind == "exec.command"
+            && effect.status == "queued"
+            && effect.policy_block_reason.is_none()
+            && !effect.cancel_requested
+            && seen_claimable.insert(effect.effect_id.clone())
+        {
+            claimable.push(ClaimableEffect {
+                effect_id: effect.effect_id,
+                kind: effect.kind,
+                target: effect.target,
+                profile: effect.profile,
+                input_json: effect.input_json,
+                required_capabilities_json: effect.required_capabilities_json,
+                declared_profiles_json: effect.declared_profiles_json,
+            });
+        }
+    }
     for effect in claimable {
         let terminal = match effect.kind.as_str() {
             "agent.tell" => run_agent_effect(store_path, &options.instance_id, &effect, options)?,
@@ -2351,10 +3259,308 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
             "workflow.invoke" => {
                 run_workflow_invoke_effect(store_path, &options.instance_id, &effect, options)?
             }
+            "queue.file" | "queue.claim" | "queue.release" | "queue.finish" => {
+                run_queue_effect(store_path, &options.instance_id, &effect, options)?
+            }
+            "exec.command" => run_exec_effect(
+                store_path,
+                &options.instance_id,
+                &effect,
+                options.exec_profile,
+                script_manifest.as_ref(),
+            )?,
+            "lease.acquire" | "lease.release" | "ledger.append" | "counter.consume" => {
+                run_coordination_effect(store_path, &options.instance_id, &effect)?
+            }
+            "event.notify" => run_notify_effect(store_path, &options.instance_id, &effect)?,
             _ => continue,
         };
         report.ran_effects += 1;
         report.terminal_events.push(terminal.event_id);
+    }
+    Ok(report)
+}
+
+/// Workspace-scoped coordination state (spec/coordination.md): shared
+/// lease/ledger/counter durable state outlives disposable run stores.
+fn coordination_store_path() -> PathBuf {
+    env::var("WHIPPLESCRIPT_COORDINATION_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".whipplescript/coordination.sqlite"))
+}
+
+/// Workspace-scoped builtin tracker path: the backlog outlives disposable
+/// run stores.
+fn items_store_path() -> PathBuf {
+    env::var("WHIPPLESCRIPT_ITEMS_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".whipplescript/items.sqlite"))
+}
+
+/// Projects ready work items from declared builtin queues into
+/// instance-local `queue.item.ready` facts, and retires projections whose
+/// items are no longer ready. The tracker is the source of truth; the run
+/// store holds a cache keyed (queue, id).
+fn project_queue_items(
+    store_path: &Path,
+    instance_id: &str,
+    ir: &IrProgram,
+) -> Result<(), StoreError> {
+    if ir.queues.is_empty() {
+        return Ok(());
+    }
+    for queue in &ir.queues {
+        if queue.tracker != "builtin" {
+            continue;
+        }
+        let items = whipplescript_store::items::WorkItemStore::open(items_store_path())?;
+        // Keep a projection alive while this instance holds the claim: the
+        // dispatching rule's multi-stage chain needs its trigger fact until
+        // the item is finished or released. Re-fires are idempotent (effect
+        // ids are identity-derived), matching the engine's existing idiom.
+        let ready = items
+            .list_items(Some(&queue.name), None)?
+            .into_iter()
+            .filter(|item| {
+                (item.status == "open" && item.claimed_by.is_none())
+                    || (item.status == "in_progress"
+                        && item.claimed_by.as_deref() == Some(instance_id))
+            })
+            .collect::<Vec<_>>();
+        drop(items);
+        let store = SqliteStore::open(store_path)?;
+        let existing = store
+            .list_facts(instance_id)?
+            .into_iter()
+            .filter(|fact| fact.name == "queue.item.ready")
+            .filter(|fact| {
+                json_from_str(&fact.value_json)
+                    .get("queue")
+                    .and_then(Value::as_str)
+                    == Some(queue.name.as_str())
+            })
+            .collect::<Vec<_>>();
+        drop(store);
+        let ready_prefixes = ready
+            .iter()
+            .map(|item| format!("{}:{}:", queue.name, item.id))
+            .collect::<Vec<_>>();
+        for item in &ready {
+            let prefix = format!("{}:{}:", queue.name, item.id);
+            if existing.iter().any(|fact| fact.key.starts_with(&prefix)) {
+                continue;
+            }
+            // Salt the key with the item's update generation: a released
+            // item re-projects as a fresh fact instead of colliding with
+            // its retired predecessor.
+            let key = format!("{prefix}{}", stable_hash_hex(&item.updated_at));
+            let value_json = json!({
+                "queue": queue.name,
+                "id": item.id,
+                "title": item.title,
+                "body": item.body,
+                "status": item.status,
+                "labels": item.labels,
+                "metadata": item.metadata,
+            })
+            .to_string();
+            let store = SqliteStore::open(store_path)?;
+            let mut kernel = RuntimeKernel::new(store);
+            // Salt with updated_at: a released item re-projects as a fresh
+            // fact generation instead of colliding with its retired one.
+            kernel.derive_fact(
+                instance_id,
+                "queue.item.ready",
+                &key,
+                &value_json,
+                None,
+                Some(&idempotency_key(&[
+                    instance_id,
+                    "queue.item.ready",
+                    &key,
+                    &item.updated_at,
+                ])),
+            )?;
+        }
+        for fact in existing {
+            if !ready_prefixes
+                .iter()
+                .any(|prefix| fact.key.starts_with(prefix))
+            {
+                let mut store = SqliteStore::open(store_path)?;
+                store.retire_fact(instance_id, &fact.fact_id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TimePassReport {
+    timers_fired: usize,
+    deadlines_expired: usize,
+    terminal_events: Vec<String>,
+}
+
+/// Resolves creation-anchored time: fires due `timer.wait` effects and
+/// expires effects whose `timeout` deadline passed. Wall-clock reads live
+/// here, on worker passes — never in rule evaluation.
+fn resolve_due_time_effects(
+    store_path: &Path,
+    instance_id: &str,
+) -> Result<TimePassReport, StoreError> {
+    let mut report = TimePassReport::default();
+    let store = SqliteStore::open(store_path)?;
+    let due = store.due_time_effects(instance_id)?;
+    drop(store);
+    for effect in due {
+        if effect.kind == "timer.wait" {
+            let run_id = idempotency_key(&[instance_id, &effect.effect_id, "timer-run"]);
+            let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "timer-lease"]);
+            let store = SqliteStore::open(store_path)?;
+            let mut kernel = RuntimeKernel::new(store);
+            kernel.start_run(RunStart {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "timer",
+                worker_id: "whip-timer",
+                lease_id: &lease_id,
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: &json!({
+                    "duration_seconds": effect.timeout_seconds,
+                })
+                .to_string(),
+            })?;
+            let terminal = kernel.complete_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "timer",
+                worker_id: "whip-timer",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some("timer fired"),
+                metadata_json: &json!({
+                    "duration_seconds": effect.timeout_seconds,
+                })
+                .to_string(),
+                idempotency_key: Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "timer-terminal",
+                ])),
+            })?;
+            let value_json = json!({
+                "effect_id": effect.effect_id,
+                "run_id": run_id,
+                "status": "completed",
+                "fired": true,
+                "duration_seconds": effect.timeout_seconds,
+            })
+            .to_string();
+            kernel.derive_fact(
+                instance_id,
+                "timer.fired",
+                &effect.effect_id,
+                &value_json,
+                Some(&terminal.event_id),
+                Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "timer.fired",
+                ])),
+            )?;
+            report.timers_fired += 1;
+            report.terminal_events.push(terminal.event_id);
+            continue;
+        }
+        // Deadline expiry: running effects time out at the run level and get
+        // a cancellation request; never-run effects expire directly.
+        let store = SqliteStore::open(store_path)?;
+        let running_run = store
+            .list_runs(instance_id)?
+            .into_iter()
+            .find(|run| run.effect_id == effect.effect_id && run.status == "running");
+        drop(store);
+        let terminal_event_id = match running_run {
+            Some(run) => {
+                let store = SqliteStore::open(store_path)?;
+                let mut kernel = RuntimeKernel::new(store);
+                let terminal = kernel.timeout_run(EffectCompletion {
+                    instance_id,
+                    effect_id: &effect.effect_id,
+                    run_id: &run.run_id,
+                    provider: &run.provider,
+                    worker_id: &run.worker_id,
+                    status: "timed_out",
+                    exit_code: None,
+                    summary: Some("deadline exceeded"),
+                    metadata_json: &json!({
+                        "timeout_seconds": effect.timeout_seconds,
+                        "reason": "deadline exceeded",
+                    })
+                    .to_string(),
+                    idempotency_key: Some(&idempotency_key(&[
+                        instance_id,
+                        &effect.effect_id,
+                        "deadline-terminal",
+                    ])),
+                })?;
+                let store = kernel.into_store();
+                let mut store = store;
+                let _ = store.request_effect_cancellation(EffectCancellationRequest {
+                    instance_id,
+                    effect_id: &effect.effect_id,
+                    revision_id: None,
+                    reason: Some("deadline exceeded"),
+                    requested_by: "deadline",
+                    causation_event_id: Some(&terminal.event_id),
+                    idempotency_key: Some(&idempotency_key(&[
+                        instance_id,
+                        &effect.effect_id,
+                        "deadline-cancel-request",
+                    ])),
+                });
+                terminal.event_id
+            }
+            None => {
+                let mut store = SqliteStore::open(store_path)?;
+                let terminal = store.expire_effect(
+                    instance_id,
+                    &effect.effect_id,
+                    Some(&idempotency_key(&[
+                        instance_id,
+                        &effect.effect_id,
+                        "deadline-terminal",
+                    ])),
+                )?;
+                terminal.event_id
+            }
+        };
+        let store = SqliteStore::open(store_path)?;
+        let mut kernel = RuntimeKernel::new(store);
+        let value_json = json!({
+            "effect_id": effect.effect_id,
+            "status": "timed_out",
+            "reason": "deadline exceeded",
+            "timeout_seconds": effect.timeout_seconds,
+        })
+        .to_string();
+        kernel.derive_fact(
+            instance_id,
+            "effect.timed_out",
+            &effect.effect_id,
+            &value_json,
+            Some(&terminal_event_id),
+            Some(&idempotency_key(&[
+                instance_id,
+                &effect.effect_id,
+                "effect.timed_out",
+            ])),
+        )?;
+        report.deadlines_expired += 1;
+        report.terminal_events.push(terminal_event_id);
     }
     Ok(report)
 }
@@ -2682,44 +3888,87 @@ fn agent_provider_selection_with_config_paths(
         return Ok(fallback_provider_selection(fallback_provider));
     };
     let declared = serde_json::from_str::<Value>(&effect.declared_profiles_json)?;
-    let Some(harness) = declared_agent_harness_in_value(&declared, agent) else {
-        return Ok(fallback_provider_selection(fallback_provider));
-    };
-    let Some(kind) = declared_harness_kind_in_value(&declared, &harness) else {
-        return Err(StoreError::Conflict(format!(
-            "agent `{agent}` is bound to harness `{harness}`, but that harness is not declared"
-        )));
-    };
-    if let Some(config) = provider_binding_for_harness(&harness, config_paths)? {
-        let config_kind = config.provider_kind.as_str();
-        if config_kind != kind {
+    if let Some(harness) = declared_agent_harness_in_value(&declared, agent) {
+        let Some(kind) = declared_harness_kind_in_value(&declared, &harness) else {
             return Err(StoreError::Conflict(format!(
-                "provider config for harness `{harness}` has kind `{config_kind}`, but source declares `{kind}`"
+                "agent `{agent}` is bound to harness `{harness}`, but that harness is not declared"
             )));
+        };
+        if let Some(config) = provider_binding_for_harness(&harness, config_paths)? {
+            let config_kind = config.provider_kind.as_str();
+            if config_kind != kind {
+                return Err(StoreError::Conflict(format!(
+                    "provider config for harness `{harness}` has kind `{config_kind}`, but source declares `{kind}`"
+                )));
+            }
+            let command_plan = if kind == "command" {
+                Some(command_launch_plan_from_config(&config)?)
+            } else {
+                None
+            };
+            return Ok(AgentProviderSelection {
+                provider_id: config.provider_id.clone(),
+                kind,
+                source_harness_id: Some(harness),
+                surface: Some(config.surface.as_str().to_owned()),
+                provider_config: Some(config),
+                command_plan,
+            });
         }
-        let command_plan = if kind == "command" {
-            Some(command_launch_plan_from_config(&config)?)
+        let execution_kind = if fallback_provider == "fixture" {
+            "fixture".to_owned()
         } else {
-            None
+            kind
         };
         return Ok(AgentProviderSelection {
-            provider_id: config.provider_id.clone(),
-            kind,
+            provider_id: harness.clone(),
+            kind: execution_kind,
             source_harness_id: Some(harness),
-            surface: Some(config.surface.as_str().to_owned()),
-            provider_config: Some(config),
-            command_plan,
+            surface: None,
+            provider_config: None,
+            command_plan: None,
         });
     }
 
-    Ok(AgentProviderSelection {
-        provider_id: harness.clone(),
-        kind,
-        source_harness_id: Some(harness),
-        surface: None,
-        provider_config: None,
-        command_plan: None,
-    })
+    if let Some(provider) = declared_agent_provider_in_value(&declared, agent) {
+        let kind = provider.clone();
+        if let Some(config) = provider_binding_for_harness(&provider, config_paths)? {
+            let config_kind = config.provider_kind.as_str();
+            if config_kind != kind {
+                return Err(StoreError::Conflict(format!(
+                    "provider config for direct provider `{provider}` has kind `{config_kind}`, but source declares `{kind}`"
+                )));
+            }
+            let command_plan = if kind == "command" {
+                Some(command_launch_plan_from_config(&config)?)
+            } else {
+                None
+            };
+            return Ok(AgentProviderSelection {
+                provider_id: config.provider_id.clone(),
+                kind,
+                source_harness_id: None,
+                surface: Some(config.surface.as_str().to_owned()),
+                provider_config: Some(config),
+                command_plan,
+            });
+        }
+        let execution_kind = if fallback_provider == "fixture" {
+            "fixture".to_owned()
+        } else {
+            kind
+        };
+        return Ok(AgentProviderSelection {
+            provider_id: provider,
+            kind: execution_kind,
+            source_harness_id: None,
+            surface: None,
+            provider_config: None,
+            command_plan: None,
+        });
+    }
+
+    Ok(fallback_provider_selection(fallback_provider))
 }
 
 fn fallback_provider_selection(provider: &str) -> AgentProviderSelection {
@@ -2965,6 +4214,36 @@ fn declared_agent_harness_in_value(value: &Value, agent: &str) -> Option<String>
             object
                 .get("agents")
                 .and_then(|agents| declared_agent_harness_in_value(agents, agent))
+        }
+        _ => None,
+    }
+}
+
+fn declared_agent_provider_in_value(value: &Value, agent: &str) -> Option<String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| declared_agent_provider_in_value(item, agent)),
+        Value::Object(object) => {
+            if let Some(entry) = object.get(agent) {
+                return entry
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            let object_agent = object
+                .get("name")
+                .or_else(|| object.get("agent_name"))
+                .and_then(Value::as_str);
+            if object_agent == Some(agent) {
+                return object
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            object
+                .get("agents")
+                .and_then(|agents| declared_agent_provider_in_value(agents, agent))
         }
         _ => None,
     }
@@ -3617,7 +4896,19 @@ fn run_baml_effect(
         input_schema_hash: "fixture".to_owned(),
         output_schema_hash: "fixture".to_owned(),
     };
-    let value = fixture_baml_value(&output_type);
+    // Sum-type outputs carry embedded per-variant fixtures: return the
+    // selected (or first declared) tagged variant (spec/sum-types.md).
+    let value = input
+        .get("fixture_variants")
+        .and_then(Value::as_object)
+        .and_then(|variants| {
+            let selected = options
+                .variant
+                .as_deref()
+                .or_else(|| input.get("fixture_default").and_then(Value::as_str))?;
+            variants.get(selected).map(Value::to_string)
+        })
+        .unwrap_or_else(|| fixture_baml_value(&output_type));
     if options.outcome == FixtureOutcome::Cancelled {
         return cancel_baml_effect(store_path, instance_id, effect, &input, options);
     }
@@ -3800,7 +5091,7 @@ fn run_human_effect(
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "human-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "human-lease"]);
     let inbox_item_id = idempotency_key(&[instance_id, &effect.effect_id, "inbox"]);
-    kernel.run_human_ask(HumanAskExecution {
+    let terminal = kernel.run_human_ask(HumanAskExecution {
         instance_id,
         effect_id: &effect.effect_id,
         run_id: &run_id,
@@ -3815,7 +5106,30 @@ fn run_human_effect(
         severity,
         related_effects_json: &json!([effect.effect_id]).to_string(),
         related_artifacts_json: "[]",
+    })?;
+    // The ask is issued: a completed-status fact lets `after ask succeeds`
+    // branches fire (e.g. flow await-state records carrying the ask's
+    // effect id for answer correlation).
+    let issued_json = json!({
+        "effect_id": effect.effect_id,
+        "run_id": run_id,
+        "inbox_item_id": inbox_item_id,
+        "status": "completed",
     })
+    .to_string();
+    kernel.derive_fact(
+        instance_id,
+        "human.ask.issued",
+        &effect.effect_id,
+        &issued_json,
+        Some(&terminal.event_id),
+        Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "human.ask.issued",
+        ])),
+    )?;
+    Ok(terminal)
 }
 
 fn resolve_effect_input_after_bindings(
@@ -4040,6 +5354,983 @@ fn run_capability_effect(
         terminal
     };
     Ok(terminal)
+}
+
+/// Executes a granted `exec` effect. Grants are operator-config-only: the
+/// `WHIPPLESCRIPT_EXEC_ALLOW` allowlist (colon-separated glob prefixes).
+/// Source declares; config grants; there is no self-granting.
+fn exec_command_granted(command: &str) -> bool {
+    let Ok(allow) = env::var("WHIPPLESCRIPT_EXEC_ALLOW") else {
+        return false;
+    };
+    allow
+        .split(':')
+        .filter(|pattern| !pattern.is_empty())
+        .any(|pattern| {
+            if let Some(prefix) = pattern.strip_suffix('*') {
+                command.starts_with(prefix)
+            } else {
+                command == pattern
+            }
+        })
+}
+
+/// In-workflow injection (spec/event-ingress.md): one instance lands a
+/// typed, schema-validated, durable event in another known instance — still
+/// "inject a durable event", not "open a channel". A payload that fails
+/// validation fails the effect; no ill-typed fact lands in the peer.
+fn run_notify_effect(
+    store_path: &Path,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let input = json_from_str(&effect.input_json);
+    let target = input
+        .get("target_instance")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let event_name = input
+        .get("event")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let payload = input.get("payload").cloned().unwrap_or(Value::Null);
+    let shape = input.get("shape").cloned().unwrap_or(Value::Null);
+
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "notify-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "notify-lease"]);
+    let store = SqliteStore::open(store_path)?;
+    let mut kernel = RuntimeKernel::new(store);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "notify",
+        worker_id: "whip-notify",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({"target": target, "event": event_name}).to_string(),
+    })?;
+
+    let mut errors = Vec::new();
+    validate_ingest_value(&payload, &shape, "$", &mut errors);
+    let target_exists = SqliteStore::open(store_path)?
+        .get_instance(&target)?
+        .is_some();
+    if !target_exists {
+        errors.push(format!("target instance `{target}` not found"));
+    }
+    if !errors.is_empty() {
+        let reason = format!("notify of `{event_name}` rejected: {}", errors.join("; "));
+        let terminal = kernel.fail_run(EffectCompletion {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &run_id,
+            provider: "notify",
+            worker_id: "whip-notify",
+            status: "failed",
+            exit_code: None,
+            summary: Some(&reason),
+            metadata_json: &json!({"failure": {"message": reason}}).to_string(),
+            idempotency_key: Some(&idempotency_key(&[
+                instance_id,
+                &effect.effect_id,
+                "terminal",
+            ])),
+        })?;
+        return Ok(terminal);
+    }
+
+    let payload_json = payload.to_string();
+    let received = kernel.ingest_external_event(
+        &target,
+        &event_name,
+        &payload_json,
+        Some(&idempotency_key(&[&target, "notify", &effect.effect_id])),
+    )?;
+    kernel.derive_fact(
+        &target,
+        &event_name,
+        &received.event_id,
+        &payload_json,
+        Some(&received.event_id),
+        Some(&idempotency_key(&[
+            &target,
+            "notify-fact",
+            &effect.effect_id,
+        ])),
+    )?;
+    let terminal = kernel.complete_run(EffectCompletion {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "notify",
+        worker_id: "whip-notify",
+        status: "completed",
+        exit_code: Some(0),
+        summary: Some(&format!("notified {target} with `{event_name}`")),
+        metadata_json: &json!({"target": target, "event": event_name}).to_string(),
+        idempotency_key: Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "terminal",
+        ])),
+    })?;
+    kernel.derive_fact(
+        instance_id,
+        "event.notify.completed",
+        &effect.effect_id,
+        &json!({
+            "effect_id": effect.effect_id,
+            "run_id": run_id,
+            "status": "completed",
+            "value": {"target": target, "event": event_name},
+        })
+        .to_string(),
+        Some(&terminal.event_id),
+        Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "notify-self-fact",
+        ])),
+    )?;
+    Ok(terminal)
+}
+
+/// Executes one coordination verb (spec/coordination.md): one atomic store
+/// transaction, completed with a sum-typed outcome value the after-block
+/// predicates (`held`/`contended`/`ok`/`over`) dispatch on. Contention and
+/// over-budget are completed outcomes, never failures.
+fn run_coordination_effect(
+    store_path: &Path,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    use whipplescript_store::coordination::{AcquireOutcome, ConsumeOutcome, CoordinationStore};
+
+    let input = json_from_str(&effect.input_json);
+    let mut coordination = CoordinationStore::open(coordination_store_path())?;
+    let field = |name: &str| {
+        input
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let value = match effect.kind.as_str() {
+        "lease.acquire" => {
+            let resource = field("resource");
+            let key = field("key");
+            let outcome = coordination.try_acquire(
+                &resource,
+                &key,
+                input.get("slots").and_then(Value::as_i64).unwrap_or(1),
+                input
+                    .get("ttl_seconds")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(600),
+                instance_id,
+            )?;
+            match outcome {
+                AcquireOutcome::Held => json!({
+                    "variant": "Held",
+                    "resource": resource,
+                    "key": key,
+                }),
+                AcquireOutcome::Contended { holders } => json!({
+                    "variant": "Contended",
+                    "resource": resource,
+                    "key": key,
+                    "holders": holders,
+                }),
+            }
+        }
+        "lease.release" => {
+            // The release names its acquire; resource and key come from the
+            // recorded acquire input, so they cannot drift.
+            let acquire_effect_id = field("acquire_effect_id");
+            let store = SqliteStore::open(store_path)?;
+            let acquire_input = store
+                .list_effects(instance_id)?
+                .into_iter()
+                .find(|candidate| candidate.effect_id == acquire_effect_id)
+                .map(|candidate| json_from_str(&candidate.input_json))
+                .unwrap_or(Value::Null);
+            drop(store);
+            let resource = acquire_input
+                .get("resource")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let key = acquire_input
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let released = coordination.release(&resource, &key, instance_id)?;
+            json!({
+                "variant": "Released",
+                "resource": resource,
+                "key": key,
+                "released": released,
+            })
+        }
+        "ledger.append" => {
+            let ledger = field("ledger");
+            let partition = field("partition");
+            let entry = input.get("entry").cloned().unwrap_or(Value::Null);
+            let seq = coordination.append(
+                &ledger,
+                &partition,
+                &entry.to_string(),
+                instance_id,
+                input
+                    .get("retain_seconds")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(86400),
+            )?;
+            json!({
+                "variant": "Appended",
+                "ledger": ledger,
+                "partition": partition,
+                "seq": seq,
+            })
+        }
+        "counter.consume" => {
+            let counter = field("counter");
+            let key = field("key");
+            let period = coordination.current_period(&field("reset"))?;
+            let outcome = coordination.consume(
+                &counter,
+                &key,
+                input.get("amount").and_then(Value::as_i64).unwrap_or(0),
+                input.get("cap").and_then(Value::as_i64).unwrap_or(0),
+                &period,
+            )?;
+            match outcome {
+                ConsumeOutcome::Ok { remaining } => json!({
+                    "variant": "Ok",
+                    "counter": counter,
+                    "key": key,
+                    "remaining": remaining,
+                }),
+                ConsumeOutcome::Over { remaining } => json!({
+                    "variant": "Over",
+                    "counter": counter,
+                    "key": key,
+                    "remaining": remaining,
+                }),
+            }
+        }
+        other => {
+            return Err(StoreError::Conflict(format!(
+                "unknown coordination effect kind `{other}`"
+            )))
+        }
+    };
+
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "coord-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "coord-lease"]);
+    let store = SqliteStore::open(store_path)?;
+    let mut kernel = RuntimeKernel::new(store);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "coordination",
+        worker_id: "whip-coordination",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({"kind": effect.kind}).to_string(),
+    })?;
+    let terminal = kernel.complete_run(EffectCompletion {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "coordination",
+        worker_id: "whip-coordination",
+        status: "completed",
+        exit_code: Some(0),
+        summary: Some(&format!(
+            "{} -> {}",
+            effect.kind,
+            value.get("variant").and_then(Value::as_str).unwrap_or("?")
+        )),
+        metadata_json: &value.to_string(),
+        idempotency_key: Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "terminal",
+        ])),
+    })?;
+    let fact = json!({
+        "effect_id": effect.effect_id,
+        "run_id": run_id,
+        "status": "completed",
+        "value": value,
+    });
+    kernel.derive_fact(
+        instance_id,
+        &format!("{}.completed", effect.kind),
+        &effect.effect_id,
+        &fact.to_string(),
+        Some(&terminal.event_id),
+        Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "coord-fact",
+        ])),
+    )?;
+    Ok(terminal)
+}
+
+/// The validated result of `-> Schema` / `-> each Schema` stdout ingestion.
+enum ExecIngest {
+    Single(Value),
+    Stream(Vec<Value>),
+}
+
+type ExecOutcome =
+    Result<(i32, String, String, Option<ExecIngest>), (Option<(i32, String, String)>, String)>;
+
+/// Parses and validates exec stdout against the effect's embedded contract
+/// (spec/json-ingestion.md). Streams are all-or-nothing: any malformed line
+/// fails the whole effect so a partial stream never half-commits.
+fn ingest_exec_stdout(contract: &Value, stdout: &str) -> Result<ExecIngest, String> {
+    let schema = contract
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("json");
+    let shape = contract.get("shape").cloned().unwrap_or(Value::Null);
+    let each = contract
+        .get("each")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let text = stdout.trim();
+    if !each {
+        let value: Value = serde_json::from_str(text)
+            .map_err(|error| format!("stdout is not valid JSON for `{schema}`: {error}"))?;
+        if !value.is_object() {
+            return Err(format!(
+                "stdout must be a single JSON object conforming to `{schema}`"
+            ));
+        }
+        let mut errors = Vec::new();
+        validate_ingest_value(&value, &shape, "$", &mut errors);
+        if !errors.is_empty() {
+            return Err(format!(
+                "stdout does not conform to `{schema}`: {}",
+                errors.join("; ")
+            ));
+        }
+        return Ok(ExecIngest::Single(value));
+    }
+    let elements: Vec<Value> = if text.starts_with('[') {
+        serde_json::from_str::<Value>(text)
+            .map_err(|error| format!("stdout is not a valid JSON array of `{schema}`: {error}"))?
+            .as_array()
+            .cloned()
+            .ok_or_else(|| format!("stdout must be a JSON array or JSONL stream of `{schema}`"))?
+    } else {
+        let mut items = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let value = serde_json::from_str(line).map_err(|error| {
+                format!(
+                    "line {} is not valid JSON for `{schema}`: {error}",
+                    index + 1
+                )
+            })?;
+            items.push(value);
+        }
+        items
+    };
+    let mut errors = Vec::new();
+    for (index, element) in elements.iter().enumerate() {
+        validate_ingest_value(element, &shape, &format!("[{index}]"), &mut errors);
+    }
+    if !errors.is_empty() {
+        return Err(format!(
+            "stream does not conform to `{schema}`: {}",
+            errors.join("; ")
+        ));
+    }
+    Ok(ExecIngest::Stream(elements))
+}
+
+fn truncate_exec_bytes(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    text.chars().take(8192).collect::<String>()
+}
+
+fn exec_output_to_outcome(
+    output: std::process::Output,
+    parse_contract: &Option<Value>,
+) -> ExecOutcome {
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout_full = String::from_utf8_lossy(&output.stdout).to_string();
+    let stdout = truncate_exec_bytes(&output.stdout);
+    let stderr = truncate_exec_bytes(&output.stderr);
+    if output.status.success() {
+        match parse_contract {
+            Some(contract) => match ingest_exec_stdout(contract, &stdout_full) {
+                Ok(ingested) => Ok((exit_code, stdout, stderr, Some(ingested))),
+                Err(reason) => Err((Some((exit_code, stdout, stderr)), reason)),
+            },
+            None => Ok((exit_code, stdout, stderr, None)),
+        }
+    } else {
+        Err((
+            Some((exit_code, stdout, stderr)),
+            format!("exec command exited with status {exit_code}"),
+        ))
+    }
+}
+
+fn run_script_capability_exec(
+    script_manifest: Option<&ScriptManifest>,
+    capability: &str,
+    input: &Value,
+    parse_contract: &Option<Value>,
+) -> ExecOutcome {
+    let Some(manifest) = script_manifest else {
+        return Err((
+            None,
+            "script manifest is required for hosted exec capabilities".to_owned(),
+        ));
+    };
+    let Some(script) = manifest.get(capability) else {
+        return Err((
+            None,
+            format!("script capability `{capability}` is not declared in the manifest"),
+        ));
+    };
+    if script
+        .argv
+        .iter()
+        .any(|arg| executable_basename(arg) == "whip")
+    {
+        return Err((
+            None,
+            "script capabilities may not execute the `whip` control-plane binary".to_owned(),
+        ));
+    }
+    let Some(script_index) = script.argv.iter().position(|arg| Path::new(arg).is_file()) else {
+        return Err((
+            None,
+            format!("script capability `{capability}` argv does not name a readable script file"),
+        ));
+    };
+    let script_path = Path::new(&script.argv[script_index]);
+    let bytes = match fs::read(script_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Err((
+                None,
+                format!(
+                    "script capability `{capability}` failed to read `{}`: {error}",
+                    script_path.display()
+                ),
+            ))
+        }
+    };
+    let actual_sha256 = sha256_hex(&bytes);
+    if actual_sha256 != script.sha256 {
+        return Err((
+            None,
+            format!(
+                "script capability `{capability}` hash mismatch: expected {}, got {}",
+                script.sha256, actual_sha256
+            ),
+        ));
+    }
+    let verified_path =
+        match write_verified_script_copy(capability, &actual_sha256, &bytes, script_path) {
+            Ok(path) => path,
+            Err(error) => {
+                return Err((
+                    None,
+                    format!(
+                        "script capability `{capability}` failed to stage verified copy: {error}"
+                    ),
+                ))
+            }
+        };
+    let mut argv = script.argv.clone();
+    argv[script_index] = verified_path.display().to_string();
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    for (name, reference) in &script.env {
+        let Some(env_name) = reference.strip_prefix("env:") else {
+            return Err((
+                None,
+                format!("script capability `{capability}` env `{name}` must use an env: reference"),
+            ));
+        };
+        match env::var(env_name) {
+            Ok(value) => {
+                command.env(name, value);
+            }
+            Err(_) => {
+                return Err((
+                    None,
+                    format!(
+                        "script capability `{capability}` requires missing environment variable `{env_name}`"
+                    ),
+                ))
+            }
+        }
+    }
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let stdin_json = input
+        .get("stdin")
+        .cloned()
+        .unwrap_or(Value::Null)
+        .to_string();
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = fs::remove_file(&verified_path);
+            return Err((None, format!("exec command failed to start: {error}")));
+        }
+    };
+    if let Some(stdin) = child.stdin.as_mut() {
+        if let Err(error) = stdin.write_all(stdin_json.as_bytes()) {
+            let _ = child.kill();
+            let _ = fs::remove_file(&verified_path);
+            return Err((None, format!("exec command failed to write stdin: {error}")));
+        }
+    }
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_file(&verified_path);
+            return Err((None, format!("exec command failed: {error}")));
+        }
+    };
+    let _ = fs::remove_file(&verified_path);
+    exec_output_to_outcome(output, parse_contract)
+}
+
+fn executable_basename(arg: &str) -> &str {
+    Path::new(arg)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(arg)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn write_verified_script_copy(
+    capability: &str,
+    sha256: &str,
+    bytes: &[u8],
+    original_path: &Path,
+) -> io::Result<PathBuf> {
+    let sanitized = capability
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let extension = original_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_default();
+    let path = env::temp_dir().join(format!(
+        "whipplescript-script-{sanitized}-{sha256}{extension}"
+    ));
+    fs::write(&path, bytes)?;
+    if let Ok(metadata) = fs::metadata(original_path) {
+        let _ = fs::set_permissions(&path, metadata.permissions());
+    }
+    Ok(path)
+}
+
+fn run_exec_effect(
+    store_path: &Path,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    exec_profile: ExecProfile,
+    script_manifest: Option<&ScriptManifest>,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let input = json_from_str(&effect.input_json);
+    let mode = input.get("mode").and_then(Value::as_str).unwrap_or("raw");
+    let command = input
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let capability = input
+        .get("capability")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let parse_contract = input.get("parse").cloned();
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "exec-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "exec-lease"]);
+    let store = SqliteStore::open(store_path)?;
+    let mut kernel = RuntimeKernel::new(store);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "exec",
+        worker_id: "whip-exec",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({"mode": mode, "command": command, "capability": capability})
+            .to_string(),
+    })?;
+
+    let outcome = if mode == "capability" {
+        run_script_capability_exec(script_manifest, &capability, &input, &parse_contract)
+    } else if exec_profile.is_hosted() {
+        Err((
+            None,
+            "raw exec is not allowed in hosted exec profile".to_owned(),
+        ))
+    } else if !exec_command_granted(&command) {
+        Err((
+            None,
+            format!("exec command `{command}` is not granted; add it to WHIPPLESCRIPT_EXEC_ALLOW"),
+        ))
+    } else {
+        match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()
+        {
+            Ok(output) => exec_output_to_outcome(output, &parse_contract),
+            Err(error) => Err((None, format!("exec command failed to start: {error}"))),
+        }
+    };
+
+    match outcome {
+        Ok((exit_code, stdout, stderr, ingested)) => {
+            let mut value = json!({
+                "mode": mode,
+                "command": command,
+                "capability": capability,
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+            });
+            if mode == "capability" {
+                if let Some(sha256) = script_manifest
+                    .and_then(|manifest| manifest.get(&capability))
+                    .map(|script| script.sha256.clone())
+                {
+                    insert_json_field(&mut value, "sha256", Value::String(sha256));
+                }
+            }
+            let terminal = kernel.complete_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "exec",
+                worker_id: "whip-exec",
+                status: "completed",
+                exit_code: Some(i64::from(exit_code)),
+                summary: Some("exec completed"),
+                metadata_json: &value.to_string(),
+                idempotency_key: Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "terminal",
+                ])),
+            })?;
+            let mut fact = json!({
+                "effect_id": effect.effect_id,
+                "run_id": run_id,
+                "status": "completed",
+                "mode": mode,
+                "capability": capability,
+                "exit_code": exit_code,
+                "stdout": value.get("stdout").cloned().unwrap_or(Value::Null),
+            });
+            match ingested {
+                // `-> Schema`: the typed value is the success payload, bound
+                // by `after x succeeds as r`.
+                Some(ExecIngest::Single(parsed)) => {
+                    insert_json_field(&mut fact, "value", parsed);
+                }
+                // `-> each Schema`: one typed fact per element, reacted to by
+                // ordinary per-fact rule fan-out.
+                Some(ExecIngest::Stream(elements)) => {
+                    let schema = parse_contract
+                        .as_ref()
+                        .and_then(|contract| contract.get("schema"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("json")
+                        .to_owned();
+                    for (index, element) in elements.iter().enumerate() {
+                        kernel.ingest_fact(
+                            instance_id,
+                            &schema,
+                            &format!("{}:{index}", effect.effect_id),
+                            &element.to_string(),
+                            Some(&terminal.event_id),
+                            Some(&idempotency_key(&[
+                                instance_id,
+                                &effect.effect_id,
+                                "ingest",
+                                &index.to_string(),
+                            ])),
+                        )?;
+                    }
+                    insert_json_field(&mut fact, "ingested_count", json!(elements.len()));
+                }
+                None => {}
+            }
+            kernel.derive_fact(
+                instance_id,
+                "exec.command.completed",
+                &effect.effect_id,
+                &fact.to_string(),
+                Some(&terminal.event_id),
+                Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "exec-fact",
+                ])),
+            )?;
+            Ok(terminal)
+        }
+        Err((detail, reason)) => {
+            let metadata = match &detail {
+                Some((exit_code, stdout, stderr)) => json!({
+                    "failure": {"message": reason},
+                    "exit_code": exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                }),
+                None => json!({"failure": {"message": reason}}),
+            };
+            let terminal = kernel.fail_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "exec",
+                worker_id: "whip-exec",
+                status: "failed",
+                exit_code: detail.as_ref().map(|(code, _, _)| i64::from(*code)),
+                summary: Some(&reason),
+                metadata_json: &metadata.to_string(),
+                idempotency_key: Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "terminal",
+                ])),
+            })?;
+            let fact = json!({
+                "effect_id": effect.effect_id,
+                "run_id": run_id,
+                "status": "failed",
+                "mode": mode,
+                "capability": capability,
+                "error": {"message": reason},
+            })
+            .to_string();
+            kernel.derive_fact(
+                instance_id,
+                "exec.command.failed",
+                &effect.effect_id,
+                &fact,
+                Some(&terminal.event_id),
+                Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "exec-fact",
+                ])),
+            )?;
+            Ok(terminal)
+        }
+    }
+}
+
+fn run_queue_effect(
+    store_path: &Path,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    options: &WorkerOptions,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    use whipplescript_store::items::{ClaimOutcome, WorkItemStore};
+    let input = json_from_str(&effect.input_json);
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "queue-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "queue-lease"]);
+    let store = SqliteStore::open(store_path)?;
+    let mut kernel = RuntimeKernel::new(store);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "queue",
+        worker_id: "whip-queue",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &effect.input_json,
+    })?;
+    drop(kernel);
+
+    let mut items = WorkItemStore::open(items_store_path())?;
+    let outcome: Result<Value, String> = match effect.kind.as_str() {
+        "queue.file" => {
+            let queue = effect.target.clone().unwrap_or_default();
+            let item = input.get("item").cloned().unwrap_or_else(|| json!({}));
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let body = item.get("body").and_then(Value::as_str).unwrap_or_default();
+            let labels = item
+                .get("labels")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let metadata = item.get("metadata").cloned().unwrap_or_else(|| json!({}));
+            let filed_by = format!("workflow:{instance_id}");
+            items
+                .file_item(&queue, title, body, &labels, &metadata, Some(&filed_by))
+                .map(|filed| {
+                    json!({
+                        "queue": filed.queue,
+                        "id": filed.id,
+                        "title": filed.title,
+                    })
+                })
+                .map_err(|error| format!("file failed: {error:?}"))
+        }
+        "queue.claim" => {
+            let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
+            match items.claim_item(id, instance_id) {
+                Ok(ClaimOutcome::Claimed) => Ok(json!({"id": id, "claimed_by": instance_id})),
+                Ok(ClaimOutcome::AlreadyClaimed { holder }) => {
+                    Err(format!("already claimed by `{holder}`"))
+                }
+                Ok(ClaimOutcome::NotFound) => Err(format!("item `{id}` not found")),
+                Err(error) => Err(format!("claim failed: {error:?}")),
+            }
+        }
+        "queue.release" => {
+            let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
+            match items.release_item(id) {
+                Ok(true) => Ok(json!({"id": id, "status": "open"})),
+                Ok(false) => Err(format!("item `{id}` was not in progress")),
+                Err(error) => Err(format!("release failed: {error:?}")),
+            }
+        }
+        "queue.finish" => {
+            let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
+            let summary = input
+                .pointer("/payload/summary")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            match items.finish_item(id, summary.as_deref()) {
+                Ok(true) => Ok(json!({"id": id, "status": "done", "summary": summary})),
+                Ok(false) => Err(format!("item `{id}` cannot finish from its current status")),
+                Err(error) => Err(format!("finish failed: {error:?}")),
+            }
+        }
+        other => Err(format!("unknown queue effect kind `{other}`")),
+    };
+    drop(items);
+
+    let store = SqliteStore::open(store_path)?;
+    let mut kernel = RuntimeKernel::new(store);
+    let _ = options;
+    match outcome {
+        Ok(value) => {
+            let terminal = kernel.complete_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "queue",
+                worker_id: "whip-queue",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some("queue operation completed"),
+                metadata_json: &value.to_string(),
+                idempotency_key: Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "terminal",
+                ])),
+            })?;
+            let fact_value = json!({
+                "effect_id": effect.effect_id,
+                "run_id": run_id,
+                "status": "completed",
+                "value": value,
+            })
+            .to_string();
+            kernel.derive_fact(
+                instance_id,
+                &format!("{}.completed", effect.kind),
+                &effect.effect_id,
+                &fact_value,
+                Some(&terminal.event_id),
+                Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "queue-fact",
+                ])),
+            )?;
+            Ok(terminal)
+        }
+        Err(reason) => {
+            let terminal = kernel.fail_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "queue",
+                worker_id: "whip-queue",
+                status: "failed",
+                exit_code: Some(1),
+                summary: Some(&reason),
+                metadata_json: &json!({"failure": {"message": reason}}).to_string(),
+                idempotency_key: Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "terminal",
+                ])),
+            })?;
+            let fact_value = json!({
+                "effect_id": effect.effect_id,
+                "run_id": run_id,
+                "status": "failed",
+                "error": {"message": reason},
+            })
+            .to_string();
+            kernel.derive_fact(
+                instance_id,
+                &format!("{}.failed", effect.kind),
+                &effect.effect_id,
+                &fact_value,
+                Some(&terminal.event_id),
+                Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "queue-fact",
+                ])),
+            )?;
+            Ok(terminal)
+        }
+    }
 }
 
 fn run_event_effect(
@@ -4335,7 +6626,10 @@ fn run_workflow_invoke_effect(
         let child_worker = WorkerOptions {
             instance_id: child_instance_id.clone(),
             provider: options.provider.clone(),
+            exec_profile: options.exec_profile,
+            script_manifest_path: options.script_manifest_path.clone(),
             outcome: options.outcome,
+            variant: options.variant.clone(),
             program_path: Some(program_path.to_path_buf()),
             root: Some(target_workflow.to_owned()),
             provider_config_paths: options.provider_config_paths.clone(),
@@ -4683,6 +6977,15 @@ fn dev(options: &CliOptions) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Err(code) = validate_hosted_exec_for_path(
+        &dev_options.program_path,
+        dev_options.root.as_deref(),
+        dev_options.exec_profile,
+        dev_options.script_manifest_path.as_deref(),
+        options.json,
+    ) {
+        return code;
+    }
     let started = match start_workflow_instance(
         &dev_options.program_path,
         dev_options.root.as_deref(),
@@ -4698,6 +7001,34 @@ fn dev(options: &CliOptions) -> ExitCode {
             Ok(compiled) => compiled,
             Err(error) => return report_compile_failure(&dev_options.program_path, error),
         };
+    let mut stream = DevStream::new(dev_options.stream);
+    if stream.enabled()
+        && stream
+            .emit(
+                "dev.started",
+                json!({
+                    "instance_id": started.instance_id,
+                    "workflow": started.workflow,
+                    "program_id": started.program_id,
+                    "version_id": started.version_id,
+                    "provider": dev_options.provider,
+                }),
+            )
+            .is_err()
+    {
+        return ExitCode::FAILURE;
+    }
+    let mut last_streamed_event_sequence = 0_i64;
+    if let Err(code) = stream_dev_event_deltas(
+        &mut stream,
+        &options.store_path,
+        &started.instance_id,
+        last_streamed_event_sequence,
+    )
+    .map(|sequence| last_streamed_event_sequence = sequence)
+    {
+        return code;
+    }
     let mut steps = Vec::new();
     let mut workers = Vec::new();
     for _ in 0..dev_options.max_iterations {
@@ -4711,12 +7042,31 @@ fn dev(options: &CliOptions) -> ExitCode {
             Ok(report) => report,
             Err(error) => return report_store_error("failed to step instance", error),
         };
+        if stream
+            .emit("dev.step", step_report_to_json(&step_report))
+            .is_err()
+        {
+            return ExitCode::FAILURE;
+        }
+        if let Err(code) = stream_dev_event_deltas(
+            &mut stream,
+            &options.store_path,
+            &started.instance_id,
+            last_streamed_event_sequence,
+        )
+        .map(|sequence| last_streamed_event_sequence = sequence)
+        {
+            return code;
+        }
         let worker_report = match run_worker_once(
             &options.store_path,
             &WorkerOptions {
                 instance_id: started.instance_id.clone(),
                 provider: dev_options.provider.clone(),
+                exec_profile: dev_options.exec_profile,
+                script_manifest_path: dev_options.script_manifest_path.clone(),
                 outcome: dev_options.outcome,
+                variant: dev_options.variant.clone(),
                 program_path: Some(PathBuf::from(&dev_options.program_path)),
                 root: dev_options.root.clone(),
                 provider_config_paths: dev_options.provider_config_paths.clone(),
@@ -4726,10 +7076,38 @@ fn dev(options: &CliOptions) -> ExitCode {
             Ok(report) => report,
             Err(error) => return report_store_error("failed to run worker", error),
         };
+        if stream
+            .emit("dev.worker", worker_report_to_json(&worker_report))
+            .is_err()
+        {
+            return ExitCode::FAILURE;
+        }
+        if let Err(code) = stream_dev_event_deltas(
+            &mut stream,
+            &options.store_path,
+            &started.instance_id,
+            last_streamed_event_sequence,
+        )
+        .map(|sequence| last_streamed_event_sequence = sequence)
+        {
+            return code;
+        }
         let idle = step_report.committed_rules == 0 && worker_report.ran_effects == 0;
         steps.push(step_report);
         workers.push(worker_report);
         if idle {
+            if stream
+                .emit(
+                    "dev.idle",
+                    json!({
+                        "instance_id": started.instance_id,
+                        "iterations": steps.len(),
+                    }),
+                )
+                .is_err()
+            {
+                return ExitCode::FAILURE;
+            }
             break;
         }
     }
@@ -4745,11 +7123,28 @@ fn dev(options: &CliOptions) -> ExitCode {
         Ok(effects) => effects,
         Err(error) => return report_store_error("failed to list effects", error),
     };
-    let assertions = eval_assertions(
+    let runs = match store.list_runs(&started.instance_id) {
+        Ok(runs) => runs,
+        Err(error) => return report_store_error("failed to list runs", error),
+    };
+    let artifact_counts = match artifact_counts_for_runs(&store, &runs) {
+        Ok(counts) => counts,
+        Err(error) => return report_store_error("failed to list artifacts", error),
+    };
+    let artifacts = match artifacts_for_runs(&store, &runs) {
+        Ok(artifacts) => artifacts,
+        Err(error) => return report_store_error("failed to list artifacts", error),
+    };
+    let evidence = match store.list_evidence(&started.instance_id) {
+        Ok(evidence) => evidence,
+        Err(error) => return report_store_error("failed to list evidence", error),
+    };
+    let mut assertions = eval_assertions(
         &ir,
         &facts,
         &effects,
         Some(Path::new(&dev_options.program_path)),
+        &dev_options.assertion_filter,
     );
     let assertion_events = match persist_assertion_events(
         &store,
@@ -4762,16 +7157,33 @@ fn dev(options: &CliOptions) -> ExitCode {
         Ok(events) => events,
         Err(error) => return report_store_error("failed to record assertion events", error),
     };
+    for assertion in &mut assertions {
+        assertion.event_id = assertion_events.get(&assertion.target_id).cloned();
+    }
     if let Err(error) = persist_assertion_diagnostics(
         &store,
         &started.instance_id,
         &started.program_id,
         &started.version_id,
-        &assertions,
+        &mut assertions,
         &assertion_events,
     ) {
         return report_store_error("failed to record assertion diagnostics", error);
     }
+    if let Err(code) = stream_dev_event_deltas(
+        &mut stream,
+        &options.store_path,
+        &started.instance_id,
+        last_streamed_event_sequence,
+    )
+    .map(|sequence| last_streamed_event_sequence = sequence)
+    {
+        return code;
+    }
+    let diagnostics = match store.list_diagnostics(Some(&started.instance_id)) {
+        Ok(diagnostics) => diagnostics,
+        Err(error) => return report_store_error("failed to list diagnostics", error),
+    };
     let failed_assertions = assertions
         .iter()
         .filter(|assertion| !assertion.passed)
@@ -4786,14 +7198,40 @@ fn dev(options: &CliOptions) -> ExitCode {
         .flat_map(|step| &step.branch_reports)
         .filter(|branch| branch.status != BranchStatus::Matched)
         .collect::<Vec<_>>();
+    let dev_report = dev_report_to_json(DevReportJsonInput {
+        started: &started,
+        ir: &ir,
+        steps: &steps,
+        workers: &workers,
+        diagnostics: &diagnostics,
+        assertion_filter: &dev_options.assertion_filter,
+        assertions: &assertions,
+        runs: &runs,
+        artifact_counts: &artifact_counts,
+        artifacts: &artifacts,
+        evidence: &evidence,
+    });
+    if stream.enabled()
+        && stream
+            .emit(
+                "dev.assertions",
+                executable_spec_report_to_json(&assertions),
+            )
+            .is_err()
+    {
+        return ExitCode::FAILURE;
+    }
+    if stream.enabled() && stream.emit("dev.report", dev_report.clone()).is_err() {
+        return ExitCode::FAILURE;
+    }
+    if stream.enabled() {
+        if failed_assertions.is_empty() && guard_errors.is_empty() && branch_errors.is_empty() {
+            return ExitCode::SUCCESS;
+        }
+        return ExitCode::from(1);
+    }
     if options.json {
-        let _ = emit_json(json!({
-            "instance_id": started.instance_id,
-            "workflow": started.workflow,
-            "steps": steps.iter().map(step_report_to_json).collect::<Vec<_>>(),
-            "workers": workers.iter().map(worker_report_to_json).collect::<Vec<_>>(),
-            "assertions": assertions.iter().map(assertion_report_to_json).collect::<Vec<_>>(),
-        }));
+        let _ = emit_json(dev_report);
         if failed_assertions.is_empty() && guard_errors.is_empty() && branch_errors.is_empty() {
             ExitCode::SUCCESS
         } else {
@@ -4852,14 +7290,2460 @@ fn dev(options: &CliOptions) -> ExitCode {
     }
 }
 
+fn validate_hosted_exec_for_path(
+    path: &str,
+    root: Option<&str>,
+    exec_profile: ExecProfile,
+    script_manifest_path: Option<&Path>,
+    json_output: bool,
+) -> Result<(), ExitCode> {
+    if !exec_profile.is_hosted() {
+        return Ok(());
+    }
+    let script_manifest = match load_script_manifest(script_manifest_path) {
+        Ok(manifest) => manifest,
+        Err(message) => {
+            if json_output {
+                let _ = emit_json(json!({"status": "error", "error": message}));
+            } else {
+                eprintln!("{message}");
+            }
+            return Err(ExitCode::from(2));
+        }
+    };
+    let (source, ir) = match compile_source_path_with_root(path, root) {
+        Ok(compiled) => compiled,
+        Err(error) => return Err(report_compile_failure(path, error)),
+    };
+    let diagnostics = lint_hosted_exec(&source, &ir, exec_profile, script_manifest.as_ref());
+    if diagnostics.is_empty() {
+        return Ok(());
+    }
+    if json_output {
+        let _ = emit_json(json!({
+            "status": "error",
+            "error": {
+                "kind": "diagnostics",
+                "diagnostics": diagnostics.iter().map(parser_diagnostic_to_json).collect::<Vec<_>>(),
+            },
+        }));
+    } else {
+        for diagnostic in diagnostics {
+            eprint!("{}", render_diagnostic(path, &source, &diagnostic));
+        }
+    }
+    Err(ExitCode::FAILURE)
+}
+
+fn stream_dev_event_deltas(
+    stream: &mut DevStream,
+    store_path: &Path,
+    instance_id: &str,
+    after_sequence: i64,
+) -> Result<i64, ExitCode> {
+    if !stream.enabled() {
+        return Ok(after_sequence);
+    }
+    let store = match SqliteStore::open(store_path) {
+        Ok(store) => store,
+        Err(error) => return Err(report_store_error("failed to open store", error)),
+    };
+    let events = match store.list_events(instance_id) {
+        Ok(events) => events,
+        Err(error) => return Err(report_store_error("failed to stream dev events", error)),
+    };
+    let new_events = events
+        .iter()
+        .filter(|event| event.sequence > after_sequence)
+        .collect::<Vec<_>>();
+    if new_events.is_empty() {
+        return Ok(after_sequence);
+    }
+    let latest_sequence = new_events
+        .iter()
+        .map(|event| event.sequence)
+        .max()
+        .unwrap_or(after_sequence);
+    if stream
+        .emit(
+            "dev.events",
+            json!({
+                "instance_id": instance_id,
+                "after_sequence": after_sequence,
+                "count": new_events.len(),
+                "events": new_events
+                    .iter()
+                    .map(|event| event_to_json(event))
+                    .collect::<Vec<_>>(),
+            }),
+        )
+        .is_err()
+    {
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(latest_sequence)
+}
+
+struct DevReportJsonInput<'a> {
+    started: &'a StartedWorkflow,
+    ir: &'a IrProgram,
+    steps: &'a [StepReport],
+    workers: &'a [WorkerReport],
+    diagnostics: &'a [DiagnosticView],
+    assertion_filter: &'a AssertionTagFilter,
+    assertions: &'a [AssertionReport],
+    runs: &'a [RunView],
+    artifact_counts: &'a BTreeMap<String, usize>,
+    artifacts: &'a [ArtifactView],
+    evidence: &'a [EvidenceView],
+}
+
+fn dev_report_to_json(input: DevReportJsonInput<'_>) -> Value {
+    json!({
+        "schema": "whipplescript.dev_report.v0",
+        "instance_id": input.started.instance_id,
+        "workflow": input.started.workflow,
+        "source_metadata": source_metadata_json(input.ir),
+        "steps": input.steps.iter().map(step_report_to_json).collect::<Vec<_>>(),
+        "workers": input.workers.iter().map(worker_report_to_json).collect::<Vec<_>>(),
+        "diagnostics": input.diagnostics.iter().map(diagnostic_to_json).collect::<Vec<_>>(),
+        "assertion_filter": assertion_filter_to_json(input.assertion_filter, input.ir.assertions.len(), input.assertions.len()),
+        "executable_spec": executable_spec_report_to_json(input.assertions),
+        "assertions": input.assertions.iter().map(assertion_report_to_json).collect::<Vec<_>>(),
+        "provider_runs": provider_runs_summary_json(input.runs, input.artifact_counts),
+        "provider_artifacts": provider_artifacts_summary_json(input.artifacts),
+        "provider_evidence": provider_evidence_summary_json(input.evidence),
+    })
+}
+
+fn accept(options: &CliOptions) -> ExitCode {
+    let Some(path) = single_arg(options, "usage: whip accept <fixture.json>") else {
+        return ExitCode::from(2);
+    };
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("{path}: failed to read acceptance fixture: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let fixture = match serde_json::from_str::<Value>(&source) {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            eprintln!("{path}: invalid acceptance fixture JSON: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(message) = acceptance_validate_fixture_shape(&fixture) {
+        eprintln!("{path}: {message}");
+        return ExitCode::from(2);
+    }
+    let fixture_dir = Path::new(&path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let dev_options = match acceptance_dev_options(&fixture, fixture_dir) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("{path}: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let input_json = fixture.get("input").map(Value::to_string);
+    let acceptance_run =
+        match acceptance_dev_report(options, &dev_options, &fixture, input_json.as_deref()) {
+            Ok(report) => report,
+            Err(code) => return code,
+        };
+    let failures = acceptance_failures(&fixture, &acceptance_run);
+    let passed = failures.is_empty();
+    let observed = acceptance_observed_json(&acceptance_run);
+    let report = json!({
+        "schema": "whipplescript.acceptance_report.v0",
+        "fixture": path,
+        "workflow": dev_options.program_path,
+        "passed": passed,
+        "failures": failures,
+        "observed": observed,
+        "dev_report": acceptance_run.dev_report,
+    });
+    if options.json {
+        let _ = emit_json(report);
+    } else if passed {
+        println!("accept {path}: passed");
+    } else {
+        eprintln!("accept {path}: failed");
+        for failure in report
+            .get("failures")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            eprintln!("- {failure}");
+        }
+    }
+    if passed {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+fn acceptance_validate_fixture_shape(fixture: &Value) -> Result<(), String> {
+    match fixture.get("expect") {
+        Some(expect) if expect.is_object() => acceptance_validate_expect_shape(expect)?,
+        Some(_) => return Err("acceptance fixture expect must be an object".to_owned()),
+        None => return Err("acceptance fixture requires object field `expect`".to_owned()),
+    }
+    if let Some(actions) = fixture.get("actions") {
+        if !actions.is_array() {
+            return Err("acceptance fixture actions must be an array".to_owned());
+        }
+    }
+    if let Some(setup) = fixture.get("setup") {
+        if !setup.is_object() {
+            return Err("acceptance fixture setup must be an object".to_owned());
+        }
+        for key in ["effects", "artifacts"] {
+            if setup.get(key).is_some() {
+                return Err(format!(
+                    "acceptance fixture setup.{key} is not supported in acceptance_fixture.v0"
+                ));
+            }
+        }
+        for key in ["facts", "inbox"] {
+            if setup.get(key).is_some_and(|value| !value.is_array()) {
+                return Err(format!("acceptance fixture setup.{key} must be an array"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn acceptance_validate_expect_shape(expect: &Value) -> Result<(), String> {
+    acceptance_validate_optional_enum(expect, "dev_status", &["success", "failure"])?;
+    acceptance_validate_optional_enum(expect, "status", &["passed", "failed", "error"])?;
+    acceptance_validate_optional_string_field(expect, "workflow")?;
+    acceptance_validate_optional_u64_field(expect, "diagnostics")?;
+    for key in [
+        "source_metadata",
+        "trace",
+        "assertions",
+        "assertion_untagged",
+        "summary",
+    ] {
+        acceptance_validate_optional_object_field(expect, key)?;
+    }
+    for key in [
+        "diagnostics_by_code",
+        "actions",
+        "assertion_reads",
+        "inbox",
+        "assertion_tags",
+        "facts",
+        "effects",
+        "runs",
+        "artifacts",
+        "evidence",
+    ] {
+        acceptance_validate_optional_array_field(expect, key)?;
+    }
+    if let Some(assertions) = expect.get("assertions") {
+        acceptance_validate_optional_u64_fields(
+            assertions,
+            "expect.assertions",
+            &["total", "passed", "failed", "error"],
+        )?;
+    }
+    if let Some(assertion_untagged) = expect.get("assertion_untagged") {
+        acceptance_validate_optional_u64_fields(
+            assertion_untagged,
+            "expect.assertion_untagged",
+            &["total", "passed", "failed", "error"],
+        )?;
+    }
+    if let Some(summary) = expect.get("summary") {
+        acceptance_validate_optional_u64_fields(summary, "expect.summary", &["facts", "effects"])?;
+    }
+    if let Some(source_metadata) = expect.get("source_metadata") {
+        acceptance_validate_optional_array_field_with_path(
+            source_metadata,
+            "expect.source_metadata",
+            "targets",
+        )?;
+    }
+    if let Some(trace) = expect.get("trace") {
+        acceptance_validate_optional_object_field_with_path(trace, "expect.trace", "summary")?;
+        acceptance_validate_optional_object_field_with_path(trace, "expect.trace", "conformance")?;
+        acceptance_validate_optional_array_field_with_path(trace, "expect.trace", "groups")?;
+        acceptance_validate_optional_array_field_with_path(trace, "expect.trace", "items")?;
+        if let Some(summary) = trace.get("summary") {
+            acceptance_validate_optional_u64_fields(
+                summary,
+                "expect.trace.summary",
+                &["events", "abstract_events"],
+            )?;
+        }
+        if let Some(conformance) = trace.get("conformance") {
+            acceptance_validate_optional_bool_field_with_path(
+                conformance,
+                "expect.trace.conformance",
+                "ok",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn acceptance_validate_optional_enum(
+    object: &Value,
+    key: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let Some(value) = object.get(key) else {
+        return Ok(());
+    };
+    let Some(value) = value.as_str() else {
+        return Err(format!("`expect.{key}` must be a string"));
+    };
+    if !allowed.contains(&value) {
+        return Err(format!("unknown expect.{key} `{value}`"));
+    }
+    Ok(())
+}
+
+fn acceptance_validate_optional_string_field(object: &Value, key: &str) -> Result<(), String> {
+    if object.get(key).is_some_and(|value| !value.is_string()) {
+        return Err(format!("`expect.{key}` must be a string"));
+    }
+    Ok(())
+}
+
+fn acceptance_validate_optional_u64_field(object: &Value, key: &str) -> Result<(), String> {
+    if object
+        .get(key)
+        .is_some_and(|value| value.as_u64().is_none())
+    {
+        return Err(format!("`expect.{key}` must be a non-negative integer"));
+    }
+    Ok(())
+}
+
+fn acceptance_validate_optional_u64_fields(
+    object: &Value,
+    path: &str,
+    keys: &[&str],
+) -> Result<(), String> {
+    for key in keys {
+        if object
+            .get(*key)
+            .is_some_and(|value| value.as_u64().is_none())
+        {
+            return Err(format!("`{path}.{key}` must be a non-negative integer"));
+        }
+    }
+    Ok(())
+}
+
+fn acceptance_validate_optional_object_field(object: &Value, key: &str) -> Result<(), String> {
+    if object.get(key).is_some_and(|value| !value.is_object()) {
+        return Err(format!("`expect.{key}` must be an object"));
+    }
+    Ok(())
+}
+
+fn acceptance_validate_optional_object_field_with_path(
+    object: &Value,
+    path: &str,
+    key: &str,
+) -> Result<(), String> {
+    if object.get(key).is_some_and(|value| !value.is_object()) {
+        return Err(format!("`{path}.{key}` must be an object"));
+    }
+    Ok(())
+}
+
+fn acceptance_validate_optional_array_field(object: &Value, key: &str) -> Result<(), String> {
+    if object.get(key).is_some_and(|value| !value.is_array()) {
+        return Err(format!("`expect.{key}` must be an array"));
+    }
+    Ok(())
+}
+
+fn acceptance_validate_optional_array_field_with_path(
+    object: &Value,
+    path: &str,
+    key: &str,
+) -> Result<(), String> {
+    if object.get(key).is_some_and(|value| !value.is_array()) {
+        return Err(format!("`{path}.{key}` must be an array"));
+    }
+    Ok(())
+}
+
+fn acceptance_validate_optional_bool_field_with_path(
+    object: &Value,
+    path: &str,
+    key: &str,
+) -> Result<(), String> {
+    if object.get(key).is_some_and(|value| !value.is_boolean()) {
+        return Err(format!("`{path}.{key}` must be a boolean"));
+    }
+    Ok(())
+}
+
+fn acceptance_dev_options(fixture: &Value, fixture_dir: &Path) -> Result<DevOptions, String> {
+    if fixture.get("schema").and_then(Value::as_str) != Some("whipplescript.acceptance_fixture.v0")
+    {
+        return Err(
+            "expected schema `whipplescript.acceptance_fixture.v0` in acceptance fixture"
+                .to_owned(),
+        );
+    }
+    let workflow = fixture
+        .get("workflow")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "acceptance fixture requires string field `workflow`".to_owned())?;
+    let workflow = acceptance_fixture_path(fixture_dir, workflow);
+    let provider_config_paths = fixture
+        .get("provider_config_paths")
+        .map(|value| {
+            let paths = value
+                .as_array()
+                .ok_or_else(|| "`provider_config_paths` must be an array of strings".to_owned())?;
+            paths
+                .iter()
+                .map(|path| {
+                    path.as_str()
+                        .map(|path| acceptance_fixture_path(fixture_dir, path))
+                        .ok_or_else(|| "`provider_config_paths` entries must be strings".to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let assertion_filter = AssertionTagFilter {
+        include_tags: acceptance_string_array(fixture, "include_tags")?,
+        exclude_tags: acceptance_string_array(fixture, "exclude_tags")?,
+    };
+    let root = acceptance_optional_string(fixture, "root")?;
+    let provider =
+        acceptance_optional_string(fixture, "provider")?.unwrap_or_else(|| "fixture".to_owned());
+    let outcome_value =
+        acceptance_optional_string(fixture, "outcome")?.unwrap_or_else(|| "completed".to_owned());
+    let outcome = match outcome_value.as_str() {
+        "completed" => FixtureOutcome::Completed,
+        "failed" => FixtureOutcome::Failed,
+        "timed_out" | "timeout" => FixtureOutcome::TimedOut,
+        "cancelled" | "cancel" => FixtureOutcome::Cancelled,
+        other => return Err(format!("unknown acceptance fixture outcome `{other}`")),
+    };
+    let max_iterations = match fixture.get("max_iterations") {
+        Some(value) => {
+            let value = value
+                .as_u64()
+                .ok_or_else(|| "`max_iterations` must be a positive integer".to_owned())?;
+            if value == 0 {
+                return Err("`max_iterations` must be at least 1".to_owned());
+            }
+            usize::try_from(value)
+                .map_err(|_| "`max_iterations` is too large for this platform".to_owned())?
+        }
+        None => 8,
+    };
+    Ok(DevOptions {
+        program_path: workflow.to_string_lossy().into_owned(),
+        root,
+        provider,
+        exec_profile: ExecProfile::Dev,
+        script_manifest_path: None,
+        provider_config_paths,
+        outcome,
+        variant: acceptance_optional_string(fixture, "variant")?,
+        max_iterations,
+        assertion_filter,
+        stream: None,
+    })
+}
+
+fn acceptance_optional_string(fixture: &Value, key: &str) -> Result<Option<String>, String> {
+    fixture
+        .get(key)
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("`{key}` must be a string"))
+        })
+        .transpose()
+}
+
+fn acceptance_fixture_path(fixture_dir: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        fixture_dir.join(path)
+    }
+}
+
+fn acceptance_string_array(fixture: &Value, key: &str) -> Result<Vec<String>, String> {
+    let Some(values) = fixture.get(key) else {
+        return Ok(Vec::new());
+    };
+    let values = values
+        .as_array()
+        .ok_or_else(|| format!("`{key}` must be an array of strings"))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("`{key}` entries must be strings"))
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct AcceptanceDevRun {
+    dev_report: Value,
+    dev_success: bool,
+    actions: Vec<AcceptanceActionReport>,
+    facts: Vec<FactView>,
+    effects: Vec<EffectView>,
+    runs: Vec<RunView>,
+    artifact_counts: BTreeMap<String, usize>,
+    artifacts: Vec<ArtifactView>,
+    evidence: Vec<EvidenceView>,
+    inbox_items: Vec<InboxItemView>,
+    events: Vec<EventView>,
+}
+
+#[derive(Clone, Debug)]
+struct AcceptanceActionReport {
+    action_type: String,
+    event_id: String,
+    sequence: i64,
+}
+
+fn acceptance_dev_report(
+    options: &CliOptions,
+    dev_options: &DevOptions,
+    fixture: &Value,
+    input_json: Option<&str>,
+) -> Result<AcceptanceDevRun, ExitCode> {
+    let started = start_workflow_instance(
+        &dev_options.program_path,
+        dev_options.root.as_deref(),
+        input_json,
+        options,
+    )?;
+    let (_source, ir) =
+        match compile_source_path_with_root(&dev_options.program_path, dev_options.root.as_deref())
+        {
+            Ok(compiled) => compiled,
+            Err(error) => return Err(report_compile_failure(&dev_options.program_path, error)),
+        };
+    acceptance_seed_setup_facts(fixture, options, &started.instance_id, &ir)?;
+    acceptance_seed_setup_inbox(fixture, options, &started.instance_id)?;
+    let actions = acceptance_run_actions(fixture, options, &started.instance_id)?;
+    let mut steps = Vec::new();
+    let mut workers = Vec::new();
+    for _ in 0..dev_options.max_iterations {
+        let step_report = match step_instance(
+            &options.store_path,
+            &started.instance_id,
+            &ir,
+            Some(Path::new(&dev_options.program_path)),
+            None,
+        ) {
+            Ok(report) => report,
+            Err(error) => return Err(report_store_error("failed to step instance", error)),
+        };
+        let worker_report = match run_worker_once(
+            &options.store_path,
+            &WorkerOptions {
+                instance_id: started.instance_id.clone(),
+                provider: dev_options.provider.clone(),
+                exec_profile: dev_options.exec_profile,
+                script_manifest_path: dev_options.script_manifest_path.clone(),
+                outcome: dev_options.outcome,
+                variant: dev_options.variant.clone(),
+                program_path: Some(PathBuf::from(&dev_options.program_path)),
+                root: dev_options.root.clone(),
+                provider_config_paths: dev_options.provider_config_paths.clone(),
+                max_child_iterations: 8,
+            },
+        ) {
+            Ok(report) => report,
+            Err(error) => return Err(report_store_error("failed to run worker", error)),
+        };
+        let idle = step_report.committed_rules == 0 && worker_report.ran_effects == 0;
+        steps.push(step_report);
+        workers.push(worker_report);
+        if idle {
+            break;
+        }
+    }
+    let store = match SqliteStore::open(&options.store_path) {
+        Ok(store) => store,
+        Err(error) => return Err(report_store_error("failed to open store", error)),
+    };
+    let facts = match store.list_facts(&started.instance_id) {
+        Ok(facts) => facts,
+        Err(error) => return Err(report_store_error("failed to list facts", error)),
+    };
+    let effects = match store.list_effects(&started.instance_id) {
+        Ok(effects) => effects,
+        Err(error) => return Err(report_store_error("failed to list effects", error)),
+    };
+    let runs = match store.list_runs(&started.instance_id) {
+        Ok(runs) => runs,
+        Err(error) => return Err(report_store_error("failed to list runs", error)),
+    };
+    let artifact_counts = match artifact_counts_for_runs(&store, &runs) {
+        Ok(counts) => counts,
+        Err(error) => return Err(report_store_error("failed to list artifacts", error)),
+    };
+    let artifacts = match artifacts_for_runs(&store, &runs) {
+        Ok(artifacts) => artifacts,
+        Err(error) => return Err(report_store_error("failed to list artifacts", error)),
+    };
+    let evidence = match store.list_evidence(&started.instance_id) {
+        Ok(evidence) => evidence,
+        Err(error) => return Err(report_store_error("failed to list evidence", error)),
+    };
+    let inbox_items = match store.list_inbox_items(None) {
+        Ok(items) => items
+            .into_iter()
+            .filter(|item| item.instance_id == started.instance_id)
+            .collect::<Vec<_>>(),
+        Err(error) => return Err(report_store_error("failed to list inbox items", error)),
+    };
+    let events = match store.list_events(&started.instance_id) {
+        Ok(events) => events,
+        Err(error) => return Err(report_store_error("failed to list events", error)),
+    };
+    let mut assertions = eval_assertions(
+        &ir,
+        &facts,
+        &effects,
+        Some(Path::new(&dev_options.program_path)),
+        &dev_options.assertion_filter,
+    );
+    let assertion_events = match persist_assertion_events(
+        &store,
+        &started.instance_id,
+        &started.version_id,
+        &facts,
+        &effects,
+        &assertions,
+    ) {
+        Ok(events) => events,
+        Err(error) => {
+            return Err(report_store_error(
+                "failed to record assertion events",
+                error,
+            ))
+        }
+    };
+    for assertion in &mut assertions {
+        assertion.event_id = assertion_events.get(&assertion.target_id).cloned();
+    }
+    if let Err(error) = persist_assertion_diagnostics(
+        &store,
+        &started.instance_id,
+        &started.program_id,
+        &started.version_id,
+        &mut assertions,
+        &assertion_events,
+    ) {
+        return Err(report_store_error(
+            "failed to record assertion diagnostics",
+            error,
+        ));
+    }
+    let diagnostics = match store.list_diagnostics(Some(&started.instance_id)) {
+        Ok(diagnostics) => diagnostics,
+        Err(error) => return Err(report_store_error("failed to list diagnostics", error)),
+    };
+    let failed_assertions = assertions.iter().any(|assertion| !assertion.passed);
+    let guard_errors = steps
+        .iter()
+        .flat_map(|step| &step.guard_reports)
+        .any(|guard| guard.status == GuardStatus::Error);
+    let branch_errors = steps
+        .iter()
+        .flat_map(|step| &step.branch_reports)
+        .any(|branch| branch.status != BranchStatus::Matched);
+    let report = dev_report_to_json(DevReportJsonInput {
+        started: &started,
+        ir: &ir,
+        steps: &steps,
+        workers: &workers,
+        diagnostics: &diagnostics,
+        assertion_filter: &dev_options.assertion_filter,
+        assertions: &assertions,
+        runs: &runs,
+        artifact_counts: &artifact_counts,
+        artifacts: &artifacts,
+        evidence: &evidence,
+    });
+    Ok(AcceptanceDevRun {
+        dev_report: report,
+        dev_success: !failed_assertions && !guard_errors && !branch_errors,
+        actions,
+        facts,
+        effects,
+        runs,
+        artifact_counts,
+        artifacts,
+        evidence,
+        inbox_items,
+        events,
+    })
+}
+
+fn acceptance_seed_setup_facts(
+    fixture: &Value,
+    options: &CliOptions,
+    instance_id: &str,
+    ir: &IrProgram,
+) -> Result<(), ExitCode> {
+    let Some(setup) = fixture.get("setup") else {
+        return Ok(());
+    };
+    if !setup.is_object() {
+        eprintln!("acceptance fixture setup must be an object");
+        return Err(ExitCode::from(2));
+    }
+    let Some(facts) = setup.get("facts").and_then(Value::as_array) else {
+        if setup.get("facts").is_some() {
+            eprintln!("acceptance fixture setup.facts must be an array");
+            return Err(ExitCode::from(2));
+        }
+        return Ok(());
+    };
+    let mut store = open_store_or_exit(options)?;
+    for (index, fact) in facts.iter().enumerate() {
+        let Some(name) = fact.get("name").and_then(Value::as_str) else {
+            eprintln!("acceptance fixture setup.facts[{index}].name must be a string");
+            return Err(ExitCode::from(2));
+        };
+        let Some(value) = fact.get("value") else {
+            eprintln!("acceptance fixture setup.facts[{index}].value is required");
+            return Err(ExitCode::from(2));
+        };
+        let mut errors = Vec::new();
+        validate_json_for_ir_type(
+            ir,
+            value,
+            &IrType::Ref(name.to_owned()),
+            &format!("setup.facts[{index}].value"),
+            &mut errors,
+        );
+        if !errors.is_empty() {
+            eprintln!(
+                "invalid acceptance fixture setup.facts[{index}] for `{name}`: {}",
+                errors.join("; ")
+            );
+            return Err(ExitCode::from(2));
+        }
+        let value_json = value.to_string();
+        let key = fact
+            .get("key")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| record_fact_key(name, &value_json));
+        let fact_id = idempotency_key(&[
+            instance_id,
+            "acceptance.setup.fact",
+            &index.to_string(),
+            name,
+            &key,
+            &value_json,
+        ]);
+        let event_idempotency = idempotency_key(&[
+            instance_id,
+            "acceptance.setup.fact.event",
+            &index.to_string(),
+            name,
+            &key,
+        ]);
+        if let Err(error) = store.derive_fact(DerivedFact {
+            instance_id,
+            fact: NewFact {
+                fact_id: &fact_id,
+                name,
+                key: &key,
+                value_json: &value_json,
+                schema_id: Some(name),
+                provenance_class: "fixture",
+                correlation_id: Some("acceptance.fixture"),
+                source_span_json: None,
+            },
+            source: "acceptance.fixture",
+            causation_id: None,
+            idempotency_key: Some(&event_idempotency),
+        }) {
+            eprintln!(
+                "failed to seed acceptance setup fact: {}",
+                store_error(error)
+            );
+            return Err(ExitCode::FAILURE);
+        }
+    }
+    Ok(())
+}
+
+fn acceptance_seed_setup_inbox(
+    fixture: &Value,
+    options: &CliOptions,
+    instance_id: &str,
+) -> Result<(), ExitCode> {
+    let Some(setup) = fixture.get("setup") else {
+        return Ok(());
+    };
+    let Some(inbox_items) = setup.get("inbox").and_then(Value::as_array) else {
+        if setup.get("inbox").is_some() {
+            eprintln!("acceptance fixture setup.inbox must be an array");
+            return Err(ExitCode::from(2));
+        }
+        return Ok(());
+    };
+    let store = open_store_or_exit(options)?;
+    for (index, item) in inbox_items.iter().enumerate() {
+        let Some(prompt) = item.get("prompt").and_then(Value::as_str) else {
+            eprintln!("acceptance fixture setup.inbox[{index}].prompt must be a string");
+            return Err(ExitCode::from(2));
+        };
+        let status = item
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending");
+        let severity = item
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or("normal");
+        let choices_json = match acceptance_optional_array_json(item, "choices") {
+            Ok(value) => value,
+            Err(message) => {
+                eprintln!("acceptance fixture setup.inbox[{index}].{message}");
+                return Err(ExitCode::from(2));
+            }
+        };
+        let related_effects_json = match acceptance_optional_array_json(item, "related_effects") {
+            Ok(value) => value,
+            Err(message) => {
+                eprintln!("acceptance fixture setup.inbox[{index}].{message}");
+                return Err(ExitCode::from(2));
+            }
+        };
+        let related_artifacts_json = match acceptance_optional_array_json(item, "related_artifacts")
+        {
+            Ok(value) => value,
+            Err(message) => {
+                eprintln!("acceptance fixture setup.inbox[{index}].{message}");
+                return Err(ExitCode::from(2));
+            }
+        };
+        let freeform_allowed = item
+            .get("freeform_allowed")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let inbox_item_id = item
+            .get("inbox_item_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                idempotency_key(&[
+                    instance_id,
+                    "acceptance.setup.inbox",
+                    &index.to_string(),
+                    prompt,
+                    status,
+                    severity,
+                ])
+            });
+        if let Err(error) = store.create_inbox_item(NewInboxItem {
+            inbox_item_id: &inbox_item_id,
+            instance_id,
+            effect_id: item.get("effect_id").and_then(Value::as_str),
+            status,
+            prompt,
+            choices_json: &choices_json,
+            freeform_allowed,
+            severity,
+            related_effects_json: &related_effects_json,
+            related_artifacts_json: &related_artifacts_json,
+        }) {
+            eprintln!(
+                "failed to seed acceptance setup inbox item: {}",
+                store_error(error)
+            );
+            return Err(ExitCode::FAILURE);
+        }
+    }
+    Ok(())
+}
+
+fn acceptance_optional_array_json(item: &Value, key: &str) -> Result<String, String> {
+    match item.get(key) {
+        Some(value) if value.is_array() => Ok(value.to_string()),
+        Some(_) => Err(format!("{key} must be an array")),
+        None => Ok("[]".to_owned()),
+    }
+}
+
+fn acceptance_run_actions(
+    fixture: &Value,
+    options: &CliOptions,
+    instance_id: &str,
+) -> Result<Vec<AcceptanceActionReport>, ExitCode> {
+    let Some(actions) = fixture.get("actions").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let store = open_store_or_exit(options)?;
+    let mut kernel = RuntimeKernel::new(store);
+    let mut reports = Vec::new();
+    for (index, action) in actions.iter().enumerate() {
+        let Some(action_type) = action.get("type").and_then(Value::as_str) else {
+            eprintln!("acceptance fixture actions[{index}].type must be a string");
+            return Err(ExitCode::from(2));
+        };
+        let idempotency = idempotency_key(&[
+            instance_id,
+            "acceptance-action",
+            &index.to_string(),
+            action_type,
+        ]);
+        let event = match action_type {
+            "pause" => {
+                let reason = action
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("acceptance fixture pause");
+                kernel.pause_instance(instance_id, Some(reason), Some(&idempotency))
+            }
+            "resume" => kernel.resume_instance(instance_id, Some(&idempotency)),
+            "cancel" => {
+                let reason = action
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("acceptance fixture cancel");
+                kernel.cancel_instance(instance_id, Some(reason), Some(&idempotency))
+            }
+            other => {
+                eprintln!(
+                    "unknown acceptance fixture action `{other}`; expected pause, resume, or cancel"
+                );
+                return Err(ExitCode::from(2));
+            }
+        };
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => return Err(report_store_error("failed to run fixture action", error)),
+        };
+        reports.push(AcceptanceActionReport {
+            action_type: action_type.to_owned(),
+            event_id: event.event_id,
+            sequence: event.sequence,
+        });
+    }
+    Ok(reports)
+}
+
+fn acceptance_failures(fixture: &Value, run: &AcceptanceDevRun) -> Vec<String> {
+    let mut failures = Vec::new();
+    let expect = fixture.get("expect").unwrap_or(&Value::Null);
+    let expected_dev_status = expect
+        .get("dev_status")
+        .and_then(Value::as_str)
+        .unwrap_or("success");
+    match expected_dev_status {
+        "success" if !run.dev_success => failures.push("expected dev run to succeed".to_owned()),
+        "failure" if run.dev_success => failures.push("expected dev run to fail".to_owned()),
+        "success" | "failure" => {}
+        other => failures.push(format!("unknown expected dev_status `{other}`")),
+    }
+    if let Some(expected) = expect.get("workflow").and_then(Value::as_str) {
+        acceptance_expect_str(&run.dev_report, "/workflow", expected, &mut failures);
+    }
+    if let Some(expected) = expect.get("status").and_then(Value::as_str) {
+        acceptance_expect_str(
+            &run.dev_report,
+            "/executable_spec/status",
+            expected,
+            &mut failures,
+        );
+    }
+    acceptance_expect_source_metadata(expect, &run.dev_report, &mut failures);
+    if let Some(expected) = expect.get("diagnostics").and_then(Value::as_u64) {
+        let actual = run
+            .dev_report
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0) as u64;
+        if actual != expected {
+            failures.push(format!("expected diagnostics={expected}, got {actual}"));
+        }
+    }
+    acceptance_expect_diagnostics_by_code(expect, &run.dev_report, &mut failures);
+    acceptance_expect_actions(expect, &run.actions, &mut failures);
+    acceptance_expect_assertion_reads(
+        expect,
+        &run.dev_report,
+        &run.events,
+        &run.evidence,
+        &mut failures,
+    );
+    if let Some(assertions) = expect.get("assertions").and_then(Value::as_object) {
+        for key in ["total", "passed", "failed", "error"] {
+            if let Some(expected) = assertions.get(key).and_then(Value::as_u64) {
+                let pointer = format!("/executable_spec/summary/{key}");
+                let actual = run.dev_report.pointer(&pointer).and_then(Value::as_u64);
+                if actual != Some(expected) {
+                    failures.push(format!(
+                        "expected assertions.{key}={expected}, got {}",
+                        actual
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "missing".to_owned())
+                    ));
+                }
+            }
+        }
+    }
+    acceptance_expect_assertion_tags(expect, &run.dev_report, &mut failures);
+    acceptance_expect_assertion_untagged(expect, &run.dev_report, &mut failures);
+    acceptance_expect_summary(expect, &run.facts, &run.effects, &mut failures);
+    acceptance_expect_facts(expect, &run.facts, &mut failures);
+    acceptance_expect_effects(expect, &run.effects, &mut failures);
+    acceptance_expect_runs(expect, &run.runs, &run.artifact_counts, &mut failures);
+    acceptance_expect_artifacts(expect, &run.artifacts, &mut failures);
+    acceptance_expect_evidence(expect, &run.evidence, &mut failures);
+    acceptance_expect_inbox(expect, &run.inbox_items, &mut failures);
+    acceptance_expect_trace(expect, &run.events, &mut failures);
+    failures
+}
+
+fn acceptance_expect_actions(
+    expect: &Value,
+    action_reports: &[AcceptanceActionReport],
+    failures: &mut Vec<String>,
+) {
+    let Some(expected_actions) = expect.get("actions").and_then(Value::as_array) else {
+        return;
+    };
+    for (index, expected_action) in expected_actions.iter().enumerate() {
+        let Some(action_type) = expected_action.get("type").and_then(Value::as_str) else {
+            failures.push(format!("expect.actions[{index}].type must be a string"));
+            continue;
+        };
+        let Some(expected_count) = expected_action.get("count").and_then(Value::as_u64) else {
+            failures.push(format!("expect.actions[{index}].count must be an integer"));
+            continue;
+        };
+        let actual_count = action_reports
+            .iter()
+            .filter(|report| report.action_type == action_type)
+            .count() as u64;
+        if actual_count != expected_count {
+            failures.push(format!(
+                "expected actions[{index}] type={action_type:?} count={expected_count}, got {actual_count}"
+            ));
+        }
+    }
+}
+
+fn acceptance_expect_trace(expect: &Value, events: &[EventView], failures: &mut Vec<String>) {
+    let Some(expected_trace) = expect.get("trace") else {
+        return;
+    };
+    let actual_trace = acceptance_observed_trace_json(events);
+    if let Some(expected_ok) = expected_trace
+        .pointer("/conformance/ok")
+        .and_then(Value::as_bool)
+    {
+        let actual_ok = actual_trace
+            .pointer("/conformance/ok")
+            .and_then(Value::as_bool);
+        if actual_ok != Some(expected_ok) {
+            failures.push(format!(
+                "expected trace.conformance.ok={expected_ok}, got {}",
+                actual_ok
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "missing".to_owned())
+            ));
+        }
+    }
+    if let Some(expected) = expected_trace
+        .pointer("/summary/events")
+        .and_then(Value::as_u64)
+    {
+        let actual = actual_trace
+            .pointer("/summary/events")
+            .and_then(Value::as_u64);
+        if actual != Some(expected) {
+            failures.push(format!(
+                "expected trace.summary.events={expected}, got {}",
+                actual
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "missing".to_owned())
+            ));
+        }
+    }
+    if let Some(expected) = expected_trace
+        .pointer("/summary/abstract_events")
+        .and_then(Value::as_u64)
+    {
+        let actual = actual_trace
+            .pointer("/summary/abstract_events")
+            .and_then(Value::as_u64);
+        if actual != Some(expected) {
+            failures.push(format!(
+                "expected trace.summary.abstract_events={expected}, got {}",
+                actual
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "missing".to_owned())
+            ));
+        }
+    }
+    if let Some(expected_groups) = expected_trace.get("groups").and_then(Value::as_array) {
+        let actual_groups = actual_trace
+            .get("groups")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for (index, expected_group) in expected_groups.iter().enumerate() {
+            let Some(event_type) = expected_group.get("type").and_then(Value::as_str) else {
+                failures.push(format!(
+                    "expect.trace.groups[{index}].type must be a string"
+                ));
+                continue;
+            };
+            let Some(expected_count) = expected_group.get("count").and_then(Value::as_u64) else {
+                failures.push(format!(
+                    "expect.trace.groups[{index}].count must be an integer"
+                ));
+                continue;
+            };
+            let actual_count = actual_groups
+                .iter()
+                .find(|group| group.get("type").and_then(Value::as_str) == Some(event_type))
+                .and_then(|group| group.get("count"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if actual_count != expected_count {
+                failures.push(format!(
+                    "expected trace.groups[{index}] type={event_type:?} count={expected_count}, got {actual_count}"
+                ));
+            }
+        }
+    }
+    if let Some(expected_items) = expected_trace.get("items").and_then(Value::as_array) {
+        let actual_items = actual_trace
+            .get("items")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for (index, expected_item) in expected_items.iter().enumerate() {
+            if !acceptance_trace_item_has_selector(expected_item) {
+                failures.push(format!(
+                    "expect.trace.items[{index}] must include at least one selector"
+                ));
+                continue;
+            }
+            if !actual_items
+                .iter()
+                .any(|actual_item| acceptance_trace_item_matches(expected_item, actual_item))
+            {
+                failures.push(format!(
+                    "expected trace.items[{index}] {}, got no matching trace item",
+                    acceptance_trace_item_selector(expected_item)
+                ));
+            }
+        }
+    }
+}
+
+fn acceptance_trace_item_has_selector(expected_item: &Value) -> bool {
+    expected_item
+        .get("sequence")
+        .and_then(Value::as_u64)
+        .is_some()
+        || [
+            "type",
+            "effect_id",
+            "run_id",
+            "status",
+            "predicate",
+            "reason",
+            "provider",
+        ]
+        .iter()
+        .any(|key| expected_item.get(key).and_then(Value::as_str).is_some())
+}
+
+fn acceptance_trace_item_matches(expected_item: &Value, actual_item: &Value) -> bool {
+    if let Some(expected_sequence) = expected_item.get("sequence").and_then(Value::as_u64) {
+        if actual_item.get("sequence").and_then(Value::as_u64) != Some(expected_sequence) {
+            return false;
+        }
+    }
+    if let Some(expected_type) = expected_item.get("type").and_then(Value::as_str) {
+        if actual_item.pointer("/event/type").and_then(Value::as_str) != Some(expected_type) {
+            return false;
+        }
+    }
+    for key in [
+        "effect_id",
+        "run_id",
+        "status",
+        "predicate",
+        "reason",
+        "provider",
+    ] {
+        if let Some(expected) = expected_item.get(key).and_then(Value::as_str) {
+            let pointer = format!("/event/{key}");
+            if actual_item.pointer(&pointer).and_then(Value::as_str) != Some(expected) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn acceptance_trace_item_selector(expected_item: &Value) -> String {
+    let mut selectors = Vec::new();
+    if let Some(sequence) = expected_item.get("sequence").and_then(Value::as_u64) {
+        selectors.push(format!("sequence={sequence}"));
+    }
+    for key in [
+        "type",
+        "effect_id",
+        "run_id",
+        "status",
+        "predicate",
+        "reason",
+        "provider",
+    ] {
+        if let Some(value) = expected_item.get(key).and_then(Value::as_str) {
+            selectors.push(format!("{key}={value:?}"));
+        }
+    }
+    selectors.join(" ")
+}
+
+fn acceptance_expect_inbox(
+    expect: &Value,
+    inbox_items: &[InboxItemView],
+    failures: &mut Vec<String>,
+) {
+    let Some(expected_items) = expect.get("inbox").and_then(Value::as_array) else {
+        return;
+    };
+    for (index, expected_item) in expected_items.iter().enumerate() {
+        let Some(status) = expected_item.get("status").and_then(Value::as_str) else {
+            failures.push(format!("expect.inbox[{index}].status must be a string"));
+            continue;
+        };
+        let Some(expected_count) = expected_item.get("count").and_then(Value::as_u64) else {
+            failures.push(format!("expect.inbox[{index}].count must be an integer"));
+            continue;
+        };
+        let severity = expected_item.get("severity").and_then(Value::as_str);
+        let actual_count = inbox_items
+            .iter()
+            .filter(|item| {
+                item.status == status
+                    && severity
+                        .map(|expected_severity| item.severity == expected_severity)
+                        .unwrap_or(true)
+            })
+            .count() as u64;
+        if actual_count != expected_count {
+            let severity_clause = severity
+                .map(|severity| format!(" severity={severity:?}"))
+                .unwrap_or_default();
+            failures.push(format!(
+                "expected inbox[{index}] status={status:?}{severity_clause} count={expected_count}, got {actual_count}"
+            ));
+        }
+    }
+}
+
+fn acceptance_expect_assertion_reads(
+    expect: &Value,
+    dev_report: &Value,
+    events: &[EventView],
+    evidence: &[EvidenceView],
+    failures: &mut Vec<String>,
+) {
+    let Some(expected_reads) = expect.get("assertion_reads").and_then(Value::as_array) else {
+        return;
+    };
+    let observed_reads = acceptance_observed_assertion_reads(dev_report, events, evidence);
+    let actual_reads = observed_reads
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .collect::<Vec<_>>();
+    for (index, expected_read) in expected_reads.iter().enumerate() {
+        if !acceptance_assertion_read_has_selector(expected_read) {
+            failures.push(format!(
+                "expect.assertion_reads[{index}] must include at least one selector"
+            ));
+            continue;
+        }
+        let Some(actual_read) = acceptance_find_assertion_read(expected_read, &actual_reads) else {
+            failures.push(format!(
+                "expected assertion_reads[{index}] {}, got no matching assertion read",
+                acceptance_assertion_read_selector(expected_read)
+            ));
+            continue;
+        };
+        if let Some(expected) = expected_read.get("match_count").and_then(Value::as_u64) {
+            let actual = actual_read.get("match_count").and_then(Value::as_u64);
+            if actual != Some(expected) {
+                failures.push(format!(
+                    "expected assertion_reads[{index}] match_count={expected}, got {}",
+                    actual
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "missing".to_owned())
+                ));
+            }
+        }
+        let Some(expected_matches) = expected_read.get("matches").and_then(Value::as_array) else {
+            continue;
+        };
+        let actual_matches = actual_read
+            .get("matches")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for (match_index, expected_match) in expected_matches.iter().enumerate() {
+            let Some(expected_count) = expected_match.get("count").and_then(Value::as_u64) else {
+                failures.push(format!(
+                    "expect.assertion_reads[{index}].matches[{match_index}].count must be an integer"
+                ));
+                continue;
+            };
+            let actual_count = actual_matches
+                .iter()
+                .filter(|actual_match| {
+                    acceptance_assertion_read_match_matches(expected_match, actual_match)
+                })
+                .filter_map(|actual_match| actual_match.get("count").and_then(Value::as_u64))
+                .sum::<u64>();
+            if actual_count != expected_count {
+                failures.push(format!(
+                    "expected assertion_reads[{index}].matches[{match_index}] {} count={expected_count}, got {actual_count}",
+                    acceptance_assertion_read_match_selector(expected_match)
+                ));
+            }
+        }
+    }
+}
+
+fn acceptance_assertion_read_has_selector(expected_read: &Value) -> bool {
+    ["source", "kind", "head", "guard"]
+        .iter()
+        .any(|key| expected_read.get(key).and_then(Value::as_str).is_some())
+}
+
+fn acceptance_find_assertion_read<'a>(
+    expected_read: &Value,
+    actual_reads: &'a [&'a Value],
+) -> Option<&'a Value> {
+    actual_reads.iter().copied().find(|actual_read| {
+        for key in ["source", "kind", "head", "guard"] {
+            if let Some(expected) = expected_read.get(key).and_then(Value::as_str) {
+                if actual_read.get(key).and_then(Value::as_str) != Some(expected) {
+                    return false;
+                }
+            }
+        }
+        true
+    })
+}
+
+fn acceptance_assertion_read_selector(expected_read: &Value) -> String {
+    ["source", "kind", "head", "guard"]
+        .iter()
+        .filter_map(|key| {
+            expected_read
+                .get(key)
+                .and_then(Value::as_str)
+                .map(|value| format!("{key}={value:?}"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn acceptance_assertion_read_match_matches(expected_match: &Value, actual_match: &Value) -> bool {
+    for key in ["name", "status", "prompt_content_type", "provenance_class"] {
+        if let Some(expected) = expected_match.get(key).and_then(Value::as_str) {
+            if actual_match.get(key).and_then(Value::as_str) != Some(expected) {
+                return false;
+            }
+        }
+    }
+    for key in ["trace_items", "evidence_items"] {
+        if let Some(expected) = expected_match.get(key).and_then(Value::as_u64) {
+            if actual_match.get(key).and_then(Value::as_u64) != Some(expected) {
+                return false;
+            }
+        }
+    }
+    if let Some(expected) = expected_match
+        .get("trace_sequences")
+        .and_then(Value::as_array)
+    {
+        let actual = actual_match
+            .get("trace_sequences")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if actual != expected.as_slice() {
+            return false;
+        }
+    }
+    if let Some(expected) = expected_match.get("evidence_ids").and_then(Value::as_array) {
+        let actual = actual_match
+            .get("evidence_ids")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if actual != expected.as_slice() {
+            return false;
+        }
+    }
+    true
+}
+
+fn acceptance_assertion_read_match_selector(expected_match: &Value) -> String {
+    let mut selectors = ["name", "status", "prompt_content_type", "provenance_class"]
+        .iter()
+        .filter_map(|key| {
+            expected_match
+                .get(key)
+                .and_then(Value::as_str)
+                .map(|value| format!("{key}={value:?}"))
+        })
+        .collect::<Vec<_>>();
+    selectors.extend(["trace_items", "evidence_items"].iter().filter_map(|key| {
+        expected_match
+            .get(key)
+            .and_then(Value::as_u64)
+            .map(|value| format!("{key}={value}"))
+    }));
+    selectors.extend(
+        ["trace_sequences", "evidence_ids"]
+            .iter()
+            .filter_map(|key| {
+                expected_match
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .map(|value| format!("{key}={}", Value::Array(value.clone())))
+            }),
+    );
+    selectors.join(" ")
+}
+
+fn acceptance_expect_diagnostics_by_code(
+    expect: &Value,
+    dev_report: &Value,
+    failures: &mut Vec<String>,
+) {
+    let Some(expected_codes) = expect.get("diagnostics_by_code").and_then(Value::as_array) else {
+        return;
+    };
+    let diagnostics = dev_report
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for (index, expected_code) in expected_codes.iter().enumerate() {
+        let Some(code) = expected_code.get("code").and_then(Value::as_str) else {
+            failures.push(format!(
+                "expect.diagnostics_by_code[{index}].code must be a string"
+            ));
+            continue;
+        };
+        let Some(expected_count) = expected_code.get("count").and_then(Value::as_u64) else {
+            failures.push(format!(
+                "expect.diagnostics_by_code[{index}].count must be an integer"
+            ));
+            continue;
+        };
+        let actual_count = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.get("code").and_then(Value::as_str) == Some(code))
+            .count() as u64;
+        if actual_count != expected_count {
+            failures.push(format!(
+                "expected diagnostics_by_code[{index}] code={code:?} count={expected_count}, got {actual_count}"
+            ));
+        }
+    }
+}
+
+fn acceptance_expect_assertion_tags(
+    expect: &Value,
+    dev_report: &Value,
+    failures: &mut Vec<String>,
+) {
+    let Some(expected_tags) = expect.get("assertion_tags").and_then(Value::as_array) else {
+        return;
+    };
+    let actual_tags = dev_report
+        .pointer("/executable_spec/tags")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for (index, expected_tag) in expected_tags.iter().enumerate() {
+        let Some(tag) = expected_tag.get("tag").and_then(Value::as_str) else {
+            failures.push(format!(
+                "expect.assertion_tags[{index}].tag must be a string"
+            ));
+            continue;
+        };
+        let Some(actual_tag) = actual_tags
+            .iter()
+            .find(|actual| actual.get("tag").and_then(Value::as_str) == Some(tag))
+        else {
+            failures.push(format!(
+                "expected assertion_tags[{index}] tag={tag:?}, got no matching executable-spec tag group"
+            ));
+            continue;
+        };
+        for key in ["total", "passed", "failed", "error"] {
+            if let Some(expected) = expected_tag.get(key).and_then(Value::as_u64) {
+                let pointer = format!("/summary/{key}");
+                let actual = actual_tag.pointer(&pointer).and_then(Value::as_u64);
+                if actual != Some(expected) {
+                    failures.push(format!(
+                        "expected assertion_tags[{index}] tag={tag:?} {key}={expected}, got {}",
+                        actual
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "missing".to_owned())
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn acceptance_expect_assertion_untagged(
+    expect: &Value,
+    dev_report: &Value,
+    failures: &mut Vec<String>,
+) {
+    let Some(expected_untagged) = expect.get("assertion_untagged").and_then(Value::as_object)
+    else {
+        return;
+    };
+    let actual_untagged = dev_report.pointer("/executable_spec/untagged");
+    for key in ["total", "passed", "failed", "error"] {
+        if let Some(expected) = expected_untagged.get(key).and_then(Value::as_u64) {
+            let pointer = format!("/summary/{key}");
+            let actual = actual_untagged
+                .and_then(|untagged| untagged.pointer(&pointer))
+                .and_then(Value::as_u64);
+            if actual != Some(expected) {
+                failures.push(format!(
+                    "expected assertion_untagged.{key}={expected}, got {}",
+                    actual
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "missing".to_owned())
+                ));
+            }
+        }
+    }
+}
+
+fn acceptance_expect_source_metadata(
+    expect: &Value,
+    dev_report: &Value,
+    failures: &mut Vec<String>,
+) {
+    let Some(expected_targets) = expect
+        .pointer("/source_metadata/targets")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    let actual_targets = dev_report
+        .pointer("/source_metadata/targets")
+        .and_then(Value::as_object);
+    for (index, expected_target) in expected_targets.iter().enumerate() {
+        let Some(target_kind) = expected_target.get("target_kind").and_then(Value::as_str) else {
+            failures.push(format!(
+                "expect.source_metadata.targets[{index}].target_kind must be a string"
+            ));
+            continue;
+        };
+        let Some(target) = expected_target.get("target").and_then(Value::as_str) else {
+            failures.push(format!(
+                "expect.source_metadata.targets[{index}].target must be a string"
+            ));
+            continue;
+        };
+        let target_key = source_metadata_target_key(target_kind, target);
+        let Some(actual_target) = actual_targets.and_then(|targets| targets.get(&target_key))
+        else {
+            failures.push(format!(
+                "expected source_metadata.targets[{index}] {target_key:?}, got no matching target"
+            ));
+            continue;
+        };
+        if let Some(expected_description) =
+            expected_target.get("description").and_then(Value::as_str)
+        {
+            let actual_description = actual_target.get("description").and_then(Value::as_str);
+            if actual_description != Some(expected_description) {
+                failures.push(format!(
+                    "expected source_metadata.targets[{index}] {target_key:?} description={expected_description:?}, got {}",
+                    actual_description
+                        .map(|value| format!("{value:?}"))
+                        .unwrap_or_else(|| "missing".to_owned())
+                ));
+            }
+        }
+        if let Some(expected_tags) = expected_target.get("tags").and_then(Value::as_array) {
+            let actual_tags = actual_target
+                .get("tags")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            for expected_tag in expected_tags {
+                let Some(expected_tag) = expected_tag.as_str() else {
+                    failures.push(format!(
+                        "expect.source_metadata.targets[{index}].tags entries must be strings"
+                    ));
+                    continue;
+                };
+                if !actual_tags
+                    .iter()
+                    .any(|actual_tag| actual_tag.as_str() == Some(expected_tag))
+                {
+                    failures.push(format!(
+                        "expected source_metadata.targets[{index}] {target_key:?} tag={expected_tag:?}, got no matching tag"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn acceptance_expect_summary(
+    expect: &Value,
+    facts: &[FactView],
+    effects: &[EffectView],
+    failures: &mut Vec<String>,
+) {
+    let Some(summary) = expect.get("summary").and_then(Value::as_object) else {
+        return;
+    };
+    if let Some(expected) = summary.get("facts").and_then(Value::as_u64) {
+        let actual = facts.len() as u64;
+        if actual != expected {
+            failures.push(format!("expected summary.facts={expected}, got {actual}"));
+        }
+    }
+    if let Some(expected) = summary.get("effects").and_then(Value::as_u64) {
+        let actual = effects.len() as u64;
+        if actual != expected {
+            failures.push(format!("expected summary.effects={expected}, got {actual}"));
+        }
+    }
+}
+
+fn acceptance_observed_json(run: &AcceptanceDevRun) -> Value {
+    let fact_total = run.facts.len();
+    let effect_total = run.effects.len();
+    let mut fact_counts = BTreeMap::new();
+    for fact in &run.facts {
+        *fact_counts.entry(fact.name.clone()).or_insert(0_u64) += 1;
+    }
+    let facts = fact_counts
+        .into_iter()
+        .map(|(name, count)| json!({"name": name, "count": count}))
+        .collect::<Vec<_>>();
+
+    let mut effect_counts = BTreeMap::new();
+    for effect in &run.effects {
+        *effect_counts
+            .entry((effect.kind.clone(), effect.status.clone()))
+            .or_insert(0_u64) += 1;
+    }
+    let effects = effect_counts
+        .into_iter()
+        .map(|((kind, status), count)| json!({"kind": kind, "status": status, "count": count}))
+        .collect::<Vec<_>>();
+
+    json!({
+        "summary": {
+            "facts": fact_total,
+            "effects": effect_total,
+        },
+        "facts": facts,
+        "effects": effects,
+        "actions": acceptance_actions_json(&run.actions),
+        "source_metadata": acceptance_observed_source_metadata(&run.dev_report),
+        "runs": provider_runs_summary_json(&run.runs, &run.artifact_counts),
+        "artifacts": provider_artifacts_summary_json(&run.artifacts),
+        "evidence": provider_evidence_summary_json(&run.evidence),
+        "inbox": acceptance_inbox_summary_json(&run.inbox_items),
+        "trace": acceptance_observed_trace_json(&run.events),
+        "diagnostics_by_code": acceptance_observed_diagnostics_by_code(&run.dev_report),
+        "executable_spec": acceptance_observed_executable_spec(&run.dev_report),
+        "assertion_reads": acceptance_observed_assertion_reads(&run.dev_report, &run.events, &run.evidence),
+    })
+}
+
+fn acceptance_observed_trace_json(events: &[EventView]) -> Value {
+    let abstract_records = reconstruct_trace_records(events);
+    let conformance = check_trace(&abstract_records);
+    let mut groups = BTreeMap::<String, u64>::new();
+    for record in &abstract_records {
+        let event = trace_event_to_json(&record.event);
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        *groups.entry(event_type).or_insert(0) += 1;
+    }
+    let groups = groups
+        .into_iter()
+        .map(|(event_type, count)| json!({"type": event_type, "count": count}))
+        .collect::<Vec<_>>();
+    let items = abstract_records
+        .iter()
+        .map(trace_record_to_json)
+        .collect::<Vec<_>>();
+    let conformance = match conformance {
+        Ok(()) => json!({"ok": true}),
+        Err(violation) => json!({
+            "ok": false,
+            "sequence": violation.sequence,
+            "message": violation.message,
+        }),
+    };
+    json!({
+        "summary": {
+            "events": events.len(),
+            "abstract_events": abstract_records.len(),
+        },
+        "groups": groups,
+        "items": items,
+        "conformance": conformance,
+    })
+}
+
+fn acceptance_inbox_summary_json(inbox_items: &[InboxItemView]) -> Value {
+    let mut groups = BTreeMap::<(String, String), u64>::new();
+    for item in inbox_items {
+        *groups
+            .entry((item.status.clone(), item.severity.clone()))
+            .or_insert(0) += 1;
+    }
+    let groups = groups
+        .into_iter()
+        .map(|((status, severity), count)| {
+            json!({
+                "status": status,
+                "severity": severity,
+                "count": count,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "summary": {
+            "total": inbox_items.len(),
+        },
+        "groups": groups,
+    })
+}
+
+fn acceptance_actions_json(action_reports: &[AcceptanceActionReport]) -> Value {
+    Value::Array(
+        action_reports
+            .iter()
+            .map(|report| {
+                json!({
+                    "type": report.action_type,
+                    "event_id": report.event_id,
+                    "sequence": report.sequence,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn acceptance_observed_source_metadata(dev_report: &Value) -> Value {
+    let targets = dev_report
+        .pointer("/source_metadata/targets")
+        .and_then(Value::as_object)
+        .map(|targets| {
+            targets
+                .iter()
+                .map(|(key, target)| {
+                    json!({
+                        "key": key,
+                        "target_kind": target.get("target_kind").cloned().unwrap_or(Value::Null),
+                        "target": target.get("target").cloned().unwrap_or(Value::Null),
+                        "tags": target.get("tags").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+                        "description": target.get("description").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "summary": {
+            "targets": targets.len(),
+        },
+        "targets": targets,
+    })
+}
+
+fn acceptance_observed_diagnostics_by_code(dev_report: &Value) -> Value {
+    let mut counts = BTreeMap::new();
+    for diagnostic in dev_report
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(code) = diagnostic.get("code").and_then(Value::as_str) {
+            *counts.entry(code.to_owned()).or_insert(0_u64) += 1;
+        }
+    }
+    Value::Array(
+        counts
+            .into_iter()
+            .map(|(code, count)| json!({"code": code, "count": count}))
+            .collect(),
+    )
+}
+
+fn acceptance_observed_assertion_reads(
+    dev_report: &Value,
+    events: &[EventView],
+    evidence: &[EvidenceView],
+) -> Value {
+    let trace_records = reconstruct_trace_records(events);
+    let reads = dev_report
+        .get("assertions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|assertion| {
+            assertion
+                .get("reads")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        })
+        .map(|read| acceptance_observed_assertion_read(read, &trace_records, evidence))
+        .collect::<Vec<_>>();
+    Value::Array(reads)
+}
+
+fn acceptance_observed_assertion_read(
+    read: &Value,
+    trace_records: &[TraceRecord],
+    evidence: &[EvidenceView],
+) -> Value {
+    let mut groups = BTreeMap::<
+        (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+        (u64, BTreeSet<u64>, BTreeSet<String>),
+    >::new();
+    for match_report in read
+        .get("matches")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let key = (
+            match_report
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            match_report
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            match_report
+                .get("prompt_content_type")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            match_report
+                .get("provenance_class")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        );
+        let entry = groups
+            .entry(key)
+            .or_insert_with(|| (0, BTreeSet::new(), BTreeSet::new()));
+        entry.0 += 1;
+        if read.get("kind").and_then(Value::as_str) == Some("effect") {
+            if let Some(effect_id) = match_report.get("id").and_then(Value::as_str) {
+                entry
+                    .1
+                    .extend(trace_sequences_for_effect(trace_records, effect_id));
+                entry.2.extend(evidence_ids_for_effect(evidence, effect_id));
+            }
+        }
+    }
+    let match_groups = groups
+        .into_iter()
+        .map(
+            |(
+                (name, status, prompt_content_type, provenance_class),
+                (count, trace_sequences, evidence_ids),
+            )| {
+                let trace_sequences = trace_sequences.into_iter().collect::<Vec<_>>();
+                let evidence_ids = evidence_ids.into_iter().collect::<Vec<_>>();
+                let mut group = json!({
+                    "name": name,
+                    "status": status,
+                    "prompt_content_type": prompt_content_type,
+                    "provenance_class": provenance_class,
+                    "count": count,
+                });
+                if !trace_sequences.is_empty() || !evidence_ids.is_empty() {
+                    insert_json_field(&mut group, "trace_items", json!(trace_sequences.len()));
+                    insert_json_field(&mut group, "evidence_items", json!(evidence_ids.len()));
+                    insert_json_field(&mut group, "trace_sequences", json!(trace_sequences));
+                    insert_json_field(&mut group, "evidence_ids", json!(evidence_ids));
+                }
+                group
+            },
+        )
+        .collect::<Vec<_>>();
+    let mut observed = json!({
+        "kind": read.get("kind").cloned().unwrap_or(Value::Null),
+        "head": read.get("head").cloned().unwrap_or(Value::Null),
+        "source": read.get("source").cloned().unwrap_or(Value::Null),
+        "match_count": read.get("match_count").cloned().unwrap_or(Value::Null),
+        "matches": match_groups,
+    });
+    if let Some(guard) = read.get("guard").and_then(Value::as_str) {
+        insert_json_field(&mut observed, "guard", Value::String(guard.to_owned()));
+    }
+    observed
+}
+
+fn trace_sequences_for_effect(trace_records: &[TraceRecord], effect_id: &str) -> Vec<u64> {
+    trace_records
+        .iter()
+        .filter(|record| trace_event_mentions_effect(&record.event, effect_id))
+        .map(|record| record.sequence)
+        .collect()
+}
+
+fn trace_event_mentions_effect(event: &TraceEvent, effect_id: &str) -> bool {
+    match event {
+        TraceEvent::EffectCreated {
+            effect_id: candidate,
+            ..
+        }
+        | TraceEvent::EffectClaimed {
+            effect_id: candidate,
+        }
+        | TraceEvent::RunStarted {
+            effect_id: candidate,
+            ..
+        }
+        | TraceEvent::LeaseExpired {
+            effect_id: candidate,
+            ..
+        }
+        | TraceEvent::EffectTerminal {
+            effect_id: candidate,
+            ..
+        }
+        | TraceEvent::ProviderDiagnostic {
+            effect_id: candidate,
+            ..
+        }
+        | TraceEvent::EffectBlocked {
+            effect_id: candidate,
+            ..
+        }
+        | TraceEvent::EffectCancelled {
+            effect_id: candidate,
+        }
+        | TraceEvent::EffectCancellationRequested {
+            effect_id: candidate,
+            ..
+        } => candidate == effect_id,
+        TraceEvent::DependencyCreated(edge) => {
+            edge.upstream_effect_id == effect_id || edge.downstream_effect_id == effect_id
+        }
+        TraceEvent::RevisionActivated {
+            terminal_cancel_effects,
+            request_cancel_effects,
+            ..
+        } => {
+            terminal_cancel_effects
+                .iter()
+                .any(|candidate| candidate == effect_id)
+                || request_cancel_effects
+                    .iter()
+                    .any(|candidate| candidate == effect_id)
+        }
+        TraceEvent::InstancePaused
+        | TraceEvent::InstanceResumed
+        | TraceEvent::InstanceCancelled => false,
+    }
+}
+
+fn evidence_ids_for_effect(evidence: &[EvidenceView], effect_id: &str) -> Vec<String> {
+    evidence
+        .iter()
+        .filter(|item| {
+            item.subject_id == effect_id
+                || item.causation_id.as_deref() == Some(effect_id)
+                || item.correlation_id.as_deref() == Some(effect_id)
+        })
+        .map(|item| item.evidence_id.clone())
+        .collect()
+}
+
+fn provider_runs_summary_json(
+    runs: &[RunView],
+    artifact_counts: &BTreeMap<String, usize>,
+) -> Value {
+    let total_artifact_count = runs
+        .iter()
+        .map(|run| artifact_counts.get(&run.run_id).copied().unwrap_or(0) as u64)
+        .sum::<u64>();
+    let mut groups = BTreeMap::<(String, String), (u64, u64)>::new();
+    for run in runs {
+        let artifact_count = artifact_counts.get(&run.run_id).copied().unwrap_or(0) as u64;
+        let entry = groups
+            .entry((run.provider.clone(), run.status.clone()))
+            .or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += artifact_count;
+    }
+    let groups = groups
+        .into_iter()
+        .map(|((provider, status), (count, artifact_count))| {
+            json!({
+                "provider": provider,
+                "status": status,
+                "count": count,
+                "artifact_count": artifact_count,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "summary": {
+            "total": runs.len(),
+            "artifact_count": total_artifact_count,
+        },
+        "groups": groups,
+    })
+}
+
+fn provider_artifacts_summary_json(artifacts: &[ArtifactView]) -> Value {
+    let mut groups = BTreeMap::<(String, Option<String>), u64>::new();
+    for artifact in artifacts {
+        *groups
+            .entry((artifact.kind.clone(), artifact.mime_type.clone()))
+            .or_insert(0) += 1;
+    }
+    let groups = groups
+        .into_iter()
+        .map(|((kind, mime_type), count)| {
+            json!({
+                "kind": kind,
+                "mime_type": mime_type,
+                "count": count,
+            })
+        })
+        .collect::<Vec<_>>();
+    let items = artifacts
+        .iter()
+        .map(|artifact| {
+            json!({
+                "artifact_id": artifact.artifact_id,
+                "run_id": artifact.run_id,
+                "kind": artifact.kind,
+                "mime_type": artifact.mime_type,
+                "content_hash": artifact.content_hash,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "summary": {
+            "total": artifacts.len(),
+        },
+        "groups": groups,
+        "items": items,
+    })
+}
+
+fn provider_evidence_summary_json(evidence: &[EvidenceView]) -> Value {
+    let mut groups = BTreeMap::<(String, String), u64>::new();
+    for item in evidence {
+        *groups
+            .entry((item.kind.clone(), item.subject_type.clone()))
+            .or_insert(0) += 1;
+    }
+    let groups = groups
+        .into_iter()
+        .map(|((kind, subject_type), count)| {
+            json!({
+                "kind": kind,
+                "subject_type": subject_type,
+                "count": count,
+            })
+        })
+        .collect::<Vec<_>>();
+    let items = evidence
+        .iter()
+        .map(|item| {
+            json!({
+                "evidence_id": item.evidence_id,
+                "kind": item.kind,
+                "subject_type": item.subject_type,
+                "subject_id": item.subject_id,
+                "causation_id": item.causation_id,
+                "correlation_id": item.correlation_id,
+                "summary": item.summary,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "summary": {
+            "total": evidence.len(),
+        },
+        "groups": groups,
+        "items": items,
+    })
+}
+
+fn acceptance_observed_executable_spec(dev_report: &Value) -> Value {
+    let executable_spec = dev_report.get("executable_spec").and_then(Value::as_object);
+    let tags = executable_spec
+        .and_then(|spec| spec.get("tags"))
+        .and_then(Value::as_array)
+        .map(|tags| {
+            tags.iter()
+                .map(|tag| {
+                    json!({
+                        "tag": tag.get("tag").cloned().unwrap_or(Value::Null),
+                        "status": tag.get("status").cloned().unwrap_or(Value::Null),
+                        "summary": tag.get("summary").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut observed = json!({
+        "status": executable_spec
+            .and_then(|spec| spec.get("status"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "summary": executable_spec
+            .and_then(|spec| spec.get("summary"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "tags": tags,
+    });
+    if let Some(untagged) = executable_spec
+        .and_then(|spec| spec.get("untagged"))
+        .and_then(Value::as_object)
+    {
+        insert_json_field(
+            &mut observed,
+            "untagged",
+            json!({
+                "status": untagged.get("status").cloned().unwrap_or(Value::Null),
+                "summary": untagged.get("summary").cloned().unwrap_or(Value::Null),
+            }),
+        );
+    }
+    observed
+}
+
+fn acceptance_expect_facts(expect: &Value, facts: &[FactView], failures: &mut Vec<String>) {
+    let Some(expected_facts) = expect.get("facts").and_then(Value::as_array) else {
+        return;
+    };
+    for (index, expected_fact) in expected_facts.iter().enumerate() {
+        let Some(name) = expected_fact.get("name").and_then(Value::as_str) else {
+            failures.push(format!("expect.facts[{index}].name must be a string"));
+            continue;
+        };
+        let Some(expected_count) = expected_fact.get("count").and_then(Value::as_u64) else {
+            failures.push(format!("expect.facts[{index}].count must be an integer"));
+            continue;
+        };
+        let actual_count = facts.iter().filter(|fact| fact.name == name).count() as u64;
+        if actual_count != expected_count {
+            failures.push(format!(
+                "expected facts[{index}] name={name:?} count={expected_count}, got {actual_count}"
+            ));
+        }
+    }
+}
+
+fn acceptance_expect_effects(expect: &Value, effects: &[EffectView], failures: &mut Vec<String>) {
+    let Some(expected_effects) = expect.get("effects").and_then(Value::as_array) else {
+        return;
+    };
+    for (index, expected_effect) in expected_effects.iter().enumerate() {
+        let Some(kind) = expected_effect.get("kind").and_then(Value::as_str) else {
+            failures.push(format!("expect.effects[{index}].kind must be a string"));
+            continue;
+        };
+        let status = expected_effect.get("status").and_then(Value::as_str);
+        let Some(expected_count) = expected_effect.get("count").and_then(Value::as_u64) else {
+            failures.push(format!("expect.effects[{index}].count must be an integer"));
+            continue;
+        };
+        let actual_count = effects
+            .iter()
+            .filter(|effect| {
+                effect.kind == kind
+                    && status
+                        .map(|expected_status| effect.status == expected_status)
+                        .unwrap_or(true)
+            })
+            .count() as u64;
+        if actual_count != expected_count {
+            let status_clause = status
+                .map(|status| format!(" status={status:?}"))
+                .unwrap_or_default();
+            failures.push(format!(
+                "expected effects[{index}] kind={kind:?}{status_clause} count={expected_count}, got {actual_count}"
+            ));
+        }
+    }
+}
+
+fn acceptance_expect_runs(
+    expect: &Value,
+    runs: &[RunView],
+    artifact_counts: &BTreeMap<String, usize>,
+    failures: &mut Vec<String>,
+) {
+    let Some(expected_runs) = expect.get("runs").and_then(Value::as_array) else {
+        return;
+    };
+    for (index, expected_run) in expected_runs.iter().enumerate() {
+        let Some(provider) = expected_run.get("provider").and_then(Value::as_str) else {
+            failures.push(format!("expect.runs[{index}].provider must be a string"));
+            continue;
+        };
+        let status = expected_run.get("status").and_then(Value::as_str);
+        let Some(expected_count) = expected_run.get("count").and_then(Value::as_u64) else {
+            failures.push(format!("expect.runs[{index}].count must be an integer"));
+            continue;
+        };
+        let matching_runs = runs
+            .iter()
+            .filter(|run| {
+                run.provider == provider
+                    && status
+                        .map(|expected_status| run.status == expected_status)
+                        .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
+        let actual_count = matching_runs.len() as u64;
+        if actual_count != expected_count {
+            let status_clause = status
+                .map(|status| format!(" status={status:?}"))
+                .unwrap_or_default();
+            failures.push(format!(
+                "expected runs[{index}] provider={provider:?}{status_clause} count={expected_count}, got {actual_count}"
+            ));
+        }
+        if let Some(expected_artifact_count) =
+            expected_run.get("artifact_count").and_then(Value::as_u64)
+        {
+            let actual_artifact_count = matching_runs
+                .iter()
+                .map(|run| artifact_counts.get(&run.run_id).copied().unwrap_or(0) as u64)
+                .sum::<u64>();
+            if actual_artifact_count != expected_artifact_count {
+                let status_clause = status
+                    .map(|status| format!(" status={status:?}"))
+                    .unwrap_or_default();
+                failures.push(format!(
+                    "expected runs[{index}] provider={provider:?}{status_clause} artifact_count={expected_artifact_count}, got {actual_artifact_count}"
+                ));
+            }
+        }
+    }
+}
+
+fn acceptance_expect_artifacts(
+    expect: &Value,
+    artifacts: &[ArtifactView],
+    failures: &mut Vec<String>,
+) {
+    let Some(expected_artifacts) = expect.get("artifacts").and_then(Value::as_array) else {
+        return;
+    };
+    for (index, expected_artifact) in expected_artifacts.iter().enumerate() {
+        let Some(kind) = expected_artifact.get("kind").and_then(Value::as_str) else {
+            failures.push(format!("expect.artifacts[{index}].kind must be a string"));
+            continue;
+        };
+        let mime_type = expected_artifact.get("mime_type").and_then(Value::as_str);
+        let Some(expected_count) = expected_artifact.get("count").and_then(Value::as_u64) else {
+            failures.push(format!(
+                "expect.artifacts[{index}].count must be an integer"
+            ));
+            continue;
+        };
+        let actual_count = artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.kind == kind
+                    && mime_type
+                        .map(|expected_mime| artifact.mime_type.as_deref() == Some(expected_mime))
+                        .unwrap_or(true)
+            })
+            .count() as u64;
+        if actual_count != expected_count {
+            let mime_clause = mime_type
+                .map(|mime_type| format!(" mime_type={mime_type:?}"))
+                .unwrap_or_default();
+            failures.push(format!(
+                "expected artifacts[{index}] kind={kind:?}{mime_clause} count={expected_count}, got {actual_count}"
+            ));
+        }
+    }
+}
+
+fn acceptance_expect_evidence(
+    expect: &Value,
+    evidence: &[EvidenceView],
+    failures: &mut Vec<String>,
+) {
+    let Some(expected_evidence) = expect.get("evidence").and_then(Value::as_array) else {
+        return;
+    };
+    for (index, expected_item) in expected_evidence.iter().enumerate() {
+        let Some(kind) = expected_item.get("kind").and_then(Value::as_str) else {
+            failures.push(format!("expect.evidence[{index}].kind must be a string"));
+            continue;
+        };
+        let subject_type = expected_item.get("subject_type").and_then(Value::as_str);
+        let Some(expected_count) = expected_item.get("count").and_then(Value::as_u64) else {
+            failures.push(format!("expect.evidence[{index}].count must be an integer"));
+            continue;
+        };
+        let actual_count = evidence
+            .iter()
+            .filter(|item| {
+                item.kind == kind
+                    && subject_type
+                        .map(|expected_subject_type| item.subject_type == expected_subject_type)
+                        .unwrap_or(true)
+            })
+            .count() as u64;
+        if actual_count != expected_count {
+            let subject_clause = subject_type
+                .map(|subject_type| format!(" subject_type={subject_type:?}"))
+                .unwrap_or_default();
+            failures.push(format!(
+                "expected evidence[{index}] kind={kind:?}{subject_clause} count={expected_count}, got {actual_count}"
+            ));
+        }
+    }
+}
+
+fn acceptance_expect_str(
+    report: &Value,
+    pointer: &str,
+    expected: &str,
+    failures: &mut Vec<String>,
+) {
+    let actual = report.pointer(pointer).and_then(Value::as_str);
+    if actual != Some(expected) {
+        failures.push(format!(
+            "expected {pointer}={expected:?}, got {}",
+            actual
+                .map(|value| format!("{value:?}"))
+                .unwrap_or_else(|| "missing".to_owned())
+        ));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DevStreamFormat {
+    Ndjson,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DevStream {
+    format: Option<DevStreamFormat>,
+    sequence: usize,
+}
+
+impl DevStream {
+    fn new(format: Option<DevStreamFormat>) -> Self {
+        Self {
+            format,
+            sequence: 0,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.format.is_some()
+    }
+
+    fn emit(&mut self, event: &str, data: Value) -> io::Result<()> {
+        let Some(DevStreamFormat::Ndjson) = self.format else {
+            return Ok(());
+        };
+        let envelope = json!({
+            "schema": "whipplescript.dev_stream.v0",
+            "sequence": self.sequence,
+            "event": event,
+            "data": data,
+        });
+        self.sequence += 1;
+        let rendered = serde_json::to_string(&envelope)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{rendered}")?;
+        stdout.flush()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DevOptions {
     program_path: String,
     root: Option<String>,
     provider: String,
+    exec_profile: ExecProfile,
+    script_manifest_path: Option<PathBuf>,
     provider_config_paths: Vec<PathBuf>,
     outcome: FixtureOutcome,
+    variant: Option<String>,
     max_iterations: usize,
+    assertion_filter: AssertionTagFilter,
+    stream: Option<DevStreamFormat>,
 }
 
 impl DevOptions {
@@ -4867,9 +9751,14 @@ impl DevOptions {
         let mut program_path = None;
         let mut root = None;
         let mut provider = "fixture".to_owned();
+        let mut exec_profile = ExecProfile::from_env();
+        let mut script_manifest_path = script_manifest_path_from_env();
         let mut provider_config_paths = Vec::new();
         let mut outcome = FixtureOutcome::Completed;
+        let mut variant = None;
         let mut max_iterations = 8usize;
+        let mut assertion_filter = AssertionTagFilter::default();
+        let mut stream = None;
         let mut index = 0;
         while index < args.len() {
             match args[index].as_str() {
@@ -4893,6 +9782,51 @@ impl DevOptions {
                         return Err("expected path after `--provider-config`".to_owned());
                     };
                     provider_config_paths.push(PathBuf::from(value));
+                }
+                "--exec-profile" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected profile after `--exec-profile`".to_owned());
+                    };
+                    exec_profile = ExecProfile::parse(value)?;
+                }
+                "--script-manifest" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected path after `--script-manifest`".to_owned());
+                    };
+                    script_manifest_path = Some(PathBuf::from(value));
+                }
+                "--include-tag" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected tag after `--include-tag`".to_owned());
+                    };
+                    assertion_filter.include_tags.push(value.clone());
+                }
+                "--exclude-tag" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected tag after `--exclude-tag`".to_owned());
+                    };
+                    assertion_filter.exclude_tags.push(value.clone());
+                }
+                "--stream" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected value after `--stream`".to_owned());
+                    };
+                    stream = Some(match value.as_str() {
+                        "ndjson" => DevStreamFormat::Ndjson,
+                        _ => return Err("only `--stream ndjson` is supported".to_owned()),
+                    });
+                }
+                "--variant" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected variant name after `--variant`".to_owned());
+                    };
+                    variant = Some(value.clone());
                 }
                 "--fail" => outcome = FixtureOutcome::Failed,
                 "--timeout" => outcome = FixtureOutcome::TimedOut,
@@ -4921,7 +9855,7 @@ impl DevOptions {
                 value if program_path.is_none() => program_path = Some(value.to_owned()),
                 _ => {
                     return Err(
-                        "usage: whip dev <workflow.whip> [--provider fixture] [--provider-config path] [--until idle] [--fail|--timeout|--cancel]"
+                        "usage: whip dev <workflow.whip> [--provider fixture] [--provider-config path] [--until idle] [--include-tag tag] [--exclude-tag tag] [--stream ndjson] [--fail|--timeout|--cancel]"
                             .to_owned(),
                     )
                 }
@@ -4930,7 +9864,7 @@ impl DevOptions {
         }
         let Some(program_path) = program_path else {
             return Err(
-                "usage: whip dev <workflow.whip> [--provider fixture] [--provider-config path] [--until idle] [--fail|--timeout|--cancel]"
+                "usage: whip dev <workflow.whip> [--provider fixture] [--provider-config path] [--until idle] [--include-tag tag] [--exclude-tag tag] [--stream ndjson] [--fail|--timeout|--cancel]"
                     .to_owned(),
             );
         };
@@ -4938,10 +9872,37 @@ impl DevOptions {
             program_path,
             root,
             provider,
+            exec_profile,
+            script_manifest_path,
             provider_config_paths,
             outcome,
+            variant,
             max_iterations,
+            assertion_filter,
+            stream,
         })
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct AssertionTagFilter {
+    include_tags: Vec<String>,
+    exclude_tags: Vec<String>,
+}
+
+impl AssertionTagFilter {
+    fn matches(&self, tags: &[String]) -> bool {
+        if !self.exclude_tags.is_empty()
+            && tags
+                .iter()
+                .any(|tag| self.exclude_tags.iter().any(|excluded| excluded == tag))
+        {
+            return false;
+        }
+        self.include_tags.is_empty()
+            || tags
+                .iter()
+                .any(|tag| self.include_tags.iter().any(|included| included == tag))
     }
 }
 
@@ -4961,6 +9922,8 @@ struct OwnedLowering {
     terminal: Option<OwnedWorkflowTerminal>,
     branch_reports: Vec<BranchReport>,
     errors: Vec<String>,
+    /// Effect ids targeted by `cancel <binding>` operations in live scopes.
+    cancels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5021,11 +9984,13 @@ struct OwnedEffect {
     profile: Option<String>,
     correlation_id: Option<String>,
     source_span_json: Option<String>,
+    timeout_seconds: Option<i64>,
 }
 
 impl OwnedEffect {
     fn as_new_effect(&self) -> NewEffect<'_> {
         NewEffect {
+            timeout_seconds: self.timeout_seconds,
             effect_id: &self.effect_id,
             kind: &self.kind,
             target: self.target.as_deref(),
@@ -5089,6 +10054,8 @@ fn ready_contexts(
             let matching = facts
                 .iter()
                 .filter(|fact| fact.name == schema || fact.name == normalize_pattern_name(schema))
+                .filter(|fact| pattern_agent_matches(ir, schema, fact))
+                .filter(|fact| pattern_queue_matches(schema, fact))
                 .cloned()
                 .collect::<Vec<_>>();
             if matching.is_empty() {
@@ -5125,12 +10092,65 @@ fn ready_contexts(
             contexts = expanded;
             continue;
         }
+        // Special readiness patterns without an `as` binding (for example
+        // `ralph completed turn`) require a matching fact but bind nothing.
+        let normalized = normalize_pattern_name(pattern);
+        if normalized != pattern {
+            let satisfied = facts.iter().any(|fact| {
+                fact.name == normalized
+                    && pattern_agent_matches(ir, pattern, fact)
+                    && pattern_queue_matches(pattern, fact)
+            });
+            if !satisfied {
+                return ReadyContexts::empty(guard_reports);
+            }
+            continue;
+        }
         return ReadyContexts::empty(guard_reports);
     }
     ReadyContexts {
         contexts,
         guard_reports,
     }
+}
+
+/// For `<queue> has ready item` patterns, only the named queue's projected
+/// items match.
+fn pattern_queue_matches(pattern: &str, fact: &FactView) -> bool {
+    let mut words = pattern.split_whitespace();
+    let Some(queue) = words.next() else {
+        return true;
+    };
+    if !(words.next() == Some("has")
+        && words.next() == Some("ready")
+        && words.next() == Some("item"))
+    {
+        return true;
+    }
+    json_from_str(&fact.value_json)
+        .get("queue")
+        .and_then(Value::as_str)
+        .is_none_or(|fact_queue| fact_queue == queue)
+}
+
+/// For `<agent> completed turn` patterns where the leading word names a
+/// declared agent, only that agent's turns match. The generic `worker` form
+/// (or any word that is not a declared agent) matches turns from any agent.
+fn pattern_agent_matches(ir: &IrProgram, pattern: &str, fact: &FactView) -> bool {
+    let Some(agent) = completed_turn_agent(pattern) else {
+        return true;
+    };
+    if !ir.agents.iter().any(|declared| declared.name == agent) {
+        return true;
+    }
+    serde_json::from_str::<Value>(&fact.value_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("agent")
+                .and_then(|v| v.as_str().map(str::to_owned))
+        })
+        .is_none_or(|fact_agent| fact_agent == agent)
 }
 
 struct ReadyContexts {
@@ -5239,21 +10259,186 @@ fn eval_assertions(
     facts: &[FactView],
     effects: &[EffectView],
     source_path: Option<&Path>,
+    filter: &AssertionTagFilter,
 ) -> Vec<AssertionReport> {
     ir.assertions
         .iter()
-        .map(|assertion| {
-            eval_assertion(
-                assertion.expr.source.as_str(),
-                &assertion.expr.expr,
+        .filter_map(|assertion| {
+            let target_id = stable_hash_hex(assertion.expr.source.as_str());
+            let (tags, description) = source_metadata_for_target(ir, "assertion", &target_id);
+            if !filter.matches(&tags) {
+                return None;
+            }
+            let reads = assertion
+                .projection_reads
+                .iter()
+                .map(|read| assertion_read_report(read, facts, effects, ir))
+                .collect::<Vec<_>>();
+            Some(eval_assertion(AssertionEvalInput {
+                target_id: &target_id,
+                source: assertion.expr.source.as_str(),
+                expr: &assertion.expr.expr,
+                reads,
+                tags,
+                description,
                 ir,
-                source_path.map(|_| assertion.expr.span),
+                span: source_path.map(|_| assertion.expr.span),
                 source_path,
                 facts,
                 effects,
-            )
+            }))
         })
         .collect()
+}
+
+fn assertion_read_report(
+    read: &IrProjectionRead,
+    facts: &[FactView],
+    effects: &[EffectView],
+    ir: &IrProgram,
+) -> AssertionReadReport {
+    let kind = match read.kind {
+        QueryKind::Fact => "fact",
+        QueryKind::Effect => "effect",
+    }
+    .to_owned();
+    let source = match &read.guard {
+        Some(guard) => format!("{kind}:{} where {guard}", read.head),
+        None => format!("{kind}:{}", read.head),
+    };
+    let (matches, error) = assertion_read_matches(read, facts, effects, ir);
+    AssertionReadReport {
+        kind,
+        head: read.head.clone(),
+        guard: read.guard.clone(),
+        source,
+        match_count: matches.len(),
+        matches,
+        error,
+    }
+}
+
+fn assertion_read_matches(
+    read: &IrProjectionRead,
+    facts: &[FactView],
+    effects: &[EffectView],
+    ir: &IrProgram,
+) -> (Vec<AssertionReadMatch>, Option<String>) {
+    let guard = match &read.guard {
+        Some(guard) => match parse_expression(guard) {
+            Ok(expr) => Some(expr),
+            Err(error) => return (Vec::new(), Some(error)),
+        },
+        None => None,
+    };
+    let scope = EvalScope::assertions(facts, effects, ir);
+    match read.kind {
+        QueryKind::Fact => {
+            let mut matches = Vec::new();
+            for fact in facts.iter().filter(|fact| fact.name == read.head.trim()) {
+                let value = json_from_str(&fact.value_json);
+                if let Some(guard) = &guard {
+                    match guard_filter_matches(eval_expr_value(
+                        guard,
+                        &scope.projection(&value, Some(read.head.trim())),
+                    )) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => return (matches, Some(error.into_json().to_string())),
+                    }
+                }
+                matches.push(AssertionReadMatch {
+                    id: fact.fact_id.clone(),
+                    name: fact.name.clone(),
+                    key: Some(fact.key.clone()),
+                    status: None,
+                    prompt_content_type: None,
+                    provenance_class: Some(fact.provenance_class.clone()),
+                    source_span_json: fact.source_span_json.clone(),
+                });
+            }
+            (matches, None)
+        }
+        QueryKind::Effect => {
+            let kind = read
+                .head
+                .trim()
+                .strip_prefix("kind ")
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let mut matches = Vec::new();
+            for effect in effects
+                .iter()
+                .filter(|effect| kind.is_none_or(|kind| effect.kind == kind))
+            {
+                let value = json!({
+                    "kind": effect.kind,
+                    "target": effect.target,
+                    "status": effect.status,
+                    "profile": effect.profile,
+                });
+                if let Some(guard) = &guard {
+                    match guard_filter_matches(eval_expr_value(
+                        guard,
+                        &scope.projection(&value, None),
+                    )) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => return (matches, Some(error.into_json().to_string())),
+                    }
+                }
+                matches.push(AssertionReadMatch {
+                    id: effect.effect_id.clone(),
+                    name: effect.kind.clone(),
+                    key: None,
+                    status: Some(effect.status.clone()),
+                    prompt_content_type: effect_prompt_content_type(effect),
+                    provenance_class: None,
+                    source_span_json: None,
+                });
+            }
+            (matches, None)
+        }
+    }
+}
+
+fn effect_prompt_content_type(effect: &EffectView) -> Option<String> {
+    json_from_str(&effect.input_json)
+        .get("prompt_content_type")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn assertion_filter_to_json(
+    filter: &AssertionTagFilter,
+    total_assertions: usize,
+    selected_assertions: usize,
+) -> Value {
+    json!({
+        "include_tags": filter.include_tags,
+        "exclude_tags": filter.exclude_tags,
+        "total": total_assertions,
+        "selected": selected_assertions,
+    })
+}
+
+fn source_metadata_for_target(
+    ir: &IrProgram,
+    target_kind: &str,
+    target: &str,
+) -> (Vec<String>, Option<String>) {
+    let tags = ir
+        .source_tags
+        .iter()
+        .filter(|tag| tag.target_kind == target_kind && tag.target == target)
+        .map(|tag| tag.name.clone())
+        .collect::<Vec<_>>();
+    let description = ir
+        .source_descriptions
+        .iter()
+        .find(|description| description.target_kind == target_kind && description.target == target)
+        .map(|description| description.value.clone());
+    (tags, description)
 }
 
 fn persist_assertion_events(
@@ -5336,7 +10521,7 @@ fn persist_assertion_events(
             correlation_id: Some(&assertion_id),
             idempotency_key: Some(&idempotency),
         })?;
-        events.insert(assertion.expr.clone(), event.event_id);
+        events.insert(assertion.target_id.clone(), event.event_id);
     }
     Ok(events)
 }
@@ -5346,10 +10531,10 @@ fn persist_assertion_diagnostics(
     instance_id: &str,
     program_id: &str,
     version_id: &str,
-    assertions: &[AssertionReport],
+    assertions: &mut [AssertionReport],
     assertion_events: &BTreeMap<String, String>,
 ) -> Result<(), StoreError> {
-    for assertion in assertions.iter().filter(|assertion| !assertion.passed) {
+    for assertion in assertions.iter_mut().filter(|assertion| !assertion.passed) {
         let assertion_id = idempotency_key(&[instance_id, "assertion", &assertion.expr]);
         let actual_json = assertion.actual.to_string();
         let message = match assertion.status {
@@ -5365,7 +10550,7 @@ fn persist_assertion_diagnostics(
             ),
             AssertionStatus::Passed => continue,
         };
-        store.record_diagnostic(DiagnosticRecord {
+        let diagnostic_id = store.record_diagnostic(DiagnosticRecord {
             instance_id: Some(instance_id),
             program_id: Some(program_id),
             program_version_id: Some(version_id),
@@ -5379,7 +10564,9 @@ fn persist_assertion_diagnostics(
             source_span_json: assertion.source_span_json.as_deref(),
             subject_type: Some("assertion"),
             subject_id: Some(&assertion.expr),
-            event_id: assertion_events.get(&assertion.expr).map(String::as_str),
+            event_id: assertion_events
+                .get(&assertion.target_id)
+                .map(String::as_str),
             effect_id: None,
             run_id: None,
             assertion_id: Some(&assertion_id),
@@ -5395,28 +10582,43 @@ fn persist_assertion_diagnostics(
                 &actual_json,
             ])),
         })?;
+        assertion.diagnostic_ids.push(diagnostic_id);
     }
     Ok(())
 }
 
-fn eval_assertion(
-    source: &str,
-    expr: &Expr,
-    ir: &IrProgram,
+struct AssertionEvalInput<'a> {
+    target_id: &'a str,
+    source: &'a str,
+    expr: &'a Expr,
+    reads: Vec<AssertionReadReport>,
+    tags: Vec<String>,
+    description: Option<String>,
+    ir: &'a IrProgram,
     span: Option<SourceSpan>,
-    source_path: Option<&Path>,
-    facts: &[FactView],
-    effects: &[EffectView],
-) -> AssertionReport {
-    let source = source.trim();
-    let scope = EvalScope::assertions(facts, effects, ir);
-    let (status, actual, error) = assertion_result(eval_expr_value(expr, &scope));
-    let (expected, actual_values) = assertion_details(expr, &scope, &actual);
-    let failure_reason = assertion_failure_reason(expr, &status, error.as_deref());
+    source_path: Option<&'a Path>,
+    facts: &'a [FactView],
+    effects: &'a [EffectView],
+}
+
+fn eval_assertion(input: AssertionEvalInput<'_>) -> AssertionReport {
+    let source = input.source.trim();
+    let scope = EvalScope::assertions(input.facts, input.effects, input.ir);
+    let (status, actual, error) = assertion_result(eval_expr_value(input.expr, &scope));
+    let (expected, actual_values) = assertion_details(input.expr, &scope, &actual);
+    let failure_reason = assertion_failure_reason(input.expr, &status, error.as_deref());
     let passed = status == AssertionStatus::Passed;
     AssertionReport {
+        target_id: input.target_id.to_owned(),
+        event_id: None,
+        diagnostic_ids: Vec::new(),
         expr: source.to_owned(),
-        source_span_json: span.map(|span| source_span_json(source_path, span, "assertion")),
+        reads: input.reads,
+        tags: input.tags,
+        description: input.description,
+        source_span_json: input
+            .span
+            .map(|span| source_span_json(input.source_path, span, "assertion")),
         status,
         passed,
         actual,
@@ -5537,6 +10739,10 @@ fn binary_op_label(op: BinaryOp) -> &'static str {
         BinaryOp::Ge => ">=",
         BinaryOp::In => "in",
         BinaryOp::NotIn => "not in",
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
     }
 }
 
@@ -5592,11 +10798,18 @@ impl<'a> EvalScope<'a> {
 fn empty_ir_program() -> IrProgram {
     IrProgram {
         workflow: String::new(),
+        source_tags: Vec::new(),
+        source_descriptions: Vec::new(),
         includes: Vec::new(),
         pattern_applications: Vec::new(),
         workflow_contracts: Vec::new(),
         uses: Vec::new(),
         harnesses: Vec::new(),
+        queues: Vec::new(),
+        events: Vec::new(),
+        leases: Vec::new(),
+        ledgers: Vec::new(),
+        counters: Vec::new(),
         schemas: Vec::new(),
         agents: Vec::new(),
         coerces: Vec::new(),
@@ -5780,6 +10993,36 @@ fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, scope: &EvalScope<'_>) -
                 !contains
             }))
         }
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+            let left = eval_expr_value(left, scope);
+            let right = eval_expr_value(right, scope);
+            let (Some(lhs), Some(rhs)) = (number_value(&left), number_value(&right)) else {
+                return EvalValue::error("arithmetic requires numeric operands");
+            };
+            let result = match op {
+                BinaryOp::Add => lhs + rhs,
+                BinaryOp::Sub => lhs - rhs,
+                BinaryOp::Mul => lhs * rhs,
+                _ => {
+                    if rhs == 0.0 {
+                        return EvalValue::error("division by zero");
+                    }
+                    lhs / rhs
+                }
+            };
+            let integer_operands = matches!(&left, EvalValue::Json(Value::Number(n)) if n.is_i64())
+                && matches!(&right, EvalValue::Json(Value::Number(n)) if n.is_i64());
+            if integer_operands && result.fract() == 0.0 && op != BinaryOp::Div {
+                EvalValue::Json(Value::Number((result as i64).into()))
+            } else if integer_operands && op == BinaryOp::Div && result.fract() == 0.0 {
+                EvalValue::Json(Value::Number((result as i64).into()))
+            } else {
+                serde_json::Number::from_f64(result)
+                    .map(Value::Number)
+                    .map(EvalValue::Json)
+                    .unwrap_or_else(|| EvalValue::error("arithmetic produced a non-finite value"))
+            }
+        }
     }
 }
 
@@ -5788,24 +11031,26 @@ fn eval_call(name: &str, args: &[Expr], scope: &EvalScope<'_>) -> EvalValue {
         ("count", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
             .map(|count| EvalValue::Json(Value::Number(count.into())))
             .unwrap_or_else(|value| value),
-        ("one", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
-            .map(|count| EvalValue::Json(Value::Bool(count == 1)))
-            .unwrap_or_else(|value| value),
-        ("none", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
-            .map(|count| EvalValue::Json(Value::Bool(count == 0)))
-            .unwrap_or_else(|value| value),
+        ("count", [expr]) => match eval_expr_value(expr, scope) {
+            EvalValue::Json(Value::Array(items)) => {
+                EvalValue::Json(Value::Number((items.len() as i64).into()))
+            }
+            EvalValue::Json(Value::Object(items)) => {
+                EvalValue::Json(Value::Number((items.len() as i64).into()))
+            }
+            EvalValue::Json(Value::String(value)) => {
+                EvalValue::Json(Value::Number((value.chars().count() as i64).into()))
+            }
+            EvalValue::Missing => EvalValue::error("missing value for count"),
+            EvalValue::Error(message) => EvalValue::Error(message),
+            _ => EvalValue::error("unsupported value for count"),
+        },
         ("exists", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
             .map(|count| EvalValue::Json(Value::Bool(count > 0)))
             .unwrap_or_else(|value| value),
         ("exists", [expr]) => EvalValue::Json(Value::Bool(
             !eval_expr_value(expr, scope).is_missing_or_null(),
         )),
-        ("empty", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
-            .map(|count| EvalValue::Json(Value::Bool(count == 0)))
-            .unwrap_or_else(|value| value),
-        ("empty", [expr]) => {
-            EvalValue::Json(Value::Bool(is_empty_value(&eval_expr_value(expr, scope))))
-        }
         _ => EvalValue::error("unknown expression function"),
     }
 }
@@ -5877,6 +11122,26 @@ fn eval_path(path: &[String], scope: &EvalScope<'_>) -> EvalValue {
     if path.is_empty() {
         return EvalValue::error("empty expression path");
     }
+    // The projection (the fact currently examined by a query's inner
+    // `where`) is the innermost scope: its fields shadow outer rule
+    // bindings. A path whose root is not a projection field falls through
+    // to the rule context, so `count(Item where owner == task.owner)`
+    // resolves `owner` against each Item and `task` against the binding.
+    if let Some(projection) = scope.projection {
+        if path
+            .first()
+            .is_some_and(|first| projection.get(first).is_some())
+        {
+            let mut current = projection;
+            for field in path {
+                let Some(next) = current.get(field) else {
+                    return EvalValue::Missing;
+                };
+                current = next;
+            }
+            return EvalValue::Json(current.clone());
+        }
+    }
     if let Some(context) = scope.context {
         if let Some(first) = path.first() {
             if let Some(rest) = path.get(1..) {
@@ -5896,6 +11161,7 @@ fn eval_path(path: &[String], scope: &EvalScope<'_>) -> EvalValue {
                 return EvalValue::Missing;
             }
         }
+        return EvalValue::Missing;
     }
     if let Some(projection) = scope.projection {
         let mut current = projection;
@@ -6051,18 +11317,8 @@ fn unwrap_optional_type(ty: &IrType) -> Option<&IrType> {
     }
 }
 
-fn is_empty_value(value: &EvalValue) -> bool {
-    match value {
-        EvalValue::Missing => true,
-        EvalValue::Json(Value::Null) => true,
-        EvalValue::Json(Value::String(value)) => value.is_empty(),
-        EvalValue::Json(Value::Array(value)) => value.is_empty(),
-        EvalValue::Json(Value::Object(value)) => value.is_empty(),
-        _ => false,
-    }
-}
-
 fn lower_rule(
+    instance_id: &str,
     ir: &IrProgram,
     rule: &IrRule,
     context: &RuleContext,
@@ -6070,8 +11326,7 @@ fn lower_rule(
     effects: &[EffectView],
     source_path: Option<&Path>,
 ) -> OwnedLowering {
-    let rule_body = desugar_then_chains(&rule.body);
-    let (body, context, branch_reports) = selected_rule_body(&rule_body, context);
+    let (body, context, branch_reports) = selected_rule_body(&rule.body, context);
     let existing_fact_ids = facts
         .iter()
         .map(|fact| fact.fact_id.as_str())
@@ -6086,7 +11341,10 @@ fn lower_rule(
     append_consumed_fact_ids(&mut lowering, &pre_terminal_body, &context, facts);
     append_workflow_terminal(&mut lowering, ir, rule, &pre_terminal_body, &context, None);
 
-    for block in top_level_record_blocks(&pre_terminal_body) {
+    for (record_index, block) in top_level_record_blocks(&pre_terminal_body)
+        .into_iter()
+        .enumerate()
+    {
         let value = parse_record_fields(
             &block.body,
             &context,
@@ -6095,26 +11353,49 @@ fn lower_rule(
         );
         let value_json = Value::Object(value).to_string();
         let fact_key = record_fact_key(&block.schema, &value_json);
-        let fact_id = idempotency_key(&[&rule.name, &block.schema, &fact_key, &value_json]);
+        let fact_id = idempotency_key(&[
+            instance_id,
+            &rule.name,
+            &block.schema,
+            &fact_key,
+            &value_json,
+        ]);
         if existing_fact_ids
             .iter()
             .any(|existing| *existing == fact_id)
         {
             continue;
         }
+        let record_source = rule
+            .metadata
+            .record_sources
+            .get(record_index)
+            .filter(|source| source.schema == block.schema);
         lowering.facts.push(OwnedFact {
             fact_id,
             name: block.schema.clone(),
             key: fact_key,
             value_json,
             schema_id: Some(block.schema),
-            provenance_class: "rule".to_owned(),
+            provenance_class: record_source
+                .map(|source| {
+                    if source.construct == "table_row" {
+                        "table"
+                    } else {
+                        "rule"
+                    }
+                })
+                .unwrap_or("rule")
+                .to_owned(),
             correlation_id: context.identity.clone(),
-            source_span_json: None,
+            source_span_json: record_source
+                .map(|source| source_span_json(source_path, source.span, &source.construct)),
         });
     }
 
-    let parsed_effects = parse_effect_statements(&pre_terminal_body, &context);
+    let mut parsed_effects = parse_effect_statements(&pre_terminal_body, &context);
+    rewrite_lease_releases(&mut parsed_effects, &rule.body);
+    let parsed_effects = parsed_effects;
     let mut node_to_effect_id = std::collections::BTreeMap::new();
     let mut binding_to_effect_id = std::collections::BTreeMap::new();
     for (index, parsed) in parsed_effects.iter().enumerate() {
@@ -6123,6 +11404,7 @@ fn lower_rule(
             .map(|effect| effect.id.as_str())
             .unwrap_or(parsed.kind.as_str());
         let effect_id = idempotency_key(&[
+            instance_id,
             &rule.name,
             node_id,
             context.identity.as_deref().unwrap_or("started"),
@@ -6185,7 +11467,18 @@ fn lower_rule(
             correlation_id: context.identity.clone(),
             source_span_json: effect_node
                 .map(|effect| source_span_json(source_path, effect.span, "effect")),
+            timeout_seconds: parsed.timeout_seconds,
         });
+    }
+
+    for binding in cancel_statements(&pre_terminal_body) {
+        if let Some(effect_id) = binding_to_effect_id.get(&binding) {
+            lowering.cancels.push(effect_id.clone());
+        } else {
+            lowering
+                .errors
+                .push(format!("cancel of unknown effect binding `{binding}`"));
+        }
     }
 
     for dependency in &rule.metadata.dependencies {
@@ -6261,6 +11554,7 @@ fn lower_rule(
             let value_json = Value::Object(value).to_string();
             let fact_key = record_fact_key(&record.schema, &value_json);
             let fact_id = idempotency_key(&[
+                instance_id,
                 &rule.name,
                 &after.binding,
                 &after.predicate,
@@ -6287,6 +11581,7 @@ fn lower_rule(
             });
         }
         let mut selected_effects = parse_effect_statements(&selected_after_body, &after_context);
+        rewrite_lease_releases(&mut selected_effects, &rule.body);
         for effect in &mut selected_effects {
             effect.after.get_or_insert_with(|| AfterScope {
                 binding: after.binding.clone(),
@@ -6301,6 +11596,7 @@ fn lower_rule(
                 .map(|effect| effect.id.as_str())
                 .unwrap_or(parsed.kind.as_str());
             let effect_id = idempotency_key(&[
+                instance_id,
                 &rule.name,
                 &after.binding,
                 &after.predicate,
@@ -6319,6 +11615,15 @@ fn lower_rule(
             binding_to_effect_id
                 .entry(binding.clone())
                 .or_insert_with(|| effect_id.clone());
+        }
+        for binding in cancel_statements(&selected_after_body) {
+            if let Some(effect_id) = selected_binding_to_effect_id.get(&binding) {
+                lowering.cancels.push(effect_id.clone());
+            } else {
+                lowering
+                    .errors
+                    .push(format!("cancel of unknown effect binding `{binding}`"));
+            }
         }
         for (index, parsed) in selected_effects.iter().enumerate() {
             let effect_node = effect_node_for_parsed(rule, parsed, index);
@@ -6374,6 +11679,7 @@ fn lower_rule(
                 correlation_id: after_context.identity.clone(),
                 source_span_json: effect_node
                     .map(|effect| source_span_json(source_path, effect.span, "effect")),
+                timeout_seconds: parsed.timeout_seconds,
             });
         }
     }
@@ -6445,6 +11751,19 @@ fn append_consumed_fact_ids(
             lowering.consumed_fact_ids.push(fact.fact_id.clone());
         }
     }
+}
+
+fn cancel_statements(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|line| {
+            let binding = line
+                .trim()
+                .trim_end_matches(';')
+                .strip_prefix("cancel ")?
+                .trim();
+            is_identifier(binding).then(|| binding.to_owned())
+        })
+        .collect()
 }
 
 fn consume_statements(body: &str) -> Vec<String> {
@@ -6519,56 +11838,6 @@ fn selected_rule_body(
         index = next_index;
     }
     (selected.join("\n"), context, branch_reports)
-}
-
-fn desugar_then_chains(body: &str) -> String {
-    let lines = body.lines().collect::<Vec<_>>();
-    let mut output = Vec::new();
-    let mut last_effect_binding: Option<String> = None;
-    let mut index = 0usize;
-    while index < lines.len() {
-        let trimmed = lines[index].trim();
-        if let (Some(statement), Some(upstream)) = (
-            trimmed.strip_prefix("then ").map(str::trim),
-            last_effect_binding.as_deref(),
-        ) {
-            output.push(format!("after {upstream} succeeds {{"));
-            output.push(format!("  {statement}"));
-            let mut depth = brace_delta(statement);
-            index += 1;
-            while depth > 0 && index < lines.len() {
-                let line = lines[index];
-                depth += brace_delta(line);
-                output.push(format!("  {line}"));
-                index += 1;
-            }
-            output.push("}".to_owned());
-            if let Some(binding) = effect_binding_from_statement(statement) {
-                last_effect_binding = Some(binding);
-            }
-            continue;
-        }
-        output.push(lines[index].to_owned());
-        if let Some(binding) = effect_binding_from_statement(trimmed) {
-            last_effect_binding = Some(binding);
-        }
-        index += 1;
-    }
-    output.join("\n")
-}
-
-fn effect_binding_from_statement(statement: &str) -> Option<String> {
-    if statement.starts_with("tell ")
-        || statement.starts_with("coerce ")
-        || statement.starts_with("claim ")
-        || statement.starts_with("askHuman ")
-        || statement.starts_with("call ")
-        || statement.starts_with("emit ")
-    {
-        binding_after_as(statement)
-    } else {
-        None
-    }
 }
 
 fn strip_after_blocks(body: &str) -> String {
@@ -6795,6 +12064,37 @@ fn case_pattern_matches(pattern: &str, value: &Value, context: &mut RuleContext)
         ));
         return true;
     }
+    // Sum-type value (spec/sum-types.md): an internally-tagged record
+    // dispatching on the synthesized `variant` discriminant, compared
+    // exactly — BAML already normalized the tag. `Variant as b` binds the
+    // matched variant record.
+    if let Some(variant) = value.get("variant").and_then(Value::as_str) {
+        let mut parts = pattern.split_whitespace();
+        if parts.next() != Some(variant) {
+            return false;
+        }
+        let binding = match (parts.next(), parts.next(), parts.next()) {
+            (None, _, _) => None,
+            (Some("as"), Some(binding), None) => Some(binding),
+            _ => return false,
+        };
+        if let Some(binding) = binding {
+            context.bindings.push((
+                binding.to_owned(),
+                FactView {
+                    fact_id: format!("case:{binding}"),
+                    program_version_id: None,
+                    revision_epoch: 0,
+                    name: binding.to_owned(),
+                    key: binding.to_owned(),
+                    value_json: value.to_string(),
+                    provenance_class: "case".to_owned(),
+                    source_span_json: None,
+                },
+            ));
+        }
+        return true;
+    }
     parse_guard_literal(pattern) == *value
 }
 
@@ -6937,8 +12237,10 @@ struct ParsedEffect {
     binding: Option<String>,
     args: Vec<String>,
     prompt: Option<String>,
+    prompt_content_type: Option<String>,
     required_capabilities: Vec<String>,
     after: Option<AfterScope>,
+    timeout_seconds: Option<i64>,
 }
 
 impl ParsedEffect {
@@ -6950,12 +12252,87 @@ impl ParsedEffect {
             "capability.call" => vec!["capability.call".to_owned()],
             "event.emit" => vec!["event.emit".to_owned()],
             "workflow.invoke" => vec!["workflow.invoke".to_owned()],
+            "exec.command" if self.name.as_deref() == Some("capability") => self
+                .target
+                .as_ref()
+                .map(|target| vec![format!("script.{target}")])
+                .unwrap_or_default(),
             _ => Vec::new(),
         };
         capabilities.extend(self.required_capabilities.iter().cloned());
         capabilities.sort();
         capabilities.dedup();
         serde_json::to_string(&capabilities).unwrap_or_else(|_| "[]".to_owned())
+    }
+}
+
+/// Extracts a `timeout <duration>` clause from an effect statement line.
+fn parse_timeout_clause_seconds(line: &str) -> Option<i64> {
+    let mut words = line.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        if word == "timeout" {
+            let value = words.peek()?;
+            return whipplescript_parser::body::parse_short_duration_seconds(value)
+                .map(|seconds| seconds as i64);
+        }
+    }
+    None
+}
+
+/// Extracts a leading double-quoted string, honoring `\"` and `\\` escapes,
+/// returning the unescaped content and the text after the closing quote.
+fn extract_quoted_string(text: &str) -> Option<(String, &str)> {
+    let rest = text.strip_prefix('"')?;
+    let mut content = String::new();
+    let mut chars = rest.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some((_, escaped @ ('"' | '\\'))) => content.push(escaped),
+                Some((_, other)) => {
+                    content.push('\\');
+                    content.push(other);
+                }
+                None => return None,
+            },
+            '"' => return Some((content, &rest[index + 1..])),
+            _ => content.push(ch),
+        }
+    }
+    None
+}
+
+/// Lease/counter keys are entity identities serialized to a stable string.
+fn coordination_key_string(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
+}
+
+/// `release <x>` is queue-or-lease by referent: a binding acquired in this
+/// rule body is a lease release (spec/coordination.md); anything else stays
+/// the queue verb.
+fn rewrite_lease_releases(effects: &mut [ParsedEffect], rule_body: &str) {
+    let acquires = rule_body
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .starts_with("acquire ")
+                .then(|| binding_after_as(trimmed))
+                .flatten()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    for effect in effects {
+        if effect.kind == "queue.release"
+            && effect
+                .args
+                .first()
+                .is_some_and(|binding| acquires.contains(binding))
+        {
+            effect.kind = "lease.release".to_owned();
+        }
     }
 }
 
@@ -6986,26 +12363,402 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 .to_owned();
             let body = invoke_body(&statement).unwrap_or_default();
             effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
                 kind: "workflow.invoke".to_owned(),
                 target: Some(target),
                 name: Some("invoke".to_owned()),
                 binding: binding_after_as(&statement),
                 args: vec![body],
                 prompt: None,
+                prompt_content_type: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
             index = next_index;
+        } else if let Some(rest) = trimmed.strip_prefix("timer until ") {
+            // Absolute deadline (spec/scheduled-time.md): the operand is a
+            // time literal or a time-typed path resolved from context.
+            let operand = rest
+                .split(" as ")
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .trim_matches('"')
+                .to_owned();
+            let deadline = parse_field_value(&operand, context)
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or(operand);
+            effects.push(ParsedEffect {
+                timeout_seconds: None,
+                kind: "timer.wait".to_owned(),
+                target: None,
+                name: None,
+                binding: binding_after_as(trimmed),
+                args: vec![deadline],
+                prompt: None,
+                prompt_content_type: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
+            index += 1;
+        } else if let Some(rest) = trimmed.strip_prefix("timer ") {
+            let duration = rest.split_whitespace().next().unwrap_or_default();
+            let duration_seconds =
+                whipplescript_parser::body::parse_short_duration_seconds(duration)
+                    .map(|seconds| seconds as i64);
+            effects.push(ParsedEffect {
+                timeout_seconds: duration_seconds,
+                kind: "timer.wait".to_owned(),
+                target: None,
+                name: None,
+                binding: binding_after_as(trimmed),
+                args: vec![duration.to_owned()],
+                prompt: None,
+                prompt_content_type: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
+            index += 1;
+        } else if let Some(rest) = trimmed.strip_prefix("file ") {
+            let (statement, next_index) =
+                parse_statement_until_balanced_braces(&lines, index, trimmed);
+            let queue = rest
+                .strip_prefix("item into ")
+                .and_then(|tail| tail.split_whitespace().next())
+                .unwrap_or_default()
+                .trim_end_matches('{')
+                .to_owned();
+            let body = invoke_body(&statement).unwrap_or_default();
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
+                kind: "queue.file".to_owned(),
+                target: Some(queue),
+                name: None,
+                binding: binding_after_as(&statement),
+                args: vec![body],
+                prompt: None,
+                prompt_content_type: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
+            index = next_index;
+        } else if trimmed.starts_with("claim ") && !trimmed.contains(" with ") {
+            let item = trimmed
+                .strip_prefix("claim ")
+                .unwrap_or_default()
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
+                kind: "queue.claim".to_owned(),
+                target: None,
+                name: None,
+                binding: binding_after_as(trimmed),
+                args: vec![item],
+                prompt: None,
+                prompt_content_type: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
+            index += 1;
+        } else if let Some(rest) = trimmed.strip_prefix("release ") {
+            let item = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            effects.push(ParsedEffect {
+                timeout_seconds: None,
+                kind: "queue.release".to_owned(),
+                target: None,
+                name: None,
+                binding: binding_after_as(trimmed),
+                args: vec![item],
+                prompt: None,
+                prompt_content_type: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
+            index += 1;
+        } else if let Some(rest) = trimmed.strip_prefix("finish ") {
+            let (statement, next_index) = if trimmed.contains('{') {
+                parse_statement_until_balanced_braces(&lines, index, trimmed)
+            } else {
+                (trimmed.to_owned(), index + 1)
+            };
+            let item = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let body = invoke_body(&statement).unwrap_or_default();
+            effects.push(ParsedEffect {
+                timeout_seconds: None,
+                kind: "queue.finish".to_owned(),
+                target: None,
+                name: None,
+                binding: binding_after_as(&statement),
+                args: vec![item, body],
+                prompt: None,
+                prompt_content_type: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
+            index = next_index;
+        } else if let Some(rest) = trimmed.strip_prefix("decide ") {
+            // Inline anonymous coercion: decide "<prompt>" -> { fields } as x.
+            let prompt = rest
+                .strip_prefix('"')
+                .and_then(|tail| tail.split_once('"'))
+                .map(|(prompt, _)| prompt.to_owned())
+                .unwrap_or_default();
+            let shape = trimmed
+                .split_once("->")
+                .and_then(|(_, tail)| tail.split_once('{'))
+                .and_then(|(_, tail)| tail.split_once('}'))
+                .map(|(shape, _)| shape.trim().to_owned())
+                .unwrap_or_default();
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
+                kind: "baml.coerce".to_owned(),
+                target: None,
+                name: Some("decide".to_owned()),
+                binding: binding_after_as(trimmed),
+                args: vec![shape],
+                prompt: Some(interpolate_prompt(&prompt, context)),
+                prompt_content_type: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
+            index += 1;
+        } else if let Some(rest) = trimmed.strip_prefix("exec ") {
+            let mut target = None;
+            let mut name = None;
+            let mut args = Vec::new();
+            let parse_spec = if rest.trim_start().starts_with('"') {
+                // Escape-aware: a JSON-emitting command (`echo '{\"k\": 1}'`)
+                // contains escaped quotes that a naive split would cut at.
+                let (command, after_command) = extract_quoted_string(rest).unwrap_or_default();
+                args.push(command);
+                after_command
+                    .trim_start()
+                    .strip_prefix("->")
+                    .map(str::trim)
+                    .map(str::to_owned)
+            } else {
+                let capability = rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                let stdin_binding = rest
+                    .split_once(" with ")
+                    .map(|(_, tail)| {
+                        tail.split("->")
+                            .next()
+                            .unwrap_or_default()
+                            .split(" as ")
+                            .next()
+                            .unwrap_or_default()
+                            .split(" timeout ")
+                            .next()
+                            .unwrap_or_default()
+                            .trim()
+                            .to_owned()
+                    })
+                    .unwrap_or_default();
+                target = Some(capability);
+                name = Some("capability".to_owned());
+                args.push(stdin_binding);
+                rest.split_once("->")
+                    .map(|(_, tail)| tail.trim().to_owned())
+            };
+            // `-> [each] Schema`: typed stdout ingestion contract
+            // (spec/json-ingestion.md), resolved into the effect input.
+            if let Some(spec) = parse_spec.as_deref().filter(|spec| !spec.is_empty()) {
+                let mut words = spec.split_whitespace();
+                match words.next() {
+                    Some("each") => {
+                        let schema = words.next().unwrap_or_default();
+                        args.push(format!("each {schema}"));
+                    }
+                    Some(schema) => args.push(schema.to_owned()),
+                    None => {}
+                }
+            }
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
+                kind: "exec.command".to_owned(),
+                target,
+                name,
+                binding: binding_after_as(trimmed),
+                args,
+                prompt: None,
+                prompt_content_type: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
+            index += 1;
+        } else if let Some(rest) = trimmed.strip_prefix("notify ") {
+            // notify <instance-expr> event <name> { payload }
+            let (statement, next_index) =
+                parse_statement_until_balanced_braces(&lines, index, trimmed);
+            let target_expr = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let event = statement
+                .split_once(" event ")
+                .map(|(_, tail)| tail)
+                .unwrap_or_default()
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches('{')
+                .to_owned();
+            let fields = statement
+                .split_once('{')
+                .and_then(|(_, tail)| tail.rsplit_once('}'))
+                .map(|(fields, _)| fields.to_owned())
+                .unwrap_or_default();
+            effects.push(ParsedEffect {
+                timeout_seconds: None,
+                kind: "event.notify".to_owned(),
+                target: None,
+                name: Some(event.clone()),
+                binding: binding_after_as(&statement),
+                args: vec![target_expr, event, fields],
+                prompt: None,
+                prompt_content_type: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
+            index = next_index;
+        } else if let Some(rest) = trimmed.strip_prefix("acquire ") {
+            // acquire <lease> for <key-expr> [until ttl] as <slot>
+            let resource = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let key_expr = rest
+                .split_once(" for ")
+                .map(|(_, tail)| tail)
+                .unwrap_or_default()
+                .split(" as ")
+                .next()
+                .unwrap_or_default()
+                .replace(" until ttl", "")
+                .trim()
+                .to_owned();
+            let until_ttl = rest.contains(" until ttl");
+            effects.push(ParsedEffect {
+                timeout_seconds: None,
+                kind: "lease.acquire".to_owned(),
+                target: Some(resource),
+                name: None,
+                binding: binding_after_as(trimmed),
+                args: vec![key_expr, until_ttl.to_string()],
+                prompt: None,
+                prompt_content_type: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
+            index += 1;
+        } else if let Some(rest) = trimmed.strip_prefix("append ") {
+            // append <Schema> { fields } to <ledger> [as x]
+            let (statement, next_index) =
+                parse_statement_until_balanced_braces(&lines, index, trimmed);
+            let schema = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let fields = statement
+                .split_once('{')
+                .and_then(|(_, tail)| tail.rsplit_once('}'))
+                .map(|(fields, _)| fields.to_owned())
+                .unwrap_or_default();
+            let ledger = statement
+                .rsplit_once(" to ")
+                .map(|(_, tail)| {
+                    tail.split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .unwrap_or_default();
+            effects.push(ParsedEffect {
+                timeout_seconds: None,
+                kind: "ledger.append".to_owned(),
+                target: Some(ledger),
+                name: None,
+                binding: binding_after_as(&statement),
+                args: vec![schema, fields],
+                prompt: None,
+                prompt_content_type: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
+            index = next_index;
+        } else if trimmed.starts_with("consume ")
+            && trimmed.contains(" for ")
+            && trimmed.contains(" amount ")
+        {
+            // consume <counter> for <key-expr> amount <expr> as <binding>
+            let rest = trimmed.strip_prefix("consume ").unwrap_or_default();
+            let counter = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let key_expr = rest
+                .split_once(" for ")
+                .map(|(_, tail)| tail)
+                .unwrap_or_default()
+                .split(" amount ")
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let amount_expr = rest
+                .split_once(" amount ")
+                .map(|(_, tail)| tail)
+                .unwrap_or_default()
+                .split(" as ")
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            effects.push(ParsedEffect {
+                timeout_seconds: None,
+                kind: "counter.consume".to_owned(),
+                target: Some(counter),
+                name: None,
+                binding: binding_after_as(trimmed),
+                args: vec![key_expr, amount_expr],
+                prompt: None,
+                prompt_content_type: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
+            index += 1;
         } else if let Some(rest) = trimmed.strip_prefix("tell ") {
             let target_expr = rest.split_whitespace().next().unwrap_or("agent");
             let (prompt, next_index) = parse_prompt_from_lines(&lines, index, trimmed);
             effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
                 kind: "agent.tell".to_owned(),
                 target: Some(resolve_tell_target(target_expr, context)),
                 name: None,
                 binding: binding_after_as(trimmed),
                 args: Vec::new(),
-                prompt: Some(interpolate_prompt(&prompt, context)),
+                prompt: Some(interpolate_prompt(&prompt.text, context)),
+                prompt_content_type: prompt.content_type,
                 required_capabilities: parse_required_capabilities(trimmed),
                 after: current_after,
             });
@@ -7022,36 +12775,60 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 .map(split_args)
                 .unwrap_or_default();
             effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
                 kind: "baml.coerce".to_owned(),
                 target: Some(name.to_owned()),
                 name: Some(name.to_owned()),
                 binding: binding_after_as(trimmed),
                 args,
                 prompt: None,
+                prompt_content_type: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
             index = next_index;
         } else if trimmed.starts_with("claim ") && trimmed.contains(" with loft") {
             effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
                 kind: "loft.claim".to_owned(),
                 target: Some("loft".to_owned()),
                 name: Some("claim".to_owned()),
                 binding: binding_after_as(trimmed),
                 args: Vec::new(),
                 prompt: None,
+                prompt_content_type: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
         } else if trimmed.starts_with("askHuman ") {
             let (prompt, next_index) = parse_prompt_from_lines(&lines, index, trimmed);
+            // Typed choices declared in source drive the inbox options.
+            let choices = trimmed
+                .split_once("choices ")
+                .and_then(|(_, tail)| tail.split_once('['))
+                .and_then(|(_, tail)| tail.split_once(']'))
+                .map(|(inner, _)| {
+                    inner
+                        .split(',')
+                        .filter_map(|value| {
+                            value
+                                .trim()
+                                .strip_prefix('"')
+                                .and_then(|v| v.strip_suffix('"'))
+                        })
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
                 kind: "human.ask".to_owned(),
                 target: Some("human".to_owned()),
                 name: Some("askHuman".to_owned()),
                 binding: binding_after_as(trimmed),
-                args: Vec::new(),
-                prompt: Some(interpolate_prompt(&prompt, context)),
+                args: choices,
+                prompt: Some(interpolate_prompt(&prompt.text, context)),
+                prompt_content_type: prompt.content_type,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -7063,12 +12840,14 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 .unwrap_or("plugin")
                 .to_owned();
             effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
                 kind: "capability.call".to_owned(),
                 target: Some(target),
                 name: Some("call".to_owned()),
                 binding: binding_after_as(trimmed),
                 args: Vec::new(),
                 prompt: None,
+                prompt_content_type: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -7079,12 +12858,14 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 .unwrap_or("event.emitted")
                 .to_owned();
             effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
                 kind: "event.emit".to_owned(),
                 target: Some(event_type),
                 name: Some("emit".to_owned()),
                 binding: binding_after_as(trimmed),
                 args: Vec::new(),
                 prompt: None,
+                prompt_content_type: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -7194,6 +12975,7 @@ fn parsed_effect_input_json(
         }),
         "baml.coerce" => {
             let function_name = effect.name.as_deref().unwrap_or("coerce");
+            let coerce_prompt = coerce_prompt_from_ir(ir, function_name);
             let output_type = ir
                 .coerces
                 .iter()
@@ -7204,24 +12986,277 @@ fn parsed_effect_input_json(
             for (index, arg) in effect.args.iter().enumerate() {
                 arguments.insert(format!("arg{index}"), parse_field_value(arg, context));
             }
-            json!({
+            let mut input = json!({
                 "function_name": function_name,
                 "arguments": Value::Object(arguments),
                 "argument_exprs": effect.args,
                 "output_type": output_type,
                 "bindings": context_bindings_json(context),
                 "rule": rule.name,
-            })
+            });
+            // Sum-type output (spec/sum-types.md): embed deterministic
+            // per-variant fixture values so a fixture run returns a tagged
+            // variant (first declared by default; `--variant` selects an
+            // arm) without the worker needing the IR.
+            if let Some(decl) = ir.schemas.iter().find_map(|schema| match schema {
+                IrSchema::Enum(decl) if decl.name == output_type => Some(decl),
+                _ => None,
+            }) {
+                let has_payloads = ir.schemas.iter().any(|schema| {
+                    matches!(schema, IrSchema::Class(class)
+                        if class.name.starts_with(&format!("{}.", decl.name)))
+                });
+                if has_payloads {
+                    let mut fixtures = serde_json::Map::new();
+                    for variant in &decl.variants {
+                        let generated = format!("{}.{variant}", decl.name);
+                        let value = if ir.schemas.iter().any(|schema| {
+                            matches!(schema, IrSchema::Class(class) if class.name == generated)
+                        }) {
+                            fixture_value_for_shape(&ingest_shape_json(
+                                ir,
+                                &IrType::Ref(generated),
+                                0,
+                            ))
+                        } else {
+                            Value::String(variant.clone())
+                        };
+                        fixtures.insert(variant.clone(), value);
+                    }
+                    if let Some(object) = input.as_object_mut() {
+                        object.insert("fixture_variants".to_owned(), Value::Object(fixtures));
+                        if let Some(first) = decl.variants.first() {
+                            object
+                                .insert("fixture_default".to_owned(), Value::String(first.clone()));
+                        }
+                    }
+                }
+            }
+            if let Some(prompt) = coerce_prompt {
+                if let Some(object) = input.as_object_mut() {
+                    object.insert("prompt_template".to_owned(), Value::String(prompt.text));
+                    if let Some(content_type) = prompt.content_type {
+                        object.insert(
+                            "prompt_content_type".to_owned(),
+                            Value::String(content_type),
+                        );
+                    }
+                }
+            }
+            input
         }
         "loft.claim" => json!({
             "action": "claim",
             "issue": context_bindings_json(context),
             "rule": rule.name,
         }),
-        "human.ask" => json!({
-            "prompt": effect.prompt.as_deref().unwrap_or_default(),
-            "choices": ["accept", "revise", "block"],
-            "severity": "normal",
+        "human.ask" => {
+            let choices = if effect.args.is_empty() {
+                json!(["accept", "revise", "block"])
+            } else {
+                json!(effect.args)
+            };
+            json!({
+                "prompt": effect.prompt.as_deref().unwrap_or_default(),
+                "choices": choices,
+                "severity": "normal",
+                "rule": rule.name,
+            })
+        }
+        "queue.file" => {
+            let fields = parse_record_fields(
+                effect.args.first().map(String::as_str).unwrap_or_default(),
+                context,
+                None,
+                errors,
+            );
+            json!({
+                "queue": effect.target,
+                "item": Value::Object(fields),
+                "rule": rule.name,
+            })
+        }
+        "queue.claim" | "queue.release" | "queue.finish" => {
+            let binding = effect.args.first().map(String::as_str).unwrap_or_default();
+            let item = parse_field_value(binding, context);
+            let mut input = json!({
+                "queue": item.get("queue").cloned().unwrap_or(Value::Null),
+                "id": item.get("id").cloned().unwrap_or(Value::Null),
+                "rule": rule.name,
+            });
+            if effect.kind == "queue.finish" {
+                let fields = parse_record_fields(
+                    effect.args.get(1).map(String::as_str).unwrap_or_default(),
+                    context,
+                    None,
+                    errors,
+                );
+                insert_json_field(&mut input, "payload", Value::Object(fields));
+            }
+            input
+        }
+        "event.notify" => {
+            let event_name = effect.args.get(1).cloned().unwrap_or_default();
+            let event = ir.events.iter().find(|event| event.name == event_name);
+            if event.is_none() {
+                errors.push(format!("notify of undeclared event `{event_name}`"));
+            }
+            let target = parse_field_value(
+                effect.args.first().map(String::as_str).unwrap_or_default(),
+                context,
+            );
+            let payload = Value::Object(parse_record_fields(
+                effect.args.get(2).map(String::as_str).unwrap_or_default(),
+                context,
+                None,
+                errors,
+            ));
+            let shape = event
+                .map(|event| ingest_shape_json(ir, &IrType::Object(event.fields.clone()), 0))
+                .unwrap_or(Value::Null);
+            json!({
+                "target_instance": coordination_key_string(&target),
+                "event": event_name,
+                "payload": payload,
+                "shape": shape,
+                "rule": rule.name,
+            })
+        }
+        "lease.acquire" => {
+            let lease = ir
+                .leases
+                .iter()
+                .find(|lease| Some(&lease.name) == effect.target.as_ref());
+            if lease.is_none() {
+                errors.push(format!(
+                    "acquire of undeclared lease `{}`",
+                    effect.target.as_deref().unwrap_or_default()
+                ));
+            }
+            let key = parse_field_value(
+                effect.args.first().map(String::as_str).unwrap_or_default(),
+                context,
+            );
+            json!({
+                "resource": effect.target,
+                "key": coordination_key_string(&key),
+                "slots": lease.map(|lease| lease.slots).unwrap_or(1),
+                "ttl_seconds": lease.map(|lease| lease.ttl_seconds).unwrap_or(600),
+                "until_ttl": effect.args.get(1).map(String::as_str) == Some("true"),
+                "rule": rule.name,
+            })
+        }
+        "lease.release" => json!({
+            "acquire_effect_id": effect
+                .args
+                .first()
+                .and_then(|binding| effect_bindings.get(binding)),
+            "rule": rule.name,
+        }),
+        "ledger.append" => {
+            let ledger = ir
+                .ledgers
+                .iter()
+                .find(|ledger| Some(&ledger.name) == effect.target.as_ref());
+            if ledger.is_none() {
+                errors.push(format!(
+                    "append to undeclared ledger `{}`",
+                    effect.target.as_deref().unwrap_or_default()
+                ));
+            }
+            let entry = Value::Object(parse_record_fields(
+                effect.args.get(1).map(String::as_str).unwrap_or_default(),
+                context,
+                None,
+                errors,
+            ));
+            let partition = ledger
+                .and_then(|ledger| entry.get(&ledger.partition_field))
+                .map(coordination_key_string)
+                .unwrap_or_default();
+            json!({
+                "ledger": effect.target,
+                "schema": effect.args.first().cloned().unwrap_or_default(),
+                "entry": entry,
+                "partition": partition,
+                "retain_seconds": ledger.map(|ledger| ledger.retain_seconds).unwrap_or(86400),
+                "rule": rule.name,
+            })
+        }
+        "counter.consume" => {
+            let counter = ir
+                .counters
+                .iter()
+                .find(|counter| Some(&counter.name) == effect.target.as_ref());
+            if counter.is_none() {
+                errors.push(format!(
+                    "consume of undeclared counter `{}`",
+                    effect.target.as_deref().unwrap_or_default()
+                ));
+            }
+            let key = parse_field_value(
+                effect.args.first().map(String::as_str).unwrap_or_default(),
+                context,
+            );
+            let amount = parse_field_value(
+                effect.args.get(1).map(String::as_str).unwrap_or_default(),
+                context,
+            );
+            json!({
+                "counter": effect.target,
+                "key": coordination_key_string(&key),
+                "amount": amount.as_i64().unwrap_or(0),
+                "cap": counter.map(|counter| counter.cap).unwrap_or(0),
+                "reset": counter.map(|counter| counter.reset.clone()).unwrap_or_else(|| "daily".to_owned()),
+                "rule": rule.name,
+            })
+        }
+        "exec.command" => {
+            let mut input = if effect.name.as_deref() == Some("capability") {
+                let stdin_expr = effect.args.first().map(String::as_str).unwrap_or_default();
+                json!({
+                    "mode": "capability",
+                    "capability": effect.target,
+                    "stdin": parse_field_value(stdin_expr, context),
+                    "stdin_binding": stdin_expr,
+                    "rule": rule.name,
+                })
+            } else {
+                json!({
+                    "mode": "raw",
+                    "command": effect.args.first().cloned().unwrap_or_default(),
+                    "rule": rule.name,
+                })
+            };
+            let parse_spec_index = if effect.name.as_deref() == Some("capability") {
+                1
+            } else {
+                1
+            };
+            if let Some(spec) = effect.args.get(parse_spec_index) {
+                let (each, schema) = match spec.strip_prefix("each ") {
+                    Some(schema) => (true, schema),
+                    None => (false, spec.as_str()),
+                };
+                insert_json_field(
+                    &mut input,
+                    "parse",
+                    json!({
+                        "schema": schema,
+                        "each": each,
+                        "shape": ingest_shape_json(ir, &IrType::Ref(schema.to_owned()), 0),
+                    }),
+                );
+            }
+            input
+        }
+        "timer.wait" if effect.timeout_seconds.is_none() => json!({
+            "deadline_at": effect.args.first().cloned().unwrap_or_default(),
+            "rule": rule.name,
+        }),
+        "timer.wait" => json!({
+            "duration": effect.args.first().cloned().unwrap_or_default(),
+            "duration_seconds": effect.timeout_seconds,
             "rule": rule.name,
         }),
         "capability.call" => json!({
@@ -7263,7 +13298,32 @@ fn parsed_effect_input_json(
             }
         }
     }
+    if matches!(effect.kind.as_str(), "agent.tell" | "human.ask") {
+        if let Some(content_type) = &effect.prompt_content_type {
+            if let Some(object) = input.as_object_mut() {
+                object.insert(
+                    "prompt_content_type".to_owned(),
+                    Value::String(content_type.clone()),
+                );
+            }
+        }
+    }
     input.to_string()
+}
+
+fn coerce_prompt_from_ir(ir: &IrProgram, function_name: &str) -> Option<ParsedPrompt> {
+    let coerce = ir
+        .coerces
+        .iter()
+        .find(|coerce| coerce.name == function_name)?;
+    let lines = coerce.body.lines().collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("prompt ") || trimmed == "prompt" {
+            return Some(parse_prompt_from_lines(&lines, index, trimmed).0);
+        }
+    }
+    None
 }
 
 fn parse_after_scope(trimmed: &str) -> Option<AfterScope> {
@@ -7286,14 +13346,21 @@ fn binding_after_as(line: &str) -> Option<String> {
     None
 }
 
-fn parse_prompt_from_lines(lines: &[&str], index: usize, trimmed: &str) -> (String, usize) {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedPrompt {
+    text: String,
+    content_type: Option<String>,
+}
+
+fn parse_prompt_from_lines(lines: &[&str], index: usize, trimmed: &str) -> (ParsedPrompt, usize) {
     if trimmed.contains("\"\"\"") {
         let mut prompt_lines = Vec::new();
         let after_open = trimmed
             .split_once("\"\"\"")
             .map(|(_, tail)| tail)
             .unwrap_or("");
-        if !after_open.is_empty() {
+        let content_type = prompt_content_type_from_opening_tail(after_open);
+        if !after_open.is_empty() && content_type.is_none() {
             prompt_lines.push(after_open.to_owned());
         }
         let mut cursor = index + 1;
@@ -7301,19 +13368,66 @@ fn parse_prompt_from_lines(lines: &[&str], index: usize, trimmed: &str) -> (Stri
             let line = lines[cursor];
             if let Some((head, _tail)) = line.split_once("\"\"\"") {
                 prompt_lines.push(head.to_owned());
-                return (prompt_lines.join("\n").trim().to_owned(), cursor);
+                return (
+                    ParsedPrompt {
+                        text: prompt_lines.join("\n").trim().to_owned(),
+                        content_type,
+                    },
+                    cursor,
+                );
             }
             prompt_lines.push(line.to_owned());
             cursor += 1;
         }
-        return (prompt_lines.join("\n").trim().to_owned(), cursor);
+        return (
+            ParsedPrompt {
+                text: prompt_lines.join("\n").trim().to_owned(),
+                content_type,
+            },
+            cursor,
+        );
     }
     let prompt = trimmed
         .split_once('"')
         .and_then(|(_, tail)| tail.rsplit_once('"').map(|(prompt, _)| prompt))
         .unwrap_or("")
         .to_owned();
-    (prompt, index)
+    (
+        ParsedPrompt {
+            text: prompt,
+            content_type: None,
+        },
+        index,
+    )
+}
+
+fn prompt_content_type_from_opening_tail(after_open: &str) -> Option<String> {
+    let candidate = after_open.trim();
+    if candidate.is_empty() || candidate.contains("\"\"\"") {
+        return None;
+    }
+    is_supported_prompt_content_type(candidate).then(|| candidate.to_ascii_lowercase())
+}
+
+fn is_supported_prompt_content_type(candidate: &str) -> bool {
+    if !is_prompt_content_type_token(candidate) {
+        return false;
+    }
+    let normalized = candidate.to_ascii_lowercase();
+    normalized.contains('/')
+        || matches!(
+            normalized.as_str(),
+            "markdown" | "json" | "text" | "plain" | "html" | "xml" | "yaml" | "yml"
+        )
+}
+
+fn is_prompt_content_type_token(candidate: &str) -> bool {
+    let mut chars = candidate.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '+' | '-' | '_'))
 }
 
 fn split_args(args: &str) -> Vec<String> {
@@ -7357,16 +13471,20 @@ fn dependency_predicate_str(predicate: &IrDependencyPredicate) -> &'static str {
 }
 
 fn normalize_pattern_name(pattern: &str) -> String {
-    if pattern.starts_with("loft has ready issue") {
-        return "LoftIssue".to_owned();
+    whipplescript_parser::runtime_fact_name_for_pattern(pattern)
+        .unwrap_or_else(|| pattern.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// Matches `<agent-or-worker> completed turn ...` readiness patterns and
+/// returns the leading word. `worker` is the generic form (any agent).
+fn completed_turn_agent(pattern: &str) -> Option<&str> {
+    let mut words = pattern.split_whitespace();
+    let first = words.next()?;
+    if words.next() == Some("completed") && words.next() == Some("turn") {
+        Some(first)
+    } else {
+        None
     }
-    if pattern.starts_with("worker completed turn") {
-        return "AgentTurn".to_owned();
-    }
-    if pattern.starts_with("human answered") {
-        return "HumanAnswer".to_owned();
-    }
-    pattern.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn ir_type_name(ty: &IrType) -> String {
@@ -7435,6 +13553,16 @@ fn top_level_record_blocks(body: &str) -> Vec<RecordBlock> {
                 index += 1;
                 continue;
             };
+            // Inline form: the block opens and closes on the statement line.
+            if let Some(body) = inline_block_body(trimmed) {
+                blocks.push(RecordBlock {
+                    schema,
+                    from_binding,
+                    body,
+                });
+                index += 1;
+                continue;
+            }
             let mut record_lines = Vec::new();
             let mut depth = brace_delta(trimmed);
             index += 1;
@@ -7457,6 +13585,17 @@ fn top_level_record_blocks(body: &str) -> Vec<RecordBlock> {
         index += 1;
     }
     blocks
+}
+
+/// Extracts the inner text of a `{ ... }` block that opens and closes on the
+/// same statement line, e.g. `complete result { total 2 }`.
+fn inline_block_body(line: &str) -> Option<String> {
+    let open = line.find('{')?;
+    let close = line.rfind('}')?;
+    if close <= open || brace_delta(line) != 0 {
+        return None;
+    }
+    Some(line[open + 1..close].trim().to_owned())
 }
 
 fn top_level_terminal_blocks(body: &str) -> Vec<TerminalBlock> {
@@ -7498,6 +13637,11 @@ fn top_level_terminal_blocks(body: &str) -> Vec<TerminalBlock> {
             index += 1;
             continue;
         };
+        if let Some(body) = inline_block_body(trimmed) {
+            blocks.push(TerminalBlock { kind, name, body });
+            index += 1;
+            continue;
+        }
         let mut block_lines = Vec::new();
         let mut depth = brace_delta(trimmed);
         index += 1;
@@ -7648,6 +13792,15 @@ fn fact_matches_after_predicate(name: &str, payload: &Value, predicate: &str) ->
                 || status == Some("completed")
         }
         "fails" => name.ends_with(".failed") || matches!(status, Some("failed" | "timed_out")),
+        // Coordination outcomes (spec/coordination.md): the op completed and
+        // its sum-typed value carries the matching variant.
+        "held" | "contended" | "ok" | "over" => {
+            status == Some("completed")
+                && payload
+                    .pointer("/value/variant")
+                    .and_then(Value::as_str)
+                    .is_some_and(|variant| variant.eq_ignore_ascii_case(predicate))
+        }
         "completes" => {
             name.ends_with(".succeeded")
                 || name.ends_with(".failed")
@@ -7716,15 +13869,21 @@ fn parse_record_field_value(
             return Value::Null;
         }
     }
-    if let Some((binding, field)) = value.split_once('.') {
-        if context
-            .bindings
-            .iter()
-            .any(|(candidate, _)| candidate == binding)
-            && context_field_value(context, binding, field).is_none()
-        {
-            errors.push(format!("could not resolve `{value}`"));
-            return Value::Null;
+    let is_plain_path = value.contains('.')
+        && value
+            .split('.')
+            .all(|segment| !segment.is_empty() && is_identifier(segment));
+    if is_plain_path {
+        if let Some((binding, field)) = value.split_once('.') {
+            if context
+                .bindings
+                .iter()
+                .any(|(candidate, _)| candidate == binding)
+                && context_field_value(context, binding, field).is_none()
+            {
+                errors.push(format!("could not resolve `{value}`"));
+                return Value::Null;
+            }
         }
     }
     parse_field_value(value, context)
@@ -7779,6 +13938,30 @@ fn parse_field_value(value: &str, context: &RuleContext) -> Value {
     if value == "null" {
         return Value::Null;
     }
+    // Variant construction `Approved { score 0.9 }` builds the
+    // internally-tagged record (spec/sum-types.md); the author never writes
+    // the discriminant.
+    if let Some((head, rest)) = value.split_once('{') {
+        let head = head.trim();
+        let rest = rest.trim_end();
+        if is_identifier(head)
+            && head
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase())
+            && rest.ends_with('}')
+        {
+            let inner = &rest[..rest.len() - 1];
+            let mut object = serde_json::Map::new();
+            object.insert("variant".to_owned(), Value::String(head.to_owned()));
+            let mut nested_errors = Vec::new();
+            for (name, field_value) in parse_record_fields(inner, context, None, &mut nested_errors)
+            {
+                object.insert(name, field_value);
+            }
+            return Value::Object(object);
+        }
+    }
     if let Ok(number) = value.parse::<i64>() {
         return Value::Number(number.into());
     }
@@ -7828,39 +14011,21 @@ enum FieldAssignment {
 }
 
 fn collect_field_assignments(body: &str) -> Vec<FieldAssignment> {
-    let lines = body.lines().collect::<Vec<_>>();
-    let mut assignments = Vec::new();
-    let mut index = 0usize;
-    while index < lines.len() {
-        let trimmed = lines[index].trim().trim_end_matches(',');
-        if trimmed.is_empty() || trimmed == "}" {
-            index += 1;
-            continue;
-        }
-        let Some((name, value)) = trimmed.split_once(char::is_whitespace) else {
-            if is_identifier(trimmed) {
-                assignments.push(FieldAssignment::Shorthand {
-                    name: trimmed.to_owned(),
-                });
-            }
-            index += 1;
-            continue;
-        };
-        let mut value_lines = vec![value.trim().to_owned()];
-        let mut depth = brace_delta(value.trim());
-        index += 1;
-        while depth > 0 && index < lines.len() {
-            let next = lines[index].trim().trim_end_matches(',');
-            depth += brace_delta(next);
-            value_lines.push(next.to_owned());
-            index += 1;
-        }
-        assignments.push(FieldAssignment::Value {
-            name: name.to_owned(),
-            value: value_lines.join(" "),
-        });
-    }
-    assignments
+    // Token-level splitting: structure comes from tokens, never line breaks,
+    // so single-line blocks (`{ id "a" status "done" }`) and multi-line
+    // blocks behave identically.
+    whipplescript_parser::body::split_field_assignments(body)
+        .into_iter()
+        .map(|assignment| match assignment.value {
+            Some(value) => FieldAssignment::Value {
+                name: assignment.name,
+                value,
+            },
+            None => FieldAssignment::Shorthand {
+                name: assignment.name,
+            },
+        })
+        .collect()
 }
 
 fn interpolate_prompt(prompt: &str, context: &RuleContext) -> String {
@@ -7964,19 +14129,47 @@ fn guard_report_to_json(report: &GuardReport) -> Value {
 
 fn assertion_report_to_json(report: &AssertionReport) -> Value {
     let mut value = json!({
+        "target_id": report.target_id,
         "expr": report.expr,
+        "reads": assertion_reads_to_json(&report.reads),
+        "tags": report.tags,
         "status": report.status.as_str(),
         "passed": report.passed,
         "actual": report.actual,
         "actual_values": report.actual_values,
         "expected": report.expected,
     });
+    if let Some(event_id) = &report.event_id {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("event_id".to_owned(), Value::String(event_id.clone()));
+        }
+    }
+    if !report.diagnostic_ids.is_empty() {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "diagnostic_ids".to_owned(),
+                Value::Array(
+                    report
+                        .diagnostic_ids
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+        }
+    }
     if let Some(failure_reason) = &report.failure_reason {
         if let Some(object) = value.as_object_mut() {
             object.insert(
                 "failure_reason".to_owned(),
                 Value::String(failure_reason.clone()),
             );
+        }
+    }
+    if let Some(description) = &report.description {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("description".to_owned(), Value::String(description.clone()));
         }
     }
     if let Some(error) = &report.error {
@@ -7987,6 +14180,200 @@ fn assertion_report_to_json(report: &AssertionReport) -> Value {
     if let Some(source_span_json) = &report.source_span_json {
         if let Some(object) = value.as_object_mut() {
             object.insert("source_span".to_owned(), json_from_str(source_span_json));
+        }
+    }
+    value
+}
+
+fn assertion_reads_to_json(reads: &[AssertionReadReport]) -> Value {
+    Value::Array(reads.iter().map(assertion_read_to_json).collect::<Vec<_>>())
+}
+
+fn assertion_read_to_json(read: &AssertionReadReport) -> Value {
+    let mut value = json!({
+        "kind": read.kind,
+        "head": read.head,
+        "source": read.source,
+        "match_count": read.match_count,
+        "matches": read.matches.iter().map(assertion_read_match_to_json).collect::<Vec<_>>(),
+    });
+    if let Some(guard) = &read.guard {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("guard".to_owned(), Value::String(guard.clone()));
+        }
+    }
+    if let Some(error) = &read.error {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("error".to_owned(), Value::String(error.clone()));
+        }
+    }
+    value
+}
+
+fn assertion_read_match_to_json(match_report: &AssertionReadMatch) -> Value {
+    let mut value = json!({
+        "id": match_report.id,
+        "name": match_report.name,
+    });
+    if let Some(key) = &match_report.key {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("key".to_owned(), Value::String(key.clone()));
+        }
+    }
+    if let Some(status) = &match_report.status {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("status".to_owned(), Value::String(status.clone()));
+        }
+    }
+    if let Some(prompt_content_type) = &match_report.prompt_content_type {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "prompt_content_type".to_owned(),
+                Value::String(prompt_content_type.clone()),
+            );
+        }
+    }
+    if let Some(provenance_class) = &match_report.provenance_class {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "provenance_class".to_owned(),
+                Value::String(provenance_class.clone()),
+            );
+        }
+    }
+    if let Some(source_span_json) = &match_report.source_span_json {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("source_span".to_owned(), json_from_str(source_span_json));
+        }
+    }
+    value
+}
+
+fn executable_spec_report_to_json(assertions: &[AssertionReport]) -> Value {
+    let mut tag_groups = BTreeMap::<String, Vec<&AssertionReport>>::new();
+    let mut untagged = Vec::new();
+    for assertion in assertions {
+        if assertion.tags.is_empty() {
+            untagged.push(assertion);
+        } else {
+            for tag in &assertion.tags {
+                tag_groups.entry(tag.clone()).or_default().push(assertion);
+            }
+        }
+    }
+
+    let mut value = json!({
+        "status": assertion_group_status(assertions),
+        "summary": assertion_group_summary(assertions),
+        "tags": tag_groups
+            .iter()
+            .map(|(tag, assertions)| {
+                json!({
+                    "tag": tag,
+                    "status": assertion_group_status(assertions.iter().copied()),
+                    "summary": assertion_group_summary(assertions.iter().copied()),
+                    "assertions": assertions
+                        .iter()
+                        .map(|assertion| executable_spec_assertion_json(assertion))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+
+    if !untagged.is_empty() {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "untagged".to_owned(),
+                json!({
+                    "status": assertion_group_status(untagged.iter().copied()),
+                    "summary": assertion_group_summary(untagged.iter().copied()),
+                    "assertions": untagged
+                        .iter()
+                        .map(|assertion| executable_spec_assertion_json(assertion))
+                        .collect::<Vec<_>>(),
+                }),
+            );
+        }
+    }
+
+    value
+}
+
+fn assertion_group_status<'a, I>(assertions: I) -> &'static str
+where
+    I: IntoIterator<Item = &'a AssertionReport>,
+{
+    let mut saw_failed = false;
+    for assertion in assertions {
+        match assertion.status {
+            AssertionStatus::Error => return "error",
+            AssertionStatus::Failed => saw_failed = true,
+            AssertionStatus::Passed => {}
+        }
+    }
+    if saw_failed {
+        "failed"
+    } else {
+        "passed"
+    }
+}
+
+fn assertion_group_summary<'a, I>(assertions: I) -> Value
+where
+    I: IntoIterator<Item = &'a AssertionReport>,
+{
+    let mut total = 0usize;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut error = 0usize;
+    for assertion in assertions {
+        total += 1;
+        match assertion.status {
+            AssertionStatus::Passed => passed += 1,
+            AssertionStatus::Failed => failed += 1,
+            AssertionStatus::Error => error += 1,
+        }
+    }
+    json!({
+        "total": total,
+        "passed": passed,
+        "failed": failed,
+        "error": error,
+    })
+}
+
+fn executable_spec_assertion_json(report: &AssertionReport) -> Value {
+    let mut value = json!({
+        "target_id": report.target_id,
+        "expr": report.expr,
+        "reads": assertion_reads_to_json(&report.reads),
+        "status": report.status.as_str(),
+        "passed": report.passed,
+    });
+    if let Some(event_id) = &report.event_id {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("event_id".to_owned(), Value::String(event_id.clone()));
+        }
+    }
+    if !report.diagnostic_ids.is_empty() {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "diagnostic_ids".to_owned(),
+                Value::Array(
+                    report
+                        .diagnostic_ids
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+        }
+    }
+    if let Some(description) = &report.description {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("description".to_owned(), Value::String(description.clone()));
         }
     }
     value
@@ -8201,6 +14588,17 @@ fn status(options: &CliOptions) -> ExitCode {
             status.failure_count,
             status.cancellation_request_count
         );
+        if let Ok(pending) = store.pending_time_effects(instance_id) {
+            if !pending.is_empty() {
+                println!("pending time effects:");
+                for effect in pending {
+                    println!(
+                        "  {} {} due_in<= {}s (status={})",
+                        effect.effect_id, effect.kind, effect.timeout_seconds, effect.status
+                    );
+                }
+            }
+        }
         if status.recent_events.is_empty() {
             println!("recent events: none");
         } else {
@@ -8448,27 +14846,197 @@ fn artifacts(options: &CliOptions) -> ExitCode {
     }
 }
 
-fn inbox(options: &CliOptions) -> ExitCode {
-    match options.args.first().map(String::as_str) {
-        None => inbox_list(options),
-        Some("show") => inbox_show(options),
-        Some("answer") => inbox_answer(options),
+fn items(options: &CliOptions) -> ExitCode {
+    use whipplescript_store::items::WorkItemStore;
+    let usage = "usage: whip items [list [--queue Q] [--status S]|add --queue Q --title T [--body B] [--label L]...|show <id>]";
+    let args = &options.args;
+    let command = args.first().map(String::as_str).unwrap_or("list");
+    let store = match WorkItemStore::open(items_store_path()) {
+        Ok(store) => store,
+        Err(error) => return report_store_error("failed to open items store", error),
+    };
+    match command {
+        "list" => {
+            let mut queue = None;
+            let mut status = None;
+            let mut iter = args.iter().skip(1);
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--queue" => queue = iter.next().cloned(),
+                    "--status" => status = iter.next().cloned(),
+                    _ => {
+                        eprintln!("{usage}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let listed = match store.list_items(queue.as_deref(), status.as_deref()) {
+                Ok(items) => items,
+                Err(error) => return report_store_error("failed to list items", error),
+            };
+            if options.json {
+                return emit_json(Value::Array(
+                    listed.iter().map(work_item_to_json).collect::<Vec<_>>(),
+                ));
+            }
+            if listed.is_empty() {
+                println!("no items");
+            }
+            for item in listed {
+                println!(
+                    "{} [{}] queue={} {}{}",
+                    item.id,
+                    item.status,
+                    item.queue,
+                    item.title,
+                    item.claimed_by
+                        .as_deref()
+                        .map(|claimed| format!(" (claimed by {claimed})"))
+                        .unwrap_or_default()
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        "add" => {
+            let mut queue = None;
+            let mut title = None;
+            let mut item_body = String::new();
+            let mut labels = Vec::new();
+            let mut iter = args.iter().skip(1);
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--queue" => queue = iter.next().cloned(),
+                    "--title" => title = iter.next().cloned(),
+                    "--body" => item_body = iter.next().cloned().unwrap_or_default(),
+                    "--label" => {
+                        if let Some(label) = iter.next() {
+                            labels.push(label.clone());
+                        }
+                    }
+                    _ => {
+                        eprintln!("{usage}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let (Some(queue), Some(title)) = (queue, title) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            // Run-identity provenance: anything filed from inside a turn is
+            // attributed to the exact turn that produced it.
+            let filed_by = ["WHIPPLESCRIPT_RUN_ID", "WHIPPLESCRIPT_INSTANCE_ID"]
+                .iter()
+                .filter_map(|name| env::var(name).ok().map(|value| format!("{name}={value}")))
+                .collect::<Vec<_>>()
+                .join(",");
+            let filed_by = (!filed_by.is_empty()).then_some(filed_by);
+            let mut store = store;
+            match store.file_item(
+                &queue,
+                &title,
+                &item_body,
+                &labels,
+                &json!({}),
+                filed_by.as_deref(),
+            ) {
+                Ok(item) => {
+                    if options.json {
+                        emit_json(work_item_to_json(&item))
+                    } else {
+                        println!("{} filed into {}", item.id, item.queue);
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(error) => report_store_error("failed to file item", error),
+            }
+        }
+        "show" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.get_item(id) {
+                Ok(Some(item)) => {
+                    if options.json {
+                        emit_json(work_item_to_json(&item))
+                    } else {
+                        println!("{} [{}] queue={}", item.id, item.status, item.queue);
+                        println!("title: {}", item.title);
+                        if !item.body.is_empty() {
+                            println!("body: {}", item.body);
+                        }
+                        if !item.labels.is_empty() {
+                            println!("labels: {}", item.labels.join(", "));
+                        }
+                        if let Some(claimed) = &item.claimed_by {
+                            println!("claimed by: {claimed}");
+                        }
+                        if let Some(filed) = &item.filed_by {
+                            println!("filed by: {filed}");
+                        }
+                        ExitCode::SUCCESS
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("item `{id}` was not found");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to load item", error),
+            }
+        }
         _ => {
-            eprintln!("usage: whip inbox [show <item>|answer <item> (--choice X|--text X)]");
+            eprintln!("{usage}");
             ExitCode::from(2)
         }
     }
 }
 
-fn inbox_list(options: &CliOptions) -> ExitCode {
+fn work_item_to_json(item: &whipplescript_store::items::WorkItem) -> Value {
+    json!({
+        "id": item.id,
+        "queue": item.queue,
+        "title": item.title,
+        "body": item.body,
+        "status": item.status,
+        "labels": item.labels,
+        "metadata": item.metadata,
+        "claimed_by": item.claimed_by,
+        "filed_by": item.filed_by,
+        "created_at": item.created_at,
+        "updated_at": item.updated_at,
+    })
+}
+
+fn inbox(options: &CliOptions) -> ExitCode {
+    match options.args.first().map(String::as_str) {
+        None => inbox_list(options, None),
+        Some("show") => inbox_show(options),
+        Some("answer") => inbox_answer(options),
+        Some(instance_id) if options.args.len() == 1 && instance_id.starts_with("ins_") => {
+            inbox_list(options, Some(instance_id))
+        }
+        _ => {
+            eprintln!(
+                "usage: whip inbox [<instance>|show <item>|answer <item> (--choice X|--text X)]"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn inbox_list(options: &CliOptions, instance_id: Option<&str>) -> ExitCode {
     let store = match open_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
-    let items = match store.list_inbox_items(Some("pending")) {
+    let mut items = match store.list_inbox_items(Some("pending")) {
         Ok(items) => items,
         Err(error) => return report_store_error("failed to list inbox items", error),
     };
+    if let Some(instance_id) = instance_id {
+        items.retain(|item| item.instance_id == instance_id);
+    }
 
     if options.json {
         emit_json(Value::Array(
@@ -8602,6 +15170,506 @@ fn inbox_answer(options: &CliOptions) -> ExitCode {
     } else {
         println!("{item_id} answered at event #{}", event.sequence);
         ExitCode::SUCCESS
+    }
+}
+
+/// `whip notify <instance> --event <name> --data <json> --program <path>`:
+/// lands a typed external event as a durable fact (spec/event-ingress.md).
+/// The payload is validated against the declared `event` schema at this
+/// boundary, so a malformed delivery cannot land an ill-typed fact. The
+/// recorded fact is the source of truth; replay re-reads it, never the
+/// delivery.
+fn notify(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip notify <instance> --event <name> --data <json> --program <workflow.whip> [--root <workflow>]";
+    let mut instance_id = None;
+    let mut event_name = None;
+    let mut data = None;
+    let mut program_path = None;
+    let mut root = None;
+    let mut index = 0;
+    while index < options.args.len() {
+        match options.args[index].as_str() {
+            "--event" => {
+                index += 1;
+                event_name = options.args.get(index).cloned();
+            }
+            "--data" => {
+                index += 1;
+                data = options.args.get(index).cloned();
+            }
+            "--program" => {
+                index += 1;
+                program_path = options.args.get(index).cloned();
+            }
+            "--root" => {
+                index += 1;
+                root = options.args.get(index).cloned();
+            }
+            other if other.starts_with('-') => {
+                eprintln!("unknown notify option `{other}`");
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+            value if instance_id.is_none() => instance_id = Some(value.to_owned()),
+            _ => {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+        index += 1;
+    }
+    let (Some(instance_id), Some(event_name), Some(data), Some(program_path)) =
+        (instance_id, event_name, data, program_path)
+    else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let (_source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
+        Ok(compiled) => compiled,
+        Err(error) => return report_compile_failure(&program_path, error),
+    };
+    let Some(event) = ir.events.iter().find(|event| event.name == event_name) else {
+        let declared = ir
+            .events
+            .iter()
+            .map(|event| event.name.as_str())
+            .collect::<Vec<_>>();
+        eprintln!(
+            "event `{event_name}` is not declared in {program_path}{}",
+            if declared.is_empty() {
+                "; the program declares no events".to_owned()
+            } else {
+                format!("; declared events: {}", declared.join(", "))
+            }
+        );
+        return ExitCode::from(2);
+    };
+    let payload: Value = match serde_json::from_str(&data) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("invalid `--data` JSON: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut errors = Vec::new();
+    validate_json_for_object(&ir, &payload, &event.fields, "$", &mut errors);
+    if !errors.is_empty() {
+        eprintln!(
+            "payload does not conform to event `{event_name}`: {}",
+            errors.join("; ")
+        );
+        return ExitCode::from(2);
+    }
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    match store.get_instance(&instance_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            eprintln!("instance `{instance_id}` not found");
+            return ExitCode::from(2);
+        }
+        Err(error) => return report_store_error("failed to load instance", error),
+    }
+    let payload_json = payload.to_string();
+    let mut kernel = RuntimeKernel::new(store);
+    let received = match kernel.ingest_external_event(
+        &instance_id,
+        &event_name,
+        &payload_json,
+        Some(&idempotency_key(&[
+            &instance_id,
+            "notify",
+            &event_name,
+            &payload_json,
+        ])),
+    ) {
+        Ok(event) => event,
+        Err(error) => return report_store_error("failed to record event", error),
+    };
+    let fact_event = match kernel.derive_fact(
+        &instance_id,
+        &event_name,
+        &received.event_id,
+        &payload_json,
+        Some(&received.event_id),
+        Some(&idempotency_key(&[
+            &instance_id,
+            "notify-fact",
+            &received.event_id,
+        ])),
+    ) {
+        Ok(event) => event,
+        Err(error) => return report_store_error("failed to record event fact", error),
+    };
+    if options.json {
+        emit_json(json!({
+            "instance_id": instance_id,
+            "event": event_name,
+            "event_id": received.event_id,
+            "fact_event_id": fact_event.event_id,
+            "payload": payload,
+        }))
+    } else {
+        println!(
+            "notified {instance_id} with `{event_name}` at event #{}",
+            fact_event.sequence
+        );
+        ExitCode::SUCCESS
+    }
+}
+
+/// Coordination state is fully attributable and inspectable
+/// (spec/coordination.md): who holds which slot, who spent the budget, who
+/// wrote which entry.
+fn coordination_list(options: &CliOptions, kind: &str) -> ExitCode {
+    let store =
+        match whipplescript_store::coordination::CoordinationStore::open(coordination_store_path())
+        {
+            Ok(store) => store,
+            Err(error) => return report_store_error("failed to open coordination store", error),
+        };
+    let name = options
+        .args
+        .first()
+        .filter(|arg| !arg.starts_with('-'))
+        .map(String::as_str);
+    match kind {
+        "leases" => {
+            let rows = match store.list_leases(name) {
+                Ok(rows) => rows,
+                Err(error) => return report_store_error("failed to list leases", error),
+            };
+            if options.json {
+                return emit_json(Value::Array(
+                    rows.iter()
+                        .map(|row| {
+                            json!({
+                                "resource": row.resource,
+                                "key": row.key,
+                                "holder": row.holder,
+                                "acquired_at": row.acquired_at,
+                                "expires_at": row.expires_at,
+                            })
+                        })
+                        .collect(),
+                ));
+            }
+            if rows.is_empty() {
+                println!("no leases held");
+            }
+            for row in rows {
+                println!(
+                    "{}/{} held by {} (expires {})",
+                    row.resource, row.key, row.holder, row.expires_at
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        "ledger" => {
+            let partition = options
+                .args
+                .iter()
+                .position(|arg| arg == "--partition")
+                .and_then(|index| options.args.get(index + 1))
+                .map(String::as_str);
+            let rows = match store.list_entries(name, partition) {
+                Ok(rows) => rows,
+                Err(error) => return report_store_error("failed to list ledger entries", error),
+            };
+            if options.json {
+                return emit_json(Value::Array(
+                    rows.iter()
+                        .map(|row| {
+                            json!({
+                                "ledger": row.ledger,
+                                "partition": row.partition,
+                                "seq": row.seq,
+                                "entry": json_from_str(&row.payload_json),
+                                "appended_by": row.appended_by,
+                                "appended_at": row.appended_at,
+                            })
+                        })
+                        .collect(),
+                ));
+            }
+            if rows.is_empty() {
+                println!("no ledger entries");
+            }
+            for row in rows {
+                println!(
+                    "{}#{} [{}] by {}: {}",
+                    row.ledger,
+                    row.seq,
+                    row.partition,
+                    row.appended_by,
+                    one_line(&row.payload_json)
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        _ => {
+            let rows = match store.list_counters(name) {
+                Ok(rows) => rows,
+                Err(error) => return report_store_error("failed to list counters", error),
+            };
+            if options.json {
+                return emit_json(Value::Array(
+                    rows.iter()
+                        .map(|row| {
+                            json!({
+                                "counter": row.counter,
+                                "key": row.key,
+                                "consumed": row.consumed,
+                                "period": row.period,
+                            })
+                        })
+                        .collect(),
+                ));
+            }
+            if rows.is_empty() {
+                println!("no counters");
+            }
+            for row in rows {
+                println!(
+                    "{}/{} consumed={} period={}",
+                    row.counter, row.key, row.consumed, row.period
+                );
+            }
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// The observability ambassador (spec/observability.md C8): a cursor-tracked
+/// exporter that tails the durable event log and emits OTLP/HTTP JSON traces.
+/// The event log is the buffer — zero hot-path overhead, failure isolation,
+/// and the cursor makes emission exactly-once across re-runs and replays.
+/// Config is the standard OTel environment; with no endpoint and no
+/// `--dry-run` it refuses rather than guessing. Plain-HTTP endpoints only:
+/// the standard sidecar deployment posts to a local OpenTelemetry Collector,
+/// which owns TLS and fan-out to backends.
+fn otel_export(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip otel-export <instance> [--dry-run]";
+    let mut instance_id = None;
+    let mut dry_run = false;
+    for arg in &options.args {
+        match arg.as_str() {
+            "--dry-run" => dry_run = true,
+            other if other.starts_with('-') => {
+                eprintln!("unknown otel-export option `{other}`");
+                return ExitCode::from(2);
+            }
+            value if instance_id.is_none() => instance_id = Some(value.to_owned()),
+            _ => {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(instance_id) = instance_id else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let runs = match store.list_runs(&instance_id) {
+        Ok(runs) => runs,
+        Err(error) => return report_store_error("failed to list runs", error),
+    };
+    let effects = match store.list_effects(&instance_id) {
+        Ok(effects) => effects,
+        Err(error) => return report_store_error("failed to list effects", error),
+    };
+    drop(store);
+
+    // Emit-once cursor: runs already exported are skipped; a crash mid-export
+    // resumes from the cursor without duplication.
+    let cursor_path = options.store_path.with_extension("otel-cursor.json");
+    let mut cursor: Value = fs::read_to_string(&cursor_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| json!({}));
+    let exported = cursor
+        .get(&instance_id)
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+
+    let trace_id = format!(
+        "{:032x}",
+        u128::from(stable_hash(&instance_id)) << 64 | u128::from(stable_hash("trace"))
+    );
+    let service_name = env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "whipplescript".to_owned());
+    let mut spans = Vec::new();
+    let mut newly_exported = Vec::new();
+    for run in &runs {
+        // Only terminal runs export (a span needs an end); running work
+        // exports on a later pass.
+        if run.status == "running" || exported.contains(&run.run_id) {
+            continue;
+        }
+        let effect = effects
+            .iter()
+            .find(|effect| effect.effect_id == run.effect_id);
+        // Spans are named after source constructs so traces read like the
+        // workflow; content stays structural (ids, kinds, statuses) per the
+        // export content policy.
+        let name = effect
+            .map(|effect| {
+                let rule = json_from_str(&effect.input_json)
+                    .get("rule")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_default();
+                if rule.is_empty() {
+                    effect.kind.clone()
+                } else {
+                    format!("{}.{}", rule, effect.kind)
+                }
+            })
+            .unwrap_or_else(|| "run".to_owned());
+        let mut attributes = vec![
+            otel_attr("whipplescript.instance_id", &instance_id),
+            otel_attr("whipplescript.effect_id", &run.effect_id),
+            otel_attr("whipplescript.run_id", &run.run_id),
+            otel_attr("whipplescript.provider", &run.provider),
+            otel_attr("whipplescript.effect.status", &run.status),
+        ];
+        if let Some(effect) = effect {
+            attributes.push(otel_attr("whipplescript.effect.kind", &effect.kind));
+            // GenAI semantic conventions (version-pinned in the spec) for
+            // model-backed spans, so fleets land in LLM dashboards natively.
+            if effect.kind == "agent.tell" || effect.kind == "baml.coerce" {
+                attributes.push(otel_attr("gen_ai.system", &run.provider));
+            }
+        }
+        spans.push(json!({
+            "traceId": trace_id,
+            "spanId": format!("{:016x}", stable_hash(&run.run_id)),
+            "name": name,
+            "kind": 1,
+            "startTimeUnixNano": otel_nanos(&run.started_at),
+            "endTimeUnixNano": otel_nanos(run.completed_at.as_deref().unwrap_or(&run.started_at)),
+            "status": {"code": if run.status == "completed" { 1 } else { 2 }},
+            "attributes": attributes,
+        }));
+        newly_exported.push(run.run_id.clone());
+    }
+    if spans.is_empty() {
+        println!("otel-export {instance_id}: nothing new to export");
+        return ExitCode::SUCCESS;
+    }
+    let payload = json!({
+        "resourceSpans": [{
+            "resource": {"attributes": [otel_attr("service.name", &service_name)]},
+            "scopeSpans": [{
+                "scope": {"name": "whipplescript", "version": whipplescript_core::version()},
+                "spans": spans,
+            }],
+        }],
+    });
+
+    if dry_run {
+        println!("{payload:#}");
+        return ExitCode::SUCCESS;
+    }
+    let endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:4318".to_owned());
+    if let Err(error) = otel_post(&endpoint, &payload.to_string()) {
+        // Failure isolation: the log persists; the exporter catches up on the
+        // next pass. Nothing was marked exported.
+        eprintln!("otel-export failed (will catch up next pass): {error}");
+        return ExitCode::FAILURE;
+    }
+    let mut all = exported;
+    all.extend(newly_exported.iter().cloned());
+    cursor[&instance_id] = json!(all.into_iter().collect::<Vec<_>>());
+    if let Err(error) = fs::write(&cursor_path, cursor.to_string()) {
+        eprintln!("failed to persist otel cursor: {error}");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "otel-export {instance_id}: exported {} span(s) to {endpoint}",
+        newly_exported.len()
+    );
+    ExitCode::SUCCESS
+}
+
+fn otel_attr(key: &str, value: &str) -> Value {
+    json!({"key": key, "value": {"stringValue": value}})
+}
+
+/// `YYYY-MM-DD HH:MM:SS` (store timestamps) to Unix nanoseconds, best-effort.
+fn otel_nanos(timestamp: &str) -> String {
+    let normalized = timestamp.replace(' ', "T");
+    let seconds = iso_like_to_unix_seconds(&normalized).unwrap_or(0);
+    format!("{}", (seconds as i128) * 1_000_000_000)
+}
+
+fn iso_like_to_unix_seconds(value: &str) -> Option<i64> {
+    let date = value.get(0..10)?;
+    let mut parts = date.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    let time = value.get(11..19).unwrap_or("00:00:00");
+    let mut parts = time.split(':');
+    let hour: i64 = parts.next()?.parse().ok()?;
+    let minute: i64 = parts.next()?.parse().ok()?;
+    let second: i64 = parts.next()?.parse().ok()?;
+    // Civil-days algorithm (Howard Hinnant), valid for the store's range.
+    let years = if month <= 2 { year - 1 } else { year };
+    let era = years.div_euclid(400);
+    let yoe = years - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Minimal OTLP/HTTP POST over plain HTTP — the sidecar's peer is a local
+/// OpenTelemetry Collector, which owns TLS and backend fan-out.
+fn otel_post(endpoint: &str, body: &str) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let stripped = endpoint
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("only http:// endpoints are supported (got `{endpoint}`); point at a local OpenTelemetry Collector"))?;
+    let host_port = stripped.split('/').next().unwrap_or(stripped);
+    let address = if host_port.contains(':') {
+        host_port.to_owned()
+    } else {
+        format!("{host_port}:4318")
+    };
+    let mut stream = std::net::TcpStream::connect(&address)
+        .map_err(|error| format!("connect {address}: {error}"))?;
+    let request = format!(
+        "POST /v1/traces HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("send: {error}"))?;
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("");
+    if status.starts_with('2') {
+        Ok(())
+    } else {
+        Err(format!("collector responded {status}"))
     }
 }
 
@@ -9289,6 +16357,12 @@ fn compile_source_path_with_root(
 ) -> Result<(String, IrProgram), CompileFailure> {
     let bundle = resolve_source_bundle(Path::new(path))?;
     let compiled = whipplescript_parser::compile_program_with_root(&bundle.source, root);
+    for warning in &compiled.warnings {
+        eprint!(
+            "{}",
+            render_diagnostic_with_severity(path, &bundle.source, warning, "warning")
+        );
+    }
     if let Some(ir) = compiled.ir {
         let mut ir = ir;
         ir.includes = bundle.includes;
@@ -9299,6 +16373,198 @@ fn compile_source_path_with_root(
             diagnostics: compiled.diagnostics,
         })
     }
+}
+
+/// Compile for static validation (`check`/`compile`): on top of ordinary
+/// compilation this enforces the workflow liveness lints.
+fn compile_source_path_for_validation(
+    path: &str,
+    root: Option<&str>,
+) -> Result<(String, IrProgram), CompileFailure> {
+    let (source, ir) = compile_source_path_with_root(path, root)?;
+    let liveness = lint_workflow_liveness(&ir);
+    if !liveness.is_empty() {
+        return Err(CompileFailure::Diagnostics {
+            source,
+            diagnostics: liveness,
+        });
+    }
+    Ok((source, ir))
+}
+
+/// Static liveness lints: every workflow must be able to terminate, and every
+/// rule must have a satisfiable read set. Escape hatches: tag a workflow
+/// `@service` when it intentionally runs forever, and tag a rule `@external`
+/// when its facts arrive from outside the workflow (plugins, fixtures,
+/// external systems).
+fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    let service_tagged = ir
+        .source_tags
+        .iter()
+        .any(|tag| tag.target_kind == "workflow" && tag.name == "service");
+    let has_terminal = ir.rules.iter().any(|rule| {
+        rule.body
+            .lines()
+            .map(str::trim)
+            .any(|line| line.starts_with("complete ") || line.starts_with("fail "))
+    });
+    if !has_terminal && !service_tagged {
+        diagnostics.push(Diagnostic {
+            span: SourceSpan { start: 0, end: 0 },
+            message: format!(
+                "workflow `{}` has no rule that reaches `complete` or `fail`",
+                ir.workflow
+            ),
+            suggestion: Some(
+                "add a rule that runs `complete <output> { ... }` or `fail <failure> { ... }`, or tag the workflow `@service` if it intentionally runs forever"
+                    .to_owned(),
+            ),
+        });
+    }
+
+    let produced = ir
+        .rules
+        .iter()
+        .flat_map(|rule| rule.metadata.fact_writes.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let input_schemas = ir
+        .workflow_contracts
+        .iter()
+        .filter(|contract| contract.kind == IrWorkflowContractKind::Input)
+        .filter_map(|contract| match &contract.ty {
+            IrType::Ref(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let has_human_ask = ir.rules.iter().any(|rule| {
+        rule.metadata
+            .effects
+            .iter()
+            .any(|effect| effect.kind == IrEffectKind::HumanAsk)
+    });
+    let has_tell = ir.rules.iter().any(|rule| {
+        rule.metadata
+            .effects
+            .iter()
+            .any(|effect| effect.kind == IrEffectKind::AgentTell)
+    });
+
+    for rule in &ir.rules {
+        let external_tagged = ir.source_tags.iter().any(|tag| {
+            tag.target_kind == "rule" && tag.target == rule.name && tag.name == "external"
+        });
+        if external_tagged {
+            continue;
+        }
+        for when in &rule.whens {
+            let pattern = when.pattern.as_str();
+            if pattern == "started" || pattern.ends_with(" is available") {
+                continue;
+            }
+            // General form: `when fact <name> as x`. Sugar phrases reduce to
+            // the same runtime fact names.
+            let general_name = pattern
+                .strip_prefix("fact ")
+                .and_then(|rest| rest.split_whitespace().next());
+            let pattern = match general_name {
+                Some("human.answer.received") => "human answered",
+                Some("agent.turn.completed") => "worker completed turn",
+                Some(name) if name.contains('.') => {
+                    // Other dotted runtime facts arrive from outside the
+                    // workflow's own rules; the lint cannot see producers.
+                    continue;
+                }
+                Some(name) => {
+                    // `fact ClassName` is an ordinary class match.
+                    let read = format!("schema:{name}");
+                    if !produced.contains(&read) && !input_schemas.contains(name) {
+                        diagnostics.push(Diagnostic {
+                            span: when.span,
+                            message: format!(
+                                "rule `{}` can never fire: nothing produces `{name}`",
+                                rule.name
+                            ),
+                            suggestion: Some(format!(
+                                "seed `{name}` from a table, record it in another rule, declare it as a workflow input, or tag the rule `@external` if it arrives from an external system"
+                            )),
+                        });
+                    }
+                    continue;
+                }
+                None => pattern,
+            };
+            if pattern.starts_with("human answered") {
+                if !has_human_ask {
+                    diagnostics.push(Diagnostic {
+                        span: when.span,
+                        message: format!(
+                            "rule `{}` can never fire: no rule creates an `askHuman` request",
+                            rule.name
+                        ),
+                        suggestion: Some(
+                            "add an `askHuman` effect, or tag the rule `@external` if answers arrive from outside this workflow"
+                                .to_owned(),
+                        ),
+                    });
+                }
+                continue;
+            }
+            if pattern.starts_with("worker completed turn") {
+                if !has_tell {
+                    diagnostics.push(Diagnostic {
+                        span: when.span,
+                        message: format!(
+                            "rule `{}` can never fire: no rule creates an agent turn",
+                            rule.name
+                        ),
+                        suggestion: Some(
+                            "add a `tell` effect, or tag the rule `@external` if turns arrive from outside this workflow"
+                                .to_owned(),
+                        ),
+                    });
+                }
+                continue;
+            }
+            let first = pattern.split_whitespace().next().unwrap_or_default();
+            if !first.chars().next().is_some_and(char::is_uppercase) {
+                // Remaining lowercase patterns (loft, manual review) are fed
+                // by external systems the lint cannot see.
+                continue;
+            }
+            let builtin = matches!(
+                first,
+                "AgentTurn"
+                    | "LoftIssue"
+                    | "LoftClaim"
+                    | "WorkItem"
+                    | "Evidence"
+                    | "HumanAnswer"
+                    | "TerminalFailed"
+                    | "TerminalTimedOut"
+                    | "TerminalCancelled"
+            );
+            if builtin
+                || produced.contains(&format!("schema:{first}"))
+                || input_schemas.contains(first)
+            {
+                continue;
+            }
+            diagnostics.push(Diagnostic {
+                span: when.span,
+                message: format!(
+                    "rule `{}` can never fire: nothing produces `{first}`",
+                    rule.name
+                ),
+                suggestion: Some(format!(
+                    "seed `{first}` from a table, record it in another rule, declare it as a workflow input, or tag the rule `@external` if it arrives from an external system"
+                )),
+            });
+        }
+    }
+
+    diagnostics
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -10222,20 +17488,6 @@ fn maude_bool_cases(expr: &Expr, context: &mut MaudeExprContext) -> MaudeBoolCas
                 ),
             }
         }
-        Expr::Call { name, args } if name == "empty" && args.len() == 1 => MaudeBoolCases {
-            true_expr: format!(
-                "emptyExpr({})",
-                maude_collection_expr(&args[0], "qZero", context)
-            ),
-            false_expr: format!(
-                "emptyExpr({})",
-                maude_collection_expr(&args[0], "qOne", context)
-            ),
-            error_expr: format!(
-                "emptyExpr({})",
-                maude_collection_expr(&args[0], "qError", context)
-            ),
-        },
         _ => MaudeBoolCases {
             true_expr: "boolTrue".to_owned(),
             false_expr: "boolFalse".to_owned(),
@@ -10748,6 +18000,94 @@ fn report_compile_failure(path: &str, error: CompileFailure) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Applies `cancel <binding>` operations committed by a rule: pending
+/// effects terminal-cancel; running effects get a cancellation request (a
+/// request, not a result); already-terminal effects are a recorded no-op.
+fn apply_rule_cancels(
+    store_path: &Path,
+    instance_id: &str,
+    rule_name: &str,
+    effect_ids: &[String],
+    causation_event_id: &str,
+) -> Result<(), StoreError> {
+    for effect_id in effect_ids {
+        let store = SqliteStore::open(store_path)?;
+        let status = store
+            .list_effects(instance_id)?
+            .into_iter()
+            .find(|effect| &effect.effect_id == effect_id)
+            .map(|effect| effect.status);
+        drop(store);
+        match status.as_deref() {
+            Some("running") => {
+                let mut store = SqliteStore::open(store_path)?;
+                let _ = store.request_effect_cancellation(EffectCancellationRequest {
+                    instance_id,
+                    effect_id,
+                    revision_id: None,
+                    reason: Some("cancelled by rule"),
+                    requested_by: rule_name,
+                    causation_event_id: Some(causation_event_id),
+                    idempotency_key: Some(&idempotency_key(&[
+                        instance_id,
+                        effect_id,
+                        rule_name,
+                        "rule-cancel-request",
+                    ])),
+                });
+            }
+            Some("completed") | Some("failed") | Some("timed_out") | Some("cancelled") => {
+                // No-op with evidence: cancelling settled work is legal.
+                let store = SqliteStore::open(store_path)?;
+                store.record_diagnostic(DiagnosticRecord {
+                    instance_id: Some(instance_id),
+                    program_id: None,
+                    program_version_id: None,
+                    severity: "info",
+                    code: Some("cancel.noop"),
+                    message: &format!(
+                        "rule `{rule_name}` cancelled effect `{effect_id}` after it reached a terminal status"
+                    ),
+                    source_span_json: None,
+                    subject_type: Some("effect"),
+                    subject_id: Some(effect_id),
+                    event_id: Some(causation_event_id),
+                    effect_id: Some(effect_id),
+                    run_id: None,
+                    assertion_id: None,
+                    evidence_ids_json: "[]",
+                    artifact_ids_json: "[]",
+                    causation_id: Some(causation_event_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&idempotency_key(&[
+                        instance_id,
+                        effect_id,
+                        rule_name,
+                        "rule-cancel-noop",
+                    ])),
+                })?;
+            }
+            Some(_) => {
+                let store = SqliteStore::open(store_path)?;
+                let mut kernel = RuntimeKernel::new(store);
+                kernel.cancel_effect(EffectCancellation {
+                    instance_id,
+                    effect_id,
+                    reason: Some("cancelled by rule"),
+                    idempotency_key: Some(&idempotency_key(&[
+                        instance_id,
+                        effect_id,
+                        rule_name,
+                        "rule-cancel",
+                    ])),
+                })?;
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 fn report_store_error(context: &str, error: StoreError) -> ExitCode {
     eprintln!("{context}: {}", store_error(error));
     ExitCode::FAILURE
@@ -10755,9 +18095,13 @@ fn report_store_error(context: &str, error: StoreError) -> ExitCode {
 
 fn store_error(error: StoreError) -> String {
     match error {
-        StoreError::Io(error) => error.to_string(),
-        StoreError::Sqlite(error) => error.to_string(),
-        StoreError::Json(error) => error.to_string(),
+        StoreError::Io(error) => format!("store I/O error: {error}"),
+        StoreError::Sqlite(error) => {
+            format!("internal store error ({error}); this is a whip bug, please report it")
+        }
+        StoreError::Json(error) => format!(
+            "internal store error (malformed stored JSON: {error}); this is a whip bug, please report it"
+        ),
         StoreError::Conflict(message) => message,
         StoreError::PolicyBlocked { reason, .. } => reason,
         StoreError::CapacityBlocked { reason, .. } => reason,
@@ -10966,12 +18310,19 @@ fn effect_provider_selection_json(effect: &EffectView) -> Option<Value> {
     }
     let agent = effect.target.as_deref()?;
     let declared = serde_json::from_str::<Value>(&effect.declared_profiles_json).ok()?;
-    let harness = declared_agent_harness_in_value(&declared, agent)?;
-    let kind = declared_harness_kind_in_value(&declared, &harness)?;
+    if let Some(harness) = declared_agent_harness_in_value(&declared, agent) {
+        let kind = declared_harness_kind_in_value(&declared, &harness)?;
+        return Some(json!({
+            "source_harness_id": harness,
+            "provider_id": harness,
+            "provider_kind": kind,
+        }));
+    }
+    let provider = declared_agent_provider_in_value(&declared, agent)?;
     Some(json!({
-        "source_harness_id": harness,
-        "provider_id": harness,
-        "provider_kind": kind,
+        "source_harness_id": Value::Null,
+        "provider_id": provider,
+        "provider_kind": provider,
     }))
 }
 
@@ -11047,6 +18398,17 @@ fn artifact_counts_for_runs(
         );
     }
     Ok(counts)
+}
+
+fn artifacts_for_runs(
+    store: &SqliteStore,
+    runs: &[RunView],
+) -> Result<Vec<ArtifactView>, StoreError> {
+    let mut artifacts = Vec::new();
+    for run in runs {
+        artifacts.extend(store.list_artifacts_for_run(&run.run_id)?);
+    }
+    Ok(artifacts)
 }
 
 fn latest_native_lifecycle_for_run(events: &[EventView], run_id: &str) -> Option<Value> {
@@ -11673,12 +19035,22 @@ fn one_line(value: &str) -> String {
 }
 
 fn render_diagnostic(path: &str, source: &str, diagnostic: &Diagnostic) -> String {
+    render_diagnostic_with_severity(path, source, diagnostic, "error")
+}
+
+fn render_diagnostic_with_severity(
+    path: &str,
+    source: &str,
+    diagnostic: &Diagnostic,
+    severity: &str,
+) -> String {
     let location = locate_span(source, diagnostic.span);
     let gutter_width = location.line.to_string().len();
     let underline = underline_for_span(&location, diagnostic.span);
     let mut rendered = String::new();
 
-    rendered.push_str("error: ");
+    rendered.push_str(severity);
+    rendered.push_str(": ");
     rendered.push_str(&diagnostic.message);
     rendered.push('\n');
     rendered.push_str(&format!(
@@ -11886,7 +19258,7 @@ assert exists(Window where elapsed < limit)
             source_span_json: None,
         }];
 
-        let assertions = eval_assertions(&ir, &facts, &[], None);
+        let assertions = eval_assertions(&ir, &facts, &[], None, &AssertionTagFilter::default());
 
         assert_eq!(assertions.len(), 1);
         assert_eq!(assertions[0].status, AssertionStatus::Error);
@@ -11941,6 +19313,7 @@ rule finish
         assert_eq!(ready.contexts.len(), 1);
 
         let lowering = lower_rule(
+            "ins_test",
             &ir,
             &ir.rules[0],
             &ready.contexts[0],
@@ -11954,120 +19327,203 @@ rule finish
     }
 
     #[test]
-    fn ready_contexts_match_loft_ready_issue_alias_to_loft_issue_fact() {
+    fn lowering_preserves_multiline_prompt_content_type_metadata() {
         let source = r#"
-workflow LoftReadyAlias
+workflow PromptContentType
 
 agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule start
+  when started
+=> {
+  tell worker as turn """markdown
+  Write a short report.
+  """
+}
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compile");
+        let lowering = lower_rule(
+            "ins_test",
+            &ir,
+            &ir.rules[0],
+            &RuleContext::default(),
+            &[],
+            &[],
+            None,
+        );
+
+        assert_eq!(lowering.effects.len(), 1);
+        let input = json_from_str(&lowering.effects[0].input_json);
+        assert_eq!(
+            input.get("prompt").and_then(Value::as_str),
+            Some("Write a short report.")
+        );
+        assert_eq!(
+            input.get("prompt_content_type").and_then(Value::as_str),
+            Some("markdown")
+        );
+    }
+
+    #[test]
+    fn lowering_preserves_coerce_prompt_content_type_metadata() {
+        let source = r#"
+workflow CoercePromptContentType
+
+class Review {
+  accepted bool
+}
+
+coerce reviewArtifact() -> Review {
+  prompt """markdown
+  Review the artifact.
+  """
+}
+
+rule start
+  when started
+=> {
+  coerce reviewArtifact() as review
+}
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compile");
+        let lowering = lower_rule(
+            "ins_test",
+            &ir,
+            &ir.rules[0],
+            &RuleContext::default(),
+            &[],
+            &[],
+            None,
+        );
+
+        assert_eq!(lowering.effects.len(), 1);
+        let input = json_from_str(&lowering.effects[0].input_json);
+        assert_eq!(
+            input.get("prompt_template").and_then(Value::as_str),
+            Some("Review the artifact.")
+        );
+        assert_eq!(
+            input.get("prompt_content_type").and_then(Value::as_str),
+            Some("markdown")
+        );
+    }
+
+    #[test]
+    fn lowering_preserves_human_prompt_content_type_metadata() {
+        let source = r#"
+workflow HumanPromptContentType
+
+rule start
+  when started
+=> {
+  askHuman """application/json
+  {
+    "question": "Approve this release?"
+  }
+  """
+}
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compile");
+        let lowering = lower_rule(
+            "ins_test",
+            &ir,
+            &ir.rules[0],
+            &RuleContext::default(),
+            &[],
+            &[],
+            None,
+        );
+
+        assert_eq!(lowering.effects.len(), 1);
+        let input = json_from_str(&lowering.effects[0].input_json);
+        assert_eq!(
+            input.get("prompt").and_then(Value::as_str),
+            Some("{\n    \"question\": \"Approve this release?\"\n  }")
+        );
+        assert_eq!(
+            input.get("prompt_content_type").and_then(Value::as_str),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn multiline_prompt_single_word_opening_tail_stays_prompt_text() {
+        let lines = ["tell worker \"\"\"hello", "world", "\"\"\""];
+        let (prompt, cursor) = parse_prompt_from_lines(&lines, 0, lines[0]);
+
+        assert_eq!(cursor, 2);
+        assert_eq!(
+            prompt,
+            ParsedPrompt {
+                text: "hello\nworld".to_owned(),
+                content_type: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ready_contexts_match_queue_ready_item_alias_to_projected_fact() {
+        let source = r#"
+workflow QueueReadyAlias
+
+queue backlog {
+  tracker builtin
+}
+
+agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
 }
 
 rule claim_ready
-  when loft has ready issue as issue
+  when backlog has ready item as item
   when worker is available
 => {
-  claim issue with loft as claim
+  claim item as lease
 }
 "#;
         let ir = whipplescript_parser::compile_program(source)
             .ir
             .expect("compile");
         let fact = FactView {
-            fact_id: "fact-loft-issue".to_owned(),
+            fact_id: "fact-queue-item".to_owned(),
             program_version_id: None,
             revision_epoch: 0,
-            name: "LoftIssue".to_owned(),
-            key: "LoftIssue:ready".to_owned(),
-            value_json: r#"{"id":"ISS-1","title":"Ready issue","body":"Do work"}"#.to_owned(),
-            provenance_class: "rule".to_owned(),
+            name: "queue.item.ready".to_owned(),
+            key: "backlog:WS-1:gen".to_owned(),
+            value_json: r#"{"queue":"backlog","id":"WS-1","title":"Ready item","body":"Do work"}"#
+                .to_owned(),
+            provenance_class: "queue".to_owned(),
             source_span_json: None,
         };
-        let facts = vec![fact];
+        let other_queue = FactView {
+            fact_id: "fact-other-item".to_owned(),
+            program_version_id: None,
+            revision_epoch: 0,
+            name: "queue.item.ready".to_owned(),
+            key: "other:WS-2:gen".to_owned(),
+            value_json: r#"{"queue":"other","id":"WS-2","title":"Other","body":""}"#.to_owned(),
+            provenance_class: "queue".to_owned(),
+            source_span_json: None,
+        };
+        let facts = vec![fact, other_queue];
         let effects = Vec::new();
         let ready = ready_contexts(&ir, &ir.rules[0], &facts, &effects, None);
 
         assert_eq!(ready.contexts.len(), 1);
-        assert_eq!(ready.contexts[0].bindings[0].0, "issue");
-        assert_eq!(ready.contexts[0].bindings[0].1.name, "LoftIssue");
-    }
-
-    #[test]
-    fn lowering_expands_done_record_from_and_then_chain() {
-        let body = r#"
-  tell codex as turn "write"
-  then tell codex as review "review"
-  then done task -> record Done from task {
-    topic
-    turn turn
-    review review
-    status "done"
-  }
-"#;
-        let desugared = desugar_then_chains(body);
-        assert!(desugared.contains("after turn succeeds"));
-        assert!(desugared.contains("after review succeeds"));
-
-        let context = RuleContext {
-            bindings: vec![
-                (
-                    "task".to_owned(),
-                    FactView {
-                        fact_id: "fact-task".to_owned(),
-                        program_version_id: None,
-                        revision_epoch: 0,
-                        name: "Task".to_owned(),
-                        key: "Task:queued".to_owned(),
-                        value_json: r#"{"topic":"rain","status":"queued"}"#.to_owned(),
-                        provenance_class: "rule".to_owned(),
-                        source_span_json: None,
-                    },
-                ),
-                (
-                    "turn".to_owned(),
-                    FactView {
-                        fact_id: "turn".to_owned(),
-                        program_version_id: None,
-                        revision_epoch: 0,
-                        name: "turn".to_owned(),
-                        key: "turn".to_owned(),
-                        value_json: r#"{"summary":"wrote"}"#.to_owned(),
-                        provenance_class: "effect".to_owned(),
-                        source_span_json: None,
-                    },
-                ),
-                (
-                    "review".to_owned(),
-                    FactView {
-                        fact_id: "review".to_owned(),
-                        program_version_id: None,
-                        revision_epoch: 0,
-                        name: "review".to_owned(),
-                        key: "review".to_owned(),
-                        value_json: r#"{"summary":"reviewed"}"#.to_owned(),
-                        provenance_class: "effect".to_owned(),
-                        source_span_json: None,
-                    },
-                ),
-            ],
-            ..RuleContext::default()
-        };
-        let final_after = after_blocks(&desugared)
-            .into_iter()
-            .last()
-            .expect("final after block");
-        let record = top_level_record_blocks(&final_after.body)
-            .into_iter()
-            .next()
-            .expect("record block");
-        let value = Value::Object(parse_record_fields(
-            &record.body,
-            &context,
-            record.from_binding.as_deref(),
-            &mut Vec::new(),
-        ));
-        assert_eq!(value.get("topic").and_then(Value::as_str), Some("rain"));
-        assert_eq!(value.get("status").and_then(Value::as_str), Some("done"));
+        assert_eq!(ready.contexts[0].bindings[0].0, "item");
+        assert_eq!(ready.contexts[0].bindings[0].1.key, "backlog:WS-1:gen");
     }
 
     #[test]
@@ -12590,6 +20046,7 @@ coerce classify(title string) -> Classification {
 }
 
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
 }
@@ -12608,54 +20065,54 @@ rule classify
 
     #[test]
     fn generates_model_searches_for_effect_dependencies() {
-        let source = include_str!("../../../examples/loft-worker-with-review.whip");
+        let source = include_str!("../../../examples/queue-worker-with-review.whip");
         let compiled = whipplescript_parser::compile_program(source);
         let ir = compiled.ir.expect("example compiles");
         let (_maude, expected) =
             generate_maude_model_search(source, &ir, Path::new("/tmp/kernel.maude"));
 
-        assert_eq!(expected.len(), 12);
+        assert_eq!(expected.len(), 18);
         assert_eq!(
             expected
                 .iter()
                 .filter(|result| result.outcome == ExpectedSearchResult::Solution)
                 .count(),
-            4
+            6
         );
         assert_eq!(
             expected
                 .iter()
                 .filter(|result| result.predicate == "succeeds")
                 .count(),
-            3
+            9
         );
         assert_eq!(
             expected
                 .iter()
                 .filter(|result| result.predicate == "fails")
                 .count(),
-            3
+            6
         );
         assert_eq!(
             expected
                 .iter()
                 .filter(|result| result.predicate == "revision-active-rule")
                 .count(),
-            2
+            1
         );
         assert_eq!(
             expected
                 .iter()
                 .filter(|result| result.predicate == "revision-stale-rule")
                 .count(),
-            2
+            1
         );
         assert_eq!(
             expected
                 .iter()
                 .filter(|result| result.predicate == "revision-effect-attribution")
                 .count(),
-            2
+            1
         );
     }
 
@@ -12738,14 +20195,14 @@ class Result {
   metadata map<string>
 }
 
-assert empty(Result)
+assert count(Result) == 0
 assert count(Result) == 0
 assert count(Result where status == "accepted") >= 0
-assert empty(Result where status not in ["accepted", "queued"])
+assert count(Result where status not in ["accepted", "queued"]) == 0
 assert "urgent" in ["urgent", "later"]
 
 rule accept
-  when Task as task where task.status == "queued" && task.priority >= 1 && "urgent" in task.labels && task.metadata["phase"] == "kernel" && empty(Result where metadata["phase"] == "done")
+  when Task as task where task.status == "queued" && task.priority >= 1 && "urgent" in task.labels && task.metadata["phase"] == "kernel" && count(Result where metadata["phase"] == "done") == 0
 => {
   record Result {
     status "accepted"
@@ -12771,7 +20228,6 @@ rule accept
         assert!(maude.contains("arrayHas("));
         assert!(maude.contains("mapHas("));
         assert!(maude.contains("queryFilter("));
-        assert!(maude.contains("emptyExpr(query("));
         assert!(maude.contains("countExpr(query("));
         assert!(expected.iter().any(|result| {
             result.description == "accept true guard commits rule"
@@ -12867,7 +20323,7 @@ rule accept
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let kernel_path =
             fs::canonicalize(root.join("models/maude/kernel.maude")).expect("kernel path resolves");
-        let source = include_str!("../../../examples/loft-worker-with-review.whip");
+        let source = include_str!("../../../examples/queue-worker-with-review.whip");
         let compiled = whipplescript_parser::compile_program(source);
         let ir = compiled.ir.expect("example compiles");
         let (maude, expected) = generate_maude_model_search(source, &ir, &kernel_path);
@@ -12927,11 +20383,11 @@ class Result {
   status string
 }
 
-assert empty(Result)
+assert count(Result) == 0
 assert count(Result) == 0
 
 rule accept
-  when Task as task where task.status == "queued" && empty(Result)
+  when Task as task where task.status == "queued" && count(Result) == 0
 => {
   record Result {
     status "accepted"
@@ -13087,6 +20543,8 @@ rule accept
             "providers.json".to_owned(),
             "--until".to_owned(),
             "idle".to_owned(),
+            "--stream".to_owned(),
+            "ndjson".to_owned(),
         ])
         .expect("dev options parse");
 
@@ -13095,6 +20553,7 @@ rule accept
             dev.provider_config_paths,
             vec![PathBuf::from("providers.json")]
         );
+        assert_eq!(dev.stream, Some(DevStreamFormat::Ndjson));
     }
 
     #[test]
@@ -13304,7 +20763,7 @@ rule accept
             selection,
             AgentProviderSelection {
                 provider_id: "coder".to_owned(),
-                kind: "codex".to_owned(),
+                kind: "fixture".to_owned(),
                 source_harness_id: Some("coder".to_owned()),
                 surface: None,
                 provider_config: None,
@@ -13337,8 +20796,41 @@ rule accept
             agent_provider_selection_with_config_paths(&effect, "fixture", &[]).expect("selection");
 
         assert_eq!(selection.provider_id, "coder");
-        assert_eq!(selection.kind, "codex");
+        assert_eq!(selection.kind, "fixture");
         assert_eq!(selection.source_harness_id.as_deref(), Some("coder"));
+    }
+
+    #[test]
+    fn agent_provider_selection_uses_direct_provider_metadata() {
+        let effect = ClaimableEffect {
+            effect_id: "eff-1".to_owned(),
+            kind: "agent.tell".to_owned(),
+            target: Some("implementer".to_owned()),
+            profile: Some("repo-writer".to_owned()),
+            input_json: "{}".to_owned(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: json!({
+                "agents": [
+                    {"name": "implementer", "provider": "codex", "profile": "repo-writer"}
+                ]
+            })
+            .to_string(),
+        };
+
+        let selection =
+            agent_provider_selection_with_config_paths(&effect, "fixture", &[]).expect("selection");
+
+        assert_eq!(
+            selection,
+            AgentProviderSelection {
+                provider_id: "codex".to_owned(),
+                kind: "fixture".to_owned(),
+                source_harness_id: None,
+                surface: None,
+                provider_config: None,
+                command_plan: None,
+            }
+        );
     }
 
     #[test]

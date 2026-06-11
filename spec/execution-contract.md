@@ -67,12 +67,12 @@ rules unless a future explicit reopen/retry control-plane operation creates a
 new instance.
 
 Revision activation is not a rule commit. It has its own control-plane
-transaction boundary and cannot be smuggled into `record`, `emit`, `call`,
+transaction boundary and cannot be smuggled into `record`, `notify`, `call`,
 `tell`, `coerce`, `askHuman`, `invoke`, `complete`, or `fail`.
 
 Fact records and effect graph nodes produced by the same rule commit share
 correlation metadata. This lets later rules match typed relationships such as
-"worker completed turn for Loft issue" without depending on prompt text.
+"worker completed turn for work item" without depending on prompt text.
 
 ## Effect Graph
 
@@ -107,7 +107,7 @@ This is unordered:
 
 ```whipplescript
 => {
-  loft.note "Starting work"
+  file item into backlog { title "Starting work" }
   tell worker "Implement the issue"
 }
 ```
@@ -116,14 +116,15 @@ If ordering matters, the source must express it:
 
 ```whipplescript
 => {
-  claim issue with loft as claim
+  claim item as work
 
-  after claim succeeds {
-    tell worker """
-    Implement {{ claim.issue.title }}
+  after work succeeds {
+    tell worker """markdown
+    Implement {{ item.title }}
     """
   }
 }
+```
 ```
 
 Lowering:
@@ -180,21 +181,21 @@ predicate is satisfied.
 Allowed:
 
 ```whipplescript
-claim issue with loft as claim
-after claim succeeds {
-  tell worker "{{ claim.issue.title }}"
+claim item as work
+after work succeeds {
+  tell worker "{{ item.title }}"
 }
 ```
 
 Rejected:
 
 ```whipplescript
-claim issue with loft as claim
-tell worker "{{ claim.issue.title }}"
+claim item as work
+tell worker "{{ item.title }}"
 ```
 
-The compiler should report that `claim.issue.title` is only available after the
-claim effect succeeds.
+The compiler should report that claim output fields are only available after
+the claim effect succeeds.
 
 Effect bindings are typed by the effect contract:
 

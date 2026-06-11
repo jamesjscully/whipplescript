@@ -1,5 +1,7 @@
+@service
 workflow TerminalOutputUnion
 
+# Effect completion is a union; `case` makes every terminal state explicit.
 class WorkItem {
   title string
   body string

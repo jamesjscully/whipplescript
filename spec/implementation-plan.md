@@ -391,8 +391,8 @@ Acceptance:
 - [x] CLI errors include next-step guidance.
 - [ ] `whip step` can drive `examples/minimal-noop.whip` from `external.started`
   to a recorded `StartupSeen` fact.
-- [ ] `whip dev` can drive `examples/implementation-plan-phase-review.whip`
-  through phase request creation and provider dispatch using a fixture provider.
+- [ ] `whip dev` can drive `examples/openclaw-lite.whip` through heartbeat
+  observation, planner dispatch, and queue filing using a fixture provider.
 - [ ] Worker failures at provider binding, credential lookup, workspace
   preparation, adapter launch, request submission, stream/read, artifact
   capture, and terminal-event append are visible in status and trace output.
@@ -762,9 +762,8 @@ Acceptance:
     prerequisite tracking.
 - [x] A failed e2e run leaves artifacts useful enough to debug without
   rerunning immediately.
-- [ ] validation workflow `implementation-plan-phase-review.whip` can create phase
-  review facts, enqueue Codex review effects, run configured Codex threads, and
-  update `spec/implementation-plan-phase-review-tracker.md`.
+- [ ] validation workflow `openclaw-lite.whip` can create heartbeat facts,
+  enqueue planner effects, file queue work, and record a human-review decision.
 - [ ] Real-provider validation can be run with Codex, Claude, and Pi provider
   bindings independently, with skipped providers reported as unavailable rather
   than silently passing.

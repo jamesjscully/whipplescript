@@ -48,7 +48,7 @@ rule implement
     worker is available
   }
 => {
-  tell worker """
+  tell worker """markdown
   Implement this work item:
 
   {{ item.goal }}
@@ -61,7 +61,7 @@ rule implement
 rule review
   when worker completed work as item
 => {
-  tell reviewer """
+  tell reviewer """markdown
   Review this work item:
 
   {{ item.goal }}
@@ -90,7 +90,7 @@ rule escalate
   when worker failed work as item
   when item.attempts >= 3
 => {
-  askHuman """
+  askHuman """markdown
   This work item failed three times:
 
   {{ item.goal }}
@@ -103,6 +103,30 @@ rule escalate
 `tell worker` lowers to an `agent.tell` effect. It does not synchronously run
 the provider. The runtime creates a durable effect, the harness executes it, and
 the completion returns as facts/events that other rules can match.
+
+Multiline prompts may declare an optional content type immediately after the
+opening delimiter:
+
+```whipplescript
+tell worker as turn """markdown
+Write a short implementation report.
+"""
+```
+
+The content type token must be either a supported short name (`markdown`,
+`json`, `text`, `plain`, `html`, `xml`, `yaml`, or `yml`) or a MIME-style token
+containing `/`, such as `application/json` or `text/markdown`. Tokens begin with
+an alphanumeric character. Later characters may be alphanumeric or one of `/`,
+`.`, `+`, `-`, or `_`.
+
+For `tell`, `askHuman`, and `coerce` prompts, the CLI lowering preserves this
+value as `prompt_content_type` in the durable effect input JSON and removes the
+annotation from the prompt body. Coerce effect input also preserves the source
+prompt body as `prompt_template`. The annotation is metadata for reports,
+rendering, and future validation. It does not invoke a parser, change provider
+routing, require JSON validation, or alter rule readiness. If a supported or
+MIME-style annotation is followed by extra inline text, `check` reports a
+malformed content-type annotation; put prompt text on the next line.
 
 If a rule produces multiple effects, they are unordered unless the source uses
 explicit dependency syntax. Source order does not imply execution order.
@@ -128,10 +152,11 @@ Core integrations also provide source-level affordances for common workflow
 boundaries:
 
 ```text
-loft has ready issue
-claim issue with loft
+<queue> has ready item
+claim item
 askHuman
 coerce
+exec <capability> with <record>
 attach skill
 ```
 
@@ -140,20 +165,20 @@ durable state or touches the world, the lowering must be explainable as facts
 and effects.
 
 `when` is the only rule-readiness clause introducer. `with` is reserved for
-action/effect configuration, such as selecting the Loft work kernel in
-`claim issue with loft`. It must not be accepted as a synonym for `when`; doing
-so would blur state observation with effect routing.
+effect input/configuration, such as passing typed stdin in
+`exec backup_repo with request -> Report`. It must not be accepted as a synonym
+for `when`; doing so would blur state observation with effect routing.
 
 Authors may group readiness clauses to reduce repetition:
 
 ```whipplescript
 rule implement_ready_issue
   when {
-    loft has ready issue as issue
+    backlog has ready item as item
     worker is available
   }
 => {
-  claim issue with loft as claim
+  claim item as work
 }
 ```
 
@@ -284,7 +309,7 @@ pattern AgentReview<Input, Output> {
       reviewer is available
     }
   => {
-    tell reviewer """
+    tell reviewer """markdown
     Review {{ item.title }}.
     """ as turn
 
@@ -346,7 +371,7 @@ workflow ReviewPhase {
       reviewer is available
     }
   => {
-    tell reviewer """
+    tell reviewer """markdown
     Review {{ phase.title }}.
     """ as turn
 
@@ -492,7 +517,7 @@ Language constructs that touch the world lower into effect categories defined in
 tell       -> agent.tell
 askHuman   -> human.ask
 coerce     -> baml.coerce
-emit       -> event.emit
+notify     -> event.notify
 call       -> capability.call
 ```
 
@@ -602,7 +627,7 @@ rule run_codex_language_task
     codex is available
   }
 => {
-  tell codex as turn """
+  tell codex as turn """markdown
   Write {{ task.language }} text to {{ task.artifactPath }}.
   """
 }
@@ -652,14 +677,15 @@ instead.
 The following forms are syntax sugar over ordinary rule commits, effects,
 dependencies, and fact consumption. They do not add lifecycle semantics.
 
-`none(query)` and `one(query)` are assertion/guard aliases:
+Assertions use explicit expression-kernel functions:
 
 ```whip
-assert none(Task where status == "queued")
-assert one(Result where provider == "codex")
+assert count(Task where status == "queued") == 0
+assert count(Result where provider == "codex") == 1
 ```
 
-They lower to `count(query) == 0` and `count(query) == 1` behavior.
+Use `count(query) == N` for exact cardinality and `exists(query)` for existence.
+The language should not grow assertion aliases for those cases.
 
 `record Class from binding { ... }` lets record fields copy from an in-scope
 fact without repeating the binding path:
@@ -695,37 +721,22 @@ done task -> record ReviewedPoem from task {
 
 This lowers exactly like `done task` followed by `record ReviewedPoem ...`.
 
-`after effect succeeds as output => { ... }` aliases the terminal output inside
+`after effect succeeds as output { ... }` aliases the terminal output inside
 the block while keeping the original effect binding as the effect handle:
 
 ```whip
-after poemTurn succeeds as turn => {
+after poemTurn succeeds as turn {
   coerce reviewPoem(task.language, turn.summary) as review
 }
 ```
 
-`then` chains are shorthand for common success dependencies:
-
-```whip
-tell task.poet as poemTurn """
-...
-"""
-then coerce reviewPoem(task.language, poemTurn.summary) as review
-then done task -> record ReviewedPoem from task {
-  language
-  turn poemTurn
-  review review
-  status "reviewed"
-}
-```
-
-This lowers to `after poemTurn succeeds { coerce ... }` followed by
-`after review succeeds { done task -> record ... }`.
+Follow-up effect work must use explicit `after` blocks. Source order does not
+imply effect order, and WhippleScript does not provide `then` sequencing sugar.
 
 ### Expression Parser Coverage
 
 The source expression parser covers guards, assertions, projection filters,
-matrix rows, typed effect arguments, interpolation paths, and branch guards with
+table rows, typed effect arguments, interpolation paths, and branch guards with
 one deterministic expression kernel. Each surface must parse to the same typed
 IR nodes so validation, snapshots, Maude checks, and runtime evaluation do not
 grow separate dialects.
@@ -736,7 +747,7 @@ grow separate dialects.
 | Top-level `assert <expr>` | all guard forms plus fact/effect projection queries | Result must be boolean. Assertions are read-only checkpoints over committed facts/effects. |
 | `Class where <expr>` | field paths rooted at the projected class alias, comparisons, booleans, membership, presence, map indexes | Projection filters are pure reads and cannot enqueue effects or call providers. |
 | `effect kind K where <expr>` | effect status/kind/profile/output paths, comparisons, booleans, membership, presence, map indexes | Output paths must respect completion status and terminal-output union tags. |
-| Static matrix rows | typed literals, arrays, records in schema context, enum/literal values, `AgentRef` values | Matrix rows are compile-time seed data, not runtime loops. |
+| Static table rows | typed literals, arrays, records in schema context, enum/literal values, `AgentRef` values | Table rows are compile-time seed data, not runtime loops. |
 | Effect and `record` arguments | typed paths, literals, arrays, records in expected schema context, `AgentRef` values | Arguments must satisfy the declared payload or fact schema before lowering. |
 | Interpolation paths | field paths, optional-present paths after proof, map indexes | Interpolation is path-oriented; it does not admit arbitrary provider calls or string parsing. |
 | `case expr` scrutinees and branch guards | finite-domain enum/literal/optional/tagged-union values and ordinary boolean branch guards | Branch guards reuse the same parser and evaluator as `where` guards. |
@@ -779,7 +790,7 @@ case review.status {
   Revise => record RevisionNeeded {
     review review
   }
-  Blocked => askHuman """
+  Blocked => askHuman """markdown
     This review is blocked:
     {{ review.reason }}
   """
@@ -790,10 +801,10 @@ Example optional branch:
 
 ```whipplescript
 case issue.assignee {
-  Some assignee => tell reviewer """
+  Some assignee => tell reviewer """markdown
     Review {{ issue.title }} for {{ assignee.name }}.
   """
-  None => askHuman """
+  None => askHuman """markdown
     Assign an owner before this issue can continue.
   """
 }
@@ -810,7 +821,7 @@ case turn.output {
   Failed failure => record ProviderFailure {
     reason failure.reason
   }
-  Blocked block => askHuman """
+  Blocked block => askHuman """markdown
     Provider run was blocked:
     {{ block.reason }}
   """
@@ -852,7 +863,7 @@ Conversational fact sugar is allowed for core integrations:
 
 ```whipplescript
 when {
-  loft has ready issue as issue
+  backlog has ready item as item
   worker is available
 }
 ```
@@ -881,17 +892,17 @@ capability/effect kind
 Examples:
 
 ```whipplescript
-claim issue with loft as claim
+claim item as work
 
-after claim succeeds {
-  tell worker """
-  Implement {{ claim.issue.title }}
+after work succeeds {
+  tell worker """markdown
+  Implement {{ item.title }}
   """
 }
 ```
 
-The downstream `agent.tell` effect is correlated with the `loft.claim` output
-and the claimed issue. Later completion facts can therefore support patterns
+The downstream `agent.tell` effect is correlated with the queue claim output
+and the claimed item. Later completion facts can therefore support patterns
 like:
 
 ```whipplescript
@@ -935,7 +946,7 @@ rule run_language_task
     task.provider is available
   }
 => {
-  tell task.provider requires ["agent.tell"] as turn """
+  tell task.provider requires ["agent.tell"] as turn """markdown
   Write {{ task.language }} text to {{ task.artifactPath }}.
   """
 }
@@ -955,23 +966,123 @@ so externally inserted or replayed effects cannot bypass source validation.
 
 ## Reuse And Matrices
 
-Validation workflows often need a deterministic matrix: providers x languages,
+Validation workflows often need a deterministic table: providers x languages,
 phases x reviewers, or fixtures x validators. The language should provide a
-source-level way to seed small static matrices without hiding effects:
+source-level way to seed small static tables without hiding effects:
 
 ```whipplescript
-matrix language_tasks as LanguageTask [
-  { provider "codex", language "French", expectedScript "Latin" },
-  { provider "claude", language "Hindi", expectedScript "Devanagari" },
-  { provider "pi", language "Japanese", expectedScript "Kana and kanji" },
+table language_tasks as LanguageTask [
+  {
+    provider codex
+    language "French"
+    expectedScript "Latin"
+    status "queued"
+  }
+
+  {
+    provider claude
+    language "Hindi"
+    expectedScript "Devanagari"
+    status "queued"
+  }
+
+  {
+    provider pi
+    language "Japanese"
+    expectedScript "Kana and kanji"
+    status "queued"
+  }
 ]
 ```
 
-Matrix rows lower to ordinary `record` writes during rule evaluation. They must
-be fully typed and deterministic; they are not loops over runtime collections.
-Until matrix syntax lands, validation workflows should seed the equivalent typed
-facts explicitly in a `when started` rule. That is the shape used by
-the provider-language and companion-skill validation fixtures.
+Table rows lower to ordinary `record` writes during rule evaluation. They must
+be fully typed and deterministic; they are not loops over runtime collections,
+and they do not hide effects or provider execution. In this implementation
+slice, a table declaration compiles to a generated `when started` rule that
+records each row as a fact of the declared class. Each row uses the same field
+assignment syntax as `record Class { ... }`, including unquoted `AgentRef`
+values, scalar literals, arrays, maps, and object literals in typed contexts.
+
+Table declarations are intended for small validation and fixture data sets.
+Runtime fan-out over facts still happens through ordinary rules that match the
+seeded facts. If a workflow needs to create rows from provider output, external
+systems, time, or model judgment, it must use explicit effects and ordinary
+`record` operations instead of `table`.
+
+Compiled IR records table row source spans as generated rule
+`record_sources`. At runtime, facts seeded from table rows use
+`provenance_class: "table"` and report `source_span.construct: "table_row"` in
+JSON inspection output. The source span points at the row, not at hidden runtime
+logic.
+
+## Tags
+
+Tags are non-semantic source metadata for filtering, documentation, reports, and
+future release gates:
+
+```whipplescript
+@fixture
+@acceptance
+workflow ProviderLanguageE2E
+
+@fixture
+table language_tasks as LanguageTask [
+  {
+    provider codex
+    language "French"
+    status "queued"
+  }
+]
+
+@acceptance
+assert count(LanguageTask where status == "queued") == 6
+```
+
+The current implementation accepts tags on workflows, tables, assertions, and
+rules. A tag starts with `@` and uses a single non-whitespace name made from
+letters, digits, `_`, `-`, `.`, and `:`. Examples: `@fixture`,
+`@release-gate`, `@provider:codex`.
+
+Tags are preserved in typed IR as source metadata. They do not change rule
+readiness, rule ordering, effect routing, capabilities, provider selection,
+table seeding, effects, or runtime state. `whip dev` may include or exclude
+assertion evaluation by tag for validation reports, but this filtering is not
+workflow execution semantics. Duplicate tags are preserved for now; reporting
+may choose to de-duplicate in a future slice.
+
+## Descriptions
+
+Descriptions are non-semantic source metadata for reports and generated
+documentation. They may appear immediately before workflows, tables,
+assertions, and rules, after any tags:
+
+```whipplescript
+@fixture
+description "Fixture-backed provider x language acceptance workflow"
+workflow ProviderLanguageE2E
+
+description "Static provider x language task rows"
+table language_tasks as LanguageTask [
+  {
+    provider codex
+    language "French"
+    status "queued"
+  }
+]
+
+description "Route one queued task to its selected provider"
+rule run_language_task
+  when LanguageTask as task
+=> {
+  done task
+}
+```
+
+Descriptions are preserved in typed IR as source metadata. They do not change
+rule readiness, rule ordering, effect routing, capabilities, provider
+selection, assertion behavior, or runtime state. A description cannot attach to
+schemas, agents, harnesses, coerces, includes, plugins, workflow contracts,
+patterns, or applications in this slice.
 
 Repeated effect chains should be reusable without obscuring the durable graph.
 A rule template or action block may abstract identical `tell -> coerce ->
@@ -979,7 +1090,7 @@ record` shapes only if expansion is static and inspectable in the compiled IR:
 
 ```whipplescript
 action run_language_task(agent AgentRef, task LanguageTask, provider string) {
-  tell agent as turn """
+  tell agent as turn """markdown
   Write {{ task.language }} text to {{ task.artifactPath }}.
   """
 
@@ -1027,15 +1138,15 @@ Use `after` when one effect must wait for another:
 ```whipplescript
 rule implement_claimed_issue
   when {
-    loft has ready issue as issue
+    backlog has ready item as item
     worker is available
   }
 => {
-  claim issue with loft as claim
+  claim item as work
 
-  after claim succeeds {
-    tell worker """
-    Implement {{ claim.issue.title }}
+  after work succeeds {
+    tell worker """markdown
+    Implement {{ item.title }}
     """
   }
 }
@@ -1107,3 +1218,88 @@ when {
 ```
 
 The second form is friendly but still exposes the causal edge.
+
+## Surface revisions (decided 2026-06-09)
+
+The following supersede earlier statements in this document where they
+conflict. Decision records: [`language-ergonomics-tracker.md`](language-ergonomics-tracker.md).
+
+### Readiness matching: general form and sugar
+
+The general readiness form matches any fact by name, including dotted
+runtime facts:
+
+```whip
+when fact agent.turn.completed as turn where turn.agent == "triager"
+when fact human.answer.received as answer where answer.choice == "approve"
+```
+
+Runtime events are stored and matched as facts, so `fact` is the truthful
+keyword. Dotted lowercase names cannot collide with capitalized user
+classes.
+
+The English readiness phrases are documented sugar over this form — each
+has a defined lowering, none is magic:
+
+| Sugar | Lowers to |
+| --- | --- |
+| `when started` | the initial `external.started` event match |
+| `when <agent> is available` | agent capacity readiness |
+| `when human answered [<label>] as x` | `when fact human.answer.received as x` (`<label>` is documentary) |
+| `when <agent> completed turn ... as x` | `when fact agent.turn.completed as x` (+ agent guard when `<agent>` names a declared agent; the word `worker` is generic) |
+| `when <queue> has ready item as x` | ready-item projection match for the queue ([work-queues.md](work-queues.md)) |
+
+`manual review requested` is removed (undocumented, unused). All Loft
+phrases are removed with the work-queue design.
+
+### Sequencing sugar: superseded
+
+The earlier stance "WhippleScript does not provide `then` sequencing sugar"
+is superseded by the `flow` construct — named flows lower multi-step
+sequences to ordinary rules with compiler-managed state. See
+[`flow.md`](flow.md). The design-pressure principle is preserved: the
+lowering is fully visible (generated rules, reserved `flow.` state facts,
+provenance spans).
+
+### Time
+
+`timeout <duration>` on any effect (creation-anchored), `timer <duration>
+as x` effects, and the `cancel <binding>` body operation. See
+[`time.md`](time.md).
+
+### Work queues
+
+`queue <name> { tracker <kind> }`, the `file`/`claim`/`release`/`finish`
+verbs, and the builtin workspace tracker. See [`work-queues.md`](work-queues.md).
+
+### Inline typed decisions and choice types
+
+`decide "<prompt>" -> { <fields> } as x` is anonymous-coercion sugar: it
+lowers to a generated `coerce` function and class with stable names and the
+ordinary `baml.coerce` effect. Promotion to a named `coerce` is a mechanical
+refactor once a shape is reused.
+
+`case` is permitted over string-literal-union types with exhaustiveness
+checking; plain `string` scrutinees remain rejected.
+
+`askHuman as x choices ["approve", "reject"] "..."` declares the choice set
+in source: `x.choice` is typed as the literal union (case-able, exhaustive),
+and the inbox presents exactly those choices.
+
+### `exec`
+
+Dev profile: `exec "<command>" as x` creates an `exec.command` effect gated by
+operator config (`WHIPPLESCRIPT_EXEC_ALLOW`). This is a laptop-loop convenience,
+not a security boundary.
+
+Hosted profile: `exec <capability> with <record> -> Type as x` creates an
+`exec.command` effect requiring `script.<capability>`. The operator manifest
+supplies argv and a SHA-256 pin; the worker verifies bytes before spawn and
+passes the typed record on stdin. Raw command strings are rejected in hosted
+checks and workers. Evidence records exit code, truncated stdout/stderr, and
+the executing hash for hosted capabilities.
+
+### Removed: `emit`
+
+`emit event.name` is removed from the surface: it had no documented
+semantics and no usage. Events are the runtime's to append.

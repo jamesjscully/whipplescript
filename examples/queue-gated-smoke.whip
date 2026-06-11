@@ -1,0 +1,60 @@
+@service
+description "The agent turn only runs after the work-item claim succeeds"
+workflow QueueGatedSmoke
+
+queue backlog {
+  tracker builtin
+}
+
+class QueueGatedResult {
+  itemId string
+  itemTitle string
+  summary string
+  status "done"
+}
+
+agent worker {
+  provider codex
+  profile "repo-writer"
+  capacity 1
+}
+
+assert count(effect kind queue.claim where status == completed) == 1
+assert count(effect kind agent.tell where status == completed) == 1
+assert count(QueueGatedResult where status == "done") == 1
+assert count(effect kind human.ask) == 0
+
+rule implement_ready_item
+  when {
+    backlog has ready item as item
+    worker is available
+  }
+=> {
+  claim item as lease
+
+  after lease succeeds {
+    tell worker as turn """markdown
+    This turn must only run after the work-item claim succeeds.
+
+    {{ item.title }}
+    """
+  }
+
+  after turn succeeds as outcome {
+    finish item {
+      summary outcome.summary
+    }
+    record QueueGatedResult {
+      itemId item.id
+      itemTitle item.title
+      summary outcome.summary
+      status "done"
+    }
+  }
+
+  after lease fails {
+    askHuman """markdown
+    The work-item claim failed, so the worker turn must not start.
+    """
+  }
+}

@@ -1,0 +1,63 @@
+workflow IncidentRouter
+source_tags
+@service workflow IncidentRouter
+schemas
+  class Owner
+    name string
+  class Incident
+    id string
+    title string
+    severity int
+    tags array<string>
+    metadata map<string>
+    owner optional<ref<Owner>>
+    assignee agentref<codex | claude | pi>
+    status literal<"open">
+  class RoutedIncident
+    id string
+    provider string
+    route union<literal<"code"> | literal<"review"> | literal<"ops">>
+    status literal<"routed">
+agents
+  agent codex harness=<fallback> provider=codex profile=repo-writer capacity=1 skills=[] capabilities=[]
+  agent claude harness=<fallback> provider=claude profile=repo-reader capacity=1 skills=[] capabilities=[]
+  agent pi harness=<fallback> provider=pi profile=repo-reader capacity=1 skills=[] capabilities=[]
+assertions
+  assert count(Incident where status == "open") == 0
+    reads
+      fact:Incident where status == "open"
+  assert count(RoutedIncident where route in ["code", "review", "ops"]) == 2
+    reads
+      fact:RoutedIncident where route in ["code", "review", "ops"]
+  assert exists(RoutedIncident where provider == "codex")
+    reads
+      fact:RoutedIncident where provider == "codex"
+  assert exists(RoutedIncident where provider == "pi")
+    reads
+      fact:RoutedIncident where provider == "pi"
+rules
+  rule table_incidents
+    when started
+    reads
+      pattern:started
+    writes
+      schema:Incident
+    record_sources
+      schema:Incident construct=table_row span=726..907
+      schema:Incident construct=table_row span=910..1091
+    body_hash 8e0268dfb39ee011
+  rule route_incident
+    when Incident as incident where (((incident.severity >= 2) && ("route" in incident.metadata)) && (incident.metadata["route"] in ["code", "review", "ops"])) && ((incident.owner == null) || exists(incident.owner))
+    when incident.assignee is available
+    reads
+      pattern:incident.assignee is available
+      schema:Incident
+    writes
+      schema:RoutedIncident
+    consumes
+      schema:Incident
+    effects
+      turn kind=agent.tell binding=turn key=bace924c779e81b8
+    body_hash 487aac506570c011
+rule_dependencies
+  table_incidents --schema:Incident--> route_incident

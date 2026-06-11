@@ -1,0 +1,80 @@
+workflow AutoResearchLite
+
+output result ResearchResult
+failure error ResearchStopped
+
+# A research loop becomes facts plus a budgeted experiment, not an implicit loop.
+class ResearchProject {
+  id string
+}
+
+class Hypothesis {
+  id string
+  project ResearchProject
+  idea string
+  status "queued"
+}
+
+class ExperimentMetric {
+  score float
+  notes string
+}
+
+class ResearchResult {
+  hypothesisId string
+  score float
+  decision "keep"
+}
+
+class ResearchStopped {
+  reason string
+}
+
+# The budget is a coordination primitive, not a hidden loop counter.
+counter experiment_budget {
+  key ResearchProject
+  cap 3
+  reset daily
+}
+
+table projects as ResearchProject [
+  {
+    id "proj-autoresearch"
+  }
+]
+
+table hypotheses as Hypothesis [
+  {
+    id "H-1"
+    project { id "proj-autoresearch" }
+    idea "Try a smaller candidate set before ranking."
+    status "queued"
+  }
+]
+
+rule run_budgeted_experiment
+  when Hypothesis as hypothesis where hypothesis.status == "queued"
+=> {
+  consume experiment_budget for hypothesis.project amount 1 as budget
+
+  after budget ok {
+    exec "printf '{\"score\":0.82,\"notes\":\"accuracy improved\"}\\n'" -> ExperimentMetric as metric
+  }
+
+  after budget over {
+    done hypothesis
+    fail error {
+      reason "experiment budget exhausted"
+    }
+  }
+
+  after metric succeeds as result {
+    done hypothesis
+
+    complete result {
+      hypothesisId hypothesis.id
+      score result.score
+      decision "keep"
+    }
+  }
+}

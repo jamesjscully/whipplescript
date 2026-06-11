@@ -1,174 +1,19 @@
-# WhippleScript Manual
+# Authoring guide
 
-This manual explains how to build, run, inspect, and extend WhippleScript
-workflows. If you are new, start with [Quickstart](quickstart.md),
-[Tutorial](tutorial.md), and [Concepts](concepts.md). Use
-[API Reference](api-reference.md) when you need exact command syntax or
-crate-level surfaces.
+How to structure WhippleScript workflows well: modeling data, sequencing
+effects, branching, composing source, and debugging runs. New users should
+start with the [quickstart](quickstart.md) and [tutorial](tutorial.md); exact
+syntax for every construct is in the
+[language reference](language-reference.md).
 
-## 1. What WhippleScript Is
+The premise behind all of the guidance here: rules own policy and stay
+deterministic; everything external is a durable effect; the runtime owns
+delivery, retries, idempotency, and inspection.
 
-WhippleScript is a durable orchestration language for agent work. It is not a
-general programming language and it is not a prompt-only convention.
+## Model data with classes and enums
 
-The core loop is:
-
-```text
-facts/events are present
-rules match them
-rules commit new facts and durable effects
-workers execute effects
-provider results return as events/facts
-more rules may run
-the workflow eventually completes, fails, or is cancelled
-```
-
-The language owns policy. The runtime owns durability, effect delivery, leases,
-idempotency, retries, replay, and inspection.
-
-## 2. Install And Check The CLI
-
-Install `whip` with [Install WhippleScript](install.md), then check the local
-tooling:
-
-```sh
-whip doctor
-```
-
-From a development checkout, build the full workspace when changing code:
-
-```sh
-cargo build --workspace
-```
-
-Optional formal tooling is available through the repo Nix shell:
-
-```sh
-nix develop
-```
-
-The full local check set is:
-
-```sh
-cargo fmt --all -- --check
-cargo test --workspace
-scripts/check-formal-models.sh
-scripts/check-tla-models.sh
-scripts/check-e2e.sh
-```
-
-For a single readiness artifact:
-
-```sh
-scripts/check-release-readiness.sh
-```
-
-## 3. Write A Minimal Workflow
-
-Create `examples/minimal-noop.whip` style source:
-
-```whip
-workflow MinimalNoop
-
-class StartupSeen {
-  source string
-  state "observed"
-}
-
-rule observe_start
-  when started
-=> {
-  record StartupSeen {
-    source "external.started"
-    state "observed"
-  }
-}
-```
-
-Check it:
-
-```sh
-whip check examples/minimal-noop.whip
-```
-
-Compile it:
-
-```sh
-whip compile examples/minimal-noop.whip
-```
-
-## 4. Start And Inspect An Instance
-
-Use a dedicated store for local runs:
-
-```sh
-STORE=.whipplescript/manual.sqlite
-```
-
-Start the workflow:
-
-```sh
-whip --store "$STORE" \
-  run examples/minimal-noop.whip \
-  --input '{}' \
-  --json
-```
-
-Save the returned `instance_id`.
-
-Inspect:
-
-```sh
-whip --store "$STORE" status <instance>
-whip --store "$STORE" log <instance>
-whip --store "$STORE" facts <instance>
-```
-
-At this point `run` has created the instance and start event. It has not stepped
-rules unless you use `dev`.
-
-Advance deterministic rules:
-
-```sh
-whip --store "$STORE" \
-  step <instance> --program examples/minimal-noop.whip
-```
-
-Inspect facts again:
-
-```sh
-whip --store "$STORE" facts <instance>
-```
-
-## 5. Use `dev` For Local Validation
-
-`dev` starts a new instance, steps rules, runs fixture workers, and evaluates
-assertions:
-
-```sh
-whip --store "$STORE" \
-  dev examples/provider-language-e2e.whip \
-  --provider fixture \
-  --until idle \
-  --json
-```
-
-Use fixture outcome switches to exercise terminal branches:
-
-```sh
-whip --store "$STORE" \
-  dev examples/human-review.whip --provider fixture --fail
-
-whip --store "$STORE" \
-  dev examples/human-review.whip --provider fixture --timeout
-
-whip --store "$STORE" \
-  dev examples/human-review.whip --provider fixture --cancel
-```
-
-## 6. Model Data With Classes And Enums
-
-Use classes for durable facts and effect payloads:
+Facts are typed. Use enums for closed decision sets and literal fields for
+small state machines:
 
 ```whip
 enum ReviewStatus {
@@ -180,7 +25,6 @@ enum ReviewStatus {
 class WorkItem {
   id string
   title string
-  body string
   status "queued" | "reviewed"
 }
 
@@ -191,241 +35,106 @@ class WorkReview {
 }
 ```
 
-Use literal fields for small state machines. This keeps guards deterministic:
+Literal-typed status fields keep guards deterministic and make illegal states
+unrepresentable: a rule matching `where item.status == "queued"` cannot also
+see a reviewed item.
 
-```whip
-rule review_ready
-  when WorkItem as item where item.status == "queued"
-=> {
-  ...
-}
-```
+Prefer consuming and re-recording facts over mutating status in place —
+`done item -> record WorkItem { ... status "reviewed" }` makes the state
+transition atomic with whatever else the rule commits.
 
-## 7. Request Agent Work
-
-Declare an agent:
+## Request agent work
 
 ```whip
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
   capabilities ["agent.tell"]
-  skills ["whipplescript-author"]
 }
-```
 
-Use `tell` to enqueue work:
-
-```whip
 rule implement
-  when {
-    WorkItem as item where item.status == "queued"
-    worker is available
-  }
+  when WorkItem as item where item.status == "queued"
+  when worker is available
 => {
-  tell worker requires ["agent.tell"] as turn """
+  tell worker requires ["agent.tell"] as turn """markdown
   Implement this item:
 
   {{ item.title }}
-  {{ item.body }}
   """
 
-  after turn succeeds as completed => {
+  after turn succeeds as completed {
     done item -> record WorkItem {
       id item.id
       title item.title
-      body item.body
       status "reviewed"
     }
   }
 }
 ```
 
-`tell` creates an `agent.tell` effect. The provider does not run during the rule
-commit. A worker starts a provider run and completes the effect later.
+`tell` records an effect; the provider runs later. Three consequences worth
+internalizing:
 
-## 8. Use BAML Coercion For Typed Model Decisions
+- Source order inside a rule body does not order effects. Use `after` blocks
+  to create dependency edges.
+- Effect output (`completed` above) is visible only inside the `after` block
+  that proves the terminal status. This is what makes causality auditable.
+- `when worker is available` is the capacity gate; without it the rule still
+  fires but the effect may block on capacity.
 
-Declare a coerce function:
+## Make typed model decisions with `coerce`
+
+When a judgment call should produce structured data rather than prose,
+declare a coerce function and branch on its completion:
 
 ```whip
 coerce reviewWork(title string, summary string) -> WorkReview {
-  prompt """
+  prompt """markdown
   Review the completed work.
 
-  Title:
-  {{ title }}
-
-  Summary:
-  {{ summary }}
+  Title: {{ title }}
+  Summary: {{ summary }}
 
   {{ ctx.output_format }}
   """
 }
-```
 
-Call it from a rule:
+rule review
+  when ...
+=> {
+  tell worker as turn "..."
 
-```whip
-after turn succeeds as completed => {
-  coerce reviewWork(item.title, completed.summary) as review
-}
-
-after review succeeds as result => {
-  record ReviewedWork {
-    item item
-    review result
+  after turn succeeds as completed {
+    coerce reviewWork(item.title, completed.summary) as review
   }
-}
 
-after review fails as failure => {
-  askHuman "Review failed: {{ failure.reason }}"
-}
-```
-
-`coerce` is effectful. It is not a local function call.
-
-## 9. Use Plugins And Skills Correctly
-
-Import plugins with `use`:
-
-```whip
-use memory
-```
-
-Call plugin capabilities as effects:
-
-```whip
-call memory.query for item as context
-
-after context succeeds as memory => {
-  tell worker as turn "Use this context: {{ memory.summary }}"
-}
-```
-
-Assign skills to agents or turns:
-
-```whip
-agent planner {
-  profile "repo-reader"
-  capacity 1
-  skills ["whipplescript-author", "human-review-user"]
-}
-```
-
-Skills are context bundles. They are not imports and they do not extend grammar.
-
-## 10. Compose Source
-
-Use `include` for source files:
-
-```whip
-include "schemas/common.whip"
-include "review.baml"
-```
-
-Use `pattern` and `apply` for compile-time reuse:
-
-```whip
-pattern ReviewWithAgent<Input, Output> {
-  input Input as item
-
-  rule dispatch
-    when {
-      Input as item
-      reviewer is available
-    }
-  => {
-    tell reviewer as turn "Review {{ item.title }}."
-
-    after turn succeeds as completed => {
-      done item -> record Output {
-        turn completed
-        status "reviewed"
-      }
+  after review succeeds as result {
+    record ReviewedWork {
+      item item
+      review result
     }
   }
-}
 
-apply ReviewWithAgent<WorkItem, ReviewedWork> as ReviewWork {
-  reviewer worker
-}
-```
-
-Use `invoke` for runtime child workflows:
-
-```whip
-invoke ReviewPhase {
-  phase PhaseReviewRequest {
-    id phase.id
-    title phase.title
-  }
-} as child
-
-after child succeeds as result => {
-  record ReviewComplete {
-    phaseId phase.id
-    result result
+  after review fails as failure {
+    askHuman "Review failed: {{ failure.reason }}"
   }
 }
 ```
 
-Rule of thumb:
+`coerce` is an effect, not a function call: it is durable, it can fail, and
+its typed output is only available in the `after` branch.
 
-| Need | Use |
-| --- | --- |
-| Split declarations across files | `include` |
-| Import provider/plugin resources | `use` |
-| Reuse rule/effect fragments inline | `pattern` + `apply` |
-| Run a child instance with its own lifecycle | `workflow` + `invoke` |
+## Branch deterministically
 
-## 11. Complete Or Fail A Workflow
-
-Declare terminal contracts:
-
-```whip
-workflow ReviewPhase {
-  input phase PhaseReviewRequest
-  output result PhaseReviewResult
-  failure error ReviewPhaseFailure
-  ...
-}
-```
-
-Complete:
-
-```whip
-complete result {
-  phaseId phase.id
-  status "accepted"
-}
-```
-
-Fail:
-
-```whip
-fail error {
-  phaseId phase.id
-  reason "review blocked"
-}
-```
-
-Workflow terminal actions are atomic with the rule commit. A completed, failed,
-or cancelled instance is terminal.
-
-## 12. Branch Deterministically
-
-Use guards for simple filtering:
+Guards handle filtering; `case` handles finite domains; `after ... completes`
+handles exhaustive terminal-status handling:
 
 ```whip
 rule accept
   when ReviewedWork as reviewed where reviewed.review.status == Accept
-=> {
-  ...
-}
+=> { ... }
 ```
-
-Use `case` for finite-domain branches:
 
 ```whip
 case review.status {
@@ -441,164 +150,301 @@ case review.status {
 }
 ```
 
-Use `after effect completes` when all terminal statuses matter:
-
 ```whip
 after turn completes {
   case turn.output {
-    Completed result => {
-      record TurnSucceeded { summary result.summary }
-    }
-    Failed failure => {
-      record TurnFailed { reason failure.reason }
-    }
-    TimedOut timeout => {
-      record TurnTimedOut { reason timeout.reason }
-    }
-    Cancelled cancelled => {
-      record TurnCancelled { reason cancelled.reason }
-    }
+    Completed result => { record TurnSucceeded { summary result.summary } }
+    Failed failure   => { record TurnFailed { reason failure.reason } }
+    TimedOut timeout => { record TurnTimedOut { reason timeout.reason } }
+    Cancelled c      => { record TurnCancelled { reason c.reason } }
   }
 }
 ```
 
-Keep branching over typed values. Do not parse prompt text to decide route or
-status.
+Branch over typed values. Never parse prompt text to decide a route or a
+status — if a decision needs model judgment, make it a `coerce` and branch on
+the typed result.
 
-## 13. Inspect And Debug
+## Sequential flows
 
-Use this sequence first:
+Most orchestration is best expressed as independent rules: each reacts to the
+facts it cares about, and the runtime sequences them through `after` edges.
+But some work is genuinely a script — do this, then ask a human, then branch —
+and threading it through nested `after` blocks obscures the sequence. A `flow`
+writes that sequence top to bottom while lowering to the same rules:
 
-```sh
-whip status <instance>
-whip log <instance>
-whip facts <instance>
-whip effects <instance>
-whip runs <instance>
-whip diagnostics <instance>
-whip evidence <instance>
-whip trace <instance> --check
+```whip
+flow triage
+  when Ticket as ticket
+{
+  tell triager as turn "Plan {{ ticket.title }}."
+  askHuman as signoff "Approve {{ turn.summary }}?"
+
+  when signoff.choice == "approve" {
+    complete result { decision signoff.choice }
+  } else {
+    fail error { reason "rejected" }
+  }
+}
 ```
 
-If an effect did not run:
+Inside a flow, each effect step's output is in scope for the steps that follow
+(`turn`, then `signoff`), so you do not nest `after` blocks for the common
+case. Attach `on fails { ... }` / `on timeout { ... }` to a step to handle its
+failure paths, and use `when <expr> { } else { }` to branch on a prior step's
+output.
 
-1. Check `effects <instance>` for status and `policy_block_reason`.
-2. Check `runs <instance>` for provider attempts.
-3. Check `diagnostics <instance>` for assertion/provider errors.
-4. Check `evidence <instance>` for provider artifacts and failure details.
-5. Check `trace <instance> --check` for lifecycle conformance.
+When to reach for a flow versus plain rules:
 
-## 14. Handle Human Review
+| Situation | Use |
+| --- | --- |
+| Steps that always run in a fixed order, with shared bindings | `flow` |
+| Independent reactions that fan in from different facts | separate `rule`s |
+| One linear path with a human gate in the middle | `flow` |
+| Branchy policy where order is data-driven, not positional | `rule`s + guards |
 
-`askHuman` creates a `human.ask` effect. The fixture worker turns it into an
-inbox item.
+A flow is not a new runtime mode. It compiles to ordinary rules
+(`flow.<name>.seg0`, `seg1`, …) plus a generated await state, all visible in
+`whip check`. Everything you know about rules — atomic commits, durable
+effects, `after` semantics — still applies.
 
-List pending items:
+## Work queues
 
-```sh
-whip inbox
+When work arrives as a backlog rather than as facts you seed up front, declare
+a queue and let rules claim from it:
+
+```whip
+queue backlog {
+  tracker builtin
+}
+
+rule pick_up
+  when backlog has ready item as item
+  when worker is available
+=> {
+  claim item as work
+  tell worker as turn "Resolve {{ work.title }}."
+
+  after work fails as taken {
+    // another claimant won the race — just wait for the next ready item
+  }
+}
 ```
 
-Show one item:
+The verbs are `file item into <queue> { ... }`, `claim`, `release`, and
+`finish`. A losing `claim` is a normal branchable failure, not an error, so a
+contended queue stays correct without locks in source.
 
-```sh
-whip inbox show <item>
+Operate the backlog from the CLI with `whip items add`, `whip items list`, and
+`whip items show`. The builtin tracker is workspace-scoped and issues ids like
+`WS-1`; items an agent files mid-turn carry run-identity provenance. Full
+syntax is in the [language reference](language-reference.md#work-queues).
+
+## Time and deadlines
+
+Keep time out of guards — guards must stay pure. Express deadlines as effects:
+
+- `timeout <dur>` on an effect bounds how long it may run; an
+  `after ... times out` / `on timeout` branch reacts when it expires.
+- `timer <dur> as deadline` is a standalone delay you branch on with
+  `after deadline succeeds`.
+- `cancel <binding>` stops a pending or running effect you bound earlier.
+
+```whip
+tell worker as turn timeout 10m "Do the work."
+
+after turn times out as t {
+  askHuman "Worker exceeded 10m — escalate?"
+}
 ```
 
-Answer:
+Durations are `<n><unit>` with units `s`/`m`/`h`/`d`. Timers and timeouts fire
+on worker passes — there is no daemon — so `whip dev --until idle` treats
+pending timers as idle, and `whip status` lists the time effects an instance is
+waiting on.
 
-```sh
-whip inbox answer <item> --choice approve --by alice
-whip inbox answer <item> --text "Split this into smaller work" --by alice
+## Express retries as facts
+
+There is no built-in retry policy; retries are ordinary facts and rules,
+which keeps them visible and auditable:
+
+```whip
+rule attempt_job
+  when Job as job where job.status == "pending" and job.attempts < 3
+  when worker is available
+=> {
+  tell worker as turn "Do job {{ job.id }}"
+
+  after turn succeeds as ok {
+    done job -> record JobDone { id job.id }
+  }
+
+  after turn fails as failed {
+    done job -> record Job {
+      id job.id
+      attempts job.attempts + 1
+      status "pending"
+    }
+  }
+}
+
+rule give_up
+  when Job as job where job.attempts >= 3
+=> {
+  done job -> record JobAbandoned { id job.id }
+}
 ```
 
-The answer appends a durable event.
+## Gate on humans
 
-## 15. Operate Instances
+`askHuman` creates an inbox item; a `human answered` rule reacts to the
+answer. The [tutorial](tutorial.md) builds this pattern end to end, and
+[`examples/human-review.whip`](../examples/human-review.whip) is the minimal
+version. Operate the inbox with `whip inbox`, `whip inbox show <item>`, and
+`whip inbox answer <item> (--choice X | --text "...") [--by NAME]`.
 
-Pause:
+## Run a local command (escape hatch)
 
-```sh
-whip pause <instance>
+`exec` has a dev form and a hosted form.
+
+`exec "<command>" as result` runs a local command as an effect and exposes
+`result.exit_code` and `result.stdout`. It is a dev-profile escape hatch,
+deliberately constrained:
+
+- There is no source syntax to grant it. The operator allow-lists commands
+  through `WHIPPLESCRIPT_EXEC_ALLOW` (colon-separated glob prefixes such as
+  `scripts/*`); anything outside the list fails and routes to `after x fails`.
+- There is no sandbox for raw dev `exec` — a grant is a documented trust
+  decision. Keep the allow-list as narrow as the workflow needs, and prefer
+  agents, plugins, or child workflows when one of those fits.
+
+Hosted deployments should use named script capabilities instead:
+
+```whip
+exec backup_repo with request -> Report as backup
 ```
 
-Resume:
+The operator supplies `--exec-profile hosted --script-manifest <path>`. The
+manifest maps `backup_repo` to argv, a pinned SHA-256 digest, and optional
+secret references:
 
-```sh
-whip resume <instance>
+```json
+{
+  "backup_repo": {
+    "argv": ["bash", "scripts/backup.sh"],
+    "sha256": "9f2c...",
+    "env": { "BACKUP_TOKEN": "env:BACKUP_TOKEN" }
+  }
+}
 ```
 
-Cancel:
+Hosted `exec` rejects raw command strings, verifies the script bytes before
+spawn, runs argv-direct with typed JSON stdin, and records the executing hash.
 
-```sh
-whip cancel <instance>
+Use `exec` for deterministic local steps that genuinely belong in the
+workflow — running a test script, a linter — not as a way to smuggle
+orchestration into shell.
+
+## Compose source
+
+| Need | Use |
+| --- | --- |
+| Split declarations across files | `include "schemas/common.whip"` |
+| Bring in BAML classes/functions | `include "review.baml"` |
+| Import plugin capabilities | `use memory` |
+| Reuse a rule/effect fragment at compile time | `pattern` + `apply` |
+| Sequence fixed steps with shared bindings | `flow` |
+| Pull work from a durable backlog | `queue` + `claim` |
+| Run work with its own lifecycle and terminal contract | `workflow` + `invoke` |
+
+Patterns are compile-time templates — `apply` expands them into ordinary
+declarations before type checking. `invoke` is runtime composition — the
+child is a real instance, and the parent sees only its declared output or
+failure payload:
+
+```whip
+invoke ReviewPhase {
+  phase PhaseReviewRequest {
+    id phase.id
+    title phase.title
+  }
+} as child
+
+after child succeeds as result {
+  record ReviewComplete { phaseId phase.id result result }
+}
+
+after child fails as failure {
+  record ReviewBlocked { phaseId phase.id reason failure.reason }
+}
 ```
 
-Retry an eligible effect:
+## End the workflow
 
-```sh
-whip retry <instance> <effect>
+Declare what the workflow produces, and make some rule produce it:
+
+```whip
+output result PhaseReviewResult
+failure error ReviewPhaseFailure
 ```
 
-Pause/resume are nonterminal. Cancel is terminal.
+`complete result { ... }` and `fail error { ... }` are atomic with the rule
+commit and validate against the declared contract. `whip check` rejects
+workflows with no path to a terminal; tag genuinely perpetual workflows
+`@service` and externally-fed rules `@external` (see
+[liveness checks](language-reference.md#liveness-checks)).
 
-## 16. Validate Provider Boundaries
+Remember the failure split: a provider failure is effect/run state for rules
+to react to; `fail` is the workflow itself giving up. Don't conflate them —
+deciding which provider failures are fatal is exactly the policy the source
+should express.
 
-Default validation uses fixture providers. Optional real-provider smoke checks
-are configured with environment variables:
+## Debug a run
 
-```sh
-WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \
-WHIPPLESCRIPT_REAL_PROVIDERS=loft,baml,codex \
-scripts/check-real-providers.sh
-```
-
-For the smallest Codex smoke:
-
-```sh
-scripts/check-codex-message.sh
-```
-
-For an OpenAI-backed local BAML-compatible coerce bridge:
+Work through the views in order:
 
 ```sh
-scripts/check-openai-coerce.sh
+whip status <instance>        # lifecycle, counts, recent events
+whip log <instance>           # the event sequence
+whip facts <instance>         # current fact state
+whip effects <instance>       # effect status + policy_block_reason
+whip runs <instance>          # provider attempts
+whip diagnostics <instance>   # recorded errors
+whip evidence <instance>      # provider payloads and artifacts
+whip trace <instance> --check # lifecycle conformance
 ```
 
-The wrapper loads `OPENAI_API_KEY` as data from `.env` when needed and generates
-a per-run bearer token for the local `/coerce` bridge.
+`whip --json dev <file> --provider fixture --until idle` plus assertions is
+the tightest authoring loop: assertions turn "it seems to work" into a
+checked claim about the final state.
 
-Provider failures must appear as events, run/effect terminal state, diagnostics,
-and evidence. They do not automatically fail the workflow unless source rules
-execute `fail`.
+## Checklist before sharing a workflow
 
-## 17. Authoring Checklist
+- `whip check` passes; `@service`/`@external` tags appear only where
+  intentional.
+- Effects are ordered by `after` blocks, not source order.
+- Routing decisions are typed source data (`AgentRef`, enums, literals) —
+  not model output.
+- Every failure branch retries, escalates, or deliberately ignores; none
+  fall through silently.
+- Agent profiles are as narrow as the work allows; plugin calls are explicit
+  `call` effects; skills are attached to agents or turns, not imported.
+- `whip --json dev` passes its assertions with the fixture provider, and
+  `whip trace --check` reports conformance.
 
-Before treating a workflow as ready:
-
-- `whip check <file>` succeeds.
-- `whip compile <file>` snapshot is stable and understandable.
-- Effects are ordered with `after`, not source order.
-- Rule readiness uses `when` clauses or `when { ... }` groups, never `with`.
-- Provider/model routing is deterministic source metadata, not an LLM decision.
-- Agent profiles are as narrow as possible.
-- Plugin capabilities are explicit `call` effects.
-- Skills are attached to agents or turns.
-- Terminal behavior is explicit through `complete`, `fail`, or operator cancel.
-- Failure branches either retry, escalate, or intentionally ignore failures.
-- `whip dev <file> --json` passes assertions with fixture providers.
-- `whip trace <instance> --check --json` reports conformance.
-
-## 18. Common Mistakes
+## Common mistakes
 
 | Mistake | Fix |
 | --- | --- |
-| Relying on source order for effect sequencing. | Use `after effect succeeds/fails/completes`. |
-| Asking a model to choose provider identity. | Use `AgentRef<...>`, enums, or literal source fields. |
-| Treating `coerce` as a local function. | Branch on the `baml.coerce` effect completion. |
-| Importing skills with `use`. | Attach skills to agents or turns. |
-| Hiding orchestration in shell scripts. | Represent work as rules, facts, and effects. |
-| Storing credentials in source. | Use provider/runtime configuration references. |
-| Reading effect output outside an `after` branch. | Bind output inside the terminal branch. |
-| Treating provider failure as workflow failure. | Add a rule that chooses to `fail` when policy requires it. |
-| Using `with` as a rule condition. | Use `when`; reserve `with` for action configuration like `claim issue with loft`. |
+| Relying on source order to sequence effects | Use `after effect succeeds/fails/completes`. |
+| Reading effect output outside its `after` branch | Bind output inside the branch that proves the status. |
+| Treating `coerce` as a local function call | Branch on the effect's completion. |
+| Letting a model choose the provider or route | Use `AgentRef<...>`, enums, or literal fields. |
+| Treating provider failure as workflow failure | Write a rule that decides when to `fail`. |
+| Importing skills with `use` | Attach skills to agents or turns; `use` is for plugins. |
+| Hiding orchestration in shell scripts around the CLI | Express it as rules, facts, and effects. |
+| Reading the clock in a guard | Use a `timeout`, `timer`, or recorded fact. |
+| Treating a lost `claim` as an error | Branch on the claim failure and wait for the next ready item. |
+| Reaching for `emit` to log an event | `emit` was removed; derive facts from effect completions. |
+| Granting raw dev `exec` broadly | Keep `WHIPPLESCRIPT_EXEC_ALLOW` as narrow as the workflow needs; use hosted script capabilities for untrusted authoring. |
+| Credentials in `.whip` source | Use provider configuration references. |

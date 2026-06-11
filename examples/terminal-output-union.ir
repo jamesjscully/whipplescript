@@ -1,4 +1,6 @@
 workflow TerminalOutputUnion
+source_tags
+@service workflow TerminalOutputUnion
 schemas
   class WorkItem
     title string
@@ -21,14 +23,14 @@ rules
     effects
       classification kind=baml.coerce binding=classification key=9cc6833fa173e479
     terminal_outputs
-      classification span=472..488
-        Completed payload=ref<Classification> span=472..488
-        Failed payload=object<{reason string, summary string, effect_id string, run_id string}> span=472..488
-        TimedOut payload=object<{summary string, effect_id string, run_id string}> span=472..488
-        Cancelled payload=object<{summary string, effect_id string, run_id string}> span=472..488
+      classification span=557..573
+        Completed payload=ref<Classification> span=557..573
+        Failed payload=object<{reason string, summary string, effect_id string, run_id string}> span=557..573
+        TimedOut payload=object<{summary string, effect_id string, run_id string}> span=557..573
+        Cancelled payload=object<{summary string, effect_id string, run_id string}> span=557..573
     terminal_branches
-      case classification Completed binding=result guard=- body_hash=68cc197fa99f85c2 span=472..488
-      case classification Failed binding=failure guard=- body_hash=2380b8f08533fbed span=610..624
-      case classification TimedOut binding=timeout guard=- body_hash=41b33e02ef29fa29 span=743..759
-      case classification Cancelled binding=cancel guard=- body_hash=52481a247ffe13d7 span=882..898
+      case classification Completed binding=result guard=- body_hash=68cc197fa99f85c2 span=557..573
+      case classification Failed binding=failure guard=- body_hash=2380b8f08533fbed span=695..709
+      case classification TimedOut binding=timeout guard=- body_hash=41b33e02ef29fa29 span=828..844
+      case classification Cancelled binding=cancel guard=- body_hash=52481a247ffe13d7 span=967..983
     body_hash e7b3c42ca4066628

@@ -34,7 +34,7 @@ class WorkClassification {
 }
 
 coerce classifyWork(summary string) -> WorkClassification {
-  prompt """
+  prompt """markdown
   Classify this agent result:
 
   {{ summary }}

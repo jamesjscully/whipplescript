@@ -1,14 +1,19 @@
 workflow EffectOutputScope
 
+queue backlog {
+  tracker builtin
+}
+
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
 }
 
 rule bad_scope
-  when loft has ready issue as issue
+  when backlog has ready item as item
 => {
-  claim issue with loft as claim
+  claim item as claim
 
-  tell worker "{{ claim.issue.title }}"
+  tell worker "{{ claim.value.id }}"
 }

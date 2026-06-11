@@ -5,6 +5,7 @@ class WorkItem {
 }
 
 agent worker {
+  provider fixture
   profile "repo-writer"
   capacity 1
 }

@@ -28,7 +28,7 @@ workflow RevisionValidation {
     after proposal succeeds as patch {
       done target
 
-      askHuman """
+      askHuman """markdown
       Review this patch proposal before activating a workflow revision.
 
       Instance:
@@ -83,6 +83,7 @@ workflow PatchProposalChild {
   }
 
   agent planner {
+  provider codex
     profile "repo-writer"
     capacity 1
     skills ["whipplescript-author"]
@@ -92,7 +93,7 @@ workflow PatchProposalChild {
     when RevisionTarget as target
     when planner is available
   => {
-    tell planner as turn """
+    tell planner as turn """markdown
     Draft a candidate workflow source file for this requested revision.
 
     Instance:

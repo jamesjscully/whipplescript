@@ -18,16 +18,17 @@ whipplescript-e2e-<test>-<pid>-trace.txt
 Those artifacts are written before trace conformance is checked, so a failed
 test leaves the abstract lifecycle trace available for debugging.
 
-The deterministic CLI e2e suite includes `examples/provider-language-e2e.whip`.
-That workflow drives logical `codex`, `claude`, and `pi` agents through six
-language-generation tasks, then reviews every completed turn with a typed BAML
-`coerce`. The default run uses the fixture worker, so it checks orchestration,
-dependencies, effect/fact projection, and BAML argument rehydration without
-requiring real provider credentials.
+The deterministic CLI e2e suite includes `examples/provider-language-e2e.whip`
+and its acceptance fixture. That workflow drives logical `codex`, `claude`,
+and `pi` agents through six table-seeded language-generation tasks, then
+reviews every completed turn with a typed BAML `coerce`. The default run uses
+the fixture worker, so it checks orchestration, dependencies, effect/fact
+projection, assertion reads, trace summaries, provider-run/evidence metadata,
+and BAML argument rehydration without requiring real provider credentials.
 
 This workflow is also a language-feature regression target. The intended
-source shape is one shared `LanguageTask` schema with deterministic routing
-guards such as `where task.provider == "codex"`, not one duplicate task class
+source shape is one shared `LanguageTask` schema with a typed
+`AgentRef<codex | claude | pi>` provider field, not one duplicate task class
 per provider. The test should not ask BAML or any language model to decide
 provider identity, model identity, or route selection.
 
@@ -40,8 +41,8 @@ assertions prove one dispatch per logical reviewer and three completed
 `agent.tell` effects. The test fails if routing moves into BAML output, prompt
 text inspection, or duplicate provider-specific task schemas.
 
-The e2e suite should eventually encode these assertions in WhippleScript source
-rather than only in Rust test code:
+The provider-language example encodes these assertions in WhippleScript source
+and `examples/provider-language-e2e.accept.json` pins the final report:
 
 ```text
 count(LanguageE2EResult where provider == "codex") == 2
@@ -79,7 +80,7 @@ Required deterministic coverage:
 
 Golden IR fixtures are the validation bridge between parser coverage and e2e
 behavior. They should snapshot guards, assertions, projection queries, branch
-guards, matrix rows, typed `record`/effect arguments, dynamic `AgentRef`
+guards, table rows, typed `record`/effect arguments, dynamic `AgentRef`
 targets, map indexes, arrays, and `Missing` versus `null` preserving nodes. The
 fixtures should be small, source-stable, and reviewed alongside runtime e2e
 changes so implementation cannot silently create a second expression dialect.
@@ -92,7 +93,8 @@ metadata directly in WhippleScript source:
 - provider/model identity is represented by literals, enums, or `AgentRef`
   values supplied by the workflow, not by a BAML classifier or model answer
 - provider-language or phase-review tasks are seeded from typed facts with one
-  shared task schema; static matrix syntax remains future sugar
+  shared task schema; provider-language now uses typed static table rows for
+  deterministic fixture data
 - companion instructions encourage agents to emit artifacts and trace evidence,
   while source assertions check counts, route coverage, and terminal effect
   states

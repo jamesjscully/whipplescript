@@ -1,229 +1,154 @@
-# Runtime And Operations Reference
+# Runtime & operations
 
-This page explains what happens after a `.whip` bundle is checked, compiled,
-and started.
+What happens after a workflow compiles: where state lives, how instances and
+effects move through their lifecycles, how failures surface, and how to
+operate running instances.
 
-## Runtime Loops
+## Runtime loops
 
-WhippleScript separates deterministic rule progress from provider execution.
+The runtime separates deterministic progress from provider execution:
 
 | Loop | Responsibility |
 | --- | --- |
-| starter | Create an instance and seed initial input facts/events. |
-| stepper | Evaluate ready rules and commit facts/effects/dependencies atomically. |
-| worker | Claim materialized effects, start provider runs, renew/expire leases, and record completions. |
-| projection/recovery | Rebuild or advance current views from the durable event log. |
+| starter | Create an instance and seed input facts/events. |
+| stepper | Evaluate ready rules; commit facts, effects, and dependencies atomically. |
+| worker | Claim ready effects, run providers under leases, record completions. |
+| projection | Maintain current views (facts, effects, status, traces) over the event log. |
 
-`step` must not execute providers. `worker` must not invent source policy. `dev`
-may compose loops for local validation, but the durable boundaries stay the
-same.
+`step` never executes providers. `worker` never invents policy. `dev`
+composes the loops for local convenience without changing the boundaries.
 
-## Store
+## The store
 
-The default local store is:
+State lives in a SQLite file, by default `.whipplescript/store.sqlite`.
+Select one explicitly per environment with `--store <path>` or the
+`WHIPPLESCRIPT_STORE` environment variable; every command that touches an
+instance must use the store that created it.
 
-```text
-.whipplescript/store.sqlite
-```
+The store holds program versions, instances, the append-only event log, and
+projections over it: facts, effects and their dependencies, provider runs,
+leases, workflow invocations, inbox items, evidence, artifacts, and
+registered capabilities/profiles/plugins. The event log is the source of
+truth; everything else can be rebuilt from it.
 
-Use `--store <path>` or `WHIPPLESCRIPT_STORE` to isolate environments:
-
-```sh
-whip --store .whipplescript/dev.sqlite doctor
-```
-
-The store records:
+## Instance lifecycle
 
 ```text
-program versions
-instances
-events
-facts
-effects
-effect dependencies
-runs
-leases
-workflow invocations
-inbox items
-evidence
-artifacts
-capabilities
-profiles
-provider bindings
-plugin manifests
+running -> paused -> running        (pause / resume)
+running -> completed                (a rule ran `complete`)
+running -> failed                   (a rule ran `fail`)
+running -> cancelled                (operator ran `cancel`)
 ```
 
-The event log is the source of truth. Facts, effects, status views, traces, and
-invocation links are projections over durable state.
+`completed`, `failed`, and `cancelled` are terminal: the instance rejects
+further rule commits and lifecycle transitions. Cancellation is an operator
+action, distinct from workflow `fail` — there is no source syntax for it.
 
-## Instance Lifecycle
+## Effects, runs, and leases
 
-Instances move through these states:
+An *effect* is a durable request for external work. A *run* is one provider
+attempt at an effect. A *lease* protects a running attempt from being claimed
+by a second worker.
 
 ```text
-running
-paused
-completed
-failed
-cancelled
+queued -> running -> completed | failed | timed_out | cancelled
+queued -> blocked_by_dependency | blocked_by_capacity
+        | blocked_by_capability | blocked_by_profile
 ```
 
-`completed`, `failed`, and `cancelled` are terminal. Terminal instances reject
-additional rule commits and public lifecycle transitions.
+A provider failure is recorded as effect/run state, events, and evidence — it
+does **not** fail the workflow. Rules decide policy: retry, escalate, ignore,
+or execute `fail`. This is the central operational property; an instance with
+ten failed provider runs is still `running` until a rule or operator says
+otherwise.
 
-`complete <output> { ... }` appends a `workflow.completed` event, stores the
-terminal payload, and marks the instance `completed`.
-
-`fail <failure> { ... }` appends a `workflow.failed` event, stores the terminal
-payload, and marks the instance `failed`.
-
-`cancel` is an operator control-plane action. It appends an instance transition
-event and prevents further progress; it is not equivalent to workflow `fail`.
-
-## Effects, Runs, And Leases
-
-An effect is a durable request for external work. A run is one provider attempt
-for an effect. A lease protects a running provider attempt from duplicate
-workers.
-
-Typical effect lifecycle:
-
-```text
-queued -> running -> completed
-queued -> running -> failed
-queued -> running -> timed_out
-queued -> blocked_by_dependency
-queued -> blocked_by_capacity
-queued -> blocked_by_capability
-queued -> blocked_by_profile
-```
-
-Terminal provider outcomes are recorded as effect/run events. They do not
-automatically fail the workflow instance. Source rules decide whether to retry,
-escalate, ignore, or execute `fail`.
-
-## Provider Failure Capture
-
-Provider failures should be represented in three places:
-
-```text
-event stream  -> what happened and when
-run/effect    -> current terminal provider status
-evidence      -> diagnostic payload, provider name, artifacts, and causal links
-```
-
-This is the desired distinction:
-
-| Failure | Meaning | Workflow state |
+| Outcome | Recorded as | Instance state |
 | --- | --- | --- |
-| provider run failed | The harness/provider could not complete an effect. | unchanged unless rules react |
-| effect timed out | The run exceeded policy or local dev bounds. | unchanged unless rules react |
-| workflow failed | A rule executed `fail <failure> { ... }`. | terminal `failed` |
-| instance cancelled | Operator or policy cancelled the instance. | terminal `cancelled` |
+| Provider run failed or timed out | effect/run terminal state, events, evidence | unchanged until rules react |
+| Rule executed `fail ... { ... }` | `workflow.failed` event, terminal payload | `failed` |
+| Operator ran `cancel` | transition event | `cancelled` |
 
-Provider adapters should capture real errors, not just synthetic status codes:
+Provider adapters capture real diagnostics — exit codes, stderr excerpts,
+SDK errors, timeout reasons, artifact paths, correlation ids — as evidence.
+Secrets are never persisted.
 
-```text
-process exit status
-stderr/stdout excerpts
-SDK exception class/message
-HTTP status/body excerpt
-timeout reason
-missing credential/configuration reason
-artifact paths
-provider correlation ids
-```
-
-The captured diagnostic must be safe to store. Do not persist provider secrets.
-
-## Workflow Invocation
-
-`invoke Workflow { ... } as binding` creates a durable child workflow request.
-The child has its own instance lifecycle and event log.
-
-Parent effects resolve from child terminal state:
-
-```text
-child completed -> parent invocation succeeds with declared output payload
-child failed    -> parent invocation fails with declared failure payload
-child timed out -> parent invocation fails/times out according to policy
-child cancelled -> parent invocation completes on the cancellation branch
-```
-
-The parent observes declared terminal payloads and invocation metadata. It does
-not read child-local facts as ordinary parent facts.
-
-## Workflow Revision
-
-`whip revise` changes the active program version for a non-terminal running
-instance after compatibility checks pass. Revision is append-only: the runtime
-records a revision activation event, a new revision epoch, old/new program
-version ids, cancellation policy, diagnostics, and evidence links.
-
-Existing effects keep their original `program_version_id` and `revision_epoch`.
-Future rule commits and effects use the active revision epoch.
+## Inspecting an instance
 
 ```sh
-whip --store .whipplescript/dev.sqlite revise <instance> candidate.whip --root Workflow --dry-run
-whip --store .whipplescript/dev.sqlite revise <instance> candidate.whip --root Workflow --cancel keep
-whip --store .whipplescript/dev.sqlite revise <instance> candidate.whip --root Workflow --cancel queued
-whip --store .whipplescript/dev.sqlite revise <instance> candidate.whip --root Workflow --cancel running
+whip --store <store> instances
+whip --store <store> status      <instance>
+whip --store <store> log         <instance>
+whip --store <store> facts       <instance>
+whip --store <store> effects     <instance>
+whip --store <store> runs        <instance>
+whip --store <store> diagnostics <instance>
+whip --store <store> --json evidence <instance>
+whip --store <store> --json trace <instance> --check
 ```
 
-`--cancel running` requests cancellation for already-running old-version work.
-It does not invent a terminal effect result; the provider, timeout, or recovery
-path still records the terminal outcome.
+When an effect did not run, work down this list in order: `effects` (status
+and `policy_block_reason`), `runs` (provider attempts), `diagnostics`,
+`evidence`, then `trace --check` for lifecycle conformance. Add `--json` to
+any of these for machine-readable output.
 
-Same-root revision is the v0 boundary. Changing the root workflow, migrating
-active facts across schema-breaking changes, using provider-specific native
-cancellation depth, or applying policies more destructive than queued/running
-cancellation must use future explicit operations with dry-run reports and
-dedicated confirmation flags. The implementation plan for those operations is
-tracked in
-[`../spec/workflow-revision-followups-tracker.md`](../spec/workflow-revision-followups-tracker.md).
-
-## Inspecting State
-
-Common commands:
+## Operating an instance
 
 ```sh
-whip --store .whipplescript/dev.sqlite instances
-whip --store .whipplescript/dev.sqlite status <instance>
-whip --store .whipplescript/dev.sqlite log <instance>
-whip --store .whipplescript/dev.sqlite facts <instance>
-whip --store .whipplescript/dev.sqlite effects <instance>
-whip --store .whipplescript/dev.sqlite runs <instance>
-whip --store .whipplescript/dev.sqlite evidence <instance> --json
-whip --store .whipplescript/dev.sqlite trace <instance> --check --json
+whip --store <store> pause  <instance>     # block new provider starts
+whip --store <store> resume <instance>
+whip --store <store> cancel <instance>     # terminal
+whip --store <store> retry  <instance> <effect>
 ```
 
-`status --json` includes parent/child invocation links when available.
+`retry` moves an eligible failed or timed-out effect back to `queued`.
+`recover` reconciles interrupted native provider runs from persisted
+evidence after a crash; see [providers & plugins](providers.md).
 
-## Lifecycle Controls
+## Child workflows
+
+`invoke Workflow { ... } as child` creates a durable child instance with its
+own event log. The parent's invocation effect resolves from the child's
+terminal state — declared output payload on completion, declared failure
+payload on failure. The parent never reads child-local facts directly.
+
+## Revising a running instance
+
+`whip revise` switches a non-terminal instance to a new program version
+after compatibility checks. Always preview first:
 
 ```sh
-whip --store .whipplescript/dev.sqlite pause <instance>
-whip --store .whipplescript/dev.sqlite resume <instance>
-whip --store .whipplescript/dev.sqlite cancel <instance>
-whip --store .whipplescript/dev.sqlite retry <instance> <effect>
+whip --store <store> revise <instance> candidate.whip --root Workflow --dry-run
+whip --store <store> revise <instance> candidate.whip --root Workflow --cancel keep
 ```
 
-Pause/resume are nonterminal controls. Cancel is terminal. Retry moves eligible
-failed or timed-out effects back to queued when policy allows.
+Revision is append-only: the runtime records an activation event, a new
+revision epoch, and diagnostics. Existing effects keep their original
+program version; future commits use the new one. The `--cancel` policy
+controls what happens to old-version work:
 
-## Incident Bundle
+| Policy | Effect on old-version work |
+| --- | --- |
+| `keep` | Stays claimable and runnable. |
+| `queued` | Queued/blocked/claimable effects are terminally cancelled. |
+| `running` | As `queued`, plus cancellation is requested for running effects. |
 
-Before manually repairing or deleting runtime state, collect:
+A `running` cancellation is a request, not a result — the provider still
+records the terminal outcome through the normal effect lifecycle.
+
+Revision is limited to the same root workflow in v0. Root changes and
+schema-breaking fact migrations are tracked in
+[`spec/workflow-revision-followups-tracker.md`](../spec/workflow-revision-followups-tracker.md).
+
+## Capturing an incident
+
+Before repairing or deleting runtime state, capture the JSON views:
 
 ```sh
-whip --store <store> status <instance> --json
-whip --store <store> log <instance> --json
-whip --store <store> facts <instance> --json
-whip --store <store> effects <instance> --json
-whip --store <store> runs <instance> --json
-whip --store <store> evidence <instance> --json
-whip --store <store> trace <instance> --check --json
+for cmd in status log facts effects runs evidence; do
+  whip --store <store> --json $cmd <instance> > incident-$cmd.json
+done
+whip --store <store> --json trace <instance> --check > incident-trace.json
 ```
 
-For provider issues, also preserve the relevant artifacts and provider-specific
-configuration names, but not credential values.
+For provider issues, also preserve artifacts and the provider configuration
+names involved — never credential values.

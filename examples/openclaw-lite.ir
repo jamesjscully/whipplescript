@@ -1,102 +1,60 @@
 workflow OpenClawLite
-uses
-  plugin memory
+source_tags
+@service workflow OpenClawLite
 schemas
-  class OpenClawCronTick
+  class Heartbeat
     job string
-    interval string
-    firedAt string
-    status literal<"ready">
-  class OpenClawHeartbeat
-    job string
-    interval string
-    firedAt string
     status literal<"observed">
-  class WorkItem
+  class Plan
     title string
-    body string
-    status literal<"ready">
-  class PlannedWork
-    title string
-    body string
-    context ref<MemoryContext>
-    turn ref<AgentTurn>
-    status literal<"planned">
-  class MemoryContext
     summary string
-    target string
+    status literal<"ready">
+queues
+  queue backlog tracker=builtin
 agents
-  agent planner harness=<fallback> profile=repo-reader capacity=1 skills=[whipplescript-author, human-review-user] capabilities=[]
-  agent worker harness=<fallback> profile=repo-writer capacity=2 skills=[whipplescript-author, loft-user] capabilities=[]
-  agent reviewer harness=<fallback> profile=human-review capacity=1 skills=[human-review-user] capabilities=[]
+  agent planner harness=<fallback> provider=codex profile=repo-reader capacity=1 skills=[] capabilities=[]
+  agent reviewer harness=<fallback> provider=claude profile=repo-reader capacity=1 skills=[] capabilities=[]
 assertions
-  assert none(OpenClawCronTick where status == "ready")
+  assert count(Heartbeat where status == "observed") == 1
     reads
-      fact:OpenClawCronTick where status == "ready"
-  assert one(OpenClawHeartbeat where status == "observed")
+      fact:Heartbeat where status == "observed"
+  assert count(Plan where status == "ready") == 1
     reads
-      fact:OpenClawHeartbeat where status == "observed"
-  assert one(PlannedWork where status == "planned")
+      fact:Plan where status == "ready"
+  assert count(effect kind queue.file where status == completed) == 1
     reads
-      fact:PlannedWork where status == "planned"
-  assert one(effect kind event.emit where status == completed)
-    reads
-      effect:kind event.emit where status == completed
-  assert one(effect kind capability.call where status == completed)
-    reads
-      effect:kind capability.call where status == completed
-  assert one(effect kind agent.tell where status == completed)
-    reads
-      effect:kind agent.tell where status == completed
+      effect:kind queue.file where status == completed
 rules
-  rule seed_fixture_tick
+  rule observe_heartbeat
     when started
     reads
       pattern:started
     writes
-      schema:OpenClawCronTick
-      schema:WorkItem
-    body_hash 924c4b66be61456a
-  rule emit_heartbeat
-    when OpenClawCronTick as tick where tick.status == "ready"
-    reads
-      schema:OpenClawCronTick
-    writes
-      schema:OpenClawHeartbeat
-    consumes
-      schema:OpenClawCronTick
-    effects
-      heartbeat kind=event.emit binding=heartbeat key=9505683a9c1b069b
-    body_hash 2af53726d8563270
-  rule plan_ready_work
-    when OpenClawHeartbeat as beat where beat.status == "observed"
-    when WorkItem as item where item.status == "ready"
+      schema:Heartbeat
+    body_hash 66ebf556cd43442b
+  rule plan_recurring_work
+    when Heartbeat as beat where beat.status == "observed"
     when planner is available
     reads
       pattern:planner is available
-      schema:OpenClawHeartbeat
-      schema:WorkItem
+      schema:Heartbeat
     writes
-      schema:PlannedWork
-    consumes
-      schema:WorkItem
+      schema:Plan
     effects
-      context kind=capability.call binding=context key=c365d9d620545aef
-      plan kind=agent.tell binding=plan key=ebcd339759631287
+      planTurn kind=agent.tell binding=planTurn key=97a3c1a4726b15f5
+      effect2 kind=queue.file binding=- key=297a57f0b754728a
     dependencies
-      context --succeeds--> plan
-    body_hash 3fb2b75afb920518
-  rule request_human_trace_review
-    when OpenClawHeartbeat as beat where beat.status == "observed"
+      planTurn --succeeds--> effect2
+    body_hash 4c44573435143a42
+  rule escalate_plan_for_review
+    when Plan as plan where plan.status == "ready"
     when reviewer is available
     reads
       pattern:reviewer is available
-      schema:OpenClawHeartbeat
+      schema:Plan
     effects
-      effect1 kind=human.ask binding=- key=faca6b0ad3ce61a7
-    body_hash 6f74ac88c4ae5f7c
+      effect1 kind=human.ask binding=- key=354295ddaf3d196e
+    body_hash f9342bbc7ed9e7fa
 rule_dependencies
-  emit_heartbeat --schema:OpenClawHeartbeat--> plan_ready_work
-  emit_heartbeat --schema:OpenClawHeartbeat--> request_human_trace_review
-  seed_fixture_tick --schema:OpenClawCronTick--> emit_heartbeat
-  seed_fixture_tick --schema:WorkItem--> plan_ready_work
+  observe_heartbeat --schema:Heartbeat--> plan_recurring_work
+  plan_recurring_work --schema:Plan--> escalate_plan_for_review

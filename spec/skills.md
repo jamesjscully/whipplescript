@@ -82,7 +82,7 @@ enter provider context only through explicit agent or turn attachment.
 Or to individual turns:
 
 ```whipplescript
-tell worker with skills ["loft"] """
+tell worker with skills ["loft"] """markdown
 Claim one ready issue and implement it.
 """
 ```

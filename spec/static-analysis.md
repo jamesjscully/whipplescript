@@ -23,7 +23,7 @@ queries before later compiler phases.
 
 ### Expression Kernel Checks
 
-For every guard, assertion, interpolation, matrix row, and effect argument, the
+For every guard, assertion, interpolation, table row, and effect argument, the
 compiler must compute:
 
 ```text
