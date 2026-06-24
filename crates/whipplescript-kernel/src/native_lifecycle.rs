@@ -73,6 +73,13 @@ pub struct NativeAgentTurnObservation {
     pub provider_turn_id: Option<String>,
     pub terminal: bool,
     pub provider_payload_shape: Value,
+    /// A provider *control-plane* error reason for a terminal failure (e.g.
+    /// "usage limit exceeded", auth failure, model-not-found) extracted from the
+    /// terminal event's dedicated error field. This is operational, not model
+    /// output content, so it is allowed to cross the shape-only redaction
+    /// boundary (capped + secret-redacted at serialization). `None` for success
+    /// and for non-error terminals.
+    pub provider_error: Option<String>,
 }
 
 impl NativeAgentTurnObservation {
@@ -90,6 +97,7 @@ impl NativeAgentTurnObservation {
             provider_turn_id,
             terminal: kind.terminal(),
             provider_payload_shape,
+            provider_error: None,
         }
     }
 
@@ -101,7 +109,13 @@ impl NativeAgentTurnObservation {
             provider_turn_id: None,
             terminal: kind.terminal(),
             provider_payload_shape: Value::Null,
+            provider_error: None,
         }
+    }
+
+    fn provider_error(mut self, provider_error: Option<String>) -> Self {
+        self.provider_error = provider_error;
+        self
     }
 
     fn session_id(mut self, session_id: Option<String>) -> Self {
@@ -148,8 +162,20 @@ pub fn normalize_codex_app_server_event(message: &Value) -> Option<NativeAgentTu
                     .and_then(Value::as_str)
                     .map(str::to_owned),
             )
-            .payload_shape(params),
+            .payload_shape(params)
+            .provider_error(codex_terminal_error(params)),
     )
+}
+
+/// The Codex app-server reports a terminal failure reason under
+/// `params.turn.error.message` (with `codexErrorInfo` as a machine code). This is
+/// a control-plane error string, not model output.
+fn codex_terminal_error(params: &Value) -> Option<String> {
+    params
+        .pointer("/turn/error/message")
+        .or_else(|| params.pointer("/error/message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn codex_terminal_kind(params: &Value) -> AgentTurnLifecycleKind {
@@ -189,7 +215,21 @@ pub fn normalize_claude_agent_sdk_event(
                     .map(str::to_owned),
             )
             .turn_id(Some(event.run_id.clone()))
-            .payload_shape(&event.payload),
+            .payload_shape(&event.payload)
+            .provider_error(
+                event
+                    .payload
+                    .pointer("/error/message")
+                    .or_else(|| event.payload.get("error").filter(|e| e.is_string()))
+                    .or_else(|| {
+                        event
+                            .payload
+                            .get("message")
+                            .filter(|_| event.event_type == "claude.turn.failed")
+                    })
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            ),
     )
 }
 
@@ -220,8 +260,18 @@ pub fn normalize_pi_rpc_event(message: &Value) -> Option<NativeAgentTurnObservat
                     .and_then(Value::as_str)
                     .map(str::to_owned),
             )
-            .payload_shape(message),
+            .payload_shape(message)
+            .provider_error(pi_terminal_error(message)),
     )
+}
+
+/// Pi reports a terminal failure reason under `/message/errorMessage`.
+fn pi_terminal_error(message: &Value) -> Option<String> {
+    message
+        .pointer("/message/errorMessage")
+        .or_else(|| message.get("errorMessage"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn pi_terminal_kind(message: &Value) -> AgentTurnLifecycleKind {

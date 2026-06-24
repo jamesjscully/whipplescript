@@ -1,0 +1,20 @@
+workflow MessagingDemo
+source_tags
+@service workflow MessagingDemo
+source_descriptions
+"Inbound + outbound messaging: react to a channel message and reply on the same channel" workflow MessagingDemo
+workflow_contracts
+  output result ref<Handled>
+schemas
+  class Handled
+    reply string
+channels
+  channel ops_room provider=slack destination="#ops"
+rules
+  rule acknowledge_message
+    when message from ops_room as msg
+    reads
+      pattern:message from ops_room as msg
+    effects
+      reply kind=capability.call binding=reply construct=send->messaging.send key=c01472de7e75713c
+    body_hash 9ed1304b98663a1b

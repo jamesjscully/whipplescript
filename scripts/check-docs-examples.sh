@@ -29,6 +29,8 @@ check_example examples/scheduled-escalation.whip
 check_example examples/exec-json-ingest.whip
 check_example examples/deterministic-validation.whip
 check_example examples/event-bridge.whip
+check_example examples/messaging-demo.whip
+check_example examples/file-store-demo.whip
 check_example examples/reusable-review-pattern.whip
 check_example examples/reusable-action-chain.whip
 check_example examples/queue-worker-with-review.whip

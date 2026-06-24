@@ -557,12 +557,38 @@ impl NativeProviderEvent {
             "provider_turn_id": self.provider_turn_id,
             "sequence": self.sequence,
             "evidence_shape": json_shape(&self.evidence),
+            "provider_error": self.redacted_provider_error(),
             "artifacts": self
                 .artifacts
                 .iter()
                 .map(NativeProviderArtifactRef::to_json_redacted)
                 .collect::<Vec<_>>(),
         })
+    }
+
+    /// The provider control-plane error reason carried on a terminal failure
+    /// event's evidence, capped and secret-redacted before it crosses the
+    /// shape-only redaction boundary. `Value::Null` when absent.
+    pub fn redacted_provider_error(&self) -> Value {
+        match self.evidence.get("provider_error").and_then(Value::as_str) {
+            Some(message) => Value::String(redacted_provider_error_detail(message)),
+            None => Value::Null,
+        }
+    }
+}
+
+/// Cap a provider control-plane error to a sane length and strip any secrets the
+/// shared metadata redactor recognizes. Provider errors are operational strings
+/// (usage limit, auth failure, model-not-found), not model output, but a cap +
+/// secret scrub keeps a misbehaving provider from smuggling bulk content through.
+pub fn redacted_provider_error_detail(message: &str) -> String {
+    const MAX_PROVIDER_ERROR_CHARS: usize = 300;
+    let redacted = redact_sensitive_metadata(message);
+    if redacted.chars().count() > MAX_PROVIDER_ERROR_CHARS {
+        let truncated: String = redacted.chars().take(MAX_PROVIDER_ERROR_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        redacted
     }
 }
 

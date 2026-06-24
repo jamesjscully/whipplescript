@@ -21476,8 +21476,10 @@ fn is_pi_native_provider(provider: &str) -> bool {
 fn codex_app_server_adapter(
     provider: &str,
 ) -> Result<CodexAppServerAdapter<StdioCodexAppServerTransport>, StoreError> {
-    let model = env::var("WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL")
-        .unwrap_or_else(|_| "gpt-5.4-mini".to_owned());
+    // Session-default model for the spawned app-server; the per-turn request
+    // carries the authoritative model. Resolved from config/env/~/.codex, never
+    // a hard-coded default.
+    let model = codex_app_server_model(None)?;
     let model_config = format!("model={model:?}");
     let args = [
         "app-server",
@@ -21525,11 +21527,7 @@ fn codex_native_turn_request(
     provider_options.insert("cwd".to_owned(), Value::String(provider_cwd(config)?));
     provider_options.insert(
         "model".to_owned(),
-        Value::String(provider_model(
-            config,
-            "WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL",
-            "gpt-5.4-mini",
-        )),
+        Value::String(codex_app_server_model(config)?),
     );
     apply_provider_config_options(&mut provider_options, config);
     Ok(NativeProviderTurnRequest {
@@ -21722,6 +21720,24 @@ fn provider_model(config: Option<&ProviderBindingConfig>, env_key: &str, default
         .and_then(|config| config.default_model.clone())
         .or_else(|| env::var(env_key).ok())
         .unwrap_or_else(|| default.to_owned())
+}
+
+/// Resolve the Codex app-server model without a hard-coded default: a
+/// provider-config `default_model`, then `WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL`,
+/// then the `model` configured in `~/.codex/config.toml` (the same source the
+/// codex coerce path reads). Erroring when none resolves keeps the agent-turn
+/// path from silently pinning a model the operator never chose.
+fn codex_app_server_model(config: Option<&ProviderBindingConfig>) -> Result<String, StoreError> {
+    config
+        .and_then(|config| config.default_model.clone())
+        .or_else(|| env::var("WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL").ok())
+        .or_else(coerce_runtime::codex_config_model)
+        .ok_or_else(|| {
+            StoreError::Conflict(
+                "no Codex agent model: set WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL, a provider-config `default_model`, or `model` in ~/.codex/config.toml"
+                    .to_owned(),
+            )
+        })
 }
 
 fn provider_cwd(config: Option<&ProviderBindingConfig>) -> Result<String, StoreError> {

@@ -474,6 +474,7 @@ impl<T: CodexAppServerTransport> CodexAppServerAdapter<T> {
             evidence: json!({
                 "provider_payload_shape": observation.provider_payload_shape,
                 "message_shape": json_shape(&message),
+                "provider_error": observation.provider_error,
             }),
             artifacts: artifact_refs_from_codex_message(&message),
         })
@@ -1527,6 +1528,40 @@ mod tests {
             .expect("terminal event");
         assert_eq!(completed.event_kind, NativeProviderEventKind::Completed);
         assert!(completed.event_kind.is_terminal());
+    }
+
+    #[test]
+    fn native_adapter_surfaces_codex_usage_limit_error_on_failed_turn() {
+        // Real shape from codex-cli 0.137.0: a failed turn carries the
+        // control-plane reason under `params.turn.error.message`.
+        let transport = FakeTransport::with_reads(&[
+            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"failed","error":{"codexErrorInfo":"usageLimitExceeded","message":"You've hit your usage limit. Try again at 6:09 PM."}}}}"#,
+        ]);
+        let client = CodexAppServerClient::new(transport);
+        let mut adapter = CodexAppServerAdapter::new("codex-main", codex_capability(), client);
+        adapter
+            .start_turn(native_codex_request())
+            .expect("turn starts");
+
+        let failed = adapter
+            .next_event("run-1")
+            .expect("event reads")
+            .expect("terminal event");
+        assert_eq!(failed.event_kind, NativeProviderEventKind::Failed);
+        assert!(failed.event_kind.is_terminal());
+        // The provider error reason crosses the redaction boundary (operational,
+        // not model output) and is surfaced for the failure diagnostic.
+        assert_eq!(
+            failed.redacted_provider_error().as_str(),
+            Some("You've hit your usage limit. Try again at 6:09 PM.")
+        );
+        assert!(failed
+            .to_json_redacted()
+            .to_string()
+            .contains("usage limit"));
     }
 
     #[test]

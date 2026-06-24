@@ -1,0 +1,66 @@
+workflow FileStoreDemo
+
+output result Saved
+
+failure error FileError
+
+# std.files: a `file store` is a policy boundary over a provider-backed document
+# root. `write text`/`read text` are durable effects validated against the
+# store's `allow write`/`allow read` globs. This example writes a note then reads
+# it back, completing with the round-tripped content.
+class Saved {
+  content string
+}
+
+class FileError {
+  reason string
+}
+
+class Wrote {
+  path string
+}
+
+file store notes_store {
+  root "./.whipplescript/filestore-demo"
+  allow read ["notes/**"]
+  allow write ["notes/**"]
+}
+
+rule write_note
+  when started
+=> {
+  write text to notes_store at "notes/hello.txt" {
+    body "hello from the file store"
+    mode upsert
+  } as written
+
+  after written succeeds {
+    record Wrote {
+      path "notes/hello.txt"
+    }
+  }
+
+  after written fails as write_error {
+    fail error {
+      reason write_error.message
+    }
+  }
+}
+
+rule read_note
+  when Wrote as wrote
+=> {
+  read text from notes_store at "notes/hello.txt" as loaded
+
+  after loaded succeeds as file {
+    complete result {
+      content file.content
+    }
+  }
+
+  after loaded fails as read_error {
+    fail error {
+      reason read_error.message
+    }
+  }
+}

@@ -44,8 +44,8 @@ fn env_nonempty(key: &str) -> Option<String> {
 
 /// The `model = "..."` from `~/.codex/config.toml` (the model the codex CLI is
 /// configured to use), so the codex coerce path tracks the user's config rather
-/// than a hard-coded default.
-fn codex_config_model() -> Option<String> {
+/// than a hard-coded default. Shared with the agent-turn app-server path.
+pub(crate) fn codex_config_model() -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let path = std::path::Path::new(&home)
         .join(".codex")

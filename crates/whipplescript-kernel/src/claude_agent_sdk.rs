@@ -495,6 +495,7 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkAdapter<T> {
             evidence: json!({
                 "provider_payload_shape": observation.provider_payload_shape,
                 "sidecar_payload": sidecar_payload,
+                "provider_error": observation.provider_error,
             }),
             artifacts,
         })

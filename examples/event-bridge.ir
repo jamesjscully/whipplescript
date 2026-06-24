@@ -2,36 +2,25 @@ workflow EventBridge
 source_tags
 @service workflow EventBridge
 schemas
-  class PeerInstance
-    id string
-    service string
   class DeploymentNotice
     service string
     status literal<"notified">
 assertions
-  assert count(DeploymentNotice where status == "notified") == 1
+  assert count(DeploymentNotice where status == "notified") <= 1
     reads
       fact:DeploymentNotice where status == "notified"
 rules
-  rule table_peers
-    when started
-    reads
-      pattern:started
-    writes
-      schema:PeerInstance
-    record_sources
-      schema:PeerInstance construct=table_row span=331..372
-    body_hash dd846c051d36002e
-  rule signal_peer_after_successful_deploy
+  rule relay_to_peer
     when deploy.finished as deployed where deployed.status == "ok"
-    when PeerInstance as peer where peer.service == deployed.service
     reads
       pattern:deploy.finished as deployed
-      schema:PeerInstance
+    effects
+      sent kind=event.notify binding=sent key=86cc210693f3562d
+    body_hash b1f148a3cc2e40ba
+  rule note_acknowledged
+    when deploy.acknowledged as ack
+    reads
+      pattern:deploy.acknowledged as ack
     writes
       schema:DeploymentNotice
-    effects
-      sent kind=event.notify binding=sent key=e37997559fb61b58
-    body_hash 46867d4f3a14089a
-rule_dependencies
-  table_peers --schema:PeerInstance--> signal_peer_after_successful_deploy
+    body_hash 9ac93312b1e2e0f6

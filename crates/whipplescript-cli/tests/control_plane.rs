@@ -35,6 +35,8 @@ fn checks_all_example_workflows() {
         "human-review.whip",
         "multi-agent-bounded-concurrency.whip",
         "openclaw-lite.whip",
+        "messaging-demo.whip",
+        "file-store-demo.whip",
         // `package-memory.whip` imports the non-`std.` `memory` package, so it
         // requires a `whip.lock` and cannot be checked in this lock-free bundle.
         // Its locked check is covered by `check_discovers_*` and the

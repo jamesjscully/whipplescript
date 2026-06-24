@@ -1769,11 +1769,19 @@ impl RuntimeKernel {
             subject_id: execution.run_id,
             causation_id: Some(execution.effect_id),
             correlation_id: Some(occurrence_key),
-            summary: Some(&format!(
-                "{} native provider event from {}",
-                event.event_kind.as_str(),
-                event.provider_event_type
-            )),
+            summary: Some(&match event.redacted_provider_error() {
+                Value::String(detail) => format!(
+                    "{} native provider event from {}: {}",
+                    event.event_kind.as_str(),
+                    event.provider_event_type,
+                    detail
+                ),
+                _ => format!(
+                    "{} native provider event from {}",
+                    event.event_kind.as_str(),
+                    event.provider_event_type
+                ),
+            }),
             metadata_json: &metadata,
         })?;
         let observation = native_provider_event_observation(event);
@@ -1792,11 +1800,19 @@ impl RuntimeKernel {
         run_metadata_json: &str,
     ) -> StoreResult<StoredEvent> {
         let status = native_terminal_status(event.event_kind);
-        let summary = format!(
-            "{} native provider event from {}",
-            event.event_kind.as_str(),
-            event.provider_event_type
-        );
+        let summary = match event.redacted_provider_error() {
+            Value::String(detail) => format!(
+                "{} native provider event from {}: {}",
+                event.event_kind.as_str(),
+                event.provider_event_type,
+                detail
+            ),
+            _ => format!(
+                "{} native provider event from {}",
+                event.event_kind.as_str(),
+                event.provider_event_type
+            ),
+        };
         let provider_correlation_id =
             provider_terminal_correlation_id(execution.instance_id, execution.run_id);
         let metadata_base = add_provider_correlation_id(

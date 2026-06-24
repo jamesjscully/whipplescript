@@ -2,13 +2,19 @@
 workflow EventBridge
 
 # Signal schemas let external systems drive a workflow without inventing facts.
+# `deploy.finished` is the ingress signal an operator (or peer) injects; `peer`
+# names the live instance the bridge should relay an acknowledgement to.
 signal deploy.finished {
   service string
   status "ok" | "failed"
+  peer string
 }
 
-class PeerInstance {
-  id string
+# `deploy.acknowledged` is the directed-injection signal: the bridge emits it
+# into the `peer` instance, which reacts by recording a notice. Delivery to a
+# real, running instance is the whole point — a missing target fails the `emit`
+# effect with `target instance <id> not found`.
+signal deploy.acknowledged {
   service string
 }
 
@@ -17,29 +23,30 @@ class DeploymentNotice {
   status "notified"
 }
 
-table peers as PeerInstance [
-  {
-    id "ins_peer"
-    service "api"
-  }
-]
+# At-most-once: a relayed acknowledgement is admitted to the target instance at
+# most once (idempotent injection), so the target records no duplicate notice.
+# This holds before any signal arrives (count 0) and after delivery (count 1).
+assert count(DeploymentNotice where status == "notified") <= 1
 
-assert count(DeploymentNotice where status == "notified") == 1
-
-# External systems inject deploy.finished with `whip signal`.
-rule signal_peer_after_successful_deploy
+# Ingress + relay: an external `whip signal` injects `deploy.finished`; on a
+# successful deploy the bridge injects `deploy.acknowledged` into the named peer
+# instance with `emit signal ... to`.
+rule relay_to_peer
   when deploy.finished as deployed where deployed.status == "ok"
-  when PeerInstance as peer where peer.service == deployed.service
 => {
-  emit signal deploy.finished to peer.id {
+  emit signal deploy.acknowledged to deployed.peer {
     service deployed.service
-    status deployed.status
   } as sent
+}
 
-  after sent succeeds {
-    record DeploymentNotice {
-      service deployed.service
-      status "notified"
-    }
+# Proof of delivery: the target instance reacts to the *injected* signal. When
+# the bridge relays to its own id, this fires in the same instance; with a real
+# peer id it fires in the peer.
+rule note_acknowledged
+  when deploy.acknowledged as ack
+=> {
+  record DeploymentNotice {
+    service ack.service
+    status "notified"
   }
 }

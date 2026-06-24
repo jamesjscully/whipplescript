@@ -1,0 +1,34 @@
+workflow FileStoreDemo
+workflow_contracts
+  output result ref<Saved>
+  failure error ref<FileError>
+schemas
+  class Saved
+    content string
+  class FileError
+    reason string
+  class Wrote
+    path string
+file_stores
+  file store notes_store root="./.whipplescript/filestore-demo"
+    allow read ["notes/**"]
+    allow write ["notes/**"]
+rules
+  rule write_note
+    when started
+    reads
+      pattern:started
+    writes
+      schema:Wrote
+    effects
+      written kind=file.write binding=written key=69c052e4ac5ac811
+    body_hash ae144b8402954777
+  rule read_note
+    when Wrote as wrote
+    reads
+      schema:Wrote
+    effects
+      loaded kind=file.read binding=loaded key=5c9d19a02da2ed23
+    body_hash a46847123124a6e2
+rule_dependencies
+  write_note --schema:Wrote--> read_note

@@ -534,6 +534,7 @@ impl<T: PiRpcTransport> PiRpcAdapter<T> {
             evidence: json!({
                 "provider_payload_shape": observation.provider_payload_shape,
                 "rpc_evidence": summarize_pi_rpc_evidence(&state, std::slice::from_ref(&message), terminal),
+                "provider_error": observation.provider_error,
             }),
             artifacts: artifact_refs_from_pi_message(&message),
         })
