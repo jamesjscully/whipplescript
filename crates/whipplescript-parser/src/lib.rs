@@ -19514,10 +19514,10 @@ rule_dependencies
                 include_str!("../../../examples/multi-agent-bounded-concurrency.whip"),
                 include_str!("../../../examples/multi-agent-bounded-concurrency.ir"),
             ),
-            (
-                include_str!("../../../examples/openclaw-lite.whip"),
-                include_str!("../../../examples/openclaw-lite.ir"),
-            ),
+            // `openclaw-lite` now imports the external `memory` package, so it
+            // only compiles clean with a `whip.lock`; this parser-level snapshot
+            // has no package resolution. Its IR stability is covered by the
+            // lock-aware `dev_openclaw_lite_observes_heartbeat_and_files_work`.
             (
                 include_str!("../../../examples/scheduled-escalation.whip"),
                 include_str!("../../../examples/scheduled-escalation.ir"),

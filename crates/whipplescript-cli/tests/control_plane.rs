@@ -34,13 +34,13 @@ fn checks_all_example_workflows() {
         "circuit-breaker.whip",
         "human-review.whip",
         "multi-agent-bounded-concurrency.whip",
-        "openclaw-lite.whip",
         "messaging-demo.whip",
         "file-store-demo.whip",
-        // `package-memory.whip` imports the non-`std.` `memory` package, so it
-        // requires a `whip.lock` and cannot be checked in this lock-free bundle.
-        // Its locked check is covered by `check_discovers_*` and the
-        // `dev_capability_call_*` tests.
+        // `openclaw-lite.whip` and `package-memory.whip` import the non-`std.`
+        // `memory` package, so they require a `whip.lock` and cannot be checked in
+        // this lock-free bundle. openclaw-lite's locked check + fixture dev run is
+        // covered by `dev_openclaw_lite_observes_heartbeat_and_files_work`;
+        // package-memory by `check_discovers_*` and `dev_capability_call_*`.
         "provider-language-e2e.whip",
     ];
     let paths = examples
@@ -4278,6 +4278,10 @@ fn dev_openclaw_lite_observes_heartbeat_and_files_work() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let example = example_path("openclaw-lite.whip");
+    // openclaw-lite imports the external `memory` package, so check/dev require
+    // the committed lock (its `source.path` resolves `packages/memory.json`
+    // relative to the lock's directory, `examples/`).
+    let lock = example_path("openclaw-lite.lock.json");
     let dev = run_json(
         bin,
         &[
@@ -4290,6 +4294,8 @@ fn dev_openclaw_lite_observes_heartbeat_and_files_work() {
             "fixture",
             "--until",
             "idle",
+            "--package-lock",
+            lock.to_str().expect("utf-8 lock path"),
         ],
     );
     let instance_id = dev

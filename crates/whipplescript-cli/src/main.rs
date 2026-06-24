@@ -1556,6 +1556,12 @@ fn lint(options: &CliOptions) -> ExitCode {
                 };
                 cli_actions.insert(id.clone(), action);
             }
+            // `lint` does not resolve packages (it analyzes source structure), but
+            // accepts `--package-lock <path>` and ignores it so the same argument
+            // set works across `check`/`lint`/`compile` for package-locked examples.
+            "--package-lock" => {
+                index += 1;
+            }
             other if other.starts_with('-') => {
                 eprintln!("unknown lint option `{other}`");
                 eprintln!("{usage}");

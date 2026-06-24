@@ -88,6 +88,24 @@ cancellation behavior, artifact capture, and evidence shape may change.
 After a crash leaves native runs interrupted, `whip recover <instance>`
 reconciles them from persisted provider evidence.
 
+The agent-turn model is never hardcoded. For the Codex app-server surface it
+resolves provider config `default_model` → `WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL`
+→ the `model` in `~/.codex/config.toml`; with none of those set the turn fails
+with a clear "no model configured" message rather than guessing a default.
+
+### Provider errors in failure diagnostics
+
+Native evidence is shape-redacted: prompts and model output are recorded as
+JSON *shape* only, never values, so a turn's contents never leak into the run
+store. Provider **control-plane** errors are the deliberate exception. When a
+turn fails for an operational reason — usage-limit exceeded, auth rejected,
+model not found — that reason is operational metadata, not model output, so it
+crosses the redaction boundary into the failure diagnostic and the effect's
+evidence summary. The reason is capped (300 chars) and run through the same
+secret redaction as everything else, so an "auth failed" message can name the
+cause without echoing a token. Read `whip diagnostics <instance>` /
+`whip effects <instance>` on a failed agent turn to see it.
+
 Real-provider smoke tests are opt-in:
 
 ```sh

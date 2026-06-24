@@ -1,6 +1,8 @@
 workflow OpenClawLite
 source_tags
 @service workflow OpenClawLite
+uses
+  package memory
 schemas
   class Heartbeat
     job string
@@ -44,11 +46,15 @@ rules
     writes
       schema:Plan
     effects
+      context kind=capability.call binding=context key=7e81e084dae5eb13
       planTurn kind=agent.tell binding=planTurn key=97a3c1a4726b15f5
-      effect2 kind=queue.file binding=- key=297a57f0b754728a
+      effect3 kind=queue.file binding=- key=581529889869fddd
+      effect4 kind=capability.call binding=- key=557da7ba98895333
     dependencies
-      planTurn --succeeds--> effect2
-    body_hash 4c44573435143a42
+      context --succeeds--> planTurn
+      planTurn --succeeds--> effect3
+      planTurn --succeeds--> effect4
+    body_hash 19b4f8dd1e0ef5b5
   rule escalate_plan_for_review
     when Plan as plan where plan.status == "ready"
     when reviewer is available

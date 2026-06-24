@@ -37,7 +37,7 @@ check_example examples/queue-worker-with-review.whip
 check_example examples/multi-agent-bounded-concurrency.whip
 check_example examples/circuit-breaker.whip
 check_example examples/ralph.whip
-check_example examples/openclaw-lite.whip
+check_example examples/openclaw-lite.whip --package-lock examples/openclaw-lite.lock.json
 check_example examples/autoresearch-lite.whip
 check_example examples/gastown-lite.whip
 check_example examples/revision-ticket-v1.whip

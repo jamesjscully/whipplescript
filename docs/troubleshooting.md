@@ -119,6 +119,25 @@ check counts, and redacted preflight results. Provider failures surface as
 diagnostics, evidence, and run/effect status, not as generic command
 failures.
 
+## A native agent turn failed and I can't tell why
+
+`whip status` only shows the instance stuck or failed. The provider's reason
+for a failed agent turn is recorded as control-plane metadata on the effect —
+it crosses the evidence redaction boundary precisely because it is operational,
+not model output. Read it directly:
+
+```sh
+whip diagnostics <instance>   # failure diagnostic carries the provider reason
+whip effects <instance>       # effect evidence summary carries it too
+```
+
+Common reasons: `usageLimitExceeded` (Codex/ChatGPT plan quota — wait for the
+reset window), an auth rejection (re-run the provider's own login, e.g.
+`codex login`), or "no model configured" (set `default_model` in the provider
+config or `model` in `~/.codex/config.toml`). The reason is capped and
+secret-redacted, so it names the cause without echoing a token. Prompts and
+model output stay shape-redacted and never appear here.
+
 ## Native provider strict mode fails
 
 Strict mode validates real native adapters:
