@@ -1,7 +1,7 @@
 # Flow: sequential surface lowering to rules
 
 Status: spec drafted 2026-06-09 from decided design
-([`language-ergonomics-tracker.md`](language-ergonomics-tracker.md) A1).
+([`language-ergonomics-tracker.md`](decision-records/language-ergonomics-tracker.md) A1).
 Stage: spec -> modeling -> implementation + testing -> review.
 
 ## Framing
@@ -66,7 +66,13 @@ flow triage
     the preceding effect step. Handler bodies are full statement lists
     (commonly `release`, `record`, `fail`). An unhandled failure stalls the
     progression visibly (facts/effects show the terminal effect; no silent
-    drop).
+    drop). A stalled progression is a liveness hazard, not an acceptable
+    terminal: when the flow is its workflow's only terminal path, every
+    failure/timeout branch must be handled in a way that reaches a workflow
+    terminal, or the liveness lint fails (see [Static checks](#static-checks)).
+    Step terminals use the canonical union
+    ([expression-kernel.md](expression-kernel.md)): `on fails` matches
+    `Failed<E>` and `on timeout` matches `TimedOut` (status `timed_out`).
 - Excluded from v1: `retry N` (designed-for: the progression state fact
   reserves an `attempts` field; ships v1.5 with a mandatory bound),
   collection loops, parallel blocks (fan-out is the `when` trigger's job).
@@ -115,14 +121,26 @@ per-fact arrives later with no syntax change.
 
 ## Static checks
 
-- User rules that read or consume `flow.`-namespaced facts are checker
-  errors.
-- Liveness: a flow with a path to `complete`/`fail` satisfies the
-  no-terminal-path lint for its workflow; flow steps' reads are generated
-  and exempt from the dead-rule lint (their producers are generated
-  alongside).
-- `on fails` handlers are checked like rule bodies (terminals validated
-  against contracts, bindings in scope).
+These are owned by [static-analysis.md](static-analysis.md) (which treats the
+generated step rules and `flow.`-namespaced facts as first-class for
+read/write-set, effect-safety, and cycle analysis). All severities use the
+canonical `error | warning | info | hint` enum.
+
+- User (non-generated) rules that read, match, consume, or `record`
+  `flow.`-namespaced facts are checker errors. A user class name may not begin
+  with `flow.`. Only the owning flow's generated rules may touch its progression
+  state.
+- Liveness: a flow counts as a workflow's terminal path only when **every**
+  branch reaches a workflow terminal (`complete`/`fail`). This includes each
+  handled `on fails` and `on timeout` handler and both arms of every internal
+  `when ... { } else { }`. A reachable step whose failure/timeout is unhandled
+  stalls the progression and therefore leaves that branch with no terminal — so
+  the no-terminal-path liveness lint **fails** for a flow that is the workflow's
+  only terminal path. A flow does not satisfy liveness merely by having *some*
+  path to `complete`/`fail`. Flow steps' generated reads are exempt from the
+  dead-rule lint (their producers are generated alongside).
+- `on fails` and `on timeout` handlers are checked like rule bodies (terminals
+  validated against contracts, bindings in scope).
 
 ## Dependencies
 
@@ -140,4 +158,8 @@ the unified evaluator.
   facts produce distinct progressions).
 - Handler coverage: a failing step with a handler runs exactly the handler;
   without a handler, the progression stalls with the state fact and
-  terminal effect inspectable (no silent drop).
+  terminal effect inspectable (no silent drop). The stall is observable
+  behavior, not a sanctioned terminal: when the flow is the workflow's only
+  terminal path, an unhandled failure/timeout branch is a liveness-lint
+  failure at compile time (see [Static checks](#static-checks)), so a shipped
+  workflow cannot rely on a silent forever-stall.

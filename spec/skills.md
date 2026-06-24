@@ -29,8 +29,6 @@ The canonical file format may follow the `SKILL.md` convention:
 skills/
   loft/
     SKILL.md
-  thoth/
-    SKILL.md
   repo-worker/
     SKILL.md
 ```
@@ -44,7 +42,7 @@ project .whipplescript/skills/
 installed WhippleScript packages
 first-party bundled skills
 explicit CLI/config paths
-plugin resource discovery
+package/provider resource discovery
 ```
 
 The registry records provenance for each skill:
@@ -72,12 +70,13 @@ Skills may be attached to agents:
 ```whipplescript
 agent worker {
   profile "repo-writer"
-  skills ["repo-worker", "loft", "thoth"]
+  skills ["repo-worker", "loft"]
 }
 ```
 
-There is no top-level `use skill` form. Top-level `use` imports plugins; skills
-enter provider context only through explicit agent or turn attachment.
+There is no top-level `use skill` form. Top-level `use` imports package/library
+surface; skills enter provider context only through explicit agent or turn
+attachment.
 
 Or to individual turns:
 
@@ -87,7 +86,14 @@ Claim one ready issue and implement it.
 """
 ```
 
-The harness resolves skills into context before the provider turn starts.
+The harness resolves skills into context before the provider turn starts. Both a
+turn-scoped `with skills [...]` attachment and a turn-scoped `with access to
+<resource> { … }` grant ride on the `agent.tell` effect as metadata: skills are
+context bundles and the access grant is authority-narrowing metadata (Proposal A
+in [`admission-and-idempotency.md`](admission-and-idempotency.md)). Neither is a
+separate durable effect, and neither grants capability authority on its own.
+Skill injection and in-turn activity under a grant are recorded as evidence, not
+rule-matchable facts.
 
 ## Rules
 
@@ -110,10 +116,9 @@ loft-user
 human-review-user
 ```
 
-Optional package/plugin skills:
+Optional package skills:
 
 ```text
-thoth-user
 memory-user
 github-user
 browser-user

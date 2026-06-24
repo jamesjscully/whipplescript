@@ -162,7 +162,7 @@ Checked examples live in `examples/`:
 - `gastown-lite.whip`
 - `multi-agent-bounded-concurrency.whip`
 - `openclaw-lite.whip`
-- `plugin-memory.whip`
+- `package-memory.whip`
 - `provider-language-e2e.whip`
 
 Each has a matching `.ir` snapshot used by parser tests.

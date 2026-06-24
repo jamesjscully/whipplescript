@@ -1,0 +1,26 @@
+load ../flow-namespace.maude
+
+--- Coverage: a user rule that accesses a flow-owned fact is a violation.
+search [1] in WHIPPLESCRIPT-FLOW-NAMESPACE :
+  userRule(userA) ruleAccess(userA, flowF) flowOwned(flowF) violations(mtViol)
+  =>* C:Cfg violations(viol(userA, flowF) ; VS:PairSet) .
+
+--- Coverage: with a generated rule and a user rule both accessing flow state,
+--- the user rule is flagged -- the legitimate generated access does not mask it.
+search [1] in WHIPPLESCRIPT-FLOW-NAMESPACE :
+  genRule(genA) ruleAccess(genA, flowF)
+  userRule(userB) ruleAccess(userB, flowF)
+  flowOwned(flowF) violations(mtViol)
+  =>* C:Cfg violations(viol(userB, flowF) ; VS:PairSet) .
+
+--- Bite: a generated flow rule accessing flow-owned state is exempt. The RESIDUAL
+--- soup var means any violation in any reachable state would be a solution, so
+--- No solution proves the generated rule is never flagged.
+search [1] in WHIPPLESCRIPT-FLOW-NAMESPACE :
+  genRule(genA) ruleAccess(genA, flowF) flowOwned(flowF) violations(mtViol)
+  =>* violations(viol(R:Rule, F:Fact) ; VS:PairSet) RESIDUAL:Cfg .
+
+--- Bite: a user rule accessing a non-owned ordinary fact is fine -- never flagged.
+search [1] in WHIPPLESCRIPT-FLOW-NAMESPACE :
+  userRule(userA) ruleAccess(userA, plainF) violations(mtViol)
+  =>* violations(viol(R:Rule, F:Fact) ; VS:PairSet) RESIDUAL:Cfg .

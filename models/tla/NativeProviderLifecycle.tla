@@ -25,11 +25,13 @@ VARIABLES
   \* @type: Set(Str);
   terminalAppended,
   \* @type: Seq(Str);
-  eventLog
+  eventLog,
+  \* @type: Seq(<<Str, Str>>);
+  terminalEvents
 
 vars ==
   << effectStatus, cancelRequested, cancelAcknowledged, providerEvidence,
-     artifactCaptureFailed, terminalAppended, eventLog >>
+     artifactCaptureFailed, terminalAppended, eventLog, terminalEvents >>
 
 EffectStatuses ==
   {"running", "completed", "failed", "cancelled"}
@@ -45,6 +47,7 @@ Init ==
   /\ artifactCaptureFailed = {}
   /\ terminalAppended = {}
   /\ eventLog = << >>
+  /\ terminalEvents = << >>
 
 AppendEvent(ev) ==
   /\ ev \in Events
@@ -58,7 +61,7 @@ RequestCancellation(e, ev) ==
   /\ cancelRequested' = cancelRequested \cup {e}
   /\ AppendEvent(ev)
   /\ UNCHANGED << effectStatus, cancelAcknowledged, providerEvidence,
-                  artifactCaptureFailed, terminalAppended >>
+                  artifactCaptureFailed, terminalAppended, terminalEvents >>
 
 AcknowledgeCancellation(e, ev) ==
   /\ e \in Effects
@@ -69,7 +72,7 @@ AcknowledgeCancellation(e, ev) ==
   /\ cancelAcknowledged' = cancelAcknowledged \cup {e}
   /\ AppendEvent(ev)
   /\ UNCHANGED << effectStatus, cancelRequested, providerEvidence,
-                  artifactCaptureFailed, terminalAppended >>
+                  artifactCaptureFailed, terminalAppended, terminalEvents >>
 
 RecordProviderEvidence(e, ev) ==
   /\ e \in Effects
@@ -79,7 +82,7 @@ RecordProviderEvidence(e, ev) ==
   /\ providerEvidence' = providerEvidence \cup {e}
   /\ AppendEvent(ev)
   /\ UNCHANGED << effectStatus, cancelRequested, cancelAcknowledged,
-                  artifactCaptureFailed, terminalAppended >>
+                  artifactCaptureFailed, terminalAppended, terminalEvents >>
 
 RecoverProviderTerminal(e, ev) ==
   /\ e \in Effects
@@ -89,6 +92,7 @@ RecoverProviderTerminal(e, ev) ==
   /\ e \notin terminalAppended
   /\ effectStatus' = [effectStatus EXCEPT ![e] = "completed"]
   /\ terminalAppended' = terminalAppended \cup {e}
+  /\ terminalEvents' = Append(terminalEvents, <<e, "completed">>)
   /\ AppendEvent(ev)
   /\ UNCHANGED << cancelRequested, cancelAcknowledged, providerEvidence,
                   artifactCaptureFailed >>
@@ -101,6 +105,7 @@ CompleteProvider(e, ev) ==
   /\ e \notin terminalAppended
   /\ effectStatus' = [effectStatus EXCEPT ![e] = "completed"]
   /\ terminalAppended' = terminalAppended \cup {e}
+  /\ terminalEvents' = Append(terminalEvents, <<e, "completed">>)
   /\ AppendEvent(ev)
   /\ UNCHANGED << cancelRequested, cancelAcknowledged, providerEvidence,
                   artifactCaptureFailed >>
@@ -113,6 +118,7 @@ RequiredArtifactCaptureFailure(e, ev) ==
   /\ artifactCaptureFailed' = artifactCaptureFailed \cup {e}
   /\ effectStatus' = [effectStatus EXCEPT ![e] = "failed"]
   /\ terminalAppended' = terminalAppended \cup {e}
+  /\ terminalEvents' = Append(terminalEvents, <<e, "failed">>)
   /\ AppendEvent(ev)
   /\ UNCHANGED << cancelRequested, cancelAcknowledged, providerEvidence >>
 
@@ -124,6 +130,7 @@ CancelAfterAcknowledgement(e, ev) ==
   /\ e \notin terminalAppended
   /\ effectStatus' = [effectStatus EXCEPT ![e] = "cancelled"]
   /\ terminalAppended' = terminalAppended \cup {e}
+  /\ terminalEvents' = Append(terminalEvents, <<e, "cancelled">>)
   /\ AppendEvent(ev)
   /\ UNCHANGED << cancelRequested, cancelAcknowledged, providerEvidence,
                   artifactCaptureFailed >>
@@ -143,6 +150,12 @@ Spec ==
 EventSeqOk(seq) ==
   \A i \in 1..Len(seq) : seq[i] \in Events
 
+\* @type: (Seq(<<Str, Str>>)) => Bool;
+TerminalEventSeqOk(seq) ==
+  \A i \in 1..Len(seq) :
+    /\ seq[i][1] \in Effects
+    /\ seq[i][2] \in TerminalStatuses
+
 TypeOk ==
   /\ effectStatus \in [Effects -> EffectStatuses]
   /\ cancelRequested \subseteq Effects
@@ -151,6 +164,7 @@ TypeOk ==
   /\ artifactCaptureFailed \subseteq Effects
   /\ terminalAppended \subseteq Effects
   /\ EventSeqOk(eventLog)
+  /\ TerminalEventSeqOk(terminalEvents)
 
 TerminalSetMatchesStatus ==
   \A e \in Effects :
@@ -167,8 +181,13 @@ RequiredArtifactFailurePreventsSuccess ==
     e \in artifactCaptureFailed => effectStatus[e] # "completed"
 
 NoDuplicateTerminalOutcome ==
-  \A e \in Effects :
-    e \in terminalAppended => Cardinality({effectStatus[e]} \cap TerminalStatuses) = 1
+  \A i, j \in 1..Len(terminalEvents) :
+    terminalEvents[i][1] = terminalEvents[j][1] => i = j
+
+TerminalEventsMatchTerminalSet ==
+  /\ Len(terminalEvents) = Cardinality(terminalAppended)
+  /\ \A i \in 1..Len(terminalEvents) :
+       terminalEvents[i][1] \in terminalAppended
 
 ProviderEvidenceRecoveryIsTerminalWhenCompleted ==
   \A e \in Effects :
@@ -186,6 +205,7 @@ SafetyInvariants ==
   /\ CancellationAcknowledgementDoesNotFabricateTerminal
   /\ RequiredArtifactFailurePreventsSuccess
   /\ NoDuplicateTerminalOutcome
+  /\ TerminalEventsMatchTerminalSet
   /\ ProviderEvidenceRecoveryIsTerminalWhenCompleted
 
 ====

@@ -299,7 +299,7 @@ rule give_up
 
 `askHuman` creates an inbox item; a `human answered` rule reacts to the
 answer. The [tutorial](tutorial.md) builds this pattern end to end, and
-[`examples/human-review.whip`](../examples/human-review.whip) is the minimal
+[`examples/human-review.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/human-review.whip) is the minimal
 version. Operate the inbox with `whip inbox`, `whip inbox show <item>`, and
 `whip inbox answer <item> (--choice X | --text "...") [--by NAME]`.
 
@@ -316,7 +316,7 @@ deliberately constrained:
   `scripts/*`); anything outside the list fails and routes to `after x fails`.
 - There is no sandbox for raw dev `exec` — a grant is a documented trust
   decision. Keep the allow-list as narrow as the workflow needs, and prefer
-  agents, plugins, or child workflows when one of those fits.
+	  agents, package capabilities, or child workflows when one of those fits.
 
 Hosted deployments should use named script capabilities instead:
 
@@ -350,8 +350,8 @@ orchestration into shell.
 | Need | Use |
 | --- | --- |
 | Split declarations across files | `include "schemas/common.whip"` |
-| Bring in BAML classes/functions | `include "review.baml"` |
-| Import plugin capabilities | `use memory` |
+| Bring in coerce classes/functions | `include "review.coerce"` |
+| Import package/library surface | `use memory` |
 | Reuse a rule/effect fragment at compile time | `pattern` + `apply` |
 | Sequence fixed steps with shared bindings | `flow` |
 | Pull work from a durable backlog | `queue` + `claim` |
@@ -427,7 +427,7 @@ checked claim about the final state.
   not model output.
 - Every failure branch retries, escalates, or deliberately ignores; none
   fall through silently.
-- Agent profiles are as narrow as the work allows; plugin calls are explicit
+- Agent profiles are as narrow as the work allows; package calls are explicit
   `call` effects; skills are attached to agents or turns, not imported.
 - `whip --json dev` passes its assertions with the fixture provider, and
   `whip trace --check` reports conformance.
@@ -441,7 +441,7 @@ checked claim about the final state.
 | Treating `coerce` as a local function call | Branch on the effect's completion. |
 | Letting a model choose the provider or route | Use `AgentRef<...>`, enums, or literal fields. |
 | Treating provider failure as workflow failure | Write a rule that decides when to `fail`. |
-| Importing skills with `use` | Attach skills to agents or turns; `use` is for plugins. |
+| Importing skills with `use` | Attach skills to agents or turns; `use` imports package/library surface. |
 | Hiding orchestration in shell scripts around the CLI | Express it as rules, facts, and effects. |
 | Reading the clock in a guard | Use a `timeout`, `timer`, or recorded fact. |
 | Treating a lost `claim` as an error | Branch on the claim failure and wait for the next ready item. |

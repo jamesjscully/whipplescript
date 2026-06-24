@@ -11,7 +11,7 @@ source rule language
   -> event-sourced runtime kernel and store
   -> control plane
   -> registries
-  -> provider harnesses, plugins, and capability enforcement
+  -> package/provider registration and capability enforcement
 ```
 
 The core should stay intentionally small. It should provide the machinery for
@@ -24,18 +24,17 @@ Core integrations:
 agent harness interface
 capability registry
 skill registry
-BAML-backed coerce
+schema-coercion effects, with coerce as a current backend
 Loft work kernel integration
 human review inbox
 artifact/evidence store
 observability/status views
 ```
 
-Plugin-by-default integrations:
+Package/provider-by-default integrations:
 
 ```text
 memory systems
-Thoth governance
 GitHub / Linear / Jira
 browser automation
 web research
@@ -72,8 +71,13 @@ whip effects
 whip status
 ```
 
-The kernel, not the control plane or plugins, owns instance transition
-semantics. See [kernel-api.md](kernel-api.md).
+The kernel owns the durable transaction primitives — event append, projection,
+rule commit, effect enqueue/claim/complete, lease lifecycle, and the
+instance-lifecycle transitions (create/pause/resume/cancel/revise activation).
+The control plane decides *when* to invoke those transactions (recovery loops,
+workers, CLI) but does not reimplement their semantics: pause/resume/cancel and
+revision activation are kernel transactions sequenced by the control plane, not
+control-plane-private state mutations. See [kernel-api.md](kernel-api.md).
 
 Facts in `F` are typed projection records with explicit provenance. See
 [fact-provenance.md](fact-provenance.md).
@@ -155,11 +159,12 @@ The architecture depends on these supporting specs:
   effects and authority binding.
 - [capability-registry.md](capability-registry.md) defines capability binding
   and enforcement.
-- [plugin-system.md](plugin-system.md) defines the package and plugin model.
+- [plugin-system.md](plugin-system.md) preserves legacy runtime
+  provider-registry notes from the retired plugin model.
 - [skills.md](skills.md) defines deterministic skill loading and attachment.
 - [agent-harness.md](agent-harness.md) defines provider adapters for real
   coding-agent turns.
-- [coerce.md](coerce.md) defines BAML-backed model calls as durable effects.
+- [coerce.md](coerce.md) defines typed schema-coercion as a durable effect.
 - [loft-integration.md](loft-integration.md) defines the separate work
   kernel WhippleScript relies on for serious repo execution.
 - [human-review.md](human-review.md) defines human inbox semantics.

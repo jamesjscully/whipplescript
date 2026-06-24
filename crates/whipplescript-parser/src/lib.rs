@@ -4,12 +4,20 @@
 //! hand-written parser. It preserves source spans and keeps rule/effect bodies
 //! as source text until the typed IR is ready to lower them.
 
+mod action_expand;
 pub mod body;
 mod flow_expand;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
+};
+use whipplescript_core::{
+    ConstructField, ConstructInterface, ConstructRegistration, ContractRegistry, EffectContract,
+    LibraryRegistration, TypedOutputValidation, CONSTRUCT_FAMILY_EFFECT_OPERATION,
+    CONSTRUCT_INTERFACE_CAPABILITY, CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE,
+    CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME, CONSTRUCT_LOWERING_CAPABILITY_CALL,
+    CONSTRUCT_SCOPE_RULE_BODY,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +40,54 @@ pub struct Diagnostic {
     pub span: SourceSpan,
     pub message: String,
     pub suggestion: Option<String>,
+    /// Secondary spans carrying supporting context (spec/error-handling.md "Spans
+    /// And Labels"): a `note`-style related-information label pointing at a
+    /// definition, prior claim, or other related site. Empty for most
+    /// diagnostics; surfaced in CLI text, JSON reports, and LSP
+    /// `relatedInformation`.
+    pub related: Vec<RelatedInfo>,
+}
+
+/// A secondary span + short label attached to a [`Diagnostic`] as related
+/// information (never a top-level diagnostic of its own).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelatedInfo {
+    pub span: SourceSpan,
+    pub message: String,
+}
+
+impl Diagnostic {
+    /// Attaches a related-information label at `span` (builder style, so the
+    /// common no-related case stays a plain struct literal that only needs the
+    /// new field defaulted).
+    pub fn with_related(mut self, span: SourceSpan, message: impl Into<String>) -> Self {
+        self.related.push(RelatedInfo {
+            span,
+            message: message.into(),
+        });
+        self
+    }
+}
+
+/// The marker that introduced a comment, preserved so a formatter can re-emit it
+/// faithfully.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommentMarker {
+    /// `# …`
+    Hash,
+    /// `// …`
+    Slash,
+}
+
+/// A source comment captured by the lexer. Comments are kept out of the token
+/// stream (so the parser is unaffected) but retained here so tooling — `whip fmt`,
+/// the LSP — can preserve them. `text` is the trimmed content after the marker;
+/// `span` covers the marker through end of line (exclusive of the newline).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Comment {
+    pub marker: CommentMarker,
+    pub text: String,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,10 +131,15 @@ pub enum Item {
     WorkflowContract(WorkflowContractDecl),
     Harness(HarnessDecl),
     Queue(QueueDecl),
+    Channel(ChannelDecl),
+    FileStore(FileStoreDecl),
     Flow(FlowDecl),
+    Action(ActionDecl),
     Agent(AgentDecl),
     Enum(EnumDecl),
     Event(EventDecl),
+    Source(SourceDecl),
+    Test(TestDecl),
     Lease(LeaseDecl),
     Ledger(LedgerDecl),
     Counter(CounterDecl),
@@ -87,6 +148,38 @@ pub enum Item {
     Coerce(CoerceDecl),
     Assert(AssertDecl),
     Rule(RuleDecl),
+}
+
+impl Item {
+    /// Source span of this top-level item, used to interleave preserved comments.
+    fn span(&self) -> SourceSpan {
+        match self {
+            Self::Include(decl) => decl.path.span,
+            Self::Use(decl) => decl.name.span,
+            Self::Pattern(decl) => decl.span,
+            Self::Apply(decl) => decl.span,
+            Self::WorkflowContract(decl) => decl.span,
+            Self::Harness(decl) => decl.span,
+            Self::Queue(decl) => decl.span,
+            Self::Channel(decl) => decl.span,
+            Self::FileStore(decl) => decl.span,
+            Self::Flow(decl) => decl.span,
+            Self::Action(decl) => decl.span,
+            Self::Agent(decl) => decl.span,
+            Self::Enum(decl) => decl.span,
+            Self::Event(decl) => decl.span,
+            Self::Source(decl) => decl.span,
+            Self::Test(decl) => decl.span,
+            Self::Lease(decl) => decl.span,
+            Self::Ledger(decl) => decl.span,
+            Self::Counter(decl) => decl.span,
+            Self::Class(decl) => decl.span,
+            Self::Table(decl) => decl.span,
+            Self::Coerce(decl) => decl.span,
+            Self::Assert(decl) => decl.span,
+            Self::Rule(decl) => decl.span,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,12 +262,63 @@ pub struct QueueDecl {
     pub span: SourceSpan,
 }
 
+/// `channel <name> { provider <p> [workspace <w>] [destination "<d>"] }`
+/// (std.messaging): a named communication route through a provider. The bare
+/// `channel` construct shape is reserved by the platform for `std.messaging`
+/// (spec/messaging.md), so third-party packages cannot author channel-like
+/// semantics with weaker guarantees. Lowers to a `metadata_only` declaration
+/// (like `queue`); the runtime messaging provider is later-stage work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelDecl {
+    pub name: Ident,
+    pub provider: Ident,
+    pub workspace: Option<Ident>,
+    pub destination: Option<StringLiteral>,
+    pub span: SourceSpan,
+}
+
+/// `file store <name> { root "<dir>" }` (std.files): a capability-scoped file
+/// store identity with a literal root directory. v0 is a local storage boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileStoreDecl {
+    pub name: Ident,
+    pub root: String,
+    pub read_globs: Vec<String>,
+    pub write_globs: Vec<String>,
+    /// Source spans of each clause keyword (`root` / the `allow` of read / write),
+    /// so `whip fmt` can interleave own-line and trailing body comments by position
+    /// (the body otherwise rebuilds from the AST, dropping comments).
+    pub root_span: Option<SourceSpan>,
+    pub read_span: Option<SourceSpan>,
+    pub write_span: Option<SourceSpan>,
+    pub span: SourceSpan,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FlowDecl {
     pub name: Ident,
     pub tags: Vec<TagDecl>,
     pub description: Option<StringLiteral>,
     pub whens: Vec<WhenClause>,
+    pub body: BlockSource,
+    pub span: SourceSpan,
+}
+
+/// One typed parameter of an `action` template (DR-0023).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionParam {
+    pub name: Ident,
+    pub ty: TypeSyntax,
+    pub span: SourceSpan,
+}
+
+/// `action <name>(<param: type>, …) { <effect chain> }` (DR-0023): a static,
+/// hygienic, inline-expanded template over rule-body effect chains. Consumed by
+/// `expand_action_calls` before lowering; never a runtime construct.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionDecl {
+    pub name: Ident,
+    pub params: Vec<ActionParam>,
     pub body: BlockSource,
     pub span: SourceSpan,
 }
@@ -250,12 +394,12 @@ pub struct CounterDecl {
     pub span: SourceSpan,
 }
 
-/// A typed external-event declaration (`event deploy.finished { ... }`):
+/// A typed external-signal declaration (`signal deploy.finished { ... }`):
 /// the ingress manifest naming a dotted event and its payload schema
 /// (spec/event-ingress.md).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventDecl {
-    /// Dotted lowercase event name (`deploy.finished`).
+    /// Dotted lowercase signal name (`deploy.finished`).
     pub name: String,
     pub name_span: SourceSpan,
     pub fields: Vec<ClassField>,
@@ -266,7 +410,270 @@ pub struct EventDecl {
 pub struct ClassField {
     pub name: Ident,
     pub ty: TypeSyntax,
+    /// `@key`: this field is the class's natural key (used for import per-row
+    /// idempotency, spec/std-library/files.md). At most one per class in v0.
+    pub is_key: bool,
     pub span: SourceSpan,
+}
+
+/// A top-level source declaration: `source <provider> as <name> { ... }` or
+/// `source clock as <name> { ... }`. Lowers through the `source_declaration`
+/// construct family to a `signal_source` (generic provider) or `clock_source`
+/// (the `clock` provider) admission template (spec/std-time.md,
+/// spec/construct-grammar.md). A source admits a durable signal fact; it never
+/// fires a rule directly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceDecl {
+    /// `as <name>` — the source instance name.
+    pub name: Ident,
+    /// The provider keyword (`clock`) or a generic provider identifier.
+    pub provider: Ident,
+    /// Recurrence/timezone/missed policy; `Some` only for the `clock` provider.
+    pub clock: Option<ClockPolicy>,
+    /// `observe as <binding>` — binds the provider observation schema.
+    pub observe_binding: Ident,
+    /// `emit <signal> { <field> <value> ... }` — maps the observation into the
+    /// declared signal payload.
+    pub emit: SourceEmit,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClockPolicy {
+    pub recurrence: Recurrence,
+    pub timezone: Option<StringLiteral>,
+    pub missed: Option<MissedPolicy>,
+    pub span: SourceSpan,
+}
+
+/// Recurrence forms from spec/std-time.md (conservative first surface).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Recurrence {
+    /// `at <hh:mm>` — a single scheduled occurrence.
+    At { time: TimeOfDay, span: SourceSpan },
+    /// `every <duration>` — interval occurrences.
+    EveryDuration {
+        seconds: u64,
+        source: String,
+        span: SourceSpan,
+    },
+    /// `every <calendar-pattern> at <hh:mm>` — calendar occurrences.
+    EveryCalendar {
+        pattern: CalendarPattern,
+        time: TimeOfDay,
+        span: SourceSpan,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CalendarPattern {
+    Day,
+    Weekday,
+    Weekly(Weekday),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Weekday {
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+    Sunday,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimeOfDay {
+    pub hour: u8,
+    pub minute: u8,
+    pub span: SourceSpan,
+}
+
+/// Missed-occurrence policy from spec/std-time.md. No silent default: a recurring
+/// source must declare one (enforced by the checker).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MissedPolicy {
+    Skip,
+    Coalesce,
+    CatchUp { limit: u32 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceEmit {
+    /// Dotted lowercase signal name materialized by this source.
+    pub signal: String,
+    pub signal_span: SourceSpan,
+    pub fields: Vec<SourceEmitField>,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceEmitField {
+    pub name: Ident,
+    pub value: SourceValue,
+    pub span: SourceSpan,
+}
+
+/// A value mapped into an emitted signal field: an observation path
+/// (`tick.scheduled_at`) or a literal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SourceValue {
+    Path {
+        binding: Ident,
+        segments: Vec<Ident>,
+        span: SourceSpan,
+    },
+    String(StringLiteral),
+    Number(String, SourceSpan),
+}
+
+/// A deterministic test scenario (spec/workflow-testing.md). Validated by
+/// `whip check`; excluded from compile/run IR; executed by `whip test`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestDecl {
+    pub name: StringLiteral,
+    /// Optional `workflow <Name>` header binding the scenario to one workflow
+    /// in a multi-workflow bundle (spec/workflow-testing.md). Single-workflow
+    /// files may omit it and bind implicitly.
+    pub workflow: Option<Ident>,
+    pub clauses: Vec<TestClause>,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TestClause {
+    Given(GivenClause),
+    Stub(StubClause),
+    Run(RunClause),
+    Expect(ExpectClause),
+}
+
+/// A `<field> <expr>` mapping inside a `given` record body. `value` is the source
+/// text of the expression (parsed via `parse_expression` when validated), matching
+/// how guards and assertions capture expressions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestField {
+    pub name: Ident,
+    pub value: String,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GivenClause {
+    Input {
+        fields: Vec<TestField>,
+        span: SourceSpan,
+    },
+    Fact {
+        ty: Ident,
+        fields: Vec<TestField>,
+        span: SourceSpan,
+    },
+    Signal {
+        name: String,
+        fields: Vec<TestField>,
+        span: SourceSpan,
+    },
+    Clock {
+        at: StringLiteral,
+        span: SourceSpan,
+    },
+    Tracker {
+        tracker: String,
+        fields: Vec<TestField>,
+        span: SourceSpan,
+    },
+    /// `given file <store> at <path> "<content>"` seeds a fixture file in the
+    /// named `file store` so a `read` during `whip test` resolves deterministic
+    /// content (the harness redirects the store root to a temp dir).
+    File {
+        store: String,
+        path: StringLiteral,
+        content: StringLiteral,
+        span: SourceSpan,
+    },
+}
+
+/// `stub <surface…> <outcome> [record | string]`. The surface path and outcome
+/// are kept as tokens; provider-specific validation happens in the harness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StubClause {
+    /// Surface path segments (each may be dotted, e.g. `script.run`); the trailing
+    /// segment is the outcome.
+    pub surface: Vec<String>,
+    pub outcome: String,
+    pub payload: Option<StubPayload>,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StubPayload {
+    Record(Vec<TestField>),
+    Message(StringLiteral),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunClause {
+    pub kind: RunKind,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RunKind {
+    UntilIdle,
+    UntilWorkflowCompleted,
+    UntilWorkflowFailed,
+    ForSteps(u32),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpectClause {
+    pub target: ExpectTarget,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExpectTarget {
+    WorkflowCompleted,
+    WorkflowFailed { failure: Option<Ident> },
+    Rule { name: Ident, status: RuleStatus },
+    Effect { name: String, status: EffectStatus },
+    Diagnostic { code: String },
+    NoEffect { name: String },
+    Projection(ProjQuery),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuleStatus {
+    Fired,
+    FiredTimes(u32),
+    DidNotFire,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EffectStatus {
+    Requested,
+    Completed,
+    Failed,
+}
+
+/// A projection query: `<noun> exists | count <predicate> is <N> | where <predicate>`.
+/// The predicate reuses the guard expression kernel, restricted to projection
+/// fields. The noun is a dotted fact name, so a scenario can assert over runtime
+/// facts such as `agent.turn.completed` as well as single-identifier user facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjQuery {
+    pub noun: String,
+    pub kind: ProjQueryKind,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProjQueryKind {
+    Exists,
+    Count { predicate: String, count: u32 },
+    Where { predicate: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -404,7 +811,11 @@ pub struct IrProgram {
     pub uses: Vec<IrUse>,
     pub harnesses: Vec<IrHarness>,
     pub queues: Vec<IrQueue>,
+    pub channels: Vec<IrChannel>,
+    pub file_stores: Vec<IrFileStore>,
     pub events: Vec<IrEvent>,
+    pub sources: Vec<IrSource>,
+    pub tests: Vec<IrTest>,
     pub leases: Vec<IrLease>,
     pub ledgers: Vec<IrLedger>,
     pub counters: Vec<IrCounter>,
@@ -499,7 +910,7 @@ pub struct IrUse {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IrUseKind {
-    Plugin,
+    Package,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -507,6 +918,31 @@ pub struct IrQueue {
     pub name: String,
     pub tracker: String,
     pub span: SourceSpan,
+}
+
+/// A lowered `channel` declaration (std.messaging): the channel identity, its
+/// provider, and optional workspace/destination config. Lowering class is
+/// `metadata_only`; the runtime messaging provider consumes it later.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrChannel {
+    pub name: String,
+    pub provider: String,
+    pub workspace: Option<String>,
+    pub destination: Option<String>,
+    pub span: SourceSpan,
+}
+
+/// A lowered `file store` declaration (std.files): the store identity + its
+/// literal local root directory, consumed by the runtime file provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrFileStore {
+    pub name: String,
+    pub root: String,
+    /// Path globs (relative to `root`) a `read` may touch; empty = any path
+    /// inside the root. Enforced at runtime in addition to root-containment.
+    pub read_globs: Vec<String>,
+    /// Path globs a `write` may touch; empty = any path inside the root.
+    pub write_globs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -545,6 +981,41 @@ pub struct IrEvent {
     pub span: SourceSpan,
 }
 
+/// A lowered source declaration (spec/std-time.md). `is_clock` selects the
+/// `clock_source` lowering; otherwise `signal_source`. Both lower through the
+/// `source_declaration` construct family and admit a durable signal fact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrSource {
+    pub name: String,
+    pub provider: String,
+    pub is_clock: bool,
+    pub recurrence: Option<Recurrence>,
+    pub timezone: Option<String>,
+    pub missed: Option<MissedPolicy>,
+    pub observe_binding: String,
+    pub emit_signal: String,
+    pub emit_fields: Vec<IrSourceEmitField>,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrSourceEmitField {
+    pub name: String,
+    pub value: SourceValue,
+    pub span: SourceSpan,
+}
+
+/// A lowered test scenario (spec/workflow-testing.md). Tests are excluded from
+/// the executable IR (`compile`/`run` ignore them); `whip check` validates them
+/// and `whip test` runs them. The clause detail is retained for the harness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrTest {
+    pub name: String,
+    pub workflow: Option<String>,
+    pub clauses: Vec<TestClause>,
+    pub span: SourceSpan,
+}
+
 /// Coordination resources (spec/coordination.md), lowered.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrLease {
@@ -577,6 +1048,8 @@ pub struct IrCounter {
 pub struct IrClassField {
     pub name: String,
     pub ty: IrType,
+    /// `@key`: this field is the class's natural key (import per-row idempotency).
+    pub is_key: bool,
     pub span: SourceSpan,
 }
 
@@ -668,6 +1141,10 @@ pub struct IrRuleMetadata {
     pub case_branches: Vec<IrRuleCaseBranch>,
     pub terminal_outputs: Vec<IrTerminalOutput>,
     pub terminal_branches: Vec<IrTerminalCaseBranch>,
+    /// Maximum nesting depth of `after` blocks in the rule body (0 = no `after`,
+    /// 1 = a top-level `after`, 2 = an `after` inside an `after`, …). Surfaced for the
+    /// `lint.deep_after_nesting` maintainability check.
+    pub max_after_depth: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -703,16 +1180,44 @@ pub struct IrEffectNode {
     pub kind: IrEffectKind,
     pub binding: Option<String>,
     pub required_capabilities: Vec<String>,
+    pub construct_use: Option<IrConstructUse>,
     pub idempotency_key: String,
     pub span: SourceSpan,
     /// Creation-anchored deadline from a `timeout <duration>` clause.
     pub timeout_seconds: Option<u64>,
+    /// Turn-access grants (`with access to …`) lowered onto an `agent.tell` effect as
+    /// authority-narrowing metadata (Proposal A). Empty for non-grant effects.
+    pub access_grants: Vec<IrAccessGrant>,
+}
+
+/// A lowered turn-access grant: the granted operations narrow the turn's effective
+/// authority on `resource` (modeled in `models/maude/turn-access-grant.maude`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrAccessGrant {
+    pub resource: String,
+    pub operations: Vec<IrAccessGrantOp>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrAccessGrantOp {
+    pub operation: String,
+    pub target: Option<String>,
+    pub globs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrConstructUse {
+    pub keyword: String,
+    pub scope: String,
+    pub construct_family: String,
+    pub lowering_target: String,
+    pub target_capability: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IrEffectKind {
     AgentTell,
-    BamlCoerce,
+    Coerce,
     LoftClaim,
     HumanAsk,
     CapabilityCall,
@@ -728,6 +1233,10 @@ pub enum IrEffectKind {
     LedgerAppend,
     CounterConsume,
     EventNotify,
+    FileRead,
+    FileWrite,
+    FileImport,
+    FileExport,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -798,6 +1307,8 @@ pub struct IrTerminalCaseBranch {
 pub enum DependencyPredicate {
     Succeeds,
     Fails,
+    TimedOut,
+    Cancelled,
     Completes,
 }
 
@@ -814,6 +1325,8 @@ struct SemanticContext {
     leases: BTreeSet<String>,
     ledgers: BTreeSet<String>,
     counters: BTreeSet<String>,
+    /// Declared `channel` names (std.messaging); `send via <channel>` must name one.
+    channels: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -826,8 +1339,8 @@ struct WorkflowInputSurface {
 struct SchemaIndex {
     classes: BTreeMap<String, BTreeMap<String, TypeSyntax>>,
     enums: BTreeMap<String, BTreeSet<String>>,
-    /// Declared external events (spec/event-ingress.md); their payload
-    /// schemas live in `classes` keyed by the dotted event name.
+    /// Declared external signals (spec/event-ingress.md); their payload
+    /// schemas live in `classes` keyed by the dotted signal name.
     events: BTreeSet<String>,
 }
 
@@ -1088,6 +1601,69 @@ pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOut
     }
 }
 
+/// One top-level declaration for an editor outline (`whip lsp`'s
+/// `textDocument/documentSymbol`): its name, a coarse kind tag, and source span.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeclSymbol {
+    pub name: String,
+    pub kind: &'static str,
+    pub span: SourceSpan,
+}
+
+/// Top-level declarations of `source` in source order, for an editor outline. On a
+/// parse error it returns whatever declarations parsed (best-effort outline).
+pub fn document_symbols(source: &str) -> Vec<DeclSymbol> {
+    let program = parse_program(source).program;
+    let mut symbols = Vec::new();
+    if let Some(workflow) = &program.workflow {
+        symbols.push(DeclSymbol {
+            name: workflow.name.clone(),
+            kind: "workflow",
+            span: workflow.span,
+        });
+    }
+    for workflow in &program.workflows {
+        symbols.push(DeclSymbol {
+            name: workflow.name.name.clone(),
+            kind: "workflow",
+            span: workflow.span,
+        });
+    }
+    for pattern in &program.patterns {
+        symbols.push(DeclSymbol {
+            name: pattern.name.name.clone(),
+            kind: "pattern",
+            span: pattern.span,
+        });
+    }
+    for item in &program.items {
+        let symbol = match item {
+            Item::Class(decl) => ("class", decl.name.name.clone(), decl.span),
+            Item::Enum(decl) => ("enum", decl.name.name.clone(), decl.span),
+            Item::Agent(decl) => ("agent", decl.name.name.clone(), decl.span),
+            Item::Rule(decl) => ("rule", decl.name.name.clone(), decl.span),
+            Item::Coerce(decl) => ("coerce", decl.name.name.clone(), decl.span),
+            Item::Flow(decl) => ("flow", decl.name.name.clone(), decl.span),
+            Item::Action(decl) => ("action", decl.name.name.clone(), decl.span),
+            Item::Lease(decl) => ("lease", decl.name.name.clone(), decl.span),
+            Item::Ledger(decl) => ("ledger", decl.name.name.clone(), decl.span),
+            Item::Counter(decl) => ("counter", decl.name.name.clone(), decl.span),
+            Item::Queue(decl) => ("queue", decl.name.name.clone(), decl.span),
+            Item::Channel(decl) => ("channel", decl.name.name.clone(), decl.span),
+            Item::FileStore(decl) => ("file store", decl.name.name.clone(), decl.span),
+            Item::Event(decl) => ("signal", decl.name.clone(), decl.span),
+            Item::Table(decl) => ("table", decl.name.name.clone(), decl.span),
+            _ => continue,
+        };
+        symbols.push(DeclSymbol {
+            name: symbol.1,
+            kind: symbol.0,
+            span: symbol.2,
+        });
+    }
+    symbols
+}
+
 /// Formats the syntax tree without lowering or analyzing rule bodies.
 pub fn format_program(source: &str) -> FormatOutput {
     let parsed = parse_program(source);
@@ -1104,6 +1680,570 @@ pub fn format_program(source: &str) -> FormatOutput {
     }
 }
 
+/// Format `source` while preserving comments where they can be placed safely:
+/// top-level **leading** comments (a `# …` or `// …` line above a declaration, or
+/// a file-header block) and **trailing** comments on a single-line top-level
+/// declaration (`workflow Demo  # …`, attached to that element's line); comments
+/// inside raw-body declarations (`rule`/`apply`/`coerce`/`table`/`flow`, carried by
+/// the body substring); and comments inside `class`/`agent`/`enum` bodies, including a
+/// data-carrying `enum` variant's nested field block — both own-line (interleaved
+/// by source position) and trailing comments on a field/variant line (appended to
+/// it), and `signal`/`queue`/`file store` bodies the same way — even though those
+/// bodies rebuild from the AST. Returns `None` when the program does not parse, or
+/// when a comment has nowhere to attach — e.g. one trailing a declaration's
+/// opening-brace line, with no field on that line. The caller refuses such files
+/// rather than dropping comments.
+pub fn format_program_preserving_comments(source: &str) -> Option<String> {
+    let parsed = parse_program(source);
+    if !parsed.diagnostics.is_empty() {
+        return None;
+    }
+    let mut comments = lex_comments(source);
+    if comments.is_empty() {
+        return Some(format_syntax(parsed.program));
+    }
+    // Both the top-level interleave and the per-body interleave below assume
+    // ascending source order.
+    comments.sort_by_key(|comment| comment.span.start);
+    let program = parsed.program;
+
+    // Each top-level element as (source span, formatted chunk), in source order.
+    let mut elements: Vec<(SourceSpan, String)> = Vec::new();
+    if let Some(workflow) = program.workflow {
+        let mut chunk = String::new();
+        format_tags(&program.workflow_tags, &mut chunk);
+        format_description(program.workflow_description.as_ref(), &mut chunk);
+        push_line(&mut chunk, format!("workflow {}", workflow.name));
+        elements.push((workflow.span, chunk));
+    }
+    for pattern in program.patterns {
+        let span = pattern.span;
+        let mut chunk = String::new();
+        format_pattern(pattern, &mut chunk);
+        elements.push((span, chunk));
+    }
+    for item in program.items {
+        let span = item.span();
+        let mut chunk = String::new();
+        // Field-list bodies (`class`/`agent`/`enum`) rebuild from the AST, which
+        // drops comments. Interleave their own-line body comments here; a body
+        // comment that cannot be placed safely refuses the whole file (the
+        // raw-body formatters — rule/coerce/table — already carry their comments).
+        let placed = match &item {
+            Item::Class(class_decl) => Some(try_format_class_with_comments(
+                class_decl, source, &comments, &mut chunk,
+            )),
+            Item::Agent(agent) => Some(try_format_agent_with_comments(
+                agent, source, &comments, &mut chunk,
+            )),
+            Item::Enum(enum_decl) => Some(try_format_enum_with_comments(
+                enum_decl, source, &comments, &mut chunk,
+            )),
+            Item::Event(event) => Some(try_format_event_with_comments(
+                event, source, &comments, &mut chunk,
+            )),
+            Item::Queue(queue) => Some(try_format_queue_with_comments(
+                queue, source, &comments, &mut chunk,
+            )),
+            Item::FileStore(file_store) => Some(try_format_filestore_with_comments(
+                file_store, source, &comments, &mut chunk,
+            )),
+            _ => None,
+        };
+        match placed {
+            Some(true) => {}
+            Some(false) => return None,
+            None => format_item(item, &mut chunk),
+        }
+        elements.push((span, chunk));
+    }
+    for workflow in program.workflows {
+        let span = workflow.span;
+        let mut chunk = String::new();
+        format_workflow(workflow, &mut chunk);
+        elements.push((span, chunk));
+    }
+    elements.sort_by_key(|(span, _)| span.start);
+
+    // Classify top-level comments. A comment INSIDE an element's span is preserved
+    // by that element's body formatter — a raw `body.text` substring
+    // (rule/coerce/table) or the per-body interleave above (class/agent/enum) — so
+    // emitting it here too would duplicate it; skip it. Otherwise an own-line
+    // comment is `leading` (interleaved between elements by position), and a
+    // trailing comment (code before it) attaches to the element whose last source
+    // line it shares — typically a single-line declaration (`workflow Demo  # x`).
+    // A trailing comment with no such element has nowhere to attach, so the file is
+    // refused rather than dropping it.
+    let mut leading: Vec<&Comment> = Vec::new();
+    let mut element_trailing: Vec<Option<&Comment>> = vec![None; elements.len()];
+    for comment in &comments {
+        let in_body = elements
+            .iter()
+            .any(|(span, _)| span.start < comment.span.start && comment.span.start < span.end);
+        if in_body {
+            continue;
+        }
+        let line_start = source[..comment.span.start]
+            .rfind('\n')
+            .map(|newline| newline + 1)
+            .unwrap_or(0);
+        if source[line_start..comment.span.start].trim().is_empty() {
+            leading.push(comment);
+            continue;
+        }
+        let comment_line = line_index(source, comment.span.start);
+        let mut placed = false;
+        for (index, (span, _)) in elements.iter().enumerate() {
+            if line_index(source, span.end.saturating_sub(1)) == comment_line {
+                if element_trailing[index].is_some() {
+                    return None;
+                }
+                element_trailing[index] = Some(comment);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            return None;
+        }
+    }
+
+    let mut out = String::new();
+    let mut next_comment = 0;
+    let element_count = elements.len();
+    for (index, (span, chunk)) in elements.iter().enumerate() {
+        while next_comment < leading.len() && leading[next_comment].span.start < span.start {
+            push_line(&mut out, format_comment(leading[next_comment]));
+            next_comment += 1;
+        }
+        match element_trailing[index] {
+            Some(comment) => {
+                out.push_str(chunk.strip_suffix('\n').unwrap_or(chunk));
+                out.push_str(&format!("  {}\n", format_comment(comment)));
+            }
+            None => out.push_str(chunk),
+        }
+        if index + 1 < element_count {
+            out.push('\n');
+        }
+    }
+    if next_comment < leading.len() {
+        if element_count > 0 {
+            out.push('\n');
+        }
+        while next_comment < leading.len() {
+            push_line(&mut out, format_comment(leading[next_comment]));
+            next_comment += 1;
+        }
+    }
+
+    // Safety net against silent data loss: in-body comments are left to each
+    // element's body formatter, and some formatters rebuild from the AST (which
+    // drops comments). The idempotency self-check can't catch a *consistent*
+    // drop, so verify here that every source comment survives — refuse otherwise.
+    if lex_comments(&out).len() != comments.len() {
+        return None;
+    }
+    Some(out)
+}
+
+fn format_comment(comment: &Comment) -> String {
+    let marker = match comment.marker {
+        CommentMarker::Hash => "#",
+        CommentMarker::Slash => "//",
+    };
+    let text = comment.text.trim();
+    if text.is_empty() {
+        marker.to_owned()
+    } else {
+        format!("{marker} {text}")
+    }
+}
+
+/// Zero-based source line of a byte offset.
+fn line_index(source: &str, offset: usize) -> usize {
+    source.as_bytes()[..offset]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count()
+}
+
+/// Classify the comments inside `body` (a field-list declaration's brace region)
+/// against its `members` (each member's span + already-formatted lines, in source
+/// order). Returns the own-line comments to interleave between members, plus a
+/// per-member optional trailing comment (appended to that member's last line).
+/// Returns `None` when a comment cannot be placed safely — a comment inside a
+/// *multi-line* member's own body (a deeper level this pass does not place), or a
+/// trailing comment with no single-line member on its line — so the caller refuses
+/// the file rather than misplace it. `comments` must be sorted by `span.start`.
+fn classify_body_comments<'a>(
+    source: &str,
+    body: SourceSpan,
+    members: &[(SourceSpan, Vec<String>)],
+    comments: &'a [Comment],
+) -> Option<(Vec<&'a Comment>, Vec<Option<&'a Comment>>)> {
+    let mut own_line: Vec<&Comment> = Vec::new();
+    let mut trailing: Vec<Option<&Comment>> = vec![None; members.len()];
+    for comment in comments {
+        if comment.span.start <= body.start || comment.span.start >= body.end {
+            continue;
+        }
+        // A comment inside a multi-line member's own braces is a deeper level we do
+        // not place here (e.g. a data-carrying `enum` variant's nested field).
+        if members.iter().any(|(span, lines)| {
+            lines.len() > 1 && span.start < comment.span.start && comment.span.start < span.end
+        }) {
+            return None;
+        }
+        let line_start = source[..comment.span.start]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        if source[line_start..comment.span.start].trim().is_empty() {
+            own_line.push(comment);
+            continue;
+        }
+        // Trailing: attach to a single-line member sharing the comment's line.
+        let comment_line = line_index(source, comment.span.start);
+        let mut placed = false;
+        for (index, (span, lines)) in members.iter().enumerate() {
+            if lines.len() == 1 && line_index(source, span.start) == comment_line {
+                if trailing[index].is_some() {
+                    return None;
+                }
+                trailing[index] = Some(comment);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            return None;
+        }
+    }
+    Some((own_line, trailing))
+}
+
+/// Emit each member's lines, interleaving `own_line` comments by source position
+/// (at `indent`) and appending each member's `trailing` comment to its last line.
+/// `members` and `own_line` must be in ascending `span.start` order; `trailing`
+/// is parallel to `members`.
+fn emit_members_with_comments(
+    members: &[(SourceSpan, Vec<String>)],
+    own_line: &[&Comment],
+    trailing: &[Option<&Comment>],
+    indent: &str,
+    formatted: &mut String,
+) {
+    let mut next = 0;
+    for (index, (span, lines)) in members.iter().enumerate() {
+        while next < own_line.len() && own_line[next].span.start < span.start {
+            push_line(
+                formatted,
+                format!("{indent}{}", format_comment(own_line[next])),
+            );
+            next += 1;
+        }
+        let last = lines.len().saturating_sub(1);
+        for (offset, line) in lines.iter().enumerate() {
+            match trailing[index] {
+                Some(comment) if offset == last => {
+                    push_line(formatted, format!("{line}  {}", format_comment(comment)));
+                }
+                _ => push_line(formatted, line.clone()),
+            }
+        }
+    }
+    while next < own_line.len() {
+        push_line(
+            formatted,
+            format!("{indent}{}", format_comment(own_line[next])),
+        );
+        next += 1;
+    }
+}
+
+/// Format a `class` body with its own-line and trailing comments preserved.
+/// Returns `false` (caller refuses the file) when a body comment cannot be placed
+/// safely.
+fn try_format_class_with_comments(
+    class_decl: &ClassDecl,
+    source: &str,
+    comments: &[Comment],
+    formatted: &mut String,
+) -> bool {
+    let members: Vec<(SourceSpan, Vec<String>)> = class_decl
+        .fields
+        .iter()
+        .map(|field| {
+            let key = if field.is_key { " @key" } else { "" };
+            (
+                field.span,
+                vec![format!(
+                    "  {} {}{key}",
+                    field.name.name,
+                    field.ty.to_source()
+                )],
+            )
+        })
+        .collect();
+    let Some((own_line, trailing)) =
+        classify_body_comments(source, class_decl.span, &members, comments)
+    else {
+        return false;
+    };
+    push_line(formatted, format!("class {} {{", class_decl.name.name));
+    emit_members_with_comments(&members, &own_line, &trailing, "  ", formatted);
+    push_line(formatted, "}");
+    true
+}
+
+/// Format a `queue` body (its single `tracker` member) with own-line and trailing
+/// comments preserved. Returns `false` (caller refuses the file) when a body
+/// comment cannot be placed safely.
+fn try_format_queue_with_comments(
+    queue: &QueueDecl,
+    source: &str,
+    comments: &[Comment],
+    formatted: &mut String,
+) -> bool {
+    let members: Vec<(SourceSpan, Vec<String>)> = vec![(
+        queue.tracker.span,
+        vec![format!("  tracker {}", queue.tracker.name)],
+    )];
+    let Some((own_line, trailing)) = classify_body_comments(source, queue.span, &members, comments)
+    else {
+        return false;
+    };
+    push_line(formatted, format!("queue {} {{", queue.name.name));
+    emit_members_with_comments(&members, &own_line, &trailing, "  ", formatted);
+    push_line(formatted, "}");
+    true
+}
+
+/// Format a `file store` body (its `root` and optional `allow read`/`allow write`
+/// clauses) with own-line and trailing comments preserved, interleaved by the
+/// clause spans captured during parsing. Returns `false` (caller refuses the file)
+/// when a body comment cannot be placed safely.
+fn try_format_filestore_with_comments(
+    file_store: &FileStoreDecl,
+    source: &str,
+    comments: &[Comment],
+    formatted: &mut String,
+) -> bool {
+    let render = |globs: &[String]| {
+        globs
+            .iter()
+            .map(|glob| format!("{glob:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut members: Vec<(SourceSpan, Vec<String>)> = Vec::new();
+    if let Some(span) = file_store.root_span {
+        members.push((span, vec![format!("  root {:?}", file_store.root)]));
+    }
+    if !file_store.read_globs.is_empty() {
+        if let Some(span) = file_store.read_span {
+            members.push((
+                span,
+                vec![format!("  allow read [{}]", render(&file_store.read_globs))],
+            ));
+        }
+    }
+    if !file_store.write_globs.is_empty() {
+        if let Some(span) = file_store.write_span {
+            members.push((
+                span,
+                vec![format!(
+                    "  allow write [{}]",
+                    render(&file_store.write_globs)
+                )],
+            ));
+        }
+    }
+    members.sort_by_key(|(span, _)| span.start);
+    let Some((own_line, trailing)) =
+        classify_body_comments(source, file_store.span, &members, comments)
+    else {
+        return false;
+    };
+    push_line(formatted, format!("file store {} {{", file_store.name.name));
+    emit_members_with_comments(&members, &own_line, &trailing, "  ", formatted);
+    push_line(formatted, "}");
+    true
+}
+
+/// Format a `signal` body (a typed payload schema of `ClassField`s, like a class)
+/// with its own-line and trailing comments preserved. Returns `false` (caller
+/// refuses the file) when a body comment cannot be placed safely.
+fn try_format_event_with_comments(
+    event: &EventDecl,
+    source: &str,
+    comments: &[Comment],
+    formatted: &mut String,
+) -> bool {
+    let members: Vec<(SourceSpan, Vec<String>)> = event
+        .fields
+        .iter()
+        .map(|field| {
+            (
+                field.span,
+                vec![format!("  {} {}", field.name.name, field.ty.to_source())],
+            )
+        })
+        .collect();
+    let Some((own_line, trailing)) = classify_body_comments(source, event.span, &members, comments)
+    else {
+        return false;
+    };
+    push_line(formatted, format!("signal {} {{", event.name));
+    emit_members_with_comments(&members, &own_line, &trailing, "  ", formatted);
+    push_line(formatted, "}");
+    true
+}
+
+fn agent_field_span(field: &AgentField) -> SourceSpan {
+    match field {
+        AgentField::Provider(ident) => ident.span,
+        AgentField::Profile(profile) => profile.span,
+        AgentField::Capacity(_, span)
+        | AgentField::Skills(_, span)
+        | AgentField::Capabilities(_, span) => *span,
+        AgentField::Unknown { span, .. } => *span,
+    }
+}
+
+fn agent_field_line(field: &AgentField) -> String {
+    match field {
+        AgentField::Provider(provider) => format!("  provider {}", provider.name),
+        AgentField::Profile(profile) => format!("  profile {:?}", profile.value),
+        AgentField::Capacity(capacity, _) => format!("  capacity {capacity}"),
+        AgentField::Skills(skills, _) => {
+            let skills = skills
+                .iter()
+                .map(|skill| format!("{:?}", skill.value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("  skills [{skills}]")
+        }
+        AgentField::Capabilities(capabilities, _) => {
+            let capabilities = capabilities
+                .iter()
+                .map(|capability| format!("{:?}", capability.value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("  capabilities [{capabilities}]")
+        }
+        AgentField::Unknown { name, .. } => format!("  {}", name.name),
+    }
+}
+
+/// Format an `agent` body with its own-line and trailing comments preserved.
+/// Returns `false` (caller refuses the file) when a body comment cannot be placed
+/// safely.
+fn try_format_agent_with_comments(
+    agent: &AgentDecl,
+    source: &str,
+    comments: &[Comment],
+    formatted: &mut String,
+) -> bool {
+    let members: Vec<(SourceSpan, Vec<String>)> = agent
+        .fields
+        .iter()
+        .map(|field| (agent_field_span(field), vec![agent_field_line(field)]))
+        .collect();
+    let Some((own_line, trailing)) = classify_body_comments(source, agent.span, &members, comments)
+    else {
+        return false;
+    };
+    let harness = agent
+        .harness
+        .as_ref()
+        .map(|harness| format!(" using {}", harness.name))
+        .unwrap_or_default();
+    push_line(
+        formatted,
+        format!("agent {}{} {{", agent.name.name, harness),
+    );
+    emit_members_with_comments(&members, &own_line, &trailing, "  ", formatted);
+    push_line(formatted, "}");
+    true
+}
+
+/// Lines for one enum variant, with comments inside a data-carrying variant's
+/// nested field block preserved (own-line interleaved, trailing appended) — the
+/// block is a field list in braces, so it reuses the same classify/emit one level
+/// deeper. Returns `None` when a nested comment cannot be placed safely.
+fn enum_variant_lines_with_comments(
+    variant: &EnumVariantDecl,
+    source: &str,
+    comments: &[Comment],
+) -> Option<Vec<String>> {
+    if variant.fields.is_empty() {
+        return Some(vec![format!("  {}", variant.name.name)]);
+    }
+    let members: Vec<(SourceSpan, Vec<String>)> = variant
+        .fields
+        .iter()
+        .map(|field| {
+            (
+                field.span,
+                vec![format!("    {} {}", field.name.name, field.ty.to_source())],
+            )
+        })
+        .collect();
+    // `comments` is filtered to this variant's span by classify (via variant.span).
+    let (own_line, trailing) = classify_body_comments(source, variant.span, &members, comments)?;
+    let mut block = String::new();
+    emit_members_with_comments(&members, &own_line, &trailing, "    ", &mut block);
+    let mut lines = vec![format!("  {} {{", variant.name.name)];
+    lines.extend(block.lines().map(str::to_owned));
+    lines.push("  }".to_owned());
+    Some(lines)
+}
+
+/// Format an `enum` body with its comments preserved at both levels: between
+/// variants (own-line interleaved, trailing appended to a bare variant's line) and
+/// inside a data-carrying variant's nested field block. Each brace-body filters
+/// comments by its own span, so the two levels never double-count. Returns `false`
+/// (caller refuses the file) when a comment cannot be placed safely.
+fn try_format_enum_with_comments(
+    enum_decl: &EnumDecl,
+    source: &str,
+    comments: &[Comment],
+    formatted: &mut String,
+) -> bool {
+    let mut members: Vec<(SourceSpan, Vec<String>)> = Vec::with_capacity(enum_decl.variants.len());
+    for variant in &enum_decl.variants {
+        let Some(lines) = enum_variant_lines_with_comments(variant, source, comments) else {
+            return false;
+        };
+        members.push((variant.span, lines));
+    }
+    // Enum-body-level comments are those NOT inside a data variant's nested block
+    // (those are placed by `enum_variant_lines_with_comments`); pass only those to
+    // the body-level classify so the nested ones are not counted twice.
+    let body_level: Vec<Comment> = comments
+        .iter()
+        .filter(|comment| {
+            !enum_decl.variants.iter().any(|variant| {
+                !variant.fields.is_empty()
+                    && variant.span.start < comment.span.start
+                    && comment.span.start < variant.span.end
+            })
+        })
+        .cloned()
+        .collect();
+    let Some((own_line, trailing)) =
+        classify_body_comments(source, enum_decl.span, &members, &body_level)
+    else {
+        return false;
+    };
+    push_line(formatted, format!("enum {} {{", enum_decl.name.name));
+    emit_members_with_comments(&members, &own_line, &trailing, "  ", formatted);
+    push_line(formatted, "}");
+    true
+}
+
 fn select_root_workflow(
     mut program: Program,
     root: Option<&str>,
@@ -1114,6 +2254,7 @@ fn select_root_workflow(
                 Some(workflow) if workflow.name == root => {}
                 Some(workflow) => {
                     return Err(vec![Diagnostic {
+                        related: Vec::new(),
                         span: workflow.span,
                         message: format!("root workflow `{root}` was not found"),
                         suggestion: Some(format!("available workflow: `{}`", workflow.name)),
@@ -1121,6 +2262,7 @@ fn select_root_workflow(
                 }
                 None => {
                     return Err(vec![Diagnostic {
+                        related: Vec::new(),
                         span: SourceSpan { start: 0, end: 0 },
                         message: format!("root workflow `{root}` was not found"),
                         suggestion: Some(
@@ -1148,6 +2290,7 @@ fn select_root_workflow(
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Err(vec![Diagnostic {
+                    related: Vec::new(),
                     span: SourceSpan { start: 0, end: 0 },
                     message: format!("root workflow `{root}` was not found"),
                     suggestion: Some(format!("available workflows: {names}")),
@@ -1163,6 +2306,7 @@ fn select_root_workflow(
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(vec![Diagnostic {
+                related: Vec::new(),
                 span: SourceSpan { start: 0, end: 0 },
                 message: "multiple workflow declarations require an explicit root".to_owned(),
                 suggestion: Some(format!(
@@ -1189,6 +2333,91 @@ fn select_root_workflow(
 }
 
 impl IrProgram {
+    pub fn construct_uses(&self) -> Vec<&IrConstructUse> {
+        self.rules
+            .iter()
+            .flat_map(|rule| rule.metadata.effects.iter())
+            .filter_map(|effect| effect.construct_use.as_ref())
+            .collect()
+    }
+
+    pub fn contract_registry(&self) -> ContractRegistry {
+        let mut libraries = BTreeMap::<String, LibraryRegistration>::new();
+        let mut contracts = BTreeMap::<(String, String), EffectContract>::new();
+
+        for use_decl in &self.uses {
+            libraries
+                .entry(use_decl.name.clone())
+                .or_insert_with(|| LibraryRegistration {
+                    id: use_decl.name.clone(),
+                    version: "unlocked".to_owned(),
+                    standard: false,
+                });
+        }
+
+        if !self.harnesses.is_empty() || !self.agents.is_empty() {
+            register_standard_library(&mut libraries, "std.agent");
+        }
+        if !self.queues.is_empty() {
+            register_standard_library(&mut libraries, "std.tracker");
+        }
+        if !self.events.is_empty() {
+            register_standard_library(&mut libraries, "std.ingress");
+        }
+        if !self.leases.is_empty() || !self.ledgers.is_empty() || !self.counters.is_empty() {
+            register_standard_library(&mut libraries, "std.coord");
+        }
+        if !self.channels.is_empty() {
+            register_standard_library(&mut libraries, "std.messaging");
+        }
+        if !self.coerces.is_empty() {
+            register_standard_library(&mut libraries, "std.coerce");
+            register_effect_contract(
+                &mut libraries,
+                &mut contracts,
+                IrEffectKind::Coerce,
+                Vec::new(),
+            );
+        }
+
+        for rule in &self.rules {
+            for effect in &rule.metadata.effects {
+                register_effect_contract(
+                    &mut libraries,
+                    &mut contracts,
+                    effect.kind.clone(),
+                    effect.required_capabilities.clone(),
+                );
+            }
+        }
+
+        // Built-in standard-library construct registrations. Unlike third-party
+        // packages (whose constructs come from a package manifest + lock), these
+        // are compiled into the platform, so they are available without a lock and
+        // are EXEMPT from the package-lock requirement (1929 OPTION A). Registered
+        // only when actually used, so channel-only programs and registry-shape
+        // tests are unaffected. Modeled in
+        // `models/maude/std-construct-authorization.maude`.
+        let mut constructs = Vec::new();
+        if self
+            .construct_uses()
+            .iter()
+            .any(|use_form| use_form.keyword == "send")
+        {
+            register_standard_library(&mut libraries, "std.messaging");
+            constructs.push(builtin_messaging_send_construct());
+            contracts
+                .entry((MESSAGING_SEND_CAPABILITY.to_owned(), "v0".to_owned()))
+                .or_insert_with(builtin_messaging_send_effect_contract);
+        }
+
+        ContractRegistry {
+            libraries: libraries.into_values().collect(),
+            constructs,
+            effect_contracts: contracts.into_values().collect(),
+        }
+    }
+
     pub fn to_snapshot(&self) -> String {
         let mut snapshot = String::new();
         push_line(&mut snapshot, format!("workflow {}", self.workflow));
@@ -1301,9 +2530,12 @@ impl IrProgram {
                     IrSchema::Class(class_decl) => {
                         push_line(&mut snapshot, format!("  class {}", class_decl.name));
                         for field in &class_decl.fields {
+                            // `@key` is serialized only when set, so non-keyed
+                            // classes keep their prior snapshot (no ripple).
+                            let key = if field.is_key { " @key" } else { "" };
                             push_line(
                                 &mut snapshot,
-                                format!("    {} {}", field.name, field.ty.to_snapshot()),
+                                format!("    {} {}{key}", field.name, field.ty.to_snapshot()),
                             );
                         }
                     }
@@ -1327,6 +2559,47 @@ impl IrProgram {
                     &mut snapshot,
                     format!("  queue {} tracker={}", queue.name, queue.tracker),
                 );
+            }
+        }
+
+        if !self.channels.is_empty() {
+            push_line(&mut snapshot, "channels");
+            for channel in &self.channels {
+                let mut line = format!("  channel {} provider={}", channel.name, channel.provider);
+                if let Some(workspace) = &channel.workspace {
+                    line.push_str(&format!(" workspace={workspace}"));
+                }
+                if let Some(destination) = &channel.destination {
+                    line.push_str(&format!(" destination={destination:?}"));
+                }
+                push_line(&mut snapshot, line);
+            }
+        }
+
+        if !self.file_stores.is_empty() {
+            push_line(&mut snapshot, "file_stores");
+            for file_store in &self.file_stores {
+                push_line(
+                    &mut snapshot,
+                    format!(
+                        "  file store {} root={:?}",
+                        file_store.name, file_store.root
+                    ),
+                );
+                // Globs are serialized only when present, so stores without an
+                // `allow` clause keep their prior snapshot (no ripple).
+                if !file_store.read_globs.is_empty() {
+                    push_line(
+                        &mut snapshot,
+                        format!("    allow read {:?}", file_store.read_globs),
+                    );
+                }
+                if !file_store.write_globs.is_empty() {
+                    push_line(
+                        &mut snapshot,
+                        format!("    allow write {:?}", file_store.write_globs),
+                    );
+                }
             }
         }
 
@@ -1454,14 +2727,44 @@ impl IrProgram {
                     push_line(&mut snapshot, "    effects");
                     for effect in &rule.metadata.effects {
                         let binding = effect.binding.as_deref().unwrap_or("-");
+                        let construct = effect
+                            .construct_use
+                            .as_ref()
+                            .map(|form| {
+                                format!(" construct={}->{}", form.keyword, form.target_capability)
+                            })
+                            .unwrap_or_default();
+                        // Turn-access grants are appended only when present, so
+                        // grant-free effects keep their existing snapshot shape.
+                        let grants = if effect.access_grants.is_empty() {
+                            String::new()
+                        } else {
+                            let rendered = effect
+                                .access_grants
+                                .iter()
+                                .map(|grant| {
+                                    let ops = grant
+                                        .operations
+                                        .iter()
+                                        .map(|op| op.operation.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(",");
+                                    format!("{}[{ops}]", grant.resource)
+                                })
+                                .collect::<Vec<_>>()
+                                .join(";");
+                            format!(" grants={rendered}")
+                        };
                         push_line(
                             &mut snapshot,
                             format!(
-                                "      {} kind={} binding={} key={}",
+                                "      {} kind={} binding={}{} key={}{}",
                                 effect.id,
                                 effect.kind.as_str(),
                                 binding,
-                                effect.idempotency_key
+                                construct,
+                                effect.idempotency_key,
+                                grants
                             ),
                         );
                     }
@@ -1576,11 +2879,364 @@ impl IrProgram {
     }
 }
 
+/// The `std.messaging` outbound `send` capability id (the target of the `send`
+/// construct's `capability.call` lowering).
+const MESSAGING_SEND_CAPABILITY: &str = "messaging.send";
+
+/// Built-in `std.messaging` `send` construct registration (1929 OPTION A): the
+/// compiler-provided equivalent of a package-authored `capability_call`
+/// construct, available without a package lock. Mirrors how a `recall`-style
+/// construct would be declared in a package manifest, but owned by the platform.
+fn builtin_messaging_send_construct() -> ConstructRegistration {
+    ConstructRegistration {
+        id: MESSAGING_SEND_CAPABILITY.to_owned(),
+        library_id: "std.messaging".to_owned(),
+        version: "v0".to_owned(),
+        construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION.to_owned(),
+        keyword: "send".to_owned(),
+        scope: CONSTRUCT_SCOPE_RULE_BODY.to_owned(),
+        fields: vec![
+            ConstructField {
+                name: "channel".to_owned(),
+                kind: "identifier".to_owned(),
+                required: true,
+            },
+            ConstructField {
+                name: "text".to_owned(),
+                kind: "expression".to_owned(),
+                required: true,
+            },
+        ],
+        requires: vec![ConstructInterface {
+            kind: CONSTRUCT_INTERFACE_CAPABILITY.to_owned(),
+            name: Some(MESSAGING_SEND_CAPABILITY.to_owned()),
+            type_ref: None,
+            phase: CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME.to_owned(),
+            cardinality: CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE.to_owned(),
+        }],
+        provides: Vec::new(),
+        lowering_target: CONSTRUCT_LOWERING_CAPABILITY_CALL.to_owned(),
+        target_capability: Some(MESSAGING_SEND_CAPABILITY.to_owned()),
+    }
+}
+
+/// Built-in `std.messaging` `messaging.send` `capability.call` effect contract,
+/// the target the `send` construct lowers to. Present without a lock so
+/// `validate_construct_uses` resolves the std-library exemption.
+fn builtin_messaging_send_effect_contract() -> EffectContract {
+    EffectContract {
+        id: MESSAGING_SEND_CAPABILITY.to_owned(),
+        library_id: "std.messaging".to_owned(),
+        version: "v0".to_owned(),
+        effect_kind: "capability.call".to_owned(),
+        source_forms: vec!["send".to_owned()],
+        input_schema: Some("messaging.send.input".to_owned()),
+        output_schema: Some("MessageSendReceipt".to_owned()),
+        required_capabilities: vec![MESSAGING_SEND_CAPABILITY.to_owned()],
+        provider_kinds: vec!["messaging".to_owned()],
+        projected_facts: vec!["effect.output".to_owned()],
+        validation: TypedOutputValidation::RuntimeBoundary,
+    }
+}
+
+fn register_standard_library(libraries: &mut BTreeMap<String, LibraryRegistration>, id: &str) {
+    libraries
+        .entry(id.to_owned())
+        .or_insert_with(|| LibraryRegistration {
+            id: id.to_owned(),
+            version: "v0".to_owned(),
+            standard: true,
+        });
+}
+
+fn register_effect_contract(
+    libraries: &mut BTreeMap<String, LibraryRegistration>,
+    contracts: &mut BTreeMap<(String, String), EffectContract>,
+    kind: IrEffectKind,
+    required_capabilities: Vec<String>,
+) {
+    let contract = effect_contract_for_kind(kind, required_capabilities);
+    register_standard_library(libraries, contract.library_id.as_str());
+    contracts
+        .entry((contract.id.clone(), contract.version.clone()))
+        .and_modify(|existing| {
+            merge_unique(
+                &mut existing.required_capabilities,
+                &contract.required_capabilities,
+            );
+            merge_unique(&mut existing.provider_kinds, &contract.provider_kinds);
+            merge_unique(&mut existing.source_forms, &contract.source_forms);
+            merge_unique(&mut existing.projected_facts, &contract.projected_facts);
+        })
+        .or_insert(contract);
+}
+
+fn merge_unique(target: &mut Vec<String>, values: &[String]) {
+    for value in values {
+        if !target.contains(value) {
+            target.push(value.clone());
+        }
+    }
+    target.sort();
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn effect_contract_for_kind(
+    kind: IrEffectKind,
+    required_capabilities: Vec<String>,
+) -> EffectContract {
+    let mut required_capabilities = required_capabilities;
+    required_capabilities.sort();
+    required_capabilities.dedup();
+    let effect_kind = kind.as_str().to_owned();
+
+    let (
+        library_id,
+        source_forms,
+        input_schema,
+        output_schema,
+        default_capabilities,
+        provider_kinds,
+        projected_facts,
+        validation,
+    ) = match kind {
+        IrEffectKind::AgentTell => (
+            "std.agent",
+            strings(&["tell"]),
+            Some("agent.turn.request"),
+            Some("AgentTurn"),
+            strings(&["agent.turn"]),
+            strings(&["agent"]),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
+        IrEffectKind::Coerce => (
+            "std.coerce",
+            strings(&["coerce", "decide"]),
+            Some("coerce.input"),
+            Some("typed-provider-output"),
+            strings(&["model.invoke"]),
+            strings(&["model"]),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
+        IrEffectKind::LoftClaim => (
+            "std.tracker",
+            strings(&["claim with"]),
+            Some("tracker.claim.input"),
+            Some("LoftClaim"),
+            Vec::new(),
+            strings(&["tracker"]),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
+        IrEffectKind::HumanAsk => (
+            "std.human",
+            strings(&["askHuman"]),
+            Some("human.ask.input"),
+            Some("HumanAnswer"),
+            strings(&["human.ask"]),
+            strings(&["human"]),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
+        IrEffectKind::CapabilityCall => (
+            "std.exec",
+            strings(&["call"]),
+            Some("capability.call.input"),
+            Some("capability.call.output"),
+            Vec::new(),
+            strings(&["capability"]),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
+        IrEffectKind::EventEmit => (
+            "std.ingress",
+            strings(&["emit"]),
+            Some("event.emit.input"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            TypedOutputValidation::None,
+        ),
+        IrEffectKind::WorkflowInvoke => (
+            "std.workflow",
+            strings(&["invoke"]),
+            Some("workflow.invoke.input"),
+            Some("workflow.terminal"),
+            Vec::new(),
+            Vec::new(),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
+        IrEffectKind::TimerWait => (
+            "std.schedule",
+            strings(&["timer"]),
+            Some("timer.wait.input"),
+            Some("TimerElapsed"),
+            Vec::new(),
+            Vec::new(),
+            strings(&["effect.output"]),
+            TypedOutputValidation::None,
+        ),
+        IrEffectKind::ExecCommand => (
+            "std.exec",
+            strings(&["exec"]),
+            Some("exec.command.input"),
+            Some("exec.command.output"),
+            strings(&["exec.run"]),
+            strings(&["script", "command"]),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
+        IrEffectKind::QueueFile => (
+            "std.tracker",
+            strings(&["file"]),
+            Some("queue.file.input"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            TypedOutputValidation::None,
+        ),
+        IrEffectKind::QueueClaim => (
+            "std.tracker",
+            strings(&["claim"]),
+            Some("queue.claim.input"),
+            Some("QueueClaim"),
+            Vec::new(),
+            Vec::new(),
+            strings(&["effect.output"]),
+            TypedOutputValidation::None,
+        ),
+        IrEffectKind::QueueRelease => (
+            "std.tracker",
+            strings(&["release"]),
+            Some("queue.release.input"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            TypedOutputValidation::None,
+        ),
+        IrEffectKind::QueueFinish => (
+            "std.tracker",
+            strings(&["finish"]),
+            Some("queue.finish.input"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            TypedOutputValidation::None,
+        ),
+        IrEffectKind::LeaseAcquire => (
+            "std.coord",
+            strings(&["acquire"]),
+            Some("lease.acquire.input"),
+            Some("LeaseAcquireOutcome"),
+            Vec::new(),
+            Vec::new(),
+            strings(&["effect.output"]),
+            TypedOutputValidation::None,
+        ),
+        IrEffectKind::LedgerAppend => (
+            "std.coord",
+            strings(&["append"]),
+            Some("ledger.append.input"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            TypedOutputValidation::None,
+        ),
+        IrEffectKind::CounterConsume => (
+            "std.coord",
+            strings(&["consume"]),
+            Some("counter.consume.input"),
+            Some("CounterConsumeOutcome"),
+            Vec::new(),
+            Vec::new(),
+            strings(&["effect.output"]),
+            TypedOutputValidation::None,
+        ),
+        IrEffectKind::EventNotify => (
+            "std.ingress",
+            strings(&["emit", "signal"]),
+            Some("event.notify.input"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            TypedOutputValidation::None,
+        ),
+        IrEffectKind::FileRead => (
+            "std.files",
+            strings(&["read"]),
+            Some("file.read.input"),
+            Some("FileReadResult"),
+            Vec::new(),
+            Vec::new(),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
+        IrEffectKind::FileWrite => (
+            "std.files",
+            strings(&["write"]),
+            Some("file.write.input"),
+            Some("FileWriteResult"),
+            Vec::new(),
+            Vec::new(),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
+        IrEffectKind::FileImport => (
+            "std.files",
+            strings(&["import"]),
+            Some("file.import.input"),
+            Some("FileImportResult"),
+            Vec::new(),
+            Vec::new(),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
+        IrEffectKind::FileExport => (
+            "std.files",
+            strings(&["export"]),
+            Some("file.export.input"),
+            Some("FileExportResult"),
+            Vec::new(),
+            Vec::new(),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
+    };
+
+    merge_unique(&mut required_capabilities, &default_capabilities);
+
+    EffectContract {
+        id: effect_kind.clone(),
+        library_id: library_id.to_owned(),
+        version: "v0".to_owned(),
+        effect_kind,
+        source_forms,
+        input_schema: input_schema.map(str::to_owned),
+        output_schema: output_schema.map(str::to_owned),
+        required_capabilities,
+        provider_kinds,
+        projected_facts,
+        validation,
+    }
+}
+
 impl IrEffectKind {
     fn as_str(&self) -> &'static str {
         match self {
             Self::AgentTell => "agent.tell",
-            Self::BamlCoerce => "baml.coerce",
+            Self::Coerce => "coerce",
             Self::LoftClaim => "loft.claim",
             Self::HumanAsk => "human.ask",
             Self::CapabilityCall => "capability.call",
@@ -1596,6 +3252,10 @@ impl IrEffectKind {
             Self::LedgerAppend => "ledger.append",
             Self::CounterConsume => "counter.consume",
             Self::EventNotify => "event.notify",
+            Self::FileRead => "file.read",
+            Self::FileWrite => "file.write",
+            Self::FileImport => "file.import",
+            Self::FileExport => "file.export",
         }
     }
 }
@@ -1605,6 +3265,8 @@ impl DependencyPredicate {
         match self {
             Self::Succeeds => "succeeds",
             Self::Fails => "fails",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
             Self::Completes => "completes",
         }
     }
@@ -1613,12 +3275,18 @@ impl DependencyPredicate {
 impl IrUseKind {
     fn as_str(&self) -> &'static str {
         match self {
-            Self::Plugin => "plugin",
+            Self::Package => "package",
         }
     }
 }
 
 impl IrType {
+    /// A human-readable label for this type (e.g. `ref<TicketRequest>`), for use in
+    /// diagnostics such as workflow-input errors.
+    pub fn display_label(&self) -> String {
+        self.to_snapshot()
+    }
+
     fn to_snapshot(&self) -> String {
         match self {
             Self::Primitive(primitive) => primitive.as_str().to_owned(),
@@ -1675,15 +3343,32 @@ fn lower_program(
     let (program, pattern_applications) = expand_pattern_applications(program, &mut diagnostics);
     let program = {
         let mut program = program;
+        // DR-0023: collect `action` templates, then expand their calls inside
+        // every rule body — including rules generated by flow expansion below.
+        // Calls are rewritten into ordinary effect-chain text that re-enters the
+        // normal lowering pipeline; the `action` declarations themselves are
+        // consumed (never a runtime construct).
+        let actions: Vec<ActionDecl> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Action(action) => Some(action.clone()),
+                _ => None,
+            })
+            .collect();
         let mut expanded = Vec::with_capacity(program.items.len());
         for item in program.items {
             match item {
-                Item::Flow(flow) => {
-                    expanded.extend(flow_expand::expand_flow(flow, &mut diagnostics))
-                }
+                Item::Flow(flow) => expanded.extend(flow_expand::expand_flow(
+                    flow,
+                    &mut diagnostics,
+                    &mut warnings,
+                )),
+                Item::Action(_) => {}
                 other => expanded.push(other),
             }
         }
+        action_expand::expand_action_calls(&mut expanded, &actions, &mut diagnostics);
         program.items = expanded;
         program
     };
@@ -1691,11 +3376,12 @@ fn lower_program(
     let harness_names = collect_harness_names(&program, &mut diagnostics);
     let agent_names = collect_agent_names(&program, &mut diagnostics);
     let workflow_contract_names = collect_workflow_contract_names(&program, &mut diagnostics);
-    let semantic = SemanticContext::from_program(&program, workflow_inputs);
+    let mut semantic = SemanticContext::from_program(&program, workflow_inputs);
     let workflow = match program.workflow {
         Some(workflow) => workflow.name,
         None => {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: SourceSpan { start: 0, end: 0 },
                 message: "expected workflow declaration".to_owned(),
                 suggestion: Some("add `workflow Name` before declarations".to_owned()),
@@ -1714,7 +3400,11 @@ fn lower_program(
         uses: Vec::new(),
         harnesses: Vec::new(),
         queues: Vec::new(),
+        channels: Vec::new(),
+        file_stores: Vec::new(),
         events: Vec::new(),
+        sources: Vec::new(),
+        tests: Vec::new(),
         leases: Vec::new(),
         ledgers: Vec::new(),
         counters: Vec::new(),
@@ -1739,6 +3429,12 @@ fn lower_program(
         &mut ir,
     );
 
+    // Inline `decide -> { … } as <binding>` synthesizes a hygienic
+    // `decide.<rule>.<binding>` class so its anonymous result shape flows like a
+    // named `coerce -> Schema`. Done before the rule loop so `analyze_rule` sees
+    // the class in the semantic index when type-checking field/`case` access.
+    collect_inline_decide_schemas(&program.items, &mut semantic, &mut ir);
+
     for item in program.items {
         match item {
             Item::Include(include) => lower_include(include, &mut ir),
@@ -1755,7 +3451,13 @@ fn lower_program(
             Item::Flow(flow) => {
                 let _ = flow;
             }
+            // Actions are consumed before this loop (DR-0023 slice 1 drops them;
+            // slice 2 expands their calls); reaching one here is unreachable.
+            Item::Action(action) => {
+                let _ = action;
+            }
             Item::Pattern(pattern) => diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: pattern.span,
                 message: format!(
                     "pattern `{}` is not allowed inside this declaration scope",
@@ -1764,6 +3466,7 @@ fn lower_program(
                 suggestion: Some("declare patterns at source top level".to_owned()),
             }),
             Item::Apply(apply) => diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: apply.span,
                 message: format!(
                     "pattern application `{}` was not expanded",
@@ -1775,12 +3478,27 @@ fn lower_program(
             }),
             Item::Harness(harness) => lower_harness(harness, &mut ir, &mut diagnostics),
             Item::Queue(queue) => lower_queue(queue, &mut ir, &mut diagnostics),
+            Item::Channel(channel) => lower_channel(channel, &mut ir, &mut diagnostics),
+            // The `file store` declaration (capability-scoped store identity)
+            // lowers to its name + literal root; the runtime file provider reads
+            // `<root>/<path>` for `read` effects against this store.
+            Item::FileStore(file_store) => {
+                ir.file_stores.push(IrFileStore {
+                    name: file_store.name.name,
+                    root: file_store.root,
+                    read_globs: file_store.read_globs,
+                    write_globs: file_store.write_globs,
+                });
+            }
             Item::Agent(agent) => lower_agent(agent, &mut ir, &harness_names, &mut diagnostics),
             Item::Enum(enum_decl) => lower_enum(enum_decl, &mut ir, &mut diagnostics),
             Item::Event(event) => lower_event(event, &mut ir, &mut diagnostics),
+            Item::Source(source) => lower_source(source, &mut ir, &mut diagnostics),
+            Item::Test(test) => lower_test(test, &mut ir, &mut diagnostics),
             Item::Lease(lease) => {
                 if !schema_names.contains(&lease.key_type.name) {
                     diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: lease.key_type.span,
                         message: format!(
                             "lease `{}` keys on undeclared type `{}`",
@@ -1802,6 +3520,7 @@ fn lower_program(
             Item::Ledger(ledger) => {
                 if !schema_names.contains(&ledger.entry_schema.name) {
                     diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: ledger.entry_schema.span,
                         message: format!(
                             "ledger `{}` records undeclared entry type `{}`",
@@ -1821,6 +3540,7 @@ fn lower_program(
             Item::Counter(counter) => {
                 if !schema_names.contains(&counter.key_type.name) {
                     diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: counter.key_type.span,
                         message: format!(
                             "counter `{}` keys on undeclared type `{}`",
@@ -1902,11 +3622,52 @@ fn lower_program(
     }
 
     ir.rule_dependencies = build_rule_dependencies(&ir.rules);
+    validate_turn_access_grant_file_operations(&ir, &mut diagnostics);
 
     CompileOutput {
         ir: diagnostics.is_empty().then_some(ir),
         diagnostics,
         warnings,
+    }
+}
+
+/// Post-lowering check: a turn-access grant whose resource is a declared `file store`
+/// may only grant file operations (`read`/`write`/`import`/`export`). Runs after the
+/// whole program is lowered so every file-store declaration is visible regardless of
+/// source order. Grants whose resource is NOT a declared file store are left alone —
+/// they may be package-provided resources whose operation vocabulary lives in the
+/// capability registry (validated at the construct-graph layer), so this stays
+/// zero-false-positive.
+fn validate_turn_access_grant_file_operations(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    const FILE_OPERATIONS: [&str; 4] = ["read", "write", "import", "export"];
+    let file_stores: BTreeSet<&str> = ir
+        .file_stores
+        .iter()
+        .map(|store| store.name.as_str())
+        .collect();
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            for grant in &effect.access_grants {
+                if !file_stores.contains(grant.resource.as_str()) {
+                    continue;
+                }
+                for op in &grant.operations {
+                    if !FILE_OPERATIONS.contains(&op.operation.as_str()) {
+                        diagnostics.push(Diagnostic { related: Vec::new(),
+                            span: effect.span,
+                            message: format!(
+                                "rule `{}` grants `{}` on file store `{}`, which is not a file operation",
+                                rule.name, op.operation, grant.resource
+                            ),
+                            suggestion: Some(
+                                "file-store grants allow `read`, `write`, `import`, or `export`"
+                                    .to_owned(),
+                            ),
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1919,6 +3680,7 @@ fn warn_deprecated_consume(rule: &RuleDecl, warnings: &mut Vec<Diagnostic>) {
             && words.next() == Some("for");
         if (line == "consume" || line.starts_with("consume ")) && !is_counter_consume {
             warnings.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!("rule `{}` uses deprecated `consume`", rule.name.name),
                 suggestion: Some(
@@ -1956,6 +3718,105 @@ fn lower_source_description(
     }
 }
 
+/// Detect recursive pattern application over the pattern-declaration graph and
+/// emit `graph.unbounded_pattern_recursion` (severity error) for each expansion
+/// cycle, naming the cycle. Returns the set of patterns that participate in a
+/// cycle so the caller can suppress the generic "nested apply" message for them.
+///
+/// A pattern's body that `apply`s another pattern is an edge; a pattern that can
+/// reach itself (directly via a self-apply, or transitively) cannot elaborate into
+/// a finite first-order program, so v0 rejects it (spec/static-analysis.md). The
+/// reachability closure mirrors `models/maude/pattern-recursion.maude`.
+fn detect_pattern_recursion(
+    patterns: &BTreeMap<String, PatternDecl>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> BTreeSet<String> {
+    // Application edges: pattern name -> the patterns its body applies, with spans.
+    let mut edges: BTreeMap<&str, Vec<(&str, SourceSpan)>> = BTreeMap::new();
+    for pattern in patterns.values() {
+        let mut applied = Vec::new();
+        for item in &pattern.items {
+            if let Item::Apply(apply) = item {
+                applied.push((apply.pattern.name.as_str(), apply.span));
+            }
+        }
+        edges.insert(pattern.name.name.as_str(), applied);
+    }
+
+    // A pattern is recursive iff it can reach itself. Find a shortest cycle path
+    // back to `start` via breadth-first search, tracking each node's predecessor.
+    let find_cycle = |start: &str| -> Option<(Vec<String>, SourceSpan)> {
+        let mut queue: VecDeque<&str> = VecDeque::new();
+        // predecessor[node] = (came_from, span_of_edge) used to first reach `node`.
+        let mut predecessor: BTreeMap<&str, (&str, SourceSpan)> = BTreeMap::new();
+        for &(target, span) in edges.get(start).into_iter().flatten() {
+            if target == start {
+                // Direct self-application.
+                return Some((vec![start.to_owned(), start.to_owned()], span));
+            }
+            if predecessor.insert(target, (start, span)).is_none() {
+                queue.push_back(target);
+            }
+        }
+        while let Some(node) = queue.pop_front() {
+            for &(target, span) in edges.get(node).into_iter().flatten() {
+                if target == start {
+                    // Reconstruct start -> ... -> node, then close back to start.
+                    let mut path = vec![node.to_owned()];
+                    let mut cursor = node;
+                    while cursor != start {
+                        let (from, _) = predecessor[cursor];
+                        path.push(from.to_owned());
+                        cursor = from;
+                    }
+                    path.reverse();
+                    path.push(start.to_owned());
+                    // Report at the first apply edge of `start` that enters the cycle.
+                    let first = &path[1];
+                    let entry_span = edges
+                        .get(start)
+                        .into_iter()
+                        .flatten()
+                        .find(|(target, _)| target == first)
+                        .map(|(_, span)| *span)
+                        .unwrap_or(span);
+                    return Some((path, entry_span));
+                }
+                if predecessor.insert(target, (node, span)).is_none() {
+                    queue.push_back(target);
+                }
+            }
+        }
+        None
+    };
+
+    let mut recursive = BTreeSet::new();
+    // Iterate patterns in declaration-name order for deterministic diagnostics, and
+    // report each cycle once by skipping members already covered by a prior cycle.
+    for name in patterns.keys() {
+        if recursive.contains(name) {
+            continue;
+        }
+        if let Some((cycle, span)) = find_cycle(name) {
+            for member in &cycle {
+                recursive.insert(member.clone());
+            }
+            diagnostics.push(Diagnostic { related: Vec::new(),
+                span,
+                message: format!(
+                    "recursive pattern application is not allowed (graph.unbounded_pattern_recursion): expansion cycle {}",
+                    cycle.join(" -> ")
+                ),
+                suggestion: Some(
+                    "break the cycle: pattern expansion must elaborate into a finite program"
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+    recursive
+}
+
 fn expand_pattern_applications(
     mut program: Program,
     diagnostics: &mut Vec<Diagnostic>,
@@ -1967,12 +3828,21 @@ fn expand_pattern_applications(
             .is_some()
         {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: pattern.name.span,
                 message: format!("pattern `{}` is declared more than once", pattern.name.name),
                 suggestion: Some("rename one pattern declaration".to_owned()),
             });
         }
     }
+
+    // v0 forbids recursive pattern application (spec/static-analysis.md,
+    // graph.unbounded_pattern_recursion): an `apply` that reaches, directly or
+    // transitively, a pattern already on the active expansion stack can never
+    // elaborate into a finite first-order program. Detect cycles up front so the
+    // precise diagnostic is emitted and the generic "nested apply not supported
+    // yet" message is suppressed for the recursive case.
+    let recursive_patterns = detect_pattern_recursion(&patterns, diagnostics);
 
     let mut expanded_items = Vec::new();
     let mut applications = Vec::new();
@@ -1983,6 +3853,7 @@ fn expand_pattern_applications(
         };
         let Some(pattern) = patterns.get(&apply.pattern.name) else {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: apply.pattern.span,
                 message: format!("pattern `{}` was not found", apply.pattern.name),
                 suggestion: Some("declare the pattern before applying it".to_owned()),
@@ -1991,6 +3862,7 @@ fn expand_pattern_applications(
         };
         if pattern.type_params.len() != apply.type_args.len() {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: apply.span,
                 message: format!(
                     "pattern `{}` expects {} type arguments but got {}",
@@ -2018,6 +3890,7 @@ fn expand_pattern_applications(
                 &type_substitutions,
                 &value_substitutions,
                 &local_names,
+                &recursive_patterns,
                 diagnostics,
             ) {
                 generated.push(generated_name);
@@ -2104,6 +3977,7 @@ fn parse_pattern_value_arguments(
         let mut parts = line.splitn(2, char::is_whitespace);
         let Some(name) = parts.next().filter(|name| is_identifier(name)) else {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: apply.body.span,
                 message: format!(
                     "pattern application `{}` has malformed argument `{line}`",
@@ -2119,6 +3993,7 @@ fn parse_pattern_value_arguments(
             .filter(|value| !value.is_empty())
         else {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: apply.body.span,
                 message: format!(
                     "pattern application `{}` argument `{name}` is missing a value",
@@ -2130,6 +4005,7 @@ fn parse_pattern_value_arguments(
         };
         if args.insert(name.to_owned(), value.to_owned()).is_some() {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: apply.body.span,
                 message: format!(
                     "pattern application `{}` passes argument `{name}` more than once",
@@ -2148,6 +4024,7 @@ fn expand_pattern_item(
     type_substitutions: &BTreeMap<String, TypeSyntax>,
     value_substitutions: &BTreeMap<String, String>,
     local_names: &BTreeMap<String, String>,
+    recursive_patterns: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<(String, Item)> {
     match item {
@@ -2157,7 +4034,19 @@ fn expand_pattern_item(
         )),
         Item::Use(use_decl) => Some((format!("use:{}", use_decl.name.value), Item::Use(use_decl))),
         Item::Queue(queue) => Some((format!("queue:{}", queue.name.name), Item::Queue(queue))),
+        Item::Channel(channel) => Some((
+            format!("channel:{}", channel.name.name),
+            Item::Channel(channel),
+        )),
+        Item::FileStore(file_store) => Some((
+            format!("file-store:{}", file_store.name.name),
+            Item::FileStore(file_store),
+        )),
         Item::Event(event) => Some((format!("event:{}", event.name), Item::Event(event))),
+        Item::Source(source) => {
+            Some((format!("source:{}", source.name.name), Item::Source(source)))
+        }
+        Item::Test(test) => Some((format!("test:{}", test.name.value), Item::Test(test))),
         Item::Lease(lease) => Some((format!("lease:{}", lease.name.name), Item::Lease(lease))),
         Item::Ledger(ledger) => {
             Some((format!("ledger:{}", ledger.name.name), Item::Ledger(ledger)))
@@ -2167,6 +4056,9 @@ fn expand_pattern_item(
             Item::Counter(counter),
         )),
         Item::Flow(flow) => Some((format!("flow:{}", flow.name.name), Item::Flow(flow))),
+        Item::Action(action) => {
+            Some((format!("action:{}", action.name.name), Item::Action(action)))
+        }
         Item::Harness(mut harness) => {
             let name = rename_ident(harness.name, alias, local_names);
             let generated = format!("harness:{}", name.name);
@@ -2175,6 +4067,7 @@ fn expand_pattern_item(
         }
         Item::WorkflowContract(contract) => {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: contract.span,
                 message: "workflow contracts are not allowed in pattern bodies".to_owned(),
                 suggestion: Some(
@@ -2185,6 +4078,7 @@ fn expand_pattern_item(
         }
         Item::Pattern(pattern) => {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: pattern.span,
                 message: "nested pattern declarations are not supported".to_owned(),
                 suggestion: Some("declare reusable patterns at source top level".to_owned()),
@@ -2192,15 +4086,21 @@ fn expand_pattern_item(
             None
         }
         Item::Apply(apply) => {
-            diagnostics.push(Diagnostic {
-                span: apply.span,
-                message: "pattern applications inside pattern bodies are not supported yet"
-                    .to_owned(),
-                suggestion: Some(
-                    "apply patterns from workflow bodies only in this implementation slice"
+            // A recursive nested apply was already rejected with the precise
+            // graph.unbounded_pattern_recursion diagnostic by detect_pattern_recursion;
+            // don't also emit the generic "not supported yet" message for it.
+            if !recursive_patterns.contains(&apply.pattern.name) {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: apply.span,
+                    message: "pattern applications inside pattern bodies are not supported yet"
                         .to_owned(),
-                ),
-            });
+                    suggestion: Some(
+                        "apply patterns from workflow bodies only in this implementation slice"
+                            .to_owned(),
+                    ),
+                });
+            }
             None
         }
         Item::Agent(mut agent) => {
@@ -2443,6 +4343,7 @@ fn lower_assert(
             });
         }
         Err(message) => diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: assertion.span,
             message: format!("invalid assertion expression: {message}"),
             suggestion: Some(
@@ -2513,6 +4414,9 @@ fn sort_projection_reads(reads: &mut Vec<IrProjectionRead>) {
 
 fn collect_schema_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
+    // Track the first declaration span per name so a duplicate can point back to
+    // it as related information ("first declared here").
+    let mut first_spans: BTreeMap<String, SourceSpan> = BTreeMap::new();
     for item in &program.items {
         let name = match item {
             Item::Enum(enum_decl) => &enum_decl.name,
@@ -2521,11 +4425,18 @@ fn collect_schema_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) ->
         };
 
         if !names.insert(name.name.clone()) {
-            diagnostics.push(Diagnostic {
+            let mut diagnostic = Diagnostic {
+                related: Vec::new(),
                 span: name.span,
                 message: format!("schema `{}` is declared more than once", name.name),
                 suggestion: Some("rename one declaration or merge the schemas".to_owned()),
-            });
+            };
+            if let Some(first) = first_spans.get(&name.name) {
+                diagnostic = diagnostic.with_related(*first, "first declared here");
+            }
+            diagnostics.push(diagnostic);
+        } else {
+            first_spans.insert(name.name.clone(), name.span);
         }
     }
 
@@ -2540,6 +4451,7 @@ fn collect_harness_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) -
         };
         if !names.insert(harness.name.name.clone()) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: harness.name.span,
                 message: format!("harness `{}` is declared more than once", harness.name.name),
                 suggestion: Some(
@@ -2559,6 +4471,7 @@ fn collect_agent_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> 
         };
         if !names.insert(agent.name.name.clone()) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: agent.name.span,
                 message: format!("agent `{}` is declared more than once", agent.name.name),
                 suggestion: Some("rename one agent declaration or merge the settings".to_owned()),
@@ -2594,6 +4507,7 @@ fn collect_workflow_contract_names(
             .is_some()
         {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: contract.name.span,
                 message: format!(
                     "workflow declares {} `{}` more than once",
@@ -2620,6 +4534,7 @@ impl SemanticContext {
         let mut leases = BTreeSet::new();
         let mut ledgers = BTreeSet::new();
         let mut counters = BTreeSet::new();
+        let mut channels = BTreeSet::new();
 
         for item in &program.items {
             schemas.insert_item(item);
@@ -2654,6 +4569,9 @@ impl SemanticContext {
                 Item::Counter(counter) => {
                     counters.insert(counter.name.name.clone());
                 }
+                Item::Channel(channel) => {
+                    channels.insert(channel.name.name.clone());
+                }
                 _ => {}
             }
         }
@@ -2672,6 +4590,7 @@ impl SemanticContext {
             leases,
             ledgers,
             counters,
+            channels,
         }
     }
 }
@@ -2796,6 +4715,29 @@ impl SchemaIndex {
                 ("run_id", string_ty()),
             ],
         );
+        // The generic inbound messaging envelope (spec/messaging.md): a
+        // `when message from <channel> as msg` binding sees a `Message`, never a
+        // domain type. Structured sub-payloads (sender_claims, interaction,
+        // correlation) are JSON-serialized strings here; provider-specific
+        // payloads live in bounded evidence / `raw_ref`, not as untyped facts.
+        index.insert_class(
+            "Message",
+            [
+                ("message_id", string_ty()),
+                ("channel", string_ty()),
+                ("provider", string_ty()),
+                ("received_at", string_ty()),
+                ("sender", string_ty()),
+                ("sender_claims", string_ty()),
+                ("thread_id", string_ty()),
+                ("text", string_ty()),
+                ("markdown", string_ty()),
+                ("attachments", array_ty(string_ty())),
+                ("interaction", string_ty()),
+                ("raw_ref", string_ty()),
+                ("correlation", string_ty()),
+            ],
+        );
         index
     }
 
@@ -2856,9 +4798,9 @@ impl SchemaIndex {
             }
             Item::Event(event) => {
                 self.events.insert(event.name.clone());
-                // The payload schema is indexed under the dotted event name,
+                // The payload schema is indexed under the dotted signal name,
                 // unreachable from user class declarations, so bare `when
-                // <event> as x` bindings type-check field access.
+                // <signal> as x` bindings type-check field access.
                 self.classes.insert(
                     event.name.clone(),
                     event
@@ -2988,7 +4930,7 @@ fn lower_workflow_contract(
 }
 
 fn lower_use(use_decl: UseDecl, ir: &mut IrProgram, _diagnostics: &mut Vec<Diagnostic>) {
-    let kind = IrUseKind::Plugin;
+    let kind = IrUseKind::Package;
     ir.uses.push(IrUse {
         kind,
         name: use_decl.name.value,
@@ -2998,6 +4940,7 @@ fn lower_use(use_decl: UseDecl, ir: &mut IrProgram, _diagnostics: &mut Vec<Diagn
 fn lower_queue(queue: QueueDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
     if queue.tracker.name != "builtin" {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: queue.tracker.span,
             message: format!(
                 "queue `{}` uses unavailable tracker `{}`",
@@ -3016,9 +4959,41 @@ fn lower_queue(queue: QueueDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
     });
 }
 
+fn lower_channel(channel: ChannelDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    // Two channels with the same name would make `send via <name>` / `when
+    // message from <name>` ambiguous (a channel name is a routing identity).
+    if let Some(existing) = ir
+        .channels
+        .iter()
+        .find(|other| other.name == channel.name.name)
+    {
+        diagnostics.push(
+            Diagnostic {
+                related: Vec::new(),
+                span: channel.name.span,
+                message: format!("channel `{}` is declared more than once", channel.name.name),
+                suggestion: Some("give each channel a unique name".to_owned()),
+            }
+            .with_related(existing.span, "first declared here"),
+        );
+        return;
+    }
+    // The construct-side accepts any declared provider; runtime provider
+    // availability (and the outbound/inbound feature checks in
+    // spec/messaging.md "Static Checks") is later runtime-stage work.
+    ir.channels.push(IrChannel {
+        name: channel.name.name,
+        provider: channel.provider.name,
+        workspace: channel.workspace.map(|workspace| workspace.name),
+        destination: channel.destination.map(|destination| destination.value),
+        span: channel.span,
+    });
+}
+
 fn lower_harness(harness: HarnessDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
     if !is_supported_harness_kind(&harness.kind.name) {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: harness.kind.span,
             message: format!(
                 "harness `{}` uses unsupported kind `{}`",
@@ -3064,6 +5039,7 @@ fn lower_agent(
     if let Some(harness) = &agent.harness {
         if !harness_names.contains(&harness.name) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: harness.span,
                 message: format!(
                     "agent `{}` uses unknown harness `{}`",
@@ -3082,6 +5058,7 @@ fn lower_agent(
             AgentField::Provider(provider) => {
                 if lowered.provider.is_some() {
                     diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: provider.span,
                         message: format!(
                             "agent `{}` declares provider more than once",
@@ -3093,7 +5070,7 @@ fn lower_agent(
                     });
                 }
                 if agent.harness.is_some() {
-                    diagnostics.push(Diagnostic {
+                    diagnostics.push(Diagnostic { related: Vec::new(),
                         span: provider.span,
                         message: format!(
                             "agent `{}` declares both `using` harness and direct provider `{}`",
@@ -3106,7 +5083,7 @@ fn lower_agent(
                     });
                 }
                 if !is_supported_harness_kind(&provider.name) {
-                    diagnostics.push(Diagnostic {
+                    diagnostics.push(Diagnostic { related: Vec::new(),
                         span: provider.span,
                         message: format!(
                             "agent `{}` uses unsupported provider `{}`",
@@ -3124,6 +5101,7 @@ fn lower_agent(
             AgentField::Capacity(capacity, span) => {
                 if capacity == 0 {
                     diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span,
                         message: format!(
                             "agent `{}` capacity must be greater than zero",
@@ -3139,6 +5117,7 @@ fn lower_agent(
                 for skill in skills {
                     if !seen.insert(skill.value.clone()) {
                         diagnostics.push(Diagnostic {
+                            related: Vec::new(),
                             span: skill.span,
                             message: format!(
                                 "agent `{}` attaches skill `{}` more than once",
@@ -3155,6 +5134,7 @@ fn lower_agent(
                 for capability in capabilities {
                     if !seen.insert(capability.value.clone()) {
                         diagnostics.push(Diagnostic {
+                            related: Vec::new(),
                             span: capability.span,
                             message: format!(
                                 "agent `{}` declares capability `{}` more than once",
@@ -3167,7 +5147,7 @@ fn lower_agent(
                 }
             }
             AgentField::Unknown { name, .. } => {
-                diagnostics.push(Diagnostic {
+                diagnostics.push(Diagnostic { related: Vec::new(),
                     span: name.span,
                     message: format!(
                         "unknown agent field `{}` on agent `{}`",
@@ -3183,6 +5163,7 @@ fn lower_agent(
 
     if lowered.profile.is_none() {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: agent.name.span,
             message: format!("agent `{}` is missing a profile", agent.name.name),
             suggestion: Some("add `profile \"profile-name\"` inside the agent block".to_owned()),
@@ -3190,7 +5171,7 @@ fn lower_agent(
     }
 
     if lowered.harness.is_none() && lowered.provider.is_none() {
-        diagnostics.push(Diagnostic {
+        diagnostics.push(Diagnostic { related: Vec::new(),
             span: agent.name.span,
             message: format!("agent `{}` is missing provider binding", agent.name.name),
             suggestion: Some("add `provider codex`, `provider claude`, `provider pi`, `provider fixture`, or use an explicit harness".to_owned()),
@@ -3199,6 +5180,7 @@ fn lower_agent(
 
     if lowered.capacity.is_none() {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: agent.name.span,
             message: format!("agent `{}` is missing capacity", agent.name.name),
             suggestion: Some("add `capacity 1` inside the agent block".to_owned()),
@@ -3213,6 +5195,7 @@ fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Dia
     for variant in &enum_decl.variants {
         if !variants.insert(variant.name.name.clone()) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: variant.span,
                 message: format!(
                     "enum `{}` declares variant `{}` more than once",
@@ -3228,6 +5211,7 @@ fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Dia
         for field in &variant.fields {
             if field.name.name == "variant" {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: field.name.span,
                     message: format!(
                         "variant `{}` of enum `{}` declares reserved field `variant`",
@@ -3252,11 +5236,13 @@ fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Dia
         let mut fields = vec![IrClassField {
             name: "variant".to_owned(),
             ty: IrType::LiteralString(variant.name.name.clone()),
+            is_key: false,
             span: variant.name.span,
         }];
         fields.extend(variant.fields.iter().map(|field| IrClassField {
             name: field.name.name.clone(),
             ty: lower_type(field.ty.clone()),
+            is_key: false,
             span: field.span,
         }));
         ir.schemas.push(IrSchema::Class(IrClass {
@@ -3277,21 +5263,191 @@ fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Dia
     }));
 }
 
+fn validate_test_expr_source(
+    label: &str,
+    source: &str,
+    span: SourceSpan,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if source.trim().is_empty() {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span,
+            message: format!("{label} is empty"),
+            suggestion: Some("provide an expression".to_owned()),
+        });
+        return;
+    }
+    if let Err(error) = parse_expression(source) {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span,
+            message: format!("{label} is not a valid expression: {error}"),
+            suggestion: None,
+        });
+    }
+}
+
+fn lower_test(test: TestDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    if ir
+        .tests
+        .iter()
+        .any(|existing| existing.name == test.name.value)
+    {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: test.name.span,
+            message: format!("test `{}` is declared more than once", test.name.value),
+            suggestion: Some("give each test scenario a distinct name".to_owned()),
+        });
+    }
+    if !test
+        .clauses
+        .iter()
+        .any(|clause| matches!(clause, TestClause::Expect(_)))
+    {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: test.span,
+            message: format!("test `{}` has no `expect` clause", test.name.value),
+            suggestion: Some("a test must assert at least one expected outcome".to_owned()),
+        });
+    }
+    // Validate that captured expression source (given field values, projection
+    // predicates) parses, so `whip check` catches malformed test scenarios.
+    for clause in &test.clauses {
+        match clause {
+            TestClause::Given(
+                GivenClause::Input { fields, .. }
+                | GivenClause::Fact { fields, .. }
+                | GivenClause::Signal { fields, .. },
+            ) => {
+                for field in fields {
+                    validate_test_expr_source(
+                        &format!("given field `{}`", field.name.name),
+                        &field.value,
+                        field.span,
+                        diagnostics,
+                    );
+                }
+            }
+            TestClause::Expect(ExpectClause {
+                target: ExpectTarget::Projection(query),
+                ..
+            }) => match &query.kind {
+                ProjQueryKind::Count { predicate, .. } | ProjQueryKind::Where { predicate } => {
+                    validate_test_expr_source(
+                        &format!("predicate on `{}`", query.noun),
+                        predicate,
+                        query.span,
+                        diagnostics,
+                    );
+                }
+                ProjQueryKind::Exists => {}
+            },
+            _ => {}
+        }
+    }
+    ir.tests.push(IrTest {
+        name: test.name.value,
+        workflow: test.workflow.map(|identifier| identifier.name),
+        clauses: test.clauses,
+        span: test.span,
+    });
+}
+
+fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    if ir
+        .sources
+        .iter()
+        .any(|existing| existing.name == source.name.name)
+    {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: source.name.span,
+            message: format!("source `{}` is declared more than once", source.name.name),
+            suggestion: Some("remove the duplicate source declaration".to_owned()),
+        });
+    }
+    // Clock-source static checks (spec/std-time.md): a recurring schedule must
+    // declare a missed policy (no silent default), and a calendar schedule should
+    // declare a timezone.
+    if let Some(clock) = &source.clock {
+        let recurring = !matches!(clock.recurrence, Recurrence::At { .. });
+        if recurring && clock.missed.is_none() {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: clock.span,
+                message: format!(
+                    "recurring source `{}` must declare a `missed` policy",
+                    source.name.name
+                ),
+                suggestion: Some(
+                    "add `missed skip`, `missed coalesce`, or `missed catch_up limit N`".to_owned(),
+                ),
+            });
+        }
+        if matches!(clock.recurrence, Recurrence::EveryCalendar { .. }) && clock.timezone.is_none()
+        {
+            diagnostics.push(Diagnostic { related: Vec::new(),
+                span: clock.span,
+                message: format!(
+                    "calendar source `{}` should declare a `timezone`",
+                    source.name.name
+                ),
+                suggestion: Some(
+                    "add `timezone \"America/New_York\"`; a calendar schedule without one defaults to UTC".to_owned(),
+                ),
+            });
+        }
+    }
+    let is_clock = source.clock.is_some();
+    let recurrence = source.clock.as_ref().map(|clock| clock.recurrence.clone());
+    let timezone = source
+        .clock
+        .as_ref()
+        .and_then(|clock| clock.timezone.as_ref().map(|tz| tz.value.clone()));
+    let missed = source.clock.as_ref().and_then(|clock| clock.missed);
+    ir.sources.push(IrSource {
+        name: source.name.name,
+        provider: source.provider.name,
+        is_clock,
+        recurrence,
+        timezone,
+        missed,
+        observe_binding: source.observe_binding.name,
+        emit_signal: source.emit.signal,
+        emit_fields: source
+            .emit
+            .fields
+            .into_iter()
+            .map(|field| IrSourceEmitField {
+                name: field.name.name,
+                value: field.value,
+                span: field.span,
+            })
+            .collect(),
+        span: source.span,
+    });
+}
+
 fn lower_event(event: EventDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
     if ir.events.iter().any(|existing| existing.name == event.name) {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: event.name_span,
-            message: format!("event `{}` is declared more than once", event.name),
-            suggestion: Some("remove the duplicate event declaration".to_owned()),
+            message: format!("signal `{}` is declared more than once", event.name),
+            suggestion: Some("remove the duplicate signal declaration".to_owned()),
         });
     }
     let mut fields = BTreeSet::new();
     for field in &event.fields {
         if !fields.insert(field.name.name.clone()) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: field.name.span,
                 message: format!(
-                    "event `{}` declares field `{}` more than once",
+                    "signal `{}` declares field `{}` more than once",
                     event.name, field.name.name
                 ),
                 suggestion: Some(
@@ -3308,6 +5464,7 @@ fn lower_event(event: EventDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
             .map(|field| IrClassField {
                 name: field.name.name,
                 ty: lower_type(field.ty),
+                is_key: false,
                 span: field.span,
             })
             .collect(),
@@ -3326,6 +5483,7 @@ fn lower_class(
     for field in &class_decl.fields {
         if !fields.insert(field.name.name.clone()) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: field.name.span,
                 message: format!(
                     "class `{}` declares field `{}` more than once",
@@ -3339,6 +5497,26 @@ fn lower_class(
         validate_type_refs(&field.ty, schema_names, agent_names, diagnostics);
     }
 
+    // v0 allows a single natural key per class (import keys one fact per row).
+    let key_fields = class_decl
+        .fields
+        .iter()
+        .filter(|field| field.is_key)
+        .collect::<Vec<_>>();
+    if key_fields.len() > 1 {
+        for field in key_fields.into_iter().skip(1) {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: field.span,
+                message: format!(
+                    "class `{}` declares more than one `@key` field",
+                    class_decl.name.name
+                ),
+                suggestion: Some("a class has at most one `@key` natural key in v0".to_owned()),
+            });
+        }
+    }
+
     ir.schemas.push(IrSchema::Class(IrClass {
         name: class_decl.name.name,
         span: class_decl.span,
@@ -3348,6 +5526,7 @@ fn lower_class(
             .map(|field| IrClassField {
                 name: field.name.name,
                 ty: lower_type(field.ty),
+                is_key: field.is_key,
                 span: field.span,
             })
             .collect(),
@@ -3363,6 +5542,7 @@ fn lower_table(
 ) {
     if !semantic.schemas.class_exists(&table.schema.name) {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: table.schema.span,
             message: format!(
                 "table `{}` targets unknown class `{}`",
@@ -3375,6 +5555,7 @@ fn lower_table(
 
     if table.rows.is_empty() {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: table.span,
             message: format!("table `{}` has no rows", table.name.name),
             suggestion: Some("add at least one `{ ... }` row".to_owned()),
@@ -3444,6 +5625,7 @@ fn lower_coerce(
     for param in &coerce.params {
         if !params.insert(param.name.name.clone()) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: param.name.span,
                 message: format!(
                     "coerce `{}` declares parameter `{}` more than once",
@@ -3485,6 +5667,7 @@ fn validate_type_refs(
         TypeSyntax::Ref { name } => {
             if !schema_names.contains(&name.name) && !is_builtin_schema_ref(&name.name) {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: name.span,
                     message: format!("unknown schema reference `{}`", name.name),
                     suggestion: Some(format!(
@@ -3499,6 +5682,7 @@ fn validate_type_refs(
             for agent in agents {
                 if !seen.insert(agent.name.clone()) {
                     diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: agent.span,
                         message: format!("AgentRef lists agent `{}` more than once", agent.name),
                         suggestion: Some(
@@ -3508,6 +5692,7 @@ fn validate_type_refs(
                 }
                 if !agent_names.contains(&agent.name) {
                     diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: agent.span,
                         message: format!("AgentRef references unknown agent `{}`", agent.name),
                         suggestion: Some(format!(
@@ -3557,10 +5742,17 @@ fn lower_rule(
         &rule,
         semantic,
         &binding_types_for_rule(&rule),
+        &known_roots_for_rule(&rule),
         workflow_contract_names,
         diagnostics,
     );
     validate_effectful_self_trigger(&rule, &metadata, diagnostics);
+    validate_flowfail_generated_only(&rule, diagnostics);
+    validate_send_channels(&rule, semantic, diagnostics);
+    validate_message_from_channels(&rule, semantic, diagnostics);
+    validate_flow_namespace_access(&rule, &metadata, diagnostics);
+    validate_evidence_fact_not_matched(&rule, diagnostics);
+    validate_turn_access_grants(&rule, &metadata, diagnostics);
     ir.rules.push(IrRule {
         name: rule.name.name,
         whens: rule.whens.into_iter().map(lower_when_clause).collect(),
@@ -3595,6 +5787,7 @@ fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Di
     for line in rule.body.text.lines().map(str::trim) {
         if line.starts_with("then ") {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "rule `{}` uses unsupported `then` sequencing",
@@ -3607,6 +5800,7 @@ fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Di
         }
         if line.starts_with("after ") && line.contains("=>") {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "rule `{}` uses unsupported `after ... =>` sequencing",
@@ -3643,6 +5837,254 @@ fn build_rule_dependencies(rules: &[IrRule]) -> Vec<IrRuleDependency> {
     dependencies
 }
 
+/// The `flowfail` terminal is generated-only: flow expansion emits it for an
+/// effect whose failure is unhandled in a self-terminating flow (the 503 auto-fail
+/// trigger), routing to the kernel generic failed terminal. Authors drive failure
+/// with the typed `fail <Failure> { ... }` terminal instead, so a `flowfail` in a
+/// user (non-`flow.`) rule is rejected. Generated flow rules carry a dotted `flow.`
+/// name a user identifier cannot form, so they are exempt.
+/// `send via <channel>` (std.messaging) must name a declared `channel`. The
+/// channel name is carried as the construct's `channel` field; an unknown channel
+/// would lower to a `messaging.send` effect that no provider can route, so it is
+/// rejected at compile time (mirrors `acquire`/`consume` resource-existence checks).
+/// `when message from <channel> as msg` (spec/messaging.md) must name a declared
+/// channel, mirroring the outbound `send via <channel>` check.
+fn validate_message_from_channels(
+    rule: &RuleDecl,
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for when in &rule.whens {
+        let (pattern, _) = split_when_guard(&when.text);
+        let Some(rest) = pattern.trim_start().strip_prefix("message from ") else {
+            continue;
+        };
+        let Some(channel) = rest.split_whitespace().next() else {
+            continue;
+        };
+        if !semantic.channels.contains(&channel.to_owned()) {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: when.span,
+                message: format!("`when message from {channel}` names an unknown channel"),
+                suggestion: Some(
+                    "declare it with `channel <name> { provider … }`, or correct the channel name"
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+}
+
+fn validate_send_channels(
+    rule: &RuleDecl,
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let (ast, _) =
+        body::parse_rule_body(&rule.body.text, rule.body.span.start, body::BodyMode::Rule);
+    fn walk(
+        statements: &[body::BodyStmt],
+        semantic: &SemanticContext,
+        span: SourceSpan,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        for statement in statements {
+            match statement {
+                body::BodyStmt::Effect(effect) => {
+                    if let body::BodyEffectKind::ConstructCapabilityCall {
+                        keyword, fields, ..
+                    } = &effect.kind
+                    {
+                        if keyword == "send" {
+                            if let Some(channel) =
+                                fields.iter().find(|field| field.name == "channel")
+                            {
+                                if !semantic.channels.contains(&channel.source) {
+                                    diagnostics.push(Diagnostic {
+                                        related: Vec::new(),
+                                        span: effect.span,
+                                        message: format!(
+                                            "`send via {}` names an unknown channel",
+                                            channel.source
+                                        ),
+                                        suggestion: Some(
+                                            "declare it with `channel <name> { provider … }`, or correct the channel name"
+                                                .to_owned(),
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                body::BodyStmt::After(after) => walk(&after.body, semantic, span, diagnostics),
+                body::BodyStmt::Case(case) => {
+                    for branch in &case.branches {
+                        walk(&branch.body, semantic, span, diagnostics);
+                    }
+                }
+                body::BodyStmt::Branch(branch) => {
+                    walk(&branch.then_body, semantic, span, diagnostics);
+                    if let Some(else_body) = &branch.else_body {
+                        walk(else_body, semantic, span, diagnostics);
+                    }
+                }
+                body::BodyStmt::Handler(handler) => {
+                    walk(&handler.body, semantic, span, diagnostics)
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(&ast.statements, semantic, rule.body.span, diagnostics);
+}
+
+fn validate_flowfail_generated_only(rule: &RuleDecl, diagnostics: &mut Vec<Diagnostic>) {
+    if rule.name.name.starts_with("flow.") {
+        return;
+    }
+    for line in rule.body.text.lines() {
+        if line.trim() == "flowfail" {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` uses the generated-only `flowfail` terminal",
+                    rule.name.name
+                ),
+                suggestion: Some(
+                    "`flowfail` is emitted internally by flow auto-fail; use a typed `fail <Failure> { ... }` terminal instead"
+                        .to_owned(),
+                ),
+            });
+            break;
+        }
+    }
+}
+
+/// Flow progression state (the `FlowAwait_*` classes a `flow` lowers to) is owned
+/// by the flow's own generated rules. A user (non-generated) rule may not read,
+/// match, consume, or record any flow-state fact (spec/static-analysis.md): touching
+/// it would let user logic corrupt or short-circuit the flow's progression. The
+/// rule's read/write/consume metadata is the structural signal (no text scanning,
+/// so no false positives from a prompt that happens to mention the prefix).
+/// Generated flow rules carry a dotted `flow.` name a user identifier cannot form,
+/// so they are exempt. Modeled in `models/maude/flow-namespace.maude`.
+fn validate_flow_namespace_access(
+    rule: &RuleDecl,
+    metadata: &IrRuleMetadata,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if rule.name.name.starts_with("flow.") {
+        return;
+    }
+    let prefixed = format!("schema:{}", flow_expand::FLOW_STATE_PREFIX);
+    let mut reported = BTreeSet::new();
+    let accesses = metadata
+        .fact_reads
+        .iter()
+        .chain(&metadata.fact_writes)
+        .chain(&metadata.fact_consumes);
+    for fact in accesses {
+        if !fact.starts_with(&prefixed) || !reported.insert(fact.clone()) {
+            continue;
+        }
+        let class = fact.strip_prefix("schema:").unwrap_or(fact);
+        diagnostics.push(Diagnostic { related: Vec::new(),
+            span: rule.name.span,
+            message: format!(
+                "rule `{}` may not reference flow-state fact `{class}`: flow progression state is owned by the flow's generated rules",
+                rule.name.name
+            ),
+            suggestion: Some(
+                "drive the workflow from your own fact classes; a flow's `FlowAwait_*` state is internal".to_owned(),
+            ),
+        });
+    }
+}
+
+/// In-turn agent observations — `agent.turn.streamed` (streamed progress),
+/// `agent.turn.tool_requested` (in-turn tool call), and `agent.turn.artifact_captured`
+/// (captured artifact/diff) — are recorded as EVIDENCE, never as rule-matchable facts
+/// (spec/agent-harness.md). The rule-matchable lifecycle facts are
+/// `agent.turn.started/completed/failed/timed_out/cancelled`. A `when` that matches an
+/// evidence-only fact can never fire, so it is a compile-time error.
+const EVIDENCE_ONLY_TURN_FACTS: [&str; 3] = [
+    "agent.turn.streamed",
+    "agent.turn.tool_requested",
+    "agent.turn.artifact_captured",
+];
+
+/// Structural well-formedness of turn-access grants (`with access to <resource> { … }`)
+/// on `agent.tell` effects: a grant must grant at least one operation, and a single
+/// tell must not list the same resource twice (merge them). The deeper "required
+/// Resource/Operation/Capability ports" validation against the capability registry is a
+/// separate construct-graph-layer concern, so this stays registry-independent and
+/// zero-false-positive.
+fn validate_turn_access_grants(
+    rule: &RuleDecl,
+    metadata: &IrRuleMetadata,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for effect in &metadata.effects {
+        if effect.access_grants.is_empty() {
+            continue;
+        }
+        let mut seen = BTreeSet::new();
+        for grant in &effect.access_grants {
+            if grant.operations.is_empty() {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: effect.span,
+                    message: format!(
+                        "rule `{}` has a `with access to {}` grant that grants no operations",
+                        rule.name.name, grant.resource
+                    ),
+                    suggestion: Some(
+                        "list at least one operation in the grant block, or drop the grant"
+                            .to_owned(),
+                    ),
+                });
+            }
+            if !seen.insert(grant.resource.clone()) {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: effect.span,
+                    message: format!(
+                        "rule `{}` lists turn-access resource `{}` more than once on one `tell`",
+                        rule.name.name, grant.resource
+                    ),
+                    suggestion: Some(
+                        "merge the grant clauses for a resource into a single block".to_owned(),
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn validate_evidence_fact_not_matched(rule: &RuleDecl, diagnostics: &mut Vec<Diagnostic>) {
+    for when in &rule.whens {
+        let (pattern, _) = split_when_guard(&when.text);
+        let Some(name) = runtime_fact_name_for_pattern(pattern) else {
+            continue;
+        };
+        if EVIDENCE_ONLY_TURN_FACTS.contains(&name.as_str()) {
+            diagnostics.push(Diagnostic { related: Vec::new(),
+                span: when.span,
+                message: format!(
+                    "rule `{}` matches evidence-only fact `{name}`: in-turn observations are evidence, not rule-matchable facts",
+                    rule.name.name
+                ),
+                suggestion: Some(
+                    "match a lifecycle fact (`agent.turn.completed`/`failed`/`timed_out`/`cancelled`) and read in-turn detail from its evidence".to_owned(),
+                ),
+            });
+        }
+    }
+}
+
 fn validate_effectful_self_trigger(
     rule: &RuleDecl,
     metadata: &IrRuleMetadata,
@@ -3656,7 +6098,7 @@ fn validate_effectful_self_trigger(
         if metadata.fact_reads.contains(written_fact)
             && !metadata.fact_consumes.contains(written_fact)
         {
-            diagnostics.push(Diagnostic {
+            diagnostics.push(Diagnostic { related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "effectful rule `{}` preserves trigger fact `{written_fact}`",
@@ -3685,6 +6127,7 @@ fn validate_workflow_terminal_actions(
     rule: &RuleDecl,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
+    known_roots: &BTreeSet<String>,
     contracts: &WorkflowContractNames,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -3707,6 +6150,7 @@ fn validate_workflow_terminal_actions(
             }
         }) else {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!("rule `{}` has malformed `{action}` action", rule.name.name),
                 suggestion: Some(format!(
@@ -3717,6 +6161,7 @@ fn validate_workflow_terminal_actions(
         };
         if !declared.contains_key(name) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "rule `{}` {action}s unknown workflow terminal `{name}`",
@@ -3743,6 +6188,7 @@ fn validate_workflow_terminal_actions(
             contract_ty,
             semantic,
             binding_types,
+            known_roots,
             diagnostics,
         );
     }
@@ -3755,6 +6201,7 @@ fn validate_workflow_terminal_payload(
     contract_ty: &TypeSyntax,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
+    known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some((_, _, body)) = workflow_terminal_blocks(&rule.body.text).into_iter().find(
@@ -3767,7 +6214,7 @@ fn validate_workflow_terminal_payload(
     let schema = match contract_ty {
         TypeSyntax::Ref { name } if semantic.schemas.class_exists(&name.name) => &name.name,
         _ => {
-            diagnostics.push(Diagnostic {
+            diagnostics.push(Diagnostic { related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "workflow terminal `{terminal_name}` uses a non-class payload contract"
@@ -3786,7 +6233,15 @@ fn validate_workflow_terminal_payload(
             RecordFieldAssignment::Shorthand { field } => (field.clone(), field),
         };
         let line = format!("{field} {value}");
-        validate_record_field(rule, &line, schema, semantic, binding_types, diagnostics);
+        validate_record_field(
+            rule,
+            &line,
+            schema,
+            semantic,
+            binding_types,
+            known_roots,
+            diagnostics,
+        );
     }
     validate_required_terminal_fields(rule, schema, terminal_name, &body, semantic, diagnostics);
 }
@@ -3813,7 +6268,7 @@ fn validate_required_terminal_fields(
         if seen.contains(required) || matches!(ty, TypeSyntax::Optional { .. }) {
             continue;
         }
-        diagnostics.push(Diagnostic {
+        diagnostics.push(Diagnostic { related: Vec::new(),
             span: rule.body.span,
             message: format!(
                 "workflow terminal `{terminal_name}` is missing required field `{schema}.{required}`"
@@ -3821,6 +6276,39 @@ fn validate_required_terminal_fields(
             suggestion: Some(format!("add `{required}` to the `{terminal_name}` payload")),
         });
     }
+}
+
+/// Maximum nesting depth of `after` blocks across `statements` (an `after` inside an
+/// `after` is depth 2, …). Other nesting (`case`/`when`/handlers) is descended into so
+/// an `after` buried inside them still counts, but only `after` increments the depth —
+/// it is `after`-chaining specifically that `lint.deep_after_nesting` advises moving to
+/// a `flow`. Computed from the body AST so prompt braces never confuse it.
+fn max_after_depth(statements: &[body::BodyStmt]) -> usize {
+    use body::BodyStmt;
+    statements
+        .iter()
+        .map(|statement| match statement {
+            BodyStmt::After(after) => 1 + max_after_depth(&after.body),
+            BodyStmt::Case(case) => case
+                .branches
+                .iter()
+                .map(|branch| max_after_depth(&branch.body))
+                .max()
+                .unwrap_or(0),
+            BodyStmt::Branch(branch) => {
+                let then_depth = max_after_depth(&branch.then_body);
+                let else_depth = branch
+                    .else_body
+                    .as_deref()
+                    .map(max_after_depth)
+                    .unwrap_or(0);
+                then_depth.max(else_depth)
+            }
+            BodyStmt::Handler(handler) => max_after_depth(&handler.body),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn analyze_rule(
@@ -3840,6 +6328,7 @@ fn analyze_rule(
             .iter()
             .map(|when| fact_read_from_when(&when.text))
             .collect(),
+        max_after_depth: max_after_depth(&body_ast.statements),
         ..IrRuleMetadata::default()
     };
     let mut seen_bindings = BTreeSet::new();
@@ -3853,6 +6342,7 @@ fn analyze_rule(
             && !pattern_text.ends_with(" is available")
         {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: when.span,
                 message: format!(
                     "rule `{}` has unknown readiness pattern `{pattern_text}`",
@@ -3874,33 +6364,46 @@ fn analyze_rule(
                     None => format!("declare `class {schema}` before matching it"),
                 };
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: when.span,
                     message: format!("rule `{}` matches unknown class `{schema}`", rule.name.name),
                     suggestion: Some(suggestion),
                 });
             }
-            // The bare dotted form is the typed event reaction
-            // (spec/event-ingress.md): it requires a declared `event`;
+            // The bare dotted form is the typed signal reaction
+            // (spec/event-ingress.md): it requires a declared `signal`;
             // undeclared dotted facts keep the untyped `when fact` form.
             if schema.contains('.')
                 && !pattern_text.trim_start().starts_with("fact ")
                 && !semantic.schemas.events.contains(&schema)
             {
-                diagnostics.push(Diagnostic {
+                diagnostics.push(Diagnostic { related: Vec::new(),
                     span: when.span,
                     message: format!(
-                        "rule `{}` reacts to undeclared event `{schema}`",
+                        "rule `{}` reacts to undeclared signal `{schema}`",
                         rule.name.name
                     ),
                     suggestion: Some(format!(
-                        "declare `event {schema} {{ ... }}` for a typed reaction, or use `when fact {schema} as ...` for an untyped one"
+                        "declare `signal {schema} {{ ... }}` for a typed reaction, or use `when fact {schema} as ...` for an untyped one"
                     )),
                 });
             }
             binding_types.insert(binding, schema);
         }
     }
-    let effect_payload_types = collect_effect_payload_types(rule, semantic);
+    let mut effect_payload_types = collect_effect_payload_types(rule, semantic);
+    // `exec ... -> Schema as binding` is parsed from the AST (the command text
+    // can itself contain `->`/` as `, so a text scan is unsafe), giving its
+    // result the same after-binding type flow a named `coerce -> Schema` gets.
+    collect_exec_payload_types(&body_ast.statements, semantic, &mut effect_payload_types);
+    // Inline `decide … as <binding>` carries the synthesized
+    // `decide.<rule>.<binding>` class (see `collect_inline_decide_schemas`), so
+    // its result is `case`able / field-accessible like a named coerce result.
+    collect_decide_payload_types(
+        &body_ast.statements,
+        &rule.name.name,
+        &mut effect_payload_types,
+    );
     for (binding, payload_type) in &effect_payload_types {
         if let IrType::Ref(schema) = payload_type {
             binding_types.insert(binding.clone(), schema.clone());
@@ -3914,9 +6417,18 @@ fn analyze_rule(
             continue;
         };
         let mut words = rest.split_whitespace();
-        let (Some(binding), Some(_predicate), Some(keyword), Some(alias)) =
-            (words.next(), words.next(), words.next(), words.next())
-        else {
+        let Some(binding) = words.next() else {
+            continue;
+        };
+        let Some(predicate) = words.next() else {
+            continue;
+        };
+        // `times out` is the only two-token predicate; skip its second word so
+        // the `as <alias>` clause lines up.
+        if predicate == "times" && words.next() != Some("out") {
+            continue;
+        }
+        let (Some(keyword), Some(alias)) = (words.next(), words.next()) else {
             continue;
         };
         if keyword != "as" {
@@ -3926,8 +6438,28 @@ fn analyze_rule(
         if alias.is_empty() {
             continue;
         }
-        if let Some(IrType::Ref(schema)) = effect_payload_types.get(binding) {
-            binding_types.insert(alias.to_owned(), schema.clone());
+        // Bind the alias to the terminal payload schema that matches the
+        // predicate, consistent with the case-tag payload schemas
+        // (terminal_payload_schema_for_tag): `times out` -> `TerminalTimedOut`,
+        // `cancelled` -> `TerminalCancelled`. Other predicates carry the
+        // effect's completed payload schema.
+        match predicate {
+            "times" => {
+                binding_types.insert(alias.to_owned(), "TerminalTimedOut".to_owned());
+            }
+            "cancelled" => {
+                binding_types.insert(alias.to_owned(), "TerminalCancelled".to_owned());
+            }
+            // The `fails` branch carries the effect's FAILURE payload (e.g. an
+            // `exec` failure's `.message`, a `coerce`/workflow failure's
+            // `.reason`), never the completed success schema — so it must not
+            // inherit the success payload type.
+            "fails" => {}
+            _ => {
+                if let Some(IrType::Ref(schema)) = effect_payload_types.get(binding) {
+                    binding_types.insert(alias.to_owned(), schema.clone());
+                }
+            }
         }
     }
     for when in &rule.whens {
@@ -3952,9 +6484,15 @@ fn analyze_rule(
         &effect_payload_types,
         diagnostics,
     );
-    validate_record_blocks(rule, semantic, &binding_types, diagnostics);
-    validate_effect_payloads(rule, semantic, &binding_types, diagnostics);
-    validate_workflow_invocations(rule, semantic, &binding_types, diagnostics);
+    // Complete value-position root set: typed bindings plus every binding NAME
+    // the body introduces (AST-collected, so multi-line-prompt `tell`/`exec`
+    // results and `case` payloads are covered, which `binding_types` omits).
+    let mut known_roots: BTreeSet<String> = binding_types.keys().cloned().collect();
+    collect_all_binding_names(&body_ast.statements, &mut known_roots);
+    validate_record_blocks(rule, semantic, &binding_types, &known_roots, diagnostics);
+    validate_effect_payloads(rule, semantic, &binding_types, &known_roots, diagnostics);
+    validate_effect_field_roots(rule, &body_ast.statements, &known_roots, diagnostics);
+    validate_workflow_invocations(rule, semantic, &binding_types, &known_roots, diagnostics);
     let mut block_stack: Vec<BlockFrame> = Vec::new();
     let mut misplaced_effect_bindings = BTreeSet::new();
     seed_ast_only_effect_bindings(&body_ast.statements, &mut seen_bindings, &mut binding_types);
@@ -3982,7 +6520,7 @@ fn analyze_rule(
 
         if let Some(binding) = binding_after_multiline_string_end(line) {
             misplaced_effect_bindings.insert(binding.clone());
-            diagnostics.push(Diagnostic {
+            diagnostics.push(Diagnostic { related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "rule `{}` places effect binding `{binding}` after a multiline string delimiter",
@@ -4015,6 +6553,7 @@ fn analyze_rule(
             match binding_types.get(&binding) {
                 Some(schema) => metadata.fact_consumes.push(format!("schema:{schema}")),
                 None => diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: rule.body.span,
                     message: format!(
                         "rule `{}` consumes unknown fact binding `{binding}`",
@@ -4045,7 +6584,7 @@ fn analyze_rule(
                         } else {
                             format!("create an effect with `as {binding}` before the `after` block")
                         };
-                        diagnostics.push(Diagnostic {
+                        diagnostics.push(Diagnostic { related: Vec::new(),
                             span: rule.body.span,
                             message: format!(
                                 "rule `{}` has `after` block for unknown effect binding `{binding}`",
@@ -4057,14 +6596,14 @@ fn analyze_rule(
                     block_stack.push(BlockFrame::After { binding, predicate });
                 }
                 None => {
-                    diagnostics.push(Diagnostic {
+                    diagnostics.push(Diagnostic { related: Vec::new(),
                         span: rule.body.span,
                         message: format!(
                             "rule `{}` has unsupported `after` dependency predicate",
                             rule.name.name
                         ),
                         suggestion: Some(
-                            "use `after name succeeds`, `after name fails`, or `after name completes`"
+                            "use `after name succeeds`, `after name fails`, `after name completes`, `after name times out`, or `after name cancelled`"
                                 .to_owned(),
                         ),
                     });
@@ -4076,6 +6615,7 @@ fn analyze_rule(
         if let Some((schema, _)) = parse_record_start(line) {
             if !semantic.schemas.class_exists(&schema) {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: rule.body.span,
                     message: format!("rule `{}` records unknown class `{schema}`", rule.name.name),
                     suggestion: Some(format!("declare `class {schema}` before recording it")),
@@ -4087,7 +6627,15 @@ fn analyze_rule(
         }
 
         if let Some((kind, binding)) = parse_effect_line(line) {
-            validate_agent_tell_target(rule, line, &kind, semantic, &binding_types, diagnostics);
+            validate_agent_tell_target(
+                rule,
+                line,
+                &kind,
+                semantic,
+                &binding_types,
+                &known_roots,
+                diagnostics,
+            );
             anonymous_effects += 1;
             let id = binding
                 .clone()
@@ -4112,9 +6660,13 @@ fn analyze_rule(
                 kind,
                 binding,
                 required_capabilities: parse_required_capabilities(line),
+                construct_use: None,
                 idempotency_key,
                 span: rule.body.span,
                 timeout_seconds: None,
+                // The line-scanner result is overwritten by collect_effects_from_ast
+                // below (which carries the real grants); empty here is fine.
+                access_grants: Vec::new(),
             });
         }
     }
@@ -4191,7 +6743,7 @@ fn terminal_completed_payload_type(
     semantic: &SemanticContext,
 ) -> IrType {
     match kind {
-        IrEffectKind::BamlCoerce => parse_coerce_call_name(line)
+        IrEffectKind::Coerce => parse_coerce_call_name(line)
             .and_then(|name| semantic.coerce_outputs.get(name))
             .cloned()
             .map(lower_type)
@@ -4211,7 +6763,11 @@ fn terminal_completed_payload_type(
         | IrEffectKind::LeaseAcquire
         | IrEffectKind::LedgerAppend
         | IrEffectKind::CounterConsume
-        | IrEffectKind::EventNotify => terminal_unknown_payload_type(),
+        | IrEffectKind::EventNotify
+        | IrEffectKind::FileRead
+        | IrEffectKind::FileWrite
+        | IrEffectKind::FileImport
+        | IrEffectKind::FileExport => terminal_unknown_payload_type(),
     }
 }
 
@@ -4690,7 +7246,30 @@ fn ir_field(name: &str, ty: IrType) -> IrClassField {
     IrClassField {
         name: name.to_owned(),
         ty,
+        is_key: false,
         span: SourceSpan { start: 0, end: 0 },
+    }
+}
+
+/// Lower a `tell`'s parsed turn-access grants to IR. Empty for any other effect kind.
+fn ir_access_grants_for_body(kind: &body::BodyEffectKind) -> Vec<IrAccessGrant> {
+    match kind {
+        body::BodyEffectKind::Tell { access_grants, .. } => access_grants
+            .iter()
+            .map(|grant| IrAccessGrant {
+                resource: grant.resource.clone(),
+                operations: grant
+                    .operations
+                    .iter()
+                    .map(|op| IrAccessGrantOp {
+                        operation: op.operation.clone(),
+                        target: op.target.clone(),
+                        globs: op.globs.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -4698,18 +7277,15 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
     match kind {
         body::BodyEffectKind::Tell { .. } => IrEffectKind::AgentTell,
         body::BodyEffectKind::Coerce { .. } | body::BodyEffectKind::Decide { .. } => {
-            IrEffectKind::BamlCoerce
+            IrEffectKind::Coerce
         }
         body::BodyEffectKind::AskHuman { .. } => IrEffectKind::HumanAsk,
-        body::BodyEffectKind::Call { .. } => IrEffectKind::CapabilityCall,
+        body::BodyEffectKind::Call { .. }
+        | body::BodyEffectKind::ConstructCapabilityCall { .. } => IrEffectKind::CapabilityCall,
         body::BodyEffectKind::Invoke { .. } => IrEffectKind::WorkflowInvoke,
         body::BodyEffectKind::Timer { .. } => IrEffectKind::TimerWait,
         body::BodyEffectKind::Exec { .. } => IrEffectKind::ExecCommand,
         body::BodyEffectKind::QueueFile { .. } => IrEffectKind::QueueFile,
-        body::BodyEffectKind::QueueClaim {
-            legacy_plugin: Some(_),
-            ..
-        } => IrEffectKind::LoftClaim,
         body::BodyEffectKind::QueueClaim { .. } => IrEffectKind::QueueClaim,
         body::BodyEffectKind::QueueRelease { .. } => IrEffectKind::QueueRelease,
         body::BodyEffectKind::QueueFinish { .. } => IrEffectKind::QueueFinish,
@@ -4717,26 +7293,56 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
         body::BodyEffectKind::LedgerAppend { .. } => IrEffectKind::LedgerAppend,
         body::BodyEffectKind::CounterConsume { .. } => IrEffectKind::CounterConsume,
         body::BodyEffectKind::Notify { .. } => IrEffectKind::EventNotify,
+        body::BodyEffectKind::FileRead { .. } => IrEffectKind::FileRead,
+        body::BodyEffectKind::FileWrite { .. } => IrEffectKind::FileWrite,
+        body::BodyEffectKind::FileImport { .. } => IrEffectKind::FileImport,
+        body::BodyEffectKind::FileExport { .. } => IrEffectKind::FileExport,
+    }
+}
+
+fn construct_use_for_body(kind: &body::BodyEffectKind) -> Option<IrConstructUse> {
+    match kind {
+        body::BodyEffectKind::ConstructCapabilityCall {
+            keyword,
+            target_capability,
+            ..
+        } => Some(IrConstructUse {
+            keyword: keyword.clone(),
+            scope: "rule_body".to_owned(),
+            construct_family: "effect_operation".to_owned(),
+            lowering_target: "capability_call".to_owned(),
+            target_capability: target_capability.clone(),
+        }),
+        _ => None,
     }
 }
 
 fn is_ast_only_effect_kind(kind: &body::BodyEffectKind) -> bool {
+    // `send via <channel> { … } as x` closes its `as` on the block line (unlike
+    // `recall`, whose `as` is inline), so the line scanner cannot see the binding;
+    // seed it from the AST. Other `ConstructCapabilityCall`s (e.g. `recall`) are
+    // line-visible and must NOT be treated as AST-only.
+    if let body::BodyEffectKind::ConstructCapabilityCall { keyword, .. } = kind {
+        return keyword == "send";
+    }
     matches!(
         kind,
         body::BodyEffectKind::Timer { .. }
             | body::BodyEffectKind::Exec { .. }
             | body::BodyEffectKind::Decide { .. }
             | body::BodyEffectKind::QueueFile { .. }
-            | body::BodyEffectKind::QueueClaim {
-                legacy_plugin: None,
-                ..
-            }
+            | body::BodyEffectKind::QueueClaim { .. }
             | body::BodyEffectKind::QueueRelease { .. }
             | body::BodyEffectKind::QueueFinish { .. }
             | body::BodyEffectKind::LeaseAcquire { .. }
             | body::BodyEffectKind::LedgerAppend { .. }
             | body::BodyEffectKind::CounterConsume { .. }
             | body::BodyEffectKind::Notify { .. }
+            // `write`/`export` put their `as <binding>` on the block's closing
+            // line, so the line-based scanner cannot see it; seed it from the AST
+            // so `after <binding>` blocks and sequence checks resolve.
+            | body::BodyEffectKind::FileWrite { .. }
+            | body::BodyEffectKind::FileExport { .. }
     )
 }
 
@@ -4750,12 +7356,10 @@ fn seed_ast_only_effect_bindings(
 ) {
     for statement in statements {
         match statement {
-            body::BodyStmt::Effect(effect) => {
-                if is_ast_only_effect_kind(&effect.kind) {
-                    if let Some(binding) = &effect.binding {
-                        seen_bindings.insert(binding.clone());
-                        let _ = binding_types;
-                    }
+            body::BodyStmt::Effect(effect) if is_ast_only_effect_kind(&effect.kind) => {
+                if let Some(binding) = &effect.binding {
+                    seen_bindings.insert(binding.clone());
+                    let _ = binding_types;
                 }
             }
             body::BodyStmt::After(after) => {
@@ -4828,23 +7432,47 @@ fn walk_effects(
                 }
                 let idempotency_key =
                     effect_idempotency_key(rule_name, &id, &kind, &effect.binding);
+                let mut required_capabilities = effect.requires.clone();
+                match &effect.kind {
+                    body::BodyEffectKind::Call { capability, .. } => {
+                        required_capabilities.push(capability.clone());
+                    }
+                    body::BodyEffectKind::ConstructCapabilityCall {
+                        target_capability, ..
+                    } => {
+                        required_capabilities.push(target_capability.clone());
+                    }
+                    _ => {}
+                }
+                required_capabilities.sort();
+                required_capabilities.dedup();
+                let construct_use = construct_use_for_body(&effect.kind);
+                let access_grants = ir_access_grants_for_body(&effect.kind);
                 effects.push(IrEffectNode {
                     id,
                     kind,
                     binding: effect.binding.clone(),
-                    required_capabilities: effect.requires.clone(),
+                    required_capabilities,
+                    construct_use,
                     idempotency_key,
                     span: effect.span,
                     timeout_seconds: effect.timeout_seconds,
+                    access_grants,
                 });
             }
             body::BodyStmt::After(after) => {
                 let predicate = match after.predicate {
                     body::AfterPredicate::Succeeds => DependencyPredicate::Succeeds,
                     body::AfterPredicate::Fails => DependencyPredicate::Fails,
-                    // Coordination outcomes are completion-valued: the
-                    // downstream effect depends on the op completing; which
-                    // arm runs is decided by the outcome variant at lowering.
+                    // `times out` / `cancelled` are distinct non-success terminal
+                    // statuses, so the downstream effect releases only on that
+                    // specific status (mirroring succeeds/fails), not on any
+                    // terminal.
+                    body::AfterPredicate::TimedOut => DependencyPredicate::TimedOut,
+                    body::AfterPredicate::Cancelled => DependencyPredicate::Cancelled,
+                    // Coordination outcomes are completion-valued: the downstream
+                    // depends on the op reaching a terminal state; the outcome
+                    // variant selects the arm at lowering.
                     body::AfterPredicate::Completes
                     | body::AfterPredicate::Held
                     | body::AfterPredicate::Contended
@@ -4927,10 +7555,12 @@ fn validate_coerce_call(
     line: &str,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
+    known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some((function_name, args)) = parse_coerce_call(line) else {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!("rule `{}` has malformed coerce call", rule.name.name),
             suggestion: Some("write `coerce functionName(arg, ...) as name`".to_owned()),
@@ -4939,6 +7569,7 @@ fn validate_coerce_call(
     };
     let Some(params) = semantic.coerce_params.get(function_name) else {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!(
                 "rule `{}` calls unknown coerce function `{function_name}`",
@@ -4952,6 +7583,7 @@ fn validate_coerce_call(
     };
     if args.len() != params.len() {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!(
                 "rule `{}` calls coerce `{function_name}` with {} argument(s), expected {}",
@@ -4965,6 +7597,22 @@ fn validate_coerce_call(
     }
     let scope = ExprScope::from_bindings(binding_types);
     for (arg, param) in args.iter().zip(params) {
+        // Dangling-root check (mirrors record/terminal value validation): an arg
+        // whose root is not a known binding is a typo/unbound reference, which the
+        // type-checker below accepts leniently.
+        if let Some(root) = dangling_value_root(arg, known_roots) {
+            diagnostics.push(Diagnostic { related: Vec::new(),
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` has unknown binding `{root}` in coerce `{function_name}` argument",
+                    rule.name.name
+                ),
+                suggestion: Some(
+                    "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern"
+                        .to_owned(),
+                ),
+            });
+        }
         validate_expr_source_against_type(
             rule,
             &format!("coerce `{function_name}`"),
@@ -4982,12 +7630,20 @@ fn validate_effect_payloads(
     rule: &RuleDecl,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
+    known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for statement in effect_payload_statements(&rule.body.text) {
         let trimmed = statement.trim();
         if trimmed.starts_with("coerce ") {
-            validate_coerce_call(rule, trimmed, semantic, binding_types, diagnostics);
+            validate_coerce_call(
+                rule,
+                trimmed,
+                semantic,
+                binding_types,
+                known_roots,
+                diagnostics,
+            );
         } else if trimmed.starts_with("claim ") && trimmed.contains(" with ") {
             // Legacy loft form only; plain `claim <item>` is a queue verb
             // validated by the body AST.
@@ -5000,11 +7656,13 @@ fn validate_workflow_invocations(
     rule: &RuleDecl,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
+    known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for statement in workflow_invoke_statements(&rule.body.text) {
         let Some((target, body)) = invoke_statement_parts(&statement) else {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "rule `{}` has malformed workflow invocation",
@@ -5016,6 +7674,7 @@ fn validate_workflow_invocations(
         };
         if semantic.workflow.as_deref() == Some(target) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "rule `{}` recursively invokes workflow `{target}`",
@@ -5030,6 +7689,7 @@ fn validate_workflow_invocations(
         }
         let Some(surface) = semantic.workflow_inputs.get(target) else {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "rule `{}` invokes unknown workflow `{target}`",
@@ -5051,6 +7711,7 @@ fn validate_workflow_invocations(
             };
             if !seen.insert(field.clone()) {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: rule.body.span,
                     message: format!("workflow invocation `{target}` repeats input `{field}`"),
                     suggestion: Some("remove the duplicate invocation input".to_owned()),
@@ -5065,6 +7726,7 @@ fn validate_workflow_invocations(
                     .collect::<Vec<_>>()
                     .join(", ");
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: rule.body.span,
                     message: format!("workflow `{target}` has no input `{field}`"),
                     suggestion: Some(if known.is_empty() {
@@ -5075,6 +7737,19 @@ fn validate_workflow_invocations(
                 });
                 continue;
             };
+            if let Some(root) = dangling_value_root(&value, known_roots) {
+                diagnostics.push(Diagnostic { related: Vec::new(),
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` has unknown binding `{root}` in `invoke {target}` input `{field}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some(
+                        "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern"
+                            .to_owned(),
+                    ),
+                });
+            }
             validate_expr_source_against_type(
                 rule,
                 target,
@@ -5091,6 +7766,7 @@ fn validate_workflow_invocations(
                 continue;
             }
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!("workflow invocation `{target}` is missing input `{input}`"),
                 suggestion: Some(format!(
@@ -5110,6 +7786,7 @@ fn validate_loft_claim_payload(
 ) {
     let Some(issue_expr) = parse_loft_claim_issue_expr(line) else {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!("rule `{}` has malformed loft claim", rule.name.name),
             suggestion: Some("write `claim issueBinding with loft as claim`".to_owned()),
@@ -5134,6 +7811,7 @@ fn validate_agent_tell_target(
     kind: &IrEffectKind,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
+    known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if kind != &IrEffectKind::AgentTell {
@@ -5141,6 +7819,7 @@ fn validate_agent_tell_target(
     }
     let Some(target) = parse_tell_target(line) else {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!("rule `{}` has malformed tell target", rule.name.name),
             suggestion: Some("write `tell agentName ...` or `tell task.agentRef ...`".to_owned()),
@@ -5149,6 +7828,7 @@ fn validate_agent_tell_target(
     };
     if target.starts_with('"') {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!(
                 "rule `{}` uses a string literal as a tell target",
@@ -5161,6 +7841,22 @@ fn validate_agent_tell_target(
     let required_capabilities = parse_required_capabilities(line);
     if target.contains('.') {
         let Some(ty) = expression_type(target, semantic, binding_types) else {
+            // Unknown type can mean a dangling root (the path's binding does not
+            // exist) — caught here since the type lookup returns None silently. A
+            // known root with a bad path is left to other validation.
+            if let Some(root) = dangling_value_root(target, known_roots) {
+                diagnostics.push(Diagnostic { related: Vec::new(),
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` has unknown binding `{root}` in tell target `{target}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some(
+                        "reference a binding from a `when ... as name` clause or an effect `as` binding"
+                            .to_owned(),
+                    ),
+                });
+            }
             return;
         };
         if let TypeSyntax::AgentRef { agents, .. } = ty {
@@ -5175,6 +7871,7 @@ fn validate_agent_tell_target(
             }
         } else {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "rule `{}` uses non-AgentRef dynamic tell target `{target}`",
@@ -5190,6 +7887,7 @@ fn validate_agent_tell_target(
     }
     if !semantic.agents.contains(target) {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!("rule `{}` tells unknown agent `{target}`", rule.name.name),
             suggestion: Some("declare the target agent before telling it".to_owned()),
@@ -5216,7 +7914,7 @@ fn validate_agent_capabilities(
         .unwrap_or_default();
     for capability in required_capabilities {
         if !declared.contains(capability) {
-            diagnostics.push(Diagnostic {
+            diagnostics.push(Diagnostic { related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "rule `{}` tells agent `{agent}` requiring undeclared capability `{capability}`",
@@ -5247,6 +7945,7 @@ fn validate_availability_when(
         };
         if !matches!(ty, TypeSyntax::AgentRef { .. }) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "rule `{}` checks availability for non-AgentRef `{target}`",
@@ -5262,6 +7961,7 @@ fn validate_availability_when(
     }
     if !semantic.agents.contains(target) {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!("rule `{}` checks unknown agent `{target}`", rule.name.name),
             suggestion: Some("declare the target agent before checking availability".to_owned()),
@@ -5331,7 +8031,7 @@ fn validate_expression(
                 diagnostics,
             );
         }
-        Err(message) => diagnostics.push(Diagnostic {
+        Err(message) => diagnostics.push(Diagnostic { related: Vec::new(),
             span: rule.body.span,
             message: format!("rule `{}` has invalid {label} expression: {message}", rule.name.name),
             suggestion: Some("use deterministic field paths, literals, boolean operators, comparisons, membership, count, or exists".to_owned()),
@@ -5359,6 +8059,7 @@ fn validate_parsed_expression(
     let ty = infer_expr_type(expr, semantic, scope, context, diagnostics);
     if ty != ExprType::Bool && ty != ExprType::Unknown {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: context.span,
             message: format!("{} has non-boolean {label} expression", context.subject),
             suggestion: Some(format!("{label} expressions must evaluate to bool")),
@@ -5386,6 +8087,7 @@ fn validate_expr_node(
                         validate_optional_path_access(schema, path, semantic, presence_proofs)
                     {
                         diagnostics.push(Diagnostic {
+                            related: Vec::new(),
                             span: context.span,
                             message: format!(
                                 "{} has unsafe optional path `{}`: {message}",
@@ -5401,6 +8103,7 @@ fn validate_expr_node(
                     }
                     if let Err(message) = semantic.schemas.resolve_field_path(schema, path) {
                         diagnostics.push(Diagnostic {
+                            related: Vec::new(),
                             span: context.span,
                             message: format!(
                                 "{} has invalid expression path `{}`: {message}",
@@ -5415,6 +8118,7 @@ fn validate_expr_node(
                     return;
                 }
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!("{} has unknown expression root `{root}`", context.subject),
                     suggestion: Some(
@@ -5427,6 +8131,7 @@ fn validate_expr_node(
                 validate_optional_path_access(schema, &path[1..], semantic, presence_proofs)
             {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} has unsafe optional path `{}`: {message}",
@@ -5441,6 +8146,7 @@ fn validate_expr_node(
             }
             if let Err(message) = semantic.schemas.resolve_field_path(schema, &path[1..]) {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} has invalid expression path `{}`: {message}",
@@ -5464,6 +8170,7 @@ fn validate_expr_node(
             let key_ty = infer_expr_type(key, semantic, scope, context, diagnostics);
             if !matches!(key_ty, ExprType::String | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!("{} indexes a map with a non-string key", context.subject),
                     suggestion: Some(
@@ -5479,6 +8186,7 @@ fn validate_expr_node(
         }
         Expr::Object(fields) => {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: context.span,
                 message: format!(
                     "{} uses an object literal without an expected object or map type",
@@ -5603,6 +8311,7 @@ fn validate_unknown_implicit_ident(
         return;
     }
     diagnostics.push(Diagnostic {
+        related: Vec::new(),
         span: context.span,
         message: format!(
             "{} fact query `{schema}` has unknown field `{name}`",
@@ -5639,7 +8348,7 @@ fn validate_function_call(
     match name {
         "count" => {
             if args.len() != 1 {
-                diagnostics.push(Diagnostic {
+                diagnostics.push(Diagnostic { related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} calls `count` with {} arguments, expected 1",
@@ -5656,6 +8365,7 @@ fn validate_function_call(
             let ty = infer_expr_type(&args[0], semantic, scope, context, diagnostics);
             if !is_countable_type(&ty) {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} calls `count` with unsupported argument type `{}`",
@@ -5672,6 +8382,7 @@ fn validate_function_call(
         "exists" => {
             if args.len() != 1 {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} calls `exists` with {} arguments, expected 1",
@@ -5684,7 +8395,7 @@ fn validate_function_call(
             }
             let ty = infer_expr_type(&args[0], semantic, scope, context, diagnostics);
             if !matches!(args[0], Expr::Index { .. }) && !is_exists_type(&ty) {
-                diagnostics.push(Diagnostic {
+                diagnostics.push(Diagnostic { related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} calls `exists` with unsupported argument type `{}`",
@@ -5715,6 +8426,7 @@ fn validate_query_expr(
     if *kind == QueryKind::Fact {
         let Some(schema) = query_head_schema(head, semantic) else {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: context.span,
                 message: format!(
                     "{} queries unknown fact schema `{}`",
@@ -5730,6 +8442,7 @@ fn validate_query_expr(
             let ty = infer_expr_type(guard, semantic, &guard_scope, context, diagnostics);
             if !matches!(ty, ExprType::Bool | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} fact query `{}` has non-boolean `where` expression",
@@ -5908,6 +8621,7 @@ fn infer_expr_type(
             let key_ty = infer_expr_type(key, semantic, scope, context, diagnostics);
             if !matches!(key_ty, ExprType::String | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!("{} indexes a map with a non-string key", context.subject),
                     suggestion: Some(
@@ -5920,6 +8634,7 @@ fn infer_expr_type(
                 ExprType::Unknown => ExprType::Unknown,
                 _ => {
                     diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: context.span,
                         message: format!("{} indexes a non-map expression", context.subject),
                         suggestion: Some("use indexing only on map values".to_owned()),
@@ -5942,6 +8657,7 @@ fn infer_expr_type(
             let inner = infer_expr_type(expr, semantic, scope, context, diagnostics);
             if !matches!(inner, ExprType::Bool | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} applies `!` to a non-boolean expression",
@@ -5960,6 +8676,7 @@ fn infer_expr_type(
             "exists" => ExprType::Bool,
             _ => {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} calls unsupported expression function `{name}`",
@@ -5999,6 +8716,7 @@ fn infer_binary_type(
             for ty in [&left_ty, &right_ty] {
                 if !matches!(ty, ExprType::Bool | ExprType::Unknown) {
                     diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: context.span,
                         message: format!(
                             "{} uses boolean operator with non-boolean operand",
@@ -6016,6 +8734,7 @@ fn infer_binary_type(
         BinaryOp::Eq | BinaryOp::Ne => {
             if !types_comparable(&left_ty, &right_ty) {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!("{} compares incompatible expression types", context.subject),
                     suggestion: Some(
@@ -6028,6 +8747,7 @@ fn infer_binary_type(
         BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
             if !is_orderable_pair(&left_ty, &right_ty) {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!("{} orders non-orderable expression values", context.subject),
                     suggestion: Some(
@@ -6042,6 +8762,7 @@ fn infer_binary_type(
                 ExprType::Array(item_ty) => {
                     if !types_comparable(&left_ty, item_ty) {
                         diagnostics.push(Diagnostic {
+                            related: Vec::new(),
                             span: context.span,
                             message: format!(
                                 "{} uses membership with incompatible item type",
@@ -6057,6 +8778,7 @@ fn infer_binary_type(
                 ExprType::Map(_) => {
                     if !is_string_like_key_type(&left_ty) {
                         diagnostics.push(Diagnostic {
+                            related: Vec::new(),
                             span: context.span,
                             message: format!(
                                 "{} uses map membership with a non-string key",
@@ -6070,6 +8792,7 @@ fn infer_binary_type(
                 }
                 ExprType::Unknown => {}
                 _ => diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} uses membership against a non-array/non-map expression",
@@ -6086,6 +8809,7 @@ fn infer_binary_type(
             for ty in [&left_ty, &right_ty] {
                 if !matches!(ty, ExprType::Int | ExprType::Float | ExprType::Unknown) {
                     diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: context.span,
                         message: format!(
                             "{} uses arithmetic with a non-numeric operand",
@@ -6125,6 +8849,7 @@ fn infer_array_type(
             Some(existing) if types_comparable(existing, &ty) => {}
             Some(_) => {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!("{} has mixed-type array literal", context.subject),
                     suggestion: Some("use array literals whose elements share one type".to_owned()),
@@ -6343,6 +9068,7 @@ fn validate_finite_domain_expr(
     for literal in literals.into_iter().flatten() {
         if !domain.iter().any(|value| value == &literal) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: context.span,
                 message: format!(
                     "{} compares finite-domain value to unknown `{literal}`",
@@ -6377,6 +9103,7 @@ fn validate_finite_domain_relation(
                 .all(|value| !right_domain.iter().any(|right| right == value))
             {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} has statically unsatisfiable finite-domain equality",
@@ -6402,6 +9129,7 @@ fn validate_finite_domain_relation(
                 .all(|literal| !domain.iter().any(|value| value == literal))
             {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} has statically unsatisfiable finite-domain membership",
@@ -6424,6 +9152,7 @@ fn validate_finite_domain_relation(
                     .all(|value| literals.iter().any(|literal| literal == value))
             {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} has statically unsatisfiable finite-domain exclusion",
@@ -6582,6 +9311,7 @@ fn validate_case_blocks(
             && active_completes_binding_for_case(&text_lines, index, scrutinee);
         if scrutinee_ty.is_none() && !terminal_case {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "rule `{}` has case scrutinee `{scrutinee}` that is not a typed path",
@@ -6628,7 +9358,13 @@ fn validate_case_blocks(
                             diagnostics,
                         );
                     }
-                    if let Some(guard) = branch.guard {
+                    // Terminal-case guards are validated by
+                    // `collect_terminal_case_metadata`, which is the only path
+                    // with `effect_payload_types` and so the only one that can
+                    // bind the tag-refined payload (`Completed result where
+                    // result.x ...`) into the guard scope. Validating them here
+                    // too would reject that binding as an unknown root.
+                    if let Some(guard) = branch.guard.filter(|_| !terminal_case) {
                         let mut branch_scope = binding_types.clone();
                         if let Some(scrutinee_ty) = scrutinee_ty.as_ref() {
                             if let Some((binding, schema)) =
@@ -6784,6 +9520,7 @@ fn validate_case_pattern(
     if pattern == "None" {
         if !matches!(scrutinee_ty, Some(TypeSyntax::Optional { .. })) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span,
                 message: format!(
                     "rule `{}` uses `None` for a non-optional case",
@@ -6797,6 +9534,7 @@ fn validate_case_pattern(
     if pattern.starts_with("Some ") {
         if !matches!(scrutinee_ty, Some(TypeSyntax::Optional { .. })) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span,
                 message: format!(
                     "rule `{}` uses `Some` for a non-optional case",
@@ -6818,6 +9556,7 @@ fn validate_case_pattern(
             let (variant, binding) = sum_case_pattern_parts(pattern);
             if !variants.contains(variant) {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span,
                     message: format!("enum `{}` has no variant `{variant}`", name.name),
                     suggestion: Some(format!(
@@ -6835,6 +9574,7 @@ fn validate_case_pattern(
                     .class_exists(&format!("{}.{variant}", name.name))
             {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span,
                     message: format!(
                         "variant `{variant}` of enum `{}` carries no payload to bind",
@@ -6847,6 +9587,7 @@ fn validate_case_pattern(
         TypeSyntax::Union { variants, .. } => {
             let Some(literal) = parse_literal_expr(pattern) else {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span,
                     message: format!(
                         "rule `{}` has unsupported case pattern `{pattern}`",
@@ -6861,6 +9602,7 @@ fn validate_case_pattern(
         TypeSyntax::AgentRef { agents, .. } => {
             let Some(literal) = parse_literal_expr(pattern) else {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span,
                     message: format!(
                         "rule `{}` has unsupported AgentRef case pattern `{pattern}`",
@@ -6877,8 +9619,24 @@ fn validate_case_pattern(
         TypeSyntax::Optional { inner, .. } => {
             validate_case_pattern(rule, pattern, Some(inner), span, semantic, diagnostics);
         }
+        // `case` over a `bool` field: only the two literals `true`/`false` (plus
+        // the `_`/`default` fallbacks already handled above) are valid patterns.
+        TypeSyntax::Primitive { name, .. } if name == "bool" => {
+            if !matches!(pattern, "true" | "false") {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span,
+                    message: format!(
+                        "rule `{}` has case pattern `{pattern}` that is not a `bool` value",
+                        rule.name.name
+                    ),
+                    suggestion: Some("match `true`, `false`, or `_`".to_owned()),
+                });
+            }
+        }
         _ => {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span,
                 message: format!(
                     "rule `{}` cannot pattern-match this scrutinee type",
@@ -6911,7 +9669,7 @@ fn validate_terminal_case_pattern(
     };
     let binding = parts.next();
     if parts.next().is_some() || binding.is_none() {
-        diagnostics.push(Diagnostic {
+        diagnostics.push(Diagnostic { related: Vec::new(),
             span,
             message: format!(
                 "rule `{}` has malformed terminal-output case pattern `{pattern}`",
@@ -6924,6 +9682,7 @@ fn validate_terminal_case_pattern(
     let tags = terminal_case_tags();
     if !tags.contains(&tag) {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span,
             message: format!(
                 "rule `{}` terminal-output case pattern cannot be `{tag}`",
@@ -6960,6 +9719,7 @@ fn validate_terminal_case_coverage(
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!(
                 "rule `{}` has non-exhaustive terminal-output case; missing {}",
@@ -6985,6 +9745,7 @@ fn validate_duplicate_terminal_case_patterns(
         };
         if !seen.insert(pattern.to_owned()) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: branch.pattern_span,
                 message: format!(
                     "rule `{}` has duplicate unguarded terminal-output case pattern `{pattern}`",
@@ -7031,6 +9792,7 @@ fn validate_case_coverage(
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!(
                 "rule `{}` has non-exhaustive case; missing {}",
@@ -7054,6 +9816,7 @@ fn validate_duplicate_case_patterns(
         };
         if !seen.insert(pattern.to_owned()) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: branch.pattern_span,
                 message: format!(
                     "rule `{}` has duplicate unguarded case pattern `{pattern}`",
@@ -7092,6 +9855,11 @@ fn finite_case_domain(
         TypeSyntax::AgentRef { agents, .. } => {
             Some(agents.iter().map(|agent| agent.name.clone()).collect())
         }
+        // `bool` is a finite two-value domain: an exhaustive `case` over it must
+        // cover both `true` and `false` (or carry a `_`).
+        TypeSyntax::Primitive { name, .. } if name == "bool" => {
+            Some(vec!["true".to_owned(), "false".to_owned()])
+        }
         _ => None,
     }
 }
@@ -7117,6 +9885,11 @@ fn normalized_case_pattern(pattern: &str) -> Option<&str> {
     }
     // Coverage counts the variant, not its payload binding.
     let (pattern, _) = sum_case_pattern_parts(pattern);
+    // `bool` literals parse to the value-less `LiteralExpr::Bool`; return them
+    // verbatim so they count toward `true`/`false` coverage.
+    if matches!(pattern, "true" | "false") {
+        return Some(pattern);
+    }
     parse_literal_expr(pattern).and_then(|literal| match literal {
         LiteralExpr::String(value) | LiteralExpr::Ident(value) => Some(value),
         _ => None,
@@ -7153,6 +9926,7 @@ fn validate_union_case_pattern(
     }
     let LiteralExpr::String(value) = literal else {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span,
             message: format!(
                 "rule `{}` case pattern must be one of its literal variants",
@@ -7164,6 +9938,7 @@ fn validate_union_case_pattern(
     };
     if !allowed.contains(value) {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span,
             message: format!("rule `{}` case pattern cannot be `{value}`", rule.name.name),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
@@ -7184,6 +9959,7 @@ fn validate_agent_ref_case_pattern(
         .collect::<Vec<_>>();
     let (LiteralExpr::String(value) | LiteralExpr::Ident(value)) = literal else {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span,
             message: format!("rule `{}` has non-agent case pattern", rule.name.name),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
@@ -7192,6 +9968,7 @@ fn validate_agent_ref_case_pattern(
     };
     if !allowed.contains(value) {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span,
             message: format!("AgentRef has no agent `{value}`"),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
@@ -7214,7 +9991,7 @@ fn validate_binding_uses(
             continue;
         }
 
-        diagnostics.push(Diagnostic {
+        diagnostics.push(Diagnostic { related: Vec::new(),
             span: rule.body.span,
             message: format!(
                 "rule `{}` uses effect output `{root}` outside a matching `after {root} ...` block",
@@ -7248,6 +10025,13 @@ pub fn runtime_fact_name_for_pattern(pattern: &str) -> Option<String> {
     }
     if pattern.starts_with("human answered") {
         return Some("human.answer.received".to_owned());
+    }
+    // Inbound messaging (spec/messaging.md): `message from <channel>` matches the
+    // channel-specific `message.<channel>` fact ingested by `whip message`.
+    if let Some(rest) = pattern.strip_prefix("message from ") {
+        if let Some(channel) = rest.split_whitespace().next() {
+            return Some(format!("message.{channel}"));
+        }
     }
     let mut words = pattern.split_whitespace();
     let first = words.next()?;
@@ -7283,6 +10067,11 @@ fn binding_from_when(when: &str) -> Option<(String, String)> {
         words.next();
         words.next() == Some("completed") && words.next() == Some("turn")
     };
+    let has_ready_item = {
+        let mut words = pattern.split_whitespace();
+        words.next();
+        words.next() == Some("has") && words.next() == Some("ready") && words.next() == Some("item")
+    };
     let schema = if let Some(rest) = pattern.strip_prefix("fact ") {
         rest.split_whitespace().next()?.to_owned()
     } else if first.chars().next().is_some_and(char::is_uppercase) {
@@ -7296,12 +10085,12 @@ fn binding_from_when(when: &str) -> Option<(String, String)> {
         "AgentTurn".to_owned()
     } else if pattern.starts_with("human answered ") {
         "HumanAnswer".to_owned()
-    } else if {
-        let mut words = pattern.split_whitespace();
-        words.next();
-        words.next() == Some("has") && words.next() == Some("ready") && words.next() == Some("item")
-    } {
+    } else if has_ready_item {
         "WorkItem".to_owned()
+    } else if pattern.starts_with("message from ") {
+        // Inbound messaging (spec/messaging.md): `when message from <channel> as
+        // msg` binds the generic `Message` envelope, never a domain type.
+        "Message".to_owned()
     } else {
         return None;
     };
@@ -7324,7 +10113,7 @@ fn effect_binding_schema(
     match kind {
         IrEffectKind::LoftClaim => Some("LoftClaim".to_owned()),
         IrEffectKind::HumanAsk => Some("HumanAnswer".to_owned()),
-        IrEffectKind::BamlCoerce => parse_coerce_call_name(line).and_then(|name| {
+        IrEffectKind::Coerce => parse_coerce_call_name(line).and_then(|name| {
             semantic
                 .coerce_outputs
                 .get(name)
@@ -7343,7 +10132,11 @@ fn effect_binding_schema(
         | IrEffectKind::LeaseAcquire
         | IrEffectKind::LedgerAppend
         | IrEffectKind::CounterConsume
-        | IrEffectKind::EventNotify => None,
+        | IrEffectKind::EventNotify
+        | IrEffectKind::FileRead
+        | IrEffectKind::FileWrite
+        | IrEffectKind::FileImport
+        | IrEffectKind::FileExport => None,
     }
 }
 
@@ -7533,8 +10326,143 @@ fn paren_delta(line: &str) -> i32 {
     })
 }
 
-/// Collects the schemas an `exec ... -> each` stream records as facts.
-fn push_ingest_fact_writes(statements: &[body::BodyStmt], fact_writes: &mut Vec<String>) {
+/// The hygienic class name synthesized for an inline `decide -> { … } as
+/// <binding>`. Dots are illegal in user class names (like the `flow.<name>.seg*`
+/// rule convention), so `decide.<rule>.<binding>` can never collide with a
+/// declared schema. The lowering pass, the type checker, and the runtime fixture
+/// all derive the same name, so the anonymous result shape flows exactly like a
+/// named `coerce -> Schema`: `after <binding> succeeds as r` resolves `r`'s
+/// fields for `case` dispatch and field access.
+pub fn inline_decide_schema_name(rule: &str, binding: &str) -> String {
+    format!("decide.{rule}.{binding}")
+}
+
+/// A single-identifier `decide` field type is either a primitive keyword
+/// (`bool`, `string`, …) or a reference to a declared class/enum. The `decide`
+/// grammar only admits single identifiers, so no compound parsing is needed.
+fn decide_field_type_syntax(ty: &str, span: SourceSpan) -> TypeSyntax {
+    if is_primitive_type(ty) {
+        TypeSyntax::Primitive {
+            name: ty.to_owned(),
+            span,
+        }
+    } else {
+        TypeSyntax::Ref {
+            name: Ident {
+                name: ty.to_owned(),
+                span,
+            },
+        }
+    }
+}
+
+/// Collects every inline `decide … as <binding>` in a rule body — recursing
+/// through nested after/case/branch/handler blocks — yielding
+/// `(binding, result_fields, span)` for synthesis and type registration.
+fn collect_decide_effects<'a>(
+    statements: &'a [body::BodyStmt],
+    out: &mut Vec<(&'a str, &'a [(String, String)], SourceSpan)>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                if let body::BodyEffectKind::Decide { result_fields } = &effect.kind {
+                    if let Some(binding) = &effect.binding {
+                        out.push((binding.as_str(), result_fields.as_slice(), effect.span));
+                    }
+                }
+            }
+            body::BodyStmt::After(after) => collect_decide_effects(&after.body, out),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_decide_effects(&branch.body, out);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                collect_decide_effects(&branch.then_body, out);
+                if let Some(else_body) = &branch.else_body {
+                    collect_decide_effects(else_body, out);
+                }
+            }
+            body::BodyStmt::Handler(handler) => collect_decide_effects(&handler.body, out),
+            _ => {}
+        }
+    }
+}
+
+/// Registers each inline `decide … as <binding>` result as `Ref(decide.<rule>.<binding>)`
+/// so the after-binding type flow resolves the anonymous shape's fields, exactly
+/// like a named `coerce -> Schema`. The synthesized class is injected into both
+/// the semantic schema index and the IR by [`collect_inline_decide_schemas`].
+fn collect_decide_payload_types(
+    statements: &[body::BodyStmt],
+    rule_name: &str,
+    payloads: &mut BTreeMap<String, IrType>,
+) {
+    let mut decides = Vec::new();
+    collect_decide_effects(statements, &mut decides);
+    for (binding, _fields, _span) in decides {
+        payloads.insert(
+            binding.to_owned(),
+            IrType::Ref(inline_decide_schema_name(rule_name, binding)),
+        );
+    }
+}
+
+/// Synthesizes a hygienic `decide.<rule>.<binding>` class for every inline
+/// `decide -> { … } as <binding>`, injecting it into both the semantic schema
+/// index (so field access / `case` type-check) and the IR (so the runtime
+/// fixture can generate the anonymous shape). Mirrors the generated
+/// `<Enum>.<Variant>` class synthesis for data-carrying sum-type variants.
+fn collect_inline_decide_schemas(
+    items: &[Item],
+    semantic: &mut SemanticContext,
+    ir: &mut IrProgram,
+) {
+    for item in items {
+        let Item::Rule(rule) = item else {
+            continue;
+        };
+        let (body_ast, _) =
+            body::parse_rule_body(&rule.body.text, rule.body.span.start, body::BodyMode::Rule);
+        let mut decides = Vec::new();
+        collect_decide_effects(&body_ast.statements, &mut decides);
+        for (binding, fields, span) in decides {
+            let name = inline_decide_schema_name(&rule.name.name, binding);
+            // Build the field shape once as `TypeSyntax` (the schema-index form),
+            // then lower it for the IR so both representations stay in lockstep.
+            let mut syntax_fields: BTreeMap<String, TypeSyntax> = BTreeMap::new();
+            let mut ir_fields = Vec::new();
+            for (field_name, field_ty) in fields {
+                let ty = decide_field_type_syntax(field_ty, span);
+                ir_fields.push(IrClassField {
+                    name: field_name.clone(),
+                    ty: lower_type(ty.clone()),
+                    is_key: false,
+                    span,
+                });
+                syntax_fields.insert(field_name.clone(), ty);
+            }
+            semantic.schemas.classes.insert(name.clone(), syntax_fields);
+            ir.schemas.push(IrSchema::Class(IrClass {
+                name,
+                fields: ir_fields,
+                span,
+            }));
+        }
+    }
+}
+
+/// Registers the typed result of the single `exec "..." -> Schema as binding`
+/// form so `after <binding> succeeds as r` resolves `r`'s fields — the same
+/// after-binding type flow a named `coerce -> Schema` already gets. The
+/// streaming `-> each Schema` form records one fact per element (not a single
+/// bound value), so it is skipped here.
+fn collect_exec_payload_types(
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    payloads: &mut BTreeMap<String, IrType>,
+) {
     for statement in statements {
         match statement {
             body::BodyStmt::Effect(effect) => {
@@ -7543,9 +10471,56 @@ fn push_ingest_fact_writes(statements: &[body::BodyStmt], fact_writes: &mut Vec<
                     ..
                 } = &effect.kind
                 {
-                    if parse.each {
+                    if !parse.each {
+                        if let Some(binding) = &effect.binding {
+                            if semantic.schemas.class_exists(&parse.schema) {
+                                payloads.insert(binding.clone(), IrType::Ref(parse.schema.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            body::BodyStmt::After(after) => {
+                collect_exec_payload_types(&after.body, semantic, payloads)
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_exec_payload_types(&branch.body, semantic, payloads);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                collect_exec_payload_types(&branch.then_body, semantic, payloads);
+                if let Some(else_body) = &branch.else_body {
+                    collect_exec_payload_types(else_body, semantic, payloads);
+                }
+            }
+            body::BodyStmt::Handler(handler) => {
+                collect_exec_payload_types(&handler.body, semantic, payloads)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collects the schemas an `exec ... -> each` stream records as facts.
+fn push_ingest_fact_writes(statements: &[body::BodyStmt], fact_writes: &mut Vec<String>) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                match &effect.kind {
+                    body::BodyEffectKind::Exec {
+                        parse_target: Some(parse),
+                        ..
+                    } if parse.each => {
                         fact_writes.push(format!("schema:{}", parse.schema));
                     }
+                    // `import <fmt> <Schema>` admits one `<Schema>` fact per row
+                    // (spec/std-library/files.md), so a `when <Schema>` rule has a
+                    // producer for liveness/effect-graph analysis.
+                    body::BodyEffectKind::FileImport { schema, .. } => {
+                        fact_writes.push(format!("schema:{schema}"));
+                    }
+                    _ => {}
                 }
             }
             body::BodyStmt::After(after) => push_ingest_fact_writes(&after.body, fact_writes),
@@ -7573,6 +10548,7 @@ fn push_ingest_fact_writes(statements: &[body::BodyStmt], fact_writes: &mut Vec<
 ///   instant here is a valid literal and passes.
 /// - `exec ... -> Schema` / `-> each Schema`: the parse target must name a
 ///   declared class (spec/json-ingestion.md).
+///
 /// The coordination safety model (spec/coordination.md): at most one held
 /// lease per progression (hard default), exhaustive outcome handling, and
 /// the linear must-release discipline (instance terminals auto-release, so
@@ -7588,7 +10564,7 @@ fn validate_coordination_discipline(
     collect_coordination_effects(statements, &mut acquires, &mut consumes);
 
     if acquires.len() > 1 {
-        diagnostics.push(Diagnostic {
+        diagnostics.push(Diagnostic { related: Vec::new(),
             span: acquires[1].2,
             message: format!(
                 "rule `{}` acquires more than one lease in a single progression",
@@ -7608,7 +10584,7 @@ fn validate_coordination_discipline(
         collect_after_predicates(statements, binding, &mut predicates);
         for required in ["held", "contended"] {
             if !predicates.contains(required) {
-                diagnostics.push(Diagnostic {
+                diagnostics.push(Diagnostic { related: Vec::new(),
                     span: *span,
                     message: format!(
                         "rule `{}` does not handle the `{required}` outcome of lease `{binding}`",
@@ -7622,7 +10598,7 @@ fn validate_coordination_discipline(
         }
         if let Some(held_body) = find_after_body(statements, binding, body::AfterPredicate::Held) {
             if !releases_or_terminates(held_body, binding) {
-                diagnostics.push(Diagnostic {
+                diagnostics.push(Diagnostic { related: Vec::new(),
                     span: *span,
                     message: format!(
                         "rule `{}` can hold lease `{binding}` forever: the `held` branch neither releases it nor reaches a workflow terminal",
@@ -7640,7 +10616,7 @@ fn validate_coordination_discipline(
         collect_after_predicates(statements, binding, &mut predicates);
         for required in ["ok", "over"] {
             if !predicates.contains(required) {
-                diagnostics.push(Diagnostic {
+                diagnostics.push(Diagnostic { related: Vec::new(),
                     span: *span,
                     message: format!(
                         "rule `{}` does not handle the `{required}` outcome of counter consume `{binding}`",
@@ -7797,7 +10773,7 @@ fn validate_body_effect_operands(
                     body::BodyEffectKind::LeaseAcquire { resource, .. }
                         if !semantic.leases.contains(resource) =>
                     {
-                        diagnostics.push(Diagnostic {
+                        diagnostics.push(Diagnostic { related: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` acquires undeclared lease `{resource}`",
@@ -7810,7 +10786,7 @@ fn validate_body_effect_operands(
                     }
                     body::BodyEffectKind::LedgerAppend { ledger, schema, .. } => {
                         if !semantic.ledgers.contains(ledger) {
-                            diagnostics.push(Diagnostic {
+                            diagnostics.push(Diagnostic { related: Vec::new(),
                                 span: effect.span,
                                 message: format!(
                                     "rule `{}` appends to undeclared ledger `{ledger}`",
@@ -7823,6 +10799,7 @@ fn validate_body_effect_operands(
                         }
                         if !semantic.schemas.class_exists(schema) {
                             diagnostics.push(Diagnostic {
+                                related: Vec::new(),
                                 span: effect.span,
                                 message: format!(
                                     "rule `{}` appends unknown entry class `{schema}`",
@@ -7835,7 +10812,7 @@ fn validate_body_effect_operands(
                     body::BodyEffectKind::CounterConsume { counter, .. }
                         if !semantic.counters.contains(counter) =>
                     {
-                        diagnostics.push(Diagnostic {
+                        diagnostics.push(Diagnostic { related: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` consumes undeclared counter `{counter}`",
@@ -7866,6 +10843,7 @@ fn validate_body_effect_operands(
                                 ),
                             };
                         diagnostics.push(Diagnostic {
+                            related: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` parses exec output into unknown schema `{}`",
@@ -7888,7 +10866,7 @@ fn validate_body_effect_operands(
                 let root = segments.next().unwrap_or_default();
                 let path = segments.map(str::to_owned).collect::<Vec<_>>();
                 let Some(schema) = binding_types.get(root) else {
-                    diagnostics.push(Diagnostic {
+                    diagnostics.push(Diagnostic { related: Vec::new(),
                         span: effect.span,
                         message: format!(
                             "rule `{}` uses unknown binding `{root}` in `timer until {until}`",
@@ -7916,7 +10894,7 @@ fn validate_body_effect_operands(
                 match resolved {
                     Ok(TypeSyntax::Primitive { ref name, .. }) if name == "time" => {}
                     Ok(_) => {
-                        diagnostics.push(Diagnostic {
+                        diagnostics.push(Diagnostic { related: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` uses non-time operand `{until}` in `timer until`",
@@ -7928,7 +10906,7 @@ fn validate_body_effect_operands(
                         });
                     }
                     Err(message) => {
-                        diagnostics.push(Diagnostic {
+                        diagnostics.push(Diagnostic { related: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` has invalid `timer until` operand `{until}`: {message}",
@@ -8028,6 +11006,7 @@ fn validate_known_field_paths_at_span(
         }
         if let Err(message) = semantic.schemas.resolve_field_path(schema, &path) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span,
                 message: format!(
                     "rule `{}` has invalid field path `{root}.{}`: {message}",
@@ -8121,6 +11100,7 @@ fn validate_binding_name(
 ) {
     if RESERVED_BINDING_KEYWORDS.contains(&binding) {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span,
             message: format!(
                 "rule `{}` binds reserved keyword `{binding}`",
@@ -8197,10 +11177,12 @@ fn validate_record_field(
     record_schema: &str,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
+    known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some((field, expr)) = record_field_assignment(line) else {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!(
                 "rule `{}` has malformed field assignment in `record {record_schema}`",
@@ -8216,6 +11198,7 @@ fn validate_record_field(
     };
     let Some(field_ty) = fields.get(field) else {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!("class `{record_schema}` has no field `{field}`"),
             suggestion: Some(format!(
@@ -8231,7 +11214,7 @@ fn validate_record_field(
                 return;
             }
             if let Err(message) = semantic.schemas.resolve_field_path(schema, &path) {
-                diagnostics.push(Diagnostic {
+                diagnostics.push(Diagnostic { related: Vec::new(),
                     span: rule.body.span,
                     message: format!(
                         "rule `{}` has invalid field path `{root}.{}`: {message}",
@@ -8244,6 +11227,20 @@ fn validate_record_field(
                     ),
                 });
             }
+        } else if let Some(root) = dangling_value_root(expr, known_roots) {
+            // A field access whose root is neither a bound name nor a special
+            // root is a dangling reference (the binding does not exist).
+            diagnostics.push(Diagnostic { related: Vec::new(),
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` has unknown binding `{root}` in `record {record_schema}` field `{field}`",
+                    rule.name.name
+                ),
+                suggestion: Some(
+                    "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern"
+                        .to_owned(),
+                ),
+            });
         }
     }
 
@@ -8275,10 +11272,257 @@ fn record_field_assignment(line: &str) -> Option<(&str, &str)> {
     (!field.is_empty() && !expr.is_empty()).then_some((field, expr))
 }
 
+/// Roots valid in value positions without being author bindings: the
+/// external-event payload and the coerce prompt context. An explicit allowlist
+/// so genuine typos are still caught.
+const SPECIAL_VALUE_ROOTS: &[&str] = &["external", "ctx"];
+
+/// Collects every binding NAME a rule body introduces, from the parsed AST so it
+/// is robust to multi-line prompts and nesting (the line-based effect collectors
+/// only track `coerce`/`claim`, so `tell`/`exec`/etc. bindings are invisible to
+/// `binding_types`). Used to reject dangling roots in value positions without
+/// false-flagging valid effect results, `after` aliases, or case bindings.
+fn collect_all_binding_names(statements: &[body::BodyStmt], out: &mut BTreeSet<String>) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                if let Some(binding) = &effect.binding {
+                    out.insert(binding.clone());
+                }
+            }
+            body::BodyStmt::After(after) => {
+                if let Some(alias) = &after.alias {
+                    out.insert(alias.clone());
+                }
+                collect_all_binding_names(&after.body, out);
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    if let Some(binding) = &branch.binding {
+                        out.insert(binding.clone());
+                    }
+                    collect_all_binding_names(&branch.body, out);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                collect_all_binding_names(&branch.then_body, out);
+                if let Some(else_body) = &branch.else_body {
+                    collect_all_binding_names(else_body, out);
+                }
+            }
+            body::BodyStmt::Handler(handler) => {
+                collect_all_binding_names(&handler.body, out);
+            }
+            body::BodyStmt::Record(_)
+            | body::BodyStmt::Done { .. }
+            | body::BodyStmt::Terminal(_)
+            | body::BodyStmt::Cancel { .. } => {}
+        }
+    }
+}
+
+/// Flags dangling roots in the field payloads of body-AST effects that the
+/// line-based validators don't reach: `emit`/`notify` (`Notify`), `file item
+/// into` (`QueueFile`), and ledger `append` (`LedgerAppend`). Uses the parsed
+/// AST and the same root check as the record/coerce/tell/invoke validators.
+fn validate_effect_field_roots(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    known_roots: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => match &effect.kind {
+                body::BodyEffectKind::Notify {
+                    target_expr,
+                    event,
+                    fields,
+                } => {
+                    check_operand_root(
+                        rule,
+                        &format!("emit `{event}` target"),
+                        target_expr,
+                        known_roots,
+                        diagnostics,
+                    );
+                    check_field_value_roots(
+                        rule,
+                        &format!("emit `{event}`"),
+                        fields,
+                        known_roots,
+                        diagnostics,
+                    );
+                }
+                body::BodyEffectKind::QueueFile { queue, fields } => {
+                    check_field_value_roots(
+                        rule,
+                        &format!("file into `{queue}`"),
+                        fields,
+                        known_roots,
+                        diagnostics,
+                    );
+                }
+                body::BodyEffectKind::QueueFinish { item, fields } => {
+                    check_operand_root(rule, "finish item", item, known_roots, diagnostics);
+                    check_field_value_roots(rule, "finish", fields, known_roots, diagnostics);
+                }
+                body::BodyEffectKind::LedgerAppend { ledger, fields, .. } => {
+                    check_field_value_roots(
+                        rule,
+                        &format!("append to `{ledger}`"),
+                        fields,
+                        known_roots,
+                        diagnostics,
+                    );
+                }
+                body::BodyEffectKind::LeaseAcquire {
+                    resource, key_expr, ..
+                } => {
+                    check_operand_root(
+                        rule,
+                        &format!("acquire `{resource}` key"),
+                        key_expr,
+                        known_roots,
+                        diagnostics,
+                    );
+                }
+                body::BodyEffectKind::CounterConsume {
+                    counter,
+                    key_expr,
+                    amount_expr,
+                } => {
+                    check_operand_root(
+                        rule,
+                        &format!("consume `{counter}` key"),
+                        key_expr,
+                        known_roots,
+                        diagnostics,
+                    );
+                    check_operand_root(
+                        rule,
+                        &format!("consume `{counter}` amount"),
+                        amount_expr,
+                        known_roots,
+                        diagnostics,
+                    );
+                }
+                _ => {}
+            },
+            body::BodyStmt::After(after) => {
+                validate_effect_field_roots(rule, &after.body, known_roots, diagnostics)
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    validate_effect_field_roots(rule, &branch.body, known_roots, diagnostics);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                validate_effect_field_roots(rule, &branch.then_body, known_roots, diagnostics);
+                if let Some(else_body) = &branch.else_body {
+                    validate_effect_field_roots(rule, else_body, known_roots, diagnostics);
+                }
+            }
+            body::BodyStmt::Handler(handler) => {
+                validate_effect_field_roots(rule, &handler.body, known_roots, diagnostics)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The single source of truth for value-position root validation: returns the
+/// dangling root of a single-path value expression — a `root.field…` access whose
+/// root is neither a known binding nor a recognized special root — or `None`.
+/// Bare atoms (agents, enum variants, literals) have no path and are ignored; the
+/// `"`-guard skips values whose "path" was mis-extracted from inside a string
+/// literal. Used by every value-position validator (record/terminal/coerce/tell/
+/// invoke/effect payloads/operands).
+fn dangling_value_root(value: &str, known_roots: &BTreeSet<String>) -> Option<String> {
+    let (root, path) = expression_path(value)?;
+    if !path.is_empty()
+        && !value.contains('"')
+        && !known_roots.contains(&root)
+        && !SPECIAL_VALUE_ROOTS.contains(&root.as_str())
+    {
+        Some(root)
+    } else {
+        None
+    }
+}
+
+/// Flags a dangling root in a single effect-operand expression (e.g. an
+/// `emit ... to <target>` target, a lease/counter `for <key>` key). Same check
+/// as the field/record validators.
+fn check_operand_root(
+    rule: &RuleDecl,
+    context: &str,
+    operand: &str,
+    known_roots: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if let Some(root) = dangling_value_root(operand, known_roots) {
+        diagnostics.push(Diagnostic { related: Vec::new(),
+            span: rule.body.span,
+            message: format!(
+                "rule `{}` has unknown binding `{root}` in {context} `{operand}`",
+                rule.name.name
+            ),
+            suggestion: Some(
+                "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern"
+                    .to_owned(),
+            ),
+        });
+    }
+}
+
+fn check_field_value_roots(
+    rule: &RuleDecl,
+    context: &str,
+    fields: &[body::FieldAssign],
+    known_roots: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for field in fields {
+        match &field.value {
+            body::FieldValue::Expr { source, .. } => {
+                if let Some(root) = dangling_value_root(source, known_roots) {
+                    diagnostics.push(Diagnostic { related: Vec::new(),
+                        span: rule.body.span,
+                        message: format!(
+                            "rule `{}` has unknown binding `{root}` in {context} field `{}`",
+                            rule.name.name, field.name
+                        ),
+                        suggestion: Some(
+                            "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern"
+                                .to_owned(),
+                        ),
+                    });
+                }
+            }
+            body::FieldValue::Nested { fields, .. } => {
+                check_field_value_roots(rule, context, fields, known_roots, diagnostics)
+            }
+            body::FieldValue::Shorthand => {}
+        }
+    }
+}
+
+/// The complete set of value-position binding roots for a rule: `when` bindings
+/// plus every binding the body introduces, collected from the parsed AST.
+fn known_roots_for_rule(rule: &RuleDecl) -> BTreeSet<String> {
+    let mut roots: BTreeSet<String> = binding_types_for_rule(rule).into_keys().collect();
+    let (body_ast, _) =
+        body::parse_rule_body(&rule.body.text, rule.body.span.start, body::BodyMode::Rule);
+    collect_all_binding_names(&body_ast.statements, &mut roots);
+    roots
+}
+
 fn validate_record_blocks(
     rule: &RuleDecl,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
+    known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for (schema, from_binding, body) in record_blocks(&rule.body.text) {
@@ -8294,7 +11538,15 @@ fn validate_record_blocks(
                 }
             };
             let line = format!("{field} {value}");
-            validate_record_field(rule, &line, &schema, semantic, binding_types, diagnostics);
+            validate_record_field(
+                rule,
+                &line,
+                &schema,
+                semantic,
+                binding_types,
+                known_roots,
+                diagnostics,
+            );
         }
     }
 }
@@ -8309,6 +11561,22 @@ fn record_blocks(body: &str) -> Vec<(String, Option<String>, String)> {
             index += 1;
             continue;
         };
+        // Single-line record `record X { f y }`: opens and closes on one line
+        // (brace_delta 0), so the multi-line loop below never collects its fields,
+        // leaving them unvalidated. Extract the inner content directly.
+        if brace_delta(trimmed) == 0 && trimmed.contains('{') {
+            if let (Some(open), Some(close)) = (trimmed.find('{'), trimmed.rfind('}')) {
+                if close > open {
+                    blocks.push((
+                        schema,
+                        from_binding,
+                        trimmed[open + 1..close].trim().to_owned(),
+                    ));
+                }
+            }
+            index += 1;
+            continue;
+        }
         let mut depth = brace_delta(trimmed);
         let mut record_lines = Vec::new();
         index += 1;
@@ -8352,15 +11620,30 @@ fn workflow_terminal_blocks(body: &str) -> Vec<(String, String, String)> {
         };
         let mut depth = brace_delta(trimmed);
         let mut terminal_lines = Vec::new();
-        index += 1;
-        while index < lines.len() && depth > 0 {
-            let line = lines[index];
-            let before = depth;
-            depth += brace_delta(line);
-            if !(before == 1 && depth == 0 && line.trim() == "}") {
-                terminal_lines.push(line.to_owned());
+        if depth == 0 && trimmed.contains('{') {
+            // Single-line block: `complete <name> { <fields> }` opens and closes
+            // on this line, so its inner content never reaches the multi-line loop
+            // below. Capture the content between the braces as the block body.
+            if let (Some(open), Some(close)) = (trimmed.find('{'), trimmed.rfind('}')) {
+                if close > open {
+                    let inner = trimmed[open + 1..close].trim();
+                    if !inner.is_empty() {
+                        terminal_lines.push(inner.to_owned());
+                    }
+                }
             }
             index += 1;
+        } else {
+            index += 1;
+            while index < lines.len() && depth > 0 {
+                let line = lines[index];
+                let before = depth;
+                depth += brace_delta(line);
+                if !(before == 1 && depth == 0 && line.trim() == "}") {
+                    terminal_lines.push(line.to_owned());
+                }
+                index += 1;
+            }
         }
         blocks.push((action.to_owned(), name, terminal_lines.join("\n")));
     }
@@ -8437,6 +11720,7 @@ fn validate_literal_assignment(
         TypeSyntax::LiteralString { value, .. } => {
             if literal != LiteralExpr::String(value.as_str()) {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: rule.body.span,
                     message: format!(
                         "field `{record_schema}.{field}` expects literal string `{value}`"
@@ -8522,6 +11806,7 @@ fn validate_expr_source_against_type(
                 Ok(Expr::Object(fields)) => fields,
                 Ok(_) => {
                     diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: rule.body.span,
                         message: format!("field `{record_schema}.{field}` expects a map literal"),
                         suggestion: Some(format!("record `{field} {{ key value }}`")),
@@ -8530,6 +11815,7 @@ fn validate_expr_source_against_type(
                 }
                 Err(message) => {
                     diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: rule.body.span,
                         message: format!(
                             "field `{record_schema}.{field}` expects a map literal: {message}"
@@ -8732,6 +12018,7 @@ fn push_invalid_assignment_expr(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     diagnostics.push(Diagnostic {
+        related: Vec::new(),
         span: rule.body.span,
         message: format!(
             "rule `{}` has invalid expression for field `{record_schema}.{field}`: {message}",
@@ -8762,6 +12049,7 @@ fn validate_object_literal_fields(
     for object_field in object_fields {
         if !seen.insert(object_field.key.clone()) {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "field `{record_schema}.{field}` repeats object field `{}`",
@@ -8773,6 +12061,7 @@ fn validate_object_literal_fields(
         }
         let Some(field_ty) = schema_fields.get(&object_field.key) else {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "class `{object_schema}` has no field `{}`",
@@ -8800,7 +12089,7 @@ fn validate_object_literal_fields(
         if seen.contains(required) || matches!(ty, TypeSyntax::Optional { .. }) {
             continue;
         }
-        diagnostics.push(Diagnostic {
+        diagnostics.push(Diagnostic { related: Vec::new(),
             span: rule.body.span,
             message: format!(
                 "field `{record_schema}.{field}` is missing required object field `{object_schema}.{required}`"
@@ -8842,6 +12131,7 @@ fn validate_inferred_assignment_type(
     let expected_expr_ty = expr_type_from_type_syntax(expected_ty, semantic);
     if !types_comparable(&actual_ty, &expected_expr_ty) {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!(
                 "field `{record_schema}.{field}` receives incompatible expression type"
@@ -8870,6 +12160,7 @@ fn validate_literal_against_type(
         TypeSyntax::LiteralString { value, .. } => {
             if literal != &LiteralExpr::String(value.as_str()) {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: rule.body.span,
                     message: format!(
                         "field `{record_schema}.{field}` expects literal string `{value}`"
@@ -8937,6 +12228,7 @@ fn validate_agent_ref_literal(
         .collect::<Vec<_>>();
     if let LiteralExpr::String(value) = literal {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!(
                 "field `{record_schema}.{field}` expects an AgentRef value, not string `{value}`"
@@ -8950,6 +12242,7 @@ fn validate_agent_ref_literal(
     }
     let LiteralExpr::Ident(value) = literal else {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!("field `{record_schema}.{field}` expects an AgentRef value"),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
@@ -8958,6 +12251,7 @@ fn validate_agent_ref_literal(
     };
     if !allowed.contains(value) {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!("field `{record_schema}.{field}` cannot reference agent `{value}`"),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
@@ -9507,6 +12801,7 @@ fn validate_primitive_literal(
     );
     if !valid {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!("field `{record_schema}.{field}` expects `{primitive}`"),
             suggestion: Some(format!("record a value compatible with `{primitive}`")),
@@ -9516,6 +12811,7 @@ fn validate_primitive_literal(
     match (primitive, literal) {
         ("duration", LiteralExpr::String(value)) if parse_duration_seconds(value).is_none() => {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!("field `{record_schema}.{field}` has invalid duration literal"),
                 suggestion: Some("use an ISO-8601 duration such as `\"PT30M\"`".to_owned()),
@@ -9523,6 +12819,7 @@ fn validate_primitive_literal(
         }
         ("time", LiteralExpr::String(value)) if parse_time_epoch_seconds(value).is_none() => {
             diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!("field `{record_schema}.{field}` has invalid time literal"),
                 suggestion: Some(
@@ -9548,6 +12845,7 @@ fn validate_enum_literal(
     };
     let LiteralExpr::Ident(variant) = literal else {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!("field `{record_schema}.{field}` expects enum `{schema}`"),
             suggestion: Some(format!(
@@ -9559,6 +12857,7 @@ fn validate_enum_literal(
     };
     if !variants.contains(*variant) {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!("enum `{schema}` has no variant `{variant}`"),
             suggestion: Some(format!(
@@ -9589,6 +12888,7 @@ fn validate_union_literal(
     }
     let LiteralExpr::String(value) = literal else {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!("field `{record_schema}.{field}` expects one of its literal variants"),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
@@ -9597,6 +12897,7 @@ fn validate_union_literal(
     };
     if !allowed.contains(value) {
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: rule.body.span,
             message: format!("field `{record_schema}.{field}` cannot be `{value}`"),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
@@ -9608,17 +12909,25 @@ fn parse_effect_line(line: &str) -> Option<(IrEffectKind, Option<String>)> {
     let kind = if line.starts_with("tell ") {
         IrEffectKind::AgentTell
     } else if line.starts_with("coerce ") {
-        IrEffectKind::BamlCoerce
+        IrEffectKind::Coerce
     } else if line.starts_with("claim ") {
         IrEffectKind::LoftClaim
     } else if line.starts_with("askHuman") {
         IrEffectKind::HumanAsk
-    } else if line.starts_with("call ") {
+    } else if line.starts_with("call ") || line.starts_with("recall ") {
         IrEffectKind::CapabilityCall
     } else if line.starts_with("emit ") {
         IrEffectKind::EventEmit
     } else if line.starts_with("invoke ") {
         IrEffectKind::WorkflowInvoke
+    } else if line.starts_with("read ") {
+        IrEffectKind::FileRead
+    } else if line.starts_with("write ") {
+        IrEffectKind::FileWrite
+    } else if line.starts_with("import ") {
+        IrEffectKind::FileImport
+    } else if line.starts_with("export ") {
+        IrEffectKind::FileExport
     } else {
         return None;
     };
@@ -9667,6 +12976,7 @@ fn validate_rule_prompt_content_type_annotation(
         return;
     };
     diagnostics.push(Diagnostic {
+        related: Vec::new(),
         span: rule.body.span,
         message: format!(
             "rule `{}` has malformed multiline prompt content type `{annotation}`",
@@ -9690,7 +13000,7 @@ fn validate_coerce_prompt_content_type_annotations(
         let Some(annotation) = malformed_prompt_content_type_annotation(line) else {
             continue;
         };
-        diagnostics.push(Diagnostic {
+        diagnostics.push(Diagnostic { related: Vec::new(),
             span: coerce.body.span,
             message: format!(
                 "coerce `{}` has malformed multiline prompt content type `{annotation}`",
@@ -9770,6 +13080,15 @@ fn parse_after_line(line: &str) -> Option<(String, DependencyPredicate)> {
     let predicate = match parts.next()? {
         "succeeds" => DependencyPredicate::Succeeds,
         "fails" => DependencyPredicate::Fails,
+        // `times out` / `cancelled` react only to that specific non-success
+        // terminal status (spec/expression-kernel.md), mirroring succeeds/fails.
+        "cancelled" => DependencyPredicate::Cancelled,
+        "times" => {
+            if parts.next()? != "out" {
+                return None;
+            }
+            DependencyPredicate::TimedOut
+        }
         // Coordination outcomes (spec/coordination.md) are completion-valued;
         // the arm dispatch happens on the outcome variant at lowering.
         "completes" | "held" | "contended" | "ok" | "over" => DependencyPredicate::Completes,
@@ -10032,8 +13351,54 @@ fn format_item(item: Item, formatted: &mut String) {
             push_line(formatted, format!("  tracker {}", queue.tracker.name));
             push_line(formatted, "}");
         }
-        Item::Flow(flow) => {
-            push_line(formatted, format!("flow {} {{ ... }}", flow.name.name));
+        Item::Channel(channel) => {
+            push_line(formatted, format!("channel {} {{", channel.name.name));
+            push_line(formatted, format!("  provider {}", channel.provider.name));
+            if let Some(workspace) = &channel.workspace {
+                push_line(formatted, format!("  workspace {}", workspace.name));
+            }
+            if let Some(destination) = &channel.destination {
+                push_line(formatted, format!("  destination {:?}", destination.value));
+            }
+            push_line(formatted, "}");
+        }
+        Item::FileStore(file_store) => {
+            push_line(formatted, format!("file store {} {{", file_store.name.name));
+            push_line(formatted, format!("  root {:?}", file_store.root));
+            let format_globs = |formatted: &mut String, direction: &str, globs: &[String]| {
+                if !globs.is_empty() {
+                    let rendered = globs
+                        .iter()
+                        .map(|glob| format!("{glob:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    push_line(formatted, format!("  allow {direction} [{rendered}]"));
+                }
+            };
+            format_globs(formatted, "read", &file_store.read_globs);
+            format_globs(formatted, "write", &file_store.write_globs);
+            push_line(formatted, "}");
+        }
+        Item::Flow(flow) => format_flow(flow, formatted),
+        Item::Action(action) => {
+            let params = action
+                .params
+                .iter()
+                .map(|param| format!("{} {}", param.name.name, param.ty.to_source()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            push_line(
+                formatted,
+                format!("action {}({params}) {{", action.name.name),
+            );
+            for line in action.body.text.lines() {
+                if line.trim().is_empty() {
+                    push_line(formatted, "");
+                } else {
+                    push_line(formatted, line.trim_end());
+                }
+            }
+            push_line(formatted, "}");
         }
         Item::Pattern(pattern) => format_pattern(pattern, formatted),
         Item::Apply(apply) => format_apply(apply, formatted),
@@ -10052,6 +13417,8 @@ fn format_item(item: Item, formatted: &mut String) {
         Item::Agent(agent) => format_agent(agent, formatted),
         Item::Enum(enum_decl) => format_enum(enum_decl, formatted),
         Item::Event(event) => format_event(event, formatted),
+        Item::Source(source) => format_source(source, formatted),
+        Item::Test(test) => format_test(test, formatted),
         Item::Lease(lease) => {
             push_line(formatted, format!("lease {} {{", lease.name.name));
             push_line(formatted, format!("  key {}", lease.key_type.name));
@@ -10151,7 +13518,7 @@ fn format_apply(apply: ApplyDecl, formatted: &mut String) {
             apply.pattern.name, args, apply.alias.name
         ),
     );
-    push_block_body(&apply.body.text, formatted);
+    format_block_body(&apply.body.text, formatted);
     push_line(formatted, "}");
 }
 
@@ -10242,8 +13609,230 @@ fn format_enum(enum_decl: EnumDecl, formatted: &mut String) {
     push_line(formatted, "}");
 }
 
+fn format_time_of_day(time: TimeOfDay) -> String {
+    format!("{:02}:{:02}", time.hour, time.minute)
+}
+
+fn format_weekday(day: Weekday) -> &'static str {
+    match day {
+        Weekday::Monday => "monday",
+        Weekday::Tuesday => "tuesday",
+        Weekday::Wednesday => "wednesday",
+        Weekday::Thursday => "thursday",
+        Weekday::Friday => "friday",
+        Weekday::Saturday => "saturday",
+        Weekday::Sunday => "sunday",
+    }
+}
+
+fn format_recurrence(recurrence: &Recurrence) -> String {
+    match recurrence {
+        Recurrence::At { time, .. } => format!("at {}", format_time_of_day(*time)),
+        Recurrence::EveryDuration { source, .. } => format!("every {source}"),
+        Recurrence::EveryCalendar { pattern, time, .. } => {
+            let pattern = match pattern {
+                CalendarPattern::Day => "day".to_owned(),
+                CalendarPattern::Weekday => "weekday".to_owned(),
+                CalendarPattern::Weekly(day) => format_weekday(*day).to_owned(),
+            };
+            format!("every {pattern} at {}", format_time_of_day(*time))
+        }
+    }
+}
+
+fn format_source_value(value: &SourceValue) -> String {
+    match value {
+        SourceValue::Path {
+            binding, segments, ..
+        } => {
+            let mut text = binding.name.clone();
+            for segment in segments {
+                text.push('.');
+                text.push_str(&segment.name);
+            }
+            text
+        }
+        SourceValue::String(literal) => format!("{:?}", literal.value),
+        SourceValue::Number(number, _) => number.clone(),
+    }
+}
+
+fn format_test_fields(fields: &[TestField], formatted: &mut String) {
+    for field in fields {
+        push_line(
+            formatted,
+            format!("    {} {}", field.name.name, field.value),
+        );
+    }
+}
+
+fn format_test(test: TestDecl, formatted: &mut String) {
+    push_line(formatted, format!("test {:?} {{", test.name.value));
+    if let Some(workflow) = &test.workflow {
+        push_line(formatted, format!("  workflow {}", workflow.name));
+    }
+    for clause in &test.clauses {
+        match clause {
+            TestClause::Given(given) => match given {
+                GivenClause::Input { fields, .. } => {
+                    push_line(formatted, "  given input {");
+                    format_test_fields(fields, formatted);
+                    push_line(formatted, "  }");
+                }
+                GivenClause::Fact { ty, fields, .. } => {
+                    push_line(formatted, format!("  given fact {} {{", ty.name));
+                    format_test_fields(fields, formatted);
+                    push_line(formatted, "  }");
+                }
+                GivenClause::Signal { name, fields, .. } => {
+                    push_line(formatted, format!("  given signal {name} {{"));
+                    format_test_fields(fields, formatted);
+                    push_line(formatted, "  }");
+                }
+                GivenClause::Clock { at, .. } => {
+                    push_line(formatted, format!("  given clock at {:?}", at.value));
+                }
+                GivenClause::Tracker {
+                    tracker, fields, ..
+                } => {
+                    push_line(formatted, format!("  given tracker {tracker} issue {{"));
+                    format_test_fields(fields, formatted);
+                    push_line(formatted, "  }");
+                }
+                GivenClause::File {
+                    store,
+                    path,
+                    content,
+                    ..
+                } => {
+                    push_line(
+                        formatted,
+                        format!(
+                            "  given file {store} at {:?} {:?}",
+                            path.value, content.value
+                        ),
+                    );
+                }
+            },
+            TestClause::Stub(stub) => {
+                let surface = stub.surface.join(" ");
+                match &stub.payload {
+                    Some(StubPayload::Message(message)) => push_line(
+                        formatted,
+                        format!("  stub {surface} {} {:?}", stub.outcome, message.value),
+                    ),
+                    Some(StubPayload::Record(fields)) => {
+                        push_line(formatted, format!("  stub {surface} {} {{", stub.outcome));
+                        format_test_fields(fields, formatted);
+                        push_line(formatted, "  }");
+                    }
+                    None => push_line(formatted, format!("  stub {surface} {}", stub.outcome)),
+                }
+            }
+            TestClause::Run(run) => {
+                let text = match &run.kind {
+                    RunKind::UntilIdle => "run until idle".to_owned(),
+                    RunKind::UntilWorkflowCompleted => "run until workflow completed".to_owned(),
+                    RunKind::UntilWorkflowFailed => "run until workflow failed".to_owned(),
+                    RunKind::ForSteps(steps) => format!("run for {steps} steps"),
+                };
+                push_line(formatted, format!("  {text}"));
+            }
+            TestClause::Expect(expect) => {
+                push_line(
+                    formatted,
+                    format!("  {}", format_expect_target(&expect.target)),
+                );
+            }
+        }
+    }
+    push_line(formatted, "}");
+}
+
+fn format_expect_target(target: &ExpectTarget) -> String {
+    match target {
+        ExpectTarget::WorkflowCompleted => "expect workflow completed".to_owned(),
+        ExpectTarget::WorkflowFailed { failure: None } => "expect workflow failed".to_owned(),
+        ExpectTarget::WorkflowFailed {
+            failure: Some(failure),
+        } => format!("expect workflow failed with {}", failure.name),
+        ExpectTarget::Rule { name, status } => {
+            let status = match status {
+                RuleStatus::Fired => "fired".to_owned(),
+                RuleStatus::FiredTimes(count) => format!("fired {count} times"),
+                RuleStatus::DidNotFire => "did not fire".to_owned(),
+            };
+            format!("expect rule {} {status}", name.name)
+        }
+        ExpectTarget::Effect { name, status } => {
+            let status = match status {
+                EffectStatus::Requested => "requested",
+                EffectStatus::Completed => "completed",
+                EffectStatus::Failed => "failed",
+            };
+            format!("expect effect {name} {status}")
+        }
+        ExpectTarget::Diagnostic { code } => format!("expect diagnostic {code}"),
+        ExpectTarget::NoEffect { name } => format!("expect no {name}"),
+        ExpectTarget::Projection(query) => format!("expect {}", format_proj_query(query)),
+    }
+}
+
+fn format_proj_query(query: &ProjQuery) -> String {
+    match &query.kind {
+        ProjQueryKind::Exists => format!("{} exists", query.noun),
+        ProjQueryKind::Count { predicate, count } => {
+            format!("{} count where {predicate} is {count}", query.noun)
+        }
+        ProjQueryKind::Where { predicate } => {
+            format!("{} where {predicate}", query.noun)
+        }
+    }
+}
+
+fn format_source(source: SourceDecl, formatted: &mut String) {
+    push_line(
+        formatted,
+        format!("source {} as {} {{", source.provider.name, source.name.name),
+    );
+    if let Some(clock) = &source.clock {
+        push_line(
+            formatted,
+            format!("  {}", format_recurrence(&clock.recurrence)),
+        );
+        if let Some(timezone) = &clock.timezone {
+            push_line(formatted, format!("  timezone {:?}", timezone.value));
+        }
+        match clock.missed {
+            Some(MissedPolicy::Skip) => push_line(formatted, "  missed skip"),
+            Some(MissedPolicy::Coalesce) => push_line(formatted, "  missed coalesce"),
+            Some(MissedPolicy::CatchUp { limit }) => {
+                push_line(formatted, format!("  missed catch_up limit {limit}"))
+            }
+            None => {}
+        }
+    }
+    push_line(
+        formatted,
+        format!("  observe as {}", source.observe_binding.name),
+    );
+    push_line(formatted, format!("  emit {} {{", source.emit.signal));
+    for field in &source.emit.fields {
+        push_line(
+            formatted,
+            format!(
+                "    {} {}",
+                field.name.name,
+                format_source_value(&field.value)
+            ),
+        );
+    }
+    push_line(formatted, "  }");
+    push_line(formatted, "}");
+}
+
 fn format_event(event: EventDecl, formatted: &mut String) {
-    push_line(formatted, format!("event {} {{", event.name));
+    push_line(formatted, format!("signal {} {{", event.name));
     for field in event.fields {
         push_line(
             formatted,
@@ -10256,9 +13845,10 @@ fn format_event(event: EventDecl, formatted: &mut String) {
 fn format_class(class_decl: ClassDecl, formatted: &mut String) {
     push_line(formatted, format!("class {} {{", class_decl.name.name));
     for field in class_decl.fields {
+        let key = if field.is_key { " @key" } else { "" };
         push_line(
             formatted,
-            format!("  {} {}", field.name.name, field.ty.to_source()),
+            format!("  {} {}{key}", field.name.name, field.ty.to_source()),
         );
     }
     push_line(formatted, "}");
@@ -10277,7 +13867,11 @@ fn format_table(table: TableDecl, formatted: &mut String) {
             if line.trim().is_empty() {
                 formatted.push('\n');
             } else {
-                push_line(formatted, format!("    {}", line.trim_end()));
+                // `trim()` (not `trim_end()`): normalize the field to a fixed
+                // 4-space indent rather than prepending to the row's existing
+                // indent, which compounded every pass. Row bodies are flat field
+                // lists, so a fixed indent is the canonical form.
+                push_line(formatted, format!("    {}", line.trim()));
             }
         }
         push_line(formatted, "  }");
@@ -10301,7 +13895,7 @@ fn format_coerce(coerce: CoerceDecl, formatted: &mut String) {
             coerce.output.to_source()
         ),
     );
-    push_block_body(&coerce.body.text, formatted);
+    format_block_body(&coerce.body.text, formatted);
     push_line(formatted, "}");
 }
 
@@ -10313,15 +13907,33 @@ fn format_rule(rule: RuleDecl, formatted: &mut String) {
         push_line(formatted, format!("  when {}", when.text));
     }
     push_line(formatted, "=> {");
-    push_block_body(&rule.body.text, formatted);
+    format_block_body(&rule.body.text, formatted);
     push_line(formatted, "}");
 }
 
+fn format_flow(flow: FlowDecl, formatted: &mut String) {
+    format_tags(&flow.tags, formatted);
+    format_description(flow.description.as_ref(), formatted);
+    push_line(formatted, format!("flow {}", flow.name.name));
+    for when in &flow.whens {
+        push_line(formatted, format!("  when {}", when.text));
+    }
+    // A flow opens its body with a bare `{` on its own line (after the `when`
+    // clauses), unlike a rule's `=> {`. The body is the raw source substring, so
+    // `format_block_body` re-indents it (string-aware) and carries its comments.
+    push_line(formatted, "{");
+    format_block_body(&flow.body.text, formatted);
+    push_line(formatted, "}");
+}
+
+/// Flat-prepend body emitter used where the output feeds IR construction (e.g.
+/// a table's synthetic rule body, whose `body_hash` is part of program identity).
+/// Kept byte-for-byte stable so the lowered IR / snapshots do not move; the
+/// idempotent re-indenter for human formatting is [`format_block_body`].
 fn push_block_body(body: &str, formatted: &mut String) {
     if body.is_empty() {
         return;
     }
-
     for line in body.lines() {
         if line.trim().is_empty() {
             formatted.push('\n');
@@ -10329,6 +13941,111 @@ fn push_block_body(body: &str, formatted: &mut String) {
             push_line(formatted, format!("  {}", line.trim_end()));
         }
     }
+}
+
+/// Re-indent a rule/apply body to a canonical form derived from brace nesting,
+/// so `whip fmt` is idempotent. Two concerns make this non-trivial:
+///   - **Bracket nesting:** code lines are indented by their `{`/`[`/`(` depth
+///     (string-aware via `scan_braces`), not by a flat prepend that compounds on
+///     nested `record`/`complete` blocks.
+///   - **Multi-line `"""..."""` strings:** the content is dedented to its common
+///     indent and re-indented to the block depth (preserving relative structure).
+///     This matches the single-pass canonical form AND is stable across passes,
+///     where the old flat prepend grew the string content every time.
+fn format_block_body(body: &str, formatted: &mut String) {
+    if body.trim().is_empty() {
+        return;
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let mut index = 0;
+    let mut depth: i32 = 1;
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        if trimmed.is_empty() {
+            formatted.push('\n');
+            index += 1;
+            continue;
+        }
+        let opens_with_closer = trimmed
+            .chars()
+            .next()
+            .is_some_and(|ch| matches!(ch, '}' | ']' | ')'));
+        let line_depth = if opens_with_closer {
+            (depth - 1).max(0)
+        } else {
+            depth
+        };
+        let prefix = "  ".repeat(line_depth as usize);
+        let (delta, opens_triple) = scan_braces(trimmed);
+        push_line(formatted, format!("{prefix}{trimmed}"));
+        if opens_triple {
+            // Collect the string content up to the closing `"""`.
+            let mut end = index + 1;
+            while end < lines.len() && lines[end].matches("\"\"\"").count() % 2 == 0 {
+                end += 1;
+            }
+            let content = &lines[index + 1..end];
+            let common = content
+                .iter()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| line.len() - line.trim_start().len())
+                .min()
+                .unwrap_or(0);
+            for line in content {
+                if line.trim().is_empty() {
+                    formatted.push('\n');
+                } else {
+                    push_line(formatted, format!("{prefix}{}", &line[common..]));
+                }
+            }
+            if end < lines.len() {
+                // The closing-delimiter line, re-indented to the block depth.
+                push_line(formatted, format!("{prefix}{}", lines[end].trim()));
+            }
+            index = end + 1;
+        } else {
+            index += 1;
+        }
+        depth = (depth + delta).max(0);
+    }
+}
+
+/// Net bracket-depth change for one line, ignoring brackets inside strings.
+/// Returns `(delta, opens_unclosed_triple)`: a `true` second element means the
+/// line starts a `"""..."""` that does not close on the same line, so following
+/// lines are string content. ASCII markers only — UTF-8 string bytes can't
+/// false-match.
+fn scan_braces(line: &str) -> (i32, bool) {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    let mut delta = 0i32;
+    let mut in_string = false;
+    while index < bytes.len() {
+        if in_string {
+            match bytes[index] {
+                b'\\' => index += 1,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+        if line[index..].starts_with("\"\"\"") {
+            match line[index + 3..].find("\"\"\"") {
+                Some(offset) => index += 3 + offset + 3,
+                None => return (delta, true),
+            }
+            continue;
+        }
+        match bytes[index] {
+            b'"' => in_string = true,
+            b'{' | b'[' | b'(' => delta += 1,
+            b'}' | b']' | b')' => delta -= 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    (delta, false)
 }
 
 impl TypeSyntax {
@@ -10366,6 +14083,7 @@ pub fn parser_stage() -> &'static str {
 struct Lexed {
     tokens: Vec<Token>,
     diagnostics: Vec<Diagnostic>,
+    comments: Vec<Comment>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -10401,6 +14119,7 @@ fn lex(source: &str) -> Lexed {
     let bytes = source.as_bytes();
     let mut tokens = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut comments = Vec::new();
     let mut index = 0;
 
     while index < bytes.len() {
@@ -10411,12 +14130,24 @@ fn lex(source: &str) -> Lexed {
         }
 
         if byte == b'#' {
-            index = skip_line(bytes, index + 1);
+            let end = skip_line(bytes, index + 1);
+            comments.push(Comment {
+                marker: CommentMarker::Hash,
+                text: source[index + 1..end].trim().to_owned(),
+                span: SourceSpan { start: index, end },
+            });
+            index = end;
             continue;
         }
 
         if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
-            index = skip_line(bytes, index + 2);
+            let end = skip_line(bytes, index + 2);
+            comments.push(Comment {
+                marker: CommentMarker::Slash,
+                text: source[index + 2..end].trim().to_owned(),
+                span: SourceSpan { start: index, end },
+            });
+            index = end;
             continue;
         }
 
@@ -10521,6 +14252,7 @@ fn lex(source: &str) -> Lexed {
         }
 
         diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: SourceSpan {
                 start: index,
                 end: index + 1,
@@ -10534,7 +14266,31 @@ fn lex(source: &str) -> Lexed {
     Lexed {
         tokens,
         diagnostics,
+        comments,
     }
+}
+
+/// Extract the comments from a source program, in source order. Comments are not
+/// part of the token stream or AST; this is the entry point tooling (`whip fmt`,
+/// the LSP) uses to preserve them.
+pub fn lex_comments(source: &str) -> Vec<Comment> {
+    lex(source).comments
+}
+
+/// Byte-span regions of string literals and comments in `source`. A tool that
+/// edits identifier occurrences (e.g. `whip lsp` rename) consults these to avoid
+/// touching text inside a prompt string or a comment — only code identifiers are
+/// real references.
+pub fn string_and_comment_spans(source: &str) -> Vec<SourceSpan> {
+    let lexed = lex(source);
+    let mut spans: Vec<SourceSpan> = lexed
+        .tokens
+        .iter()
+        .filter(|token| matches!(token.kind, TokenKind::String(_)))
+        .map(|token| token.span)
+        .collect();
+    spans.extend(lexed.comments.iter().map(|comment| comment.span));
+    spans
 }
 
 fn skip_line(bytes: &[u8], mut index: usize) -> usize {
@@ -10600,6 +14356,7 @@ fn lex_string(source: &str, start: usize) -> (Token, usize, Option<Diagnostic>) 
         },
         source.len(),
         Some(Diagnostic {
+            related: Vec::new(),
             span: SourceSpan {
                 start,
                 end: source.len(),
@@ -10650,7 +14407,7 @@ impl Parser<'_> {
                         workflows.push(parsed_workflow.decl);
                     } else {
                         if workflow.is_some() {
-                            self.diagnostics.push(Diagnostic {
+                            self.diagnostics.push(Diagnostic { related: Vec::new(),
                                 span: parsed_workflow.decl.name.span,
                                 message: "multiple implicit workflow headers are not supported"
                                     .to_owned(),
@@ -10793,6 +14550,7 @@ impl Parser<'_> {
         };
         if name.is_empty() {
             self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span,
                 message: "tag is missing a name".to_owned(),
                 suggestion: Some("write a tag such as `@fixture`".to_owned()),
@@ -10804,6 +14562,7 @@ impl Parser<'_> {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.'))
         {
             self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span,
                 message: format!("tag `@{name}` contains unsupported characters"),
                 suggestion: Some(
@@ -10818,6 +14577,7 @@ impl Parser<'_> {
     fn reject_pending_tags(&mut self, pending_tags: &mut Vec<TagDecl>, target: &str) {
         for tag in pending_tags.drain(..) {
             self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: tag.span,
                 message: format!("tag `@{}` cannot be attached to {target}", tag.name),
                 suggestion: Some(
@@ -10832,7 +14592,7 @@ impl Parser<'_> {
             return;
         };
         if let Some(previous) = pending_description.replace(description) {
-            self.diagnostics.push(Diagnostic {
+            self.diagnostics.push(Diagnostic { related: Vec::new(),
                 span: previous.span,
                 message: "description is not attached to a declaration".to_owned(),
                 suggestion: Some(
@@ -10861,6 +14621,7 @@ impl Parser<'_> {
     ) {
         if let Some(description) = pending_description.take() {
             self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: description.span,
                 message: format!("description cannot be attached to {target}"),
                 suggestion: Some(
@@ -10881,7 +14642,7 @@ impl Parser<'_> {
             return false;
         }
         let span = token.span;
-        self.diagnostics.push(Diagnostic {
+        self.diagnostics.push(Diagnostic { related: Vec::new(),
             span,
             message: format!(
                 "Gherkin keyword `{keyword}` is not WhippleScript workflow syntax"
@@ -10933,10 +14694,22 @@ impl Parser<'_> {
         } else if self.at_ident("flow") {
             self.parse_flow(std::mem::take(pending_tags), pending_description.take())
                 .map(Item::Flow)
+        } else if self.at_ident("action") {
+            self.reject_pending_tags(pending_tags, "action");
+            self.reject_pending_description(pending_description, "action");
+            self.parse_action().map(Item::Action)
         } else if self.at_ident("queue") {
             self.reject_pending_tags(pending_tags, "queue");
             self.reject_pending_description(pending_description, "queue");
             self.parse_queue().map(Item::Queue)
+        } else if self.at_ident("channel") {
+            self.reject_pending_tags(pending_tags, "channel");
+            self.reject_pending_description(pending_description, "channel");
+            self.parse_channel().map(Item::Channel)
+        } else if self.at_ident("file") {
+            self.reject_pending_tags(pending_tags, "file store");
+            self.reject_pending_description(pending_description, "file store");
+            self.parse_file_store().map(Item::FileStore)
         } else if self.at_ident("harness") {
             self.reject_pending_tags(pending_tags, "harness");
             self.reject_pending_description(pending_description, "harness");
@@ -10949,10 +14722,18 @@ impl Parser<'_> {
             self.reject_pending_tags(pending_tags, "enum");
             self.reject_pending_description(pending_description, "enum");
             self.parse_enum().map(Item::Enum)
-        } else if self.at_ident("event") {
-            self.reject_pending_tags(pending_tags, "event");
-            self.reject_pending_description(pending_description, "event");
+        } else if self.at_ident("signal") {
+            self.reject_pending_tags(pending_tags, "signal");
+            self.reject_pending_description(pending_description, "signal");
             self.parse_event().map(Item::Event)
+        } else if self.at_ident("source") {
+            self.reject_pending_tags(pending_tags, "source");
+            self.reject_pending_description(pending_description, "source");
+            self.parse_source().map(Item::Source)
+        } else if self.at_ident("test") {
+            self.reject_pending_tags(pending_tags, "test");
+            self.reject_pending_description(pending_description, "test");
+            self.parse_test().map(Item::Test)
         } else if self.at_ident("lease") {
             self.reject_pending_tags(pending_tags, "lease");
             self.reject_pending_description(pending_description, "lease");
@@ -11143,17 +14924,17 @@ impl Parser<'_> {
                 TokenKind::Ident(value) => value.as_str(),
                 _ => "",
             };
-            self.diagnostics.push(Diagnostic {
+            self.diagnostics.push(Diagnostic { related: Vec::new(),
                 span: removed_kind.span,
                 message: format!("`use {removed_label}` is no longer supported"),
                 suggestion: Some(
-                    "write `use memory` for plugins; attach skills with `agent { skills [...] }`"
+                    "write `use memory` for package libraries; attach skills with `agent { skills [...] }`"
                         .to_owned(),
                 ),
             });
         }
         Some(UseDecl {
-            name: self.expect_use_name("plugin name")?,
+            name: self.expect_use_name("package library name")?,
         })
     }
 
@@ -11166,6 +14947,7 @@ impl Parser<'_> {
             Some(seconds) if seconds > 0 => Some(seconds),
             _ => {
                 self.diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: span.join(unit.span),
                     message: format!("invalid duration `{value}{}`", unit.name),
                     suggestion: Some("use `<n><unit>` with unit s, m, h, or d".to_owned()),
@@ -11198,6 +14980,7 @@ impl Parser<'_> {
                 "ttl" => ttl_seconds = self.parse_decl_duration_seconds("ttl duration"),
                 other => {
                     self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: field.span,
                         message: format!("unknown lease field `{other}`"),
                         suggestion: Some("lease fields are `key`, `slots`, and `ttl`".to_owned()),
@@ -11213,6 +14996,7 @@ impl Parser<'_> {
         };
         let (Some(key_type), Some(ttl_seconds)) = (key_type, ttl_seconds) else {
             self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span,
                 message: format!(
                     "lease `{}` must declare a `key` type and a `ttl` backstop",
@@ -11252,6 +15036,7 @@ impl Parser<'_> {
                         self.advance();
                     } else {
                         self.diagnostics.push(Diagnostic {
+                            related: Vec::new(),
                             span: field.span,
                             message: "expected `by` after `partition`".to_owned(),
                             suggestion: Some("write `partition by <field>`".to_owned()),
@@ -11262,6 +15047,7 @@ impl Parser<'_> {
                 "retain" => retain_seconds = self.parse_decl_duration_seconds("retain duration"),
                 other => {
                     self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: field.span,
                         message: format!("unknown ledger field `{other}`"),
                         suggestion: Some(
@@ -11281,6 +15067,7 @@ impl Parser<'_> {
             (entry_schema, partition_field, retain_seconds)
         else {
             self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span,
                 message: format!(
                     "ledger `{}` must declare `entry`, `partition by`, and `retain`",
@@ -11327,6 +15114,7 @@ impl Parser<'_> {
                         "hourly" | "daily" | "weekly" | "monthly"
                     ) {
                         self.diagnostics.push(Diagnostic {
+                            related: Vec::new(),
                             span: period.span,
                             message: format!("unknown reset period `{}`", period.name),
                             suggestion: Some(
@@ -11338,6 +15126,7 @@ impl Parser<'_> {
                 }
                 other => {
                     self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: field.span,
                         message: format!("unknown counter field `{other}`"),
                         suggestion: Some("counter fields are `key`, `cap`, and `reset`".to_owned()),
@@ -11353,6 +15142,7 @@ impl Parser<'_> {
         };
         let (Some(key_type), Some(cap), Some(reset)) = (key_type, cap, reset) else {
             self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span,
                 message: format!(
                     "counter `{}` must declare `key`, `cap`, and `reset`",
@@ -11387,6 +15177,7 @@ impl Parser<'_> {
                 }
                 other => {
                     self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span: field.span,
                         message: format!("unknown queue field `{other}`"),
                         suggestion: Some("the only queue field is `tracker`".to_owned()),
@@ -11398,6 +15189,7 @@ impl Parser<'_> {
         let close = self.expect_symbol('}')?;
         let Some(tracker) = tracker else {
             self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: SourceSpan {
                     start,
                     end: close.span.end,
@@ -11410,6 +15202,171 @@ impl Parser<'_> {
         Some(QueueDecl {
             name,
             tracker,
+            span: SourceSpan {
+                start,
+                end: close.span.end,
+            },
+        })
+    }
+
+    fn parse_channel(&mut self) -> Option<ChannelDecl> {
+        let start = self.expect_keyword("channel")?.span.start;
+        let name = self.expect_ident("channel name")?;
+        self.expect_symbol('{')?;
+        let mut provider = None;
+        let mut workspace = None;
+        let mut destination = None;
+        while !self.is_at_end() && !self.at_symbol('}') {
+            let Some(field) = self.expect_ident("channel field") else {
+                self.synchronize_to_block_item();
+                continue;
+            };
+            match field.name.as_str() {
+                "provider" => {
+                    provider = self.expect_ident("channel provider");
+                }
+                "workspace" => {
+                    workspace = self.expect_ident("channel workspace");
+                }
+                "destination" => {
+                    destination = self.expect_string("channel destination");
+                }
+                other => {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: field.span,
+                        message: format!("unknown channel field `{other}`"),
+                        suggestion: Some(
+                            "channel fields are `provider`, `workspace`, and `destination`"
+                                .to_owned(),
+                        ),
+                    });
+                    self.synchronize_to_block_item();
+                }
+            }
+        }
+        let close = self.expect_symbol('}')?;
+        let Some(provider) = provider else {
+            self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: SourceSpan {
+                    start,
+                    end: close.span.end,
+                },
+                message: format!("channel `{}` is missing a provider", name.name),
+                suggestion: Some("add `provider <name>` inside the channel block".to_owned()),
+            });
+            return None;
+        };
+        Some(ChannelDecl {
+            name,
+            provider,
+            workspace,
+            destination,
+            span: SourceSpan {
+                start,
+                end: close.span.end,
+            },
+        })
+    }
+
+    fn parse_file_store(&mut self) -> Option<FileStoreDecl> {
+        let start = self.expect_keyword("file")?.span.start;
+        if !self.consume_ident("store") {
+            self.expected("`store` after `file`");
+            return None;
+        }
+        let name = self.expect_ident("file store name")?;
+        self.expect_symbol('{')?;
+        let mut root = None;
+        let mut read_globs = Vec::new();
+        let mut write_globs = Vec::new();
+        let mut root_span = None;
+        let mut read_span = None;
+        let mut write_span = None;
+        while !self.is_at_end() && !self.at_symbol('}') {
+            let Some(field) = self.expect_ident("file store field") else {
+                self.synchronize_to_block_item();
+                continue;
+            };
+            match field.name.as_str() {
+                "root" => {
+                    root_span = Some(field.span);
+                    root = self
+                        .expect_string("file store root")
+                        .map(|literal| literal.value);
+                }
+                // `allow read [...]` / `allow write [...]`: narrow which paths
+                // (relative to root) the store permits. Optional — an absent
+                // clause means any path inside the root.
+                "allow" => {
+                    let Some(direction) = self.expect_ident("`read` or `write` after `allow`")
+                    else {
+                        self.synchronize_to_block_item();
+                        continue;
+                    };
+                    let globs = self
+                        .parse_string_list()
+                        .map(|(literals, _)| {
+                            literals.into_iter().map(|literal| literal.value).collect()
+                        })
+                        .unwrap_or_default();
+                    match direction.name.as_str() {
+                        "read" => {
+                            read_span = Some(field.span);
+                            read_globs = globs;
+                        }
+                        "write" => {
+                            write_span = Some(field.span);
+                            write_globs = globs;
+                        }
+                        other => {
+                            self.diagnostics.push(Diagnostic {
+                                related: Vec::new(),
+                                span: direction.span,
+                                message: format!("unknown `allow` direction `{other}`"),
+                                suggestion: Some(
+                                    "use `allow read [...]` or `allow write [...]`".to_owned(),
+                                ),
+                            });
+                        }
+                    }
+                }
+                other => {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: field.span,
+                        message: format!("unknown file store field `{other}`"),
+                        suggestion: Some(
+                            "file store fields are `root`, `allow read [...]`, `allow write [...]`"
+                                .to_owned(),
+                        ),
+                    });
+                    self.synchronize_to_block_item();
+                }
+            }
+        }
+        let close = self.expect_symbol('}')?;
+        let Some(root) = root else {
+            self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: SourceSpan {
+                    start,
+                    end: close.span.end,
+                },
+                message: format!("file store `{}` is missing a root", name.name),
+                suggestion: Some("add `root \"<dir>\"` inside the file store block".to_owned()),
+            });
+            return None;
+        };
+        Some(FileStoreDecl {
+            name,
+            root,
+            read_globs,
+            write_globs,
+            root_span,
+            read_span,
+            write_span,
             span: SourceSpan {
                 start,
                 end: close.span.end,
@@ -11537,6 +15494,7 @@ impl Parser<'_> {
                         span: field_name.span.join(ty.span()),
                         name: field_name,
                         ty,
+                        is_key: false,
                     });
                 }
                 if let Some(close) = self.expect_symbol('}') {
@@ -11567,17 +15525,15 @@ impl Parser<'_> {
     }
 
     fn parse_event(&mut self) -> Option<EventDecl> {
-        let start = self.expect_keyword("event")?.span.start;
+        let start = self.expect_keyword("signal")?.span.start;
         // Dotted lowercase name (`deploy.finished`), matching the `when fact`
         // convention and distinct from PascalCase classes.
-        let first = self.expect_ident("event name")?;
+        let first = self.expect_ident("signal name")?;
         let mut name = first.name.clone();
         let mut name_span = first.span;
         while self.at_symbol('.') {
             self.expect_symbol('.');
-            let Some(segment) = self.expect_ident("event name segment") else {
-                return None;
-            };
+            let segment = self.expect_ident("signal name segment")?;
             name.push('.');
             name.push_str(&segment.name);
             name_span = name_span.join(segment.span);
@@ -11588,8 +15544,9 @@ impl Parser<'_> {
                 .any(|segment| segment.chars().next().is_some_and(char::is_uppercase))
         {
             self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: name_span,
-                message: format!("event name `{name}` must be dotted lowercase"),
+                message: format!("signal name `{name}` must be dotted lowercase"),
                 suggestion: Some(
                     "use a dotted lowercase name such as `deploy.finished`".to_owned(),
                 ),
@@ -11598,7 +15555,7 @@ impl Parser<'_> {
         let open = self.expect_symbol('{')?;
         let mut fields = Vec::new();
         while !self.is_at_end() && !self.at_symbol('}') {
-            let Some(field_name) = self.expect_ident("event field name") else {
+            let Some(field_name) = self.expect_ident("signal field name") else {
                 self.synchronize_to_block_item();
                 continue;
             };
@@ -11610,6 +15567,7 @@ impl Parser<'_> {
                 span: field_name.span.join(ty.span()),
                 name: field_name,
                 ty,
+                is_key: false,
             });
         }
         let end = self
@@ -11622,6 +15580,741 @@ impl Parser<'_> {
             fields,
             span: SourceSpan { start, end },
         })
+    }
+
+    fn last_span_end(&self) -> usize {
+        self.pos
+            .checked_sub(1)
+            .and_then(|index| self.tokens.get(index))
+            .map(|token| token.span.end)
+            .unwrap_or(0)
+    }
+
+    fn parse_dotted_name(&mut self, label: &str) -> Option<String> {
+        let first = self.expect_ident(label)?;
+        let mut name = first.name.clone();
+        while self.at_symbol('.') {
+            self.advance();
+            let segment = self.expect_ident(label)?;
+            name.push('.');
+            name.push_str(&segment.name);
+        }
+        Some(name)
+    }
+
+    /// Capture the source text of an expression from the current token to end of
+    /// line (the `assert`/guard idiom), advancing past the consumed tokens.
+    fn capture_expr_to_line_end(&mut self) -> (String, SourceSpan) {
+        let start = self
+            .peek()
+            .map(|token| token.span.start)
+            .unwrap_or(self.source.len());
+        let line_end = self.source[start..]
+            .find('\n')
+            .map(|offset| start + offset)
+            .unwrap_or(self.source.len());
+        let mut end = start;
+        while !self.is_at_end() {
+            let Some(token) = self.peek() else { break };
+            if token.span.start >= line_end {
+                break;
+            }
+            let token_end = token.span.end.min(line_end);
+            self.advance();
+            end = token_end;
+        }
+        let span = SourceSpan { start, end };
+        trimmed_source_text(self.source_text(span), span)
+    }
+
+    /// Capture source text up to (but not including) a terminator identifier or a
+    /// closing brace — used for a predicate bounded by `is`.
+    fn capture_expr_until_ident(&mut self, terminator: &str) -> (String, SourceSpan) {
+        let start = self
+            .peek()
+            .map(|token| token.span.start)
+            .unwrap_or(self.source.len());
+        let mut end = start;
+        while !self.is_at_end() && !self.at_ident(terminator) && !self.at_symbol('}') {
+            let Some(token) = self.peek() else { break };
+            let token_end = token.span.end;
+            self.advance();
+            end = token_end;
+        }
+        let span = SourceSpan { start, end };
+        trimmed_source_text(self.source_text(span), span)
+    }
+
+    fn parse_test(&mut self) -> Option<TestDecl> {
+        let start = self.expect_keyword("test")?.span.start;
+        let name = self.expect_string("test name")?;
+        let open = self.expect_symbol('{')?;
+        let mut workflow = None;
+        let mut clauses = Vec::new();
+        while !self.is_at_end() && !self.at_symbol('}') {
+            if self.at_ident("workflow") {
+                self.advance();
+                match self.expect_ident("workflow name") {
+                    Some(name) => {
+                        if workflow.is_some() {
+                            self.diagnostics.push(Diagnostic {
+                                related: Vec::new(),
+                                span: name.span,
+                                message: "a test scenario binds at most one `workflow`".to_owned(),
+                                suggestion: Some(
+                                    "remove the extra `workflow <Name>` header".to_owned(),
+                                ),
+                            });
+                        }
+                        workflow = Some(name);
+                    }
+                    None => self.synchronize_to_block_item(),
+                }
+            } else if self.at_ident("given") {
+                match self.parse_given() {
+                    Some(clause) => clauses.push(TestClause::Given(clause)),
+                    None => self.synchronize_to_block_item(),
+                }
+            } else if self.at_ident("stub") {
+                match self.parse_stub() {
+                    Some(clause) => clauses.push(TestClause::Stub(clause)),
+                    None => self.synchronize_to_block_item(),
+                }
+            } else if self.at_ident("run") {
+                match self.parse_run() {
+                    Some(clause) => clauses.push(TestClause::Run(clause)),
+                    None => self.synchronize_to_block_item(),
+                }
+            } else if self.at_ident("expect") {
+                match self.parse_expect() {
+                    Some(clause) => clauses.push(TestClause::Expect(clause)),
+                    None => self.synchronize_to_block_item(),
+                }
+            } else {
+                self.unexpected("a test clause (`workflow`, `given`, `stub`, `run`, or `expect`)");
+                self.synchronize_to_block_item();
+            }
+        }
+        let end = self
+            .expect_symbol('}')
+            .map(|token| token.span.end)
+            .unwrap_or(open.span.end);
+        Some(TestDecl {
+            name,
+            workflow,
+            clauses,
+            span: SourceSpan { start, end },
+        })
+    }
+
+    fn parse_test_record(&mut self) -> Option<(Vec<TestField>, usize)> {
+        let open = self.expect_symbol('{')?;
+        let mut fields = Vec::new();
+        while !self.is_at_end() && !self.at_symbol('}') {
+            let Some(name) = self.expect_ident("test field name") else {
+                self.synchronize_to_block_item();
+                continue;
+            };
+            let (value, value_span) = self.capture_expr_to_line_end();
+            fields.push(TestField {
+                span: name.span.join(value_span),
+                name,
+                value,
+            });
+        }
+        let end = self
+            .expect_symbol('}')
+            .map(|token| token.span.end)
+            .unwrap_or(open.span.end);
+        Some((fields, end))
+    }
+
+    fn parse_given(&mut self) -> Option<GivenClause> {
+        let start = self.expect_keyword("given")?.span.start;
+        if self.consume_ident("input") {
+            let (fields, end) = self.parse_test_record()?;
+            Some(GivenClause::Input {
+                fields,
+                span: SourceSpan { start, end },
+            })
+        } else if self.consume_ident("fact") {
+            let ty = self.expect_ident("fact type")?;
+            let (fields, end) = self.parse_test_record()?;
+            Some(GivenClause::Fact {
+                ty,
+                fields,
+                span: SourceSpan { start, end },
+            })
+        } else if self.consume_ident("signal") {
+            let name = self.parse_dotted_name("signal name")?;
+            let (fields, end) = self.parse_test_record()?;
+            Some(GivenClause::Signal {
+                name,
+                fields,
+                span: SourceSpan { start, end },
+            })
+        } else if self.consume_ident("clock") {
+            if !self.consume_ident("at") {
+                self.expected("`at <timestamp>` after `given clock`");
+            }
+            let at = self.expect_string("clock timestamp")?;
+            let end = at.span.end;
+            Some(GivenClause::Clock {
+                at,
+                span: SourceSpan { start, end },
+            })
+        } else if self.consume_ident("tracker") {
+            let tracker = self.parse_dotted_name("tracker name")?;
+            if !self.consume_ident("issue") {
+                self.expected("`issue { … }` after `given tracker <name>`");
+            }
+            let (fields, end) = self.parse_test_record()?;
+            Some(GivenClause::Tracker {
+                tracker,
+                fields,
+                span: SourceSpan { start, end },
+            })
+        } else if self.consume_ident("file") {
+            let store = self.parse_dotted_name("file store name")?;
+            if !self.consume_ident("at") {
+                self.expected("`at <path> \"<content>\"` after `given file <store>`");
+            }
+            let path = self.expect_string("file path")?;
+            let content = self.expect_string("file content")?;
+            let end = content.span.end;
+            Some(GivenClause::File {
+                store,
+                path,
+                content,
+                span: SourceSpan { start, end },
+            })
+        } else {
+            self.unexpected(
+                "`input`, `fact`, `signal`, `clock`, `tracker`, or `file` after `given`",
+            );
+            None
+        }
+    }
+
+    fn parse_stub(&mut self) -> Option<StubClause> {
+        let start = self.expect_keyword("stub")?.span.start;
+        // Surface path: dotted-name segments up to the outcome, all on the `stub`
+        // line. The trailing segment (before a `{`, string, or end-of-line) is the
+        // outcome; the rest is the surface. v0 keeps this lexical: at least one
+        // surface segment + one outcome.
+        let line_end = self.source[start..]
+            .find('\n')
+            .map(|offset| start + offset)
+            .unwrap_or(self.source.len());
+        let mut segments = Vec::new();
+        while matches!(
+            self.peek().map(|token| &token.kind),
+            Some(TokenKind::Ident(_))
+        ) && self
+            .peek()
+            .map_or(false, |token| token.span.start < line_end)
+        {
+            match self.parse_dotted_name("stub surface") {
+                Some(segment) => segments.push(segment),
+                None => break,
+            }
+        }
+        if segments.len() < 2 {
+            self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: SourceSpan {
+                    start,
+                    end: self.last_span_end(),
+                },
+                message: "stub needs a surface and an outcome (e.g. `stub agent triager succeeds`)"
+                    .to_owned(),
+                suggestion: Some("write `stub <surface...> <outcome> [payload]`".to_owned()),
+            });
+            return None;
+        }
+        let outcome = segments.pop().expect("outcome present");
+        let surface = segments;
+        let payload = if self.at_symbol('{') {
+            let (fields, _) = self.parse_test_record()?;
+            Some(StubPayload::Record(fields))
+        } else if matches!(
+            self.peek().map(|token| &token.kind),
+            Some(TokenKind::String(_))
+        ) {
+            Some(StubPayload::Message(self.expect_string("stub message")?))
+        } else {
+            None
+        };
+        let end = self.last_span_end();
+        Some(StubClause {
+            surface,
+            outcome,
+            payload,
+            span: SourceSpan { start, end },
+        })
+    }
+
+    fn parse_run(&mut self) -> Option<RunClause> {
+        let start = self.expect_keyword("run")?.span.start;
+        let kind = if self.consume_ident("until") {
+            if self.consume_ident("idle") {
+                RunKind::UntilIdle
+            } else if self.consume_ident("workflow") {
+                if self.consume_ident("completed") {
+                    RunKind::UntilWorkflowCompleted
+                } else if self.consume_ident("failed") {
+                    RunKind::UntilWorkflowFailed
+                } else {
+                    self.expected("`completed` or `failed` after `workflow`");
+                    return None;
+                }
+            } else {
+                self.expected("`idle` or `workflow completed|failed` after `until`");
+                return None;
+            }
+        } else if self.consume_ident("for") {
+            let (steps, _) = self.expect_u32("step count")?;
+            if !self.consume_ident("steps") {
+                self.expected("`steps` after the step count");
+            }
+            RunKind::ForSteps(steps)
+        } else {
+            self.expected("`until ...` or `for <N> steps` after `run`");
+            return None;
+        };
+        let end = self.last_span_end();
+        Some(RunClause {
+            kind,
+            span: SourceSpan { start, end },
+        })
+    }
+
+    fn parse_expect(&mut self) -> Option<ExpectClause> {
+        let start = self.expect_keyword("expect")?.span.start;
+        let target = if self.consume_ident("workflow") {
+            if self.consume_ident("completed") {
+                ExpectTarget::WorkflowCompleted
+            } else if self.consume_ident("failed") {
+                let failure = if self.consume_ident("with") {
+                    self.expect_ident("failure type")
+                } else {
+                    None
+                };
+                ExpectTarget::WorkflowFailed { failure }
+            } else {
+                self.expected("`completed` or `failed` after `workflow`");
+                return None;
+            }
+        } else if self.consume_ident("rule") {
+            let name = self.expect_ident("rule name")?;
+            let status = if self.consume_ident("fired") {
+                if matches!(
+                    self.peek().map(|token| &token.kind),
+                    Some(TokenKind::Number(_))
+                ) {
+                    let (count, _) = self.expect_u32("fired count")?;
+                    if !self.consume_ident("times") {
+                        self.expected("`times` after the fired count");
+                    }
+                    RuleStatus::FiredTimes(count)
+                } else {
+                    RuleStatus::Fired
+                }
+            } else if self.consume_ident("did") {
+                if !self.consume_ident("not") {
+                    self.expected("`not` in `did not fire`");
+                }
+                if !self.consume_ident("fire") {
+                    self.expected("`fire` in `did not fire`");
+                }
+                RuleStatus::DidNotFire
+            } else {
+                self.expected("`fired`, `fired <N> times`, or `did not fire`");
+                return None;
+            };
+            ExpectTarget::Rule { name, status }
+        } else if self.consume_ident("effect") {
+            let name = self.parse_dotted_name("effect name")?;
+            let status = if self.consume_ident("requested") {
+                EffectStatus::Requested
+            } else if self.consume_ident("completed") {
+                EffectStatus::Completed
+            } else if self.consume_ident("failed") {
+                EffectStatus::Failed
+            } else {
+                self.expected("`requested`, `completed`, or `failed` after the effect name");
+                return None;
+            };
+            ExpectTarget::Effect { name, status }
+        } else if self.consume_ident("diagnostic") {
+            let code = self.parse_dotted_name("diagnostic code")?;
+            ExpectTarget::Diagnostic { code }
+        } else if self.consume_ident("no") {
+            let name = self.parse_dotted_name("forbidden effect name")?;
+            ExpectTarget::NoEffect { name }
+        } else {
+            let noun = self.parse_dotted_name("projection noun")?;
+            let kind = self.parse_proj_query_kind()?;
+            let end = self.last_span_end();
+            ExpectTarget::Projection(ProjQuery {
+                noun,
+                kind,
+                span: SourceSpan { start, end },
+            })
+        };
+        let end = self.last_span_end();
+        Some(ExpectClause {
+            target,
+            span: SourceSpan { start, end },
+        })
+    }
+
+    fn parse_proj_query_kind(&mut self) -> Option<ProjQueryKind> {
+        if self.consume_ident("exists") {
+            return Some(ProjQueryKind::Exists);
+        }
+        if self.consume_ident("count") {
+            if !self.consume_ident("where") {
+                self.expected("`where <predicate> is <N>` after `count`");
+                return None;
+            }
+            let (predicate, _) = self.capture_expr_until_ident("is");
+            if !self.consume_ident("is") {
+                self.expected("`is <N>` after the count predicate");
+                return None;
+            }
+            let (count, _) = self.expect_u32("count value")?;
+            return Some(ProjQueryKind::Count { predicate, count });
+        }
+        if self.consume_ident("where") {
+            let (predicate, _) = self.capture_expr_to_line_end();
+            return Some(ProjQueryKind::Where { predicate });
+        }
+        self.expected("`exists`, `count where ... is <N>`, or `where ...`");
+        None
+    }
+
+    fn parse_source(&mut self) -> Option<SourceDecl> {
+        let start = self.expect_keyword("source")?.span.start;
+        let provider = self.expect_ident("source provider")?;
+        let is_clock = provider.name == "clock";
+        if !self.consume_ident("as") {
+            self.expected("`as <name>` after the source provider");
+            return None;
+        }
+        let name = self.expect_ident("source name")?;
+        let open = self.expect_symbol('{')?;
+
+        let mut recurrence: Option<Recurrence> = None;
+        let mut timezone: Option<StringLiteral> = None;
+        let mut missed: Option<MissedPolicy> = None;
+        let mut observe_binding: Option<Ident> = None;
+        let mut emit: Option<SourceEmit> = None;
+
+        while !self.is_at_end() && !self.at_symbol('}') {
+            if self.at_ident("every") || self.at_ident("at") {
+                if let Some(parsed) = self.parse_recurrence() {
+                    recurrence = Some(parsed);
+                } else {
+                    self.synchronize_to_block_item();
+                }
+            } else if self.at_ident("timezone") {
+                self.advance();
+                timezone = self.expect_string("timezone string");
+            } else if self.at_ident("missed") {
+                missed = self.parse_missed_policy();
+            } else if self.at_ident("observe") {
+                self.advance();
+                if !self.consume_ident("as") {
+                    self.expected("`as <binding>` after `observe`");
+                }
+                observe_binding = self.expect_ident("observe binding");
+            } else if self.at_ident("emit") {
+                emit = self.parse_source_emit();
+            } else {
+                self.unexpected(
+                    "a source clause (`every`/`at`, `timezone`, `missed`, `observe`, `emit`)",
+                );
+                self.synchronize_to_block_item();
+            }
+        }
+        let end = self
+            .expect_symbol('}')
+            .map(|token| token.span.end)
+            .unwrap_or(open.span.end);
+        let span = SourceSpan { start, end };
+
+        let observe_binding = match observe_binding {
+            Some(binding) => binding,
+            None => {
+                self.diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span,
+                    message: format!("source `{}` must declare `observe as <binding>`", name.name),
+                    suggestion: Some("add `observe as tick`".to_owned()),
+                });
+                return None;
+            }
+        };
+        let emit = match emit {
+            Some(emit) => emit,
+            None => {
+                self.diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span,
+                    message: format!(
+                        "source `{}` must declare `emit <signal> {{ ... }}`",
+                        name.name
+                    ),
+                    suggestion: Some("add `emit triage.tick { ... }`".to_owned()),
+                });
+                return None;
+            }
+        };
+
+        let clock = if is_clock {
+            let recurrence = match recurrence {
+                Some(recurrence) => recurrence,
+                None => {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span,
+                        message: format!("clock source `{}` must declare a recurrence", name.name),
+                        suggestion: Some(
+                            "add `every weekday at 09:00`, `every 5m`, or `at 09:00`".to_owned(),
+                        ),
+                    });
+                    return None;
+                }
+            };
+            Some(ClockPolicy {
+                recurrence,
+                timezone,
+                missed,
+                span,
+            })
+        } else {
+            if recurrence.is_some() || timezone.is_some() || missed.is_some() {
+                self.diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span,
+                    message: format!(
+                        "source `{}` uses clock-only clauses but its provider is `{}`, not `clock`",
+                        name.name, provider.name
+                    ),
+                    suggestion: Some(
+                        "use `source clock as ...` for recurrence, timezone, or missed clauses"
+                            .to_owned(),
+                    ),
+                });
+            }
+            None
+        };
+
+        Some(SourceDecl {
+            name,
+            provider,
+            clock,
+            observe_binding,
+            emit,
+            span,
+        })
+    }
+
+    fn parse_recurrence(&mut self) -> Option<Recurrence> {
+        if self.at_ident("at") {
+            let at = self.expect_keyword("at")?;
+            let time = self.parse_time_of_day()?;
+            return Some(Recurrence::At {
+                span: at.span.join(time.span),
+                time,
+            });
+        }
+        let every = self.expect_keyword("every")?;
+        if matches!(
+            self.peek().map(|token| &token.kind),
+            Some(TokenKind::Number(_))
+        ) {
+            let (value, _) = self.expect_u32("recurrence interval")?;
+            let unit = self.expect_ident("duration unit (`s`, `m`, `h`, or `d`)")?;
+            let seconds = match unit.name.as_str() {
+                "s" => value as u64,
+                "m" => value as u64 * 60,
+                "h" => value as u64 * 3_600,
+                "d" => value as u64 * 86_400,
+                other => {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: unit.span,
+                        message: format!("unknown duration unit `{other}`"),
+                        suggestion: Some("use `s`, `m`, `h`, or `d`".to_owned()),
+                    });
+                    return None;
+                }
+            };
+            return Some(Recurrence::EveryDuration {
+                seconds,
+                source: format!("{value}{}", unit.name),
+                span: every.span.join(unit.span),
+            });
+        }
+        let pattern_ident =
+            self.expect_ident("calendar pattern (`day`, `weekday`, or a weekday)")?;
+        let pattern = match pattern_ident.name.as_str() {
+            "day" => CalendarPattern::Day,
+            "weekday" => CalendarPattern::Weekday,
+            "monday" => CalendarPattern::Weekly(Weekday::Monday),
+            "tuesday" => CalendarPattern::Weekly(Weekday::Tuesday),
+            "wednesday" => CalendarPattern::Weekly(Weekday::Wednesday),
+            "thursday" => CalendarPattern::Weekly(Weekday::Thursday),
+            "friday" => CalendarPattern::Weekly(Weekday::Friday),
+            "saturday" => CalendarPattern::Weekly(Weekday::Saturday),
+            "sunday" => CalendarPattern::Weekly(Weekday::Sunday),
+            other => {
+                self.diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: pattern_ident.span,
+                    message: format!("unknown calendar pattern `{other}`"),
+                    suggestion: Some(
+                        "use `day`, `weekday`, or a weekday such as `monday`".to_owned(),
+                    ),
+                });
+                return None;
+            }
+        };
+        if !self.consume_ident("at") {
+            self.expected("`at <hh:mm>` after the calendar pattern");
+            return None;
+        }
+        let time = self.parse_time_of_day()?;
+        Some(Recurrence::EveryCalendar {
+            pattern,
+            span: every.span.join(time.span),
+            time,
+        })
+    }
+
+    fn parse_time_of_day(&mut self) -> Option<TimeOfDay> {
+        let (hour, hour_span) = self.expect_u32("hour")?;
+        self.expect_symbol(':')?;
+        let (minute, minute_span) = self.expect_u32("minute")?;
+        if hour > 23 || minute > 59 {
+            self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: hour_span.join(minute_span),
+                message: format!("invalid time of day `{hour:02}:{minute:02}`"),
+                suggestion: Some("use a 24-hour `hh:mm` such as `09:00`".to_owned()),
+            });
+            return None;
+        }
+        Some(TimeOfDay {
+            hour: hour as u8,
+            minute: minute as u8,
+            span: hour_span.join(minute_span),
+        })
+    }
+
+    fn parse_missed_policy(&mut self) -> Option<MissedPolicy> {
+        self.expect_keyword("missed")?;
+        if self.consume_ident("skip") {
+            return Some(MissedPolicy::Skip);
+        }
+        if self.consume_ident("coalesce") {
+            return Some(MissedPolicy::Coalesce);
+        }
+        if self.consume_ident("catch_up") {
+            if !self.consume_ident("limit") {
+                self.expected("`limit <N>` after `catch_up`");
+                return None;
+            }
+            let (limit, _) = self.expect_u32("catch_up limit")?;
+            return Some(MissedPolicy::CatchUp { limit });
+        }
+        self.expected("`skip`, `coalesce`, or `catch_up limit <N>`");
+        None
+    }
+
+    fn parse_source_emit(&mut self) -> Option<SourceEmit> {
+        let emit = self.expect_keyword("emit")?;
+        let first = self.expect_ident("emit signal name")?;
+        let mut signal = first.name.clone();
+        let mut signal_span = first.span;
+        while self.at_symbol('.') {
+            self.advance();
+            let segment = self.expect_ident("signal name segment")?;
+            signal.push('.');
+            signal.push_str(&segment.name);
+            signal_span = signal_span.join(segment.span);
+        }
+        let open = self.expect_symbol('{')?;
+        let mut fields = Vec::new();
+        while !self.is_at_end() && !self.at_symbol('}') {
+            let Some(field_name) = self.expect_ident("emit field name") else {
+                self.synchronize_to_block_item();
+                continue;
+            };
+            let Some(value) = self.parse_source_value() else {
+                self.synchronize_to_block_item();
+                continue;
+            };
+            let value_span = match &value {
+                SourceValue::Path { span, .. } => *span,
+                SourceValue::String(literal) => literal.span,
+                SourceValue::Number(_, span) => *span,
+            };
+            fields.push(SourceEmitField {
+                span: field_name.span.join(value_span),
+                name: field_name,
+                value,
+            });
+        }
+        let end = self
+            .expect_symbol('}')
+            .map(|token| token.span.end)
+            .unwrap_or(open.span.end);
+        Some(SourceEmit {
+            signal,
+            signal_span,
+            fields,
+            span: SourceSpan {
+                start: emit.span.start,
+                end,
+            },
+        })
+    }
+
+    fn parse_source_value(&mut self) -> Option<SourceValue> {
+        match self.peek().map(|token| &token.kind) {
+            Some(TokenKind::String(_)) => self.expect_string("value").map(SourceValue::String),
+            Some(TokenKind::Number(_)) => {
+                let token = self.advance().clone();
+                if let TokenKind::Number(value) = token.kind {
+                    Some(SourceValue::Number(value, token.span))
+                } else {
+                    None
+                }
+            }
+            Some(TokenKind::Ident(_)) => {
+                let binding = self.expect_ident("value path")?;
+                let mut segments = Vec::new();
+                let mut span = binding.span;
+                while self.at_symbol('.') {
+                    self.advance();
+                    let segment = self.expect_ident("path segment")?;
+                    span = span.join(segment.span);
+                    segments.push(segment);
+                }
+                Some(SourceValue::Path {
+                    binding,
+                    segments,
+                    span,
+                })
+            }
+            _ => {
+                self.expected("a value (observation path, string, or number)");
+                None
+            }
+        }
     }
 
     fn parse_class(&mut self) -> Option<ClassDecl> {
@@ -11639,10 +16332,31 @@ impl Parser<'_> {
                 self.synchronize_to_block_item();
                 continue;
             };
+            // `@key`: mark this field as the class's natural key (import per-row
+            // idempotency, spec/std-library/files.md).
+            let mut is_key = false;
+            if self.at_symbol('@') {
+                if let Some(tag) = self.parse_tag() {
+                    if tag.name == "key" {
+                        is_key = true;
+                    } else {
+                        self.diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: tag.span,
+                            message: format!("unknown field tag `@{}`", tag.name),
+                            suggestion: Some(
+                                "the only field tag is `@key` (the class natural key)".to_owned(),
+                            ),
+                        });
+                    }
+                }
+            }
+            let span = field_name.span.join(ty.span());
             fields.push(ClassField {
-                span: field_name.span.join(ty.span()),
+                span,
                 name: field_name,
                 ty,
+                is_key,
             });
         }
 
@@ -11731,6 +16445,7 @@ impl Parser<'_> {
 
         if depth != 0 {
             self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: SourceSpan {
                     start: open.span.start,
                     end: body_end,
@@ -11838,6 +16553,40 @@ impl Parser<'_> {
         })
     }
 
+    /// `action <name>(<param: type>, …) { <effect chain> }` (DR-0023). The body
+    /// is captured as a block source; expansion at call sites is a later slice.
+    fn parse_action(&mut self) -> Option<ActionDecl> {
+        let start = self.expect_keyword("action")?.span.start;
+        let name = self.expect_ident("action name")?;
+        self.expect_symbol('(')?;
+        let mut params = Vec::new();
+        while !self.is_at_end() && !self.at_symbol(')') {
+            let param_name = self.expect_ident("action parameter name")?;
+            let ty = self.parse_type()?;
+            let span = param_name.span.join(ty.span());
+            params.push(ActionParam {
+                name: param_name,
+                ty,
+                span,
+            });
+            if self.at_symbol(',') {
+                self.advance();
+            }
+        }
+        self.expect_symbol(')')?;
+        let body = self.parse_block_source()?;
+        let span = SourceSpan {
+            start,
+            end: body.span.end,
+        };
+        Some(ActionDecl {
+            name,
+            params,
+            body,
+            span,
+        })
+    }
+
     fn parse_rule(
         &mut self,
         tags: Vec<TagDecl>,
@@ -11856,6 +16605,7 @@ impl Parser<'_> {
                     .map(|token| token.span)
                     .unwrap_or(SourceSpan { start, end: start });
                 self.diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span,
                     message: "`with` is not a rule readiness clause".to_owned(),
                     suggestion: Some("use `when` for rule conditions".to_owned()),
@@ -11936,11 +16686,11 @@ impl Parser<'_> {
         let text_start = when.end;
         let mut text_end = text_start;
 
-        while !self.is_at_end()
-            && !self.at_arrow()
-            && !self.at_ident("when")
-            && !self.at_ident("rule")
-            && !(stop_at_brace && self.at_symbol('{'))
+        while !(self.is_at_end()
+            || self.at_arrow()
+            || self.at_ident("when")
+            || self.at_ident("rule")
+            || stop_at_brace && self.at_symbol('{'))
         {
             text_end = self.peek()?.span.end;
             self.advance();
@@ -11983,6 +16733,7 @@ impl Parser<'_> {
 
         if depth != 0 {
             self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: SourceSpan {
                     start: when.start,
                     end: body_end,
@@ -12021,6 +16772,7 @@ impl Parser<'_> {
 
         if clauses.is_empty() {
             self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
                 span: SourceSpan {
                     start: when.start,
                     end: close_end,
@@ -12076,6 +16828,7 @@ impl Parser<'_> {
         }
 
         self.diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: SourceSpan {
                 start: open.span.start,
                 end: body_end,
@@ -12259,7 +17012,24 @@ impl Parser<'_> {
     fn expect_use_name(&mut self, label: &str) -> Option<StringLiteral> {
         let token = self.peek()?;
         match &token.kind {
-            TokenKind::Ident(value) | TokenKind::String(value) => {
+            // A package name may be a dotted path (`std.messaging`, `std.coord`)
+            // or a bare ident (`memory`); a string literal is also accepted.
+            TokenKind::Ident(value) => {
+                let mut name = value.clone();
+                let mut span = token.span;
+                self.advance();
+                while self.at_symbol('.') {
+                    self.expect_symbol('.');
+                    let Some(segment) = self.expect_ident("package name segment") else {
+                        break;
+                    };
+                    name.push('.');
+                    name.push_str(&segment.name);
+                    span = span.join(segment.span);
+                }
+                Some(StringLiteral { value: name, span })
+            }
+            TokenKind::String(value) => {
                 let literal = StringLiteral {
                     value: value.clone(),
                     span: token.span,
@@ -12284,6 +17054,7 @@ impl Parser<'_> {
                 Ok(value) => Some((value, span)),
                 Err(_) => {
                     self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
                         span,
                         message: format!("{label} must fit in u32"),
                         suggestion: Some("use a non-negative integer such as `1`".to_owned()),
@@ -12328,6 +17099,15 @@ impl Parser<'_> {
         matches!(self.peek().map(|token| &token.kind), Some(TokenKind::Ident(value)) if value == expected)
     }
 
+    fn consume_ident(&mut self, expected: &str) -> bool {
+        if self.at_ident(expected) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
     fn at_symbol(&self, expected: char) -> bool {
         matches!(self.peek().map(|token| &token.kind), Some(TokenKind::Symbol(value)) if *value == expected)
     }
@@ -12370,6 +17150,7 @@ impl Parser<'_> {
             ),
         };
         self.diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span,
             message: format!("expected {expected}, found {found}"),
             suggestion: suggestion_for_expected(&expected),
@@ -12383,6 +17164,7 @@ impl Parser<'_> {
         };
         let expected = expected.to_string();
         self.diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span: token.span,
             message: format!("expected {expected}, found {}", token.kind.label()),
             suggestion: suggestion_for_expected(&expected),
@@ -12482,7 +17264,7 @@ fn suggestion_for_expected(expected: &str) -> Option<String> {
         "`->`" => Some("add `-> OutputType` before the coerce prompt block".to_owned()),
         "profile string" => Some("write `profile \"profile-name\"`".to_owned()),
         "capacity value" => Some("write `capacity 1`".to_owned()),
-        "plugin name" => Some("write a plugin name, such as `memory`".to_owned()),
+        "package library name" => Some("write a package library name, such as `memory`".to_owned()),
         "type name" => Some("write a primitive type or schema name".to_owned()),
         _ => None,
     }
@@ -12495,6 +17277,258 @@ mod tests {
     #[test]
     fn parser_scaffold_links_to_core() {
         assert_eq!(parser_stage(), "stage-0-skeleton");
+    }
+
+    const SEND_PROGRAM: &str = r##"
+@service
+workflow Notify
+
+class Trigger { id string }
+
+agent worker { provider fixture  profile "r"  capacity 1 }
+
+channel alerts { provider slack  destination "#ops" }
+
+table seed as Trigger [ { id "t" } ]
+
+rule notify
+  when Trigger as t
+=> {
+  send via alerts {
+    text "hello"
+  } as sent
+}
+"##;
+
+    #[test]
+    fn send_lowers_to_messaging_capability_call_and_registers_builtin() {
+        // 1929 OPTION A: `send via <channel>` lowers to a `messaging.send`
+        // capability.call and registers a built-in `std.messaging` construct +
+        // effect contract (so it is lock-exempt).
+        let compiled = compile_program(SEND_PROGRAM);
+        assert_eq!(
+            compiled.diagnostics,
+            Vec::new(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("lowered IR");
+        let uses = ir.construct_uses();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].keyword, "send");
+        assert_eq!(uses[0].target_capability, "messaging.send");
+        let registry = ir.contract_registry();
+        let send_construct = registry
+            .constructs
+            .iter()
+            .find(|form| form.keyword == "send")
+            .expect("built-in send construct registration");
+        assert_eq!(send_construct.library_id, "std.messaging");
+        assert_eq!(
+            send_construct.target_capability.as_deref(),
+            Some("messaging.send")
+        );
+        assert!(
+            registry
+                .libraries
+                .iter()
+                .any(|lib| lib.id == "std.messaging" && lib.standard),
+            "std.messaging must be a standard library"
+        );
+        assert!(
+            registry
+                .effect_contracts
+                .iter()
+                .any(|c| c.id == "messaging.send"
+                    && c.effect_kind == "capability.call"
+                    && c.library_id == "std.messaging"),
+            "built-in messaging.send effect contract must be registered"
+        );
+    }
+
+    #[test]
+    fn send_to_unknown_channel_is_rejected() {
+        let source = SEND_PROGRAM.replace("send via alerts", "send via ghost");
+        let compiled = compile_program(&source);
+        let violations: Vec<&Diagnostic> = compiled
+            .diagnostics
+            .iter()
+            .filter(|d| d.message.contains("unknown channel"))
+            .collect();
+        assert_eq!(violations.len(), 1, "{:?}", compiled.diagnostics);
+        assert!(violations[0].message.contains("ghost"));
+    }
+
+    #[test]
+    fn derives_contract_registry_from_imports_and_effects() {
+        let source = r#"
+workflow RegistrySlice
+
+use memory
+
+class Task {
+  title string
+}
+
+class Review {
+  accepted bool
+}
+
+coerce reviewTask(title string) -> Review {
+  prompt """
+  Review {{ title }}
+  """
+}
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule start
+  when Task as task
+=> {
+  tell worker as turn """
+  Work on {{ task.title }}
+  """
+
+  after turn succeeds {
+    coerce reviewTask(task.title) as review
+  }
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("program compiles");
+        let registry = ir.contract_registry();
+        assert_eq!(registry.validate(), Vec::new());
+
+        assert!(registry
+            .libraries
+            .iter()
+            .any(|library| library.id == "memory" && !library.standard));
+        assert!(registry
+            .libraries
+            .iter()
+            .any(|library| library.id == "std.agent" && library.standard));
+        assert!(registry
+            .libraries
+            .iter()
+            .any(|library| library.id == "std.coerce" && library.standard));
+
+        let coerce = registry
+            .effect_contracts
+            .iter()
+            .find(|contract| contract.id == "coerce")
+            .expect("coerce contract");
+        assert_eq!(coerce.library_id, "std.coerce");
+        assert_eq!(coerce.validation, TypedOutputValidation::RuntimeBoundary);
+        assert!(coerce.source_forms.contains(&"coerce".to_owned()));
+        assert!(coerce
+            .required_capabilities
+            .contains(&"model.invoke".to_owned()));
+
+        let agent = registry
+            .effect_contracts
+            .iter()
+            .find(|contract| contract.id == "agent.tell")
+            .expect("agent contract");
+        assert_eq!(agent.library_id, "std.agent");
+        assert_eq!(agent.output_schema.as_deref(), Some("AgentTurn"));
+    }
+
+    #[test]
+    fn capability_calls_require_the_target_capability() {
+        let source = r#"
+workflow PackageCall
+
+use memory
+
+class Task {
+  title string
+}
+
+rule start
+  when Task as task
+=> {
+  call memory.query for task as context
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("program compiles");
+        let effect = ir.rules[0]
+            .metadata
+            .effects
+            .iter()
+            .find(|effect| effect.kind == IrEffectKind::CapabilityCall)
+            .expect("capability call effect");
+        assert_eq!(
+            effect.required_capabilities,
+            vec!["memory.query".to_owned()]
+        );
+
+        let registry = ir.contract_registry();
+        let contract = registry
+            .effect_contracts
+            .iter()
+            .find(|contract| contract.id == "capability.call")
+            .expect("capability call contract");
+        assert!(contract
+            .required_capabilities
+            .contains(&"memory.query".to_owned()));
+        assert!(!contract
+            .required_capabilities
+            .contains(&"capability.call".to_owned()));
+    }
+
+    #[test]
+    fn package_recall_form_lowers_to_capability_call_marker() {
+        let source = r#"
+workflow PackageRecall
+
+use memory
+
+class Task {
+  title string
+}
+
+rule start
+  when Task as task
+=> {
+  recall project_memory for task as context
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("program compiles");
+        let effect = ir.rules[0]
+            .metadata
+            .effects
+            .iter()
+            .find(|effect| effect.kind == IrEffectKind::CapabilityCall)
+            .expect("capability call effect");
+        assert_eq!(effect.binding.as_deref(), Some("context"));
+        assert_eq!(
+            effect.required_capabilities,
+            vec!["memory.query".to_owned()]
+        );
+        assert_eq!(
+            effect.construct_use,
+            Some(IrConstructUse {
+                keyword: "recall".to_owned(),
+                scope: "rule_body".to_owned(),
+                construct_family: "effect_operation".to_owned(),
+                lowering_target: "capability_call".to_owned(),
+                target_capability: "memory.query".to_owned(),
+            })
+        );
+        assert_eq!(ir.construct_uses().len(), 1);
+        assert!(ir.to_snapshot().contains("construct=recall->memory.query"));
     }
 
     #[test]
@@ -12915,7 +17949,7 @@ class Task {
     }
 
     #[test]
-    fn use_short_form_imports_plugins_and_rejects_removed_kinds() {
+    fn use_short_form_imports_package_libraries_and_rejects_removed_kinds() {
         let parsed = parse_program("workflow Imports\n\nuse memory\n");
         assert_eq!(parsed.diagnostics, Vec::new());
         let use_decl = parsed.program.items.iter().find_map(|item| match item {
@@ -14300,7 +19334,7 @@ workflow UnsatisfiableFiniteDomains
 
 class Task {
   provider "codex" | "claude"
-  route "pi" | "baml"
+  route "pi" | "coerce"
 }
 
 rule disjoint_equality
@@ -14497,8 +19531,16 @@ rule_dependencies
                 include_str!("../../../examples/reusable-review-pattern.ir"),
             ),
             (
+                include_str!("../../../examples/reusable-action-chain.whip"),
+                include_str!("../../../examples/reusable-action-chain.ir"),
+            ),
+            (
                 include_str!("../../../examples/exec-json-ingest.whip"),
                 include_str!("../../../examples/exec-json-ingest.ir"),
+            ),
+            (
+                include_str!("../../../examples/deterministic-validation.whip"),
+                include_str!("../../../examples/deterministic-validation.ir"),
             ),
             (
                 include_str!("../../../examples/autoresearch-lite.whip"),
@@ -14713,6 +19755,365 @@ rule gated
         );
     }
 
+    fn read_codec_program(format: &str) -> String {
+        format!(
+            r#"
+workflow ReadBody
+
+output result Result
+
+class Result {{
+  status string
+}}
+
+file store project_files {{
+  root "./data"
+}}
+
+rule pick
+  when started
+=> {{
+  read {format} from project_files at "note.md" as fileResult
+  after fileResult succeeds as result {{
+    complete result {{
+      status "ok"
+    }}
+  }}
+}}
+"#
+        )
+    }
+
+    #[test]
+    fn read_accepts_text_and_markdown_body_codecs() {
+        for format in ["text", "markdown"] {
+            let compiled = compile_program(&read_codec_program(format));
+            assert_eq!(
+                compiled.diagnostics,
+                Vec::new(),
+                "`read {format}` compiles clean"
+            );
+            assert!(compiled.ir.is_some(), "`read {format}` produces IR");
+        }
+    }
+
+    #[test]
+    fn read_rejects_structured_and_binary_codecs() {
+        // Structured codecs are the `import` surface; `bytes` is a deferred read
+        // codec. `read` decodes only body formats in v0.
+        for format in ["json", "jsonl", "csv", "bytes"] {
+            let compiled = compile_program(&read_codec_program(format));
+            assert!(
+                compiled
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("not supported")),
+                "`read {format}` is rejected with a diagnostic; got {:?}",
+                compiled.diagnostics
+            );
+        }
+    }
+
+    fn write_program(format: &str, mode_clause: &str) -> String {
+        format!(
+            r#"
+workflow WriteBody
+
+output result Result
+
+class Result {{
+  status string
+}}
+
+file store out_files {{
+  root "./data"
+}}
+
+rule pick
+  when started
+=> {{
+  write {format} to out_files at "report.md" {{
+    body "hello"
+    {mode_clause}
+  }} as written
+  after written succeeds as result {{
+    complete result {{
+      status "ok"
+    }}
+  }}
+}}
+"#
+        )
+    }
+
+    #[test]
+    fn write_accepts_text_and_markdown_with_explicit_mode() {
+        for format in ["text", "markdown"] {
+            let compiled = compile_program(&write_program(format, "mode create"));
+            assert_eq!(
+                compiled.diagnostics,
+                Vec::new(),
+                "`write {format}` with an explicit mode compiles clean"
+            );
+            assert!(compiled.ir.is_some(), "`write {format}` produces IR");
+        }
+    }
+
+    #[test]
+    fn write_rejects_structured_codecs() {
+        for format in ["json", "csv", "bytes"] {
+            let compiled = compile_program(&write_program(format, "mode create"));
+            assert!(
+                compiled
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("not supported")),
+                "`write {format}` is rejected; got {:?}",
+                compiled.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn write_requires_an_explicit_mode() {
+        // "No silent overwrite": omitting the mode is a check error.
+        let compiled = compile_program(&write_program("text", ""));
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("explicit `mode`")),
+            "`write` without a mode is rejected; got {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn write_rejects_unknown_mode() {
+        let compiled = compile_program(&write_program("text", "mode clobber"));
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unknown write mode")),
+            "an unknown write mode is rejected; got {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    fn import_program(format: &str) -> String {
+        format!(
+            r#"
+workflow ImportRows
+
+output result Result
+
+class Result {{
+  status string
+}}
+
+class IssueRow {{
+  title string
+  priority string
+}}
+
+file store data_files {{
+  root "./data"
+}}
+
+rule pick
+  when started
+=> {{
+  import {format} IssueRow from data_files at "issues.in" as imported
+  after imported succeeds as r {{
+    complete result {{
+      status "ok"
+    }}
+  }}
+}}
+"#
+        )
+    }
+
+    #[test]
+    fn import_accepts_structured_codecs_and_lowers_to_file_import() {
+        for format in ["jsonl", "json", "csv"] {
+            let compiled = compile_program(&import_program(format));
+            assert_eq!(
+                compiled.diagnostics,
+                Vec::new(),
+                "`import {format}` compiles clean"
+            );
+            let ir = compiled.ir.expect("import produces IR");
+            let rule = ir.rules.first().expect("rule");
+            assert!(
+                rule.metadata
+                    .effects
+                    .iter()
+                    .any(|effect| effect.kind == IrEffectKind::FileImport),
+                "`import {format}` lowers to a file.import effect"
+            );
+        }
+    }
+
+    #[test]
+    fn import_rejects_unsupported_codecs() {
+        // `import` decodes structured row codecs only; body/binary formats are
+        // not import surfaces.
+        for format in ["xml", "text", "markdown", "bytes"] {
+            let compiled = compile_program(&import_program(format));
+            assert!(
+                compiled
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("not supported")),
+                "`import {format}` is rejected; got {:?}",
+                compiled.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn class_field_key_annotation_lowers_and_rejects_duplicates() {
+        let single = compile_program(
+            r#"
+workflow Keyed
+
+class Row {
+  id string @key
+  title string
+}
+"#,
+        );
+        assert_eq!(
+            single.diagnostics,
+            Vec::new(),
+            "single `@key` compiles clean"
+        );
+        let ir = single.ir.expect("ir");
+        let class = ir
+            .schemas
+            .iter()
+            .find_map(|schema| match schema {
+                IrSchema::Class(class) if class.name == "Row" => Some(class),
+                _ => None,
+            })
+            .expect("Row class");
+        let key_fields = class
+            .fields
+            .iter()
+            .filter(|field| field.is_key)
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(key_fields, vec!["id"], "the `@key` field is recorded");
+
+        let dual = compile_program(
+            r#"
+workflow Keyed
+
+class Row {
+  a string @key
+  b string @key
+}
+"#,
+        );
+        assert!(
+            dual.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("more than one `@key`")),
+            "two `@key` fields are rejected; got {:?}",
+            dual.diagnostics
+        );
+    }
+
+    #[test]
+    fn single_line_terminal_block_validates_its_fields() {
+        // Regression: `complete <name> { <field> }` on one line was reported as
+        // missing the field, because the terminal-block extractor only captured
+        // subsequent lines (a single-line block has brace-delta 0). Both the
+        // single-line and multi-line forms must validate identically.
+        for body in [
+            "  complete result { status \"ok\" }",
+            "  complete result {\n    status \"ok\"\n  }",
+        ] {
+            let source = format!(
+                r#"
+workflow S
+
+output result Result
+
+class Result {{
+  status string
+}}
+
+rule go
+  when started
+=> {{
+{body}
+}}
+"#
+            );
+            let compiled = compile_program(&source);
+            assert!(
+                !compiled
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("missing required field")),
+                "terminal block validates its field; got {:?}",
+                compiled.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn action_declaration_parses_and_is_inert_until_expansion() {
+        // DR-0023 slice 1: an `action` template parses (typed params + a block
+        // body) and lowers away cleanly (inert until call-site expansion in
+        // slice 2), so a program declaring an unused action compiles with no
+        // diagnostics.
+        let compiled = compile_program(
+            r#"
+workflow A
+
+output result Result
+
+class Result {
+  status string
+}
+
+class Task {
+  name string
+}
+
+action do_it(task Task, label string) {
+  record Result {
+    status label
+  }
+}
+
+rule go
+  when started
+=> {
+  complete result {
+    status "ok"
+  }
+}
+"#,
+        );
+        assert_eq!(
+            compiled.diagnostics,
+            Vec::new(),
+            "an unused action declaration compiles clean"
+        );
+        let ir = compiled.ir.expect("program with an action lowers");
+        // The action is a template consumed before lowering — it is not a runtime
+        // construct, so it leaves no rule/schema behind beyond the workflow's own.
+        assert!(
+            ir.rules.iter().any(|rule| rule.name == "go"),
+            "the ordinary rule still lowers alongside the action template"
+        );
+    }
+
     #[test]
     fn accepts_typed_case_branches_in_rule_bodies() {
         let source = r#"
@@ -14833,6 +20234,125 @@ rule classify
         let compiled = compile_program(source);
         assert_eq!(compiled.diagnostics, Vec::new());
         assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn accepts_after_times_out_branch_and_types_payload_alias() {
+        let source = r#"
+workflow TimedOutBranch
+
+class WorkItem {
+  title string
+}
+
+class MessageClassification {
+  summary string
+}
+
+class Routed {
+  branch string
+  detail string
+}
+
+coerce classifyMessage(title string) -> MessageClassification {
+  prompt "Classify"
+}
+
+rule classify
+  when WorkItem as item
+=> {
+  coerce classifyMessage(item.title) as classification
+
+  after classification times out as t {
+    record Routed {
+      branch "timed_out"
+      detail t.summary
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn accepts_after_cancelled_branch_and_types_payload_alias() {
+        let source = r#"
+workflow CancelledBranch
+
+class WorkItem {
+  title string
+}
+
+class MessageClassification {
+  summary string
+}
+
+class Routed {
+  branch string
+  detail string
+}
+
+coerce classifyMessage(title string) -> MessageClassification {
+  prompt "Classify"
+}
+
+rule classify
+  when WorkItem as item
+=> {
+  coerce classifyMessage(item.title) as classification
+
+  after classification cancelled as c {
+    record Routed {
+      branch "cancelled"
+      detail c.summary
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_after_predicate_during_compilation() {
+        let source = r#"
+workflow BadPredicate
+
+class WorkItem {
+  title string
+}
+
+class MessageClassification {
+  summary string
+}
+
+class Routed {
+  branch string
+}
+
+coerce classifyMessage(title string) -> MessageClassification {
+  prompt "Classify"
+}
+
+rule classify
+  when WorkItem as item
+=> {
+  coerce classifyMessage(item.title) as classification
+
+  after classification explodes {
+    record Routed {
+      branch "boom"
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.diagnostics.iter().any(|d| d
+            .message
+            .contains("unsupported `after` predicate `explodes`")));
     }
 
     #[test]
@@ -14979,6 +20499,129 @@ rule classify
             .contains("non-exhaustive terminal-output case; missing Failed, TimedOut, Cancelled")));
     }
 
+    /// Source for terminal-output case tests: a coerce whose `Completed` payload
+    /// is `MessageClassification`, matched in an `after ... completes` case. The
+    /// `{cases}` placeholder is filled per test.
+    fn terminal_case_program(cases: &str) -> String {
+        format!(
+            r#"
+workflow TerminalCaseMatrix
+
+class WorkItem {{
+  title string
+}}
+
+class MessageClassification {{
+  summary string
+}}
+
+class Routed {{
+  branch string
+}}
+
+coerce classifyMessage(title string) -> MessageClassification {{
+  prompt "Classify"
+}}
+
+rule classify
+  when WorkItem as item
+=> {{
+  coerce classifyMessage(item.title) as classification
+
+  after classification completes {{
+    case classification {{
+{cases}
+    }}
+  }}
+}}
+"#
+        )
+    }
+
+    #[test]
+    fn accepts_guarded_terminal_case_branch_referencing_refined_payload() {
+        // Regression: a `where` guard on a tagged terminal branch must be able to
+        // read the tag-refined payload binding (`result.summary`). It was wrongly
+        // rejected as an unknown root because `validate_case_blocks` could not
+        // bind the terminal payload into the guard scope.
+        let source = terminal_case_program(
+            "      Completed result where result.summary == \"ok\" => { record Routed { branch \"ok\" } }\n      _ => { record Routed { branch \"other\" } }",
+        );
+        let compiled = compile_program(&source);
+        assert_eq!(
+            compiled.diagnostics,
+            Vec::new(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn rejects_terminal_case_guard_referencing_unknown_payload_field() {
+        let source = terminal_case_program(
+            "      Completed result where result.nonexistent == \"ok\" => { record Routed { branch \"ok\" } }\n      _ => { record Routed { branch \"other\" } }",
+        );
+        let compiled = compile_program(&source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled.diagnostics.iter().any(|d| d
+                .message
+                .contains("schema `MessageClassification` has no field `nonexistent`")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_non_boolean_terminal_case_guard() {
+        let source = terminal_case_program(
+            "      Completed result where result.summary => { record Routed { branch \"ok\" } }\n      _ => { record Routed { branch \"other\" } }",
+        );
+        let compiled = compile_program(&source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("non-boolean case guard expression")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_terminal_output_case_tag() {
+        let source = terminal_case_program(
+            "      Completed result => { record Routed { branch \"a\" } }\n      Completed other => { record Routed { branch \"b\" } }\n      Failed failure => { record Routed { branch \"f\" } }\n      TimedOut timeout => { record Routed { branch \"t\" } }\n      Cancelled cancel => { record Routed { branch \"c\" } }",
+        );
+        let compiled = compile_program(&source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled.diagnostics.iter().any(|d| d
+                .message
+                .contains("duplicate unguarded terminal-output case pattern `Completed`")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_terminal_output_case_branch_without_payload_binding() {
+        let source = terminal_case_program(
+            "      Completed => { record Routed { branch \"a\" } }\n      Failed failure => { record Routed { branch \"f\" } }\n      TimedOut timeout => { record Routed { branch \"t\" } }\n      Cancelled cancel => { record Routed { branch \"c\" } }",
+        );
+        let compiled = compile_program(&source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled.diagnostics.iter().any(|d| d
+                .message
+                .contains("malformed terminal-output case pattern `Completed`")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
     #[test]
     fn rejects_invalid_case_branch_patterns() {
         let source = r#"
@@ -15122,6 +20765,359 @@ rule route
         let compiled = compile_program(source);
         assert_eq!(compiled.diagnostics, Vec::new());
         assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn exhaustive_bool_case_compiles() {
+        // `case` over a `bool` field is valid when both `true` and `false` are
+        // covered (the finite two-value domain).
+        let source = r#"
+workflow BoolCaseOk
+
+output result Done
+
+class Done {
+  note string
+}
+
+class Flag {
+  ready bool
+}
+
+rule route
+  when Flag as f
+=> {
+  case f.ready {
+    true => {
+      complete result {
+        note "t"
+      }
+    }
+    false => {
+      complete result {
+        note "f"
+      }
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(
+            compiled.diagnostics,
+            Vec::new(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn bool_case_rejects_non_exhaustive_and_non_bool_patterns() {
+        let source = r#"
+workflow BoolCaseBad
+
+class Flag {
+  ready bool
+}
+
+rule route
+  when Flag as f
+=> {
+  case f.ready {
+    true => {
+    }
+  }
+
+  case f.ready {
+    maybe => {
+    }
+    false => {
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("non-exhaustive case; missing false")),
+            "expected non-exhaustive diagnostic: {:?}",
+            compiled.diagnostics
+        );
+        assert!(
+            compiled.diagnostics.iter().any(|d| d
+                .message
+                .contains("case pattern `maybe` that is not a `bool` value")),
+            "expected non-bool pattern diagnostic: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn exec_schema_result_resolves_typed_fields_for_case() {
+        // `exec "..." -> Schema as v` registers its result type, so an
+        // `after v succeeds as r` branch can `case` / field-access `r`'s fields —
+        // the same after-binding type flow a named `coerce -> Schema` already
+        // gets. Before the fix this produced "case scrutinee `r.kind` ... not a
+        // typed path".
+        let source = r#"
+@service
+workflow ExecTyped
+
+class Pick { kind "a" | "b" }
+class R { choice string }
+
+output result R
+
+signal go.now {
+  x string
+}
+
+rule j
+  when go.now as g
+=> {
+  exec "echo hi" -> Pick as v
+
+  after v succeeds as r {
+    case r.kind {
+      "a" => {
+        complete result {
+          choice "a"
+        }
+      }
+      "b" => {
+        complete result {
+          choice "b"
+        }
+      }
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("not a typed path")),
+            "exec -> Schema result fields should resolve: {:?}",
+            compiled.diagnostics
+        );
+        assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
+    }
+
+    #[test]
+    fn inline_decide_result_resolves_typed_fields_for_case() {
+        // `decide -> { fixed bool } as v` synthesizes a hygienic anonymous result
+        // class, so `after v succeeds as r` can `case` / field-access `r`'s
+        // fields — the same after-binding type flow a named `coerce -> Schema`
+        // gets. Before this, an inline decide result had no type, so `r.fixed`
+        // was "not a typed path" and `case r.fixed { true/false }` could not bind.
+        let source = r#"
+@service
+workflow InlineDecideTyped
+
+class R { choice string }
+output result R
+
+signal go.now {
+  x string
+}
+
+rule j
+  when go.now as g
+=> {
+  decide "is it fixed?" -> { fixed bool } as v
+
+  after v succeeds as r {
+    case r.fixed {
+      true => {
+        complete result {
+          choice "a"
+        }
+      }
+      false => {
+        complete result {
+          choice "b"
+        }
+      }
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("not a typed path")),
+            "inline decide result fields should resolve: {:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("compiles");
+        // The synthesized hygienic class is visible in the IR (so the runtime
+        // fixture can generate the anonymous shape).
+        assert!(
+            ir.schemas.iter().any(|schema| matches!(
+                schema,
+                IrSchema::Class(class) if class.name == "decide.j.v"
+            )),
+            "expected synthesized inline-decide class `decide.j.v` in IR schemas"
+        );
+    }
+
+    #[test]
+    fn rejects_flow_statement_after_branch() {
+        // A `when/else` branch ends its flow segment. A statement after it used
+        // to leak the internal `class FlowAwait_f_<n> has no field <x>` error
+        // (the trailing statement's field name fell into a flow-state lookup);
+        // now it is rejected with a clear message.
+        let source = r#"
+@service
+workflow AfterBranch
+
+output result R
+class R { v string }
+class Note { t string }
+signal go.now { x string }
+
+flow f
+  when go.now as g
+{
+  askHuman as a choices ["y", "n"] "pick"
+  when a.choice == "y" {
+    complete result {
+      v "yes"
+    }
+  } else {
+    complete result {
+      v "no"
+    }
+  }
+  record Note {
+    t "trailing"
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("statement after a `when/else` branch")),
+            "expected clear post-branch-statement diagnostic: {:?}",
+            compiled.diagnostics
+        );
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("FlowAwait")),
+            "internal FlowAwait error should be suppressed: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn signal_triggered_flow_with_post_ask_branch_compiles() {
+        // Regression: a flow triggered by a SIGNAL (dotted schema) with an
+        // `askHuman` + post-ask `when/else` used to fail with the internal
+        // `class FlowAwait_<flow>_<n> has no field t` — the trigger `t` field is
+        // omitted for a dotted/signal schema (no class to `Ref`), but the
+        // post-ask segments still read `flowState.t`. Now the trigger is simply
+        // not carried for signal triggers, keeping read and write consistent.
+        let source = r#"
+@service
+workflow SigFlow
+
+output result R
+class R { v string }
+signal go.now { x string }
+
+flow f
+  when go.now as g
+{
+  askHuman as ans choices ["y", "n"] "pick"
+  when ans.choice == "y" {
+    complete result {
+      v "yes"
+    }
+  } else {
+    complete result {
+      v "no"
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("FlowAwait")),
+            "signal-triggered flow should not leak FlowAwait internals: {:?}",
+            compiled.diagnostics
+        );
+        assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
+    }
+
+    #[test]
+    fn rejects_flow_branch_without_preceding_ask() {
+        // A flow `when/else` decides on a human answer, so it must follow an
+        // `askHuman`. A branch in the initial (pre-ask) segment is rejected with
+        // a clear diagnostic rather than silently lowering to seg rules that
+        // consume an unestablished `flowState` (a confusing internal error).
+        let source = r#"
+workflow FlowBranchNoAsk
+
+output result R
+failure error E
+class R { note string }
+class E { reason string }
+class Flag { ready bool }
+
+rule seed
+  when started
+=> {
+  record Flag {
+    ready true
+  }
+}
+
+flow only_branch
+  when Flag as f
+{
+  when f.ready {
+    complete result {
+      note "yes"
+    }
+  } else {
+    fail error {
+      reason "no"
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled.diagnostics.iter().any(|d| d
+                .message
+                .contains("branch that does not directly follow an `askHuman")),
+            "expected clear flow-branch diagnostic: {:?}",
+            compiled.diagnostics
+        );
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("flowState")),
+            "internal flowState error should be suppressed: {:?}",
+            compiled.diagnostics
+        );
     }
 
     #[test]
@@ -15351,6 +21347,18 @@ rule branch
                 include_str!("../../../examples/invalid/effectful-self-loop.whip"),
             ),
             (
+                "recursive-pattern",
+                include_str!("../../../examples/invalid/recursive-pattern.whip"),
+            ),
+            (
+                "flow-state-access",
+                include_str!("../../../examples/invalid/flow-state-access.whip"),
+            ),
+            (
+                "evidence-fact-match",
+                include_str!("../../../examples/invalid/evidence-fact-match.whip"),
+            ),
+            (
                 "unknown-schema",
                 include_str!("../../../examples/invalid/unknown-schema.whip"),
             ),
@@ -15372,6 +21380,298 @@ rule branch
                 compiled.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn rejects_dangling_root_in_record_value() {
+        // A record value referencing a binding that does not exist (a typo or an
+        // unbound name) is a dangling reference that previously compiled silently.
+        let source = r#"
+@service
+workflow DanglingRoot
+
+class Ticket { id string }
+class Note { text string }
+
+table seed as Ticket [ { id "1" } ]
+
+rule r
+  when Ticket as ticket
+=> {
+  record Note {
+    text tikcet.id
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown binding `tikcet`")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_dangling_root_in_single_line_record() {
+        // Single-line records (`record X { f y }`) were skipped by the line-based
+        // extractor (brace_delta 0) and so were never field-validated; they are
+        // now covered.
+        let source = r#"
+@service
+workflow DanglingSingleLine
+
+class Ticket { id string }
+class Note { text string }
+
+table seed as Ticket [ { id "1" } ]
+
+rule r
+  when Ticket as ticket
+=> {
+  record Note { text tikcet.id }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown binding `tikcet`")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_dangling_root_in_coerce_argument() {
+        // Coerce arguments are another value position where a typo'd/unbound root
+        // was previously accepted leniently by the type-checker.
+        let source = r#"
+@service
+workflow DanglingCoerceArg
+
+class Ticket { id string  title string }
+class Review { summary string }
+
+coerce classify(title string) -> Review { prompt "c" }
+
+agent reviewer { provider fixture  profile "r"  capacity 1 }
+
+table seed as Ticket [ { id "1"  title "t" } ]
+
+rule r
+  when Ticket as ticket
+  when reviewer is available
+=> {
+  coerce classify(tikcet.title) as rev
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown binding `tikcet`")
+                    && d.message.contains("coerce `classify`")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_dangling_root_in_counter_consume_operand() {
+        // Non-field effect operands (lease/counter `for <key>`, `emit ... to
+        // <target>`) are also checked via `check_operand_root`.
+        let source = r#"
+@service
+workflow CounterOperandDangling
+
+class CallFailed { service string }
+class Service { id string }
+
+counter failure_budget { key Service cap 3 reset daily }
+
+table seed as CallFailed [ { service "x" } ]
+
+rule strike
+  when CallFailed as f
+=> {
+  consume failure_budget for fff.service amount 1 as strike
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown binding `fff`")
+                    && d.message.contains("consume")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_dangling_root_in_queue_file_payload() {
+        // Body-AST effect payloads (`file item into`, `emit`, ledger `append`)
+        // are validated via `validate_effect_field_roots`, not the line-based
+        // validators; their field values were previously unchecked for roots.
+        let source = r#"
+@service
+workflow QueueFieldDangling
+
+class Ticket { id string }
+
+queue backlog { tracker builtin }
+
+table seed as Ticket [ { id "1" } ]
+
+rule r
+  when Ticket as ticket
+=> {
+  file item into backlog {
+    title tikcet.id
+    body "x"
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown binding `tikcet`")
+                    && d.message.contains("file into")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_dangling_root_in_invoke_input() {
+        // Invoke payload inputs are another value position the type-checker
+        // accepted leniently for unknown roots.
+        let source = r#"
+workflow Parent {
+  input task Task
+  output result Out
+
+  class Task { id string }
+  class Out { x string }
+
+  rule r
+    when Task as task
+  => {
+    invoke Child { item tikcet.id } as c
+    after c succeeds as cr {
+      done task
+      complete result { x cr.summary }
+    }
+  }
+}
+
+workflow Child {
+  input item string
+  output result ChildOut
+  class ChildOut { y string }
+  rule c
+    when item as i
+  => {
+    complete result { y "done" }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Parent"));
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown binding `tikcet`")
+                    && d.message.contains("invoke Child")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_dangling_root_in_tell_target() {
+        // A dynamic tell target with a typo'd/unbound root was silently accepted
+        // (the type lookup returned None and bailed).
+        let source = r#"
+@service
+workflow DanglingTellTarget
+
+class Ticket { id string  provider AgentRef<reviewer> }
+
+agent reviewer { provider fixture  profile "r"  capacity 1 }
+
+table seed as Ticket [ { id "1"  provider reviewer } ]
+
+rule r
+  when Ticket as ticket
+=> {
+  tell tikcet.provider as turn "go"
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown binding `tikcet`")
+                    && d.message.contains("tell target")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn accepts_effect_binding_root_in_record_value() {
+        // The AST-collected root set must include `tell`/`after` results (which
+        // the typed `binding_types` map omits), so reading an effect-result field
+        // in a record value compiles. This is the case a naive binding_types-only
+        // check wrongly rejected.
+        let source = r#"
+@service
+workflow EffectRoot
+
+class Ticket { id string }
+class Note { text string }
+
+agent reviewer { provider fixture  profile "r"  capacity 1 }
+
+table seed as Ticket [ { id "1" } ]
+
+rule r
+  when Ticket as ticket
+  when reviewer is available
+=> {
+  tell reviewer as turn "review"
+  after turn succeeds {
+    record Note {
+      text turn.summary
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(
+            compiled.diagnostics,
+            Vec::new(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        assert!(compiled.ir.is_some());
     }
 
     #[test]
@@ -15425,6 +21725,388 @@ rule branch
         assert!(compiled.diagnostics[0]
             .message
             .contains("preserves trigger fact `schema:WorkItem`"));
+    }
+
+    #[test]
+    fn rejects_non_file_operation_on_a_file_store_grant() {
+        // A grant on a declared file store may only use file operations; a non-file op
+        // (e.g. `recall`) is rejected. A non-file-store resource is left alone.
+        let program = |op: &str, resource: &str, store: &str| {
+            format!(
+                r#"
+@service
+workflow FileGrant
+
+output result R
+class R {{ ok bool }}
+class Ticket {{ id string  status "open" }}
+
+agent coder {{ provider fixture  profile "repo-writer"  capacity 1 }}
+
+file store {store} {{ root "./data"  allow read ["docs/**"] }}
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+  when coder is available
+=> {{
+  tell coder as turn
+    with access to {resource} {{
+      {op}
+    }}
+  "go"
+
+  after turn succeeds as outcome {{
+    complete result {{ ok true }}
+  }}
+}}
+"#
+            )
+        };
+
+        // `recall` on a declared file store is not a file operation.
+        let bad = compile_program(&program(
+            "recall for ticket",
+            "project_files",
+            "project_files",
+        ));
+        assert!(
+            bad.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not a file operation")),
+            "{:?}",
+            bad.diagnostics
+        );
+        // The same `recall` on a non-file-store resource is left alone (could be a
+        // package resource) — no false positive.
+        let ok = compile_program(&program(
+            "recall for ticket",
+            "project_memory",
+            "project_files",
+        ));
+        assert!(
+            !ok.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not a file operation")),
+            "{:?}",
+            ok.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_turn_access_grants() {
+        // An empty grant block and a duplicate resource on one `tell` are both
+        // structurally malformed.
+        let program = |grant_block: &str| {
+            format!(
+                r#"
+@service
+workflow GrantCheck
+
+output result R
+class R {{ ok bool }}
+class Ticket {{ id string  status "open" }}
+
+agent coder {{ provider fixture  profile "repo-writer"  capacity 1 }}
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+  when coder is available
+=> {{
+  tell coder as turn
+{grant_block}
+  "Work it."
+
+  after turn succeeds as outcome {{
+    complete result {{ ok true }}
+  }}
+}}
+"#
+            )
+        };
+
+        let empty = compile_program(&program("    with access to project_memory {\n    }\n"));
+        assert!(
+            empty
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("grants no operations")),
+            "{:?}",
+            empty.diagnostics
+        );
+
+        let duplicate = compile_program(&program(
+            "    with access to project_memory {\n      recall for ticket\n    }\n    with access to project_memory {\n      learn for ticket\n    }\n",
+        ));
+        assert!(
+            duplicate
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("more than once")),
+            "{:?}",
+            duplicate.diagnostics
+        );
+    }
+
+    #[test]
+    fn lowers_turn_access_grants_onto_the_agent_tell_effect() {
+        // `with access to <resource> { … }` on a tell lowers to `access_grants` on the
+        // agent.tell IR effect (Proposal A authority-narrowing metadata).
+        let source = r#"
+@service
+workflow GrantDemo
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+
+agent coder { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+  when coder is available
+=> {
+  tell coder as turn
+    with access to project_memory {
+      recall for ticket
+      learn for ticket
+    }
+    with access to project_files {
+      read ["docs/**"]
+    }
+  "Work it."
+
+  after turn succeeds as outcome {
+    complete result { ok true }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        let ir = compiled.ir.expect("compiles");
+        let tell = ir
+            .rules
+            .iter()
+            .flat_map(|rule| rule.metadata.effects.iter())
+            .find(|effect| effect.kind == IrEffectKind::AgentTell)
+            .expect("agent.tell effect");
+        assert_eq!(tell.access_grants.len(), 2);
+        let memory = &tell.access_grants[0];
+        assert_eq!(memory.resource, "project_memory");
+        assert_eq!(memory.operations.len(), 2);
+        assert_eq!(memory.operations[0].operation, "recall");
+        assert_eq!(memory.operations[0].target.as_deref(), Some("ticket"));
+        let files = &tell.access_grants[1];
+        assert_eq!(files.resource, "project_files");
+        assert_eq!(files.operations[0].operation, "read");
+        assert_eq!(files.operations[0].globs, vec!["docs/**".to_owned()]);
+    }
+
+    #[test]
+    fn rejects_rule_matching_evidence_only_turn_fact() {
+        // In-turn observations (streamed/tool_requested/artifact_captured) are
+        // evidence, never rule-matchable (spec/agent-harness.md); a `when` on them is
+        // an error. The lifecycle facts (completed/failed/…) stay matchable.
+        for evidence in [
+            "agent.turn.streamed",
+            "agent.turn.tool_requested",
+            "agent.turn.artifact_captured",
+        ] {
+            let source = format!(
+                "workflow EvidenceMatch\n\noutput result R\nclass R {{ ok bool }}\n\nrule react\n  when fact {evidence} as ev\n=> {{\n  complete result {{ ok true }}\n}}\n"
+            );
+            let compiled = compile_program(&source);
+            assert!(compiled.ir.is_none(), "{evidence} should be rejected");
+            assert!(
+                compiled
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("evidence-only fact")
+                        && d.message.contains(evidence)),
+                "{evidence}: {:?}",
+                compiled.diagnostics
+            );
+        }
+        // A matchable lifecycle fact does NOT get the evidence error (it may fail a
+        // different check, e.g. needing a producer, but not this one).
+        let matchable = "workflow M\n\noutput result R\nclass R {{ ok bool }}\n\nrule react\n  when fact agent.turn.completed as ev\n=> {{\n  complete result {{ ok true }}\n}}\n".replace("{{", "{").replace("}}", "}");
+        let compiled = compile_program(&matchable);
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("evidence-only fact")),
+            "completed must not be flagged as evidence-only: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_user_rule_accessing_flow_state() {
+        // Flow progression state (FlowAwait_*) is owned by the flow's generated
+        // rules; a user rule that matches/reads it is rejected.
+        let source = include_str!("../../../examples/invalid/flow-state-access.whip");
+        let compiled = compile_program(source);
+
+        assert!(compiled.ir.is_none());
+        let violations: Vec<&Diagnostic> = compiled
+            .diagnostics
+            .iter()
+            .filter(|d| d.message.contains("may not reference flow-state fact"))
+            .collect();
+        assert_eq!(violations.len(), 1, "{:?}", compiled.diagnostics);
+        assert!(
+            violations[0].message.contains("FlowAwait_triage_ticket_1"),
+            "names the offending flow-state fact: {}",
+            violations[0].message
+        );
+    }
+
+    #[test]
+    fn rejects_user_rule_using_flowfail_terminal() {
+        // `flowfail` is the generated-only 503 auto-fail terminal; an author rule
+        // that writes it is rejected (use a typed `fail <Failure>` instead).
+        let source = r#"
+@service
+workflow W
+
+class Tick { id string }
+
+table seed as Tick [ { id "T1" } ]
+
+rule r
+  when Tick as t
+=> {
+  flowfail
+}
+"#;
+        let compiled = compile_program(source);
+        let violations: Vec<&Diagnostic> = compiled
+            .diagnostics
+            .iter()
+            .filter(|d| d.message.contains("generated-only `flowfail` terminal"))
+            .collect();
+        assert_eq!(violations.len(), 1, "{:?}", compiled.diagnostics);
+    }
+
+    #[test]
+    fn flow_generated_rules_may_access_flow_state() {
+        // The legitimate flow itself compiles: its generated `flow.*` rules read
+        // the FlowAwait_* state without tripping the namespace lint.
+        let compiled = compile_program(include_str!("../../../examples/triage-flow.whip"));
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("may not reference flow-state fact")),
+            "generated flow rules must be exempt: {:?}",
+            compiled.diagnostics
+        );
+        assert!(compiled.ir.is_some(), "triage-flow should compile");
+    }
+
+    #[test]
+    fn rejects_self_recursive_pattern_application() {
+        // A pattern whose body applies itself is unbounded recursion: it can never
+        // elaborate into a finite first-order program (graph.unbounded_pattern_recursion).
+        let source = include_str!("../../../examples/invalid/recursive-pattern.whip");
+        let compiled = compile_program(source);
+
+        assert!(compiled.ir.is_none());
+        // Exactly the precise recursion diagnostic — the generic "nested apply not
+        // supported yet" message must be suppressed for the recursive case.
+        assert_eq!(compiled.diagnostics.len(), 1, "{:?}", compiled.diagnostics);
+        let diagnostic = &compiled.diagnostics[0];
+        assert!(
+            diagnostic
+                .message
+                .contains("graph.unbounded_pattern_recursion"),
+            "{}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("expansion cycle Loop -> Loop"),
+            "the diagnostic names the cycle: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn rejects_mutually_recursive_pattern_application() {
+        // A cycle that spans two patterns is rejected once, naming the full cycle.
+        let source = r#"
+workflow MutualRecursion
+
+class Item {
+  id string
+}
+
+pattern Ping<T> {
+  apply Pong<T> as a {
+  }
+}
+
+pattern Pong<T> {
+  apply Ping<T> as b {
+  }
+}
+
+apply Ping<Item> as top {
+}
+"#;
+        let compiled = compile_program(source);
+
+        assert!(compiled.ir.is_none());
+        let recursion: Vec<&Diagnostic> = compiled
+            .diagnostics
+            .iter()
+            .filter(|d| d.message.contains("graph.unbounded_pattern_recursion"))
+            .collect();
+        // One cycle, reported once (members covered are not re-reported).
+        assert_eq!(recursion.len(), 1, "{:?}", compiled.diagnostics);
+        assert!(
+            recursion[0].message.contains("Ping -> Pong -> Ping"),
+            "names the full cycle: {}",
+            recursion[0].message
+        );
+    }
+
+    #[test]
+    fn allows_non_recursive_nested_apply_without_recursion_error() {
+        // A nested apply that does NOT form a cycle is a separate v0 limitation
+        // (the generic "not supported yet" message), NOT a recursion error.
+        let source = r#"
+workflow NonRecursive
+
+class Item {
+  id string
+}
+
+pattern Inner<T> {
+}
+
+pattern Outer<T> {
+  apply Inner<T> as x {
+  }
+}
+
+apply Outer<Item> as top {
+}
+"#;
+        let compiled = compile_program(source);
+
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("graph.unbounded_pattern_recursion")),
+            "non-recursive nesting must not be flagged as recursion: {:?}",
+            compiled.diagnostics
+        );
     }
 
     #[test]
@@ -15844,5 +22526,480 @@ apply Review<Task> as taskReview {}
         );
 
         assert_eq!(formatted.formatted.as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn lexer_captures_comments_without_affecting_tokens() {
+        let source =
+            "# top comment\nworkflow Demo\n\nclass Task {\n  title string  // trailing\n}\n";
+        let comments = lex_comments(source);
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].marker, CommentMarker::Hash);
+        assert_eq!(comments[0].text, "top comment");
+        assert_eq!(comments[1].marker, CommentMarker::Slash);
+        assert_eq!(comments[1].text, "trailing");
+        // Spans point back at the original source slice (marker through line end).
+        let first = &comments[0];
+        assert_eq!(&source[first.span.start..first.span.end], "# top comment");
+        // Comments stay out of the parse: the program still compiles cleanly.
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+    }
+
+    #[test]
+    fn test_block_parses_given_run_and_expect_clauses() {
+        let source = r#"
+@service
+workflow Demo
+
+test "ci triage" {
+  given signal github.workflow_failed {
+    run_id "run_123"
+  }
+  stub agent triager succeeds
+  run until idle
+  expect issue count where external_id == "run_123" is 1
+  expect rule triage_failed_run fired
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("program compiles");
+        assert_eq!(ir.tests.len(), 1);
+        let test = &ir.tests[0];
+        assert_eq!(test.name, "ci triage");
+        assert_eq!(test.clauses.len(), 5);
+
+        match &test.clauses[0] {
+            TestClause::Given(GivenClause::Signal { name, fields, .. }) => {
+                assert_eq!(name, "github.workflow_failed");
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].name.name, "run_id");
+                assert_eq!(fields[0].value, "\"run_123\"");
+            }
+            other => panic!("expected given signal, got {other:?}"),
+        }
+        match &test.clauses[1] {
+            TestClause::Stub(stub) => {
+                assert_eq!(stub.surface, vec!["agent".to_owned(), "triager".to_owned()]);
+                assert_eq!(stub.outcome, "succeeds");
+            }
+            other => panic!("expected stub, got {other:?}"),
+        }
+        assert!(matches!(
+            &test.clauses[2],
+            TestClause::Run(RunClause {
+                kind: RunKind::UntilIdle,
+                ..
+            })
+        ));
+        match &test.clauses[3] {
+            TestClause::Expect(ExpectClause {
+                target: ExpectTarget::Projection(query),
+                ..
+            }) => {
+                assert_eq!(query.noun, "issue");
+                match &query.kind {
+                    ProjQueryKind::Count { predicate, count } => {
+                        assert_eq!(predicate, "external_id == \"run_123\"");
+                        assert_eq!(*count, 1);
+                    }
+                    other => panic!("expected count query, got {other:?}"),
+                }
+            }
+            other => panic!("expected expect projection, got {other:?}"),
+        }
+        match &test.clauses[4] {
+            TestClause::Expect(ExpectClause {
+                target: ExpectTarget::Rule { name, status },
+                ..
+            }) => {
+                assert_eq!(name.name, "triage_failed_run");
+                assert_eq!(*status, RuleStatus::Fired);
+            }
+            other => panic!("expected expect rule, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_block_rejects_a_malformed_predicate() {
+        let source = r#"
+@service
+workflow Demo
+
+test "bad predicate" {
+  run until idle
+  expect issue count where == == is 1
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("predicate on `issue`")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn source_clock_block_lowers_to_clock_source() {
+        let source = r#"
+workflow ClockSource
+
+signal triage.tick {
+  scheduled_at time
+  observed_at time
+  occurrence_id string
+  missed_count int
+}
+
+source clock as daily_triage {
+  every weekday at 09:00
+  timezone "America/New_York"
+  missed coalesce
+
+  observe as tick
+  emit triage.tick {
+    scheduled_at tick.scheduled_at
+    observed_at tick.observed_at
+    occurrence_id tick.occurrence_id
+    missed_count tick.missed_count
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("program compiles");
+        assert_eq!(ir.sources.len(), 1);
+        let decl = &ir.sources[0];
+        assert_eq!(decl.name, "daily_triage");
+        assert_eq!(decl.provider, "clock");
+        assert!(decl.is_clock);
+        assert_eq!(decl.observe_binding, "tick");
+        assert_eq!(decl.emit_signal, "triage.tick");
+        assert_eq!(decl.emit_fields.len(), 4);
+        assert_eq!(decl.timezone.as_deref(), Some("America/New_York"));
+        assert_eq!(decl.missed, Some(MissedPolicy::Coalesce));
+        match &decl.recurrence {
+            Some(Recurrence::EveryCalendar { pattern, time, .. }) => {
+                assert_eq!(*pattern, CalendarPattern::Weekday);
+                assert_eq!(time.hour, 9);
+                assert_eq!(time.minute, 0);
+            }
+            other => panic!("expected calendar recurrence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_declaration_parses_and_lowers() {
+        let source = r##"
+@service
+workflow ChannelDecl
+
+use std.messaging
+
+channel release_room {
+  provider slack
+  workspace ops
+  destination "#release"
+}
+
+output result R
+class R { v string }
+signal go.now { x string }
+
+rule j
+  when go.now as g
+=> {
+  complete result {
+    v "ok"
+  }
+}
+"##;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("program compiles");
+        assert_eq!(ir.channels.len(), 1);
+        let channel = &ir.channels[0];
+        assert_eq!(channel.name, "release_room");
+        assert_eq!(channel.provider, "slack");
+        assert_eq!(channel.workspace.as_deref(), Some("ops"));
+        assert_eq!(channel.destination.as_deref(), Some("#release"));
+        // The channel construct auto-registers std.messaging in the contract
+        // registry (like leases -> std.coord), and `use std.messaging` parses as
+        // a dotted package name.
+        let registry = ir.contract_registry();
+        assert!(registry
+            .libraries
+            .iter()
+            .any(|library| library.id == "std.messaging"));
+        // The generic `Message` envelope is a built-in referenceable schema.
+        assert!(SchemaIndex::with_builtins().class_exists("Message"));
+    }
+
+    #[test]
+    fn channel_requires_a_provider() {
+        let source = r#"
+@service
+workflow ChannelNoProvider
+
+channel orphan {
+  workspace ops
+}
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule j
+  when go.now as g
+=> { complete result { v "ok" } }
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("missing a provider")),
+            "expected missing-provider diagnostic: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn duplicate_channel_is_rejected() {
+        let source = r#"
+@service
+workflow DupChannel
+
+channel room {
+  provider slack
+}
+channel room {
+  provider discord
+}
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule j
+  when go.now as g
+=> { complete result { v "ok" } }
+"#;
+        let compiled = compile_program(source);
+        let dup = compiled
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains("declared more than once"))
+            .expect("expected duplicate-channel diagnostic");
+        // The diagnostic carries related-information pointing at the first
+        // declaration (spec/error-handling.md "Spans And Labels").
+        assert_eq!(dup.related.len(), 1, "expected one related-info entry");
+        assert_eq!(dup.related[0].message, "first declared here");
+        assert!(dup.related[0].span.start < dup.span.start);
+    }
+
+    #[test]
+    fn when_message_from_binds_message_and_validates_channel() {
+        // `when message from <channel> as msg` binds the built-in `Message`
+        // envelope and the channel must be declared (spec/messaging.md).
+        let ok = compile_program(
+            r#"
+@service
+workflow Inbound
+
+channel release_room {
+  provider slack
+}
+
+output result Decision
+class Decision { note string }
+
+rule react
+  when message from release_room as msg
+=> {
+  complete result { note msg.text }
+}
+"#,
+        );
+        assert!(
+            ok.diagnostics.is_empty(),
+            "expected clean compile, got {:?}",
+            ok.diagnostics
+        );
+        // `msg.text` resolving against the Message schema proves the binding typed.
+
+        let bad = compile_program(
+            r#"
+@service
+workflow Inbound
+
+channel release_room {
+  provider slack
+}
+
+output result Decision
+class Decision { note string }
+
+rule react
+  when message from typo_room as msg
+=> {
+  complete result { note msg.text }
+}
+"#,
+        );
+        assert!(
+            bad.diagnostics.iter().any(|d| d
+                .message
+                .contains("`when message from typo_room` names an unknown channel")),
+            "expected unknown-channel diagnostic, got {:?}",
+            bad.diagnostics
+        );
+    }
+
+    #[test]
+    fn duplicate_schema_diagnostic_points_at_first_declaration() {
+        let source = r#"
+@service
+workflow DupSchema
+
+class Thing { v string }
+class Thing { w string }
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule j
+  when go.now as g
+=> { complete result { v "ok" } }
+"#;
+        let compiled = compile_program(source);
+        let dup = compiled
+            .diagnostics
+            .iter()
+            .find(|d| {
+                d.message
+                    .contains("schema `Thing` is declared more than once")
+            })
+            .expect("expected duplicate-schema diagnostic");
+        assert_eq!(dup.related.len(), 1);
+        assert_eq!(dup.related[0].message, "first declared here");
+        assert!(dup.related[0].span.start < dup.span.start);
+    }
+
+    #[test]
+    fn interval_clock_source_parses_duration() {
+        let source = r#"
+workflow Interval
+
+signal tick.beat {
+  at_time time
+}
+
+source clock as heartbeat {
+  every 5m
+  missed skip
+
+  observe as tick
+  emit tick.beat {
+    at_time tick.scheduled_at
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("program compiles");
+        match &ir.sources[0].recurrence {
+            Some(Recurrence::EveryDuration { seconds, .. }) => assert_eq!(*seconds, 300),
+            other => panic!("expected duration recurrence, got {other:?}"),
+        }
+        assert_eq!(ir.sources[0].missed, Some(MissedPolicy::Skip));
+    }
+
+    #[test]
+    fn recurring_clock_source_requires_missed() {
+        let source = r#"
+workflow NeedsMissed
+
+signal triage.tick {
+  scheduled_at time
+}
+
+source clock as daily {
+  every weekday at 09:00
+  timezone "UTC"
+
+  observe as tick
+  emit triage.tick {
+    scheduled_at tick.scheduled_at
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("must declare a `missed` policy")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn calendar_clock_source_requires_timezone() {
+        let source = r#"
+workflow NeedsTimezone
+
+signal triage.tick {
+  scheduled_at time
+}
+
+source clock as daily {
+  every weekday at 09:00
+  missed skip
+
+  observe as tick
+  emit triage.tick {
+    scheduled_at tick.scheduled_at
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("should declare a `timezone`")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn generic_source_block_lowers_to_signal_source() {
+        let source = r#"
+workflow Ingress
+
+signal deploy.finished {
+  service string
+}
+
+source webhook as deploys {
+  observe as obs
+  emit deploy.finished {
+    service obs.service
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("program compiles");
+        assert_eq!(ir.sources.len(), 1);
+        let decl = &ir.sources[0];
+        assert!(!decl.is_clock);
+        assert_eq!(decl.provider, "webhook");
+        assert!(decl.recurrence.is_none());
+        assert_eq!(decl.emit_signal, "deploy.finished");
     }
 }

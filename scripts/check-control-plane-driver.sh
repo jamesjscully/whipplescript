@@ -10,7 +10,7 @@ cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript --test co
 cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript --test control_plane \
   dev_phase_review_creates_requests_and_runs_fixture_turns
 cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript --test control_plane \
-  dev_provider_language_e2e_runs_agent_matrix_and_baml_reviews
+  dev_provider_language_e2e_runs_agent_matrix_and_coerce_reviews
 cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript --test control_plane \
   dev_native_fixture_records_provider_lifecycle_and_artifacts_from_source_workflow
 

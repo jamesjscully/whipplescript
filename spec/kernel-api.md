@@ -41,12 +41,26 @@ claim_effect(instance, effect, worker) -> lease_id
 start_run(instance, effect, lease) -> run_id
 complete_run(instance, run, output) -> event_id
 fail_run(instance, run, error) -> event_id
+acquire_lease(instance, resource, holder) -> lease_id
+renew_lease(instance, lease) -> event_id
 expire_lease(instance, lease) -> event_id
 cancel_effect(instance, effect, reason) -> event_id
+pause_instance(instance) -> event_id
+resume_instance(instance) -> event_id
+cancel_instance(instance) -> event_id
+activate_revision(instance, revision) -> event_id
+admit_fact_batch(instance, effect, validated_batch) -> event_ids
 ```
 
 Names are illustrative; the implementation may expose fewer public functions.
-The semantic boundary is what matters.
+The semantic boundary is what matters: the instance-lifecycle transitions
+(pause/resume/cancel, revision activation) are kernel transactions the control
+plane *sequences*, not control-plane-private state mutations. There is **one**
+lease engine — `acquire/renew/expire_lease` — and `std.coord.lease`,
+`queue.claim`, and tracker claims are all surfaces over it; packages do not
+implement their own lease lifecycles. `admit_fact_batch` is the typed
+fact-batch admission primitive from
+[`admission-and-idempotency.md`](admission-and-idempotency.md).
 
 ## Transaction Boundaries
 
@@ -99,7 +113,7 @@ The kernel enforces:
 - every run references exactly one effect
 - every terminal run appends exactly one terminal event
 - provider output is validated before completion facts are visible
-- plugins cannot mutate facts or events outside kernel operations
+- providers cannot mutate facts or events outside kernel operations
 
 ## Control Plane Boundary
 
@@ -119,4 +133,4 @@ The control plane may not:
 - mark effects completed without validation
 - start blocked effects
 - infer prompt semantics as workflow facts
-- let plugins bypass rule commits or effect events
+- let providers bypass rule commits or effect events

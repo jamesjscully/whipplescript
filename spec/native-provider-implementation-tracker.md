@@ -52,7 +52,7 @@ for this writable fixture, because terminal completion alone did not prove the
 file landed in the verified workspace.
 Codex app-server approval-capable server requests have
 deterministic decline-and-record coverage, and the installed app-server has live
-invalid-turn error-shape coverage; live Codex CLI `0.128.0` file changes were
+invalid-turn error-shape coverage; previous Codex CLI `0.128.0` file changes were
 observed as `item/fileChange/outputDelta`, `turn/diff/updated`, and
 `fileChange` item notifications rather than server-side approval requests under
 `workspace-write`/`on-request`. Live Claude unavailable-write probes currently
@@ -118,7 +118,7 @@ tool-denial event shape to gate yet.
 
 | Task | Status | Description | Validation |
 | --- | --- | --- | --- |
-| NP-021 | [x] | Generate and pin/check Codex app-server schema metadata for the installed CLI. | `scripts/check-codex-app-server-schema.sh` pins `codex-cli 0.128.0` schema metadata and fails if required methods disappear: `thread/start`, `turn/started`, `turn/completed`, `turn/interrupt`, `turn/diff/updated`. |
+| NP-021 | [x] | Generate and pin/check Codex app-server schema metadata for the installed CLI. | `scripts/check-codex-app-server-schema.sh` pins reviewed `codex-cli 0.137.0` schema metadata, accepts other installed Codex versions when the adapter methods still exist, and fails if required methods disappear: `initialize`, `thread/start`, `turn/start`, `turn/started`, `turn/completed`, `turn/interrupt`, `turn/diff/updated`. Exact metadata matching is available with `WHIPPLESCRIPT_CODEX_APP_SERVER_SCHEMA_STRICT_PIN=1`. |
 | NP-022 | [x] | Implement a minimal app-server transport client for stdio JSONL or unix socket. | Deterministic fake transport tests cover request/response, notification buffering, malformed response, remote error response, timeout, and adapter-level remote start-error mapping without raw message leakage; `WHIPPLESCRIPT_CODEX_APP_SERVER_ERROR_LIVE=1 scripts/check-codex-app-server-error-smoke.sh` validates the installed app-server's JSON-RPC error response shape. |
 | NP-023 | [x] | Start a read-only Codex thread/turn with explicit workspace and profile policy. | `WHIPPLESCRIPT_CODEX_APP_SERVER_LIVE=1 scripts/check-codex-app-server-live-smoke.sh` records thread id, turn id, lifecycle notifications, and terminal status in a redacted report. |
 | NP-024 | [x] | Capture Codex approvals/tool requests and diff notifications as evidence. | Kernel evidence summarizer has deterministic fake coverage for approval requests, tool requests, diff notifications, and item notifications without raw transcript/diff capture; the app-server adapter now answers approval-capable provider requests conservatively while recording them as `agent.turn.tool_requested`; store helper records the redacted summary with provider/thread/turn links; live artifact smoke validates Codex `turn/diff/updated` for a provider-created file in a disposable workspace. |
@@ -128,7 +128,7 @@ tool-denial event shape to gate yet.
 
 | Task | Status | Description | Validation |
 | --- | --- | --- | --- |
-| NP-031 | [x] | Choose TypeScript or Python Agent SDK embedding strategy and document why. | `spec/claude-agent-sdk-strategy.md` chooses a TypeScript sidecar and compares process boundary, auth, streaming, cancellation, packaging, and testability; `scripts/check-claude-agent-sdk-surface.sh` records local/package posture. |
+| NP-031 | [x] | Choose TypeScript or Python Agent SDK embedding strategy and document why. | `spec/claude-agent-sdk-strategy.md` chooses a TypeScript sidecar and compares process boundary, auth, streaming, cancellation, packaging, and testability; `scripts/check-claude-agent-sdk-surface.sh` records local/package posture, requires declared TypeScript SDK configuration, and treats registry metadata as informational unless `WHIPPLESCRIPT_CLAUDE_AGENT_SDK_STRICT_REGISTRY=1`. |
 | NP-032 | [x] | Add minimal Claude sidecar/client that streams one read-only turn. | Rust JSONL client has deterministic fake tests; `scripts/claude-agent-sdk-sidecar.mjs` streams fake or live Agent SDK events; `scripts/check-claude-agent-sdk-live-smoke.sh` validates the fake path by default and gates live read-only smoke behind `WHIPPLESCRIPT_CLAUDE_AGENT_SDK_LIVE=1`. |
 | NP-033 | [x] | Map WhippleScript profiles/capabilities to Claude tools, permission mode, hooks, and MCP config. | `claude_agent_sdk` policy tests cover read-only mapping, writer/Bash mapping, MCP config ref propagation, forbidden tool/profile mismatch, forbidden workspace, missing approval, and missing profile. |
 | NP-034 | [x] | Capture Claude session id, stream messages, hooks/tool events, usage/cost, and terminal result. | Kernel event summarizer redacts result/usage payloads; store helper records Claude Agent SDK evidence by provider session with provider/run links and reopen tests; deterministic adapter coverage proves remote start/event errors map to redacted native boundary failures without raw provider messages. |
@@ -187,7 +187,7 @@ tool-denial event shape to gate yet.
 
 | Task | Status | Description | Validation |
 | --- | --- | --- | --- |
-| NP-091 | [x] | Extend `scripts/check-real-providers.sh` with native-provider strict mode. | `WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_STRICT=1` defaults to Codex/Claude/Pi, rejects Loft/BAML command-wrapper selections, requires native provider configs, and runs native surface probes instead of command-wrapper smoke gates. |
+| NP-091 | [x] | Extend `scripts/check-real-providers.sh` with native-provider strict mode. | `WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_STRICT=1` defaults to Codex/Claude/Pi, rejects Loft/coerce command-wrapper selections, requires native provider configs, and runs native surface probes instead of command-wrapper smoke gates. |
 | NP-092 | [x] | Add isolated fixture requirements for destructive provider tests. | `scripts/check-real-providers.sh` now refuses destructive provider suites unless global or provider-specific disposable target markers are present with the exact acknowledgement string; reports record marker posture without values. |
 | NP-093 | [x] | Emit per-provider validation reports with redacted environment posture and evidence refs. | `scripts/check-real-providers-report.sh` writes `target/real-provider-reports/<provider>.json` with set/unset environment posture, evidence refs, check summaries, and redacted preflight records. |
 | NP-094 | [x] | Add optional CI matrix for native Codex, Claude, and Pi validation. | `.github/workflows/native-provider-validation.yml` provides a workflow-dispatch Codex/Claude/Pi matrix in native-surface mode, uploads per-provider reports, and has a strict job that fails when required native configs or live prerequisites are absent. |
@@ -286,6 +286,7 @@ tool-denial event shape to gate yet.
 | 2026-06-02 | Added Claude and Pi native artifact-ref extraction for explicit provider artifact metadata, including lifecycle normalization for artifact events and redaction regressions proving raw artifact content is not emitted. |
 | 2026-06-02 | Added Claude Agent SDK and Pi RPC artifact smoke gates, report artifacts, native-validation wiring, and release-readiness coverage for metadata-only artifact capture. |
 | 2026-06-02 | Validated live Claude Agent SDK interruption using local Claude auth; observed SDK terminal subtype `error_during_execution` after interrupt and normalized it to `claude.turn.cancelled` with acknowledgement `interrupt`. |
+| 2026-06-14 | Made Claude Agent SDK surface validation capability-based rather than registry-version based: local Claude CLI drift is accepted when required flags remain present, the declared/locked TypeScript SDK dependency is the package contract, and npm/pip registry metadata is non-fatal unless strict registry mode is enabled. |
 | 2026-06-02 | Validated live Claude and Pi artifact fixtures with disposable acknowledgements; both created fixed files in temporary workspaces and reports recorded only metadata and SHA-256 hashes. |
 
 ## Validation Commands

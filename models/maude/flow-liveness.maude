@@ -1,0 +1,51 @@
+--- Flow branch-completeness liveness, per spec/static-analysis.md "Flow liveness"
+--- and "Workflow Liveness". When a flow is a terminal path for its workflow, every
+--- branch -- each `on fails`/`on timeout` handler and both arms of every internal
+--- `when ... { } else { }` -- must reach a workflow terminal. A reachable branch
+--- whose progression stalls with no terminal reached fails the lint. Companion to
+--- check_flow_liveness in flow_expand.
+---
+--- This model abstracts each checked branch to whether it settles (reaches a
+--- terminal or a fact hand-off) or stalls, and marks a flow self-terminating when
+--- it contains an inline terminal anywhere. A stalling branch is any of: an
+--- `on fails`/`on timeout` handler that reaches no terminal, a `when`/`else` arm
+--- that reaches no terminal (or a missing `else`), or an effect with an explicit
+--- `timeout` and no `on timeout` handler. It checks by reachability search that:
+---   * in a self-terminating flow, a stalling branch is a liveness violation;
+---   * a stalling branch in a flow with NO inline terminal is not flagged (the
+---     pure-handoff case is deferred, not this lint);
+---   * when every branch settles, nothing is flagged.
+mod WHIPPLESCRIPT-FLOW-LIVENESS is
+  protecting BOOL .
+
+  sorts Arm ArmSet Cfg .
+  subsort Arm < ArmSet .
+
+  ops a1 a2 : -> Arm [ctor] .   --- checked branches: handler bodies / when-else arms
+
+  op mtArms : -> ArmSet [ctor] .
+  op _&_ : ArmSet ArmSet -> ArmSet [ctor assoc comm id: mtArms] .
+  eq [arm-idem] : A:Arm & A:Arm = A:Arm .
+
+  op memberArm : Arm ArmSet -> Bool .
+  eq memberArm(A:Arm, (A:Arm & AS:ArmSet)) = true .
+  eq memberArm(A:Arm, AS:ArmSet) = false [owise] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op armSettles : Arm -> Cfg [ctor] .   --- branch reaches a terminal or fact hand-off
+  op armStalls : Arm -> Cfg [ctor] .    --- branch reaches neither -- stalled progression
+  op flowHasTerminal : -> Cfg [ctor] .   --- flow is self-terminating (an inline terminal)
+  op stalled : ArmSet -> Cfg [ctor] .    --- recorded liveness violations
+
+  var A : Arm .
+  var S : ArmSet .
+
+  --- In a self-terminating flow, a stalling branch is a violation. The LHS
+  --- requires flowHasTerminal, so a flow with no inline terminal never matches and
+  --- is left to the broader workflow-liveness lint. Guarded so each arm flags once.
+  crl [flag] : flowHasTerminal armStalls(A) stalled(S)
+      => flowHasTerminal armStalls(A) stalled(A & S)
+      if memberArm(A, S) = false .
+endm

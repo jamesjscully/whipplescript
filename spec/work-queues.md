@@ -1,8 +1,29 @@
 # Work queues: vendor-neutral issue tracking
 
 Status: spec drafted 2026-06-09 (decided in design discussion; see
-[`language-ergonomics-tracker.md`](language-ergonomics-tracker.md) A3).
+[`language-ergonomics-tracker.md`](decision-records/language-ergonomics-tracker.md) A3).
 Stage: spec -> modeling -> implementation + testing -> review.
+
+> **Superseded.** This file is the earlier queue/item formulation and is retained
+> for history. The current design is
+> [`std.tracker`](decision-records/0002-work-tracker-package.md) (issues are the
+> durable record of work; queues are ready-work projections) plus
+> [`std.coord`](coordination.md) for generic coordination resources. Two parts of
+> this document are explicitly **out of date** and must not be built on:
+>
+> - **`items.sqlite` as the source of truth** (see [The builtin tracker](#the-builtin-tracker))
+>   contradicts the current model, where coordination state is *ordinary facts*
+>   and the only durable lifecycle primitive is the **kernel lease** (see
+>   [`admission-and-idempotency.md`](admission-and-idempotency.md)). A tracker
+>   *binding* may use a local file, but no spec should treat queue state as a
+>   private mutable store that is the truth.
+> - **`claim`'s own "lease machinery"** (see
+>   [Claim and lease semantics](#claim-and-lease-semantics)) is now a *surface*
+>   over the single kernel lease primitive, not a separate implementation. The
+>   sections below are kept as historical narrative; where they describe a
+>   distinct queue lease engine, read it as the kernel lease primitive.
+>
+> `coordination.md` does not build on the stale parts of this document.
 
 ## Motivation
 
@@ -127,13 +148,22 @@ interface:
 - The **tracker is the arbiter**. The builtin enforces atomicity
   transactionally. External bindings do best-effort (check-then-assign);
   the residual race window is documented per binding.
-- A successful claim creates a whip-side **lease** (expiry, renewal) using
-  the existing lease machinery; lease expiry releases the item.
+- A successful claim takes a whip-side **lease** through the **single kernel
+  lease primitive** (`acquire`/`renew`/`expire`/`recover`) — the same primitive
+  `std.coord.lease` ([`coordination.md`](coordination.md)) surfaces — not a
+  separate queue lease engine. `queue.claim` is one *surface* over it; TTL,
+  renewal, expiry, and recovery are kernel-owned, and the claimed item's state is
+  an ordinary fact. Lease expiry releases the item.
 - `claim` on an already-claimed item completes on the failure branch with a
   typed reason — dispatch rules route around it without error handling
   ceremony.
 
 ## The builtin tracker
+
+> Historical: the "SQLite-file-as-source-of-truth" model below is superseded by
+> the facts-plus-kernel-lease model (see the note at the top of this file). A
+> tracker binding may still use a local file as its *backend*, but queue state is
+> not a private mutable store treated as the truth.
 
 The reference implementation and default binding, backed by a
 **workspace-scoped** SQLite file (default `.whipplescript/items.sqlite`),

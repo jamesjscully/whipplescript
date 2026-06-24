@@ -1,13 +1,18 @@
-# Script capabilities: content-pinned `exec` for hosted authors
+# `std.script`: content-pinned `exec` capabilities
 
-Status: spec drafted 2026-06-11 from decided design
-([`language-ergonomics-tracker.md`](language-ergonomics-tracker.md) C9).
+Status: spec revised 2026-06-14 from package design
+([`decision-records/0007-core-standard-libraries-and-providers.md`](decision-records/0007-core-standard-libraries-and-providers.md)).
 Stage: spec -> modeling -> implementation + testing -> review.
+
+Direction note: `std.script` is the preferred default implementation path for
+small custom request/response providers; see
+[`decision-records/0006-libraries-packages-providers-and-exec.md`](decision-records/0006-libraries-packages-providers-and-exec.md).
 
 ## Framing
 
-**In hosted mode, the author can never cause execution of bytes the operator
-didn't pin.**
+**If scripts are disabled, no workflow, agent output, provider output, or prompt
+injection path can cause process execution. If scripts are enabled, the author
+can only request named capabilities whose bytes the operator pinned.**
 
 The language's pitch is "safe by default, gated escape hatches." Raw
 `exec "string"` behind `WHIPPLESCRIPT_EXEC_ALLOW` is a *dev-time convenience
@@ -25,26 +30,27 @@ structural holes:
    share a user, and there is a TOCTOU window even when they don't.
 
 The target deployment is an LLM authoring WhippleScript for a non-technical
-user, in an environment where the authoring agent has no bash tool and
-cannot write or run scripts. Hosted mode therefore replaces the command
-*string* with a named, **content-pinned capability** drawn from an
-operator-curated manifest. Part C shrank the residue this must cover: events,
-`notify`, coordination resources, and JSON ingestion absorbed most of what
-used to need glue scripts, so a small vetted standard library covers most
-users.
+user. Prompt injection must not be able to turn text into execution. Hosted mode
+therefore replaces the command *string* with a named, **content-pinned
+capability** drawn from an operator-curated manifest. Typed signals,
+coordination resources, messaging, and JSON ingestion cover most glue that used
+to require scripts, so this package should stay small.
 
 ## The three planes (threat model)
 
 - **Operator/harness plane — trusted, user authority.** The user-run harness
   writes and edits scripts, recomputes hashes, updates the manifest, and
   drives the runtime: worker passes and heartbeats are harness cadence (the
-  daemon-free design means the trusted tier owns time; a heartbeat is
-  `whip notify heartbeat.tick` if the beat should be a visible typed event).
+  daemon-free design means the trusted tier owns time; a heartbeat is admitted
+  through `whip signal` if the beat should be a visible typed signal).
 - **Authoring plane — the orchestrator `.whip`, LLM-authored.** Reacts to
-  `when <agent> completed turn` and declared events; launches workers with
+  agent completions and declared signals; launches workers with
   `tell`/`invoke`; reaches the outside world only through *names* (manifest
-  capabilities, declared agents). It cannot edit scripts because no verb in
-  the language writes files — an absence, not a permission.
+  capabilities, declared agents, declared file stores, declared channels, and
+  other package resources). It may write ordinary files through `std.files` when
+  explicitly granted, but it cannot edit script capabilities, provider config, or
+  the script manifest. The security boundary is content pinning plus manifest
+  unreachability, not the absence of a file-write verb.
 - **Labor plane — worker agents.** May write any bytes anywhere in their
   workspaces, including over whitelisted script files — and it doesn't
   matter: they can edit the *file* but not the *capability*. Edited bytes
@@ -55,11 +61,15 @@ users.
 The escalation chains this kills: author writes a command string (no such
 surface exists in hosted mode); author directs a worker to rewrite a script
 (the edit unpins it); worker poisons a script ahead of an authorized call
-(same).
+(same); prompt injection asks an agent or provider to run a command (text is not
+execution authority, and provider/tool policies must not expose shell execution
+when `std.script` is disabled).
 
 ## Surface
 
 ```whip
+use std.script
+
 exec backup_repo with r -> Report as x
 
 after x succeeds as report { ... }
@@ -105,6 +115,11 @@ workspace, unreachable from any agent sandbox:
 
 ## Enforcement
 
+- **Hard off:** when `std.script` is not imported, not installed, or disabled by
+  profile/policy, every `exec` source form is rejected or blocked before any
+  provider run. Providers and agents are not allowed to treat natural-language
+  instructions, tool arguments, model output, or generic capability calls as an
+  alternate script execution channel.
 - **Check (hosted profile):** a raw `exec "string"` is a check error; a
   capability name that does not resolve in the supplied manifest is a check
   error. Dev mode keeps raw `exec` behind the env allowlist.
@@ -123,12 +138,20 @@ workspace, unreachable from any agent sandbox:
 ## Hard exclusions and harness obligations
 
 - **The `whip` binary is never whitelistable.** A script that shells out to
-  `whip notify` or `whip revise` would let the authoring plane mint
+  `whip signal` or `whip revise` would let the authoring plane mint
   control-plane actions and the tier separation collapses. The native verbs
-  (queue ops, `notify`, coordination) cover the legitimate cases.
+  (queue ops, typed signal injection, coordination) cover the legitimate cases.
+- **No script execution through agent providers.** An agent harness may have its
+  own tools, but those tools are governed by the agent provider profile. They
+  must not be used as an implicit fallback for `std.script`. If script execution
+  is disabled, an injected instruction such as "run this shell command" remains
+  ordinary text unless the agent provider independently and explicitly grants a
+  separate, audited tool.
 - **Worker sandboxes must exclude the manifest path** (and provider config
-  generally). Hash pinning makes script-file writes harmless; a manifest
-  write re-pins. This is a harness contract, recorded here as one.
+  generally). Declared `std.files` stores and agent workspaces must not include
+  script manifests or provider config. Hash pinning makes script-file writes
+  harmless; a manifest write re-pins. This is a harness contract, recorded here
+  as one.
 - **Manifest changes require explicit human confirmation, diff shown.** The
   curator in the target deployment is itself an LLM (the user's harness),
   which routinely reads worker output — so the whitelist's integrity rests
@@ -151,10 +174,13 @@ workspace, unreachable from any agent sandbox:
 ## Static checks
 
 - Hosted profile: `exec` with a quoted command string is a check error.
+- If `std.script` is not imported/enabled, any `exec` form is a check error.
 - An `exec` capability name absent from the manifest (when supplied at
   check time) is a check error naming the declared capabilities.
 - `with <binding>` requires a typed record binding; there is no positional
   or string-interpolated argument surface.
+- `exec` cannot target `whip`, package-manager commands, or other denied
+  control-plane binaries even when they appear in a manifest.
 
 ## Out of scope (v1)
 
@@ -163,6 +189,9 @@ workspace, unreachable from any agent sandbox:
 - Signed manifests / key distribution — hash pinning suffices single-host;
   signing arrives with multi-host distribution.
 - Fetching scripts from the network.
+- Shell-string execution in hosted mode.
+- Using generic providers, agent tools, or messaging channels as hidden script
+  execution fallbacks.
 
 ## Dependencies
 
@@ -185,3 +214,6 @@ flag, and the hash-verify-then-exec spawn path.
 - **Plane separation (the composite):** the authoring plane cannot cause
   execution of bytes the operator didn't pin — composition of fail-closed,
   no-injection, manifest unreachability, and the `whip` exclusion.
+- **Hard-off soundness:** with `std.script` disabled, no transition in the
+  workflow/runtime/provider model can spawn a process through `exec`, script
+  capability calls, agent text, or provider output.

@@ -1,6 +1,14 @@
 # Memory Plugin
 
-Status: draft
+Status: historical draft
+
+Direction update: this document is superseded by
+[`decision-records/0008-memory-package.md`](decision-records/0008-memory-package.md).
+Memory should be treated as the `std.memory` standard package: named memory
+pools with heuristic retrieval providers, explicit `recall from` and
+`learn from ... into` operations, turn-scoped `with access to` grants, and
+auditable context bundles. This older plugin framing remains useful as
+background but is no longer the active product shape.
 
 Memory should be a plugin, not a built-in language feature.
 
@@ -82,7 +90,7 @@ why.
 Memory may provide context before an agent turn:
 
 ```whipplescript
-recall memory for issue as context
+recall from project_memory for issue as context
 tell worker with context context "..."
 ```
 

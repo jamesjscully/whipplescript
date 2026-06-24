@@ -35,7 +35,7 @@ strict_native="${WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_STRICT:-0}"
 if [[ "$strict_native" == "1" ]]; then
   selected_providers="${WHIPPLESCRIPT_REAL_PROVIDERS:-codex,claude,pi}"
 else
-  selected_providers="${WHIPPLESCRIPT_REAL_PROVIDERS:-loft,baml}"
+  selected_providers="${WHIPPLESCRIPT_REAL_PROVIDERS:-loft,coerce}"
 fi
 
 set +e
@@ -67,13 +67,13 @@ const envNames = [
   "WHIPPLESCRIPT_LOFT_DESTRUCTIVE_TESTS",
   "WHIPPLESCRIPT_LOFT_DISPOSABLE_TARGET",
   "WHIPPLESCRIPT_LOFT_DISPOSABLE_ACK",
-  "WHIPPLESCRIPT_BAML_TEST_ENDPOINT",
-  "WHIPPLESCRIPT_BAML_TEST_FUNCTION",
-  "WHIPPLESCRIPT_BAML_TEST_ARGUMENTS_JSON",
-  "WHIPPLESCRIPT_BAML_TEST_OUTPUT_TYPE",
-  "WHIPPLESCRIPT_BAML_DESTRUCTIVE_TESTS",
-  "WHIPPLESCRIPT_BAML_DISPOSABLE_TARGET",
-  "WHIPPLESCRIPT_BAML_DISPOSABLE_ACK",
+  "WHIPPLESCRIPT_COERCE_TEST_ENDPOINT",
+  "WHIPPLESCRIPT_COERCE_TEST_FUNCTION",
+  "WHIPPLESCRIPT_COERCE_TEST_ARGUMENTS_JSON",
+  "WHIPPLESCRIPT_COERCE_TEST_OUTPUT_TYPE",
+  "WHIPPLESCRIPT_COERCE_DESTRUCTIVE_TESTS",
+  "WHIPPLESCRIPT_COERCE_DISPOSABLE_TARGET",
+  "WHIPPLESCRIPT_COERCE_DISPOSABLE_ACK",
   "WHIPPLESCRIPT_CODEX_DESTRUCTIVE_TESTS",
   "WHIPPLESCRIPT_CODEX_DISPOSABLE_TARGET",
   "WHIPPLESCRIPT_CODEX_DISPOSABLE_ACK",
@@ -164,7 +164,10 @@ for (const [provider, checks] of providers) {
   const passed = checks.filter((check) => check.status === "pass").length;
   const report = {
     provider: redactText(provider),
-    status: failed > 0 ? "fail" : skipped > 0 && passed === 0 ? "skip" : "pass",
+    // A provider is "pass" only if it actually passed a check. With no passes
+    // (everything skipped, or no checks ran at all) it is reported as "skip"
+    // (unavailable) rather than silently passing.
+    status: failed > 0 ? "fail" : passed === 0 ? "skip" : "pass",
     started_at: startedAt,
     finished_at: finishedAt,
     command_exit_code: Number(exitCode),
@@ -207,15 +210,15 @@ NODE
   echo "- Loft CLI override: $(env_state WHIPPLESCRIPT_LOFT_CLI)"
   echo "- Loft repo override: $(env_state WHIPPLESCRIPT_LOFT_REPO)"
   echo "- Loft repo preflight skip: $(env_state WHIPPLESCRIPT_LOFT_SKIP_REPO_PREFLIGHT)"
-  echo "- BAML endpoint: $(env_state WHIPPLESCRIPT_BAML_TEST_ENDPOINT)"
-  echo "- BAML destructive tests: $(env_state WHIPPLESCRIPT_BAML_DESTRUCTIVE_TESTS)"
-  echo "- BAML disposable target: $(env_state WHIPPLESCRIPT_BAML_DISPOSABLE_TARGET)"
-  echo "- BAML disposable acknowledgement: $(env_state WHIPPLESCRIPT_BAML_DISPOSABLE_ACK)"
-  echo "- BAML function: $(env_state WHIPPLESCRIPT_BAML_TEST_FUNCTION)"
-  echo "- BAML arguments JSON: $(env_state WHIPPLESCRIPT_BAML_TEST_ARGUMENTS_JSON)"
-  echo "- BAML output type: $(env_state WHIPPLESCRIPT_BAML_TEST_OUTPUT_TYPE)"
-  echo "- BAML health path: $(env_state WHIPPLESCRIPT_BAML_HEALTH_PATH)"
-  echo "- BAML CLI skip: $(env_state WHIPPLESCRIPT_BAML_SKIP_CLI)"
+  echo "- coerce endpoint: $(env_state WHIPPLESCRIPT_COERCE_TEST_ENDPOINT)"
+  echo "- coerce destructive tests: $(env_state WHIPPLESCRIPT_COERCE_DESTRUCTIVE_TESTS)"
+  echo "- coerce disposable target: $(env_state WHIPPLESCRIPT_COERCE_DISPOSABLE_TARGET)"
+  echo "- coerce disposable acknowledgement: $(env_state WHIPPLESCRIPT_COERCE_DISPOSABLE_ACK)"
+  echo "- coerce function: $(env_state WHIPPLESCRIPT_COERCE_TEST_FUNCTION)"
+  echo "- coerce arguments JSON: $(env_state WHIPPLESCRIPT_COERCE_TEST_ARGUMENTS_JSON)"
+  echo "- coerce output type: $(env_state WHIPPLESCRIPT_COERCE_TEST_OUTPUT_TYPE)"
+  echo "- coerce health path: $(env_state WHIPPLESCRIPT_COERCE_HEALTH_PATH)"
+  echo "- coerce CLI skip: $(env_state WHIPPLESCRIPT_COERCE_SKIP_CLI)"
   echo "- Codex smoke prompt: $(env_state WHIPPLESCRIPT_CODEX_SMOKE_PROMPT)"
   echo "- Codex smoke expected response: $(env_state WHIPPLESCRIPT_CODEX_SMOKE_EXPECTED)"
   echo "- Codex smoke model override: $(env_state WHIPPLESCRIPT_CODEX_MODEL)"

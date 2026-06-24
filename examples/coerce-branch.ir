@@ -20,7 +20,7 @@ rules
     writes
       schema:ClassifiedMessage
     effects
-      classification kind=baml.coerce binding=classification key=95520869f1dc020b
+      classification kind=coerce binding=classification key=7abc11ff12841563
       effect2 kind=human.ask binding=- key=9cb792d395f3f9ce
     dependencies
       classification --fails--> effect2

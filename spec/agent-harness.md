@@ -7,6 +7,26 @@ The harness layer turns durable `agent.tell` effects into real agent turns.
 WhippleScript must not pretend an agent turn exists until this layer can start a
 provider run, capture evidence, and append a completion event.
 
+## Terminology: Three Senses Of "harness"
+
+The word "harness" is overloaded. This spec uses exactly one meaning and names
+the others explicitly:
+
+```text
+harness layer        THIS document — the runtime execution layer that runs
+                     agent.tell effects as provider turns. The bare word
+                     "harness" in this file always means this layer.
+
+harness keyword      a soft-deprecated source keyword for advanced named
+                     endpoints. Authoring should route agents through the
+                     ordinary `provider` clause; see 0009. Always written as
+                     "the `harness` keyword" when referenced here.
+
+native harness       the provider's own agent harness (Codex's harness, Claude
+                     Code, Pi). Always written as "native harness" / "provider
+                     harness" when referenced here.
+```
+
 ## Harness Player
 
 A harness player is the runtime worker that executes queued harness effects.
@@ -57,34 +77,84 @@ how completion facts affect policy
 
 ```text
 resolve(profile, agent, input) -> LaunchPlan
-run(LaunchPlan) -> ProviderRunResult
+run(LaunchPlan, AbortSignal) -> ProviderRunResult
 collect(ProviderRunResult) -> CompletionEvent + artifacts
 ```
 
-The common provider result shape is intentionally richer than process
-stdout/stderr:
+The `LaunchPlan` carries the **turn-access grant** as authority-narrowing
+metadata, not as a separate effect or lowering class. When the source `tell`
+appears under `with access to <resource> { … }`, that grant is metadata on the
+`agent.tell` effect (Proposal A in
+[`admission-and-idempotency.md`](admission-and-idempotency.md)). The harness
+resolves the grant into the LaunchPlan as the **effective intersection** of
+store policy, the source-declared grant, the provider's reported capabilities,
+and the agent's profile. The adapter then runs the turn under that narrowed
+authority. In-turn tool invocations made under the grant are recorded as
+evidence (see below); they never become rule-matchable child facts.
+
+The normalized provider result is a **terminal summary plus evidence/artifact
+references**, not a typed transcript of provider-specific stream concepts:
 
 ```text
 provider
 provider_session_id
 thread_id
 turn_id
-status
+status                 # terminal: completed | failed | timed_out | cancelled
 summary
 structured_result_json?
 changed_files[]
 diff_refs[]
 artifact_refs[]
-tool_calls[]
-approval_events[]
+evidence_refs[]        # streamed progress, tool calls, approvals: EVIDENCE only
 usage_json?
 started_at
 completed_at
 ```
 
-Each adapter may obtain those fields differently, but the harness must normalize
-them before appending completion events. Missing optional fields should be
-explicitly represented as unavailable rather than silently dropped.
+Provider tool calls and approval events are **provider-incompatible stream
+concepts** (Codex approvals, Claude tool/hook events, Pi tool events do not
+share a shape), so they are not typed result fields. They live in evidence,
+reachable through `evidence_refs`/`artifact_refs`. Each adapter may obtain the
+summary fields differently, but the harness normalizes them before appending
+completion events. Missing optional fields should be explicitly represented as
+unavailable rather than silently dropped.
+
+### Cancellation
+
+`run` takes an abort/cancel signal because the providers expose materially
+different cancellation surfaces: Codex `turn/interrupt`, Claude request-only
+cancel (semantics still unvalidated), and Pi RPC `abort` whose acknowledgement
+can arrive out of order with the terminal event. The adapter contract therefore
+requires a cancel entry point and a rule for how it resolves:
+
+```text
+cancel acknowledged + terminal observed  -> status = cancelled
+cancel requested, terminal arrives first  -> use the observed terminal
+                                             (Pi: terminal may precede the
+                                             abort ack; tolerate reordering)
+cancel requested, no terminal observable, provider supports idempotent re-query
+                                          -> re-query; admit discovered terminal
+cancel requested, no terminal, no idempotent re-query
+                                          -> resolve to `uncertain` (a Failed
+                                             subkind) per the exactly-once rules
+                                             in admission-and-idempotency.md
+```
+
+This follows the exactly-once / `uncertain` terminal rules in the keystone: a
+worker never silently re-executes an external side effect when the terminal is
+unknown.
+
+### Replay
+
+An agent turn is **record-once** (Determinism And Replay in
+[`admission-and-idempotency.md`](admission-and-idempotency.md)): the turn records
+its terminal outcome plus evidence durably, and replay reads the recorded
+terminal and evidence and **never re-invokes the provider**. The turn's
+idempotency key (or companion execution fingerprint) commits to the
+provider/model id, prompt/coercion-artifact hash, and output-schema hash, so a
+changed contract is a different key and a stale recorded outcome is never
+reused.
 
 Initial provider targets:
 
@@ -102,9 +172,10 @@ coding agents are wired.
 The first implementation exposes this boundary as a kernel `AgentHarness` trait
 with a deterministic `MockAgentHarness`. The kernel-owned runner starts an
 effect run, records injected skill provenance, runs the adapter, stores
-artifacts and provider evidence, appends the terminal effect completion, and
-then emits an `agent.turn.*` event plus fact. Adapters return data; they do not
-receive store handles or mutate kernel state directly.
+artifacts and provider evidence (including in-turn stream/tool/approval
+evidence), appends the terminal effect completion, and then emits the terminal
+`agent.turn.*` lifecycle event plus its rule-matchable fact. Adapters return
+data; they do not receive store handles or mutate kernel state directly.
 
 The real provider adapters are not interchangeable command wrappers. Each one
 must map WhippleScript's durable turn contract onto the provider's native session
@@ -225,21 +296,39 @@ artifact_refs
 structured_result?
 ```
 
-Completion must also derive standard facts that later rules can match:
+Completion derives the durable, **rule-matchable** lifecycle facts:
 
 ```text
 agent.turn.started
-agent.turn.streamed
-agent.turn.tool_requested
-agent.turn.artifact_captured
 agent.turn.completed
 agent.turn.failed
 agent.turn.timed_out
 agent.turn.cancelled
 ```
 
+These are the only `agent.turn.*` values rules may match. They are the durable
+lifecycle of a turn under the canonical terminal union
+(`Completed<O> | Failed<E> | TimedOut | Cancelled`; see
+[`admission-and-idempotency.md`](admission-and-idempotency.md) and
+[`expression-kernel.md`](expression-kernel.md)).
+
+In-turn observations are recorded as **evidence**, not rule-matchable facts.
+This is Proposal A in [`admission-and-idempotency.md`](admission-and-idempotency.md):
+turn-internal activity is inspectable evidence, never event-sourced facts that
+later rules pattern-match. The following are evidence kinds, not facts:
+
+```text
+agent.turn.streamed          (evidence: streamed model progress)
+agent.turn.tool_requested    (evidence: in-turn tool call)
+agent.turn.artifact_captured (evidence: captured artifact/diff)
+```
+
+Rules cannot react to a per-tool or per-stream event; they observe only the
+terminal lifecycle facts above plus the recorded evidence on the turn. We
+explicitly rejected an event-sourced in-turn harness for v0.
+
 Native adapters normalize provider-specific event names into these canonical
-events and facts. The canonical payload includes `effect_id`, `run_id`, `agent`,
+lifecycle facts and evidence kinds. The canonical payload includes `effect_id`, `run_id`, `agent`,
 `provider`, `status`, `terminal`, provider session/turn ids when available, the
 provider event type, and only a redacted provider payload shape. Raw provider
 transcript, tool arguments, diffs, and error text belong in bounded evidence or
@@ -368,17 +457,29 @@ provider runtime failure.
 
 ## Profiles
 
-Profiles are semantic authority bundles:
+Profiles are semantic authority bundles. The canonical preset list is pinned
+once by `std.agent` in
+[`decision-records/0009-agent-package.md`](decision-records/0009-agent-package.md);
+this layer references that list rather than restating its own:
 
 ```text
 repo-reader
 repo-writer
 internet-research
-review-only
+issue-triager
+human-review
+release-operator
+no-repo
 ```
 
 Provider names are not profile names. The capability registry binds profiles to
 providers and enforcement options.
+
+Turn-scoped authority narrowing on top of the profile is expressed in source as
+`with access to <resource> { … }`. Per Proposal A it is authority-narrowing
+metadata on the `agent.tell` effect, not a profile and not a durable child
+effect; the harness folds it into the LaunchPlan's effective intersection (see
+Provider Adapter Contract).
 
 ## Skills And Context
 
@@ -388,8 +489,8 @@ Before a turn starts, the harness assembles:
 base prompt
 rule-provided message
 attached skills
-plugin-provided context bundles
-Loft/Thoth/memory artifacts, if requested
+package/provider context bundles
+tracker/repo/memory artifacts, if requested
 capability instructions
 ```
 

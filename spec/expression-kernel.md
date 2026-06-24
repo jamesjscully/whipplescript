@@ -24,8 +24,9 @@ static action/template parameters
 
 Expressions may inspect matched facts, effect projections, explicit action
 parameters, literals, and typed constants. Expressions may not perform I/O,
-enqueue effects, call providers, invoke BAML, call plugins, read clocks, use
-randomness, mutate facts, or run host-language code.
+enqueue effects, call providers, invoke schema-coercion backends, call package
+capabilities, read clocks, use randomness, mutate facts, or run host-language
+code.
 
 ## Value Domain
 
@@ -352,6 +353,33 @@ case task.provider {
 }
 ```
 
+The canonical terminal-output union an `after`/`case` sees is defined here and
+referenced by every other spec: `Completed<O> | Failed<E> | TimedOut |
+Cancelled`. Every effect, agent turn, and `coerce` terminal uses this shape.
+Domain-specific success and failure payloads are the `O` and `E` type
+parameters, not new tags. Branch keywords bind it as follows:
+
+```text
+succeeds   -> Completed<O>   (binds the success output payload O)
+fails      -> Failed<E>      (binds the failure payload E)
+times out  -> TimedOut       (terminal status value `timed_out`)
+cancelled  -> Cancelled
+completes  -> the full four-tag union, for case
+```
+
+Each branch keyword above is also usable directly as an `after <binding>
+<predicate>` branch (e.g. `after job times out as t { ... }` or `after job
+cancelled as c { ... }`). The `as` alias then carries the matching terminal
+payload schema — `succeeds`/`completes` bind the effect's completed output,
+`fails` the failure payload, `times out` the `TimedOut` payload, and
+`cancelled` the `Cancelled` payload — so field access through the alias
+type-checks the same way the corresponding `case` arm binding does.
+
+`Failed<E>` carries an optional domain payload `E`; when an effect declares no
+richer failure type, `E` defaults to the core `Failure { reason string, ... }`.
+A `coerce`/validation failure's `E` is the effect's rich failure payload (see
+[coerce.md](coerce.md), [admission-and-idempotency.md](admission-and-idempotency.md)).
+
 `after <effect> completes` exposes the effect binding as a tagged terminal
 union for deterministic branching. The v0 source pattern follows the existing
 case-branch form and binds the variant payload:
@@ -403,12 +431,15 @@ captures:
 - each branch's tag, payload binding, optional guard expression, branch body
   hash, and pattern span
 
-The `Completed` payload type is the effect's success output type, such as a
-BAML coerce result class, `AgentTurn`, `LoftClaim`, or `HumanAnswer`. The
-failure-like alternatives use structured payload schemas:
+The `Completed` payload type is the effect's success output type `O`, such as a
+schema-coercion result class, `AgentTurn`, `LoftClaim`, or `HumanAnswer`. The
+failure-like alternatives use structured payload schemas. `Failed`'s payload is
+the effect's `E`: when an effect declares a richer failure type (e.g. a
+`coerce`'s `SchemaCoerceFailed`), `E` is that type; otherwise it defaults to the
+core `Failure` shape below:
 
 ```text
-Failed    { reason string, summary string, effect_id string, run_id string }
+Failed    { reason string, summary string, effect_id string, run_id string }  # default E
 TimedOut  { summary string, effect_id string, run_id string }
 Cancelled { summary string, effect_id string, run_id string }
 ```
@@ -457,7 +488,10 @@ arrays and objects only when every nested field is equality-comparable
 ```
 
 `int` and `float` may compare numerically when lossless and well-defined. NaN
-and infinities are not valid WhippleScript numeric values.
+and infinities are not valid WhippleScript numeric values. Comparison is not
+assignment: numeric comparison across `int` and `float` is permitted here, but
+the type system still forbids implicit `int`/`float` coercion when assigning or
+constructing a typed field (see [type-system.md](type-system.md)).
 
 Class/object equality is not a routing primitive unless the class is explicitly
 marked comparable or the comparison is over known identity fields. Prefer field
@@ -790,6 +824,6 @@ fact(F) + guard(R, F, false) -> no rewrite
 fact(F) + guard(R, F, error) -> diagnostic, no graph
 ```
 
-Do not model BAML/model semantic truth in Maude. Model only the typed contract:
-a `coerce` effect may complete with a value that satisfies its output type, fail,
-time out, or be cancelled.
+Do not model schema-coercion/model semantic truth in Maude. Model only the typed
+contract: a `coerce` effect may complete with a value that satisfies its output
+type, fail, time out, or be cancelled.

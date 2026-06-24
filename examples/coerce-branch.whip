@@ -2,7 +2,7 @@
 workflow CoerceBranch
 
 
-# `coerce` turns unstructured work into a typed decision with failure handling.
+# `coerce` turns unstructured work into typed schema-coercion output with failure handling.
 enum Priority {
   Low
   Normal

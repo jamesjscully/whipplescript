@@ -137,7 +137,7 @@
         "instance_id": {"type": ["string", "null"]},
         "program_id": {"type": ["string", "null"]},
         "program_version_id": {"type": ["string", "null"]},
-        "severity": {"type": "string"},
+        "severity": {"enum": ["error", "warning", "info", "hint"]},
         "code": {"type": ["string", "null"]},
         "message": {"type": "string"},
         "source_span": {"anyOf": [{"$ref": "#/$defs/span"}, {"type": "null"}]},

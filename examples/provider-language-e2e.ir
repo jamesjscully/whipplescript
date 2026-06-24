@@ -63,9 +63,9 @@ assertions
   assert count(effect kind agent.tell where status == completed) == 6
     reads
       effect:kind agent.tell where status == completed
-  assert count(effect kind baml.coerce where status == completed) == 6
+  assert count(effect kind coerce where status == completed) == 6
     reads
-      effect:kind baml.coerce where status == completed
+      effect:kind coerce where status == completed
 rules
   rule table_language_tasks
     when started
@@ -93,7 +93,7 @@ rules
       schema:LanguageTask
     effects
       turn kind=agent.tell binding=turn key=dcc419597b331e20
-      review kind=baml.coerce binding=review key=2ffc7caad53c6757
+      review kind=coerce binding=review key=2ffc7caad53c6757
     dependencies
       turn --succeeds--> review
     body_hash 8e33bd71144e3452

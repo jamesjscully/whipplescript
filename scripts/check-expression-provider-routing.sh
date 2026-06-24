@@ -10,7 +10,7 @@ cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript-parser \
 cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript --test control_plane \
   dev_evaluates_shared_expression_kernel_for_guards_and_assertions
 cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript --test control_plane \
-  dev_provider_language_e2e_runs_agent_matrix_and_baml_reviews
+  dev_provider_language_e2e_runs_agent_matrix_and_coerce_reviews
 cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript \
   generated_model_search_runs_lowered_expression_fixture
 

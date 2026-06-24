@@ -9,11 +9,11 @@ with the [tutorial](tutorial.md); for authoring guidance, see the
 A program is a root file plus its `include` closure. A file contains
 declarations: at most one workflow header (or any number of brace-wrapped
 workflows), classes, enums, agents, coerce functions, tables, rules,
-assertions, patterns, and imports.
+assertions, patterns, events, coordination resources, harnesses, and imports.
 
 ```whip
 include "shared/review.whip"
-include "review.baml"
+include "review.coerce"
 
 use memory
 
@@ -66,6 +66,81 @@ Both forms support the full language, including contracts and terminal
 actions. Library workflows in the same bundle are invokable by name with
 `invoke`.
 
+## Lexical Structure
+
+WhippleScript is line-oriented but not indentation-sensitive. Newlines
+separate declarations, clauses, and block statements; braces group bodies.
+Whitespace otherwise separates tokens and is not meaningful.
+
+Identifiers start with a letter or `_` and continue with letters, digits, `_`,
+or `.` where a dotted event/fact name is expected. Type and declaration names
+are conventionally `UpperCamelCase`; bindings, agents, queues, resources, and
+fields are conventionally `lower_snake_case`.
+
+Line comments start with `#` or `//` outside strings and continue to the end
+of the line. String literals use double quotes. Multiline prompts use triple
+quotes, optionally annotated with a content type on the opener:
+
+```whip
+"""markdown
+Prompt body
+"""
+```
+
+The annotation is metadata; it does not validate the prompt body. Put the
+prompt body on the line after the opener. Effect bindings belong on the effect
+line, before the prompt opener:
+
+```whip
+tell worker as turn """markdown
+Do the work.
+"""
+```
+
+Reserved words cannot be used as `as` binding names. The rejected set includes
+operation and control words such as `record`, `done`, `tell`, `coerce`,
+`decide`, `askHuman`, `exec`, `call`, `invoke`, `signal`, `source`, `emit`,
+`complete`, `fail`, `after`, `case`, `when`, `on`, `timer`, `cancel`,
+`acquire`, `release`, `append`, and `consume`.
+
+## Syntax Shape
+
+The reference grammar below is intentionally compact; concrete examples for
+each construct follow in the rest of this page.
+
+```text
+program       ::= include* use* item*
+item          ::= workflow | contract | harness | agent | class | enum | event
+                | table | queue | lease | ledger | counter | coerce | rule
+                | flow | pattern | apply | action | assert
+workflow      ::= "workflow" Ident block?        # header form if block omitted
+contract      ::= ("input" | "output" | "failure") Ident Type
+class         ::= "class" TypeName "{" field* "}"
+enum          ::= "enum" TypeName "{" variant* "}"
+event         ::= "event" dotted_name "{" field* "}"
+agent         ::= "agent" Ident ("using" Ident)? "{" agent_field* "}"
+harness       ::= "harness" Ident ":" Ident
+table         ::= "table" Ident "as" TypeName "[" row* "]"
+queue         ::= "queue" Ident "{" "tracker" Ident "}"
+lease         ::= "lease" Ident "{" "key" TypeName "slots" int "ttl" duration "}"
+ledger        ::= "ledger" Ident "{" "entry" TypeName "partition" "by" Ident "retain" duration "}"
+counter       ::= "counter" Ident "{" "key" TypeName "cap" int "reset" period "}"
+coerce        ::= "coerce" Ident "(" params? ")" "->" Type block
+rule          ::= "rule" Ident when* "=>" block
+flow          ::= "flow" Ident when* block
+pattern       ::= "pattern" Ident ("<" TypeName ("," TypeName)* ">")? block
+apply         ::= "apply" Ident type_args? "as" Ident block
+action        ::= "action" Ident "(" params? ")" block
+assert        ::= "assert" expr
+when          ::= "when" readiness
+block         ::= "{" statement* "}"
+```
+
+The parser is deliberately strict about source forms that look close to valid
+WhippleScript but would lower ambiguously. For example, free-text Gherkin
+`Given`/`When`/`Then` blocks are rejected with targeted diagnostics instead of
+being treated as comments or unknown declarations.
+
 ## Declarations
 
 ### `workflow`
@@ -106,7 +181,7 @@ class WorkReview {
 }
 ```
 
-Field types follow the BAML-compatible subset: scalars (`string`, `int`,
+Field types follow the coerce-compatible subset: scalars (`string`, `int`,
 `float`, `bool`), arrays (`string[]`), classes, enums, optionals, string
 literals and literal unions (`status "open" | "done"`), and agent domains
 (`AgentRef<codex | claude | pi>`). Literal-typed fields are the idiomatic way
@@ -159,16 +234,17 @@ carry row source spans in JSON output.
 
 ### `coerce`
 
-A typed, BAML-backed model decision. Calling it in a rule creates a durable
-`baml.coerce` effect:
+A typed, coerce-backed model decision. Calling it in a rule creates a durable
+`coerce` effect:
 
 ```whip
-coerce reviewPoem(language string, summary string) -> PoemReview {
+coerce assessIncident(title string, impact string, mitigation string) -> IncidentAssessment {
   prompt """markdown
-  Review the artifact.
+  Assess the incident response.
 
-  Language: {{ language }}
-  Summary: {{ summary }}
+  Incident: {{ title }}
+  Impact: {{ impact }}
+  Proposed mitigation: {{ mitigation }}
 
   {{ ctx.output_format }}
   """
@@ -214,16 +290,64 @@ apply AgentReview<PhaseReviewRequest, PhaseReviewResult> as ReviewPlanPhase {
 Patterns have no runtime identity. When the reused work needs its own
 lifecycle, use a `workflow` and `invoke` it.
 
+### `action`
+
+Compile-time reuse of a repeated *effect chain inside a rule body*. Where
+`pattern`/`apply` abstract whole declarations, an `action` abstracts a chain of
+statements and is inlined at each call site, fully expanded into the durable
+graph:
+
+```whip
+action review_change(who AgentRef<reviewer>, item ChangeRequest) {
+  tell who as turn """markdown
+  Review {{ item.title }}.
+  """
+
+  after turn succeeds as reviewed {
+    done item -> record ReviewedChange {
+      id item.id
+      summary reviewed.summary
+      status "reviewed"
+    }
+  }
+}
+
+rule review
+  when ChangeRequest as item
+  when reviewer is available
+=> {
+  review_change(reviewer, item)
+}
+```
+
+Semantics:
+
+- **Inline, hygienic expansion.** The call is replaced by the action body with
+  arguments substituted for parameters. The action's internal bindings (`turn`,
+  `reviewed` above) are uniquified per call site, so two calls in one rule body
+  never collide. The compiled rule shows the expanded chain — there is no runtime
+  call, frame, or recursion.
+- **Fire-and-forget (v0).** A call is a standalone statement; it cannot be bound
+  with `as`.
+- **Chain shape (v0).** An action body may contain effect statements, `after`
+  blocks, `record`, and `done`. `complete`/`fail`/`case`/`branch` and nested
+  action calls are not allowed in a body (v0) — keep terminal and branching logic
+  in the calling rule.
+
+Like patterns, actions have no runtime identity; they are reuse, not subroutines.
+
 ### `include` and `use`
 
 ```whip
 include "schemas/common.whip"   // contributes declarations to the bundle
-include "review.baml"           // makes BAML classes/functions available to coerce
-use memory                      // imports a plugin by name
+include "review.coerce"           // makes coerce classes/functions available to coerce
+use memory                      // imports a package/library by name
 ```
 
-Plugins register capabilities, providers, schemas, and optional skills; their
-capabilities are invoked as explicit `call` effects.
+Packages register libraries, capabilities, providers, schemas, and optional
+skills. Their capabilities are invoked as explicit `call` effects. A locked
+package can also authorize constrained library-owned forms, such as memory
+`recall`, which still lower to ordinary core effects.
 
 ### Tags and descriptions
 
@@ -241,6 +365,50 @@ meaning for the [liveness checks](#liveness-checks): `@service` and
 `@external`. No tag changes runtime behavior — readiness, routing, and
 effects are unaffected.
 
+### Signals and sources
+
+A `signal` declares a typed external signal and its payload schema. A `source`
+block declares how a signal is admitted as a durable fact. Rules react to the
+admitted signal; a source never fires a rule directly.
+
+```whip
+signal triage.tick {
+  scheduled_at time
+  observed_at time
+  occurrence_id string
+  missed_count int
+}
+
+source clock as daily_triage {
+  every weekday at 09:00          // recurrence: `at <hh:mm>`, `every <dur>`,
+  timezone "America/New_York"     //   or `every <day|weekday|monday…> at <hh:mm>`
+  missed coalesce                 // `skip` | `coalesce` | `catch_up limit <N>`
+
+  observe as tick                 // binds the provider observation
+  emit triage.tick {              // maps the observation into the declared signal
+    scheduled_at tick.scheduled_at
+    observed_at tick.observed_at
+    occurrence_id tick.occurrence_id
+    missed_count tick.missed_count
+  }
+}
+```
+
+`source clock as <name>` is the `clock_source` construct (provided by
+[`std.time`](providers.md)); a generic `source <provider> as <name> { observe; emit }`
+is the `signal_source` construct. Both belong to the `source_declaration`
+construct family and lower to an admission template — they emit a durable signal
+fact, never a rule. Static checks: a recurring clock source must declare a
+`missed` policy (no silent default), and a calendar schedule should declare a
+`timezone` (otherwise it defaults to UTC with a diagnostic). Each clock
+occurrence is admitted at most once, keyed by its scheduled instant, so replay
+and recovery never double-admit (see the `admission-and-idempotency` and `std-time`
+specs). At runtime the worker fires all three recurrence forms — `every <duration>`
+(interval), `every <day|weekday|monday…> at <hh:mm>` (calendar), and `at <hh:mm>`
+(a single occurrence) — resolving calendar/`at` times in the declared timezone and
+honoring daylight-saving transitions (a `09:00` local schedule shifts its UTC
+instant across the DST boundary; a nonexistent spring-forward local time is skipped).
+
 ## Rules
 
 A rule waits for facts and events, optionally filters them with guards, and
@@ -248,23 +416,26 @@ commits a rewrite atomically — either every fact, effect, dependency, and
 terminal action in the selected rule persists, or none do.
 
 ```whip
-rule write_and_review_poem
-  when PoemTask as task where task.status == "queued"
-  when task.poet is available
+rule resolve_incident
+  when IncidentTicket as ticket where ticket.status == "open"
+  when responder is available
 => {
-  tell task.poet as turn """markdown
-  Write a poem in {{ task.language }}.
+  tell responder as turn """markdown
+  Investigate this incident and propose a mitigation plan.
+
+  {{ ticket.title }}
+  Impact: {{ ticket.impact }}
   """
 
   after turn succeeds as completed {
-    coerce reviewPoem(task.language, completed.summary) as review
+    coerce assessIncident(ticket.title, ticket.impact, completed.summary) as assessment
   }
 
-  after review succeeds as checked {
-    done task -> record ReviewedPoem from task {
-      provider poet
-      review checked
-      status "reviewed"
+  after assessment succeeds as checked {
+    done ticket -> record IncidentResolution from ticket {
+      mitigation completed.summary
+      risk checked.risk
+      status "resolved"
     }
   }
 }
@@ -328,6 +499,11 @@ askHuman as signoff choices ["approve", "reject"] "Approve {{ turn.summary }}?"
 The declared choices form a string-literal union, so a later `case
 answer.choice { ... }` over them is exhaustiveness-checked.
 
+A pending ask is bound to its instance: if the instance reaches a terminal
+before the ask is answered — including an operator `whip cancel` — the runtime
+retires the ask (it leaves the inbox and can no longer be answered), so an
+operator never spends a decision on a dead instance.
+
 ### Guards and expressions
 
 `where <expr>` is pure, deterministic filtering over matched facts and
@@ -345,13 +521,30 @@ indexing                        task.metadata["phase"]
 enum / finite-domain values     Accept, codex
 ```
 
+Expression precedence, from tightest to loosest:
+
+| Level | Operators/forms | Notes |
+| --- | --- | --- |
+| 1 | field access, indexing, function/query call | `task.owner.name`, `metadata["phase"]`, `count(Task where ...)` |
+| 2 | unary presence/boolean | `not x`, `!x`, `exists x`, `empty x` |
+| 3 | comparison and membership | `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `not in` |
+| 4 | conjunction | `and`, `&&` |
+| 5 | disjunction | `or`, `||` |
+
+`and` and `or` short-circuit left to right. Comparisons are type-checked:
+numbers compare with numbers, strings with strings, booleans with booleans,
+finite domains with their own domain, durations with durations, and times with
+times. There is no implicit string-to-number, string-to-bool, or enum-to-string
+coercion in guards. If a guard cannot evaluate to a boolean, the rule does not
+commit and the checker or runtime report points at the expression.
+
 Prefer the word operators in new code:
 
 ```whip
 when Job as job where job.status == "pending" and job.attempts < 3
 ```
 
-Guards never perform I/O — no provider queries, BAML calls, file reads,
+Guards never perform I/O — no provider queries, coerce calls, file reads,
 clocks, or randomness. A decision that needs model judgment or external data
 becomes an effect, and a later rule branches on its completion.
 
@@ -363,8 +556,8 @@ becomes an effect, and a later rule branches on its completion.
 | `record Class from binding { ... }` | Create a fact by copying a binding's fields and overriding the listed ones. |
 | `done binding` | Consume a matched fact. |
 | `done binding -> record ...` | Consume and replace in one atomic commit. |
-| `tell agent [requires [...]] [as x] [timeout <dur>] "..."` | Enqueue an `agent.tell` effect. |
-| `coerce fn(...) as x` | Enqueue a typed `baml.coerce` effect. |
+| `tell agent [requires [...]] [as x] [timeout <dur>] [with access to <resource> { ... }] "..."` | Enqueue an `agent.tell` effect (see [turn-access grants](#turn-access-grants)). |
+| `coerce fn(...) as x` | Enqueue a typed `coerce` effect. |
 | `decide "..." -> { ... } as x` | Enqueue an inline typed model decision (see [Inline `decide`](#inline-decide)). |
 | `askHuman [as x] [choices [...]] "..."` | Enqueue a human review request. |
 | `file item into <queue> { ... }` | File a new item into a [work queue](#work-queues). |
@@ -372,10 +565,17 @@ becomes an effect, and a later rule branches on its completion.
 | `release <item>` | Return a claimed item to the queue. |
 | `finish <item> [{ summary ... }]` | Mark a queue item done. |
 | `timer <dur> as x` | Create a [timer effect](#time-and-deadlines) that fires when due. |
+| `timer until <time> as x` | Create an absolute [timer effect](#time-and-deadlines) that fires at or after a typed instant. |
 | `cancel <binding>` | Cancel a pending or running effect bound earlier. |
 | `exec "<command>" as x` | Enqueue a dev-profile gated command effect (see [`exec`](#exec)). |
 | `exec <capability> with <record> -> Type as x` | Enqueue a hosted script capability effect with typed stdin/stdout. |
-| `call plugin.capability ... [as x]` | Enqueue a plugin capability effect. |
+| `call package.capability ... [as x]` | Enqueue a package capability effect. |
+| `recall from <pool> for <query> as x` | Package-owned memory form; requires a lock that authorizes lowering to memory recall capability. |
+| `emit signal <name> to <instance> { ... } as x` | Enqueue typed signal injection to another instance. |
+| `acquire <lease> for <key> as x` | Acquire a workspace-scoped lease; branch on `held` or `contended`. |
+| `release <lease-binding>` | Release a lease acquired earlier in the rule progression. |
+| `append Type { ... } to <ledger> as x` | Append a typed entry to a partitioned ledger. |
+| `consume <counter> for <key> amount <expr> as x` | Consume from a bounded counter; branch on `ok` or `over`. |
 | `invoke Workflow { ... } as x` | Start a durable child workflow. |
 | `after x succeeds as y { ... }` | Run when effect `x` completes successfully. |
 | `after x fails as y { ... }` | Run when effect `x` fails. |
@@ -394,6 +594,35 @@ their completions derive.
 Binding names introduced with `as` must not shadow operation keywords —
 `done`, `record`, `tell`, `complete`, `fail`, and the rest are rejected as
 binding names.
+
+### Turn-access grants
+
+A `tell` may narrow the turn's authority to specific resources with one or more
+`with access to <resource> { <grant clauses> }` modifiers, written between the
+target and the prompt:
+
+```whip
+tell coder as turn
+  with access to project_memory {
+    recall for issue
+    learn for issue
+  }
+  with access to project_files {
+    read ["docs/**"]
+  }
+"Work the issue."
+```
+
+Each grant clause is an operation grant — an operation name with an optional
+`for <ref>` target and/or `["glob", …]` path patterns. The grant is
+authority-*narrowing* metadata on the `agent.tell` effect (Proposal A): the turn's
+effective authority is the intersection of the agent profile and the grant, so a
+grant can only restrict, never widen, what the profile already permits. In-turn tool
+calls are recorded as evidence, not durable child effects.
+
+A grant must list at least one operation, must not name the same resource twice on
+one `tell`, and — for a declared `file store` resource — may only use the file
+operations `read`/`write`/`import`/`export`.
 
 ### Effect ordering and scope
 
@@ -414,6 +643,32 @@ after turn succeeds as completed {
 
 This is what keeps rule lowering deterministic and event causality
 explainable.
+
+### Matching and commits
+
+Each worker pass evaluates rules against the current projection for one
+instance and active program version. A `when Class as x` clause ranges over
+unconsumed facts of that class. Multiple fact clauses form a deterministic
+join: the rule is ready for each binding tuple that satisfies all clauses and
+guards. A rule that matches three `Ticket` facts can therefore commit three
+separate progressions, one per ticket, unless a consumed fact or terminal state
+prevents a later progression.
+
+Readiness clauses that are not facts, such as `when worker is available` or
+`when backlog has ready item as item`, are projected facts or policy gates
+checked at the same boundary. Guards run after bindings are selected and before
+the commit is built.
+
+A rule commit is atomic. The runtime records consumed facts, new facts, new
+effects, dependency edges, diagnostics/evidence, and workflow terminal actions
+in one transaction. If a typed payload, guard, branch, dependency, or terminal
+contract cannot be validated, none of that rule's outputs land.
+
+Facts are set-like by class plus key when a stable key is present; facts that
+need multiplicity must carry distinct keys. Consuming a fact removes it from
+future unconsumed matches, but the historical event/fact record remains
+inspectable. Terminal workflow states are absorbing: once a commit reaches
+`complete` or `fail`, later rule commits are rejected.
 
 ### `case`
 
@@ -443,10 +698,12 @@ case answer.choice {
 }
 ```
 
-The scrutinee must have a finite-domain type: an enum, a terminal union, or a
-string-literal union. `case` over a plain `string` is rejected — use guarded
-rules instead. See
-[`examples/terminal-output-union.whip`](../examples/terminal-output-union.whip)
+The scrutinee must have a finite-domain type: an enum, a terminal union, a
+string-literal union, an optional, or a `bool` (matched with the literals `true`
+and `false`). `case` over a plain `string` is rejected — use guarded rules
+instead. A `bool` `case` is exhaustive only when it covers both `true` and
+`false` (or carries a `_`). See
+[`examples/terminal-output-union.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/terminal-output-union.whip)
 for exhaustive terminal handling.
 
 ### Inline `decide`
@@ -459,18 +716,51 @@ declaration would only be used once:
 decide "Is this plan safe to ship? Explain." -> { fixed bool, reason string } as verdict
 
 after verdict succeeds as v {
+  record ShipReview {
+    fixed v.fixed
+    reason v.reason
+  }
+}
+```
+
+It lowers to the same `coerce` effect as a named `coerce`, so the same
+rules apply: it is durable, it can fail, and its typed output is available
+only in an `after ... succeeds` (or `after verdict succeeds`) branch. Use a
+named `coerce` when the decision is reused or deserves a documented prompt;
+reach for `decide` for a local, single-use judgment.
+
+An inline `decide`'s anonymous result type flows across the `after ... succeeds`
+binding exactly like a named `coerce -> Schema`, so you can field-access *and*
+`case` on a `decide` result. To *branch* on a decision, give the result a
+`bool`, enum, or string-literal-union field and `case` on it:
+
+```whip
+decide "Is this plan safe to ship? Explain." -> { fixed bool, reason string } as verdict
+after verdict succeeds as v {
   case v.fixed {
-    true  => { complete result { decision "ship" } }
+    true => { complete result { decision "ship" } }
     false => { askHuman "Held: {{ v.reason }}" }
   }
 }
 ```
 
-It lowers to the same `baml.coerce` effect as a named `coerce`, so the same
-rules apply: it is durable, it can fail, and its typed output is available
-only in an `after ... succeeds` (or `after verdict succeeds`) branch. Use a
-named `coerce` when the decision is reused or deserves a documented prompt;
-reach for `decide` for a local, single-use judgment.
+A named `coerce` is still the right choice when the decision shape is reused —
+its declared class is a documented, shared contract:
+
+```whip
+class ShipVerdict { decision "ship" | "hold"  reason string }
+
+coerce assessShip(plan string) -> ShipVerdict { prompt "{{ plan }}" }
+
+# in a rule body:
+coerce assessShip(ticket.plan) as verdict
+after verdict succeeds as v {
+  case v.decision {
+    "ship" => { complete result { decision "ship" } }
+    "hold" => { askHuman "Held: {{ v.reason }}" }
+  }
+}
+```
 
 ## Flows
 
@@ -514,6 +804,23 @@ on fails   { askHuman "Worker failed — retry?" }
 Terminal actions (`complete`, `fail`) end the flow exactly as they end a
 rule.
 
+**Branch liveness.** When a flow reaches a terminal on any path (it contains a
+`complete`/`fail`), every branch must reach one too, or that path stalls with the
+workflow stuck. `whip check` emits a warning when a branch leaves no terminal path:
+an `on fails`/`on timeout` handler or a `when`/`else` arm (including a missing
+`else`) that neither reaches a terminal nor records a fact a workflow rule completes
+from, or an effect that sets a `timeout` but has no `on timeout` handler. Resolve it
+by reaching a terminal on the branch (or handing off a fact), or by dropping the
+`timeout`.
+
+**Unhandled-failure auto-fail.** Branch liveness is only a warning. At runtime, if
+a step in such a self-terminating flow *does* fail with no `on fails` handler, the
+workflow does not stall forever — it auto-fails: the instance reaches `failed` with
+a generic reason (`unhandled failure of <step> …`) and no typed `failure` payload.
+Add an `on fails { fail error { ... } }` handler when you want a typed failure or
+custom recovery; otherwise the auto-fail is the safety net that guarantees the flow
+always terminates.
+
 ### How flows lower
 
 The lowering is fully visible: a flow named `triage` compiles to ordinary
@@ -524,7 +831,13 @@ like any other rule, so you can audit exactly how a flow sequences its
 effects. Nothing about flows is magic; they are a convenience surface over
 the rule and fact model.
 
-The [flow design record](../spec/flow.md) documents the lowering in full.
+A pre-ask step's output (for example a `tell` result) that a later segment
+reads is carried across the `askHuman` boundary through that `FlowAwait_*`
+state class, so `complete result { plan turn.summary }` after the answer reads
+the earlier turn even though it ran in a prior segment. Only bindings a later
+segment actually references are carried.
+
+The [flow design record](https://github.com/jamesjscully/whipplescript/blob/main/spec/flow.md) documents the lowering in full.
 
 ## Work queues
 
@@ -568,6 +881,11 @@ rule pick_up
 effect fails normally, and you branch on it like any other failure
 (`after work fails as f { ... }`) rather than treating it as an error.
 
+A claimed item is held by the claiming instance for its lifetime: `release` or
+`finish` it explicitly, or — if the instance reaches a terminal first,
+including an operator `whip cancel` — the runtime returns the still-held item to
+`open` so another worker can pick it up. A dead claimant never strands its work.
+
 Operators and agents manage items from the CLI:
 
 ```sh
@@ -580,7 +898,7 @@ When an agent files an item mid-turn through the CLI, the runtime stamps it
 with run-identity provenance from the `WHIPPLESCRIPT_RUN_ID` environment
 variable, so backlog growth is traceable to the run that caused it.
 
-The [work-queues design record](../spec/work-queues.md) covers the model in
+The [work-queues design record](https://github.com/jamesjscully/whipplescript/blob/main/spec/work-queues.md) covers the model in
 detail.
 
 ## Time and deadlines
@@ -617,7 +935,7 @@ Timers and timeouts fire on worker passes; there is no background daemon.
 `whip dev --until idle` treats pending timers as idle (it does not block
 waiting for wall-clock time), and `whip status` lists pending time effects so
 you can see what a paused instance is waiting on. The
-[time design record](../spec/time.md) documents the semantics.
+[time design record](https://github.com/jamesjscully/whipplescript/blob/main/spec/time.md) documents the semantics.
 
 ## `exec`
 
@@ -674,6 +992,157 @@ verified copy, and spawns argv-direct. No source text is interpolated into a
 shell. A hash mismatch fails before spawn and records the expected/actual
 hash in failure evidence.
 
+## Files
+
+A `file store` declares a named, root-scoped directory a workflow may read from
+and write to. It is a policy boundary, not an open filesystem handle:
+
+```whip
+file store project_files {
+  root "./data"
+  allow read ["docs/**", "notes/*.md"]
+  allow write ["out/**"]
+}
+```
+
+The optional `allow read`/`allow write` globs narrow which paths (relative to
+`root`) each operation may touch; an absent list means any path inside the root.
+
+`import <format> <Schema> from <store> at <path> as <binding>` decodes a
+structured file (`jsonl`, `json`, or `csv`) into one typed `<Schema>` fact per
+row, which `when <Schema>` rules then react to. Each row is validated against the
+schema's required fields and the whole batch is admitted atomically — any invalid
+row fails the import and admits nothing. If the schema marks a field `@key`
+(e.g. `id string @key`), that field's value identifies each row (so a re-run is
+idempotent on it); otherwise rows are keyed by position.
+
+`export <format> <Schema> to <store> at <path> { where <pred> mode <mode> } as
+<binding>` is the inverse: it serializes the `<Schema>` facts (the `where` filter
+is optional) to a `jsonl`/`json`/`csv` file, in a deterministic order, with the
+same `mode` policy as `write`. The `where`-filtered set is a *collection-valued
+projection* — the same fact-matching guards use, yielding a collection rather than
+a count.
+
+`read` loads one file into a typed binding as a gated effect:
+
+```whip
+read text from project_files at "notes.md" as fileResult
+
+after fileResult succeeds as result {
+  record Loaded { body result.content }
+}
+```
+
+The success binding exposes `result.content` (the file body) and `result.bytes`.
+A missing file or a refused path routes to `after fileResult fails`.
+
+`write` renders a body to a file. It requires an explicit `mode` — no silent
+overwrite:
+
+```whip
+write text to project_files at "summary.md" {
+  body result.content
+  mode create
+} as written
+
+after written succeeds as w {
+  record Saved { path "summary.md" }
+}
+```
+
+Modes: `create` (fail if the file exists), `replace` (fail if it does not),
+`upsert` (either), `append`. A mode violation (e.g. `create` on an existing file)
+is an ordinary failure routed to `after written fails`, leaving the file
+untouched. The `body` is an expression resolved when the effect runs, so a write
+inside `after <read> succeeds as r { … }` can write `r.content`.
+
+`read` and `write` are effects — they never run in guards or during static
+checking. The store's `root` is the scope boundary: the path is taken relative to
+`root`, a path that is absolute or uses `..` to climb out of the root is refused
+before any disk access, and (when declared) the path must match the store's
+`allow read`/`allow write` globs — a denied path fails the operation rather than
+touching files outside the policy.
+
+In a `whip test` scenario, seed deterministic file content with `given file
+<store> at "<path>" "<content>"` — the harness writes it to a temp dir and
+redirects the store root there, so the `read` runs for real against the fixture.
+
+Current limitations (see the `files` spec for the full
+package design and roadmap): `read`/`write` handle only the `text` and `markdown`
+body codecs (structured `json`/`csv`/`jsonl` are the `import`/`export` surface and
+`bytes` is deferred — the parser rejects them), and `import`/`export` and the
+`files.read`/`files.write` capability grants are not yet implemented.
+
+## Channels (`std.messaging`)
+
+A `channel` declares a named communication route through a provider — the
+boundary for talking through communication platforms (Slack, email, and the
+like). It is package-owned: the bare `channel` construct shape is reserved for
+`std.messaging`, so third-party packages cannot create channel-like semantics
+with weaker guarantees.
+
+```whip
+use std.messaging
+
+channel release_room {
+  provider slack
+  workspace ops
+  destination "#release"
+}
+```
+
+`provider` is required; `workspace` and `destination` are optional provider
+config. Secrets and credentials are always references in provider config, never
+literal source values. Declaring a channel auto-registers `std.messaging` in the
+program's library contract (you do not have to write `use std.messaging`
+separately, though it is accepted as a dotted package name).
+
+Send an outbound message with `send via <channel> { ... } as <binding>`:
+
+```whip
+rule notify
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  send via release_room {
+    text "Ticket {{ ticket.id }} needs triage."
+  } as sent
+
+  after sent succeeds {
+    complete result { ok "notified" }
+  }
+}
+```
+
+`text` is required; `markdown` and `thread_id` are optional. `send` lowers to a
+`messaging.send` capability call. Because `std.messaging` is a standard library
+built into the compiler, `send` needs **no** package lock (third-party
+constructs still require `whip package sync`). The named channel must be
+declared — `send via <unknown>` is a compile error. Under the fixture provider
+`send` records a delivery receipt without contacting a real platform; live
+Slack/email delivery is provider-configured.
+
+The generic inbound envelope is the built-in `Message` schema (`message_id`,
+`channel`, `provider`, `received_at`, `sender`, `sender_claims`, `thread_id`,
+`text`, `markdown`, `attachments`, `interaction`, `raw_ref`, `correlation`).
+Inbound messaging always produces a generic `Message`, never a domain type —
+converting one into a typed fact is explicit (`coerce msg.text -> Decision`, or
+a `signal` mapping). React to one with the readiness form:
+
+```whip
+rule react
+  when message from release_room as msg
+=> {
+  complete result { note msg.text }
+}
+```
+
+The channel must be declared (`when message from <unknown>` is a compile error),
+and `msg` is typed as `Message`. Under the fixture provider, inject a message
+with `whip message <instance> --channel <name> --text "…" --program <file>` so
+the rule fires; live Slack/email ingestion is provider-configured. (The
+`source interaction` provider mapping still needs a live messaging provider and
+remains on the roadmap — see the `messaging` spec.)
+
 ## `assert`
 
 Assertions are executable claims about a finished run, evaluated by
@@ -681,7 +1150,7 @@ Assertions are executable claims about a finished run, evaluated by
 
 ```whip
 assert count(Ticket where status == "open") == 0
-assert count(ReviewedPoem where review.confidence >= 0.5) == 3
+assert count(IncidentResolution where status == "resolved") >= 1
 assert count(effect kind agent.tell where status == completed) == 3
 ```
 
@@ -703,7 +1172,7 @@ rules below. Unknown names get did-you-mean suggestions.
   intended (watchers, recurring harnesses).
 - **Every rule must be able to fire.** Each matched class must be produced
   somewhere — a table, another rule, or a workflow input. Tag the rule
-  `@external` when its facts arrive from outside the workflow (plugins,
+  `@external` when its facts arrive from outside the workflow (packages,
   fixtures, external systems).
 
 ```whip
@@ -790,7 +1259,7 @@ Supported harness kinds: `codex`, `claude`, `pi`, `fixture`,
 `native-fixture`, `command`. Reach for this only when a plain `provider`
 binding genuinely cannot express the endpoint topology you need.
 
-## Typed data and coordination (Part C)
+## Typed data and coordination
 
 ### Sum types
 
@@ -827,6 +1296,38 @@ array and records one typed fact per element (provenance `ingest`),
 all-or-nothing — a malformed line fails the whole effect. Rules react with
 ordinary `when WorkItem as item` fan-out.
 
+### Deterministic validation
+
+`exec "<validator>" -> Schema` is the deterministic counterpart to `coerce`.
+Where `coerce` asks a model to judge an artifact, a deterministic validator is
+any non-LLM checker — Unicode script detection, a regex/format pass, a schema
+linter — whose output is reproducible: the same input always yields the same
+typed result. The workflow runs the checker, ingests its JSON verdict against a
+declared `class`, and branches on it exactly like any other typed effect. This
+is the path the e2e plan reserves for "exact script/fixture properties" that
+should hold in CI without provider access; model-judged `coerce` review and
+deterministic validation are meant to run side by side.
+
+```whip
+exec "validate-script {{artifact.path}} {{artifact.expectedScript}}" -> ScriptCheck as check
+
+after check succeeds as result {
+  complete report { detail result.detail }
+}
+
+after check fails as failure {
+  fail error { reason failure.message }   # exec failures expose `.message`
+}
+```
+
+The validator binary is supplied by the operator and granted through
+`WHIPPLESCRIPT_EXEC_ALLOW` like any dev-profile `exec`; an ungranted or
+malformed validator is a typed effect failure routed to `after check fails`,
+never a silent pass. See `examples/deterministic-validation.whip` for a runnable
+end-to-end workflow. Note that an `exec` failure binding carries the reason at
+`failure.message` (not `failure.reason`, which is the field workflow-invocation
+and `coerce` failures expose).
+
 ### Scheduled time
 
 `time` is a scalar (ISO-8601 instants, quoted literals). `timer until
@@ -834,21 +1335,33 @@ ordinary `when WorkItem as item` fan-out.
 or after the target; `after deadline succeeds` reacts to the recorded firing.
 There is no `now` in guards — the clock is read only at the worker boundary.
 
-### Events
+### Signals
 
-`event deploy.finished { service string  status string }` declares typed
+`signal deploy.finished { service string  status string }` declares typed
 external ingress. React with the bare form `when deploy.finished as d`
-(typed, no `@external` needed). Inject from outside with `whip notify
-<instance> --event deploy.finished --data '{"service":"api","status":"ok"}'
+(typed, no `@external` needed). Inject from outside with `whip signal
+<instance> --name deploy.finished --data '{"service":"api","status":"ok"}'
 --program <workflow.whip>` — the payload is validated at the boundary. Inject
-from inside another workflow with the `notify` effect:
+from inside another workflow with the signal injection effect:
 
 ```whip
-notify s.target event deploy.finished {
+emit signal deploy.finished to s.target {
   service s.service
   status "ok"
 } as sent
 ```
+
+The target (`s.target`) must be the id of an instance that already exists in
+the same store; otherwise the effect fails with `target instance <id> not
+found` and routes to `after sent fails`. Because instance ids are generated at
+`run` time, a real peer id is normally carried on a fact (e.g. a `PeerInstance`
+recorded when the peer registers), not a literal — `examples/event-bridge.whip`
+uses a placeholder `peers` table id purely so the file type-checks, so it needs
+a real peer to run. A minimal two-instance exercise: `whip run` the peer
+workflow and note its id, point the source's peer fact/table at that id (same
+`--store`), `whip signal` the source, then `whip step` + `whip worker` the
+source — the signal lands as a `deploy.finished` fact on the peer and the source
+records its `DeploymentNotice`.
 
 ### Coordination resources
 
@@ -868,10 +1381,11 @@ consume budget for t.customer amount t.estTokens as spend   # after spend ok / o
 
 The compiler enforces the safety model: at most one held lease per
 progression, exhaustive outcome handling (`held`/`contended`, `ok`/`over`),
-and must-release on every non-terminal path (reaching `complete`/`fail`
-auto-releases — holder lifetime bounds every lease, with TTL as the crash
-net). Counter reset is lazy at the consume boundary. Inspect shared state
-with `whip leases`, `whip ledger`, and `whip counters`.
+and must-release on every non-terminal path. Reaching any terminal
+auto-releases every lease the instance holds — a rule-driven `complete`/`fail`
+or an operator `whip cancel` — so holder lifetime bounds every lease, with TTL
+only as the crash net. Counter reset is lazy at the consume boundary. Inspect
+shared state with `whip leases`, `whip ledger`, and `whip counters`.
 
 ### Observability export
 
@@ -885,7 +1399,7 @@ prints the payload.
 ## What WhippleScript is not
 
 Not a general-purpose language: keep data manipulation small and
-deterministic, and push computation into providers, BAML functions, plugins,
+deterministic, and push computation into providers, coerce functions, packages,
 or child workflows behind explicit effects.
 
 Not an implicit lifecycle framework: recurring work, heartbeats, memory,

@@ -9,6 +9,7 @@ use std::{
     path::Path,
     result,
 };
+use whipplescript_core::Severity;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -198,6 +199,36 @@ pub struct DerivedFact<'a> {
     pub idempotency_key: Option<&'a str>,
 }
 
+/// One row of a typed fact batch (spec/admission-and-idempotency.md). `fact_id`
+/// is the row's derived per-row admission key (the caller computes
+/// `H(effect_key, row_index)` or `H(effect_key, natural_key)`); `key` is the
+/// fact's natural key/index recorded on the fact row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FactBatchRow<'a> {
+    pub fact_id: &'a str,
+    pub key: &'a str,
+    pub value_json: &'a str,
+}
+
+/// A typed fact batch admitted atomically from one validated effect outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FactBatch<'a> {
+    pub instance_id: &'a str,
+    pub source: &'a str,
+    pub causation_id: Option<&'a str>,
+    pub correlation_id: Option<&'a str>,
+    /// The imported row schema name; each admitted fact carries it as its name.
+    pub schema_name: &'a str,
+    pub schema_id: Option<&'a str>,
+    pub rows: &'a [FactBatchRow<'a>],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FactBatchOutcome {
+    pub admitted: usize,
+    pub skipped: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NewEffect<'a> {
     pub effect_id: &'a str,
@@ -220,7 +251,7 @@ pub struct CapabilitySchemaRegistration<'a> {
     pub capability: &'a str,
     pub description: &'a str,
     pub schema_json: &'a str,
-    pub registered_by_plugin_id: Option<&'a str>,
+    pub registered_by_package_id: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,7 +261,7 @@ pub struct EffectProviderRegistration<'a> {
     pub provider: &'a str,
     pub capability: &'a str,
     pub config_json: &'a str,
-    pub registered_by_plugin_id: Option<&'a str>,
+    pub registered_by_package_id: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -244,8 +275,8 @@ pub struct ProfileRegistration<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PluginRegistration<'a> {
-    pub plugin_id: &'a str,
+pub struct PackageRegistration<'a> {
+    pub package_id: &'a str,
     pub name: &'a str,
     pub version: &'a str,
     pub manifest_json: &'a str,
@@ -449,7 +480,7 @@ pub struct DiagnosticRecord<'a> {
     pub instance_id: Option<&'a str>,
     pub program_id: Option<&'a str>,
     pub program_version_id: Option<&'a str>,
-    pub severity: &'a str,
+    pub severity: Severity,
     pub code: Option<&'a str>,
     pub message: &'a str,
     pub source_span_json: Option<&'a str>,
@@ -470,7 +501,7 @@ pub struct DiagnosticRecord<'a> {
 pub struct TerminalDiagnosticRecord {
     pub program_id: Option<String>,
     pub program_version_id: Option<String>,
-    pub severity: String,
+    pub severity: Severity,
     pub code: Option<String>,
     pub message: String,
     pub source_span_json: Option<String>,
@@ -652,6 +683,10 @@ pub struct EffectView {
     pub required_capabilities_json: String,
     pub declared_profiles_json: String,
     pub policy_block_reason: Option<String>,
+    /// For binding-time blocks (status `blocked`), the categorized reason
+    /// (`provider_config`/`credentials`/`enforcement`/`provider_health`). Scheduling
+    /// blocks encode their category in the `blocked_by_*` status string instead.
+    pub policy_block_category: Option<String>,
     pub cancel_requested: bool,
 }
 
@@ -851,6 +886,13 @@ impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         let path = path.as_ref();
         let mut connection = Connection::open(path)?;
+        // A whip worker executes the ready set of effects concurrently (a bounded
+        // thread pool), and several worker processes may run against one store.
+        // WAL lets a writer and readers coexist; `busy_timeout` makes a contended
+        // write wait briefly instead of failing with SQLITE_BUSY. The durable
+        // lease + per-row idempotency machinery is what makes the concurrent
+        // execution itself safe (see models/tla AtMostOneRunExecutingEffect).
+        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
         apply_migrations(&mut connection)?;
         if path.to_string_lossy() != ":memory:" {
             harden_store_file_permissions(path)?;
@@ -860,6 +902,9 @@ impl SqliteStore {
 
     pub fn open_in_memory() -> StoreResult<Self> {
         let mut connection = Connection::open_in_memory()?;
+        // WAL does not apply to an in-memory database; busy_timeout is harmless
+        // and keeps behavior uniform with the file-backed store.
+        connection.execute_batch("PRAGMA busy_timeout=5000;")?;
         apply_migrations(&mut connection)?;
         Ok(Self { connection })
     }
@@ -882,7 +927,9 @@ impl SqliteStore {
         &mut self,
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             r#"
             INSERT INTO programs (program_id, name)
@@ -1197,7 +1244,9 @@ impl SqliteStore {
         let cancellation_policy = normalize_cancellation_policy(activation.cancellation_policy)?;
         let activation_policy: Value = serde_json::from_str(activation.activation_policy_json)?;
 
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Some(idempotency_key) = activation.idempotency_key {
             if let Some(existing) =
                 revision_by_idempotency_on(&tx, activation.instance_id, idempotency_key)?
@@ -1552,7 +1601,9 @@ impl SqliteStore {
         &mut self,
         request: EffectCancellationRequest<'_>,
     ) -> StoreResult<EffectCancellationRequestView> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let status = tx
             .query_row(
                 "SELECT status FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
@@ -1849,7 +1900,9 @@ impl SqliteStore {
         commit: RuleCommit<'_>,
         guard: Option<RuleCommitRevisionGuard<'_>>,
     ) -> StoreResult<StoredEvent> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Some(status) = instance_status_on(&tx, commit.instance_id)? {
             if status != "running" {
                 return Err(StoreError::Conflict(format!(
@@ -2061,7 +2114,9 @@ impl SqliteStore {
             "correlation_id": derived.fact.correlation_id,
         })
         .to_string();
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let event = append_event_on(
             &tx,
             NewEvent {
@@ -2088,6 +2143,83 @@ impl SqliteStore {
         Ok(event)
     }
 
+    /// Admit a typed fact batch atomically (spec/admission-and-idempotency.md):
+    /// from one validated effect outcome, record N facts in a single transaction.
+    /// Each row carries its derived per-row admission key as `fact_id`
+    /// (the caller computes `H(effect_key, row_index)` or `H(effect_key,
+    /// natural_key)`); a row whose key already has a fact is skipped, so
+    /// re-admission is idempotent. The whole batch commits or rolls back as a
+    /// unit, so a mid-batch failure admits nothing. Realizes the Maude
+    /// `importRow` admission model (models/maude/admission.maude).
+    pub fn admit_fact_batch(&mut self, batch: FactBatch<'_>) -> StoreResult<FactBatchOutcome> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (program_version_id, revision_epoch) = active_revision_on(&tx, batch.instance_id)?;
+        let mut admitted = 0usize;
+        let mut skipped = 0usize;
+        for row in batch.rows {
+            // Idempotent skip: a row whose derived key already produced a fact is
+            // absorbed (the admitted-set membership guard in the model).
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM facts WHERE fact_id = ?1 AND instance_id = ?2",
+                    params![row.fact_id, batch.instance_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if exists {
+                skipped += 1;
+                continue;
+            }
+            let value: Value = serde_json::from_str(row.value_json)?;
+            let payload = json!({
+                "fact_id": row.fact_id,
+                "name": batch.schema_name,
+                "key": row.key,
+                "value": value,
+                "schema_id": batch.schema_id,
+                "provenance_class": "import",
+                "correlation_id": batch.correlation_id,
+            })
+            .to_string();
+            let event = append_event_on(
+                &tx,
+                NewEvent {
+                    instance_id: batch.instance_id,
+                    event_type: "fact.derived",
+                    payload_json: &payload,
+                    source: batch.source,
+                    causation_id: batch.causation_id,
+                    correlation_id: batch.correlation_id,
+                    idempotency_key: Some(row.fact_id),
+                },
+            )?;
+            insert_fact(
+                &tx,
+                batch.instance_id,
+                batch.source,
+                &event.event_id,
+                program_version_id.as_deref(),
+                revision_epoch,
+                &NewFact {
+                    fact_id: row.fact_id,
+                    name: batch.schema_name,
+                    key: row.key,
+                    value_json: row.value_json,
+                    schema_id: batch.schema_id,
+                    provenance_class: "import",
+                    correlation_id: batch.correlation_id,
+                    source_span_json: None,
+                },
+            )?;
+            admitted += 1;
+        }
+        tx.commit()?;
+        Ok(FactBatchOutcome { admitted, skipped })
+    }
+
     pub fn complete_effect(
         &mut self,
         completion: EffectCompletion<'_>,
@@ -2100,8 +2232,33 @@ impl SqliteStore {
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
     ) -> StoreResult<StoredEvent> {
+        let run_status = completion.status;
+        self.complete_effect_terminal_inner(completion, diagnostic, run_status)
+    }
+
+    /// Recovery resolution: record a distinct `uncertain` run status while the
+    /// effect itself becomes `failed` (a Failed subkind). Realizes the TLA+
+    /// `ResolveUncertainRun` action and the admission-and-idempotency.md
+    /// exactly-once recovery rule (started-without-terminal, no idempotent
+    /// re-query → one `uncertain` terminal, never re-executed).
+    pub fn resolve_effect_uncertain(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+    ) -> StoreResult<StoredEvent> {
+        self.complete_effect_terminal_inner(completion, diagnostic, "uncertain")
+    }
+
+    fn complete_effect_terminal_inner(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        run_status: &str,
+    ) -> StoreResult<StoredEvent> {
         let payload = effect_completion_payload(completion, diagnostic.as_ref());
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let event = append_event_on(
             &tx,
             NewEvent {
@@ -2129,7 +2286,7 @@ impl SqliteStore {
               AND status = 'running'
             "#,
             params![
-                completion.status,
+                run_status,
                 completion.exit_code,
                 completion.summary,
                 completion.metadata_json,
@@ -2147,7 +2304,7 @@ impl SqliteStore {
                     WHERE run_id = ?1
                       AND effect_id = ?2
                       AND instance_id = ?3
-                      AND status IN ('completed', 'failed', 'timed_out', 'cancelled')
+                      AND status IN ('completed', 'failed', 'timed_out', 'cancelled', 'uncertain')
                     "#,
                     params![
                         completion.run_id,
@@ -2200,7 +2357,7 @@ impl SqliteStore {
                     instance_id: Some(completion.instance_id),
                     program_id: diagnostic.program_id.as_deref(),
                     program_version_id: diagnostic.program_version_id.as_deref(),
-                    severity: &diagnostic.severity,
+                    severity: diagnostic.severity,
                     code: diagnostic.code.as_deref(),
                     message: &diagnostic.message,
                     source_span_json: diagnostic.source_span_json.as_deref(),
@@ -2248,7 +2405,7 @@ impl SqliteStore {
             WHERE candidate.instance_id = ?1
               AND candidate.kind != 'timer.wait'
               AND (
-                  candidate.status IN ('queued', 'blocked_by_dependency', 'blocked_by_capacity')
+                  candidate.status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')
                   OR (candidate.kind = 'workflow.invoke' AND candidate.status = 'running')
               )
               AND NOT EXISTS (
@@ -2269,6 +2426,8 @@ impl SqliteStore {
                     AND NOT (
                         (dependency.predicate = 'succeeds' AND upstream.status = 'completed')
                         OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out'))
+                        OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out')
+                        OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled')
                         OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled'))
                     )
               )
@@ -2314,35 +2473,35 @@ impl SqliteStore {
             .map_err(Into::into)
     }
 
-    pub fn register_plugin(&self, plugin: PluginRegistration<'_>) -> StoreResult<()> {
-        serde_json::from_str::<Value>(plugin.manifest_json)?;
+    pub fn register_package(&self, package: PackageRegistration<'_>) -> StoreResult<()> {
+        serde_json::from_str::<Value>(package.manifest_json)?;
         self.connection.execute(
             r#"
-            INSERT INTO plugin_registrations (plugin_id, name, version, manifest_json)
+            INSERT INTO package_registrations (package_id, name, version, manifest_json)
             VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(plugin_id) DO UPDATE SET
+            ON CONFLICT(package_id) DO UPDATE SET
                 name = excluded.name,
                 version = excluded.version,
                 manifest_json = excluded.manifest_json
             "#,
             params![
-                plugin.plugin_id,
-                plugin.name,
-                plugin.version,
-                plugin.manifest_json,
+                package.package_id,
+                package.name,
+                package.version,
+                package.manifest_json,
             ],
         )?;
         Ok(())
     }
 
-    pub fn register_plugin_manifest(&self, manifest_json: &str) -> StoreResult<String> {
+    pub fn register_package_manifest(&self, manifest_json: &str) -> StoreResult<String> {
         let manifest: Value = serde_json::from_str(manifest_json)?;
-        let plugin_id = required_string(&manifest, "plugin_id");
-        let name = required_string(&manifest, "name");
-        let version = required_string(&manifest, "version");
+        let package_id = required_manifest_string(&manifest, &["package_id", "plugin_id"])?;
+        let name = required_manifest_string(&manifest, &["name"])?;
+        let version = required_manifest_string(&manifest, &["version"])?;
 
-        self.register_plugin(PluginRegistration {
-            plugin_id: &plugin_id,
+        self.register_package(PackageRegistration {
+            package_id: &package_id,
             name: &name,
             version: &version,
             manifest_json,
@@ -2359,13 +2518,13 @@ impl SqliteStore {
                 .map(Value::to_string)
                 .unwrap_or_else(|| "{}".to_owned());
             self.register_capability_schema(CapabilitySchemaRegistration {
-                capability: &required_string(capability, "capability"),
+                capability: &required_manifest_string(capability, &["capability", "id"])?,
                 description: capability
                     .get("description")
                     .and_then(Value::as_str)
                     .unwrap_or(""),
                 schema_json: &schema_json,
-                registered_by_plugin_id: Some(&plugin_id),
+                registered_by_package_id: Some(&package_id),
             })?;
         }
 
@@ -2380,12 +2539,18 @@ impl SqliteStore {
                 .map(Value::to_string)
                 .unwrap_or_else(|| "{}".to_owned());
             self.register_effect_provider(EffectProviderRegistration {
-                provider_id: &required_string(provider, "provider_id"),
-                effect_kind: &required_string(provider, "effect_kind"),
-                provider: &required_string(provider, "provider"),
-                capability: &required_string(provider, "capability"),
+                provider_id: &required_manifest_string(provider, &["provider_id", "id"])?,
+                effect_kind: &manifest_effect_kind(provider),
+                provider: &required_manifest_string(
+                    provider,
+                    &["provider", "provider_kind", "kind"],
+                )?,
+                capability: &required_manifest_string(
+                    provider,
+                    &["capability", "effect_contract", "effect_contract_id"],
+                )?,
                 config_json: &config_json,
-                registered_by_plugin_id: Some(&plugin_id),
+                registered_by_package_id: Some(&package_id),
             })?;
         }
 
@@ -2404,7 +2569,7 @@ impl SqliteStore {
                 .map(Value::to_string)
                 .unwrap_or_else(|| "[]".to_owned());
             self.register_profile(ProfileRegistration {
-                profile_id: &required_string(profile, "profile_id"),
+                profile_id: &required_manifest_string(profile, &["profile_id", "id"])?,
                 name: &required_string(profile, "name"),
                 description: profile
                     .get("description")
@@ -2430,18 +2595,18 @@ impl SqliteStore {
                 .map(Value::to_string)
                 .unwrap_or_else(|| "{}".to_owned());
             self.bind_capability(CapabilityBinding {
-                binding_id: &required_string(binding, "binding_id"),
+                binding_id: &required_manifest_string(binding, &["binding_id", "id"])?,
                 program_id: binding.get("program_id").and_then(Value::as_str),
-                capability: &required_string(binding, "capability"),
-                provider: &required_string(binding, "provider"),
+                capability: &required_manifest_string(binding, &["capability"])?,
+                provider: &required_manifest_string(binding, &["provider", "provider_kind"])?,
                 config_json: &config_json,
             })?;
         }
 
-        Ok(plugin_id)
+        Ok(package_id)
     }
 
-    pub fn load_plugin_manifests_from_dir(
+    pub fn load_package_manifests_from_dir(
         &self,
         directory: impl AsRef<Path>,
     ) -> StoreResult<Vec<String>> {
@@ -2453,7 +2618,7 @@ impl SqliteStore {
             }
 
             let manifest_json = fs::read_to_string(&path)?;
-            loaded.push(self.register_plugin_manifest(&manifest_json)?);
+            loaded.push(self.register_package_manifest(&manifest_json)?);
         }
         loaded.sort();
         Ok(loaded)
@@ -2470,19 +2635,19 @@ impl SqliteStore {
                 capability,
                 description,
                 schema_json,
-                registered_by_plugin_id
+                registered_by_package_id
             )
             VALUES (?1, ?2, ?3, ?4)
             ON CONFLICT(capability) DO UPDATE SET
                 description = excluded.description,
                 schema_json = excluded.schema_json,
-                registered_by_plugin_id = excluded.registered_by_plugin_id
+                registered_by_package_id = excluded.registered_by_package_id
             "#,
             params![
                 capability.capability,
                 capability.description,
                 capability.schema_json,
-                capability.registered_by_plugin_id,
+                capability.registered_by_package_id,
             ],
         )?;
         Ok(())
@@ -2501,13 +2666,13 @@ impl SqliteStore {
                 provider,
                 capability,
                 config_json,
-                registered_by_plugin_id
+                registered_by_package_id
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(effect_kind, provider) DO UPDATE SET
                 capability = excluded.capability,
                 config_json = excluded.config_json,
-                registered_by_plugin_id = excluded.registered_by_plugin_id
+                registered_by_package_id = excluded.registered_by_package_id
             "#,
             params![
                 provider.provider_id,
@@ -2515,7 +2680,7 @@ impl SqliteStore {
                 provider.provider,
                 provider.capability,
                 provider.config_json,
-                provider.registered_by_plugin_id,
+                provider.registered_by_package_id,
             ],
         )?;
         Ok(())
@@ -2565,7 +2730,10 @@ impl SqliteStore {
                 config_json
             )
             VALUES (?1, ?2, ?3, ?4, ?5)
-            ON CONFLICT(program_id, capability, provider) DO UPDATE SET
+            ON CONFLICT(binding_id) DO UPDATE SET
+                program_id = excluded.program_id,
+                capability = excluded.capability,
+                provider = excluded.provider,
                 config_json = excluded.config_json
             "#,
             params![
@@ -3401,7 +3569,9 @@ impl SqliteStore {
 
     pub fn answer_inbox_item(&mut self, answer: HumanAnswer<'_>) -> StoreResult<StoredEvent> {
         let answer_value = serde_json::from_str::<Value>(answer.answer_json)?;
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let item = tx
             .query_row(
                 r#"
@@ -3495,6 +3665,25 @@ impl SqliteStore {
         )?;
         tx.commit()?;
         Ok(event)
+    }
+
+    /// Holder-lifetime cleanup: when an instance reaches a terminal, its still
+    /// `pending` human asks are moot. Mark them `cancelled` so they drop out of
+    /// the inbox and can no longer be answered (`answer_inbox_item` rejects any
+    /// non-`pending` item) — otherwise an operator could waste a decision on a
+    /// dead instance. `inbox_items` is an authoritative table (not rebuilt by
+    /// `rebuild_projections`), so a direct status update is durable. Returns the
+    /// number of items cancelled.
+    pub fn cancel_pending_inbox_for_instance(&mut self, instance_id: &str) -> StoreResult<usize> {
+        let changed = self.connection.execute(
+            r#"
+            UPDATE inbox_items
+            SET status = 'cancelled'
+            WHERE instance_id = ?1 AND status = 'pending'
+            "#,
+            [instance_id],
+        )?;
+        Ok(changed)
     }
 
     pub fn record_skill_evidence(&self, evidence: SkillEvidence<'_>) -> StoreResult<String> {
@@ -3801,6 +3990,7 @@ impl SqliteStore {
                 effects.profile,
                 effects.required_capabilities,
                 effects.policy_block_reason,
+                effects.policy_block_category,
                 COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'),
                 EXISTS (
                     SELECT 1
@@ -3833,8 +4023,9 @@ impl SqliteStore {
                     profile: row.get(8)?,
                     required_capabilities_json: row.get(9)?,
                     policy_block_reason: row.get(10)?,
-                    declared_profiles_json: row.get(11)?,
-                    cancel_requested: row.get(12)?,
+                    policy_block_category: row.get(11)?,
+                    declared_profiles_json: row.get(12)?,
+                    cancel_requested: row.get(13)?,
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
@@ -3948,8 +4139,9 @@ impl SqliteStore {
     }
 
     pub fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
-        let payload = run_start_payload(run);
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Some(status) = instance_status_on(&tx, run.instance_id)? {
             if status != "running" {
                 return Err(StoreError::Conflict(format!(
@@ -3987,7 +4179,7 @@ impl SqliteStore {
                     updated_at = CURRENT_TIMESTAMP
                 WHERE instance_id = ?3
                   AND effect_id = ?4
-                  AND status IN ('queued', 'blocked_by_dependency', 'blocked_by_capacity')
+                  AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')
                 "#,
                 params![block.status, block.reason, run.instance_id, run.effect_id],
             )?;
@@ -4010,6 +4202,8 @@ impl SqliteStore {
                   AND NOT (
                       (dependency.predicate = 'succeeds' AND upstream.status = 'completed')
                       OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out'))
+                      OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out')
+                      OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled')
                       OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled'))
                   )
             )
@@ -4061,7 +4255,7 @@ impl SqliteStore {
                     updated_at = CURRENT_TIMESTAMP
                 WHERE instance_id = ?2
                   AND effect_id = ?3
-                  AND status IN ('queued', 'blocked_by_dependency', 'blocked_by_capacity')
+                  AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')
                 "#,
                 params![reason, run.instance_id, run.effect_id],
             )?;
@@ -4072,6 +4266,9 @@ impl SqliteStore {
             });
         }
 
+        let fingerprint = execution_fingerprint_on(&tx, run.instance_id, run.effect_id)?;
+        let run_metadata = inject_execution_fingerprint(run.metadata_json, &fingerprint);
+        let payload = run_start_payload(run, &run_metadata);
         let event = append_event_on(
             &tx,
             NewEvent {
@@ -4089,10 +4286,11 @@ impl SqliteStore {
             UPDATE effects
             SET status = 'running',
                 policy_block_reason = NULL,
+                policy_block_category = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE instance_id = ?1
               AND effect_id = ?2
-              AND status IN ('queued', 'blocked_by_dependency', 'blocked_by_capacity')
+              AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')
             "#,
             params![run.instance_id, run.effect_id],
         )?;
@@ -4118,7 +4316,7 @@ impl SqliteStore {
                 run.instance_id,
                 run.provider,
                 run.worker_id,
-                run.metadata_json,
+                run_metadata,
             ],
         )?;
         tx.execute(
@@ -4148,6 +4346,94 @@ impl SqliteStore {
         Ok(event)
     }
 
+    /// Block an effect at provider-binding time (DR-0020): the worker found the
+    /// provider unbindable (missing config/credentials/enforcement/healthy
+    /// binding) *before* provider execution. Transitions the effect to the
+    /// recoverable, non-terminal `blocked` status with a categorized reason and
+    /// returns the recorded `effect.blocked` event.
+    ///
+    /// Idempotent: if the effect is already `blocked` with the same category this
+    /// is a no-op that returns the existing block event (no new event), so a
+    /// re-claimed effect that stays unbindable does not grow the event log — the
+    /// effect simply waits, blocked, until the binding becomes available and the
+    /// next worker pass runs it.
+    pub fn block_effect_binding(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        category: &str,
+        detail: &str,
+    ) -> StoreResult<StoredEvent> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT status, policy_block_category FROM effects \
+                 WHERE instance_id = ?1 AND effect_id = ?2",
+                params![instance_id, effect_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let already_blocked = matches!(
+            &current,
+            Some((status, cat)) if status == "blocked" && cat.as_deref() == Some(category)
+        );
+        if already_blocked {
+            // Return the existing block event without recording a new one.
+            let event = tx.query_row(
+                "SELECT event_id, sequence FROM events \
+                 WHERE instance_id = ?1 AND event_type = 'effect.blocked' AND causation_id = ?2 \
+                 ORDER BY sequence DESC LIMIT 1",
+                params![instance_id, effect_id],
+                |row| {
+                    Ok(StoredEvent {
+                        event_id: row.get(0)?,
+                        sequence: row.get(1)?,
+                    })
+                },
+            )?;
+            tx.commit()?;
+            return Ok(event);
+        }
+        let payload = json!({
+            "effect_id": effect_id,
+            "status": "blocked",
+            "category": category,
+            "reason": detail,
+        })
+        .to_string();
+        let event = append_event_on(
+            &tx,
+            NewEvent {
+                instance_id,
+                event_type: "effect.blocked",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(effect_id),
+                correlation_id: None,
+                idempotency_key: Some(&format!(
+                    "binding-block:{instance_id}:{effect_id}:{category}"
+                )),
+            },
+        )?;
+        tx.execute(
+            r#"
+            UPDATE effects
+            SET status = 'blocked',
+                policy_block_reason = ?1,
+                policy_block_category = ?2,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE instance_id = ?3
+              AND effect_id = ?4
+              AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')
+            "#,
+            params![detail, category, instance_id, effect_id],
+        )?;
+        tx.commit()?;
+        Ok(event)
+    }
+
     pub fn transition_instance(
         &mut self,
         transition: InstanceTransition<'_>,
@@ -4160,6 +4446,12 @@ impl SqliteStore {
                     | ("running", "cancelled")
                     | ("paused", "cancelled")
                     | ("blocked", "cancelled")
+                    // Generic internal failure terminal (flow auto-fail): an
+                    // unhandled effect failure fails the instance directly,
+                    // without an author-typed `failure` payload.
+                    | ("running", "failed")
+                    | ("paused", "failed")
+                    | ("blocked", "failed")
             )
         }
 
@@ -4169,7 +4461,9 @@ impl SqliteStore {
             "reason": transition.reason,
         })
         .to_string();
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current_status = instance_status_on(&tx, transition.instance_id)?
             .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))?;
         if !transition_allowed(&current_status, transition.status) {
@@ -4198,7 +4492,7 @@ impl SqliteStore {
                 last_error = ?3,
                 updated_at = CURRENT_TIMESTAMP,
                 completed_at = CASE
-                    WHEN ?1 IN ('completed', 'cancelled') THEN CURRENT_TIMESTAMP
+                    WHEN ?1 IN ('completed', 'cancelled', 'failed') THEN CURRENT_TIMESTAMP
                     ELSE completed_at
                 END
             WHERE instance_id = ?4
@@ -4218,7 +4512,11 @@ impl SqliteStore {
     /// effects (dependency-cleared) and effects whose `timeout` deadline has
     /// expired. Resolved on worker passes; rule evaluation never reads the
     /// clock.
-    pub fn due_time_effects(&self, instance_id: &str) -> StoreResult<Vec<DueTimeEffect>> {
+    pub fn due_time_effects(
+        &self,
+        instance_id: &str,
+        now: &str,
+    ) -> StoreResult<Vec<DueTimeEffect>> {
         let mut statement = self.connection.prepare(
             r#"
             SELECT
@@ -4230,14 +4528,16 @@ impl SqliteStore {
             WHERE candidate.instance_id = ?1
               AND candidate.status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')
               AND (
-                  -- relative deadline: created + timeout_seconds
+                  -- relative deadline: created + timeout_seconds. `?2` is the
+                  -- evaluation clock — `'now'` (wall clock) for dev/worker, or a
+                  -- virtual timestamp a test injects via `given clock`.
                   (candidate.timeout_seconds IS NOT NULL
-                   AND (strftime('%s', 'now') - strftime('%s', candidate.created_at)) >= candidate.timeout_seconds)
+                   AND (strftime('%s', ?2) - strftime('%s', candidate.created_at)) >= candidate.timeout_seconds)
                   -- absolute deadline (timer until): input_json.deadline_at
                   -- (cast to integer: strftime returns text, and `>=` on text
                   -- compares lexicographically)
                   OR (json_extract(candidate.input_json, '$.deadline_at') IS NOT NULL
-                      AND CAST(strftime('%s', 'now') AS INTEGER)
+                      AND CAST(strftime('%s', ?2) AS INTEGER)
                           >= CAST(strftime('%s', json_extract(candidate.input_json, '$.deadline_at')) AS INTEGER))
               )
               AND (
@@ -4253,6 +4553,8 @@ impl SqliteStore {
                         AND NOT (
                             (dependency.predicate = 'succeeds' AND upstream.status = 'completed')
                             OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out'))
+                            OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out')
+                            OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled')
                             OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled'))
                         )
                   )
@@ -4261,7 +4563,7 @@ impl SqliteStore {
             "#,
         )?;
         let rows = statement
-            .query_map([instance_id], |row| {
+            .query_map([instance_id, now], |row| {
                 Ok(DueTimeEffect {
                     effect_id: row.get(0)?,
                     kind: row.get(1)?,
@@ -4271,6 +4573,82 @@ impl SqliteStore {
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Scheduled instants for an `every <interval_seconds>` clock source that are
+    /// due at `now`, strictly after `after_scheduled` (the cursor — pass the source
+    /// start when no occurrence has been admitted yet), in ascending ISO-8601
+    /// order. Pure interval arithmetic via SQLite `strftime` (no timezone, no date
+    /// library): the first occurrence is `cursor + interval`. `now` is the
+    /// evaluation clock (`'now'` for dev/worker, or an injected virtual timestamp).
+    /// Bounded to 100000 occurrences per pass as a runaway guard.
+    pub fn due_interval_occurrences(
+        &self,
+        after_scheduled: &str,
+        interval_seconds: i64,
+        now: &str,
+    ) -> StoreResult<Vec<String>> {
+        if interval_seconds <= 0 {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            r#"
+            WITH RECURSIVE occurrence(scheduled_epoch) AS (
+                SELECT CAST(strftime('%s', ?1) AS INTEGER) + ?2
+                UNION ALL
+                SELECT scheduled_epoch + ?2 FROM occurrence
+                WHERE scheduled_epoch + ?2 <= CAST(strftime('%s', ?3) AS INTEGER)
+                  AND scheduled_epoch < CAST(strftime('%s', ?1) AS INTEGER) + (?2 * 100000)
+            )
+            SELECT strftime('%Y-%m-%dT%H:%M:%SZ', scheduled_epoch, 'unixepoch')
+            FROM occurrence
+            WHERE scheduled_epoch <= CAST(strftime('%s', ?3) AS INTEGER)
+            ORDER BY scheduled_epoch
+            "#,
+        )?;
+        let rows = statement
+            .query_map(params![after_scheduled, interval_seconds, now], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Resolve an evaluation-clock token (`'now'` or an injected virtual
+    /// timestamp) to a concrete ISO-8601 instant, so an admitted occurrence records
+    /// a fixed `observed_at` (replay reads the recorded value rather than the clock).
+    pub fn resolve_clock(&self, now: &str) -> StoreResult<String> {
+        let resolved: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?1)",
+                params![now],
+                |row| row.get(0),
+            )
+            .optional()?;
+        resolved.ok_or_else(|| StoreError::Conflict(format!("unparseable clock instant `{now}`")))
+    }
+
+    /// The latest `scheduled_at` already admitted for a clock signal, read from the
+    /// append-only event log (NOT active facts — a consumed occurrence must not let
+    /// the cursor regress and re-admit). `None` when no occurrence has been admitted
+    /// yet, so the caller seeds the cursor from the source start.
+    pub fn last_clock_occurrence(
+        &self,
+        instance_id: &str,
+        signal: &str,
+    ) -> StoreResult<Option<String>> {
+        let latest: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT MAX(json_extract(payload_json, '$.scheduled_at')) \
+                 FROM events WHERE instance_id = ?1 AND event_type = ?2",
+                params![instance_id, signal],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(latest)
     }
 
     /// Pending time obligations (queued timers, unexpired deadlines) for
@@ -4314,7 +4692,9 @@ impl SqliteStore {
             "reason": "deadline exceeded",
         })
         .to_string();
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let event = append_event_on(
             &tx,
             NewEvent {
@@ -4369,7 +4749,9 @@ impl SqliteStore {
             "reason": cancellation.reason,
         })
         .to_string();
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let event = append_event_on(
             &tx,
             NewEvent {
@@ -4416,7 +4798,9 @@ impl SqliteStore {
             "new_expires_at": renewal.new_expires_at,
         })
         .to_string();
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let event = append_event_on(
             &tx,
             NewEvent {
@@ -4457,7 +4841,9 @@ impl SqliteStore {
         instance_id: &str,
         now: &str,
     ) -> StoreResult<Vec<ExpiredLease>> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let expired = {
             let mut statement = tx.prepare(
                 r#"
@@ -4543,7 +4929,9 @@ impl SqliteStore {
             "retry_after": retry.retry_after,
         })
         .to_string();
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let event = append_event_on(
             &tx,
             NewEvent {
@@ -4575,7 +4963,9 @@ impl SqliteStore {
     }
 
     pub fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let artifact_run_links = {
             let mut statement = tx.prepare(
                 r#"
@@ -5198,7 +5588,7 @@ fn insert_diagnostic_on(
                 diagnostic.instance_id,
                 diagnostic.program_id,
                 diagnostic.program_version_id,
-                diagnostic.severity,
+                diagnostic.severity.as_str(),
                 diagnostic.code,
                 diagnostic.message,
                 diagnostic.source_span_json,
@@ -5312,6 +5702,8 @@ fn satisfy_dependencies_on(connection: &Connection, instance_id: &str) -> StoreR
                           AND NOT (
                               (dependency.predicate = 'succeeds' AND upstream.status = 'completed')
                               OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out'))
+                              OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out')
+                              OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled')
                               OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled'))
                           )
                     )
@@ -5400,12 +5792,30 @@ fn policy_block_on(
         || effect.kind.starts_with("ledger.")
         || effect.kind.starts_with("counter.")
         || effect.kind == "event.notify"
+        || effect.kind.starts_with("file.")
     {
         return Ok(None);
     }
 
     if effect.kind == "exec.command" {
         let capabilities = explicit_required_capabilities(&effect)?;
+        return policy_block_for_capabilities(connection, &effect, &capabilities);
+    }
+
+    if effect.kind == "capability.call" {
+        let mut capabilities = explicit_required_capabilities(&effect)?;
+        if capabilities.is_empty() {
+            match effect.target.as_deref().filter(|target| !target.is_empty()) {
+                Some(target) => capabilities.push(target.to_owned()),
+                None => {
+                    return Ok(Some(PolicyBlock {
+                        status: "blocked_by_capability",
+                        reason: "capability.call effect has no target capability requirement"
+                            .to_owned(),
+                    }))
+                }
+            }
+        }
         return policy_block_for_capabilities(connection, &effect, &capabilities);
     }
 
@@ -6928,6 +7338,41 @@ fn required_string(value: &Value, field: &str) -> String {
         .to_owned()
 }
 
+fn required_manifest_string(value: &Value, fields: &[&str]) -> StoreResult<String> {
+    fields
+        .iter()
+        .find_map(|field| {
+            value
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "manifest entry must have one of these non-empty string fields: {}",
+                fields
+                    .iter()
+                    .map(|field| format!("`{field}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
+}
+
+fn manifest_effect_kind(provider: &Value) -> String {
+    provider
+        .get("effect_kind")
+        .or_else(|| provider.get("core_effect_kind"))
+        .or_else(|| provider.get("capability"))
+        .or_else(|| provider.get("effect_contract"))
+        .or_else(|| provider.get("effect_contract_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("capability.call")
+        .to_owned()
+}
+
 fn skill_view_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillView> {
     Ok(SkillView {
         skill_id: row.get(0)?,
@@ -6956,6 +7401,43 @@ fn skill_to_json(skill: &SkillView) -> Value {
 
 fn stable_hash_hex(value: &str) -> String {
     format!("{:016x}", stable_hash(value))
+}
+
+/// Execution fingerprint for a run, per spec/execution-contract.md: the
+/// materialized input plus the resolved dependency outputs, recorded with the run
+/// for replay verification and model-backed change detection. It is deliberately
+/// **distinct** from the effect idempotency key (the key is fixed at creation; the
+/// fingerprint reflects what the run actually executed against). Downstream effects
+/// bake their upstream outputs into `input_json` at lowering, so the materialized
+/// input already carries the resolved dependency outputs; the sorted upstream
+/// effect ids record the dependency structure that fed the run.
+fn execution_fingerprint_on(
+    connection: &Connection,
+    instance_id: &str,
+    effect_id: &str,
+) -> StoreResult<String> {
+    let input_json: String = connection
+        .query_row(
+            "SELECT input_json FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
+            params![instance_id, effect_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| "{}".to_owned());
+    let mut upstream: Vec<String> = connection
+        .prepare(
+            "SELECT upstream_effect_id FROM effect_dependencies \
+             WHERE instance_id = ?1 AND downstream_effect_id = ?2",
+        )?
+        .query_map(params![instance_id, effect_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<_, _>>()?;
+    upstream.sort();
+    Ok(stable_hash_hex(&format!(
+        "{input_json}|{}",
+        upstream.join(",")
+    )))
 }
 
 fn stable_hash(value: &str) -> u64 {
@@ -7136,7 +7618,7 @@ fn terminal_diagnostic_payload(diagnostic: &TerminalDiagnosticRecord) -> Value {
     json!({
         "program_id": diagnostic.program_id,
         "program_version_id": diagnostic.program_version_id,
-        "severity": diagnostic.severity,
+        "severity": diagnostic.severity.as_str(),
         "code": diagnostic.code,
         "message": diagnostic.message,
         "source_span": diagnostic.source_span_json.as_deref().map(|span| {
@@ -7155,7 +7637,7 @@ fn terminal_diagnostic_payload(diagnostic: &TerminalDiagnosticRecord) -> Value {
     })
 }
 
-fn run_start_payload(run: RunStart<'_>) -> String {
+fn run_start_payload(run: RunStart<'_>, metadata_json: &str) -> String {
     json!({
         "effect_id": run.effect_id,
         "run_id": run.run_id,
@@ -7163,9 +7645,26 @@ fn run_start_payload(run: RunStart<'_>) -> String {
         "worker_id": run.worker_id,
         "lease_id": run.lease_id,
         "lease_expires_at": run.lease_expires_at,
-        "metadata": serde_json::from_str::<Value>(run.metadata_json).unwrap_or(Value::Null),
+        "metadata": serde_json::from_str::<Value>(metadata_json).unwrap_or(Value::Null),
     })
     .to_string()
+}
+
+/// Merge the execution fingerprint into a run's metadata object so it is recorded
+/// with the run (in the `run_started` event payload and the projected `runs` row)
+/// and reconstructs on replay through the existing metadata flow.
+fn inject_execution_fingerprint(metadata_json: &str, fingerprint: &str) -> String {
+    let mut value: Value = serde_json::from_str(metadata_json).unwrap_or(Value::Null);
+    if !value.is_object() {
+        value = json!({});
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "execution_fingerprint".to_owned(),
+            Value::String(fingerprint.to_owned()),
+        );
+    }
+    value.to_string()
 }
 
 fn replay_rule_commit(
@@ -7898,7 +8397,8 @@ fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
         "#,
     )?;
 
-    let transaction = connection.transaction()?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for migration in MIGRATIONS {
         let applied = transaction
             .query_row(
@@ -8228,7 +8728,7 @@ mod tests {
             "evidence",
             "evidence_links",
             "diagnostics",
-            "plugin_registrations",
+            "package_registrations",
             "capability_schemas",
             "effect_providers",
             "profiles",
@@ -8324,6 +8824,68 @@ mod tests {
             .fact_exists("instance-a", "pattern:started")
             .expect("fact query"));
         assert_eq!(row_count(&store, "facts"), 1);
+    }
+
+    #[test]
+    fn admit_fact_batch_admits_atomically_and_is_per_row_idempotent() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let rows = [
+            FactBatchRow {
+                fact_id: "imp:row:0",
+                key: "0",
+                value_json: r#"{"title":"a"}"#,
+            },
+            FactBatchRow {
+                fact_id: "imp:row:1",
+                key: "1",
+                value_json: r#"{"title":"b"}"#,
+            },
+        ];
+        let batch = FactBatch {
+            instance_id: "instance-a",
+            source: "kernel",
+            causation_id: None,
+            correlation_id: Some("effect-1"),
+            schema_name: "IssueRow",
+            schema_id: Some("IssueRow"),
+            rows: &rows,
+        };
+
+        let first = store.admit_fact_batch(batch).expect("batch admits");
+        assert_eq!(first.admitted, 2);
+        assert_eq!(first.skipped, 0);
+        assert_eq!(row_count(&store, "facts"), 2);
+
+        // Re-admitting the same batch admits nothing (each derived key is already
+        // present) -- the idempotency the Maude importRow model proves.
+        let second = store.admit_fact_batch(batch).expect("re-admit");
+        assert_eq!(second.admitted, 0);
+        assert_eq!(second.skipped, 2);
+        assert_eq!(row_count(&store, "facts"), 2);
+
+        // A batch overlapping the admitted set admits only the fresh rows.
+        let overlap_rows = [
+            rows[1],
+            FactBatchRow {
+                fact_id: "imp:row:2",
+                key: "2",
+                value_json: r#"{"title":"c"}"#,
+            },
+        ];
+        let overlap = FactBatch {
+            rows: &overlap_rows,
+            ..batch
+        };
+        let third = store.admit_fact_batch(overlap).expect("overlap admits");
+        assert_eq!(third.admitted, 1);
+        assert_eq!(third.skipped, 1);
+        assert_eq!(row_count(&store, "facts"), 3);
+
+        let facts = store.list_facts("instance-a").expect("facts");
+        assert_eq!(
+            facts.iter().filter(|fact| fact.name == "IssueRow").count(),
+            3
+        );
     }
 
     #[test]
@@ -8474,6 +9036,86 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(row_count(&store, "events"), 0);
         assert_eq!(row_count(&store, "effects"), 0);
+    }
+
+    #[test]
+    fn block_effect_binding_is_idempotent_and_recoverable() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("tell", "agent.tell", "rule=start;effect=tell")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commit succeeds");
+
+        let effect = |store: &SqliteStore| {
+            store
+                .list_effects("instance-a")
+                .expect("effects list")
+                .into_iter()
+                .find(|e| e.effect_id == "tell")
+                .expect("tell effect")
+        };
+        let blocked_event_count = |store: &SqliteStore| -> i64 {
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE instance_id = 'instance-a' \
+                     AND event_type = 'effect.blocked'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count")
+        };
+        assert_eq!(effect(&store).status, "queued");
+
+        // First binding block: queued -> blocked, categorized, one event.
+        let first = store
+            .block_effect_binding(
+                "instance-a",
+                "tell",
+                "credentials",
+                "missing credentials_ref",
+            )
+            .expect("first block");
+        let e = effect(&store);
+        assert_eq!(e.status, "blocked");
+        assert_eq!(e.policy_block_category.as_deref(), Some("credentials"));
+        assert_eq!(
+            e.policy_block_reason.as_deref(),
+            Some("missing credentials_ref")
+        );
+        assert_eq!(blocked_event_count(&store), 1);
+
+        // Idempotent re-block (same category): no new event, returns the same one.
+        let second = store
+            .block_effect_binding(
+                "instance-a",
+                "tell",
+                "credentials",
+                "missing credentials_ref",
+            )
+            .expect("re-block");
+        assert_eq!(first.event_id, second.event_id, "re-block reuses the event");
+        assert_eq!(blocked_event_count(&store), 1, "re-block adds no event");
+
+        // Recoverable: a binding-blocked effect stays claimable so a later worker
+        // pass retries once the binding is available.
+        assert!(
+            store
+                .claimable_effects("instance-a")
+                .expect("claimable")
+                .iter()
+                .any(|c| c.effect_id == "tell"),
+            "blocked effect is re-claimable"
+        );
     }
 
     #[test]
@@ -8659,6 +9301,114 @@ mod tests {
     }
 
     #[test]
+    fn start_run_records_execution_fingerprint_distinct_from_effect_identity() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let effects = [
+            test_effect("tell", "agent.tell", "rule=start;effect=tell"),
+            NewEffect {
+                input_json: r#"{"prompt":"different"}"#,
+                ..test_effect("other", "agent.tell", "rule=start;effect=other")
+            },
+        ];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commit succeeds");
+
+        store
+            .start_run(RunStart {
+                instance_id: "instance-a",
+                effect_id: "tell",
+                run_id: "run-1",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-1",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+
+        // The run carries an execution fingerprint in its metadata (recorded with
+        // the run for replay verification), distinct from the effect identity.
+        let metadata: String = store
+            .connection
+            .query_row(
+                "SELECT metadata_json FROM runs WHERE run_id = ?1",
+                params!["run-1"],
+                |row| row.get(0),
+            )
+            .expect("run row");
+        let recorded: Value = serde_json::from_str(&metadata).expect("metadata json");
+        let fingerprint = recorded
+            .get("execution_fingerprint")
+            .and_then(Value::as_str)
+            .expect("execution_fingerprint recorded with the run");
+        assert!(!fingerprint.is_empty());
+        assert_ne!(
+            fingerprint, "tell",
+            "the fingerprint is not the effect id/idempotency key"
+        );
+        // It is the deterministic materialized-input fingerprint.
+        assert_eq!(
+            fingerprint,
+            execution_fingerprint_on(&store.connection, "instance-a", "tell").expect("recompute")
+        );
+        // A different materialized input is a different fingerprint.
+        assert_ne!(
+            execution_fingerprint_on(&store.connection, "instance-a", "tell").expect("fp tell"),
+            execution_fingerprint_on(&store.connection, "instance-a", "other").expect("fp other"),
+        );
+    }
+
+    #[test]
+    fn due_interval_occurrences_enumerates_each_due_tick_after_the_cursor() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+
+        // From the source start, every hour, three ticks are due by 12:00.
+        let due = store
+            .due_interval_occurrences("2026-06-18T09:00:00Z", 3600, "2026-06-18T12:00:00Z")
+            .expect("due occurrences");
+        assert_eq!(
+            due,
+            vec![
+                "2026-06-18T10:00:00Z",
+                "2026-06-18T11:00:00Z",
+                "2026-06-18T12:00:00Z",
+            ]
+        );
+
+        // From a cursor (last admitted tick), only later ticks are due.
+        let after_cursor = store
+            .due_interval_occurrences("2026-06-18T10:00:00Z", 3600, "2026-06-18T12:00:00Z")
+            .expect("due after cursor");
+        assert_eq!(
+            after_cursor,
+            vec!["2026-06-18T11:00:00Z", "2026-06-18T12:00:00Z"]
+        );
+
+        // Before the first tick is reached, nothing is due.
+        let none_yet = store
+            .due_interval_occurrences("2026-06-18T09:00:00Z", 3600, "2026-06-18T09:30:00Z")
+            .expect("none yet");
+        assert!(none_yet.is_empty());
+
+        // A non-positive interval admits nothing (guard).
+        assert!(store
+            .due_interval_occurrences("2026-06-18T09:00:00Z", 0, "2026-06-18T12:00:00Z")
+            .expect("zero interval")
+            .is_empty());
+    }
+
+    #[test]
     fn contradictory_terminal_completion_rolls_back_event_even_with_distinct_key() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let effects = [test_effect("tell", "agent.tell", "rule=start;effect=tell")];
@@ -8827,6 +9577,77 @@ mod tests {
         assert_eq!(claimable.len(), 1);
         assert_eq!(claimable[0].effect_id, "tell");
         assert_eq!(lease_status(&store, "lease-claim"), "released");
+    }
+
+    #[test]
+    fn timed_out_dependency_releases_only_on_timeout() {
+        // A `timed_out` dependency predicate releases the downstream effect only
+        // when the upstream reaches the `timed_out` terminal status, not on a
+        // successful completion (terminal-union after-branch precision).
+        for (instance, upstream_status, expect_claimable) in [
+            ("ti-completed", "completed", false),
+            ("ti-timedout", "timed_out", true),
+        ] {
+            let mut store = SqliteStore::open_in_memory().expect("store opens");
+            let effects = [
+                test_effect("up", "agent.tell", "rule=start;effect=up"),
+                test_effect("down", "agent.tell", "rule=start;effect=down"),
+            ];
+            let dependencies = [NewEffectDependency {
+                dependency_id: "dep-up-down",
+                upstream_effect_id: "up",
+                downstream_effect_id: "down",
+                predicate: "timed_out",
+            }];
+            store
+                .commit_rule(RuleCommit {
+                    instance_id: instance,
+                    rule: "start",
+                    trigger_event_id: None,
+                    facts: &[],
+                    consumed_fact_ids: &[],
+                    effects: &effects,
+                    dependencies: &dependencies,
+                    terminal: None,
+                    idempotency_key: Some("commit-start"),
+                })
+                .expect("rule commit succeeds");
+            store
+                .start_run(RunStart {
+                    instance_id: instance,
+                    effect_id: "up",
+                    run_id: "run-up",
+                    provider: "test",
+                    worker_id: "worker-1",
+                    lease_id: "lease-up",
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    metadata_json: "{}",
+                })
+                .expect("upstream run starts");
+            store
+                .complete_effect(EffectCompletion {
+                    instance_id: instance,
+                    effect_id: "up",
+                    run_id: "run-up",
+                    provider: "test",
+                    worker_id: "worker-1",
+                    status: upstream_status,
+                    exit_code: None,
+                    summary: None,
+                    metadata_json: "{}",
+                    idempotency_key: Some("complete-up"),
+                })
+                .expect("upstream reaches terminal");
+            let claimable = store
+                .claimable_effects(instance)
+                .expect("claimable effects load");
+            let down_claimable = claimable.iter().any(|e| e.effect_id == "down");
+            assert_eq!(
+                down_claimable, expect_claimable,
+                "instance {instance}: upstream `{upstream_status}` should{} release the `timed_out` downstream",
+                if expect_claimable { "" } else { " not" }
+            );
+        }
     }
 
     #[test]
@@ -11100,7 +11921,20 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].run_id, "run-tell");
         assert_eq!(runs[0].status, "running");
-        assert_eq!(runs[0].metadata_json, run_metadata_json);
+        // The caller-provided run metadata is preserved, and the run additionally
+        // records an execution fingerprint (see start_run / execution_fingerprint_on).
+        let run_metadata: Value =
+            serde_json::from_str(&runs[0].metadata_json).expect("run metadata json");
+        let expected_metadata: Value =
+            serde_json::from_str(run_metadata_json).expect("expected metadata json");
+        assert_eq!(
+            run_metadata.get("native_provider"),
+            expected_metadata.get("native_provider")
+        );
+        assert!(run_metadata
+            .get("execution_fingerprint")
+            .and_then(Value::as_str)
+            .is_some_and(|fingerprint| !fingerprint.is_empty()));
         assert!(!runs[0].cancel_requested);
 
         let events = store.list_events(&instance_id).expect("events list");
@@ -11243,7 +12077,7 @@ mod tests {
                 instance_id: Some(&instance.instance_id),
                 program_id: Some(&version.program_id),
                 program_version_id: Some(&version.version_id),
-                severity: "error",
+                severity: Severity::Error,
                 code: Some("provider.transport"),
                 message: "provider transport failed",
                 source_span_json: Some(
@@ -11269,7 +12103,7 @@ mod tests {
                     instance_id: Some(&instance.instance_id),
                     program_id: Some(&version.program_id),
                     program_version_id: Some(&version.version_id),
-                    severity: "error",
+                    severity: Severity::Error,
                     code: Some("provider.transport"),
                     message: "provider transport failed",
                     source_span_json: None,
@@ -11376,7 +12210,7 @@ mod tests {
                 Some(TerminalDiagnosticRecord {
                     program_id: Some(version.program_id.clone()),
                     program_version_id: Some(version.version_id.clone()),
-                    severity: "error".to_owned(),
+                    severity: Severity::Error,
                     code: Some("fixture.failed".to_owned()),
                     message: "fixture failed: boom".to_owned(),
                     source_span_json: Some(source_span_json.to_owned()),
@@ -11468,7 +12302,7 @@ mod tests {
                 instance_id: None,
                 program_id: Some("program-v1"),
                 program_version_id: Some("version-v1"),
-                severity: "warning",
+                severity: Severity::Warning,
                 code: Some("compile.unused"),
                 message: "unused binding",
                 source_span_json: None,
@@ -12124,7 +12958,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_registered_effect_contract_can_run_without_kernel_changes() {
+    fn legacy_manifest_registered_effect_contract_can_run_without_kernel_changes() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let version = store
             .create_program_version(test_program_version("MemoryWorkflow", "source-1", "ir-1"))
@@ -12136,10 +12970,12 @@ mod tests {
                 input_json: "{}",
             })
             .expect("instance creates");
-        let plugin_id = store
-            .register_plugin_manifest(include_str!("../../../examples/plugins/memory.json"))
-            .expect("plugin manifest loads");
-        assert_eq!(plugin_id, "plugin-memory");
+        let package_id = store
+            .register_package_manifest(include_str!(
+                "../../../examples/legacy-plugin-manifests/memory.json"
+            ))
+            .expect("legacy manifest loads");
+        assert_eq!(package_id, "legacy-memory-package");
 
         let effects = [NewEffect {
             timeout_seconds: None,
@@ -12149,7 +12985,7 @@ mod tests {
             input_json: r#"{"query":"context"}"#,
             status: "queued",
             idempotency_key: "rule=start;effect=query",
-            required_capabilities_json: r#"["memory.query"]"#,
+            required_capabilities_json: "[]",
             profile: Some("memory-user"),
             correlation_id: None,
             source_span_json: None,
@@ -12172,32 +13008,138 @@ mod tests {
                 instance_id: &instance.instance_id,
                 effect_id: "query",
                 run_id: "run-query",
-                provider: "memory-plugin",
+                provider: "memory-legacy-provider",
                 worker_id: "worker-1",
                 lease_id: "lease-query",
                 lease_expires_at: "2030-01-01T00:00:00Z",
                 metadata_json: "{}",
             })
-            .expect("plugin effect starts");
+            .expect("legacy manifest effect starts");
 
         assert_eq!(effect_status(&store, "query"), "running");
         assert_eq!(row_count(&store, "runs"), 1);
     }
 
     #[test]
-    fn discovers_plugin_manifests_from_directory() {
+    fn capability_call_uses_registered_target_capability_policy() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("MemoryWorkflow", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        store
+            .register_package_manifest(include_str!(
+                "../../../examples/legacy-plugin-manifests/memory.json"
+            ))
+            .expect("legacy manifest loads");
+
+        let effects = [NewEffect {
+            timeout_seconds: None,
+            effect_id: "query",
+            kind: "capability.call",
+            target: Some("memory.query"),
+            input_json: r#"{"target":"memory.query"}"#,
+            status: "queued",
+            idempotency_key: "rule=start;effect=query",
+            required_capabilities_json: r#"["memory.query"]"#,
+            profile: Some("memory-user"),
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commits");
+
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert_eq!(claimable.len(), 1);
+        assert_eq!(claimable[0].effect_id, "query");
+    }
+
+    #[test]
+    fn package_manifest_shape_registers_runtime_capability_policy() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("MemoryWorkflow", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let package_id = store
+            .register_package_manifest(include_str!("../../../examples/packages/memory.json"))
+            .expect("package manifest loads");
+        assert_eq!(package_id, "package-memory");
+
+        let effects = [NewEffect {
+            timeout_seconds: None,
+            effect_id: "query",
+            kind: "capability.call",
+            target: Some("memory.query"),
+            input_json: r#"{"target":"memory.query"}"#,
+            status: "queued",
+            idempotency_key: "rule=start;effect=query",
+            required_capabilities_json: "[]",
+            profile: Some("memory-user"),
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commits");
+
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert_eq!(claimable.len(), 1);
+        assert_eq!(claimable[0].effect_id, "query");
+    }
+
+    #[test]
+    fn loads_legacy_manifests_from_directory() {
         let store = SqliteStore::open_in_memory().expect("store opens");
         let loaded = store
-            .load_plugin_manifests_from_dir(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins"),
+            .load_package_manifests_from_dir(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../examples/legacy-plugin-manifests"),
             )
-            .expect("plugin manifests load");
+            .expect("legacy manifests load");
 
         assert_eq!(
             loaded,
             vec![
-                "plugin-external-notification".to_owned(),
-                "plugin-memory".to_owned(),
+                "legacy-external-notification-package".to_owned(),
+                "legacy-memory-package".to_owned(),
             ]
         );
     }

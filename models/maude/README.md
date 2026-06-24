@@ -1,6 +1,7 @@
 # Maude Models
 
-Maude is the primary formal target for the WhippleScript rule kernel.
+Maude is the primary executable-spec target for the WhippleScript kernel and
+for the package/library lowering pipeline.
 
 Use it to model:
 
@@ -10,8 +11,13 @@ guard/readiness evaluation
 workflow assertions
 effect nodes
 effect dependency edges
-claimability
+tracker-claim gated agent turns
 completion/failure outcomes
+library declaration acceptance
+construct graph composition
+lowering-class lifecycle contracts
+lowering preservation into core IR
+runtime handoff boundaries
 bounded searches for bad rule cycles
 ```
 
@@ -33,24 +39,139 @@ Run all Maude checks:
 scripts/check-formal-models.sh
 ```
 
+The newer package/lowering models layer on top of the reusable kernel:
+
+```text
+kernel.maude                   core runtime/event/effect/fact semantics
+package-contract.maude         locked package/library contract registry and
+                                typed provider-output boundary
+construct-grammar.maude         controlled construct vocabulary, fixed
+                                package construct grammar, and runtime provider
+                                authorization boundary
+construct-graph.maude           resource-qualified interface graph acceptance
+construct-lowering.maude        accepted graph to ordinary core IR preservation
+lowering-runtime-handoff.maude  lowered core IR entry into runtime shapes
+lowering-class-lifecycle.maude  platform-owned lowering-class profiles
+```
+
 Current test suites:
 
 ```text
-coerce-branches.maude       BAML-style coerce success/failure branches
-loft-claim-turn.maude       claim-gated coding-agent turn lifecycle
-effect-dependencies.maude   success/failure/completes dependency release
-expression-kernel.maude     guards, assertions, optional reads, AgentRef targets
-native-provider-lifecycle.maude cancellation ack, terminal evidence recovery,
-                             artifact failure, and duplicate-terminal safety
-policy-capacity-retry.maude policy/capacity blocks, lease expiry, retry
-ralph-loop.maude            external-event-bounded Ralph loop
-workflow-composition.maude  pattern elaboration, workflow completion, invocation
+coerce-branches.maude            schema-coercion success/failure branches
+package-contract.maude           locked package/library registry and
+                                 typed-output boundary
+construct-grammar.maude          construct acceptance, resource-qualified
+                                 interface composition, capability_call
+                                 lowering, event-source discipline, provider
+                                 authorization boundary
+construct-graph.maude            normalized construct graph acceptance
+                                 invariants: edge compatibility, capability
+                                 closure, port cardinality, unique-resolution
+                                 witnesses, deterministic lowering output,
+                                 compositionality,
+                                 produced-port constraints, fact consistency,
+                                 accepted-program adequacy
+construct-interop-examples.maude abstract package-interop scenarios for the
+                                 seven workflows in
+                                 spec/construct-interop-examples.md
+construct-lowering.maude         accepted-program to core-IR preservation:
+                                 platform lowering, edge relation preservation,
+                                 lowering-class lifecycle acceptance,
+                                 deterministic reports, exactly-one core object
+                                 ownership across node/edge entries, no extra
+                                 capabilities, runtime inputs, package
+                                 schedulers, or package lifecycle semantics
+lowering-runtime-handoff.maude   lowered core IR entry into existing runtime
+                                 lifecycle shapes: effect graph templates,
+                                 dependency blocking, event/projection
+                                 records, event-source/schedule templates, and
+                                 rejection of lowered run, claim, terminal,
+                                 cancellation, retry/lease, or provider-run
+                                 state
+lowering-class-lifecycle.maude   platform lowering-class lifecycle profiles:
+                                 metadata, capability/typed/resource effects,
+                                 event emit/source, projection view, schedule
+                                 emitter, template vs event-record output,
+                                 allowed object-entrypoint pairs, and forbidden
+                                 hidden lifecycle authority
+effect-dependencies.maude        success/failure/completes dependency release
+guard-commit-bite.maude          bite proof: the generated no-commit search shape
+                                 stays sound on the correct kernel yet catches an
+                                 unsafe guard/assertion commit rewrite
+expression-kernel.maude          guards, assertions, optional reads,
+                                 AgentRef targets
+native-provider-lifecycle.maude  cancellation ack, terminal evidence recovery,
+                                 artifact failure, and duplicate-terminal
+                                 safety
+policy-capacity-retry.maude      policy/capacity blocks, lease expiry, retry
+tracker-claim-turn.maude         tracker-claim gated coding-agent turn lifecycle
+external-event-loop.maude        external-event-bounded agent loop
+workflow-composition.maude       pattern elaboration, workflow completion,
+                                 invocation
+pattern-recursion.maude          pattern-application reachability: recursive
+                                 apply rejection (graph.unbounded_pattern_recursion)
+                                 with non-recursive nesting not flagged
+flow-namespace.maude             flow-state ownership: a user rule accessing a
+                                 FlowAwait_* fact is a violation; generated flow
+                                 rules are exempt; non-owned facts are fine
+flow-liveness.maude              flow branch-completeness: in a self-terminating
+                                 flow a stalling branch is a violation; non-self-
+                                 terminating flows and all-settling flows are fine
+flow-autofail.maude              flow unhandled-failure auto-fail (503): in a self-
+                                 terminating flow an unhandled effect failure auto-
+                                 fails the workflow; handled failures and non-self-
+                                 terminating flows never auto-fail
+std-construct-authorization.maude  std-library construct lock exemption (1929 opt A):
+                                 a built-in std construct use compiles without a
+                                 package lock; third-party/unknown construct uses
+                                 still require an authorizing lock
+turn-access-grant.maude          turn-access grant authority narrowing (Proposal A):
+                                 effective authority = profile intersect grant; a
+                                 grant never widens beyond the profile
+action-expansion.maude           action-call inlining (DR-0023): hygienic
+                                 binding per call site, acyclic gate, and that
+                                 inlining runs no provider work
+workflow-revision.maude          active revision, old-effect attribution, and
+                                 cancellation policy behavior
 ```
 
 The shell script runs every Maude test file and checks the expected number of
-`No solution.` and `Solution 1` results for each suite. This is intentionally
-simple: generated checks can later emit a richer manifest, but the first kernel
-already fails CI when an expected safety search starts finding a path.
+`No solution.` and `Solution 1` results for each suite. It also generates the
+current `whip package catalog`, converts each catalog lowering into bounded
+lifecycle obligations, and verifies the platform lowering classes satisfy
+`lowering-class-lifecycle.maude` static-safety and authority-profile rules. That
+catalog check does not prove emitted core-object outputs; output compatibility
+is checked later from concrete lowered IR inventory. The script then generates a
+package check report for `examples/packages/memory.json`, converts the emitted
+`package_contract` artifact into bounded Maude obligations, and verifies package
+effect-contract acceptance plus executable capability-call declaration lowering
+against `package-contract.maude`. It also converts the same package contract's
+construct registry into bounded construct-grammar obligations, proving the
+package-declared capability-call construct is accepted by
+`construct-grammar.maude` and lowers to an ordinary core effect template.
+
+The script then generates a package lock and check report for
+`examples/package-memory.whip`, converts the emitted `construct_graph` artifact
+into bounded Maude obligations, and verifies node acceptance, edge acceptance,
+and graph aggregation against `construct-graph.maude`. The same check report's
+`lowered_ir_report` is converted into bounded lowering obligations that verify
+edge preservation, node lowering preservation, core-object coverage, graph
+lowering boundary evidence, generated graph aggregation, and runtime lifecycle
+handoff against `construct-lowering.maude` and
+`lowering-runtime-handoff.maude`. The generated handoff check uses concrete
+`runtime_entrypoint` values from the emitted report and validator-owned
+graph-boundary facts for deterministic lowering, report completeness,
+no-runtime-inputs, and individual no-lowered-runtime-state facts rather than
+any aggregate runtime-lifecycle evidence shortcut. The
+bridge mirrors the Rust lowered-IR validator's current supported object-kind
+and runtime-entrypoint slice: schema-reserved future objects such as diagnostic
+records must become explicitly supported before generated Maude handoff checks
+accept them. This is intentionally simple: generated checks can later emit a
+richer manifest, but the
+current script already fails CI when an expected safety search starts finding a
+path, a real emitted construct graph falls outside the modeled acceptance rules,
+the emitted lowered report falls outside the modeled lowering-preservation
+rules, or the emitted runtime entrypoints fail the modeled handoff rules.
 
 ## Expression Kernel Model
 

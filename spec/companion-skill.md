@@ -23,14 +23,14 @@ The skill teaches agents:
 - Rules produce facts and durable effects; effects do not run inline.
 - Source order does not sequence effects; use `after` for explicit dependency.
 - Use Loft for project work tracking when available.
-- Use BAML `coerce` for typed model decisions.
+- Use `coerce` for typed schema coercion; coerce is a backend, not workflow logic.
 - Use skills and capabilities instead of inventing shell scripts.
 - Choose profiles by authority intent, not provider brand.
 - Keep workflows small, explicit, and analyzable.
 - Avoid internal effect recursion.
 - Treat workflow revision as a control-plane action. Source rules may propose
   candidate patch artifacts, but they must not activate running revisions.
-- Prefer plugin capabilities for memory, Thoth, GitHub, browser, etc.
+- Prefer package capabilities/providers for memory, GitHub, browser, etc.
 - Inspect status/evidence before guessing.
 
 ## Required Content
@@ -47,7 +47,7 @@ dependent-effect / `after` example
 common diagnostics and fixes
 workflow revision patch-proposal guidance
 capability/profile selection guidance
-plugin discovery guidance
+package/provider discovery guidance
 profile-selection guidance
 evidence/status inspection guidance
 ```
@@ -58,15 +58,16 @@ Current authoring guidance from validation:
   example `when LanguageTask as task where task.provider == "codex"`.
 - Prefer `AgentRef<codex | claude | pi>` for dynamic agent routing. `tell`
   targets should be literal declared agents or `AgentRef` fields such as
-  `tell task.provider`; never ask a model or BAML output to decide the route.
+  `tell task.provider`; never ask a model or schema-coercion output to decide
+  the route.
 - Keep provider/model identity as source metadata or observed evidence. Do not
   make language models identify which provider is active unless the task is
   explicitly reviewing provider evidence.
 - Put `as binding` on the same line as the effect keyword. Multi-line strings
   may follow, but the binding must be visible on the effect line for the current
   parser.
-- Use `call <capability> ... as <binding>` for plugin capabilities such as
-  memory. Do not invent plugin-specific control-flow syntax.
+- Use `call <capability> ... as <binding>` for package capabilities such as
+  memory. Do not invent package-specific control-flow syntax.
 - For running workflow revision, propose a candidate `.whip` artifact with
   ordinary effects or child workflow invocations. Tell the operator to run
   `whip revise --dry-run` and activate the revision from the control plane.
@@ -84,7 +85,7 @@ The checked companion-skill validation fixture uses:
 - source assertions over `CompanionReviewDispatch` and `effect kind agent.tell`
   counts.
 
-The fixture deliberately does not ask BAML, Codex, Claude, Pi, or any other
+The fixture deliberately does not ask coerce, Codex, Claude, Pi, or any other
 model to identify which provider/model is active or which route should be
 selected. The prompt repeats that route identity has already been selected by
 typed source metadata and asks the thread only to review its assigned phase and

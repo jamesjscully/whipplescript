@@ -58,12 +58,10 @@ provider_metadata
 prompt
 model_request
 model_response
-baml_source
-baml_output
+coerce_source
+coerce_output
 loft_command
 loft_result
-thoth_brief
-thoth_verify
 memory_query
 memory_result
 patch
@@ -335,11 +333,56 @@ records in event order so trace conformance can reject impossible sequences such
 as old-version rule commits after activation or fabricated terminal
 cancellation for running effects.
 
+## `std.telemetry`: read-side export package
+
+The canonical package contract is now [`std-telemetry.md`](std-telemetry.md).
+This section records the underlying evidence/trace rationale and the
+OpenTelemetry export decision.
+
+`std.telemetry` is the standard package for telemetry export providers and
+operator-facing export commands. It does not add workflow syntax. Workflows
+produce ordinary events, facts, effects, provider runs, artifacts, diagnostics,
+and evidence; telemetry reads those records after the fact.
+
+Core owns:
+
+```text
+durable event log
+evidence records
+local trace/evidence JSON shape
+source spans
+causal ids
+effect/run/provider lifecycle ids
+```
+
+`std.telemetry` owns:
+
+```text
+exporter providers
+OTLP/OpenTelemetry mapping
+cursor/checkpoint state
+attribute naming policy
+redaction and allowlist policy
+export status/report rendering
+```
+
+Surface:
+
+```text
+operator config
+standard OpenTelemetry environment variables
+provider bindings
+CLI commands such as whip otel-export
+```
+
+Non-goal: no `telemetry { ... }` workflow declaration, no rule-body export
+operation, and no exporter hook on the execution hot path.
+
 ## OpenTelemetry export — the ambassador (DECIDED 2026-06-10)
 
 This resolves the former open question (direct spans vs. local schema + later
 export) and is the design record for
-[`language-ergonomics-tracker.md`](language-ergonomics-tracker.md) C8.
+[`language-ergonomics-tracker.md`](decision-records/language-ergonomics-tracker.md) C8.
 Decision: **keep the local evidence store as the source of truth, and export to
 OpenTelemetry from it via a log-tailing sidecar.** The local schema above stays
 authoritative (it must work offline and in sandboxes); OTel is a read-side

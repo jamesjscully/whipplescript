@@ -30,8 +30,8 @@ whip --store .whipplescript/prod.sqlite trace <instance> --check --json
 ```
 
 The store records events, facts, effects, dependencies, runs, leases, inbox
-items, evidence, artifacts, capability registries, profiles, and plugin
-manifests.
+items, evidence, artifacts, capability registries, profiles, package manifests,
+and provider registrations.
 
 ## Control Actions
 

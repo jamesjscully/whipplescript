@@ -119,15 +119,14 @@ agent worker {
 Advanced:
 
 ```whip
-harness secure_codex: codex
-
-agent worker using secure_codex {
+agent worker {
+  provider secure_codex
   profile "repo-writer"
   capacity 1
 }
 ```
 
-Direct `provider` and `using harness` should be mutually exclusive.
+`secure_codex` is a logical provider binding supplied by package/operator config.
 
 ## Validation Checklist
 

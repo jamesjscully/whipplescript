@@ -152,10 +152,32 @@ pub struct EffectStmt {
     pub span: SourceSpan,
 }
 
+/// A turn-access grant (`with access to <resource> { <grant clauses> }`) on a `tell`:
+/// authority-narrowing metadata per Proposal A (spec/agent-harness.md). The granted
+/// operations narrow the turn's effective authority on `resource`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccessGrant {
+    pub resource: String,
+    pub operations: Vec<AccessGrantOp>,
+    pub span: SourceSpan,
+}
+
+/// One operation clause inside a turn-access grant block — an operation name with its
+/// optional `for <target>` reference and/or `["glob", …]` path patterns (e.g.
+/// `recall for issue`, `read ["docs/**"]`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccessGrantOp {
+    pub operation: String,
+    pub target: Option<String>,
+    pub globs: Vec<String>,
+    pub span: SourceSpan,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BodyEffectKind {
     Tell {
         target: String,
+        access_grants: Vec<AccessGrant>,
     },
     Coerce {
         name: String,
@@ -171,6 +193,11 @@ pub enum BodyEffectKind {
     Call {
         capability: String,
         argument: Option<String>,
+    },
+    ConstructCapabilityCall {
+        keyword: String,
+        target_capability: String,
+        fields: Vec<ConstructUseField>,
     },
     Invoke {
         workflow: String,
@@ -197,7 +224,6 @@ pub enum BodyEffectKind {
     },
     QueueClaim {
         item: String,
-        legacy_plugin: Option<String>,
     },
     QueueRelease {
         item: String,
@@ -224,7 +250,7 @@ pub enum BodyEffectKind {
         key_expr: String,
         amount_expr: String,
     },
-    /// `notify <instance-expr> event <name> { payload }`: inject a typed,
+    /// `emit signal <name> to <instance-expr> { payload }`: inject a typed,
     /// durable event into a known peer instance — directed fire-and-forget
     /// (spec/event-ingress.md, spec/coordination.md messaging).
     Notify {
@@ -232,6 +258,55 @@ pub enum BodyEffectKind {
         event: String,
         fields: Vec<FieldAssign>,
     },
+    /// `read <format> from <store> at <path> as <binding>` (std.files): a typed
+    /// file read lowering through `typed_effect_call`. v0 paths are literal
+    /// strings.
+    FileRead {
+        format: String,
+        store: String,
+        path: String,
+    },
+    /// `write <format> to <store> at <path> { body <expr> mode <mode> } as
+    /// <binding>` (std.files): a typed file write lowering through
+    /// `typed_effect_call`. v0 formats are `text`/`markdown` body codecs; the
+    /// `mode` (create/replace/upsert/append) is required (no silent overwrite),
+    /// and `body` is an expression resolved at effect-input time.
+    FileWrite {
+        format: String,
+        store: String,
+        path: String,
+        body: String,
+        mode: String,
+    },
+    /// `import <format> <Schema> from <store> at <path> as <binding>`
+    /// (std.files): decode a structured file into typed `<Schema>` facts (one per
+    /// row) via the platform fact-batch admission primitive. v0 formats are
+    /// `jsonl`/`json`/`csv`.
+    FileImport {
+        format: String,
+        schema: String,
+        store: String,
+        path: String,
+    },
+    /// `export <format> <Schema> to <store> at <path> { [where <pred>] mode
+    /// <mode> } as <binding>` (std.files): serialize the collection of `<Schema>`
+    /// facts (optionally filtered by `where`, per DR-0022 collection-valued
+    /// projections) to a structured file. v0 formats are `jsonl`/`json`/`csv`;
+    /// `mode` is required (no silent overwrite).
+    FileExport {
+        format: String,
+        schema: String,
+        store: String,
+        path: String,
+        predicate: Option<String>,
+        mode: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstructUseField {
+    pub name: String,
+    pub source: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -268,6 +343,11 @@ pub enum AfterPredicate {
     Succeeds,
     Fails,
     Completes,
+    /// Terminal statuses from the canonical terminal union
+    /// (spec/expression-kernel.md): the effect reached a non-success terminal
+    /// state. `TimedOut` is spelled `times out`; `Cancelled` is `cancelled`.
+    TimedOut,
+    Cancelled,
     /// Coordination outcomes (spec/coordination.md): the effect completed
     /// and its sum-typed value carries the matching `variant`.
     Held,
@@ -282,6 +362,8 @@ impl AfterPredicate {
             Self::Succeeds => "succeeds",
             Self::Fails => "fails",
             Self::Completes => "completes",
+            Self::TimedOut => "times out",
+            Self::Cancelled => "cancelled",
             Self::Held => "held",
             Self::Contended => "contended",
             Self::Ok => "ok",
@@ -340,6 +422,13 @@ pub struct TerminalStmt {
 pub enum TerminalKind {
     Complete,
     Fail,
+    /// Generated-only (`flowfail`): the workflow auto-fails with a generic,
+    /// untyped reason (no `failure` contract / payload). Emitted by flow
+    /// expansion for an effect whose failure is unhandled in a self-terminating
+    /// flow (the 503 auto-fail trigger); never written by authors — rejected in
+    /// user rules by `validate_flowfail_generated_only`. Lowers to the kernel
+    /// `fail_instance_internal` terminal. Carries no name or fields.
+    FailInternal,
 }
 
 /// Whether flow-only statements (`when/else`, `on fails`, `on timeout`) are
@@ -487,6 +576,7 @@ fn lex_body(source: &str, base: usize, diagnostics: &mut Vec<Diagnostic>) -> Vec
             let content_type = (!annotation.is_empty()).then(|| annotation.to_owned());
             let Some(close) = source[opener_end..].find("\"\"\"").map(|o| opener_end + o) else {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: SourceSpan {
                         start: base + start,
                         end: base + source.len(),
@@ -530,6 +620,7 @@ fn lex_body(source: &str, base: usize, diagnostics: &mut Vec<Diagnostic>) -> Vec
             }
             if !closed {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: SourceSpan {
                         start: base + start,
                         end: base + j,
@@ -651,6 +742,7 @@ fn lex_body(source: &str, base: usize, diagnostics: &mut Vec<Diagnostic>) -> Vec
             }
             _ => {
                 diagnostics.push(Diagnostic {
+                    related: Vec::new(),
                     span: SourceSpan {
                         start: base + i,
                         end: base + i + 1,
@@ -793,6 +885,7 @@ impl<'a> BodyParser<'a> {
 
     fn error(&mut self, span: SourceSpan, message: impl Into<String>, suggestion: Option<String>) {
         self.diagnostics.push(Diagnostic {
+            related: Vec::new(),
             span,
             message: message.into(),
             suggestion,
@@ -878,8 +971,8 @@ impl<'a> BodyParser<'a> {
                     "expected a rule body statement".to_owned(),
                     Some(
                         "statements start with record, done, tell, coerce, askHuman, claim, \
-                         release, finish, file, call, invoke, after, case, complete, fail, \
-                         timer, cancel, decide, or exec"
+                         release, finish, file, call, recall, invoke, emit, after, case, complete, \
+                         fail, timer, cancel, decide, or exec"
                             .to_owned(),
                     ),
                 );
@@ -899,10 +992,17 @@ impl<'a> BodyParser<'a> {
             "askHuman" => self.parse_ask_human(),
             "decide" => self.parse_decide(),
             "call" => self.parse_call(),
+            "recall" => self.parse_recall(),
+            "send" => self.parse_send(),
             "invoke" => self.parse_invoke(),
+            "read" => self.parse_read(),
+            "write" => self.parse_write(),
+            "import" => self.parse_import(),
+            "export" => self.parse_export(),
             "after" => self.parse_after(),
             "case" => self.parse_case(),
             "complete" | "fail" => self.parse_terminal(),
+            "flowfail" => self.parse_flow_fail(),
             "timer" => self.parse_timer(),
             "cancel" => self.parse_cancel(),
             "exec" => self.parse_exec(),
@@ -912,7 +1012,7 @@ impl<'a> BodyParser<'a> {
             "finish" => self.parse_queue_finish(),
             "acquire" => self.parse_lease_acquire(),
             "append" => self.parse_ledger_append(),
-            "notify" => self.parse_notify(),
+            "emit" => self.parse_emit_signal(),
             "when" if self.mode == BodyMode::Flow => self.parse_branch(),
             "on" if self.mode == BodyMode::Flow => self.parse_handler(),
             "when" | "on" => {
@@ -926,17 +1026,6 @@ impl<'a> BodyParser<'a> {
                 self.recover();
                 None
             }
-            "emit" => {
-                let span = self.span_here();
-                self.error(
-                    span,
-                    "`emit` was removed from the language".to_owned(),
-                    Some("events are appended by the runtime; record a fact instead".to_owned()),
-                );
-                self.pos += 1;
-                self.recover();
-                None
-            }
             other => {
                 let span = self.span_here();
                 self.error(
@@ -944,8 +1033,8 @@ impl<'a> BodyParser<'a> {
                     format!("unknown rule body statement `{other}`"),
                     Some(
                         "statements start with record, done, tell, coerce, askHuman, claim, \
-                         release, finish, file, call, invoke, after, case, complete, fail, \
-                         timer, cancel, decide, or exec"
+                         release, finish, file, call, recall, invoke, emit, after, case, complete, \
+                         fail, timer, cancel, decide, or exec"
                             .to_owned(),
                     ),
                 );
@@ -954,9 +1043,8 @@ impl<'a> BodyParser<'a> {
                 None
             }
         }
-        .map(|statement| {
+        .inspect(|_| {
             let _ = start;
-            statement
         })
     }
 
@@ -1302,21 +1390,132 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        let mut access_grants = Vec::new();
+        // Pre-prompt modifiers may interleave the standard ones (`as`/`requires`/
+        // `timeout`) with `with access to` turn-access grants.
+        if !self.parse_tell_modifiers(
+            &mut binding,
+            &mut requires,
+            &mut timeout_seconds,
+            &mut access_grants,
+        ) {
             return None;
         }
         let prompt = self.parse_prompt()?;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_tell_modifiers(
+            &mut binding,
+            &mut requires,
+            &mut timeout_seconds,
+            &mut access_grants,
+        ) {
             return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::Tell { target },
+            kind: BodyEffectKind::Tell {
+                target,
+                access_grants,
+            },
             binding,
             requires,
             timeout_seconds,
             prompt: Some(prompt),
             span: self.span_from(start),
         }))
+    }
+
+    /// Parse `tell` modifiers, interleaving the shared effect modifiers with
+    /// `with access to` turn-access grants until neither matches.
+    fn parse_tell_modifiers(
+        &mut self,
+        binding: &mut Option<String>,
+        requires: &mut Vec<String>,
+        timeout_seconds: &mut Option<u64>,
+        access_grants: &mut Vec<AccessGrant>,
+    ) -> bool {
+        loop {
+            if !self.parse_effect_modifiers(binding, requires, timeout_seconds, None) {
+                return false;
+            }
+            if self.at_ident("with") {
+                if !self.parse_access_grant(access_grants) {
+                    return false;
+                }
+                continue;
+            }
+            return true;
+        }
+    }
+
+    /// Parse one `with access to <resource> { <op clauses> }` turn-access grant. Each
+    /// clause is an operation name with an optional `for <target>` ref and/or
+    /// `["glob", …]` paths. `with context`/`with skills` modifiers are not yet
+    /// supported and are reported as such.
+    fn parse_access_grant(&mut self, grants: &mut Vec<AccessGrant>) -> bool {
+        let start = self.pos;
+        self.pos += 1; // with
+        if !self.consume_ident("access") {
+            let span = self.span_here();
+            let detail = if self.at_ident("context") || self.at_ident("skills") {
+                "`with context`/`with skills` turn modifiers are not supported yet"
+            } else {
+                "expected `access to <resource> { ... }` after `with`"
+            };
+            self.error(span, detail.to_owned(), None);
+            return false;
+        }
+        if !self.consume_ident("to") {
+            let span = self.span_here();
+            self.error(span, "expected `to` after `with access`".to_owned(), None);
+            return false;
+        }
+        let Some(resource) = self.ident_text("resource after `with access to`") else {
+            return false;
+        };
+        if !self.consume_sym('{') {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `{` to open the access-grant block".to_owned(),
+                None,
+            );
+            return false;
+        }
+        let mut operations = Vec::new();
+        loop {
+            if self.consume_sym('}') {
+                break;
+            }
+            let op_start = self.pos;
+            let Some(operation) = self.ident_text("operation in the access-grant block") else {
+                return false;
+            };
+            let mut target = None;
+            if self.consume_ident("for") {
+                match self.ident_text("target after `for`") {
+                    Some(name) => target = Some(name),
+                    None => return false,
+                }
+            }
+            let mut globs = Vec::new();
+            if self.at_sym('[') {
+                match self.parse_string_array() {
+                    Some(values) => globs = values,
+                    None => return false,
+                }
+            }
+            operations.push(AccessGrantOp {
+                operation,
+                target,
+                globs,
+                span: self.span_from(op_start),
+            });
+        }
+        grants.push(AccessGrant {
+            resource,
+            operations,
+            span: self.span_from(start),
+        });
+        true
     }
 
     fn parse_coerce_call(&mut self) -> Option<BodyStmt> {
@@ -1338,9 +1537,7 @@ impl<'a> BodyParser<'a> {
                 self.error(span, "unclosed coerce argument list", None);
                 return None;
             }
-            let Some((source, _)) = self.parse_value_expression() else {
-                return None;
-            };
+            let (source, _) = self.parse_value_expression()?;
             args.push(source);
             self.consume_sym(',');
         }
@@ -1452,7 +1649,7 @@ impl<'a> BodyParser<'a> {
     fn parse_call(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
         self.pos += 1; // call
-        let capability = self.ident_text("plugin capability after `call`")?;
+        let capability = self.ident_text("package capability after `call`")?;
         let argument = if self.consume_ident("for") {
             Some(self.ident_text("argument binding after `for`")?)
         } else {
@@ -1468,6 +1665,546 @@ impl<'a> BodyParser<'a> {
             kind: BodyEffectKind::Call {
                 capability,
                 argument,
+            },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: None,
+            span: self.span_from(start),
+        }))
+    }
+
+    fn parse_recall(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // recall
+        let pool = self.ident_text("memory pool after `recall`")?;
+        if !self.consume_ident("for") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `for` after recall pool".to_owned(),
+                Some("write `recall <pool> for <query> as <binding>`".to_owned()),
+            );
+            return None;
+        }
+        let (query, _) = self.parse_value_expression()?;
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+            return None;
+        }
+        if binding.is_none() {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "`recall` requires an `as` binding".to_owned(),
+                Some("write `recall <pool> for <query> as <binding>`".to_owned()),
+            );
+            return None;
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::ConstructCapabilityCall {
+                keyword: "recall".to_owned(),
+                target_capability: "memory.query".to_owned(),
+                fields: vec![
+                    ConstructUseField {
+                        name: "pool".to_owned(),
+                        source: pool,
+                    },
+                    ConstructUseField {
+                        name: "query".to_owned(),
+                        source: query,
+                    },
+                ],
+            },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: None,
+            span: self.span_from(start),
+        }))
+    }
+
+    /// `send via <channel> { text <expr> [markdown <expr>] [thread_id <expr>] }
+    /// as <binding>` (std.messaging): an outbound message lowering to a
+    /// `capability.call` (`messaging.send`), exactly like `recall` but with the
+    /// `as` on the closing-brace line (so it is an AST-only effect). The `channel`
+    /// is carried as a construct field; channel existence is checked statically.
+    fn parse_send(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // send
+        let usage = "write `send via <channel> { text <expr> } as <binding>`".to_owned();
+        if !self.consume_ident("via") {
+            let span = self.span_here();
+            self.error(span, "expected `via` after `send`".to_owned(), Some(usage));
+            return None;
+        }
+        let channel = self.ident_text("channel name after `via`")?;
+        let block_fields = self.parse_field_block(false)?;
+        let mut fields = vec![ConstructUseField {
+            name: "channel".to_owned(),
+            source: channel,
+        }];
+        let mut has_text = false;
+        for field in &block_fields {
+            match field.name.as_str() {
+                "text" | "markdown" | "thread_id" => {
+                    let FieldValue::Expr { source, .. } = &field.value else {
+                        self.error(
+                            field.span,
+                            format!("`send` field `{}` must be an expression", field.name),
+                            Some(usage.clone()),
+                        );
+                        return None;
+                    };
+                    if field.name == "text" {
+                        has_text = true;
+                    }
+                    fields.push(ConstructUseField {
+                        name: field.name.clone(),
+                        source: source.clone(),
+                    });
+                }
+                other => {
+                    self.error(
+                        field.span,
+                        format!(
+                            "unknown `send` block field `{other}` (expected `text`, `markdown`, or `thread_id`)"
+                        ),
+                        Some(usage.clone()),
+                    );
+                    return None;
+                }
+            }
+        }
+        if !has_text {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "`send` requires a `text` field".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+            return None;
+        }
+        if binding.is_none() {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "`send` requires an `as` binding".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::ConstructCapabilityCall {
+                keyword: "send".to_owned(),
+                target_capability: "messaging.send".to_owned(),
+                fields,
+            },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: None,
+            span: self.span_from(start),
+        }))
+    }
+
+    fn parse_read(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // read
+        let usage = "write `read <format> from <store> at <path> as <binding>`".to_owned();
+        let format = self.ident_text("file format after `read`")?;
+        // v0 `read` is a body read: `text`/`markdown` decode to a UTF-8 content
+        // body. Structured codecs (json/jsonl/csv) are typed row/value data —
+        // that is the `import` surface (fact-batch admission), not `read`; and
+        // `bytes` (an artifact with a content hash) is a deferred read codec.
+        // Reject anything else here so `read <format>` is honest rather than
+        // silently decoding every format as text.
+        if !matches!(format.as_str(), "text" | "markdown") {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                format!(
+                    "`read {format}` is not supported in v0 — `read` decodes only `text` or `markdown` bodies"
+                ),
+                Some(
+                    "use `read text`/`read markdown` for a body, `import <format> <Schema>` for structured rows, or `read text` + `coerce` to interpret structured content".to_owned(),
+                ),
+            );
+            return None;
+        }
+        if !self.consume_ident("from") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `from` after read format".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        let store = self.ident_text("file store after `from`")?;
+        if !self.consume_ident("at") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `at` after read store".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        let (path, _) = self.parse_value_expression()?;
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+            return None;
+        }
+        if binding.is_none() {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "`read` requires an `as` binding".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::FileRead {
+                format,
+                store,
+                path,
+            },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: None,
+            span: self.span_from(start),
+        }))
+    }
+
+    fn parse_write(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // write
+        let usage =
+            "write `write <format> to <store> at <path> { body <expr> mode <mode> } as <binding>`"
+                .to_owned();
+        let format = self.ident_text("file format after `write`")?;
+        // v0 `write` renders the `text`/`markdown` body codecs (UTF-8 bodies).
+        // Rendering typed values as json/csv is `export` (deferred, fact-batch).
+        if !matches!(format.as_str(), "text" | "markdown") {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                format!(
+                    "`write {format}` is not supported in v0 — `write` renders only `text` or `markdown` bodies"
+                ),
+                Some(
+                    "use `write text`/`write markdown` for a body; structured `export <format> <Schema>` is deferred".to_owned(),
+                ),
+            );
+            return None;
+        }
+        if !self.consume_ident("to") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `to` after write format".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        let store = self.ident_text("file store after `to`")?;
+        if !self.consume_ident("at") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `at` after write store".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        let (path, _) = self.parse_value_expression()?;
+        let fields = self.parse_field_block(false)?;
+        let mut body = None;
+        let mut mode = None;
+        for field in &fields {
+            match field.name.as_str() {
+                "body" => {
+                    if let FieldValue::Expr { source, .. } = &field.value {
+                        body = Some(source.clone());
+                    }
+                }
+                "mode" => {
+                    if let FieldValue::Expr { source, .. } = &field.value {
+                        mode = Some(source.trim().trim_matches('"').to_owned());
+                    }
+                }
+                other => {
+                    self.error(
+                        field.span,
+                        format!(
+                            "unknown `write` block field `{other}` (expected `body` or `mode`)"
+                        ),
+                        Some(usage.clone()),
+                    );
+                    return None;
+                }
+            }
+        }
+        let Some(body) = body else {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "`write` requires a `body` field".to_owned(),
+                Some(usage),
+            );
+            return None;
+        };
+        // The mode is required: "no silent overwrite" (spec/files.md).
+        let Some(mode) = mode else {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "`write` requires an explicit `mode` (create/replace/upsert/append) — no silent overwrite".to_owned(),
+                Some(usage),
+            );
+            return None;
+        };
+        if !matches!(mode.as_str(), "create" | "replace" | "upsert" | "append") {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                format!("unknown write mode `{mode}` (expected create/replace/upsert/append)"),
+                Some(usage),
+            );
+            return None;
+        }
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+            return None;
+        }
+        if binding.is_none() {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "`write` requires an `as` binding".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::FileWrite {
+                format,
+                store,
+                path,
+                body,
+                mode,
+            },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: None,
+            span: self.span_from(start),
+        }))
+    }
+
+    fn parse_import(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // import
+        let usage =
+            "write `import <format> <Schema> from <store> at <path> as <binding>`".to_owned();
+        let format = self.ident_text("import format after `import`")?;
+        // v0 `import` decodes the structured row codecs into typed facts.
+        if !matches!(format.as_str(), "jsonl" | "json" | "csv") {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                format!(
+                    "`import {format}` is not supported in v0 — `import` decodes `jsonl`, `json`, or `csv`"
+                ),
+                Some(usage),
+            );
+            return None;
+        }
+        let schema = self.ident_text("row schema after import format")?;
+        if !self.consume_ident("from") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `from` after import schema".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        let store = self.ident_text("file store after `from`")?;
+        if !self.consume_ident("at") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `at` after import store".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        let (path, _) = self.parse_value_expression()?;
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+            return None;
+        }
+        if binding.is_none() {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "`import` requires an `as` binding".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::FileImport {
+                format,
+                schema,
+                store,
+                path,
+            },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: None,
+            span: self.span_from(start),
+        }))
+    }
+
+    fn parse_export(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // export
+        let usage =
+            "write `export <format> <Schema> to <store> at <path> { [where <pred>] mode <mode> } as <binding>`"
+                .to_owned();
+        let format = self.ident_text("export format after `export`")?;
+        if !matches!(format.as_str(), "jsonl" | "json" | "csv") {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                format!(
+                    "`export {format}` is not supported in v0 — `export` writes `jsonl`, `json`, or `csv`"
+                ),
+                Some(usage),
+            );
+            return None;
+        }
+        let schema = self.ident_text("row schema after export format")?;
+        if !self.consume_ident("to") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `to` after export schema".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        let store = self.ident_text("file store after `to`")?;
+        if !self.consume_ident("at") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `at` after export store".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        let (path, _) = self.parse_value_expression()?;
+        if !self.consume_sym('{') {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `{` to open the export block".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        // Block: an optional `where <pred>` collection filter (DR-0022) + a
+        // required `mode`. The schema's facts are the collection; `where` narrows
+        // it. `mode` follows the `write` policy (no silent overwrite).
+        let mut predicate = None;
+        let mut mode = None;
+        loop {
+            if self.consume_sym('}') {
+                break;
+            }
+            if self.peek().is_none() {
+                let span = self.span_here();
+                self.error(span, "unclosed export block".to_owned(), Some(usage));
+                return None;
+            }
+            if self.consume_ident("where") {
+                let (source, _) = self.parse_value_expression()?;
+                predicate = Some(source);
+            } else if self.consume_ident("mode") {
+                let value = self.ident_text("write mode after `mode`")?;
+                mode = Some(value);
+            } else {
+                let span = self.span_here();
+                self.error(
+                    span,
+                    "unknown export block field (expected `where` or `mode`)".to_owned(),
+                    Some(usage.clone()),
+                );
+                self.recover();
+            }
+        }
+        let Some(mode) = mode else {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "`export` requires an explicit `mode` (create/replace/upsert/append) — no silent overwrite".to_owned(),
+                Some(usage),
+            );
+            return None;
+        };
+        if !matches!(mode.as_str(), "create" | "replace" | "upsert" | "append") {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                format!("unknown write mode `{mode}` (expected create/replace/upsert/append)"),
+                Some(usage),
+            );
+            return None;
+        }
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+            return None;
+        }
+        if binding.is_none() {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "`export` requires an `as` binding".to_owned(),
+                Some(usage),
+            );
+            return None;
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::FileExport {
+                format,
+                schema,
+                store,
+                path,
+                predicate,
+                mode,
             },
             binding,
             requires,
@@ -1813,21 +2550,32 @@ impl<'a> BodyParser<'a> {
         }))
     }
 
-    /// `notify <instance-expr> event <dotted.name> { payload }`.
-    fn parse_notify(&mut self) -> Option<BodyStmt> {
+    /// `emit signal <dotted.name> to <instance-expr> { payload }`.
+    fn parse_emit_signal(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
-        self.pos += 1; // notify
-        let target_expr = self.dotted_path_text("target instance after `notify`")?;
-        if !self.consume_ident("event") {
+        self.pos += 1; // emit
+        if !self.consume_ident("signal") {
             let span = self.span_here();
             self.error(
                 span,
-                "expected `event <name>` after the notify target".to_owned(),
-                Some("write `notify s.target event deploy.finished { ... }`".to_owned()),
+                "the bare `emit <name>` statement was removed from the language; \
+                 `emit` must be followed by `signal`"
+                    .to_owned(),
+                Some("write `emit signal deploy.finished to peer.id { ... }`".to_owned()),
             );
             return None;
         }
-        let event = self.dotted_path_text("event name after `event`")?;
+        let event = self.dotted_path_text("signal name after `signal`")?;
+        if !self.consume_ident("to") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `to <target>` after the signal name".to_owned(),
+                Some("write `emit signal deploy.finished to peer.id { ... }`".to_owned()),
+            );
+            return None;
+        }
+        let target_expr = self.dotted_path_text("target instance after `to`")?;
         let fields = self.parse_field_block(false)?;
         let mut binding = None;
         let mut requires = Vec::new();
@@ -2021,13 +2769,12 @@ impl<'a> BodyParser<'a> {
             let span = self.span_here();
             self.error(
                 span,
-                "`claim <item> with <plugin>` was replaced by the queue interface".to_owned(),
+                "`claim <item> with ...` is not supported".to_owned(),
                 Some("declare a `queue` and write `claim <item> [as x]`".to_owned()),
             );
             self.pos += 1;
             let _ = self.advance();
         }
-        let legacy_plugin: Option<String> = None;
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
@@ -2035,10 +2782,7 @@ impl<'a> BodyParser<'a> {
             return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::QueueClaim {
-                item,
-                legacy_plugin,
-            },
+            kind: BodyEffectKind::QueueClaim { item },
             binding,
             requires,
             timeout_seconds,
@@ -2091,6 +2835,17 @@ impl<'a> BodyParser<'a> {
                 "succeeds" => AfterPredicate::Succeeds,
                 "fails" => AfterPredicate::Fails,
                 "completes" => AfterPredicate::Completes,
+                "cancelled" => AfterPredicate::Cancelled,
+                // `times out` is the two-token spelling of the `TimedOut`
+                // terminal status (spec/expression-kernel.md).
+                "times" => {
+                    if !self.consume_ident("out") {
+                        let span = self.span_here();
+                        self.error(span, "expected `out` after `times`", None);
+                        return None;
+                    }
+                    AfterPredicate::TimedOut
+                }
                 "held" => AfterPredicate::Held,
                 "contended" => AfterPredicate::Contended,
                 "ok" => AfterPredicate::Ok,
@@ -2101,7 +2856,7 @@ impl<'a> BodyParser<'a> {
                         span,
                         format!("unsupported `after` predicate `{other}`"),
                         Some(
-                            "use `succeeds`, `fails`, `completes`, or a coordination outcome (`held`, `contended`, `ok`, `over`)"
+                            "use `succeeds`, `fails`, `completes`, `times out`, `cancelled`, or a coordination outcome (`held`, `contended`, `ok`, `over`)"
                                 .to_owned(),
                         ),
                     );
@@ -2110,7 +2865,11 @@ impl<'a> BodyParser<'a> {
             },
             _ => {
                 let span = self.span_here();
-                self.error(span, "expected `succeeds`, `fails`, or `completes`", None);
+                self.error(
+                    span,
+                    "expected `succeeds`, `fails`, `completes`, `times out`, or `cancelled`",
+                    None,
+                );
                 return None;
             }
         };
@@ -2241,9 +3000,7 @@ impl<'a> BodyParser<'a> {
     fn parse_branch(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
         self.pos += 1; // when
-        let Some((condition_source, condition)) = self.parse_value_expression() else {
-            return None;
-        };
+        let (condition_source, condition) = self.parse_value_expression()?;
         if !self.consume_sym('{') {
             let span = self.span_here();
             self.error(span, "expected `{` to open the branch body", None);
@@ -2325,12 +3082,26 @@ impl<'a> BodyParser<'a> {
             span: self.span_from(start),
         }))
     }
+
+    /// Generated-only `flowfail` (no name, no payload): the 503 auto-fail
+    /// terminal. Parses the bare keyword and produces a `FailInternal` terminal.
+    fn parse_flow_fail(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.advance()?; // consume `flowfail`
+        Some(BodyStmt::Terminal(TerminalStmt {
+            kind: TerminalKind::FailInternal,
+            name: String::new(),
+            fields: Vec::new(),
+            span: self.span_from(start),
+        }))
+    }
 }
 
 const STATEMENT_KEYWORDS: &[&str] = &[
     "record", "done", "consume", "tell", "coerce", "askHuman", "claim", "release", "finish",
-    "file", "call", "invoke", "after", "case", "complete", "fail", "timer", "cancel", "decide",
-    "exec", "when", "on", "else",
+    "file", "call", "recall", "send", "invoke", "read", "write", "import", "export", "after",
+    "case", "complete", "fail", "flowfail", "timer", "cancel", "decide", "exec", "when", "on",
+    "else",
 ];
 
 #[cfg(test)]
@@ -2416,6 +3187,51 @@ mod tests {
     }
 
     #[test]
+    fn parses_tell_with_access_grants() {
+        let ast = parse_ok(
+            "tell coder as turn\n  with access to project_memory {\n    recall for issue\n    learn for issue\n  }\n  with access to project_files {\n    read [\"docs/**\"]\n  }\n\"Work the issue.\"",
+        );
+        let BodyStmt::Effect(effect) = &ast.statements[0] else {
+            panic!("expected effect");
+        };
+        let BodyEffectKind::Tell {
+            target,
+            access_grants,
+        } = &effect.kind
+        else {
+            panic!("expected tell");
+        };
+        assert_eq!(target, "coder");
+        assert_eq!(effect.binding.as_deref(), Some("turn"));
+        assert_eq!(access_grants.len(), 2);
+
+        let memory = &access_grants[0];
+        assert_eq!(memory.resource, "project_memory");
+        assert_eq!(memory.operations.len(), 2);
+        assert_eq!(memory.operations[0].operation, "recall");
+        assert_eq!(memory.operations[0].target.as_deref(), Some("issue"));
+        assert_eq!(memory.operations[1].operation, "learn");
+
+        let files = &access_grants[1];
+        assert_eq!(files.resource, "project_files");
+        assert_eq!(files.operations.len(), 1);
+        assert_eq!(files.operations[0].operation, "read");
+        assert_eq!(files.operations[0].globs, vec!["docs/**".to_owned()]);
+    }
+
+    #[test]
+    fn reports_unsupported_with_context_modifier() {
+        let (_, diagnostics) =
+            parse_rule_body("tell coder with context memory \"go\"", 0, BodyMode::Rule);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("not supported yet")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn rejects_unknown_statement() {
         let (_, diagnostics) = parse_rule_body("frobnicate task", 0, BodyMode::Rule);
         assert!(diagnostics.iter().any(|d| d
@@ -2424,11 +3240,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_emit_with_removal_message() {
+    fn parses_emit_signal() {
+        let ast = parse_ok(
+            "emit signal deploy.finished to peer.id {\n  service deployed.service\n  status deployed.status\n} as sent",
+        );
+        let BodyStmt::Effect(effect) = &ast.statements[0] else {
+            panic!("expected effect");
+        };
+        assert_eq!(effect.binding.as_deref(), Some("sent"));
+        let BodyEffectKind::Notify {
+            target_expr,
+            event,
+            fields,
+        } = &effect.kind
+        else {
+            panic!("expected signal delivery effect");
+        };
+        assert_eq!(target_expr, "peer.id");
+        assert_eq!(event, "deploy.finished");
+        assert_eq!(fields.len(), 2);
+    }
+
+    #[test]
+    fn rejects_emit_without_signal_delivery_shape() {
         let (_, diagnostics) = parse_rule_body("emit event.name", 0, BodyMode::Rule);
         assert!(diagnostics
             .iter()
-            .any(|d| d.message.contains("`emit` was removed")));
+            .any(|d| d.message.contains("was removed from the language")));
     }
 
     #[test]
@@ -2443,6 +3281,49 @@ mod tests {
         assert_eq!(after.predicate, AfterPredicate::Succeeds);
         assert_eq!(after.alias.as_deref(), Some("done"));
         assert!(matches!(after.body[1], BodyStmt::After(_)));
+    }
+
+    #[test]
+    fn parses_after_times_out_branch() {
+        let ast = parse_ok(
+            "exec \"report.sh\" -> Report as job\n\nafter job times out as t {\n  cancel job\n}",
+        );
+        let BodyStmt::After(after) = &ast.statements[1] else {
+            panic!("expected after");
+        };
+        assert_eq!(after.predicate, AfterPredicate::TimedOut);
+        assert_eq!(after.predicate.as_str(), "times out");
+        assert_eq!(after.alias.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn parses_after_cancelled_branch() {
+        let ast = parse_ok(
+            "exec \"report.sh\" -> Report as job\n\nafter job cancelled as c {\n  cancel job\n}",
+        );
+        let BodyStmt::After(after) = &ast.statements[1] else {
+            panic!("expected after");
+        };
+        assert_eq!(after.predicate, AfterPredicate::Cancelled);
+        assert_eq!(after.predicate.as_str(), "cancelled");
+        assert_eq!(after.alias.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn rejects_times_without_out() {
+        let (_, diagnostics) = parse_rule_body("after job times { cancel job }", 0, BodyMode::Rule);
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.message.contains("expected `out` after `times`")));
+    }
+
+    #[test]
+    fn rejects_unknown_after_predicate() {
+        let (_, diagnostics) =
+            parse_rule_body("after job explodes { cancel job }", 0, BodyMode::Rule);
+        assert!(diagnostics.iter().any(|d| d
+            .message
+            .contains("unsupported `after` predicate `explodes`")));
     }
 
     #[test]

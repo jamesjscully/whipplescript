@@ -1,203 +1,350 @@
-# External event ingress: typed events, injection, and hosted webhooks
+# `std.ingress`: typed signals from external sources
 
-Status: spec drafted 2026-06-10 from decided design
-([`language-ergonomics-tracker.md`](language-ergonomics-tracker.md) C5).
+Status: spec revised 2026-06-14 from package design discussion
+([`0007-core-standard-libraries-and-providers.md`](decision-records/0007-core-standard-libraries-and-providers.md)).
 Stage: spec -> modeling -> implementation + testing -> review.
 
 ## Framing
 
-**An authenticated external event becoming a durable typed fact that rules
-react to is the event-sourced core, generalized.**
+**Ingress is the typed boundary where outside observations become durable
+WhippleScript facts.**
 
-The runtime already has a working instance of this:
-`human.answer.received` is an externally-surfaced event — a human submits an
-answer, it lands as a durable fact, and rules react. An external event is the
-same shape, generalized to any producer. And the reaction surface already
-exists: `when fact <dotted.name> as x` (A3) matches arbitrary named facts.
+The runtime event log records everything, so the old source word `event` was
+overloaded: it meant both an internal log record and an author-declared outside
+input point. The source-level ingress primitive should be called a **signal**:
 
-So receiving external events needs almost no new *language*; the cost is the
-*ingress mechanism*. The design splits along exactly that seam:
+```text
+outside observation -> source provider -> validated signal fact -> rules
+```
 
-- **3a — language surface (this is core):** a typed event declaration, a
-  `when` reaction, and a CLI injection primitive. No server.
-- **3b — hosted webhooks (opt-in operations):** a long-running authenticated
-  HTTP receiver, configured not coded. No new source syntax.
+The shared top-level construct is a **source**:
 
-The discipline matches everything else: receipt of an event is impure, but
-once recorded as a fact, replay is preserved (replay re-reads the fact, not
-the network).
+```text
+source <provider> as <name> {
+  provider-specific configuration
+  observe as <binding>
+  emit <declared.signal> { explicit mapping }
+}
+```
 
-## 3a — Typed events, reaction, injection
+`std.ingress` contributes external source providers such as `cli`, `http`,
+`stdio`, `file`, and `grpc`. `std.time` contributes the `clock` source
+provider. All of them emit typed signals through the same admission boundary.
+No source fires a rule directly.
 
-### Declaration
+The construct name behind the `signal`/`source` surface syntax is
+`signal_source` (in the `source_declaration` construct family); this is the name
+the construct-graph and lowering reports use. `std.time`'s clock source is the
+net-new sibling construct `clock_source` in the same family (see
+[`std-time.md`](std-time.md)).
 
-An `event` declaration names an external event (dotted, lowercase, matching
-the `when fact` convention and distinct from PascalCase classes) and its
-payload schema (reusing the class body grammar):
+This keeps replay clean: replay reads the recorded signal fact, not the network,
+filesystem, clock, or process stream.
+
+## Signal Declaration
+
+A `signal` declaration names a typed outside input and its payload schema:
 
 ```whip
-event deploy.finished {
+signal deploy.finished {
   service string
-  status string
+  status "ok" | "failed"
   commit string
 }
 ```
 
-An `event` declaration is the typed **ingress manifest**: every point at which
-the outside world can drive a workflow is one `event` block. It also subsumes
-the `@external` liveness escape for these cases — a rule reading a declared
-event is automatically exempt from the dead-read lint, because the event *is*
-the external producer, typed rather than tagged.
+A signal is an **admission contract**. It declares that a workflow may be driven
+by this outside fact. The payload schema reuses the class-body field grammar and
+may use ordinary WhippleScript boundary types.
 
-### Reaction
+Signal names are dotted and lowercase. PascalCase remains reserved for classes,
+enums, and sum-type cases.
 
-A declared event gets the typed bare `when` form; undeclared dotted facts keep
-the untyped `when fact <name>` form:
+## Reaction
+
+A declared signal gets the typed bare `when` form:
 
 ```whip
-rule on_deploy
+rule on_deploy_finished
   when deploy.finished as d
 => {
-  tell sre as turn "Deploy of {{ d.service }} finished: {{ d.status }}"
+  tell sre "Deploy of {{ d.service }} finished: {{ d.status }}"
 }
 ```
 
-`d` is typed against the event's schema. Fan-out is the usual per-fact rule
-multiplicity.
+The binding is typed against the signal schema. Fan-out is the usual per-fact
+rule multiplicity.
 
-### Injection
+Undeclared dotted facts may still be matched through the lower-level
+`when fact <dotted.name> as x` form, but they are untyped and should not be the
+ordinary integration surface.
 
-The CLI primitive lands a typed event as a durable fact:
+## Source Surface
 
-```sh
-whip notify <instance> --event deploy.finished \
-  --data '{"service":"api","status":"ok","commit":"abc"}'
-```
+### External Source
 
-`--data` is parsed against the event's declared schema using the JSON
-ingestion primitive ([`json-ingestion.md`](json-ingestion.md)) — events and
-JSON ingestion are one mechanism: typed external JSON becomes a durable fact.
-A payload that fails schema validation is rejected at the CLI boundary (the
-event is not recorded), so a malformed external delivery cannot land an
-ill-typed fact.
-
-No server is required: the operator's existing gateway verifies a real webhook
-and shells out to `whip notify`. The recorded fact is the source of truth, so
-the path is replay-safe.
-
-### In-workflow injection (the `notify` effect)
-
-The same injection, turned inward, is an effect: one instance lands a typed
-event in another known instance.
+An external source explicitly binds the provider observation before mapping it
+to a signal:
 
 ```whip
-rule signal_peer
-  when SomethingReady as s
-=> {
-  notify s.target event deploy.finished {
-    service s.service
-    status "ok"
+use std.ingress
+
+signal github.issue_labeled {
+  issue_id string
+  label string
+  title string
+  body string
+}
+
+source http as github_issues {
+  path "/github/issues"
+  auth hmac secret github_webhook_secret
+  correlate body.issue_id
+
+  observe as delivery
+  emit github.issue_labeled {
+    issue_id delivery.body.issue_id
+    label delivery.body.label
+    title delivery.body.title
+    body delivery.body.body
   }
 }
 ```
 
-`notify <instance> event <name> { payload }` creates an effect that injects a
-typed, schema-validated, durable event into the target instance. It is the
-directed fire-and-forget primitive of the coordination model
-([`coordination.md`](coordination.md#messaging-a-durable-tuple-space)) — still
-"inject a durable event," not "open a channel," so it adds no liveness coupling
-and stays replay-safe. For point-to-point with a durable, retained log, prefer
-a `ledger` partitioned by recipient (a mailbox); use `notify` when a standing
-ledger is not wanted.
+The least-magic rule is: providers expose observation types; authors explicitly
+map observation fields into declared signal fields. A provider payload shape is
+never assumed to equal a workflow signal shape.
 
-## 3b — Hosted webhooks (config, not language)
+### CLI Admission
 
-Hosting webhooks is an opt-in runtime mode, configured the way providers are —
-**secrets are references, never values**:
+The minimal ingress implementation is a CLI admission boundary:
 
 ```sh
-whip serve --webhooks --config hooks.json
+whip signal <instance> --name deploy.finished \
+  --data '{"service":"api","status":"ok","commit":"abc"}'
 ```
 
-`hooks.json` maps a declared `event` to an endpoint path and an auth strategy
-(`hmac` / `bearer` / `shared-secret`) whose secret is a reference
-(`env:DEPLOY_WEBHOOK_SECRET`, a keychain handle, a secret id). The server
-verifies the signature, parses the body against the event schema, and lands
-the fact exactly-once (delivery dedup by provider-supplied id where present).
+The CLI validates `--data` against the declared signal schema with the JSON
+ingestion rules. A malformed payload is rejected before any fact is recorded.
 
-This adds **no source syntax** — the `event` declaration in `.whip` is the
-contract; exposure and auth are operator config, keeping secrets and the
-public-service surface out of source files. It is a separable track that may
-ship after 3a.
+The CLI path has no provider delivery id, so its admission identity follows the
+peer/CLI rule in [`admission-and-idempotency.md`](admission-and-idempotency.md):
+an operator-supplied delivery id (e.g. `--delivery-id`) is used when present;
+otherwise the kernel derives one from the canonical payload hash and the target.
+The admission records the operator/CLI origin as provenance. The store's unique
+index on `(instance, fact_identity_key)` is what makes a re-run of the same CLI
+admission append at most once; the CLI does not implement its own dedup.
 
-Deferred to 3b's own design pass, in priority order:
+### In-Workflow Signal Injection
 
-- **Correlation first.** Payload-to-instance correlation (a declared key in
-  the event payload routes a delivery to the instance holding the matching
-  fact — "ticket T-1 was updated" reaches the instance working T-1),
-  generalizing the explicit `<instance>` of `whip notify`. This is the piece
-  that removes external *bookkeeping* rather than just external *plumbing*:
-  without it, the operator's gateway must maintain its own event→instance
-  map. It outranks the hosting concerns below.
-- An event that **starts** a new instance. (Initiation already has a front
-  door — `whip run --input` seeds a typed fact — so this is sugar over an
-  existing path, not a gap.)
-- Operational surface: TLS, rate limiting / DoS posture, delivery retry
-  semantics.
+One workflow can inject a declared signal into another known instance:
 
-## Does this remove the need for extensions?
+```whip
+emit signal deploy.finished to peer.id {
+  service s.service
+  status "ok"
+  commit s.commit
+} as sent
+```
 
-It right-sizes them; it does not remove them.
+This lowers to a durable effect that validates the payload against the target
+program's signal declaration and appends the corresponding signal fact to the
+target instance. It is directed fire-and-forget signal injection, not a source
+provider, channel session, or synchronous request/reply.
 
-With external events in (3) + `exec` out + JSON typing
-([`json-ingestion.md`](json-ingestion.md)), a large class of integrations that
-would otherwise justify a plugin — "react to GitHub events, act via `gh`";
-"receive a deploy callback, run a script" — needs **no extension code**, only
-workflow source plus config. Integration flows toward the gated escape hatches
-(`exec`, events-as-facts).
+Peer injection also has no provider delivery id. Its admission identity follows
+the peer rule in [`admission-and-idempotency.md`](admission-and-idempotency.md):
+the key is derived from the origin instance id, the origin effect idempotency
+key, the target, and the canonical payload hash. Because the origin effect key is
+stable, a retried injection (e.g. after a crash between send and ack) reuses the
+same admission key, so the target appends the signal fact at most once. The
+admission carries origin-instance/effect provenance so `whip` can attribute an
+injected signal to its source workflow.
 
-What extensions remain irreducibly for:
+## Provider Scope
 
-- **Providers** — agent backends (codex/claude/pi) are long-lived
-  bidirectional sessions with streaming, cancellation, and evidence; a webhook
-  cannot model them.
-- **Synchronous in-process capabilities** — `call plugin.cap for x as y`
-  returns a typed value into the same logical step; an async event push cannot.
-  Many such capabilities collapse into `exec` + JSON-parse, but those needing
-  in-process state, pooling, or a non-CLI SDK do not.
+The initial `std.ingress` source providers are:
 
-So the accurate framing: webhooks + `exec` + JSON make extensions **optional
-for integration glue** and reserve the plugin machinery for agent providers
-and genuine in-process capabilities — a sharpening of the philosophy, not a
-removal of a subsystem.
+```text
+std.ingress.cli    operator/local CLI signal admission
+std.ingress.http   self-hosted HTTP/HTTPS webhook signal source
+std.ingress.stdio  development/test JSONL signal source
+std.ingress.file   file import/watch signal source
+std.ingress.grpc   typed service-boundary signal source
+```
 
-## Static checks
+Broker/topic adapters are deferred.
 
-- An `event` payload schema is a class body; the same field-type rules as
-  classes apply.
-- A declared event name is dotted and lowercase; a collision with a class
-  name or another event is a check error.
-- `when <event> as x` requires a declared event; the binding is typed against
-  its schema. `when fact <name>` remains available for undeclared dotted
-  facts (untyped).
-- Reading a declared event satisfies the dead-read lint without `@external`.
+### `std.ingress.cli`
 
-## Dependencies
+The baseline admission path. It validates explicit operator-supplied payloads
+and appends typed signal facts. It needs no hosted process and should be the
+reference path for tests and manual operations.
 
-Reuses the `when fact` matcher (A3), the JSON ingestion primitive (C3) for
-payload validation, and the `credentials_ref` config model (providers) for 3b
-auth. 3a introduces one CLI verb and one declaration; 3b introduces a runtime
-mode and a config schema, no source syntax.
+### `std.ingress.http`
 
-## Modeling notes
+A self-hosted HTTP/HTTPS source provider. It should support endpoint paths,
+secret references, HMAC/bearer/shared-secret auth, deduplication keys,
+payload-to-instance correlation, and transport-security configuration.
 
-- Replay safety: an injected event is recorded as a durable fact; replay
-  re-reads the fact, never re-receives the delivery (property: trace is
-  independent of redelivery).
-- Typed ingress: a payload failing schema validation is rejected before any
-  fact is recorded; no ill-typed event fact can exist (property over malformed
-  payloads).
-- Exactly-once (3b): a redelivered webhook with the same provider id lands one
-  fact; dedup is observable in the event log.
-- Liveness consolidation: a rule reading a declared event is live without
-  `@external`; removing the event declaration re-triggers the dead-read lint.
+HTTPS is a mode of this provider, not a separate package. Production deployments
+should use TLS directly or run behind a trusted TLS-terminating reverse proxy.
+Cleartext HTTP should be limited to localhost development, test fixtures, or
+explicitly declared behind-proxy deployments.
+
+HTTP owns transport mechanics only. Product-specific meaning should usually
+live in a domain package or explicit signal schema.
+
+### `std.ingress.stdio`
+
+A development/test source provider that reads typed signal deliveries from a
+line-oriented process stream. The payloads are validated against declared
+signals before admission. Identity is claimed unless wrapped by a stronger
+harness.
+
+### `std.ingress.file`
+
+A local file import/watch source provider for workflows that receive outside
+data through dropped files, export directories, or test fixtures. It should
+deduplicate, validate, and record file evidence before appending a signal fact.
+
+`std.ingress.file` is about outside observations: a file arrived, changed, or
+matched a watch pattern. Reading or writing the file's content belongs to
+[`std.files`](files.md), usually through a declared `file store`.
+
+### `std.ingress.grpc`
+
+A typed service-boundary source provider. This is useful when operators want a
+stronger service contract than generic HTTP/HTTPS webhooks, but it should wait
+until the HTTP/HTTPS and CLI paths have hardened the admission contract.
+
+### Deferred
+
+```text
+broker/topic adapters
+product-specific webhook adapters
+chat/comment platform adapters
+```
+
+Broker/topic adapters are likely useful later, but they add delivery, offset,
+consumer-group, and retention semantics that should not be pulled into the base
+design yet.
+
+## Relationship To `std.time`
+
+`std.ingress` and `std.time` share the `source` construct family:
+
+```text
+std.ingress  external delivery sources
+std.time     clock observation sources
+```
+
+Both produce typed signal facts. Neither fires rules directly.
+
+## Relationship To `std.messaging`
+
+`std.ingress` is lower-level and more powerful than messaging. It can produce
+any declared typed signal because the author provides a contract.
+
+`std.messaging` is for talking through communication platforms. Its native
+inbound value is a generic message envelope: text, sender, thread, attachments,
+interactions, and provider metadata. A messaging provider may feed ingress, but
+only through explicit configuration, interaction mapping, or schema coercion.
+
+## Relationship To `std.files`
+
+`std.ingress.file` observes file arrivals and changes. `std.files` performs
+deliberate content reads, writes, imports, and exports through file-store
+resources. A common workflow is:
+
+```text
+file source observes path -> typed signal -> std.files import/read effect
+```
+
+```text
+messaging talks
+ingress types outside facts
+```
+
+For example, a future interaction-capable messaging provider can be used in two
+ways:
+
+```text
+std.messaging receives generic Message envelopes from the provider
+std.messaging contributes source interaction to admit typed ReleaseDecision signals
+```
+
+The first is conversational. The second is a typed integration boundary.
+
+## Provider Contract
+
+Every source provider must report:
+
+```text
+provider kind
+observation schema
+transport kind
+transport security mode
+supported auth modes
+deduplication key source, if any
+correlation strategy
+payload normalization shape
+delivery evidence shape
+failure diagnostics
+whether it can start instances or only target existing instances
+```
+
+The runtime must reject provider configuration that cannot satisfy the declared
+signal's validation and correlation requirements.
+
+## Static Checks
+
+- A `signal` payload schema must type-check under the same field rules as
+  classes.
+- Signal names are dotted lowercase and cannot collide with another signal,
+  class, enum, package import, or reserved keyword.
+- `when <signal> as x` requires a declared signal and binds `x` to the signal
+  payload type.
+- A rule that reads a declared signal is live without `@external`; the signal
+  declaration is the external producer contract.
+- `source <provider> as <name>` requires an imported package that contributes
+  the provider kind.
+- `observe as <binding>` binds the provider's declared observation schema.
+- `emit <signal> { ... }` must materialize the declared signal payload type
+  from the observation binding and other recorded values in scope.
+- A source may emit only declared signals through the runtime admission
+  boundary.
+- Hosted ingress config must use secret references and must declare an
+  instance-correlation strategy unless the delivery starts a new instance.
+
+## Non-Goals
+
+- No direct rule firing from sources.
+- No provider-owned facts that bypass signal validation.
+- No hidden conversion from generic messages into domain types.
+- No source-level secrets.
+- No synchronous request/reply lifecycle; that belongs to effects or explicit
+  outbound messaging plus later signal/message observation.
+
+## Modeling Notes
+
+- **Replay safety:** replay depends only on the recorded signal fact, not on
+  external redelivery.
+- **Typed admission:** malformed payloads are rejected before any fact is
+  recorded.
+- **Exactly-once where possible:** admission identity for every signal path
+  (external delivery, CLI, peer injection) is defined in
+  [`admission-and-idempotency.md`](admission-and-idempotency.md): a provider
+  delivery id when present, else the derived per-source key. The store's unique
+  index on `(instance, fact_identity_key)` enforces append-at-most-once; a
+  duplicate is absorbed and recorded as an observable duplicate diagnostic. This
+  spec does not define its own dedup mechanism.
+- **Correlation soundness:** an observation can target only the instance
+  selected by its declared correlation rule.
+- **No direct fire:** sources can append signal facts only through the runtime
+  admission boundary.
+
+## Implementation Note
+
+The target design uses `signal`, `source`, and `emit signal`. No compatibility
+alias is specified for retired terminology.

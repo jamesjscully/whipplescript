@@ -9,6 +9,9 @@ schemas
     title string
     summary string
     status literal<"ready">
+  class ReviewDecision
+    decision string
+    decidedBy string
 queues
   queue backlog tracker=builtin
 agents
@@ -53,8 +56,15 @@ rules
       pattern:reviewer is available
       schema:Plan
     effects
-      effect1 kind=human.ask binding=- key=354295ddaf3d196e
-    body_hash f9342bbc7ed9e7fa
+      review kind=human.ask binding=review key=b4ff8387f129deaf
+    body_hash 422a9ac206c4cee2
+  rule record_review_decision
+    when human answered review as answer
+    reads
+      pattern:human answered review as answer
+    writes
+      schema:ReviewDecision
+    body_hash 4ffab13c9ba7227f
 rule_dependencies
   observe_heartbeat --schema:Heartbeat--> plan_recurring_work
   plan_recurring_work --schema:Plan--> escalate_plan_for_review

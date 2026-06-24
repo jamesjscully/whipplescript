@@ -52,10 +52,14 @@ Examples:
 ```text
 agent.turn.completed
 loft.claim.succeeded
-baml.coerce.succeeded
+schema.coerce.succeeded
+coerce.succeeded
 human.ask.created
 human.answer.received
 ```
+
+`coerce.succeeded` is a current compatibility projection for the coerce
+backend. `schema.coerce.succeeded` is the target semantic projection.
 
 Core effect contracts define their completion fact schemas.
 
@@ -74,21 +78,21 @@ loft.conflict
 Loft remains the source of truth for Loft facts. WhippleScript may cache or
 project them for rule matching, but the provenance must remain visible.
 
-### Plugin Projection Facts
+### Package/Provider Projection Facts
 
-Projected by plugin capabilities.
+Projected by package capabilities or provider outputs.
 
 Examples:
 
 ```text
 memory.queryResult
-thoth.resourceLease
+repo.resourceReservation
 github.prStatus
 ```
 
-Plugins may register schemas for these facts. They may not write them directly
-into an instance. Plugin observations enter WhippleScript through effects/events and
-kernel-mediated projection.
+Packages may register schemas for these facts. Providers may not write them
+directly into an instance. Provider observations enter WhippleScript through
+effects/events and kernel-mediated projection.
 
 ## Required Fact Metadata
 
@@ -137,8 +141,8 @@ User rules may:
 User rules may not:
 
 - directly record runtime facts
-- directly record plugin projection facts
-- directly mutate Loft/Thoth/GitHub facts
+- directly record package/provider projection facts
+- directly mutate provider-owned facts
 - forge effect completion facts
 
 To change an external system, rules enqueue effects.

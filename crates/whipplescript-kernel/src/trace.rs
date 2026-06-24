@@ -70,6 +70,7 @@ pub enum TraceEvent {
     },
     EffectBlocked {
         effect_id: String,
+        status: Option<String>,
         reason: String,
     },
     EffectCancelled {
@@ -94,6 +95,7 @@ pub enum TraceEvent {
     InstancePaused,
     InstanceResumed,
     InstanceCancelled,
+    InstanceFailed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -357,7 +359,11 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
                 return violation(record, "provider diagnostic metadata is not valid JSON");
             }
         }
-        TraceEvent::EffectBlocked { effect_id, .. } => {
+        TraceEvent::EffectBlocked {
+            effect_id,
+            status: blocked_status,
+            ..
+        } => {
             let Some(status) = state.effects.get(effect_id) else {
                 return violation(record, format!("blocked unknown effect {effect_id}"));
             };
@@ -365,6 +371,16 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
                 return violation(
                     record,
                     format!("effect {effect_id} blocked from invalid status {status:?}"),
+                );
+            }
+            if matches!(blocked_status.as_deref(), Some("blocked_by_dependency"))
+                && first_unsatisfied_dependency(state, effect_id).is_none()
+            {
+                return violation(
+                    record,
+                    format!(
+                        "effect {effect_id} marked blocked_by_dependency without an unsatisfied dependency"
+                    ),
                 );
             }
             state
@@ -467,6 +483,9 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
             state.cancelled = true;
             state.paused = true;
         }
+        // A generic internal failure is a terminal; replay records it like any
+        // other terminal and reprojects identically (no extra trace invariant).
+        TraceEvent::InstanceFailed => {}
     }
 
     Ok(())
@@ -600,6 +619,17 @@ mod tests {
         }
     }
 
+    fn dependency_block(sequence: u64, effect_id: &str) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::EffectBlocked {
+                effect_id: effect_id.to_owned(),
+                status: Some("blocked_by_dependency".to_owned()),
+                reason: "effect dependencies are not satisfied".to_owned(),
+            },
+        }
+    }
+
     #[test]
     fn accepts_claim_after_success_dependency() {
         let trace = vec![
@@ -682,6 +712,65 @@ mod tests {
 
         let violation = check_trace(&trace).expect_err("unsatisfied dependency should fail");
         assert!(violation.message.contains("before dependency"));
+    }
+
+    #[test]
+    fn accepts_dependency_block_for_unsatisfied_dependency() {
+        let trace = vec![
+            effect_created(1, "upstream"),
+            effect_created(2, "downstream"),
+            TraceRecord {
+                sequence: 3,
+                event: TraceEvent::DependencyCreated(DependencyEdge {
+                    upstream_effect_id: "upstream".to_owned(),
+                    predicate: DependencyPredicate::Succeeds,
+                    downstream_effect_id: "downstream".to_owned(),
+                }),
+            },
+            dependency_block(4, "downstream"),
+        ];
+
+        assert_eq!(check_trace(&trace), Ok(()));
+    }
+
+    #[test]
+    fn rejects_dependency_block_without_unsatisfied_dependency() {
+        let trace = vec![
+            effect_created(1, "downstream"),
+            dependency_block(2, "downstream"),
+        ];
+
+        let violation =
+            check_trace(&trace).expect_err("dependency block without dependency should fail");
+        assert!(violation
+            .message
+            .contains("without an unsatisfied dependency"));
+    }
+
+    #[test]
+    fn rejects_dependency_block_for_satisfied_failure_dependency() {
+        let trace = vec![
+            effect_created(1, "upstream"),
+            effect_created(2, "downstream"),
+            TraceRecord {
+                sequence: 3,
+                event: TraceEvent::DependencyCreated(DependencyEdge {
+                    upstream_effect_id: "upstream".to_owned(),
+                    predicate: DependencyPredicate::Fails,
+                    downstream_effect_id: "downstream".to_owned(),
+                }),
+            },
+            claim(4, "upstream"),
+            start(5, "upstream"),
+            terminal(6, "upstream", EffectStatus::Failed),
+            dependency_block(7, "downstream"),
+        ];
+
+        let violation =
+            check_trace(&trace).expect_err("satisfied failure dependency block should fail");
+        assert!(violation
+            .message
+            .contains("without an unsatisfied dependency"));
     }
 
     #[test]

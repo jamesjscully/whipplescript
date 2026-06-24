@@ -1,9 +1,10 @@
-# CLI & API reference
+# CLI reference
 
-The implemented surfaces: CLI commands and their JSON output, a compact
-language index, runtime status values and event types, JSON inspection
-shapes, and Rust crate APIs. Semantics and examples live in the
-[language reference](language-reference.md) and
+Implemented CLI commands, their exit behavior, and the compact source
+construct index. Runtime JSON contracts live in
+[JSON reference](json-reference.md). Internal Rust crate APIs live in
+[Rust API reference](rust-api.md). Semantics and examples live in the
+[language reference](language-reference.md), [manual](manual.md), and
 [runtime & operations](runtime-operations.md).
 
 ## Global CLI options
@@ -23,9 +24,10 @@ whip [--store path] [--json] [--input JSON] <command> [args]
 The current command set is:
 
 ```text
-check, compile, run, revise, step, worker, dev, accept, instances, status, log,
-facts, effects, runs, artifacts, inbox, items, evidence, diagnostics, trace,
-pause, resume, cancel, retry, recover, doctor
+package, check, compile, run, revise, step, worker, dev, accept, instances,
+status, log, facts, effects, runs, artifacts, inbox, signal, items, leases,
+ledger, counters, evidence, diagnostics, trace, otel-export, telemetry, pause,
+resume, cancel, retry, recover, doctor
 ```
 
 Run `whip <command> --help` or `whip help <command>` to print the usage line
@@ -37,11 +39,14 @@ for any command.
 | --- | --- |
 | `WHIPPLESCRIPT_STORE` | Default store path when `--store` is omitted. |
 | `WHIPPLESCRIPT_ITEMS_STORE` | Path for the builtin work-queue tracker (defaults to `.whipplescript/items.sqlite`). |
+| `WHIPPLESCRIPT_COORDINATION_STORE` | Path for workspace-scoped lease, ledger, and counter state (defaults to `.whipplescript/coordination.sqlite`). |
 | `WHIPPLESCRIPT_EXEC_ALLOW` | Dev-profile raw `exec "<command>"` allow-list: colon-separated glob prefixes such as `scripts/*:bin/ci-*`. Commands that do not match fail without running. |
 | `WHIPPLESCRIPT_EXEC_PROFILE` | `dev` (default) or `hosted`. Hosted rejects raw exec strings and requires script capabilities. |
 | `WHIPPLESCRIPT_SCRIPT_MANIFEST` | JSON manifest path for hosted script capabilities. Equivalent to `--script-manifest`. |
 | `WHIPPLESCRIPT_RUN_ID` | Run identity stamped onto items filed by an agent through `whip items add`. |
-| `WHIPPLESCRIPT_PROVIDER_CONFIGS` | Colon-separated provider binding config paths for the worker (`WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS` is a legacy alias). |
+| `WHIPPLESCRIPT_PROVIDER_CONFIGS` | Colon-separated provider binding config paths for the worker. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP endpoint for `otel-export` (defaults to `http://localhost:4318`). |
+| `OTEL_SERVICE_NAME` | Service name attached to exported OpenTelemetry resource spans. |
 
 ## CLI commands
 
@@ -59,14 +64,20 @@ optional tools:
 
 ```text
 maude
+python3 or python
+python3 -c 'import jsonschema'
 java
 apalache-mc or apalache
-baml-cli or baml
+coerce-cli or coerce
 codex
 claude
 pi
 loft
 ```
+
+The formal/report helper scripts use Python `jsonschema`. From a checkout, use
+`nix develop` or install `requirements-dev.txt` before running generated model
+searches or report-schema validation outside the packaged CI environment.
 
 With `--provider-config`, JSON output includes `provider_config_checks`. Each
 check contains the config path and redacted validation `results`.
@@ -75,25 +86,79 @@ deterministic non-live posture for Codex, Claude, and Pi. It reports CLI
 availability, credential-reference posture, and deeper checks that require
 explicit real-provider validation without printing credential values.
 
+### `package`
+
+```sh
+whip package catalog
+whip package check <manifest.json>...
+whip package lock [--output <path>] <manifest.json>...
+```
+
+Emits the current platform construct catalog, validates package manifests, and
+creates `whipplescript.package_lock.v0` lockfiles. First-class package manifests use
+`whipplescript.package_manifest.v0` with separated `libraries`,
+`capabilities`, `providers`, `profiles`, and `bindings`. Package validation
+derives and validates the normalized library/effect contract
+registry. It also checks package-level references: current packages may expose
+only `capability.call` effect contracts, required capabilities must be declared
+by the package, and bindings must name a provider kind registered for the bound
+capability. Metadata-only declaration forms are accepted when they use a
+non-reserved keyword, an accepted scope, accepted field kinds, and
+`lowering_target: "metadata_only"`; they are reported in the contract registry
+for tooling. The accepted executable declaration target is
+`lowering_target: "capability_call"` for rule-body forms that name a declared
+`target_capability` with a matching `capability.call` effect contract. The
+initial executable form is memory `recall from <pool> for <query> as <binding>`,
+which requires a package lock authorizing `recall` to lower to the memory recall
+capability.
+`package catalog` is a manifest-free machine-readable view of the accepted
+construct families, lowering classes, scopes, field kinds, interface kinds,
+phases, cardinalities, and reserved keywords.
+
+`package lock` pins each manifest by exact SHA-256. `check`, `compile`, `run`,
+`dev`, and `worker` can load the lock with `--package-lock <path>`. When that flag
+is omitted, each command discovers a `whip.lock`: an explicit `--package-lock`
+wins, otherwise it searches from the workflow file's directory upward, otherwise
+from the current directory upward. A project with a `whip.lock` at its root
+therefore needs no explicit path even when run from elsewhere. If several source
+files on one command line resolve to different locks, the command fails and asks
+for `--package-lock`. If no lock is given and none is discovered, any non-`std.`
+package import (for example `use memory`) or package construct use (for example
+`recall`) fails with a diagnostic that names the blockers and suggests
+`whip package sync`; pure `std.` programs are unaffected.
+Each locked manifest is pinned by a SHA-256 recomputed over the manifest bytes at
+load time, so editing a manifest after locking fails lock load with the stable
+`package_lock` error kind (in `--json` output); re-run `package lock` or
+`package sync` to repin. Runtime commands also enforce locked package output
+contracts. A package capability effect with `validation: runtime_boundary` must
+return a value that matches its `output_schema`; otherwise the run fails before
+any package success fact is derived.
+
 ### `check`
 
 ```sh
 whip check [--model-search] [--root Workflow] \
   [--exec-profile dev|hosted] [--script-manifest <path>] \
+  [--package-lock <path>] \
   <workflow.whip>...
 whip --json check [--model-search] [--root Workflow] \
   [--exec-profile dev|hosted] [--script-manifest <path>] \
+  [--package-lock <path>] \
   <workflow.whip>...
 ```
 
 Parses, resolves includes, type-checks, lowers to IR, enforces the
 [liveness checks](language-reference.md#liveness-checks), and prints the IR
 snapshot. With `--model-search`, also runs generated Maude checks when
-available.
+available. The generated artifact bridge checks require Maude, Python, and the
+Python `jsonschema` package.
 
 With `--exec-profile hosted`, raw `exec "..."` is a check error and named
 `exec <capability> with <record>` forms must resolve in the supplied script
 manifest.
+
+With `--package-lock`, imported package libraries such as `use memory` resolve
+against the pinned package manifest and appear in `contract_registry`.
 
 JSON output is an array with one report per input path. Successful entries
 include source hashes, the IR snapshot, and `source_metadata`:
@@ -142,11 +207,270 @@ Exit behavior:
 | `1` | Diagnostics or generated checks failed. |
 | `2` | CLI usage error. |
 
+### `fmt`
+
+```sh
+whip fmt <workflow.whip>...           # format in place
+whip fmt --check <workflow.whip>...   # report unformatted files, exit non-zero
+```
+
+Formats WhippleScript source to the canonical layout. Formatting is idempotent:
+running `fmt` on already-formatted source makes no change.
+
+v0 limitations (both strictly non-destructive — `fmt` reports an error and leaves
+the file untouched rather than damaging it):
+
+- **Comments are preserved** across every declaration: own-line comments above a
+  top-level declaration (or a file header) and **trailing** comments on a
+  single-line declaration (`workflow Demo  # ...`); comments inside a `rule`/
+  `apply`/`coerce`/`table`/`flow` body; and — inside
+  `class`/`agent`/`enum`/`signal`/`queue`/`file store` bodies (including a
+  data-carrying `enum` variant's nested field block) — both own-line comments
+  (interleaved by source position) and trailing comments on a field/clause line.
+  The only comments `fmt` cannot place are ones with nowhere to attach — e.g. a
+  comment trailing a declaration's opening-brace line (`class Task {  # ...`), with
+  no field on that line; those cause `fmt` to **refuse the file rather than drop the
+  comment**. A no-loss check guarantees no comment is ever silently lost.
+- Bodies — `rule`/`apply`/`coerce` (including multi-line `"""..."""` strings and
+  nested `record`/`complete` blocks, with string content preserved) and `table`
+  rows — format idempotently. As a safety net `fmt` also **self-checks
+  idempotency** and refuses any file it cannot format stably (rather than writing
+  drifting/corrupting output), so even an uncovered construct is never damaged.
+
+`--check` exits non-zero if any input is unformatted (or refused) and writes
+nothing.
+
+### `lint`
+
+```bash
+whip lint <source-or-dir>... [--root <workflow>]
+whip --json lint <source-or-dir>...              # structured findings
+whip lint --rule <id> <source-or-dir>...         # run only the named rule(s)
+whip lint --deny <id> --allow <id> <source-or-dir>...   # configure actions
+```
+
+A positional may be a file or a directory (discovered recursively for `.whip` files,
+like `whip test`). `--rule <id>` (repeatable) restricts the run to the named rules;
+with none given, every rule runs. With a single source the JSON report is `{schema,
+path, findings}`; with several it is `{schema, reports: [{path, findings}, …]}`.
+
+Static-analysis warnings over a program that already compiles. Lint is a superset
+of `check` for errors: a program that fails to compile reports the compile errors
+(non-zero exit). Beyond errors it surfaces quality findings.
+
+Unused-declaration analyses flag a construct that is only usable from within the
+program but is never referenced (so it is unambiguously dead — no false positives):
+
+- **`lint.unused_coerce`** — a `coerce` function declared but never called.
+- **`lint.unused_lease`** — a `lease` declared but never acquired.
+- **`lint.unused_ledger`** — a `ledger` declared but never appended to.
+- **`lint.unused_counter`** — a `counter` declared but never consumed.
+- **`lint.unused_queue`** — a `queue` declared but never filed into or claimed.
+- **`lint.unused_file_store`** — a `file store` declared but never read or written.
+- **`lint.unused_class`** — a `class` declared but referenced nowhere.
+- **`lint.unused_enum`** — an `enum` declared but referenced nowhere.
+
+Other analyses:
+
+- **`lint.noop_rule`** — a rule whose body is empty: it fires but produces no
+  record, effect, `done`, or terminal (a forgotten or half-written body).
+- **`lint.coerce_result_unused`** — a `coerce <fn>(…) as <binding>` call whose result
+  `<binding>` is never used: the coercion runs but its result is discarded (dead work
+  or a forgotten `after <binding>` handler).
+- **`lint.broad_file_grant`** — a `file store` grant whose `read`/`write` glob matches
+  everything under the root (`**` / `**/*`): broader than any concrete call needs.
+- **`lint.deep_after_nesting`** (`info`) — a rule nesting `after` blocks ≥4 levels
+  deep; a long effect chain reads more clearly as a `flow`.
+
+Every finding resolves to the source span of the declaration it concerns. The text
+output prefixes each finding with `:line:col` (1-based) and `--json` emits one finding
+per entry with `code`, `severity`, `default_severity`, `configured_action`, `message`,
+and a `range` (`start`/`end` with 0-based `line` + UTF-16 `character`, matching LSP)
+— schema `whipplescript.lint.v0`.
+
+**Configured actions.** Each rule's *action* (a separate axis from its severity) is
+resolved from `--allow <id>`/`--deny <id>` over a project `whip.lint.json` over the
+`warn` default — CLI wins, then config, then default:
+
+- **`allow`** — the finding is suppressed (not emitted).
+- **`warn`** — the finding is reported; the run still succeeds (the default).
+- **`deny`** — the finding is reported and the run exits non-zero.
+
+A project `whip.lint.json` next to the program sets per-rule actions:
+
+```json
+{
+  "schema": "whipplescript.lint_config.v0",
+  "rules": { "lint.unused_class": "deny", "lint.noop_rule": "allow" }
+}
+```
+
+An invalid config (bad schema or action) is a `lint.internal` error (non-zero exit).
+
+### `lsp`
+
+```sh
+whip lsp     # a Language Server over stdio, launched by an editor
+```
+
+A minimal [Language Server](https://microsoft.github.io/language-server-protocol/)
+spoken over stdio (hand-rolled JSON-RPC; no extra runtime dependency). v0 provides:
+
+- **Diagnostics on edit** — on `textDocument/didOpen` and `didChange` it
+  re-compiles the document (full-text sync) and publishes
+  `textDocument/publishDiagnostics`, the same parse/validation diagnostics
+  `whip check` produces, as live editor squiggles. When the document compiles, lint
+  findings are also published as diagnostics tagged `whip lint` (at each finding's own
+  severity — the canonical `error`/`warning`/`info`/`hint` set maps 1:1 to LSP
+  severities), each pointing at the offending declaration. `didClose` clears them.
+- **Document symbols** — `textDocument/documentSymbol` returns the top-level
+  declarations (workflow, classes, agents, rules, signals, coerces, coordination
+  resources, …) for an editor outline/breadcrumb view.
+- **Go to definition** — `textDocument/definition` resolves the identifier under
+  the cursor to its top-level declaration. Top-level names are program-unique, so a
+  reference (e.g. `when Ticket`, a `coerce` call, a `signal` name) jumps to its
+  declaration; local bindings resolve to nothing for now.
+- **Hover** — `textDocument/hover` shows the declaration source for the symbol
+  under the cursor (so hovering a reference reveals the target's definition).
+- **Completion** — `textDocument/completion` offers language keywords plus the
+  document's declared top-level names (the editor filters by the typed prefix);
+  context/scope-aware filtering is future work.
+- **Find references** — `textDocument/references` lists every occurrence of the
+  top-level symbol under the cursor (honoring `includeDeclaration`).
+- **Rename** — `textDocument/rename` renames a top-level symbol across the
+  document, editing every code occurrence but **not** the same word inside a prompt
+  string or comment (so content is never corrupted).
+- **Formatting** — `textDocument/formatting` formats the document with the same
+  comment-preserving formatter as `whip fmt` (returns no edits if the document does
+  not parse or `fmt` would refuse it, so content is never corrupted).
+- **Document highlight** — `textDocument/documentHighlight` marks every occurrence
+  of the symbol under the cursor (the editor's always-on cursor highlighting).
+- **Workspace symbols** — `workspace/symbol` searches symbols across every open
+  document by a case-insensitive substring query (an empty query returns all). v0
+  indexes the documents the editor has opened; filesystem-wide indexing will gate on
+  the shared symbol-index service below.
+
+Cross-file/scope-aware navigation (multi-document references, local bindings,
+filesystem-wide symbols) is planned and will gate on a shared symbol-index service.
+
+### `test`
+
+```sh
+whip test <workflow.whip|dir>...               # files and/or directories
+whip --json test <workflow.whip|dir>...        # emit whipplescript.test_report.v0
+whip test <workflow.whip|dir>... --list        # enumerate selected scenario ids, run none
+whip test <workflow.whip|dir>... -i <pattern>  # include only matching scenarios (repeatable)
+whip test <workflow.whip|dir>... -x <pattern>  # exclude matching scenarios (repeatable)
+whip test <workflow.whip|dir>... --pass-if-no-tests
+```
+
+Runs the `test "…" { workflow … given … stub … run … expect … }` scenarios
+declared in the given programs, each on an isolated store (spec/workflow-testing.md).
+Each positional is a `.whip` file or a directory; a directory is discovered
+recursively for `.whip` files (hidden entries and `target/` are skipped). All sources
+are compiled and their scenarios aggregated into one report; each scenario runs against
+its own program text. Every discovered file must compile — a malformed source is exit 2,
+never a silent skip.
+
+**Scenario ids.** Each scenario is identified as `<workflow>::<name>` — the workflow
+is the scenario's `workflow` clause, or the program's root workflow — both in the
+report's `id` field and for selection.
+
+**Selection.** `-i`/`--include` and `-x`/`--exclude` filter scenarios by that id. A
+pattern containing `::` matches the two halves independently — an empty side matches
+anything, so `Sel::` selects a whole workflow and `::*passes` selects by test name
+across workflows — while a pattern without `::` matches the test name alone. `*` is
+the only wildcard and matches any run of characters. Includes are OR'd (no `-i` means
+all); excludes override includes. `--list` prints the selected ids (one per line, or
+a JSON `tests` array under `--json`) without running them.
+
+**Exit codes** (per spec/workflow-testing.md): `0` all selected scenarios passed ·
+`1` a scenario ran and failed an expectation · `2` setup is invalid (a compile
+error, or a scenario the harness cannot run faithfully) · `4` no scenarios were
+selected — unless `--pass-if-no-tests` downgrades that to `0`.
+
+The driver runs the scenario in rounds — each round drains rule evaluation to idle
+(what `whip step` does) and then settles queued effects (including agent turns)
+through the deterministic **fixture** provider. The `run` clause controls how many
+rounds: `run until idle` (or `until workflow completed|failed`) drives to a fixed
+point — until the workflow reaches a terminal state or stops making progress —
+while `run for N steps` runs exactly N rounds (stopping early only if the workflow
+turns terminal), which lets a test inspect an intermediate state. The
+`stub <surface> <outcome>` clause selects the fixture outcome: `succeeds` or
+`fails`. So a workflow that tells an agent and reacts to `completed turn` runs
+end-to-end under `stub agent <name> succeeds`. (`times_out`/`cancels` are rejected
+as unsupported — the fixture agent path is a shell-command harness that can only
+exit 0/non-zero, so it cannot faithfully simulate a timeout, and the harness will
+not silently pretend the turn succeeded.)
+
+v0 driver scope: `workflow <Name>` header; `given signal`, `given input`
+(validated against the workflow's input contract and seeded as the declared input
+fact), `given fact <Type> { … }` (a pre-existing fact), `given clock at
+"<timestamp>"` (inject a virtual evaluation clock so `timer until`/`timeout`
+deadlines fire — or stay pending — deterministically and without a real sleep),
+`given tracker <name> issue { … }` (seed an existing issue into the builtin tracker,
+isolated per scenario, surfaced through the real `queue.item.ready` projection),
+`given file <store> at "<path>" "<content>"` (seed a deterministic fixture file
+into a declared `file store`, isolated per scenario in a temp dir the store root
+is redirected to, so a `read` runs through the real worker against the fixture);
+`stub agent <name>
+succeeds|fails` and `stub coerce <fn> returns { … }` (inject the typed coerce
+output a workflow branches on); `run until idle|workflow completed|failed` and
+`run for N steps`; `expect workflow completed|failed`,
+`expect rule <name> fired|did not fire|fired N times`, effect expects
+`expect effect <kind> requested|completed|failed` and `expect no <kind>` (over the
+settled effect log, matched by effect kind such as `agent.tell`), fact projection
+expects `expect <fact> exists | where <pred> | count where <pred> is N` — where
+`<fact>` is a dotted fact name, so it can target runtime facts such as
+`agent.turn.completed` as well as single-identifier user facts — and
+`expect diagnostic <code>` (a runtime diagnostic recorded during the run, matched
+by code). Every `expect` target is evaluated.
+
+Honest by construction: a scenario the driver cannot run faithfully — an
+unsupported stub outcome, or a `given input` that violates the input contract —
+is reported as **invalid**
+with the reason in the scenario's `diagnostics`, never a pass. The runner never
+silently skips an assertion. (Stubbing different agents differently in one
+scenario — e.g. `stub agent alpha succeeds` + `stub agent beta fails` — is
+supported.)
+
+JSON output is `whipplescript.test_report.v0`: a top-level `status`
+(`passed | failed | invalid | no_tests`) and `summary`
+(`selected/passed/failed/invalid/skipped`), plus one object per scenario with its
+`id`, bound `workflow`, `steps` (the `given`/`stub`/`run` clauses), `expectations`
+(each `expect` with a `passed`/`failed` status), and `diagnostics` (failure and
+harness-error detail).
+
+See `examples/tested-agent-turn.whip` for a worked example: a workflow plus three
+scenarios exercising `given input`, `stub … succeeds|fails`, `run until idle` /
+`run for N steps`, and the workflow/rule/effect/projection/diagnostic expects.
+
+#### `test replay`
+
+```sh
+whip test replay <instance-id>
+whip --json test replay <instance-id>
+```
+
+Regression-debugging tool (outside the scenario syntax): replays a recorded
+instance's event log into a throwaway copy of the `--store` and checks that the
+reconstructed projection is byte-identical to the live-built one — the
+**replay-equality** invariant (spec/workflow-testing.md). The canonical projection
+is the instance's terminal status plus its active facts and effects, with volatile
+fields (event/fact/effect ids, timestamps, revision epochs) excluded and arrays
+sorted, so the comparison is order- and id-independent. The user's store is never
+mutated (the rebuild runs on the temp copy). Exit `0` = equal, `1` = diverged
+(the JSON report then carries both `recorded` and `replayed` projections), `2` =
+setup error (unknown instance or unreadable store).
+
+This operates on a `--store` instance rather than a standalone trace/event-log
+file + `--workflow`; a portable file-based trace format is a future extension.
+
 ### `compile`
 
 ```sh
-whip compile <workflow.whip> [--root Workflow]
-whip --json compile <workflow.whip> [--root Workflow]
+whip compile <workflow.whip> [--root Workflow] [--package-lock <path>]
+whip --json compile <workflow.whip> [--model-search] [--root Workflow] [--package-lock <path>]
 ```
 
 Prints the compiled IR snapshot. JSON output includes:
@@ -167,15 +491,27 @@ Prints the compiled IR snapshot. JSON output includes:
 }
 ```
 
+With `--model-search`, JSON compile reports also run the generated Maude checks
+over the emitted IR, construct graph, and lowered IR report. This option
+requires `--json`; non-JSON `compile` keeps stdout reserved for the IR snapshot.
+The generated artifact bridge checks require Maude, Python, and the Python
+`jsonschema` package. The CLI passes its current platform construct catalog to
+the bridge scripts with `--platform-catalog`, so inherited
+`WHIPPLESCRIPT_PLATFORM_CATALOG_PATH` settings do not affect generated checks.
+Standalone bridge-script runs must pass `--platform-catalog <path>` or bind the
+same catalog through `WHIPPLESCRIPT_PLATFORM_CATALOG_PATH`.
+
 ### `run`
 
 ```sh
-whip [--store path] [--input JSON] run <workflow.whip> [--root Workflow]
+whip [--store path] [--input JSON] run <workflow.whip> \
+  [--root Workflow] [--package-lock <path>]
 ```
 
 Compiles the source bundle, creates a program version if needed, creates an
 instance, appends `external.started`, and seeds declared workflow input facts.
-It does not run ready rules or providers.
+It does not run ready rules or providers. With `--package-lock`, locked package
+manifests are registered into the store before the instance starts.
 
 JSON output:
 
@@ -227,6 +563,7 @@ whip [--store path] worker <instance> \
   [--provider-config <path>] \
   [--exec-profile dev|hosted] \
   [--script-manifest <path>] \
+  [--package-lock <path>] \
   [--program <workflow.whip>] \
   [--root Workflow] \
   [--once] \
@@ -238,9 +575,8 @@ Starts currently claimable effects and completes them through the selected
 provider. The default provider is the deterministic fixture provider.
 `--provider-config <path>` can be repeated to bind source harness ids to
 concrete provider configs; worker also reads colon-separated
-`WHIPPLESCRIPT_PROVIDER_CONFIGS` and the legacy
-`WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS`. `--fail`, `--timeout`, and `--cancel`
-force fixture terminal outcomes for failure-path tests.
+`WHIPPLESCRIPT_PROVIDER_CONFIGS`. `--fail`, `--timeout`, and `--cancel` force
+fixture terminal outcomes for failure-path tests.
 
 Hosted script execution uses `--exec-profile hosted --script-manifest <path>`
 or `WHIPPLESCRIPT_EXEC_PROFILE=hosted` plus
@@ -248,11 +584,14 @@ or `WHIPPLESCRIPT_EXEC_PROFILE=hosted` plus
 capabilities for the instance program, verifies SHA-256 before spawn, and
 runs argv-direct with JSON stdin.
 
+With `--package-lock`, the worker registers locked package manifests before
+claimable-effect policy checks.
+
 Supported fixture effect kinds:
 
 ```text
 agent.tell
-baml.coerce
+coerce
 human.ask
 capability.call
 workflow.invoke
@@ -262,6 +601,11 @@ queue.release
 queue.finish
 timer.wait
 exec.command
+signal.emit
+lease.acquire
+lease.release
+ledger.append
+counter.consume
 ```
 
 JSON output includes:
@@ -284,6 +628,7 @@ whip [--store path] [--input JSON] dev <workflow.whip> \
   [--provider-config <path>] \
   [--exec-profile dev|hosted] \
   [--script-manifest <path>] \
+  [--package-lock <path>] \
   [--until idle] \
   [--max-iterations N] \
   [--include-tag TAG] \
@@ -294,7 +639,10 @@ whip [--store path] [--input JSON] dev <workflow.whip> \
 
 Convenience local validation loop. It starts a new instance, alternates `step`
 and `worker`, stops when idle or when `--max-iterations` is reached, then
-evaluates source assertions. `--provider-config <path>` can be repeated and is
+evaluates source assertions. The text summary reports the final instance outcome
+(`status completed`/`failed`/`cancelled`, or — when still `running` and idle — the
+reason: a pending human ask with the `whip inbox answer …` command, or a pointer to
+`whip status` for blocked effects and failures). `--provider-config <path>` can be repeated and is
 passed to the embedded worker loop. `--include-tag <tag>` and `--exclude-tag
 <tag>` can be repeated to select which source assertions are evaluated and
 reported; they do not skip rules, effects, providers, or table seeding.
@@ -303,6 +651,9 @@ Exclusion takes precedence when both filters match an assertion.
 `--exec-profile hosted --script-manifest <path>` applies the hosted script
 capability checks before the instance starts and passes the same manifest to
 the embedded worker.
+
+`--package-lock <path>` applies package resolution before the instance starts
+and passes the same lock to the embedded worker loop.
 
 `--stream ndjson` emits compact line-delimited JSON progress envelopes with
 schema `whipplescript.dev_stream.v0`. Current events are `dev.started`,
@@ -409,7 +760,7 @@ and evidence links.
 | Command | Meaning |
 | --- | --- |
 | `instances` | List all instances in the configured store. |
-| `status <instance>` | Show instance status, counts, recent events, and workflow invocation links in JSON. |
+| `status <instance>` | Show instance status, counts, recent events, pending time effects, any pending human asks (with the `whip inbox answer …` command to unblock them), and workflow invocation links. |
 | `log <instance>` | Show append-only event log. |
 | `facts <instance>` | Show current unconsumed facts. |
 | `effects <instance>` | Show effects, status, target, profile, and block reason. |
@@ -436,6 +787,41 @@ Inbox commands inspect and answer human review requests created by `human.ask`
 effects. Bare `whip inbox` lists pending items; `whip inbox <instance>`
 filters pending items to one instance.
 
+### `signal`
+
+```sh
+whip [--store path] [--json] signal <instance> \
+  --name <signal.name> \
+  --data <json> \
+  --program <workflow.whip> \
+  [--root Workflow]
+```
+
+Validates an external signal payload against the source bundle's declared
+`signal <name> { ... }` schema, appends the signal fact to the instance log, and
+derives the typed fact that rules match with `when <signal.name> as x` or the
+general `when fact <signal.name> as x` form. A malformed or undeclared signal is
+rejected before an ill-typed fact can land.
+
+Human output prints the signal sequence. JSON output includes:
+
+```json
+{
+  "instance_id": "inst_...",
+  "signal": "deploy.finished",
+  "signal_id": "sig_...",
+  "fact_id": "fact_..."
+}
+```
+
+Exit behavior:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | Signal accepted and typed fact derived. |
+| `1` | Store, source, or payload validation failed. |
+| `2` | CLI usage error. |
+
 ### Items commands
 
 ```sh
@@ -452,6 +838,23 @@ on. `--status` filters on the item status categories `open`, `in_progress`,
 `done`, and `cancelled`. When an agent files an item mid-turn through
 `whip items add`, the new item carries run-identity provenance taken from the
 `WHIPPLESCRIPT_RUN_ID` environment variable.
+
+### Coordination inspection
+
+```sh
+whip [--json] leases [<resource>]
+whip [--json] ledger [<ledger>] [--partition <value>]
+whip [--json] counters [<counter>]
+```
+
+These commands inspect workspace-scoped coordination state created by
+`lease`, `ledger`, and `counter` declarations and their corresponding
+`acquire`, `release`, `append`, and `consume` effects. They read
+`.whipplescript/coordination.sqlite` by default, or
+`WHIPPLESCRIPT_COORDINATION_STORE` when set. They do not use the instance
+`--store`; coordination resources intentionally outlive disposable run stores.
+
+JSON output shapes are documented in [JSON reference](json-reference.md).
 
 ### Lifecycle commands
 
@@ -474,6 +877,45 @@ whip recover <instance>
 Terminal instances are absorbing: completed, failed, and cancelled instances do
 not accept further public lifecycle transitions or rule commits.
 
+### `otel-export`
+
+```sh
+whip [--store path] otel-export <instance> [--dry-run]
+```
+
+Tails terminal provider runs from the instance store and emits OTLP/HTTP JSON
+spans. The event log and provider-run tables are the buffer; a cursor file next
+to the SQLite store records exported run ids so repeated exporter passes are
+emit-once. `--dry-run` prints the payload and does not write the cursor.
+
+Configuration:
+
+| Variable | Meaning |
+| --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector endpoint; defaults to `http://localhost:4318`. |
+| `OTEL_SERVICE_NAME` | Resource service name; defaults to `whipplescript`. |
+
+Exit behavior:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | Export succeeded, nothing was new, or dry-run printed payload. |
+| `1` | Store read, HTTP export, or cursor persistence failed. |
+| `2` | CLI usage error. |
+
+### `telemetry`
+
+```sh
+whip [--store path] [--json] telemetry status
+whip [--store path] [--json] telemetry reset-cursor [<instance>]
+```
+
+Manages the `otel-export` emit-once cursor. `status` reports the exporter endpoint
+and service name plus the per-instance count of runs already exported.
+`reset-cursor` clears the cursor — for one `<instance>` or, with no argument, all of
+it — so the next `otel-export` re-sends from the start. Neither command touches
+workflow execution.
+
 ## Language reference index
 
 For examples and semantics, see [Language Reference](language-reference.md).
@@ -486,13 +928,18 @@ This section is a compact index of source constructs.
 | Workflow | `workflow Name { ... }` or `workflow Name` | Deployable runtime boundary. |
 | Contract | `input name Type`, `output name Type`, `failure name Type` | Typed workflow input/output/failure contract. |
 | Include | `include "path.whip"` | Source bundle composition. |
-| Plugin import | `use memory` | Import plugin by name. |
+| Package/library import | `use memory` | Import package library surface by name. |
 | Class | `class Name { field Type }` | Typed fact and payload schema. |
 | Enum | `enum Name { A B }` | Finite string domain. |
+| Signal | `signal deploy.finished { field Type }` | Typed external signal ingress schema. |
+| Harness | `harness coder: codex` | Named provider endpoint family used by `agent ... using coder`. |
 | Agent | `agent name { profile "..."; capacity N; skills [...] }` | Logical provider target and policy metadata. |
-| Coerce | `coerce fn(args...) -> Type { prompt """markdown ... """ }` | Declared BAML-backed effect. |
+| Coerce | `coerce fn(args...) -> Type { prompt """markdown ... """ }` | Declared coerce-backed effect. |
 | Flow | `flow name when ... { step; step; ... }` | A rule whose body is a multi-step sequence; lowers to `flow.<name>.seg<N>` rules. |
 | Queue | `queue name { tracker builtin }` | Declared vendor-neutral work-item backlog. |
+| Lease | `lease name { key Type slots N ttl 10m }` | Workspace-scoped bounded mutex/semaphore resource. |
+| Ledger | `ledger name { entry Type partition by field retain 90d }` | Workspace-scoped append log partitioned by a typed field. |
+| Counter | `counter name { key Type cap N reset daily }` | Workspace-scoped consumable budget with lazy reset. |
 | Pattern | `pattern Name<T> { ... }` | Compile-time reusable fragment. |
 | Apply | `apply Name<Type> as Alias { ... }` | Pattern specialization. |
 | Assertion | `assert expression` | Deterministic projection check in `dev`. |
@@ -510,7 +957,8 @@ This section is a compact index of source constructs.
 | Human answer | `when human answered <label> as x` | Match a `human.answer.received` fact created when an inbox item is answered. The binding payload exposes `choice`, `text`, `answered_by`, `prompt`, `inbox_item_id`, and `effect_id`. |
 | Agent turn | `when <agent> completed turn ... [as x]` | Match an `agent.turn.completed` fact. A declared agent name filters to that agent's turns; the generic word `worker` matches any agent. |
 | Queue readiness | `when <queue> has ready item as x` | Match an item that is ready to be claimed in a work queue. |
-| General event | `when fact <dotted.name> as x [where ...]` | General readiness form; the English phrases above are sugar over it. |
+| Declared signal | `when deploy.finished as x` | Match a typed external signal fact declared with `signal deploy.finished { ... }`. |
+| General fact | `when fact <dotted.name> as x [where ...]` | General readiness form; the English phrases above are sugar over it. |
 
 ### Rule body operations
 
@@ -521,8 +969,8 @@ This section is a compact index of source constructs.
 | `done binding` | Mark matched fact consumed. `consume binding` is a deprecated alias; the checker now emits a warning for it. |
 | `done binding -> record ...` | Consume and create replacement fact atomically. |
 | `tell agent ... [timeout <dur>] as turn` | `agent.tell` effect. |
-| `coerce fn(...) as result` | `baml.coerce` effect. |
-| `decide "..." -> { ... } as result` | Inline typed `baml.coerce` effect. |
+| `coerce fn(...) as result` | `coerce` effect. |
+| `decide "..." -> { ... } as result` | Inline typed `coerce` effect. |
 | `exec "<command>" as result` | Dev-profile `exec.command` effect (gated by `WHIPPLESCRIPT_EXEC_ALLOW`; exposes `exit_code`, `stdout`). |
 | `exec <capability> with <record> -> Type as result` | Hosted `exec.command` effect requiring `script.<capability>`, typed JSON stdin, SHA-256 manifest verification, and typed stdout ingestion. |
 | `file item into <queue> { ... }` | `queue.file` effect. |
@@ -530,638 +978,28 @@ This section is a compact index of source constructs.
 | `release <item>` | `queue.release` effect. |
 | `finish <item> [{ summary ... }]` | `queue.finish` effect. |
 | `timer <duration> as x` | `timer.wait` effect completed when due. |
+| `timer until <time> as x` | Absolute `timer.wait` effect completed at or after a typed instant. |
 | `cancel <binding>` | Terminal-cancel a pending effect; request cancellation of a running one. |
 | `askHuman ... [choices [...]] ...` | `human.ask` effect. |
 | `call capability for value as result` | `capability.call` effect. |
+| `emit signal <name> to <instance> { ... } as x` | `signal.emit` effect that injects a typed signal into another instance. |
+| `acquire <lease> for <key> as x` | `lease.acquire` effect with `held` / `contended` branch outcomes. |
+| `release <lease-binding>` | `lease.release` effect. |
+| `append Type { ... } to <ledger> as x` | `ledger.append` effect. |
+| `consume <counter> for <key> amount <expr> as x` | `counter.consume` effect with `ok` / `over` branch outcomes. |
 | `invoke Workflow { ... } as child` | `workflow.invoke` effect. |
 | `after effect succeeds/fails/completes` | Dependency branch scoped by terminal status. |
 | `case expr { Pattern => { ... } }` | Deterministic finite-domain branch. |
 | `complete output { ... }` | `workflow.completed` event and terminal completed state. |
 | `fail failure { ... }` | `workflow.failed` event and terminal failed state. |
 
-## Status values
+## JSON contracts
 
-### Instance status
+Status values, event types, inspection output, coordination output, provider metadata, and artifact manifest shapes are documented in [JSON reference](json-reference.md).
 
-```text
-running
-paused
-completed
-failed
-cancelled
-```
+## Rust APIs
 
-`completed`, `failed`, and `cancelled` are terminal.
-
-### Effect status
-
-```text
-queued
-blocked_by_dependency
-blocked_by_capacity
-blocked_by_capability
-blocked_by_profile
-running
-completed
-failed
-timed_out
-cancelled
-```
-
-### Run status
-
-```text
-running
-completed
-failed
-timed_out
-cancelled
-lease_expired
-```
-
-### Lease status
-
-```text
-active
-released
-expired
-```
-
-## Event types
-
-Common event types:
-
-| Event | Meaning |
-| --- | --- |
-| `external.started` | Instance start input event. |
-| `rule.committed` | Rule atomically committed facts/effects/dependencies/terminal action. |
-| `effect.run_started` | Provider run started for an effect. |
-| `effect.terminal` | Effect completed, failed, timed out, or cancelled. |
-| `effect.blocked` | Effect blocked before provider start. |
-| `effect.cancellation_requested` | Running effect received a durable cancellation request. |
-| `effect.retried` | Effect returned to queued for retry. |
-| `lease.expired` | Active run lease expired. |
-| `lease.renewed` | Active run lease was renewed. |
-| `instance.transitioned` | Pause/resume/cancel transition. |
-| `workflow.completed` | Workflow produced declared output and became completed. |
-| `workflow.failed` | Workflow produced declared failure and became failed. |
-| `workflow.revision_activated` | Instance active program version changed. |
-| `workflow.revision_rejected` | Non-dry-run revision failed compatibility checks. |
-| `fact.derived` | Runtime projection derived a durable fact from an event/effect. |
-| `assertion.passed` | Explicit assertion evaluation returned true. |
-| `assertion.failed` | Explicit assertion evaluation returned false and produced a diagnostic. |
-| `assertion.errored` | Explicit assertion evaluation could not produce a boolean result and produced a diagnostic. |
-| `agent.turn.completed` | Agent turn completion projection. |
-| `agent.turn.failed` | Agent turn failure projection. |
-| `agent.turn.timed_out` | Agent turn timeout projection. |
-| `agent.turn.cancelled` | Agent turn cancellation projection. |
-| `agent.turn.started` | Native provider turn start observation. |
-| `agent.turn.streamed` | Native provider stream observation. |
-| `agent.turn.tool_requested` | Native provider tool/approval observation. |
-| `agent.turn.artifact_captured` | Native provider artifact/diff observation. |
-| `artifact.capture.failed` | Provider artifact capture failed before or during terminal completion. |
-| `human.ask.created` | Human review request was created. |
-| `human.answer.received` | Human answered an inbox item. |
-
-## JSON inspection shapes
-
-Field sets may grow. Consumers should ignore unknown fields.
-
-### Event
-
-```json
-{
-  "event_id": "evt_...",
-  "instance_id": "inst_...",
-  "sequence": 1,
-  "event_type": "rule.committed",
-  "payload": {},
-  "occurred_at": "...",
-  "source": "kernel",
-  "causation_id": null,
-  "correlation_id": null
-}
-```
-
-### Fact
-
-```json
-{
-  "fact_id": "fact_...",
-  "program_version_id": "ver_...",
-  "revision_epoch": 0,
-  "name": "WorkItem",
-  "key": "item-1",
-  "value": {},
-  "provenance_class": "rule",
-  "source_span": null
-}
-```
-
-### Effect
-
-```json
-{
-  "effect_id": "effect-1",
-  "kind": "agent.tell",
-  "target": "worker",
-  "status": "queued",
-  "profile": "repo-writer",
-  "policy_block_reason": null,
-  "input": {}
-}
-```
-
-### Run
-
-```json
-{
-  "run_id": "run-...",
-  "effect_id": "effect-1",
-  "provider": "fixture",
-  "worker_id": "whip-worker",
-  "status": "completed",
-  "started_at": "...",
-  "completed_at": "..."
-}
-```
-
-### Status
-
-`whip --json status <instance>` returns instance metadata, aggregate counts,
-recent events, and optional `workflow_invocations.parent` /
-`workflow_invocations.children` links.
-
-### Trace
-
-`whip --json trace <instance> --check` returns:
-
-```json
-{
-  "schema": "whipplescript.local_trace.v0",
-  "instance_id": "inst_...",
-  "events": [],
-  "facts": [],
-  "effects": [],
-  "runs": [],
-  "evidence": [],
-  "evidence_links": [],
-  "abstract_trace": [],
-  "conformance": {"ok": true}
-}
-```
-
-The trace report uses schema `whipplescript.local_trace.v0`; the draft JSON
-Schema is validated by `scripts/check-report-schemas.sh`.
-
-### Provider binding config
-
-Provider binding config JSON is consumed by `whip doctor --provider-config`,
-`whip worker --provider-config`, `whip dev --provider-config`, and
-`scripts/check-native-provider-configs.sh`.
-
-```json
-{
-  "provider_id": "codex-main",
-  "provider_kind": "codex",
-  "surface": "codex_app_server",
-  "credentials_ref": "env:OPENAI_API_KEY",
-  "profile_ids": ["repo-reader", "repo-writer"],
-  "default_model": "gpt-5.4-mini",
-  "workspace_policy": "read_only",
-  "timeout_ms": 60000,
-  "cancellation_depth": "native_stop",
-  "artifact_policy": "required",
-  "health_checks": ["codex_cli", "app_server_schema"]
-}
-```
-
-Enums:
-
-| Field | Values |
-| --- | --- |
-| `provider_kind` | `codex`, `claude`, `pi`, `fixture`, `command`, `baml`, `loft` |
-| `surface` | `codex_app_server`, `claude_agent_sdk`, `pi_sdk`, `pi_rpc`, `fixture`, `command`, `baml_http`, `loft_cli` |
-| `cancellation_depth` | `none`, `cooperative_request`, `native_stop`, `hard_process_stop`, `remote_session_cancel` |
-
-Unknown config fields are preserved as `extra` for validation/reporting but
-must not contain secret values.
-
-Workers can discover config files through colon-separated
-`WHIPPLESCRIPT_PROVIDER_CONFIGS`; `WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS` is
-accepted as a legacy alias. Source harness ids bind to config `provider_id`
-values, and matching configs populate native request fields such as
-`default_model`, `workspace_policy`, `cancellation_depth`, `artifact_policy`,
-`credentials_ref`, `timeout_ms`, `profile_ids`, and health-check metadata.
-
-### Provider capability JSON
-
-The kernel exposes built-in capability descriptions for native and fixture
-providers:
-
-```json
-{
-  "provider_kind": "pi",
-  "surface": "pi_rpc",
-  "protocol_version": "pi-cli-rpc",
-  "session_identity_fields": ["session_id", "parent_id"],
-  "stream_event_kinds": ["agent_start", "turn_start", "message_start", "message_end", "turn_end", "agent_end"],
-  "tool_policy": "pi_tools_extensions_skills",
-  "cancellation_depths": ["none", "cooperative_request", "native_stop"],
-  "artifact_manifest": true,
-  "health_checks": ["pi_cli", "rpc_mode", "provider_model", "extensions"],
-  "auth_requirements": ["pi_provider_api_key_or_auth_storage"]
-}
-```
-
-Capability JSON is descriptive. Runtime policy must still validate a concrete
-binding before a provider turn starts.
-
-### Provider validation result
-
-Provider validation results are redacted:
-
-```json
-{
-  "provider": "codex-main",
-  "surface": "codex_app_server",
-  "status": "pass",
-  "phase": "provider.surface.valid",
-  "code": "surface_supported",
-  "message": "provider kind and adapter surface are supported",
-  "retryable": false,
-  "missing_config_keys": []
-}
-```
-
-`status` is `pass`, `fail`, or `skip`. Failures use `phase` values such as
-`provider.config.invalid`, `provider.surface.unsupported`, or
-`provider.config.missing`.
-
-### Native lifecycle observation
-
-Native provider observations normalize into `agent.turn.*` events and same-name
-facts. Event payloads use this shape:
-
-```json
-{
-  "effect_id": "tell",
-  "run_id": "run-tell",
-  "agent": "worker",
-  "provider": "codex",
-  "profile": "repo-writer",
-  "status": "tool_requested",
-  "provider_event_type": "item/tool/call",
-  "provider_session_id": "thread-1",
-  "provider_turn_id": "turn-1",
-  "terminal": false,
-  "provider_payload_shape": {"type": "object", "keys": 6},
-  "evidence_id": "ev_..."
-}
-```
-
-Canonical statuses:
-
-```text
-started
-streamed
-tool_requested
-artifact_captured
-completed
-failed
-timed_out
-cancelled
-```
-
-The linked evidence kind is `agent.turn.native_event`. It stores provider event
-type, session/turn ids, terminal flag, status, and redacted payload shape, not
-raw provider payload text.
-
-### Provider terminal metadata
-
-`effect.terminal` payloads for provider runs include provider metadata under
-`payload.metadata`. Agent terminal metadata includes redacted stdout, stderr,
-transcript, usage shape, failure shape, provider correlation id, and terminal
-payload hash:
-
-```json
-{
-  "stdout": {"redacted": true, "bytes": 0, "chars": 0},
-  "stderr": {"redacted": true, "bytes": 0, "chars": 0},
-  "transcript": {"redacted": true, "bytes": 128, "chars": 128},
-  "usage": {},
-  "failure": null,
-  "provider_correlation_id": "key_...",
-  "terminal_payload_hash": "f8311b4ed0a2c641"
-}
-```
-
-Recovery-generated terminal metadata wraps the persisted provider evidence:
-
-```json
-{
-  "recovery": "provider_evidence_terminal",
-  "evidence_id": "ev_...",
-  "provider_metadata": {},
-  "provider_correlation_id": "key_...",
-  "terminal_payload_hash": "..."
-}
-```
-
-The terminal idempotency key is derived from instance id, run id, provider
-correlation id, terminal payload hash, and the terminal marker. The store still
-rejects any second terminal completion for the same running run, even if the
-second attempt has a distinct idempotency key.
-
-Artifact metadata can be inspected without reading artifact contents:
-
-```sh
-whip --json artifacts <run-id>
-```
-
-The JSON response contains `run_id` and an `artifacts` array with artifact id,
-kind, redacted path/ref, redacted content hash, MIME type, and creation time.
-The command does not read or emit raw artifact files.
-`whip --json runs <instance>` and `whip --json trace <instance>` include
-`artifact_count` per run so operators can discover runs with artifact metadata
-before calling `whip artifacts`.
-
-### Artifact manifest
-
-Provider evidence may include an artifact manifest:
-
-```json
-{
-  "schema_version": "whipplescript.artifact_manifest.v1",
-  "entry_count": 1,
-  "entries": [
-    {
-      "artifact_id": "art_...",
-      "kind": "transcript",
-      "uri": {
-        "type": "ref",
-        "value": "provider://codex/runs/run-tell/transcript_ref"
-      },
-      "content_hash": {
-        "algorithm": "provider",
-        "value": "..."
-      },
-      "mime_type": "text/plain",
-      "size_bytes": null,
-      "redaction_status": "unredacted_metadata_only",
-      "retention_policy": "provider_default",
-      "required": false,
-      "source_provider_event": null
-    }
-  ]
-}
-```
-
-Allowed `uri.type` values are `path` and `ref`. Allowed `redaction_status`
-values are `redacted`, `unredacted_metadata_only`, and `reference_only`.
-Allowed `retention_policy` values are `ephemeral`, `provider_default`,
-`retain`, and `delete_after_run`.
-
-### Artifact capture failure
-
-Artifact capture failures append `artifact.capture.failed`:
-
-```json
-{
-  "event_type": "artifact.capture.failed",
-  "provider": "codex",
-  "adapter": "codex_app_server",
-  "run_id": "run-tell",
-  "artifact_ref": {
-    "type": "ref",
-    "value": "provider://codex/runs/run-tell/diff"
-  },
-  "error_kind": "missing",
-  "recoverable": true,
-  "message": {"redacted": true, "bytes": 24, "chars": 24},
-  "transcript_ref": "provider://codex/runs/run-tell/transcript_ref",
-  "stderr_ref": null
-}
-```
-
-Allowed `error_kind` values are `missing`, `unreadable`, `oversized`,
-`hash_mismatch`, and `redaction_failed`. Required artifact capture failure
-prevents a provider result from being marked successful.
-
-## Rust crate APIs
-
-The Rust APIs are currently internal-stability APIs for the workspace. They are
-useful for integration tests and local tooling, but should not be treated as a
-published semver contract yet.
-
-### `whipplescript-core`
-
-| Item | Meaning |
-| --- | --- |
-| `version()` | Compiler/runtime version string. |
-| `IMPLEMENTATION_STAGE` | Current stage label. |
-
-### `whipplescript-parser`
-
-Primary entrypoints:
-
-| Item | Meaning |
-| --- | --- |
-| `parse_program(source)` | Parse source into AST plus diagnostics. |
-| `compile_program(source)` | Parse/type-check/lower source into `IrProgram`. |
-| `compile_program_with_root(source, root)` | Compile a source bundle with explicit root selection. |
-| `format_program(source)` | Format source while preserving rule/coerce block bodies. |
-| `parse_expression(expr)` | Parse a guard/assertion expression. |
-| `parse_duration_seconds(value)` | Parse supported duration literal to seconds. |
-| `parse_time_epoch_seconds(value)` | Parse supported timestamp literal to epoch seconds. |
-
-Important AST/IR structs include:
-
-```text
-Program
-WorkflowDecl
-WorkflowContractDecl
-PatternDecl
-ApplyDecl
-IncludeDecl
-UseDecl
-AgentDecl
-EnumDecl
-ClassDecl
-CoerceDecl
-RuleDecl
-WhenClause
-IrProgram
-IrWorkflowContract
-IrPatternApplication
-IrAssertion
-IrUse
-IrSchema
-IrAgent
-IrCoerce
-IrRule
-IrEffectNode
-IrEffectDependency
-IrTerminalOutput
-Expr
-```
-
-### `whipplescript-store`
-
-`SqliteStore` owns durable runtime persistence.
-
-Lifecycle and program methods:
-
-| Method | Meaning |
-| --- | --- |
-| `open(path)` / `open_in_memory()` | Open store and apply migrations. |
-| `schema_version()` | Read applied schema version. |
-| `create_program_version(...)` | Create or find program version metadata. |
-| `create_instance(...)` | Create a running instance. |
-| `transition_instance(...)` | Pause/resume/cancel with transition guards. |
-| `status(instance_id)` | Aggregate instance status view. |
-| `list_instances()` / `get_instance()` | Instance inspection. |
-
-Rule/effect methods:
-
-| Method | Meaning |
-| --- | --- |
-| `append_event(...)` | Append raw event. |
-| `commit_rule(...)` | Atomic rule commit with facts, effects, dependencies, and optional workflow terminal action. |
-| `derive_fact(...)` | Derive fact from an event/projection. |
-| `claimable_effects(instance_id)` | List effects ready for worker execution. |
-| `satisfy_dependencies(instance_id)` | Release dependency-blocked effects whose predicates are satisfied. |
-| `start_run(...)` | Start provider run and active lease. |
-| `complete_effect(...)` | Mark running run/effect terminal. |
-| `complete_effect_with_terminal_diagnostic(...)` | Terminal completion with diagnostic capture. |
-| `cancel_effect(...)` | Cancel an effect. |
-| `renew_lease(...)` / `expire_leases(...)` | Lease maintenance. |
-| `retry_effect(...)` | Retry failed/timed-out effect. |
-
-Inspection methods:
-
-```text
-list_events
-list_facts
-list_facts_including_consumed
-list_effects
-list_runs
-list_evidence
-list_evidence_links
-list_diagnostics
-list_diagnostics_from_events
-list_artifacts_for_run
-```
-
-Registry and extension methods:
-
-```text
-register_plugin
-register_plugin_manifest
-load_plugin_manifests_from_dir
-register_capability_schema
-register_effect_provider
-register_profile
-bind_capability
-register_skill
-attach_skill
-list_skills
-list_skill_attachments
-record_skill_evidence
-```
-
-Human review methods:
-
-```text
-create_inbox_item
-list_inbox_items
-get_inbox_item
-answer_inbox_item
-```
-
-Workflow invocation methods:
-
-```text
-record_workflow_invocation
-get_workflow_invocation
-list_child_workflow_invocations
-get_parent_workflow_invocation
-```
-
-### `whipplescript-kernel`
-
-`RuntimeKernel` wraps store operations and emits trace records.
-
-Core methods:
-
-```text
-create_program_version
-create_program_version_for_program
-create_instance
-ingest_external_event
-derive_fact
-evaluate_rules
-commit_rule
-claimable_effects
-satisfy_dependencies
-start_run
-complete_run
-fail_run
-timeout_run
-cancel_run
-cancel_effect
-pause_instance
-resume_instance
-cancel_instance
-renew_lease
-expire_leases
-retry_effect
-```
-
-Provider execution methods:
-
-```text
-run_agent_turn
-record_native_agent_turn_observation
-record_artifact_capture_failure
-recover_provider_terminal_from_evidence
-recover_running_provider_runs
-run_baml_coerce
-run_loft_effect
-run_human_ask
-```
-
-Provider traits and helpers:
-
-| Item | Meaning |
-| --- | --- |
-| `AgentHarness` | Agent provider adapter trait. |
-| `CommandAgentHarness` | Command-backed harness for local adapters. |
-| `CodexAgentHarness` | Codex adapter wrapper over command launch plan. |
-| `ClaudeCodeAgentHarness` | Claude Code adapter wrapper over command launch plan. |
-| `PiStyleAgentHarness` | Pi-style adapter wrapper over command launch plan. |
-| `MockAgentHarness` | Deterministic test harness. |
-| `BamlClient` / `HttpBamlClient` / `FakeBamlClient` | BAML coerce provider abstraction. |
-| `LoftClient` / `CommandLoftClient` / `FakeLoftClient` | Loft effect provider abstraction. |
-
-Native provider modules:
-
-| Module | Meaning |
-| --- | --- |
-| `provider` | Provider capability/config validation and built-in native capabilities. |
-| `codex_app_server` | Codex app-server transport and evidence summaries. |
-| `claude_agent_sdk` | Claude Agent SDK sidecar client, policy mapping, and evidence summaries. |
-| `pi_rpc` | Pi RPC client, policy mapping, and event summaries. |
-| `native_lifecycle` | Codex/Claude/Pi event normalization into `agent.turn.*`. |
-| `artifact_manifest` | Artifact manifest and capture-failure payload helpers. |
-
-Trace API:
-
-| Item | Meaning |
-| --- | --- |
-| `TraceEvent` | Abstract lifecycle event. |
-| `TraceRecord` | Sequenced abstract event. |
-| `check_trace(records)` | Validate trace conformance. |
+Rust crate APIs are internal-stability contributor interfaces, not the public CLI or JSON contract. See [Rust API reference](rust-api.md).
 
 ## Formal and release checks
 

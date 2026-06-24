@@ -263,6 +263,371 @@ rule give_up
     let _ = fs::remove_file(source);
 }
 
+/// 503 auto-fail: an effect whose failure is unhandled in a self-terminating flow
+/// drives the workflow to a `failed` terminal (instead of stalling forever) via the
+/// generic internal-failure path — no author `on fails` handler, no typed `failure`
+/// payload. Modeled in models/maude/flow-autofail.maude.
+#[test]
+fn unhandled_flow_failure_auto_fails_the_workflow() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("autofail", "sqlite");
+    let source = temp_path("autofail", "whip");
+    fs::write(
+        &source,
+        r#"
+workflow AutoFail
+
+output result Decision
+failure error Blocked
+
+class Trigger {
+  id string
+}
+
+class Decision {
+  ok string
+}
+
+class Blocked {
+  reason string
+}
+
+agent worker {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+flow f
+  when Trigger as t
+{
+  tell worker as turn "do it"
+
+  complete result {
+    ok "done"
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &["--fail"]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    // The `tell` has no `on fails` handler. Without auto-fail its failure would
+    // leave the instance stuck `running`; auto-fail drives it to `failed`.
+    assert_eq!(instance_status(bin, store_str, instance), "failed");
+    let log = run_json(bin, &["--store", store_str, "--json", "log", instance]);
+    let transitioned = log
+        .as_array()
+        .expect("log")
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("instance.transitioned")
+                && event.pointer("/payload/status").and_then(Value::as_str) == Some("failed")
+        })
+        .expect("instance.transitioned failed event");
+    let reason = transitioned
+        .pointer("/payload/reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        reason.contains("unhandled failure"),
+        "generic auto-fail reason expected, got: {reason}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// A self-terminating flow whose effect failure IS handled by an author `on fails`
+/// handler must fail through the typed terminal (a `workflow.failed` with the
+/// declared payload), NOT the generic auto-fail path.
+#[test]
+fn handled_flow_failure_does_not_auto_fail() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("handledfail", "sqlite");
+    let source = temp_path("handledfail", "whip");
+    fs::write(
+        &source,
+        r#"
+workflow HandledFail
+
+output result Decision
+failure error Blocked
+
+class Trigger {
+  id string
+}
+
+class Decision {
+  ok string
+}
+
+class Blocked {
+  reason string
+}
+
+agent worker {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+flow f
+  when Trigger as t
+{
+  tell worker as turn "do it"
+  on fails {
+    fail error {
+      reason "handled"
+    }
+  }
+
+  complete result {
+    ok "done"
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &["--fail"]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "failed");
+    let log = run_json(bin, &["--store", store_str, "--json", "log", instance]);
+    // The typed handler fires a workflow.failed with the declared Blocked payload;
+    // the generic auto-fail transition must NOT appear.
+    let failed = log
+        .as_array()
+        .expect("log")
+        .iter()
+        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("workflow.failed"))
+        .expect("workflow.failed event");
+    assert_eq!(
+        failed
+            .pointer("/payload/payload/reason")
+            .and_then(Value::as_str),
+        Some("handled"),
+        "the author on-fails handler payload must fire: {failed}"
+    );
+    assert!(
+        !log.as_array().expect("log").iter().any(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("instance.transitioned")
+                && event
+                    .pointer("/payload/reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .contains("unhandled failure")
+        }),
+        "a handled failure must not also auto-fail: {log}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// 1929 OPTION A: `send via <channel>` (std.messaging) compiles with NO package
+/// lock (the std-library exemption), runs as a `messaging.send` capability.call
+/// under the fixture provider, and the workflow completes on `after sent succeeds`.
+#[test]
+fn send_via_channel_runs_under_fixture_and_completes() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("send", "sqlite");
+    let source = temp_path("send", "whip");
+    fs::write(
+        &source,
+        r##"
+@service
+workflow Notify
+
+output result Done
+
+class Trigger {
+  id string
+}
+
+class Done {
+  ok string
+}
+
+agent worker {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+channel alerts {
+  provider slack
+  destination "#ops"
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+rule notify
+  when Trigger as t
+=> {
+  send via alerts {
+    text "hello"
+  } as sent
+
+  after sent succeeds {
+    complete result {
+      ok "sent"
+    }
+  }
+}
+"##,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    // No `--package-lock`: the std-library exemption must let `send` compile + run.
+    let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &[]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "completed");
+    let effects = run_json(bin, &["--store", store_str, "--json", "effects", instance]);
+    let send = effects
+        .as_array()
+        .expect("effects")
+        .iter()
+        .find(|effect| effect.get("target").and_then(Value::as_str) == Some("messaging.send"))
+        .expect("messaging.send effect");
+    assert_eq!(
+        send.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert_eq!(
+        send.pointer("/input/message/channel")
+            .and_then(Value::as_str),
+        Some("alerts")
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// Inbound messaging (spec/messaging.md): `whip message` injects a `Message` on a
+/// declared channel and a `when message from <channel> as msg` rule fires, binding
+/// the envelope. The fixture-parity counterpart of outbound `send`; live providers
+/// stay gated.
+#[test]
+fn inbound_message_fires_when_message_from_rule() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("inbound", "sqlite");
+    let source = temp_path("inbound", "whip");
+    fs::write(
+        &source,
+        r#"
+@service
+workflow Inbound
+
+use std.messaging
+
+channel release_room {
+  provider slack
+}
+
+output result Decision
+
+class Decision {
+  note string
+}
+
+rule react
+  when message from release_room as msg
+=> {
+  complete result {
+    note msg.text
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let source_str = source.to_str().expect("utf-8");
+    // The instance starts running and waits — no message has arrived yet.
+    let dev = dev_until_idle(bin, store_str, source_str, &[]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+    assert_eq!(instance_status(bin, store_str, &instance), "running");
+
+    // Inject an inbound message on the channel, then step the reactive rule.
+    run_text(
+        bin,
+        &[
+            "--store",
+            store_str,
+            "message",
+            &instance,
+            "--channel",
+            "release_room",
+            "--text",
+            "ship it",
+            "--program",
+            source_str,
+        ],
+    );
+    run_text(
+        bin,
+        &[
+            "--store",
+            store_str,
+            "step",
+            &instance,
+            "--program",
+            source_str,
+        ],
+    );
+    // Completing proves the `msg` binding resolved (an unresolved `msg.text`
+    // would fail the rule rather than complete).
+    assert_eq!(instance_status(bin, store_str, &instance), "completed");
+
+    // The injected envelope is a well-formed `Message` fact on the channel.
+    let facts = run_json(bin, &["--store", store_str, "--json", "facts", &instance]);
+    let message = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("message.release_room"))
+        .expect("message fact");
+    assert_eq!(
+        message.pointer("/value/text").and_then(Value::as_str),
+        Some("ship it")
+    );
+    assert_eq!(
+        message.pointer("/value/channel").and_then(Value::as_str),
+        Some("release_room")
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
 /// The general readiness form `when fact <dotted.name> as x` matches runtime
 /// facts; the English sugar phrases are abbreviations of it.
 #[test]
@@ -354,7 +719,7 @@ rule begin
   when started
 => {
   askHuman as signoff "Approve the plan?"
-  timer 1s as deadline
+  timer 3s as deadline
 
   after deadline succeeds {
     cancel signoff
@@ -383,9 +748,12 @@ rule approve
         .and_then(Value::as_str)
         .expect("instance id")
         .to_owned();
+    // The `timer 3s` gives `dev_until_idle` ample margin to settle to a waiting
+    // instance before the deadline fires (a `timer 1s` raced the dev loop on
+    // slower machines). Then sleep past the deadline so the timer is due.
     assert_eq!(instance_status(bin, store_str, &instance), "running");
 
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    std::thread::sleep(std::time::Duration::from_secs(4));
     run_text(
         bin,
         &[
@@ -652,6 +1020,98 @@ fn flow_approve_path_completes() {
 #[test]
 fn flow_reject_path_fails() {
     assert_eq!(drive_triage_flow("reject"), "failed");
+}
+
+/// A hand-written `after <ask> completes { case <ask> { Completed decided => ...
+/// decided.choice } }` must resolve the human answer's fields at runtime. The
+/// scheduled-escalation example answers before its deadline, so the Completed
+/// branch fires and the workflow completes carrying the answered choice — a
+/// regression guard for the human-ask terminal binding (the answer fact, not the
+/// `human.ask.issued` ack, must back the case scrutinee).
+#[test]
+fn human_ask_case_completed_branch_resolves_answer_choice() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("human-case", "sqlite");
+    let store_str = store.to_str().expect("utf-8").to_owned();
+    // Reuse the scheduled-escalation example (its `case answer { Completed
+    // decided => ... decided.choice }` is exactly the path under test), but push
+    // the deadline far into the future so the human answer wins the race and the
+    // Completed branch fires deterministically.
+    let example = format!(
+        "{}/../../examples/scheduled-escalation.whip",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let source_path = temp_path("human-case", "whip");
+    let source = source_path.to_str().expect("utf-8").to_owned();
+    let text = fs::read_to_string(&example)
+        .expect("read example")
+        .replace("2026-06-11T18:00:00Z", "2999-01-01T00:00:00Z");
+    fs::write(&source_path, text).expect("write source");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            &store_str,
+            "--json",
+            "dev",
+            &source,
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    let inbox = run_json(bin, &["--store", &store_str, "--json", "inbox"]);
+    let item = inbox
+        .as_array()
+        .expect("inbox")
+        .first()
+        .and_then(|item| item.get("inbox_item_id"))
+        .and_then(Value::as_str)
+        .expect("pending ask")
+        .to_owned();
+    run_text(
+        bin,
+        &[
+            "--store", &store_str, "inbox", "answer", &item, "--choice", "approve", "--by", "alice",
+        ],
+    );
+    run_text(
+        bin,
+        &[
+            "--store",
+            &store_str,
+            "step",
+            &instance,
+            "--program",
+            &source,
+        ],
+    );
+
+    // Answering before the deadline takes the Completed branch and completes.
+    assert_eq!(instance_status(bin, &store_str, &instance), "completed");
+    // `decided.choice` resolved to the answered choice in the completion output.
+    let log = run_json(bin, &["--store", &store_str, "--json", "log", &instance]);
+    let decision = log
+        .as_array()
+        .expect("log")
+        .iter()
+        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("workflow.completed"))
+        .and_then(|event| event.get("payload"))
+        .and_then(|payload| payload.get("payload"))
+        .and_then(|payload| payload.get("decision"))
+        .and_then(Value::as_str);
+    assert_eq!(decision, Some("approve"));
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source_path);
 }
 
 /// Flows fan out per matched fact: two tickets, two progressions.
@@ -1980,6 +2440,138 @@ fn otel_export_dry_run_emits_structural_spans() {
     let _ = fs::remove_file(coordination);
 }
 
+/// `whip otel-export` POSTs OTLP/HTTP+JSON to a real endpoint (validated here by
+/// an in-process collector — no external backend needed), then `whip telemetry
+/// status` reflects the emit-once cursor and `whip telemetry reset-cursor` clears
+/// it (spec/std-telemetry.md export-cursor management).
+#[test]
+fn otel_export_posts_to_collector_then_status_and_reset() {
+    use std::io::{Read, Write};
+
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("otel-post", "sqlite");
+    let source = temp_path("otel-post", "whip");
+    let coordination = temp_path("otel-post-coord", "sqlite");
+    fs::write(&source, LEASE_SOURCE).expect("write source");
+    let store_str = store.to_str().expect("utf-8").to_owned();
+    let dev = dev_with_coordination(
+        bin,
+        &store_str,
+        source.to_str().expect("utf-8"),
+        coordination.to_str().expect("utf-8"),
+    );
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // In-process OTLP collector: accept one POST, capture its body, reply 200.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind collector");
+    let port = listener.local_addr().expect("addr").port();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let collector = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..read]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let body_start = pos + 4;
+                    while buf.len() < body_start + content_length {
+                        let read = stream.read(&mut chunk).unwrap_or(0);
+                        if read == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..read]);
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                    let body = String::from_utf8_lossy(&buf[body_start..]).to_string();
+                    let _ = tx.send(body);
+                    break;
+                }
+            }
+        }
+    });
+
+    let export = Command::new(bin)
+        .args(["--store", &store_str, "otel-export", &instance])
+        .env(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            format!("http://127.0.0.1:{port}"),
+        )
+        .env("OTEL_SERVICE_NAME", "whip-test")
+        .output()
+        .expect("otel-export runs");
+    assert!(
+        export.status.success(),
+        "otel-export failed: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let body = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("collector received the OTLP POST");
+    collector.join().ok();
+    let received: Value = serde_json::from_str(&body).expect("collector body is OTLP JSON");
+    assert!(
+        received
+            .pointer("/resourceSpans/0/scopeSpans/0/spans")
+            .and_then(Value::as_array)
+            .is_some_and(|spans| !spans.is_empty()),
+        "expected exported spans in the OTLP payload: {body}"
+    );
+
+    // `telemetry status` reflects the emit-once cursor.
+    let status = run_json(
+        bin,
+        &["--store", &store_str, "--json", "telemetry", "status"],
+    );
+    assert!(
+        status
+            .pointer("/instances/0/exported_runs")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count >= 1),
+        "status should show exported runs: {status}"
+    );
+
+    // `telemetry reset-cursor` clears it; a follow-up status shows nothing.
+    let reset = run_json(
+        bin,
+        &["--store", &store_str, "--json", "telemetry", "reset-cursor"],
+    );
+    assert_eq!(
+        reset.get("cleared").and_then(Value::as_bool),
+        Some(true),
+        "{reset}"
+    );
+    let status_after = run_json(
+        bin,
+        &["--store", &store_str, "--json", "telemetry", "status"],
+    );
+    assert!(
+        status_after
+            .pointer("/instances")
+            .and_then(Value::as_array)
+            .is_some_and(|instances| instances.is_empty()),
+        "cursor should be cleared after reset: {status_after}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(coordination);
+}
+
 const EVENT_SOURCE: &str = r#"
 workflow EventDemo
 
@@ -1989,7 +2581,7 @@ class Done {
   note string
 }
 
-event deploy.finished {
+signal deploy.finished {
   service string
   status string
 }
@@ -2003,14 +2595,14 @@ rule on_deploy
 }
 "#;
 
-/// `whip notify` validates the payload against the declared `event` schema,
-/// lands a typed durable fact, and the bare `when <event> as d` reaction
+/// `whip signal` validates the payload against the declared `signal` schema,
+/// lands a typed durable fact, and the bare `when <signal> as d` reaction
 /// fires — no `@external` tag needed.
 #[test]
-fn event_notify_lands_typed_fact_and_rule_fires() {
+fn signal_lands_typed_fact_and_rule_fires() {
     let bin = env!("CARGO_BIN_EXE_whip");
-    let store = temp_path("event-notify", "sqlite");
-    let source = temp_path("event-notify", "whip");
+    let store = temp_path("signal", "sqlite");
+    let source = temp_path("signal", "whip");
     fs::write(&source, EVENT_SOURCE).expect("write source");
 
     let store_str = store.to_str().expect("utf-8");
@@ -2023,15 +2615,15 @@ fn event_notify_lands_typed_fact_and_rule_fires() {
         .to_owned();
     assert_eq!(instance_status(bin, store_str, &instance), "running");
 
-    let notified = run_json(
+    let signaled = run_json(
         bin,
         &[
             "--store",
             store_str,
             "--json",
-            "notify",
+            "signal",
             &instance,
-            "--event",
+            "--name",
             "deploy.finished",
             "--data",
             r#"{"service":"api","status":"ok"}"#,
@@ -2040,7 +2632,7 @@ fn event_notify_lands_typed_fact_and_rule_fires() {
         ],
     );
     assert_eq!(
-        notified.get("event").and_then(Value::as_str),
+        signaled.get("signal").and_then(Value::as_str),
         Some("deploy.finished")
     );
     run_text(
@@ -2068,13 +2660,13 @@ fn event_notify_lands_typed_fact_and_rule_fires() {
     let _ = fs::remove_file(source);
 }
 
-/// A malformed payload or undeclared event is rejected at the CLI boundary;
+/// A malformed payload or undeclared signal is rejected at the CLI boundary;
 /// no ill-typed fact can land.
 #[test]
-fn event_notify_rejects_bad_payload_and_unknown_event() {
+fn signal_rejects_bad_payload_and_unknown_signal() {
     let bin = env!("CARGO_BIN_EXE_whip");
-    let store = temp_path("event-reject", "sqlite");
-    let source = temp_path("event-reject", "whip");
+    let store = temp_path("signal-reject", "sqlite");
+    let source = temp_path("signal-reject", "whip");
     fs::write(&source, EVENT_SOURCE).expect("write source");
 
     let store_str = store.to_str().expect("utf-8");
@@ -2086,23 +2678,23 @@ fn event_notify_rejects_bad_payload_and_unknown_event() {
         .expect("instance id")
         .to_owned();
 
-    for (label, event, data, expected) in [
+    for (label, signal, data, expected) in [
         (
             "bad-payload",
             "deploy.finished",
             r#"{"service":"api","bogus":1}"#,
-            "does not conform to event",
+            "does not conform to signal",
         ),
-        ("unknown-event", "deploy.nope", "{}", "is not declared"),
+        ("unknown-signal", "deploy.nope", "{}", "is not declared"),
     ] {
         let output = Command::new(bin)
             .args([
                 "--store",
                 store_str,
-                "notify",
+                "signal",
                 &instance,
-                "--event",
-                event,
+                "--name",
+                signal,
                 "--data",
                 data,
                 "--program",
@@ -2120,17 +2712,17 @@ fn event_notify_rejects_bad_payload_and_unknown_event() {
     let _ = fs::remove_file(source);
 }
 
-/// Event reactions are statically checked: the bare `when` form requires a
-/// declared event, and field access on the binding is typed against the
-/// event schema.
+/// Signal reactions are statically checked: the bare `when` form requires a
+/// declared signal, and field access on the binding is typed against the
+/// signal schema.
 #[test]
-fn event_static_checks() {
+fn signal_static_checks() {
     let bin = env!("CARGO_BIN_EXE_whip");
     for (label, source_text, expected) in [
         (
-            "undeclared-event",
+            "undeclared-signal",
             EVENT_SOURCE.replace("when deploy.finished as d", "when deploy.unknown as d"),
-            "reacts to undeclared event `deploy.unknown`",
+            "reacts to undeclared signal `deploy.unknown`",
         ),
         (
             "bad-event-field",

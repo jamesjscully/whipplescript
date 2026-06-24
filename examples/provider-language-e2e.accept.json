@@ -62,11 +62,11 @@
         ]
       },
       {
-        "source": "effect:kind baml.coerce where status == completed",
+        "source": "effect:kind coerce where status == completed",
         "match_count": 6,
         "matches": [
           {
-            "name": "baml.coerce",
+            "name": "coerce",
             "status": "completed",
             "prompt_content_type": "markdown",
             "trace_items": 24,
@@ -100,7 +100,7 @@
     ],
     "effects": [
       {"kind": "agent.tell", "status": "completed", "count": 6},
-      {"kind": "baml.coerce", "status": "completed", "count": 6}
+      {"kind": "coerce", "status": "completed", "count": 6}
     ],
     "runs": [
       {"provider": "claude", "status": "completed", "count": 2, "artifact_count": 4},
@@ -114,7 +114,7 @@
     ],
     "evidence": [
       {"kind": "agent.turn.provider", "subject_type": "run", "count": 6},
-      {"kind": "baml.coerce.provider", "subject_type": "run", "count": 6},
+      {"kind": "coerce.provider", "subject_type": "run", "count": 6},
       {"kind": "skills.injected", "subject_type": "run", "count": 6},
       {"kind": "rule.committed", "subject_type": "rule_commit", "count": 19}
     ]

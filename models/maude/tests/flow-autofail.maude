@@ -1,0 +1,43 @@
+load ../flow-autofail.maude
+
+--- Coverage: a self-terminating flow with an unhandled failed effect reaches the
+--- failed terminal -- the workflow auto-fails instead of stalling.
+search [1] in WHIPPLESCRIPT-FLOW-AUTOFAIL :
+  flowSelfTerminating effFailedUnhandled(e1) running
+  =>* instanceFailed RESIDUAL:Cfg .
+
+--- Coverage: a handled failure settles via its own terminal (the handler path is
+--- reachable, so the model is not vacuously inert).
+search [1] in WHIPPLESCRIPT-FLOW-AUTOFAIL :
+  flowSelfTerminating effFailedHandled(e1) running
+  =>* settled(e1) RESIDUAL:Cfg .
+
+--- Coverage: with one handled and one unhandled failure in the same
+--- self-terminating flow, the unhandled one still drives the auto-fail -- a
+--- settling sibling does not mask the unhandled failure.
+search [1] in WHIPPLESCRIPT-FLOW-AUTOFAIL :
+  flowSelfTerminating effFailedHandled(e1) effFailedUnhandled(e2) running
+  =>* instanceFailed RESIDUAL:Cfg .
+
+--- Bite (scope): without flowSelfTerminating, an unhandled failure never
+--- auto-fails. The RESIDUAL soup var means an auto-fail in ANY reachable state
+--- would be a solution, so No solution proves the non-self-terminating flow is
+--- left to the broader workflow-liveness lint -- the same scoping flow-liveness
+--- uses. If [autofail] dropped the flowSelfTerminating requirement this would
+--- find a solution.
+search [1] in WHIPPLESCRIPT-FLOW-AUTOFAIL :
+  effFailedUnhandled(e1) running
+  =>* instanceFailed RESIDUAL:Cfg .
+
+--- Bite (handled-ness): a handled failure in a self-terminating flow never
+--- auto-fails. If [autofail] keyed on any failed effect rather than only the
+--- unhandled disposition this would find a solution.
+search [1] in WHIPPLESCRIPT-FLOW-AUTOFAIL :
+  flowSelfTerminating effFailedHandled(e1) running
+  =>* instanceFailed RESIDUAL:Cfg .
+
+--- Bite (all-handled): when every failure in a self-terminating flow is handled,
+--- nothing auto-fails even though the flow is a terminal path.
+search [1] in WHIPPLESCRIPT-FLOW-AUTOFAIL :
+  flowSelfTerminating effFailedHandled(e1) effFailedHandled(e2) running
+  =>* instanceFailed RESIDUAL:Cfg .

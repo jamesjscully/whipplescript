@@ -67,7 +67,7 @@ reactions are independent.
 ## Effect
 
 A durable request for external work. `tell` (agent turn), `coerce`/`decide`
-(typed model decision), `askHuman` (review request), `call` (plugin
+(typed model decision), `askHuman` (review request), `call` (package
 capability), `exec` (dev raw command or hosted pinned script capability),
 `timer` (a delay), the queue verbs (`file`/`claim`/`release`/`finish`), and
 `invoke` (child workflow) all create effects. An effect records what was
@@ -105,7 +105,7 @@ The thing that executes effects. The *fixture provider* is deterministic and
 local: it completes effects with synthetic results, which makes it the right
 default for development, tutorials, and tests. Native providers (Codex,
 Claude, Pi) bridge to real agent systems; see
-[providers & plugins](providers.md).
+[providers & packages](providers.md).
 
 ## Worker
 
@@ -125,9 +125,10 @@ they hold no policy of their own.
 Use `dev` day to day. Use the separate commands when you want to observe one
 boundary at a time.
 
-## Skills and plugins
+## Skills and packages
 
 A *skill* is a context bundle attached to an agent or a turn — it shapes what
-the agent knows, not what the language means. A *plugin* (imported with
-`use`) registers capabilities, providers, schemas, and resources; its
-capabilities are called as explicit effects, never as hidden control flow.
+the agent knows, not what the language means. A *package* can expose library
+surface through `use` and register capabilities, providers, schemas, and
+resources through its manifest; its capabilities are called as explicit effects,
+never as hidden control flow.

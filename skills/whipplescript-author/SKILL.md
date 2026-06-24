@@ -1,25 +1,193 @@
+---
+name: whipplescript-author
+description: >-
+  Use this skill when authoring, reviewing, debugging, or operating
+  WhippleScript/.whip workflows, and when a task would benefit from durable
+  orchestration even if the user did not ask for it explicitly: coordinating
+  parallelizable, multi-step, long-running, recurring, scheduled, resumable, or
+  auditable work; managing timers/deadlines, queues/backlogs, retries, human
+  approvals, multi-agent handoffs, fan-out/fan-in, package/plugin/tool/script calls,
+  child workflows, or typed model decisions. Good cues include orchestrate,
+  schedule, watch, monitor, queue, retry, approve, handoff, batch, pipeline,
+  daemon, service, cron, SLA, escalation, checkpoint, or long-running.
+  WhippleScript is durable orchestration: rules match typed facts/events and
+  atomically commit new facts, terminal state, or durable effects.
+---
+
 # WhippleScript Author
 
 Use this skill when authoring, reviewing, or operating `.whip` workflows.
 
+WhippleScript is a small language for durable orchestration: rules match typed
+facts/events and atomically commit new facts, terminal state, or durable
+effects. Use it for work that must survive process restarts, wait for external
+actors, branch on completed effects, or leave an auditable trace.
+
+## When To Use WhippleScript
+
+Reach for WhippleScript when the user asks to orchestrate work, or when you
+identify work that would benefit from durable coordination:
+
+- long-running workflows, services, scheduled jobs, timers, deadlines, or
+  recurring checks;
+- parallelizable work, batch processing, fan-out/fan-in, map/reduce-style
+  review, or bounded-concurrency dispatch;
+- durable state, resumability, audit trails, event logs, queues, backlogs,
+  claim/finish/release ownership, or retry policy;
+- coordination across agents, humans, tools, packages, scripts, providers, or
+  child workflows;
+- human approval gates, review queues, escalation, cancellation, timeouts, or
+  failure handling;
+- typed model decisions that should feed deterministic policy, such as
+  classification, routing over declared values, or structured extraction;
+- workflow revision, migration, repair, diagnostics, traces, evidence, or
+  replayable acceptance checks.
+
+Do not use WhippleScript for an ordinary one-shot answer, a local code edit, a
+single shell command, a simple calculation, or a normal library/app feature
+unless durable orchestration is part of the requested behavior.
+
+## Navigation
+
+Use progressive disclosure. Do not read every doc up front. Stay in this skill
+unless you need exact syntax, a checked example, or runtime command detail.
+
+- Install or first run: [`docs/quickstart.md`](../../docs/quickstart.md).
+- First full tutorial: [`docs/tutorial.md`](../../docs/tutorial.md).
+- Feature stability and deprecations:
+  [`docs/current-state.md`](../../docs/current-state.md).
+- Unclear concepts: [`docs/concepts.md`](../../docs/concepts.md).
+- Choosing a pattern: [`docs/manual.md`](../../docs/manual.md).
+- Exact syntax: [`docs/language-reference.md`](../../docs/language-reference.md).
+- Checked examples: [`docs/examples.md`](../../docs/examples.md).
+- CLI flags: [`docs/api-reference.md`](../../docs/api-reference.md).
+- JSON shapes: [`docs/json-reference.md`](../../docs/json-reference.md).
+- Diagnostics by code/category:
+  [`docs/diagnostics.md`](../../docs/diagnostics.md).
+- Existing/running instance: [`docs/runtime-operations.md`](../../docs/runtime-operations.md).
+- Fixture/native providers and packages: [`docs/providers.md`](../../docs/providers.md).
+- Command failed: [`docs/troubleshooting.md`](../../docs/troubleshooting.md).
+
+Use `spec/` only for design records or implementation trackers. Do not make an
+author read `spec/` to write a normal workflow.
+
 ## Mental Model
 
-WhippleScript is a restricted event-sourced rule machine.
+WhippleScript is a restricted event-sourced rule machine for durable
+orchestration. Typed facts and events drive rules. Each rule commit atomically
+records consumed facts, new facts, dependency edges, terminal state, or durable
+effect requests. Workers execute effects later and record evidence.
 
-- Rules match durable facts and write new facts or durable effects.
-- Effects do not run inline. Providers claim and complete them later.
+- A workflow instance owns an event log, facts, effects, provider runs,
+  evidence, and lifecycle state.
+- Rules are deterministic policy: they match facts/events, evaluate pure
+  guards, and atomically commit facts, consumed facts, effects, dependencies,
+  or workflow terminals.
+- Effects are durable requests. They do not run inline; workers execute them
+  later through providers.
 - Source order does not sequence effects. Use `after <effect> succeeds`,
-  `after <effect> fails`, or `after <effect> completes`.
-- Every effect must be auditable through status, events, evidence, and trace.
-- Workflow revision is a control-plane operation. Source rules may propose
-  candidate patch artifacts, but they must not activate a running revision.
-- Prefer Loft for project work, BAML `coerce` for typed model decisions, and
-  plugins for memory or external systems.
+  `after <effect> fails`, `after <effect> times out`, or
+  `after <effect> completes`.
+- Effect output is only in scope in the `after` branch that proves the
+  terminal status.
+- Provider failure is not workflow failure. Source rules decide whether to
+  retry, release, escalate, ignore, `complete`, or `fail`.
+- Keep routing in typed source data: agent declarations, enums, literal
+  fields, and `AgentRef<...>`. Do not ask a model to choose the provider,
+  route, or authority.
+- Workflow revision is a control-plane operation. Workflows may produce a
+  candidate patch artifact, but activation happens with `whip revise`.
 
-## Valid Minimal Workflow
+## Feature Map
 
-```whipplescript
+| Need | Use | Syntax anchor | Details |
+| --- | --- | --- | --- |
+| Durable unit of work | `workflow`, `input`, `output`, `failure` | `workflow Name` | [`language-reference.md#workflow`](../../docs/language-reference.md#workflow) |
+| Terminal contract | `complete`, `fail`, `@service` | `complete result { ... }` | [`manual.md#end-the-workflow`](../../docs/manual.md#end-the-workflow) |
+| Typed state | `class`, `enum`, literal fields | `class WorkItem { status "queued" }` | [`manual.md#model-data-with-classes-and-enums`](../../docs/manual.md#model-data-with-classes-and-enums) |
+| Sum types | enum payload variants, `case` | `enum Outcome { Approved { score float } }` | [`language-reference.md#sum-types`](../../docs/language-reference.md#sum-types) |
+| Static seed data | `table` | `table tasks as Task [ ... ]` | [`language-reference.md#table`](../../docs/language-reference.md#table) |
+| Agent target | `agent`, `profile`, `capacity`, `skills` | `agent worker { provider fixture ... }` | [`language-reference.md#agent`](../../docs/language-reference.md#agent) |
+| Deterministic policy | `rule` with `when` and `where` | `rule name ... => { ... }` | [`language-reference.md#rules`](../../docs/language-reference.md#rules) |
+| Deterministic branching | guards, `case` | `case review.status { ... }` | [`manual.md#branch-deterministically`](../../docs/manual.md#branch-deterministically) |
+| Parallel fan-out | rules, facts, agent `capacity` | `when worker is available` | [`examples.md#coordination-recipes`](../../docs/examples.md#coordination-recipes) |
+| Fixed sequence | `flow` | `flow triage when Ticket as ticket { ... }` | [`manual.md#sequential-flows`](../../docs/manual.md#sequential-flows) |
+| Agent turn | `tell` | `tell worker as turn "..."` | [`manual.md#request-agent-work`](../../docs/manual.md#request-agent-work) |
+| Typed model decision | `coerce` or `decide` | `coerce classify(...) as result` | [`language-reference.md#coerce`](../../docs/language-reference.md#coerce) |
+| Human gate | `askHuman`, `human answered` | `askHuman as review choices [...]` | [`manual.md#gate-on-humans`](../../docs/manual.md#gate-on-humans) |
+| Backlog ownership | `queue`, `claim`, `finish`, `release` | `when backlog has ready item as item` | [`language-reference.md#work-queues`](../../docs/language-reference.md#work-queues) |
+| Deadlines | `timeout`, `timer`, `cancel` | `tell worker as turn timeout 10m` | [`language-reference.md#time-and-deadlines`](../../docs/language-reference.md#time-and-deadlines) |
+| Retry policy | facts and guarded rules | `where job.attempts < 3` | [`manual.md#express-retries-as-facts`](../../docs/manual.md#express-retries-as-facts) |
+| Script capability | `exec` | `exec backup with request -> Report as x` | [`language-reference.md#exec`](../../docs/language-reference.md#exec) |
+| Package capability | `use`, `call` | `call memory.query for item as context` | [`providers.md#packages`](../../docs/providers.md#packages) |
+| External signal ingress | `signal`, `source`, `emit signal` | `signal deploy.finished { ... }` | [`language-reference.md#signals`](../../docs/language-reference.md#signals) |
+| Shared coordination | `lease`, `ledger`, `counter` | `acquire deploy_slot for env as slot` | [`language-reference.md#coordination-resources`](../../docs/language-reference.md#coordination-resources) |
+| Child lifecycle | `invoke` | `invoke ReviewPhase { ... } as child` | [`runtime-operations.md#child-workflows`](../../docs/runtime-operations.md#child-workflows) |
+| Reusable source | `pattern`, `apply`, `include` | `apply AgentReview<T> as X` | [`language-reference.md#pattern-and-apply`](../../docs/language-reference.md#pattern-and-apply) |
+| Source metadata | tags, descriptions, liveness escapes | `@external`, `@service`, `description "..."` | [`language-reference.md#tags-and-descriptions`](../../docs/language-reference.md#tags-and-descriptions) |
+| Executable checks | `assert`, tag filters | `@acceptance assert count(...) == 1` | [`language-reference.md#assert`](../../docs/language-reference.md#assert) |
+| Running-instance change | control plane | `whip revise --dry-run` | [`runtime-operations.md#revising-a-running-instance`](../../docs/runtime-operations.md#revising-a-running-instance) |
+| Runtime inspection | status, effects, runs, diagnostics, evidence, trace | `whip trace <instance> --check` | [`manual.md#debug-a-run`](../../docs/manual.md#debug-a-run) |
+| Observability export | OTLP sidecar | `whip otel-export <instance>` | [`language-reference.md#observability-export`](../../docs/language-reference.md#observability-export) |
+
+## Authoring Loop
+
+Default to the smallest workflow that exposes durable policy as facts, rules,
+and effects.
+
+1. Confirm WhippleScript is the right tool: use it for orchestration, not for
+   a one-shot answer or ordinary code edit.
+2. Name the workflow and terminal contracts.
+3. Model durable state with classes/enums. Prefer literal status fields for
+   small state machines.
+4. Pick one shape:
+   - default to `rule`s for independent reactions, fan-out, retries, and
+     event-driven policy;
+   - use `flow` only for one fixed sequence with shared bindings;
+   - use `queue` only when external work items need claim/finish/release
+     ownership;
+   - use `invoke` only when a subtask needs its own lifecycle.
+5. Declare agents with the narrowest useful `profile`, `capacity`, and
+   `capabilities`.
+6. Put every external action behind an effect: `tell`, `coerce`, `askHuman`,
+   `call`, `exec`, `timer`, `queue.*`, or `invoke`.
+7. Sequence effect outputs only with `after` blocks or flow step order.
+8. Add terminal rules: `complete output { ... }` or `fail failure { ... }`.
+   Tag truly perpetual workflows `@service`.
+9. Add assertions for the intended final facts/effects.
+10. Run the validation loop and fix source until it passes:
+
+```sh
+whip doctor
+whip check workflow.whip
+whip --json dev workflow.whip --provider fixture --until idle
+whip --json trace <instance> --check
+```
+
+## Gotchas
+
+Keep these in mind before writing source:
+
+| Mistake | Fix |
+| --- | --- |
+| Relying on source order for effect sequencing | Use `after` branches or a `flow`. |
+| Reading effect output outside its terminal branch | Bind output in `after x succeeds as y`. |
+| Treating `coerce` as a local function | Branch on the durable effect completion. |
+| Letting a model choose provider, route, or authority | Use `AgentRef`, enums, literals, and source metadata. |
+| Treating provider failure as workflow failure | Add rules that retry, escalate, release, or `fail`. |
+| Importing a skill with `use` | Attach skills to agents/turns; `use` imports package/library surface. |
+| Hiding orchestration in shell scripts | Express policy as facts, rules, and effects. |
+| Reading the clock in a guard | Use `timeout`, `timer`, or a recorded fact. |
+| Treating a lost queue claim as fatal | Branch on claim failure and wait for the next item. |
+| Placing credentials in `.whip` source | Use provider config credential references. |
+| Self-modifying a live instance from source | Propose a patch artifact and use `whip revise`. |
+
+## Minimal Workflow
+
+```whip
 workflow MinimalNoop
+
+output result StartupSeen
 
 class StartupSeen {
   source string
@@ -33,22 +201,133 @@ rule observe_start
     source "external.started"
     state "observed"
   }
+
+  complete result {
+    source "external.started"
+    state "observed"
+  }
 }
 ```
 
-Run:
+Run it:
 
 ```sh
 whip check examples/minimal-noop.whip
-whip --json run examples/minimal-noop.whip
+whip --json dev examples/minimal-noop.whip --provider fixture --until idle
 ```
 
-## Common Patterns
+Use this only as a syntax sanity check. For useful patterns, start with:
 
-Claim a ready work item before an agent turn (declare `queue backlog {
-tracker builtin }`):
+- [`examples/human-review.whip`](../../examples/human-review.whip) for inbox
+  review.
+- [`examples/triage-flow.whip`](../../examples/triage-flow.whip) for a fixed
+  agent plus human sequence.
+- [`examples/queue-worker-with-review.whip`](../../examples/queue-worker-with-review.whip)
+  for a backlog, claim, agent turn, structured review, and release/finish.
+- [`examples/scheduled-escalation.whip`](../../examples/scheduled-escalation.whip)
+  for timers and cancellation.
+- [`examples/revision-validation-approval.whip`](../../examples/revision-validation-approval.whip)
+  for safe revision proposal.
 
-```whipplescript
+## Canonical Patterns
+
+Agent work with explicit sequencing:
+
+```whip
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+  capabilities ["agent.tell"]
+}
+
+rule implement
+  when WorkItem as item where item.status == "queued"
+  when worker is available
+=> {
+  tell worker requires ["agent.tell"] as turn """markdown
+  Implement this work item:
+
+  {{ item.title }}
+  """
+
+  after turn succeeds as completed {
+    done item -> record WorkItem {
+      id item.id
+      title item.title
+      status "done"
+    }
+  }
+
+  after turn fails as failed {
+    askHuman as escalation choices ["retry", "block"] """markdown
+    The worker failed on {{ item.title }}:
+
+    {{ failed.reason }}
+    """
+  }
+}
+```
+
+Typed model decision:
+
+```whip
+coerce classifyRequest(title string, body string) -> RequestClassification {
+  prompt """markdown
+  Classify this work request.
+
+  Title: {{ title }}
+  Body: {{ body }}
+
+  {{ ctx.output_format }}
+  """
+}
+
+rule classify
+  when WorkItem as item where item.status == "queued"
+=> {
+  coerce classifyRequest(item.title, item.body) as classification
+
+  after classification succeeds as result {
+    record ClassifiedWork {
+      item item
+      classification result
+    }
+  }
+
+  after classification fails {
+    askHuman "Classify manually: {{ item.title }}"
+  }
+}
+```
+
+Sequential flow:
+
+```whip
+flow triage_ticket
+  when Ticket as ticket where ticket.status == "open"
+  when triager is available
+{
+  tell triager as plan timeout 10m "Propose a fix plan for {{ ticket.title }}."
+  on timeout { fail error { reason "triage timed out" } }
+
+  askHuman as signoff choices ["approve", "reject"] "Approve {{ plan.summary }}?"
+
+  when signoff.choice == "approve" {
+    complete result { decision "approved" }
+  } else {
+    fail error { reason "rejected" }
+  }
+}
+```
+
+Queue work:
+
+```whip
+queue backlog {
+  tracker builtin
+}
+
 rule work_ready_item
   when backlog has ready item as item
   when worker is available
@@ -56,385 +335,107 @@ rule work_ready_item
   claim item as lease
 
   after lease succeeds {
-    tell worker "Implement {{ item.title }}"
+    tell worker as turn "Resolve {{ item.title }}."
   }
 
   after turn succeeds as outcome {
     finish item { summary outcome.summary }
   }
-}
-```
 
-Sequential work reads better as a `flow`, which lowers to rules:
-
-```whipplescript
-flow triage
-  when Ticket as ticket
-{
-  tell triager as turn "Plan {{ ticket.title }}."
-  askHuman as signoff "Approve {{ turn.summary }}?"
-  when signoff.choice == "approve" {
-    complete result { decision signoff.choice }
-  } else {
-    fail error { reason "rejected" }
+  after turn fails {
+    release item
   }
 }
 ```
 
-BAML classification with human fallback:
+Package context with provenance:
 
-```whipplescript
-rule classify_request
-  when WorkItem as request
-=> {
-  coerce classifyMessage(request.title, request.body) as classification
+```whip
+use memory
 
-  after classification succeeds {
-    record ClassifiedMessage {
-      request request
-      classification classification
-    }
-  }
-
-  after classification fails {
-    askHuman "Classify this request manually: {{ request.title }}"
-  }
-}
-```
-
-Plugin capability with explicit context:
-
-```whipplescript
 rule recall_before_work
-  when WorkItem as item
-  when worker is available
+  when WorkItem as item where item.status == "queued"
 => {
   call memory.query for item as context
 
-  after context succeeds {
-    tell worker "Use this context: {{ context.summary }}"
+  after context succeeds as found {
+    tell worker as turn "Use this context: {{ found.summary }}"
   }
 }
 ```
 
 Typed dynamic agent routing:
 
-```whipplescript
-class LanguageTask {
-  provider AgentRef<codex | claude | pi>
-  language string
-  artifactPath string
-  status "queued"
-}
-
-rule run_language_task
-  when LanguageTask as task
-  when task.provider is available
-=> {
-  tell task.provider as turn """markdown
-  Write {{ task.language }} text to {{ task.artifactPath }}.
-  """
-}
-```
-
-Use `AgentRef<...>` when the workflow data selects a logical agent. The value is
-source metadata, not a model decision. Do not ask BAML or a provider prompt to
-choose the provider, model, or route; only include provider fields in model
-outputs when reviewing observed provider evidence.
-
-Static validation table:
-
-```whipplescript
-table language_tasks as LanguageTask [
-  {
-    provider codex
-    language "French"
-    artifactPath "target/dogfood/language/codex-french.txt"
-    status "queued"
-  }
-
-  {
-    provider claude
-    language "Hindi"
-    artifactPath "target/dogfood/language/claude-hindi.txt"
-    status "queued"
-  }
-]
-```
-
-Use `table` for small deterministic seed data such as providers x languages or
-phases x reviewers. Table rows are typed and compile to ordinary `record`
-writes on `started`; they are not runtime loops and must not hide provider
-calls, model decisions, or external lookups.
-
-Tags for validation metadata:
-
-```whipplescript
-@fixture
-@acceptance
-workflow ProviderLanguageE2E
-
-@acceptance
-assert count(LanguageTask where status == "queued") == 0
-```
-
-Use tags to mark fixture-backed, acceptance, release-gate, slow, or provider
-specific source. Tags are metadata only; do not rely on them for routing,
-authority, rule readiness, or provider behavior.
-
-Descriptions for report prose:
-
-```whipplescript
-@fixture
-description "Fixture-backed provider x language acceptance workflow"
-workflow ProviderLanguageE2E
-
-description "Route one queued task to its selected provider"
-rule run_language_task
-  when LanguageTask as task
-=> {
-  done task
-}
-```
-
-Use descriptions on workflows, tables, assertions, and rules when reports need
-human-readable labels. Descriptions are metadata only and cannot attach to
-schemas, agents, harnesses, coerces, includes, plugins, workflow contracts,
-patterns, or applications.
-
-Content-typed prompt metadata:
-
-```whipplescript
-tell worker as turn """markdown
-Summarize the result.
-"""
-
-askHuman """application/json
-{
-  "question": "Approve this release?"
-}
-"""
-```
-
-Use a content type on multiline `tell`, `askHuman`, or `coerce` prompts when
-reports or renderers should know how to display the body. Treat it as metadata
-only: it does not validate JSON, change model behavior, or choose a provider.
-In `dev --json` reports, matched effect reads surface the preserved
-`prompt_content_type` when assertions read those effects.
-
-Fan-out with a visible tracker:
-
-```whipplescript
-class ReviewRequest {
-  number int
+```whip
+class ReviewTask {
+  reviewer AgentRef<codex | claude | pi>
   title string
   trackerPath string
   status "queued"
 }
 
-class ReviewDispatch {
-  request ReviewRequest
-  turn AgentTurn
-  status "dispatched"
-}
-
-agent reviewer {
-  profile "repo-reader"
-  capacity 4
-}
-
-rule seed_reviews
-  when started
-=> {
-  record ReviewRequest {
-    number 0
-    title "Repository reset"
-    trackerPath "spec/review-tracker.md"
-    status "queued"
-  }
-}
-
 rule dispatch_review
-  when ReviewRequest as request
-  when reviewer is available
-=> {
-  tell reviewer as turn """markdown
-  Review phase {{ request.number }}: {{ request.title }}.
-
-  Update {{ request.trackerPath }} with status, findings, and evidence.
-  """
-
-  after turn succeeds {
-    record ReviewDispatch {
-      request request
-      turn turn
-      status "dispatched"
-    }
-  }
-}
-```
-
-Use this when the operator needs to see progress outside the runtime store.
-The workflow records durable dispatch facts, while the agent prompt tells each
-thread exactly which tracker row or file to update. Keep the tracker path in a
-fact so the prompt, evidence, and later review are tied to the same input.
-
-Companion-skill validation routing:
-
-```whipplescript
-class ReviewTask {
-  reviewer AgentRef<codex | claude | pi>
-  phase int
-  trackerPath string
-  route "spec" | "validation" | "docs"
-  status "queued"
-}
-
-rule dispatch_review
-  when ReviewTask as task where task.route in ["spec", "validation", "docs"]
+  when ReviewTask as task where task.status == "queued"
   when task.reviewer is available
 => {
   tell task.reviewer requires ["agent.tell"] as turn """markdown
-  Use the whipplescript-author companion skill.
-  Review phase {{ task.phase }} and update {{ task.trackerPath }}.
+  Review {{ task.title }} and update {{ task.trackerPath }}.
 
-  Do not infer provider, model, or route identity from prompt text; the workflow
-  selected the logical reviewer through typed AgentRef metadata.
+  The workflow selected the logical reviewer through typed AgentRef metadata.
+  Do not infer provider, model, or route identity from prompt text.
   """
 }
 ```
 
-Use this shape for provider/language/phased-review tables. One shared task
-schema plus `AgentRef` metadata is preferred over one class per provider. Source
-assertions should check dispatch/result counts; BAML reviews should judge the
-artifact or evidence, not choose the route.
+Use `AgentRef<...>` when workflow data selects a logical agent. The value is
+source metadata, not a model decision. BAML/model output may review observed
+provider evidence, but must not choose the provider or route.
 
 ## Revision Guidance
 
-When a workflow needs to adapt itself or repair a running instance, model that
-as ordinary work:
+When a workflow needs to change itself or repair a running instance:
 
-- produce a candidate `.whip` file or patch artifact through `tell`, `coerce`,
-  `call`, `invoke`, or `askHuman`
-- record where the proposal lives and why it was produced
-- ask a human or operator workflow to review the proposal when appropriate
-- instruct the operator to run `whip revise --dry-run` first
-
-Do not write `.whip` source that pretends to call `revise` from a rule body.
-Activation must happen from the control plane:
+- produce a candidate `.whip` file, diff, or patch artifact through ordinary
+  effects;
+- record where the proposal lives and why it was produced;
+- ask a human or operator workflow to approve the candidate when appropriate;
+- instruct the operator to dry-run first.
 
 ```sh
 whip revise <instance> candidate.whip --root Workflow --dry-run
 whip revise <instance> candidate.whip --root Workflow --cancel keep
 ```
 
-Use `--cancel keep` when old effects should finish, `--cancel queued` when
-queued old effects should be terminal-cancelled, and `--cancel running` when
-running providers should receive cancellation requests.
-
-## Profiles
-
-Choose profiles by authority intent:
-
-- `repo-reader`: inspect files and status, no writes.
-- `repo-writer`: make code changes.
-- `internet-research`: browse and cite external sources.
-- `human-review`: request operator decisions.
-- plugin profiles such as `memory-user`: use registered plugin capabilities.
-
-Do not assign one powerful profile to unrelated work. Split agents by authority
-and capacity.
-
-## Current Grammar Limits
-
-Guards are supported for deterministic routing over the expression kernel:
-
-```whipplescript
-when Review as review where review.status == Accept
-```
-
-Keep guards over typed facts and deterministic values: booleans, comparisons,
-membership, presence checks, projections, map indexes, and count/exists/empty
-queries. Use BAML or a registered capability only when semantic judgment is
-required.
-
-Put `as binding` on the effect line:
-
-```whipplescript
-tell worker "Do it" as turn
-```
-
-Do not put `as turn` after a closing multiline string delimiter.
-
-Use generic plugin calls for now:
-
-```whipplescript
-call memory.query for item as context
-```
-
-Do not invent plugin-specific control-flow syntax.
+Do not write source that tries to call `revise` from a rule body.
 
 ## Debug Workflow
 
-Use these commands first:
+Use these commands before changing source or prompts:
 
 ```sh
 whip doctor
 whip check workflow.whip
-whip check --model-search workflow.whip
-whip --json run workflow.whip
 whip --json dev workflow.whip --provider fixture --until idle
 whip dev workflow.whip --provider fixture --until idle --stream ndjson
-whip --json dev workflow.whip --provider fixture --until idle --include-tag acceptance
-whip --json accept workflow.accept.json
 whip status <instance>
 whip effects <instance>
 whip runs <instance>
-whip --json evidence <instance>
 whip --json diagnostics <instance>
+whip --json evidence <instance>
 whip --json trace <instance> --check
 ```
 
-When writing `.accept.json` fixtures, keep `workflow` and
-`provider_config_paths` relative to the fixture file when possible. Use
-`input` for ordinary workflow start input and `setup.facts` for typed external
-setup facts validated against declared class schemas. Use `setup.inbox` for
-pre-existing human review items; do not fake those as workflow facts. Use
-`expect.assertion_tags` and `expect.assertion_untagged` for executable-spec groups,
-`expect.source_metadata` for source tag/description targets,
-`expect.diagnostics_by_code` for durable diagnostic checks, `expect.summary`
-for total final active fact/effect counts, and `expect.facts` or
-`expect.effects` for grouped counts. Use `expect.runs` when provider run status
-or artifact count is part of the contract, and `expect.artifacts` for
-metadata-only artifact counts by kind/MIME type. Use `expect.evidence` for
-metadata-only evidence counts by kind/subject type. Use `expect.assertion_reads`
-for deterministic assertion projections; effect match groups can assert prompt
-content type, trace/evidence link counts, and stable `trace_sequences`. Each
-assertion-read expectation must include at least one selector: `source`, `kind`,
-`head`, or `guard`.
-Observed `evidence_ids` are useful drilldown links, but avoid pinning them unless
-the ids are deliberately stable. Use `expect.trace.items` only for stable
-abstract trace records, such as sequence/type/status, not for incidental runtime
-ids; each trace item expectation must include at least one selector. Fixture and
-expectation fields are shape-checked before a workflow starts, so wrong-typed
-expectations are rejected rather than treated as absent. `setup.effects` and
-`setup.artifacts` are rejected in v0. `dev` and `accept` reports include compact
-artifact/evidence item links but omit raw artifact paths, content, and evidence
-payloads. `dev --stream ndjson` includes batched `dev.events` runtime event
-deltas and a `dev.assertions` event before the final report. Run suites by
-invoking one fixture per command with an isolated store per fixture.
-
-If an effect does not run, check its status and policy block reason before
-changing prompts. Prefer the single `dev --json` report for local validation:
-it includes source metadata, assertion groups, deterministic reads, durable
-diagnostics, assertion event/diagnostic links, and table provenance.
+If an effect did not run, inspect `effects` first. The status and
+`policy_block_reason` normally say whether it is waiting on a dependency,
+capacity, capability, profile, or terminal state.
 
 ## Safety
 
-- Never hide orchestration in shell scripts or prompt text.
-- Never rely on source order for effect sequencing.
-- Do not silently inject memory. Query it as an effect and preserve evidence.
-- Do not self-modify live instances from source rules. Propose a patch artifact
-  and let the control plane activate it with `whip revise`.
-- Keep provider credentials outside workflow source.
+- Keep workflows small, explicit, and analyzable.
+- Use the fixture provider before real providers.
 - Use human review for destructive or ambiguous steps.
+- Keep profiles narrow: `repo-reader`, `repo-writer`, `internet-research`,
+  `human-review`, or package-specific authority.
+- Query memory and package capabilities as explicit effects so provenance is
+  recorded.
+- Preserve evidence before repairing runtime state.

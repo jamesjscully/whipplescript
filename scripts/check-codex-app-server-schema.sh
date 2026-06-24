@@ -6,9 +6,12 @@ SCHEMA_DIR="${WHIPPLESCRIPT_CODEX_APP_SERVER_SCHEMA_DIR:-$ROOT/target/codex-app-
 REPORT="${WHIPPLESCRIPT_CODEX_APP_SERVER_SCHEMA_REPORT:-$ROOT/target/codex-app-server-schema-report.json}"
 PIN="${WHIPPLESCRIPT_CODEX_APP_SERVER_SCHEMA_PIN:-$ROOT/spec/codex-app-server-schema.pin.json}"
 UPDATE_PIN="${WHIPPLESCRIPT_CODEX_APP_SERVER_SCHEMA_UPDATE:-0}"
+STRICT_PIN="${WHIPPLESCRIPT_CODEX_APP_SERVER_SCHEMA_STRICT_PIN:-0}"
 
 REQUIRED_METHODS=(
+  "initialize"
   "thread/start"
+  "turn/start"
   "turn/started"
   "turn/completed"
   "turn/interrupt"
@@ -28,12 +31,12 @@ if ! codex app-server generate-json-schema --out "$SCHEMA_DIR" --experimental >/
   exit 1
 fi
 
-node - "$ROOT" "$SCHEMA_DIR" "$REPORT" "$PIN" "$UPDATE_PIN" "${REQUIRED_METHODS[@]}" <<'NODE'
+node - "$ROOT" "$SCHEMA_DIR" "$REPORT" "$PIN" "$UPDATE_PIN" "$STRICT_PIN" "${REQUIRED_METHODS[@]}" <<'NODE'
 const fs = require("fs");
 const crypto = require("crypto");
 const path = require("path");
 
-const [root, schemaDir, reportPath, pinPath, updatePin, ...requiredMethods] = process.argv.slice(2);
+const [root, schemaDir, reportPath, pinPath, updatePin, strictPin, ...requiredMethods] = process.argv.slice(2);
 
 function walk(dir) {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
@@ -116,10 +119,15 @@ const comparablePinned = {
   file_hashes: pinned.file_hashes,
 };
 if (canonicalJson(comparablePinned) !== canonicalJson(metadata)) {
-  console.error("Codex app-server schema metadata changed from pin.");
+  const mode = strictPin === "1" ? "strict" : "compatible";
+  console.error(`Codex app-server schema metadata changed from pin (${mode} mode).`);
   console.error(`Report: ${path.relative(root, reportPath)}`);
   console.error(`Pin: ${path.relative(root, pinPath)}`);
-  process.exit(1);
+  if (strictPin === "1") {
+    process.exit(1);
+  }
+  console.error("Required adapter methods are present; accepting installed Codex schema.");
+  process.exit(0);
 }
 
 console.error(`Codex app-server schema pin matches: ${path.relative(root, pinPath)}`);

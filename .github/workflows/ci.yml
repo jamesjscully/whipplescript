@@ -27,6 +27,9 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v31
 
+      - name: Install Python tooling
+        run: python3 -m pip install --user -r requirements-dev.txt
+
       - name: Format
         run: cargo fmt --all -- --check
 

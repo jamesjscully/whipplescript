@@ -1,0 +1,53 @@
+--- Flow-state namespace ownership, per spec/static-analysis.md: flow progression
+--- state (the FlowAwait_* facts a `flow` lowers to) is owned by the flow's own
+--- generated rules. A user (non-generated) rule may not read, match, consume, or
+--- record any flow-state fact -- doing so could corrupt or short-circuit the
+--- flow's progression. Companion to validate_flow_namespace_access in the parser.
+---
+--- This model abstracts a rule's read/write/consume set to ruleAccess edges and
+--- tags each rule with its kind -- userRule or genRule -- since Maude cannot match
+--- the ABSENCE of a marker. It checks by reachability search that:
+---   * a user rule that accesses a flow-owned fact is a violation;
+---   * a generated flow rule accessing the same fact is exempt -- no violation;
+---   * a user rule accessing a non-owned fact is fine -- no violation.
+mod WHIPPLESCRIPT-FLOW-NAMESPACE is
+  protecting BOOL .
+
+  sorts Rule Fact PairSet Cfg .
+
+  ops userA userB : -> Rule [ctor] .   --- user-authored rules
+  ops genA : -> Rule [ctor] .          --- a generated flow rule
+  ops flowF plainF : -> Fact [ctor] .  --- a flow-owned fact and an ordinary fact
+
+  --- A directed violation pair Rule -> Fact, tracked as an idempotent set so each
+  --- violation is recorded at most once.
+  op viol : Rule Fact -> PairSet [ctor] .
+  op mtViol : -> PairSet [ctor] .
+  op _;_ : PairSet PairSet -> PairSet [ctor assoc comm id: mtViol] .
+  eq [viol-idem] : V:PairSet ; V:PairSet = V:PairSet .
+
+  op memberViol : Rule Fact PairSet -> Bool .
+  eq memberViol(R:Rule, F:Fact, (viol(R:Rule, F:Fact) ; VS:PairSet)) = true .
+  eq memberViol(R:Rule, F:Fact, VS:PairSet) = false [owise] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op ruleAccess : Rule Fact -> Cfg [ctor] .   --- rule reads/matches/consumes/records fact
+  op flowOwned : Fact -> Cfg [ctor] .          --- fact is flow progression state
+  op userRule : Rule -> Cfg [ctor] .           --- a user-authored rule
+  op genRule : Rule -> Cfg [ctor] .            --- a generated flow rule
+  op violations : PairSet -> Cfg [ctor] .       --- recorded namespace violations
+
+  vars R : Rule .
+  var F : Fact .
+  var VS : PairSet .
+
+  --- A USER rule that accesses a flow-owned fact is a namespace violation. The
+  --- LHS matches userRule(R), so a generated rule -- tagged genRule, never userRule
+  --- -- can never match and is therefore exempt. Guarded on the violation set so
+  --- each pair is recorded once.
+  crl [violate] : userRule(R) ruleAccess(R, F) flowOwned(F) violations(VS)
+      => userRule(R) ruleAccess(R, F) flowOwned(F) violations(viol(R, F) ; VS)
+      if memberViol(R, F, VS) = false .
+endm

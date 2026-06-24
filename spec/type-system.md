@@ -2,9 +2,9 @@
 
 Status: draft
 
-WhippleScript needs a real type system because facts, effect payloads, Loft
-contracts, BAML coercions, plugin capabilities, and evidence records all cross
-typed boundaries.
+WhippleScript needs a real type system because facts, effect payloads, work
+tracking contracts, coerce coercions, package capabilities, and evidence records
+all cross typed boundaries.
 
 WhippleScript is still not a general-purpose data language. Types are schemas for
 validation, routing, persistence, and external calls. Supporting a type does not
@@ -123,7 +123,7 @@ class WorkReview {
 }
 ```
 
-Literal types use BAML-style literal values where needed:
+Literal types use explicit literal values where needed:
 
 ```whipplescript
 class StatusEvent {
@@ -158,10 +158,15 @@ agent codex {
 
 The exact declaration syntax may evolve, but the type-system contract is fixed:
 each declared agent has a stable name, one profile, one capacity class, and a
-finite set of capabilities. `AgentRef<A | B>` is valid only when `A` and `B`
-are declared agents. Guards and effect targets may further constrain the domain
-by profile, capacity, and required capabilities; every remaining possible
-target must satisfy those static constraints before the rule is accepted.
+finite set of capabilities. A declared agent's `capacity` is therefore a single
+scalar value (`capacity "high"`). An `AgentRef` *constraint* is the set of
+acceptable values an agent's scalar must belong to: a constraint over profiles
+is `profiles`, over capacities is `capacities`, over capabilities is
+`capabilities` (the agent must declare all listed capabilities). `AgentRef<A |
+B>` is valid only when `A` and `B` are declared agents. Guards and effect
+targets may further constrain the domain by profile, capacity, and required
+capabilities; every remaining possible target must satisfy those static
+constraints before the rule is accepted.
 
 Agent-routing effects can declare their target capability contract directly:
 
@@ -311,14 +316,18 @@ append/remove for small workflow facts, if needed
 The same expression kernel is used for `when ... where ...` guards and
 workflow assertions. Guard and assertion expressions are pure: they can inspect
 matched facts and effect projections, but they cannot enqueue effects, call
-providers, invoke BAML, mutate facts, read files, perform network access, or
-run host-language code.
+providers, invoke schema-coercion backends, mutate facts, read files, perform
+network access, or run host-language code.
 
 Operation constraints:
 
 - ordering works on `int`, `float`, `duration`, and `time`
 - equality works on scalars, enums, literals, null, and comparable opaque
   identity values
+- numeric comparison (`==`/`<` etc.) across `int` and `float` is allowed (see
+  [expression-kernel.md](expression-kernel.md)); this is comparison, not
+  assignment, and does not relax the no-implicit-coercion rule for assigning or
+  constructing typed fields below
 - membership works on arrays and map keys
 - interpolation is limited to paths and simple values
 - object construction must satisfy a known class/effect/fact schema where one
@@ -344,8 +353,9 @@ regex/string pattern matching
 user-defined pattern extractors
 ```
 
-Nontrivial data reasoning belongs in BAML `coerce` functions or registered
-capabilities.
+Nontrivial data reasoning belongs in schema-coercion functions or registered
+capabilities. coerce may implement a schema-coercion backend, but the type system
+does not require coerce as the conceptual boundary.
 
 ## Routing-Friendly Types
 
@@ -400,7 +410,7 @@ Static checking rules:
   capabilities in the typed environment
 - assigning `"codex"` to an `AgentRef<codex | claude>` field is allowed only
   because the literal is in the finite agent domain
-- assigning a `string` expression, interpolated string, model output, plugin
+- assigning a `string` expression, interpolated string, model output, provider
   output, or untyped JSON value to an `AgentRef` field is rejected unless it
   passes through an explicit typed boundary that validates it as `AgentRef`
 - narrowing an `AgentRef<A | B | C>` with guards or patterns may only remove
@@ -439,9 +449,10 @@ a source literal, fact field, validated boundary input, or previous runtime
 selection. Provenance is not used to decide type equality, but it is required
 for diagnostics, evidence records, and runtime authorization logs.
 
-Provider/model identity should normally be deterministic metadata. BAML output
-types should contain provider fields only when the model is reviewing observed
-provider evidence, not as a way to select or confirm orchestration routes.
+Provider/model identity should normally be deterministic metadata.
+Schema-coercion output types should contain provider fields only when the model
+is reviewing observed provider evidence, not as a way to select or confirm
+orchestration routes.
 
 ## Optional And Null Rules
 
@@ -523,7 +534,12 @@ Inside the `Some` branch, `assignee` has the non-optional inner type. Inside the
 
 Tagged terminal-output unions are matched by terminal status/variant. This is
 the typed form of branching over effect completions; providers do not decide
-which branch should run through free-form text.
+which branch should run through free-form text. The canonical terminal-output
+union is defined once in [expression-kernel.md](expression-kernel.md):
+`Completed<O> | Failed<E> | TimedOut | Cancelled`, with branch keywords
+`succeeds`/`fails`/`times out`/`cancelled` and `completes` binding the full
+union. Domain success/failure payloads are the `O`/`E` parameters, not new tags;
+`Failed<E>` carries an optional domain payload defaulting to a core `Failure`.
 
 Compiler obligations:
 
@@ -535,19 +551,21 @@ Compiler obligations:
 - preserve branch-specific type refinements in later field access checks
 - keep branch guards type-checked with the normal expression kernel
 
-## BAML Lowering
+## Schema Coercion Backend Mapping
 
-Reachable WhippleScript declarations used by `coerce` lower to generated BAML:
+Reachable WhippleScript declarations used by `coerce` define the locked schema
+surface for schema coercion. Backend integrations may map that surface to their
+own artifacts. The coerce backend maps the WhippleScript subset like this:
 
 ```text
-enum       -> BAML enum
-class      -> BAML class
+enum       -> coerce enum
+class      -> coerce class
 string     -> string
 int        -> int
 float      -> float
 bool       -> bool
 array<T>   -> T[]
-map<T>     -> map<string, T>, or BAML-compatible equivalent
+map<T>     -> map<string, T>, or backend-compatible equivalent
 literal    -> literal
 image      -> image
 audio      -> audio
@@ -555,11 +573,13 @@ pdf        -> pdf
 video      -> video
 ```
 
-The compiler must reject any WhippleScript type used in a `coerce` signature that
-cannot be lowered to the selected BAML version.
+The compiler must reject any WhippleScript type used in a `coerce` signature
+that cannot be represented by the selected schema-coercion backend/version.
 
-Generated BAML is a build artifact. WhippleScript declarations remain the source of
-truth.
+Generated backend artifacts are build artifacts. WhippleScript declarations
+remain the default source of truth. Interop modes may bind existing backend
+artifacts, such as `.coerce` files, but must cross-validate shape and hashes
+against the WhippleScript schema surface.
 
 ## Boundary Validation
 
@@ -570,9 +590,9 @@ source declarations
 fact production
 effect input construction
 effect success/failure/timeout outputs
-BAML request arguments
-BAML parsed responses
-plugin capability inputs/outputs
+schema-coercion request arguments
+schema-coercion parsed responses
+package capability inputs/outputs
 human answer payloads
 evidence metadata, where typed
 ```
@@ -580,6 +600,13 @@ evidence metadata, where typed
 Validation failures should produce diagnostics with source spans when possible.
 Provider output validation failures become typed effect failures, not partial
 successes.
+
+Runtime-boundary validation is **the authority** that admits any effect output
+into durable typed facts — not provider-side validation and not source claims
+(see [admission-and-idempotency.md](admission-and-idempotency.md)). For closed
+classes this gate rejects unknown fields *after* any backend normalization
+(e.g. coerce schema-aligned parsing); the WhippleScript boundary is the final
+gate. A failed boundary validation produces a failed effect and no fact.
 
 ## Fact Types
 

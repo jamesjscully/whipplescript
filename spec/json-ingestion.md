@@ -1,7 +1,7 @@
 # JSON and JSONL ingestion: deterministic typed parsing at effect boundaries
 
 Status: spec drafted 2026-06-10 from decided design
-([`language-ergonomics-tracker.md`](language-ergonomics-tracker.md) C3).
+([`language-ergonomics-tracker.md`](decision-records/language-ergonomics-tracker.md) C3).
 Stage: spec -> modeling -> implementation + testing -> review.
 
 ## Framing
@@ -10,10 +10,11 @@ Stage: spec -> modeling -> implementation + testing -> review.
 with no model.**
 
 It is the deterministic sibling of `coerce`. `coerce` lifts *messy text* into
-a typed shape *via an LLM* (BAML, scoring-based alignment). JSON ingestion
-lifts *already-structured bytes* into typed facts *with no LLM* — a total,
-replayable function. Both land typed values against the same schema layer; the
-only difference is whether a model is involved.
+a typed shape through a schema-coercion backend, usually model-backed; coerce is
+the current backend. JSON ingestion lifts *already-structured bytes* into typed
+facts *with no LLM* — a total, replayable function. Both land typed values
+against the same schema layer; the only difference is whether a model is
+involved.
 
 The primitive already has three call sites; it wears three hats:
 
@@ -25,7 +26,7 @@ This spec covers the **effect-output** hat. The gap it closes: today `exec`
 returns `stdout` as an opaque string, so a script that emits JSON is a
 dead-end — your only options are a `coerce` (absurd: an LLM call to read bytes
 that are already structured) or string surgery (declined,
-[C2](language-ergonomics-tracker.md#c2-considered-and-declined)).
+[C2](decision-records/language-ergonomics-tracker.md#c2-considered-and-declined)).
 
 JSON ingestion adds no general computation. It is a data primitive sufficient
 for workflow execution and nothing more: bytes crossing an effect boundary
@@ -33,10 +34,18 @@ become typed state. There is no in-language JSON manipulation, querying, or
 construction — production of outbound JSON stays covered by `record`/payload
 construction serialized into effect inputs.
 
+Because this primitive is the deterministic sibling of `coerce`, it is also the
+**deterministic validation capability** the e2e plan calls for
+([`e2e.md`](e2e.md)): a non-LLM checker invoked as `exec "<validator>" ->
+Schema` emits a typed verdict that rules branch on, with no provider access, so
+exact script/format/fixture properties can be asserted in CI alongside
+model-judged `coerce` review. See `examples/deterministic-validation.whip`.
+
 ## Surface
 
 The effect-output type is declared with `->`, read as "typed as", consistent
-with `coerce fn(...) -> Type` and `decide "..." -> { ... }`.
+with `coerce fn(...) -> Type` and `decide "..." -> { ... }` (the core
+anonymous-coercion sugar defined in [`language.md`](language.md)).
 
 ### Single value
 
@@ -138,6 +147,10 @@ parser behind injected event payloads
 ([`event-ingress.md`](event-ingress.md)). No new runtime concept: a parsed
 effect is an ordinary effect whose success condition includes schema
 conformance.
+
+`std.files` reuses the same deterministic validation rules for `import json`
+and `import jsonl`; it owns file-store authority and path policy, while this
+spec owns the byte-to-schema validation semantics.
 
 ## Modeling notes
 

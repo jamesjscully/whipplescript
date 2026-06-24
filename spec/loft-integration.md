@@ -1,12 +1,16 @@
 # Loft Integration
 
-Status: legacy compatibility draft
+Status: historical adapter context
 
-Current authoring should prefer the vendor-neutral work queue surface
-(`queue`, `when <queue> has ready item`, `claim`/`finish`) documented in
-[`work-queues.md`](work-queues.md). This file records the older Loft-specific
-integration shape and provider effect contract for compatibility and historical
-context; examples here are not the primary language surface.
+Direction note: this file predates the proposed `std.tracker` package direction
+being workshopped in
+[`decision-records/0002-work-tracker-package.md`](decision-records/0002-work-tracker-package.md).
+Read this as historical adapter context, not the current product boundary.
+
+Current authoring should prefer the `std.tracker` issue surface described in
+the decision record. This file records the older Loft-specific integration
+shape and provider effect contract for historical context only; examples here
+are not normative for the current language surface.
 
 Loft is a separate kernel. It owns project work truth:
 
@@ -90,7 +94,11 @@ loft.claim(issue)
 loft.claim(issue) --succeeds--> agent.tell(worker, prompt)
 ```
 
-The agent turn should not start unless the Loft claim succeeds.
+The agent turn should not start unless the Loft claim succeeds. The triggered
+turn follows the core agent contract: a record-once terminal plus evidence, with
+in-turn activity recorded as evidence rather than rule-matchable facts (Proposal
+A; see [`admission-and-idempotency.md`](admission-and-idempotency.md) and
+[`agent-harness.md`](agent-harness.md)).
 
 ## Claim Effect Contract
 
@@ -181,7 +189,6 @@ failure fields such as `claim.issue_id`, `claim.reason`, and `claim.conflicts`.
 ```text
 Loft lease = this actor is working on issue X
 WhippleScript effect lease = this worker is running effect Y
-Thoth lease = this actor may write governed resource Z
 ```
 
 These are different leases. Do not collapse them.
@@ -353,14 +360,14 @@ That command verifies `vendor/loft` is a registered submodule, contains the
 tracked Loft spec and fixture files, has a clean worktree, and passes strict
 fixture conformance.
 
-## Thoth Bridge
+## Resource Intent
 
-Loft issues may carry Thoth resource intent metadata:
+Loft issues may carry optional resource intent metadata:
 
 ```text
 reads:  [resource_id...]
 writes: [resource_id...]
 ```
 
-Loft should not own Thoth's resource graph. It may store resource intent so
-schedulers can avoid obvious conflicts before an agent writes code.
+Loft should not own any external resource graph. It may store resource intent so
+schedulers or providers can avoid obvious conflicts before an agent writes code.

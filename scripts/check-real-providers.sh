@@ -50,7 +50,7 @@ NATIVE_SURFACE="${WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_SURFACE:-0}"
 if [[ "$STRICT_NATIVE" == "1" ]]; then
   SELECTED_PROVIDERS="${WHIPPLESCRIPT_REAL_PROVIDERS:-codex,claude,pi}"
 else
-  SELECTED_PROVIDERS="${WHIPPLESCRIPT_REAL_PROVIDERS:-loft,baml}"
+  SELECTED_PROVIDERS="${WHIPPLESCRIPT_REAL_PROVIDERS:-loft,coerce}"
 fi
 CURRENT_PROVIDER="all"
 
@@ -78,8 +78,8 @@ validate_selected_providers() {
   IFS=',' read -ra providers <<<"$SELECTED_PROVIDERS"
   for provider in "${providers[@]}"; do
     case "$provider" in
-      loft | baml | codex)
-        if [[ "$STRICT_NATIVE" == "1" && ( "$provider" == "loft" || "$provider" == "baml" ) ]]; then
+      loft | coerce | codex)
+        if [[ "$STRICT_NATIVE" == "1" && ( "$provider" == "loft" || "$provider" == "coerce" ) ]]; then
           record_preflight "$provider" native.strict.failed provider fail "command-wrapper provider is not accepted in native strict mode"
           echo "native strict mode requires Codex, Claude, and Pi native providers; $provider is command-wrapper coverage" >&2
           selected_any=1
@@ -105,7 +105,7 @@ validate_selected_providers() {
 
   if [[ "$selected_any" -ne 1 ]]; then
     record_preflight all adapter.resolve.failed provider fail "no supported real providers selected"
-    echo "WHIPPLESCRIPT_REAL_PROVIDERS must include loft, baml, codex, claude, pi, or a comma-separated subset" >&2
+    echo "WHIPPLESCRIPT_REAL_PROVIDERS must include loft, coerce, codex, claude, pi, or a comma-separated subset" >&2
     missing=1
   fi
   if [[ "$STRICT_NATIVE" == "1" ]]; then
@@ -230,11 +230,11 @@ require_env() {
   echo "$name: set"
 }
 
-check_baml_endpoint() {
+check_coerce_endpoint() {
   local endpoint="$1"
   if [[ ! "$endpoint" =~ ^http://([^/:]+)(:([0-9]+))?(/.*)?$ ]]; then
-    record_preflight baml provider.config.invalid endpoint fail "WHIPPLESCRIPT_BAML_TEST_ENDPOINT must be an http:// URL"
-    echo "WHIPPLESCRIPT_BAML_TEST_ENDPOINT must be an http:// URL" >&2
+    record_preflight coerce provider.config.invalid endpoint fail "WHIPPLESCRIPT_COERCE_TEST_ENDPOINT must be an http:// URL"
+    echo "WHIPPLESCRIPT_COERCE_TEST_ENDPOINT must be an http:// URL" >&2
     missing=1
     return
   fi
@@ -243,50 +243,50 @@ check_baml_endpoint() {
   local port="${BASH_REMATCH[3]:-80}"
   local path="${BASH_REMATCH[4]:-}"
   if [[ ! "$host" =~ ^[A-Za-z0-9._-]+$ || ! "$port" =~ ^[0-9]+$ ]]; then
-    record_preflight baml provider.config.invalid endpoint fail "WHIPPLESCRIPT_BAML_TEST_ENDPOINT contains an invalid host or port"
-    echo "WHIPPLESCRIPT_BAML_TEST_ENDPOINT contains an invalid host or port" >&2
+    record_preflight coerce provider.config.invalid endpoint fail "WHIPPLESCRIPT_COERCE_TEST_ENDPOINT contains an invalid host or port"
+    echo "WHIPPLESCRIPT_COERCE_TEST_ENDPOINT contains an invalid host or port" >&2
     missing=1
     return
   fi
 
   if ! command -v curl >/dev/null 2>&1; then
-    record_preflight baml adapter.resolve.failed command:curl fail "curl is required for BAML endpoint checks"
-    echo "missing required tool for BAML endpoint checks: curl" >&2
+    record_preflight coerce adapter.resolve.failed command:curl fail "curl is required for coerce endpoint checks"
+    echo "missing required tool for coerce endpoint checks: curl" >&2
     missing=1
     return
   fi
 
   local curl_args=(--silent --show-error --max-time 3 --output /dev/null)
-  if [[ -n "${WHIPPLESCRIPT_BAML_AUTH_TOKEN:-}" ]]; then
-    curl_args+=(-H "Authorization: Bearer $WHIPPLESCRIPT_BAML_AUTH_TOKEN")
+  if [[ -n "${WHIPPLESCRIPT_COERCE_AUTH_TOKEN:-}" ]]; then
+    curl_args+=(-H "Authorization: Bearer $WHIPPLESCRIPT_COERCE_AUTH_TOKEN")
   fi
 
   if ! curl "${curl_args[@]}" "http://$host:$port$path" >/dev/null; then
-    record_preflight baml provider.launch.failed endpoint fail "could not connect to BAML endpoint"
-    echo "could not connect to BAML endpoint $host:$port" >&2
+    record_preflight coerce provider.launch.failed endpoint fail "could not connect to coerce endpoint"
+    echo "could not connect to coerce endpoint $host:$port" >&2
     missing=1
     return
   fi
-  record_preflight baml provider.launch.ok endpoint pass "BAML endpoint TCP check ok"
-  echo "BAML endpoint TCP check ok: $host:$port"
+  record_preflight coerce provider.launch.ok endpoint pass "coerce endpoint TCP check ok"
+  echo "coerce endpoint TCP check ok: $host:$port"
 
-  if [[ -n "${WHIPPLESCRIPT_BAML_HEALTH_PATH:-}" ]]; then
-    local health_path="$WHIPPLESCRIPT_BAML_HEALTH_PATH"
+  if [[ -n "${WHIPPLESCRIPT_COERCE_HEALTH_PATH:-}" ]]; then
+    local health_path="$WHIPPLESCRIPT_COERCE_HEALTH_PATH"
     if [[ "$health_path" != /* ]]; then
       health_path="/$health_path"
     fi
     local health_curl_args=(--fail --silent --show-error --max-time 5)
-    if [[ -n "${WHIPPLESCRIPT_BAML_AUTH_TOKEN:-}" ]]; then
-      health_curl_args+=(-H "Authorization: Bearer $WHIPPLESCRIPT_BAML_AUTH_TOKEN")
+    if [[ -n "${WHIPPLESCRIPT_COERCE_AUTH_TOKEN:-}" ]]; then
+      health_curl_args+=(-H "Authorization: Bearer $WHIPPLESCRIPT_COERCE_AUTH_TOKEN")
     fi
     if ! curl "${health_curl_args[@]}" \
       "http://$host:$port$path$health_path" >/dev/null; then
-      record_preflight baml provider.result.invalid health fail "BAML endpoint health check failed"
+      record_preflight coerce provider.result.invalid health fail "coerce endpoint health check failed"
       missing=1
       return
     fi
-    record_preflight baml provider.result.valid health pass "BAML endpoint health check ok"
-    echo "BAML endpoint health check ok: $health_path"
+    record_preflight coerce provider.result.valid health pass "coerce endpoint health check ok"
+    echo "coerce endpoint health check ok: $health_path"
   fi
 }
 
@@ -339,21 +339,21 @@ if [[ "$STRICT_NATIVE" != "1" ]] && provider_enabled loft; then
   fi
 fi
 
-if [[ "$STRICT_NATIVE" != "1" ]] && provider_enabled baml; then
-  CURRENT_PROVIDER="baml"
-  if [[ "${WHIPPLESCRIPT_BAML_SKIP_CLI:-}" == "1" ]]; then
-    record_preflight baml adapter.resolve.skip baml-cli skip "WHIPPLESCRIPT_BAML_SKIP_CLI=1"
-    echo "Skipping BAML CLI probe because WHIPPLESCRIPT_BAML_SKIP_CLI=1"
+if [[ "$STRICT_NATIVE" != "1" ]] && provider_enabled coerce; then
+  CURRENT_PROVIDER="coerce"
+  if [[ "${WHIPPLESCRIPT_COERCE_SKIP_CLI:-}" == "1" ]]; then
+    record_preflight coerce adapter.resolve.skip coerce-cli skip "WHIPPLESCRIPT_COERCE_SKIP_CLI=1"
+    echo "Skipping coerce CLI probe because WHIPPLESCRIPT_COERCE_SKIP_CLI=1"
   else
-    require_any_command "baml-cli or baml" baml-cli baml || true
+    require_any_command "coerce-cli or coerce" coerce-cli coerce || true
   fi
-  require_env WHIPPLESCRIPT_BAML_TEST_ENDPOINT || true
-  require_env WHIPPLESCRIPT_BAML_TEST_FUNCTION || true
-  require_env WHIPPLESCRIPT_BAML_TEST_ARGUMENTS_JSON || true
-  require_env WHIPPLESCRIPT_BAML_TEST_OUTPUT_TYPE || true
+  require_env WHIPPLESCRIPT_COERCE_TEST_ENDPOINT || true
+  require_env WHIPPLESCRIPT_COERCE_TEST_FUNCTION || true
+  require_env WHIPPLESCRIPT_COERCE_TEST_ARGUMENTS_JSON || true
+  require_env WHIPPLESCRIPT_COERCE_TEST_OUTPUT_TYPE || true
 
-  if [[ -n "${WHIPPLESCRIPT_BAML_TEST_ENDPOINT:-}" ]]; then
-    check_baml_endpoint "$WHIPPLESCRIPT_BAML_TEST_ENDPOINT"
+  if [[ -n "${WHIPPLESCRIPT_COERCE_TEST_ENDPOINT:-}" ]]; then
+    check_coerce_endpoint "$WHIPPLESCRIPT_COERCE_TEST_ENDPOINT"
   fi
 fi
 
@@ -434,9 +434,9 @@ if provider_enabled loft; then
     real_loft_show_smoke -- --nocapture
 fi
 
-if provider_enabled baml; then
+if provider_enabled coerce; then
   cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript-kernel \
-    real_baml_coerce_endpoint_smoke -- --nocapture
+    real_coerce_endpoint_smoke -- --nocapture
 fi
 
 if provider_enabled codex; then
@@ -471,4 +471,4 @@ if provider_enabled pi; then
 fi
 
 echo "Real-provider readiness checks passed."
-echo "Provider-destructive flows remain manual until isolated Loft/BAML fixtures are approved."
+echo "Provider-destructive flows remain manual until isolated Loft/coerce fixtures are approved."

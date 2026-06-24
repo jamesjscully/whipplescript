@@ -25,11 +25,16 @@ evidence
 capability_bindings
 profiles
 skills
-plugin_registrations
+package registrations
 inbox_items
 leases
 diagnostics
 ```
+
+Implementation note: package registrations are stored as package/provider
+registration records. Legacy manifest inputs may still contain a `plugin_id`
+field while compatibility fixtures are being retired, but the logical and
+physical store model is package-based.
 
 All durable objects that can be surfaced to users should carry enough
 correlation to reconstruct a local trace:
@@ -414,8 +419,8 @@ Examples:
 stdout
 stderr
 provider_metadata
-baml_request
-baml_response
+coerce_request
+coerce_response
 failure_transcript
 trace_json
 patch

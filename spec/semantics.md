@@ -89,13 +89,26 @@ If a rewrite fails validation, no part of it commits.
 
 ## Fixpoint
 
-After accepting an event, the runtime may apply enabled pure rules until a
-fixed point:
+After accepting an event, the runtime applies enabled pure rules to a fixed
+point in a **deterministic order**, so replay reproduces the same sequence:
 
 ```text
-while exists enabled pure rule that produces a new fact:
-  apply it
+round:
+  candidates = enabled pure rules that would produce a new fact
+  order candidates by (rule declaration order, then the matched fact's
+    (name, key) order)
+  apply the first candidate; the facts it produces are appended with new
+    sequence numbers and may enable the next round
+repeat rounds until no candidate produces a new fact
 ```
+
+Each pure-rule application is its own committed step with sequence numbers, so
+the log stays gap-free and the fixpoint is replayable from `(instance_id,
+sequence)` order alone. Pure-rule productivity is bounded by stratification (no
+rule may re-produce a fact already present); effectful rules never fire inside
+the pure fixpoint. Admission of any externally-sourced or effect-terminal fact
+follows the [`admission-and-idempotency.md`](admission-and-idempotency.md)
+contract.
 
 Effectful rules are not applied in an unbounded internal loop unless the
 compiler proves a bounded productive measure. The conservative v0 rule is:

@@ -25,14 +25,21 @@ auth status payloads.
 Observed locally on May 31, 2026:
 
 ```text
-codex-cli 0.128.0
+codex-cli 0.137.0 (schema pin refreshed June 14, 2026)
 Claude Code 2.1.116
 pi 0.73.0
 ```
 
-The exact local versions matter. Codex app-server is explicitly experimental,
-and its generated schema should be treated as the compatibility target for the
-installed CLI, not a random upstream version.
+The exact local versions matter as reviewed baselines. Codex app-server is
+explicitly experimental, so the generated schema pin records one reviewed
+compatibility target. Installed Codex versions are accepted when the adapter's
+required request and notification methods are still present; exact pin matching
+is reserved for strict review mode.
+Claude Code is also a reviewed baseline rather than a support ceiling. The
+Claude Agent SDK adapter is checked by required CLI/SDK capabilities plus the
+declared TypeScript SDK dependency; npm/pip registry metadata is a freshness
+probe and is strict only when
+`WHIPPLESCRIPT_CLAUDE_AGENT_SDK_STRICT_REGISTRY=1`.
 
 ## Codex
 
@@ -51,8 +58,9 @@ Useful facts:
 - The app-server protocol is JSON-RPC-like and supports stdio JSONL, unix
   socket, and websocket transports. Upstream documentation says websocket is
   experimental and unsupported for production.
-- The local generated schema includes `thread/start`, `turn/started`,
-  `turn/completed`, `turn/interrupt`, and `turn/diff/updated`.
+- The local generated schema includes `initialize`, `thread/start`,
+  `turn/start`, `turn/started`, `turn/completed`, `turn/interrupt`, and
+  `turn/diff/updated`.
 - The local generated schema includes approval request/response objects.
 - `codex mcp-server` is a separate stdio MCP server surface; it may be useful
   for controlling a Codex engine through MCP clients, but it is not the same as
@@ -96,9 +104,13 @@ Useful facts:
 - Anthropic documents API-key authentication for third-party Agent SDK
   integrations; local claude.ai login is a CLI/user auth shape, not the product
   auth model to embed in WhippleScript.
-- Local `claude --version` reports `2.1.116 (Claude Code)`.
-- `npm view @anthropic-ai/claude-agent-sdk ...` reports latest `0.3.159`;
-  `pip index versions claude-agent-sdk` reports latest `0.2.87`.
+- The reviewed May 31 baseline reported `2.1.116 (Claude Code)`; current
+  developer machines record their installed Claude Code version in
+  `target/claude-agent-sdk-surface.json`.
+- The project package contract declares and locks
+  `@anthropic-ai/claude-agent-sdk` for the TypeScript sidecar. Registry probes
+  can report the latest TypeScript/Python SDK metadata, but ordinary
+  compatibility validation must not depend on a live registry lookup.
 - The Python Agent SDK reference says `query()` does not support interrupts and
   `ClaudeSDKClient` does. The TypeScript reference exposes cancellation through
   `AbortController` on `query()` and `interrupt()` in streaming input mode, but
@@ -114,6 +126,8 @@ Adapter implications:
   text mode.
 - The first adapter boundary should be a TypeScript sidecar using
   `@anthropic-ai/claude-agent-sdk`; Python remains a fallback/probe surface.
+- The surface gate should reject missing required CLI/SDK capabilities, not
+  harmless Claude Code version drift or transient registry unavailability.
 - WhippleScript must map profiles/capabilities into SDK tool allowlists,
   permission modes, hooks, and MCP configuration.
 - WhippleScript should persist Claude session ids, stream messages, hook/tool
@@ -202,9 +216,14 @@ runtime API should be able to express:
 
 - supported session identity fields
 - supported stream event kinds
-- supported cancellation depth
+- a cancel/abort entry point plus supported cancellation depth (Codex
+  `turn/interrupt`, Claude request-only cancel, Pi RPC `abort`); an
+  unacknowledged or out-of-order cancel resolves per the exactly-once /
+  `uncertain` terminal rules in
+  [`admission-and-idempotency.md`](admission-and-idempotency.md)
 - artifact manifest support
-- tool/approval policy support
+- tool/approval policy support, exposed as evidence rather than typed result
+  fields (provider tool/approval shapes are not portable)
 - health-check and credential-reference requirements
 - schema/protocol version used for validation
 

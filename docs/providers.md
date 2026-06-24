@@ -1,6 +1,6 @@
-# Providers & plugins
+# Providers & packages
 
-Workflows describe coordination policy; providers and plugins are how that
+Workflows describe coordination policy; providers and packages are how that
 policy reaches real agents, tools, and services. Source code names logical
 agents and capabilities. The runtime records durable effects. Workers execute
 those effects through providers. Provider output returns as events, facts,
@@ -92,7 +92,7 @@ Real-provider smoke tests are opt-in:
 
 ```sh
 WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \
-WHIPPLESCRIPT_REAL_PROVIDERS=loft,baml,codex \
+WHIPPLESCRIPT_REAL_PROVIDERS=loft,coerce,codex \
 scripts/check-real-providers.sh
 ```
 
@@ -101,24 +101,91 @@ Reports land in `target/real-provider-smoke-report.md` and
 destructive provider tests have additional gates; see
 [troubleshooting](troubleshooting.md#native-provider-strict-mode-fails).
 
+## Native coerce (real model decisions)
+
+By default `coerce` / `decide` run against the deterministic fixture, so
+`dev`, `worker`, and CI need no credentials. To run a real model decision,
+opt in with environment variables:
+
+```sh
+# OpenAI (Responses API, JSON-schema structured output)
+WHIPPLESCRIPT_COERCE_PROVIDER=openai OPENAI_API_KEY=sk-... \
+  whip dev workflow.whip --provider fixture
+
+# Anthropic (Messages API, single forced tool)
+WHIPPLESCRIPT_COERCE_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-api... \
+  whip dev workflow.whip --provider fixture
+```
+
+The output JSON Schema is built from the declared `coerce` output type and sent
+as the provider's native structured-output constraint, so the result is parsed
+straight into the typed value. Useful knobs: `WHIPPLESCRIPT_COERCE_MODEL`,
+`WHIPPLESCRIPT_COERCE_BASE_URL`, `WHIPPLESCRIPT_COERCE_MAX_TOKENS`,
+`WHIPPLESCRIPT_COERCE_TIMEOUT_SECS`.
+
+Credentials:
+
+- **OpenAI** uses `OPENAI_API_KEY` against `api.openai.com`, or — with no key —
+  the Codex OAuth token already in `~/.codex/auth.json`, which routes to the
+  ChatGPT-plan codex backend (`chatgpt.com/backend-api/codex/responses`, SSE; the
+  model comes from `WHIPPLESCRIPT_COERCE_MODEL` or `~/.codex/config.toml`). This
+  path is validated to honor structured outputs; it bills your ChatGPT plan.
+  OpenAI publicly permits codex-endpoint use.
+- **Anthropic** requires a console API key (`sk-ant-api*`, `ANTHROPIC_API_KEY` or
+  `whip auth set anthropic`). A Claude Code OAuth token (`sk-ant-oat*`) is
+  rejected with a clear message — reusing it for the API is a terms gray area.
+
+If the provider is set but no credential resolves, the coerce effect fails with
+a clear message instead of silently using a fixture.
+
+## `whip auth`
+
+whip does not run its own login — your environment is already authenticated
+(`codex login`, the Claude CLI). coerce reads those existing credentials; use
+`whip auth` to inspect what resolves or to store an explicit API key:
+
+```sh
+whip auth status                           # show what resolves (redacted) + source
+whip auth set anthropic sk-ant-api03-...   # store an explicit coerce credential
+whip auth set openai     sk-proj-...
+```
+
+`whip auth set` writes an owner-only (`0600`) config file at
+`$WHIPPLESCRIPT_CONFIG_DIR/auth.json` (else `$XDG_CONFIG_HOME/whipplescript/` or
+`~/.config/whipplescript/`). Coerce credential precedence is **environment
+variable → stored config → Codex OAuth token** (OpenAI only), so an env var
+always overrides a stored key.
+
+There are two distinct credential needs, but only one is whip's job. **coerce /
+decide** use the credential resolved above. **Harnesses** (Codex/Claude agent
+turns) authenticate through their own provider CLI (`codex login`; the Claude
+CLI's `/login`) — whip does not re-run those flows; it reuses whatever the
+environment already has.
+
 ## Effect kinds
 
 | Effect | Created by | Executed as |
 | --- | --- | --- |
 | `agent.tell` | `tell` | an agent turn |
-| `baml.coerce` | `coerce` / `decide` | a typed model decision |
+| `coerce` | `coerce` / `decide` | a typed model decision |
 | `human.ask` | `askHuman` | an inbox item awaiting a human answer |
 | `queue.*` | `file` / `claim` / `release` / `finish` | work-queue operations |
 | `timer.wait` | `timer` | a delay that fires when due |
 | `exec.command` | `exec` | dev raw command or hosted SHA-256-pinned script capability |
+| `signal.emit` | `emit signal` | typed signal injection into another instance |
+| `lease.acquire` / `lease.release` | `acquire` / `release` | workspace-scoped coordination lock/semaphore operations |
+| `ledger.append` | `append ... to <ledger>` | durable partitioned append-log write |
+| `counter.consume` | `consume ... amount ...` | bounded budget consumption |
 | `workflow.invoke` | `invoke` | a child workflow instance |
-| namespaced capabilities | `call plugin.capability` | a plugin handler |
+| namespaced capabilities | `call package.capability` | a package capability provider |
 
-## Plugins
+## Packages
 
-A plugin registers capabilities, providers, profiles, schemas, resources, and
-optional skills. The contract is simple: plugins expose explicit effects;
-they never add hidden control flow or new grammar.
+A package registers capabilities, providers, profiles, schemas, resources, and
+optional skills. First-class package manifests separate libraries,
+capabilities, providers, profiles, and bindings. The contract is
+package/library/provider: packages expose explicit effects; they never add
+hidden control flow or new grammar.
 
 ```whip
 use memory
@@ -134,10 +201,22 @@ rule fetch_context
 }
 ```
 
-The `call` creates a durable effect like any other; a provider bound by the
-plugin handles it. Plugin packaging is still experimental — the manifest
-shape and policy details live in the design-facing
-[plugin author guide](../spec/plugin-author-guide.md).
+The `call` creates a durable `capability.call` effect like any other and
+requires the package capability (`memory.query` in the example). When the
+locked package contract declares `validation: runtime_boundary`, provider
+output is checked against `output_schema` before `capability.call.succeeded` is
+derived; mismatches fail the effect instead of becoming workflow facts.
+Validate and pin package manifests before use:
+
+```sh
+whip package check examples/packages/memory.json
+whip package lock --output whip.lock examples/packages/memory.json
+whip dev workflow.whip --package-lock whip.lock
+```
+
+Package packaging is still experimental. Treat package manifests as part of the
+checked source contract: pin them with `whip package lock`, commit the lockfile
+with the workflow, and update both together.
 
 ## Practical advice
 

@@ -1,7 +1,7 @@
 # Time: effect timeouts, timers, and cancellation
 
 Status: spec drafted 2026-06-09 from decided design
-([`language-ergonomics-tracker.md`](language-ergonomics-tracker.md) A2).
+([`language-ergonomics-tracker.md`](decision-records/language-ergonomics-tracker.md) A2).
 Stage: spec -> modeling -> implementation + testing -> review.
 
 ## Surface

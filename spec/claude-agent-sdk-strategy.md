@@ -25,9 +25,13 @@ diagnostic fallback only.
   `https://code.claude.com/docs/en/agent-sdk/sessions`.
 - Official approvals/user input guide:
   `https://code.claude.com/docs/en/agent-sdk/user-input`.
-- Local CLI probe: `claude --version` reports `2.1.116 (Claude Code)`.
-- Package probe: `npm view @anthropic-ai/claude-agent-sdk ...` reports latest
-  `0.3.159`; `pip index versions claude-agent-sdk` reports latest `0.2.87`.
+- Local CLI probe: the reviewed May 31 baseline reported
+  `2.1.116 (Claude Code)`; current validation records the installed version in
+  `target/claude-agent-sdk-surface.json`.
+- Package contract: `package.json` declares and `package-lock.json` locks
+  `@anthropic-ai/claude-agent-sdk` for the TypeScript sidecar. Registry probes
+  can report TypeScript/Python SDK freshness, but ordinary compatibility should
+  not depend on live npm/pip availability.
 
 ## TypeScript Sidecar Shape
 
@@ -108,6 +112,11 @@ Until this is live-probed, Claude capabilities should advertise cancellation as
 - report path `target/claude-agent-sdk-live-smoke.json`;
 - redacted capture of session id, message type/subtype counts, result subtype,
   usage shape, and SDK/package version posture.
+
+`scripts/check-claude-agent-sdk-surface.sh` validates this boundary by checking
+required local CLI flags, Node/npm availability, and the declared/locked
+TypeScript SDK dependency. Online registry metadata is a freshness signal only
+unless `WHIPPLESCRIPT_CLAUDE_AGENT_SDK_STRICT_REGISTRY=1` is set.
 
 `NP-033` added the policy mapper from WhippleScript profiles/capabilities to
 Claude `allowedTools`, `disallowedTools`, `permissionMode`, settings sources,

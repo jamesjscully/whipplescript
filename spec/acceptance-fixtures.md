@@ -110,7 +110,7 @@ WhippleScript runtime syntax and do not add a second execution model.
     ],
     "effects": [
       {"kind": "agent.tell", "status": "completed", "count": 6},
-      {"kind": "baml.coerce", "status": "completed", "count": 6}
+      {"kind": "coerce", "status": "completed", "count": 6}
     ],
     "runs": [
       {"provider": "fixture", "status": "completed", "count": 12, "artifact_count": 12}
@@ -121,7 +121,7 @@ WhippleScript runtime syntax and do not add a second execution model.
     ],
     "evidence": [
       {"kind": "agent.turn.provider", "subject_type": "run", "count": 6},
-      {"kind": "baml.coerce.provider", "subject_type": "run", "count": 6},
+      {"kind": "coerce.provider", "subject_type": "run", "count": 6},
       {"kind": "skills.injected", "subject_type": "run", "count": 6},
       {"kind": "rule.committed", "subject_type": "rule_commit", "count": 19}
     ]

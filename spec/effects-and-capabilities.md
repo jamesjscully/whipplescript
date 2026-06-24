@@ -17,10 +17,13 @@ Initial built-in effect categories:
 ```text
 agent.tell       request an agent turn
 human.ask        request human input
-baml.coerce      request typed model coercion
+schema.coerce    request typed schema coercion
 capability.call  call a registered external capability
-event.emit       append a typed event
+signal.emit      inject a typed signal fact
 ```
+
+Current implementations may still emit the legacy effect kind `coerce`;
+the target contract is `schema.coerce`, with coerce registered as one backend.
 
 Core integrations may expose namespaced effects directly when the compiler or
 runtime needs to understand their ordering:
@@ -38,17 +41,24 @@ loft.complete
 loft.fail
 ```
 
-Plugins may also expose namespaced effect kinds:
+Packages may also expose namespaced effect contracts:
 
 ```text
 memory.query
 memory.write
-thoth.verify
 github.comment
 ```
 
-These are still ordinary durable effects. Namespacing improves typed contracts
-and status UX; it does not grant plugins new control-flow semantics.
+These are still ordinary durable effects, currently lowering through
+`capability.call` unless a platform-owned lowering class says otherwise.
+Namespacing improves typed contracts and status UX; it does not grant packages
+new control-flow semantics.
+
+Only two lowering classes are package-authorable: `metadata_only` and
+`capability_call`. The `typed_effect_call` and `resource_effect` lowering
+classes are compiler-owned for now and may not be authored by packages. A
+package effect therefore either contributes typed metadata only or lowers
+through `capability.call`; it cannot introduce a new compiler-owned lowering.
 
 All effects share the same terminal lifecycle:
 
@@ -93,23 +103,31 @@ failure categories
 dependency edges
 ```
 
-The generic lifecycle predicates are:
+The generic lifecycle predicates are the branch keywords of the canonical
+terminal-output union defined in
+[expression-kernel.md](expression-kernel.md) (`Completed<O> | Failed<E> |
+TimedOut | Cancelled`):
 
 ```text
-succeeds
-fails
-completes
+succeeds     Completed<O>
+fails        Failed<E>
+times out    TimedOut   (terminal status value `timed_out`)
+cancelled    Cancelled
+completes    the full four-tag union (for case)
 ```
 
 They are shared by every effect kind. The typed payload exposed through a named
-binding is defined by the specific effect contract.
+binding is defined by the specific effect contract; domain success/failure
+payloads are the `O`/`E` parameters, not new tags.
 
 For a named effect binding `x`:
 
 ```text
-after x succeeds   x has the success output type
-after x fails      x has the failure output type
-after x completes  x has a tagged terminal-output union
+after x succeeds     x has the success output type O
+after x fails as f   f has the failure payload E (defaults to core Failure)
+after x times out    the TimedOut tag
+after x cancelled    the Cancelled tag
+after x completes     x has the full tagged terminal-output union
 ```
 
 The language can make effects feel direct:
@@ -190,7 +208,7 @@ Good profile names:
 repo-reader
 repo-writer
 internet-research
-review-only
+human-review
 enterprise-brokered-worker
 ```
 
@@ -219,6 +237,17 @@ warnings
 
 If a governed environment requires strict enforcement and the provider cannot
 enforce the requested boundary, the effect is blocked before execution.
+
+## Admission Authority
+
+An effect's output becomes a durable typed fact only through runtime-boundary
+validation, which is **the authority** that admits effect output into typed
+facts — not provider-side validation and not source claims (see
+[admission-and-idempotency.md](admission-and-idempotency.md)). Providers and
+packages never write facts directly. Closed classes reject unknown fields
+*after* any backend normalization (e.g. coerce schema-aligned parsing); the
+WhippleScript boundary is the final gate. A failed boundary validation produces
+a failed effect with a diagnostic and admits no fact.
 
 ## Idempotency
 

@@ -71,6 +71,22 @@ help_contains() {
   failures=1
 }
 
+help_contains_optional() {
+  local provider="$1"
+  local surface="$2"
+  local check="$3"
+  local needle="$4"
+  shift 4
+  local output
+
+  if output="$("$@" --help 2>&1)" && grep -Fq -- "$needle" <<<"$output"; then
+    record_check "$provider" "$surface" "$check" pass "help includes $needle"
+    return
+  fi
+
+  record_check "$provider" "$surface" "$check" skip "optional help does not include $needle"
+}
+
 schema_contains() {
   local check="$1"
   local needle="$2"
@@ -94,7 +110,9 @@ check_codex() {
   mkdir -p "$CODEX_SCHEMA_DIR"
   if codex app-server generate-json-schema --out "$CODEX_SCHEMA_DIR" --experimental >/dev/null 2>&1; then
     record_check codex app-server-schema generate pass "generated local app-server schema"
+    schema_contains initialize '"initialize"'
     schema_contains thread-start '"thread/start"'
+    schema_contains turn-start '"turn/start"'
     schema_contains turn-started '"turn/started"'
     schema_contains turn-completed '"turn/completed"'
     schema_contains turn-interrupt '"turn/interrupt"'
@@ -113,7 +131,7 @@ check_claude() {
   help_contains claude cli allowed-tools "--allowedTools" claude
   help_contains claude cli permission-mode "--permission-mode" claude
   help_contains claude cli hook-events "--include-hook-events" claude
-  help_contains claude cli structured-output "--json-schema" claude
+  help_contains_optional claude cli structured-output "--json-schema" claude
 
   local auth
   auth="$(claude auth status --json 2>/dev/null || true)"

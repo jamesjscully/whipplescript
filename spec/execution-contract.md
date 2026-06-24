@@ -37,7 +37,7 @@ child's private projection.
 
 Revision is not a source-level construct and is not available in rule bodies.
 Rules may produce ordinary patch proposals through effects, artifacts, events,
-human review requests, typed model decisions, or child workflow invocations.
+human review requests, typed schema coercions, or child workflow invocations.
 Only the control plane can activate a proposed revision.
 
 ## Rule Commit
@@ -67,8 +67,8 @@ rules unless a future explicit reopen/retry control-plane operation creates a
 new instance.
 
 Revision activation is not a rule commit. It has its own control-plane
-transaction boundary and cannot be smuggled into `record`, `notify`, `call`,
-`tell`, `coerce`, `askHuman`, `invoke`, `complete`, or `fail`.
+transaction boundary and cannot be smuggled into `record`, `emit signal`,
+`call`, `tell`, `coerce`, `askHuman`, `invoke`, `complete`, or `fail`.
 
 Fact records and effect graph nodes produced by the same rule commit share
 correlation metadata. This lets later rules match typed relationships such as
@@ -283,10 +283,14 @@ agent.turn.cancelled
 loft.claim.succeeded
 loft.claim.failed
 loft.claim.timed_out
-baml.coerce.succeeded
-baml.coerce.failed
-baml.coerce.timed_out
-baml.coerce.cancelled
+schema.coerce.succeeded
+schema.coerce.failed
+schema.coerce.timed_out
+schema.coerce.cancelled
+coerce.succeeded
+coerce.failed
+coerce.timed_out
+coerce.cancelled
 human.ask.created
 human.answer.received
 workflow.invoke.succeeded
@@ -295,6 +299,9 @@ workflow.invoke.timed_out
 workflow.invoke.cancelled
 workflow.invoke.completed
 ```
+
+The `coerce.*` facts are current implementation compatibility names. The
+target completion fact family for core semantics is `schema.coerce.*`.
 
 Native provider adapters may append intermediate `agent.turn.*` lifecycle
 events before the terminal `effect.terminal` event. These observations are
@@ -491,18 +498,38 @@ inspectable. It should not partially commit the failed rule.
 
 ## Idempotency
 
-Every effect node has a stable idempotency key derived from:
+Every effect node has a stable idempotency key, fixed **at effect creation**,
+derived only from values known at commit time:
 
 ```text
 instance_id
 program_version
 revision_epoch
-rule_name
-trigger_event_id or consumed_fact_keys
-effect_path_in_graph
-normalized_input_hash
-resolved_dependency_output_hashes, if used
+rule_commit_event_id        (identifies the committing rule firing)
+effect_node_id              (the effect's position in the committed graph)
 ```
+
+The key must not depend on resolved dependency outputs or the materialized
+input: those are not known when the downstream effect is created (its upstream
+has not run yet), so including them would make the key underivable at creation.
+Instead, the materialized input and `resolved_dependency_output_hashes` form a
+separate **execution fingerprint**, recorded with the run for replay
+verification and for model-backed effects (so a changed model/prompt/output
+schema is a different fingerprint) — they are not part of the idempotency key.
+This is the [`admission-and-idempotency.md`](admission-and-idempotency.md)
+effect-terminal key rule.
+
+Realized (2026-06-17): the runtime effect-id derivation includes `instance_id`,
+`program_version`, `revision_epoch`, the rule-commit identity, and the
+`effect_node_id`. Literally embedding the `rule_commit_event_id` is not possible —
+that event id hashes the lowering, which includes the effects, so an effect cannot
+reference it without a cycle — so the effect key instead carries the same identity
+components the commit event does (`program_version` + `revision_epoch` + rule +
+correlation identity + node), which is equivalent for dedup identity. The
+execution fingerprint is `H(materialized input, sorted upstream effect ids)`,
+recorded in the run metadata (the materialized input already embeds resolved
+dependency outputs, baked in at lowering). Invariants modeled in
+`models/maude/effect-key.maude`.
 
 Dependency satisfaction is scheduling state, not effect identity. Retries reuse
 the same effect identity unless the source rule explicitly creates a new

@@ -1,0 +1,453 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whipplescript.dev/schemas/construct_graph_v0.schema.json",
+  "title": "WhippleScript Construct Graph Artifact v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "graph_id",
+    "platform_version",
+    "package_lock_digest",
+    "package_contract_digest",
+    "source_digest",
+    "nodes",
+    "ports",
+    "edges",
+    "effect_dependencies",
+    "derived_facts",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema": {
+      "const": "whipplescript.construct_graph.v0"
+    },
+    "graph_id": {
+      "$ref": "#/$defs/id"
+    },
+    "platform_version": {
+      "$ref": "#/$defs/id"
+    },
+    "package_lock_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "package_contract_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "source_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "nodes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/node"
+      }
+    },
+    "ports": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/port"
+      }
+    },
+    "edges": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/edge"
+      }
+    },
+    "effect_dependencies": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/effect_dependency"
+      }
+    },
+    "derived_facts": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/derived_fact"
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/diagnostic"
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "span": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "start", "end"],
+      "properties": {
+        "path": {
+          "type": ["string", "null"]
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "construct": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "string_array": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/id"
+      }
+    },
+    "core_object_kind": {
+      "enum": [
+        "fact",
+        "event",
+        "signal_source",
+        "clock_source",
+        "schedule",
+        "effect",
+        "rule",
+        "dependency",
+        "projection",
+        "assertion",
+        "diagnostic"
+      ]
+    },
+    "runtime_entrypoint": {
+      "enum": [
+        "fact_record",
+        "event_record",
+        "signal_source_template",
+        "clock_source_template",
+        "schedule_template",
+        "effect_graph_template",
+        "rule_template",
+        "effect_dependency_template",
+        "event_projection",
+        "assertion_check",
+        "diagnostic_record"
+      ]
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "node_id",
+        "construct_id",
+        "construct_family",
+        "lowering_class",
+        "lifecycle_profile",
+        "owner",
+        "source_span",
+        "required_ports",
+        "produced_ports",
+        "declared_required_interfaces",
+        "declared_provided_interfaces",
+        "required_capabilities",
+        "lowered_effect_capabilities",
+        "lowering_output_kind",
+        "allowed_core_object_kinds",
+        "allowed_runtime_entrypoints"
+      ],
+      "properties": {
+        "node_id": {
+          "$ref": "#/$defs/id"
+        },
+        "construct_id": {
+          "$ref": "#/$defs/id"
+        },
+        "construct_family": {
+          "$ref": "#/$defs/id"
+        },
+        "lowering_class": {
+          "$ref": "#/$defs/id"
+        },
+        "lifecycle_profile": {
+          "enum": [
+            "none",
+            "effect_graph",
+            "typed_effect_graph",
+            "resource_effect_graph",
+            "event_record",
+            "signal_source_template",
+            "clock_source_template",
+            "schedule_template",
+            "rule_template",
+            "event_projection",
+            "assertion_check"
+          ]
+        },
+        "owner": {
+          "$ref": "#/$defs/id"
+        },
+        "source_span": {
+          "$ref": "#/$defs/span"
+        },
+        "required_ports": {
+          "$ref": "#/$defs/string_array"
+        },
+        "produced_ports": {
+          "$ref": "#/$defs/string_array"
+        },
+        "declared_required_interfaces": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/construct_interface"
+          }
+        },
+        "declared_provided_interfaces": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/construct_interface"
+          }
+        },
+        "required_capabilities": {
+          "$ref": "#/$defs/string_array"
+        },
+        "lowered_effect_capabilities": {
+          "$ref": "#/$defs/string_array"
+        },
+        "lowering_output_kind": {
+          "$ref": "#/$defs/id"
+        },
+        "allowed_core_object_kinds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/core_object_kind"
+          }
+        },
+        "allowed_runtime_entrypoints": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/runtime_entrypoint"
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "construct_interface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name", "type", "phase", "cardinality"],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/id"
+        },
+        "name": {
+          "type": ["string", "null"]
+        },
+        "type": {
+          "type": ["string", "null"]
+        },
+        "phase": {
+          "$ref": "#/$defs/id"
+        },
+        "cardinality": {
+          "enum": ["exactly-one", "optional-one", "many", "named-many"]
+        }
+      }
+    },
+    "port": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "port_id",
+        "owner_node_id",
+        "direction",
+        "kind",
+        "type",
+        "phase",
+        "resource_identity",
+        "contract_version",
+        "cardinality",
+        "source_span"
+      ],
+      "properties": {
+        "port_id": {
+          "$ref": "#/$defs/id"
+        },
+        "owner_node_id": {
+          "$ref": "#/$defs/id"
+        },
+        "direction": {
+          "enum": ["required", "produced"]
+        },
+        "kind": {
+          "enum": [
+            "Resource",
+            "Projection",
+            "Event",
+            "SignalSource",
+            "Value",
+            "EffectHandle",
+            "TerminalOutput",
+            "Capability",
+            "ProviderKind",
+            "Operation"
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/id"
+        },
+        "phase": {
+          "enum": ["compile", "runtime", "both"]
+        },
+        "resource_identity": {
+          "type": ["string", "null"]
+        },
+        "contract_version": {
+          "$ref": "#/$defs/id"
+        },
+        "cardinality": {
+          "enum": ["exactly-one", "optional-one", "many", "named-many"]
+        },
+        "source_span": {
+          "$ref": "#/$defs/span"
+        }
+      }
+    },
+    "edge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required_port_id",
+        "provider_node_id",
+        "provided_port_id",
+        "order_index",
+        "resource_key",
+        "resolution_reason",
+        "evidence"
+      ],
+      "properties": {
+        "required_port_id": {
+          "$ref": "#/$defs/id"
+        },
+        "provider_node_id": {
+          "$ref": "#/$defs/id"
+        },
+        "provided_port_id": {
+          "$ref": "#/$defs/id"
+        },
+        "order_index": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "resource_key": {
+          "type": ["string", "null"]
+        },
+        "resolution_reason": {
+          "$ref": "#/$defs/id"
+        },
+        "evidence": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "effect_dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dependency_ref",
+        "rule_name",
+        "upstream_node_id",
+        "predicate",
+        "downstream_node_id",
+        "source_span",
+        "evidence"
+      ],
+      "properties": {
+        "dependency_ref": {
+          "$ref": "#/$defs/id"
+        },
+        "rule_name": {
+          "$ref": "#/$defs/id"
+        },
+        "upstream_node_id": {
+          "$ref": "#/$defs/id"
+        },
+        "predicate": {
+          "enum": ["succeeds", "fails", "completes"]
+        },
+        "downstream_node_id": {
+          "$ref": "#/$defs/id"
+        },
+        "source_span": {
+          "$ref": "#/$defs/span"
+        },
+        "evidence": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "derived_fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["predicate", "owner_subsystem", "input_refs", "diagnostic_span"],
+      "properties": {
+        "predicate": {
+          "$ref": "#/$defs/id"
+        },
+        "owner_subsystem": {
+          "$ref": "#/$defs/id"
+        },
+        "input_refs": {
+          "$ref": "#/$defs/string_array",
+          "uniqueItems": true
+        },
+        "diagnostic_span": {
+          "$ref": "#/$defs/span"
+        }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "refs", "source_span"],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/id"
+        },
+        "severity": {
+          "enum": ["error", "warning", "info", "hint"]
+        },
+        "refs": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/string_array"
+          }
+        },
+        "source_span": {
+          "$ref": "#/$defs/span"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

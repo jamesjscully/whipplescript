@@ -1,7 +1,7 @@
 # Sum types: data-carrying enum variants
 
 Status: spec drafted 2026-06-10 from decided design
-([`language-ergonomics-tracker.md`](language-ergonomics-tracker.md) C1).
+([`language-ergonomics-tracker.md`](decision-records/language-ergonomics-tracker.md) C1).
 Stage: spec -> modeling -> implementation + testing -> review.
 
 ## Framing
@@ -16,7 +16,9 @@ union of variant records.**
 The feature exists to make illegal states unrepresentable: an `Approved`
 outcome that carries a `score` and a `Rejected` outcome that carries a
 `reason` cannot be confused, and `case` over them is exhaustive. This matters
-most for the typed outputs of model decisions (`coerce`/`decide`), which is
+most for the typed outputs of model decisions (`coerce` and `decide`, the core
+anonymous-coercion sugar that lowers to a generated `coerce` — see
+[`language.md`](language.md)), which is
 where the language's control flow actually branches — and it protects the
 LLM-author audience from the largest bug class: forgetting that a payload is
 present only for one outcome.
@@ -120,9 +122,9 @@ Synthesized from the variant name; never written in source.
   generated state classes. It is a documented, inspectable convention, not
   hidden state.
 - The variant name is the single source of truth: the author cannot typo or
-  desynchronize the tag, and the WS↔BAML contract is mechanical (below).
+  desynchronize the tag, and the WS↔coerce contract is mechanical (below).
 
-Not `$variant`: a `$`-prefixed key risks reservation in BAML / JSON-schema
+Not `$variant`: a `$`-prefixed key risks reservation in coerce / JSON-schema
 surfaces. A plain reserved identifier (`variant`) avoids that and reads
 cleanly in raw fact JSON.
 
@@ -147,20 +149,23 @@ Runtime representation is internally tagged JSON:
 ```
 
 WS's runtime `case` compares `variant` **exactly** — by the time a fact exists,
-BAML's parser has already normalized the tag to the canonical schema value
-(see below), so no fuzzy matching is needed on the WS side.
+the schema-coercion boundary has already normalized or rejected the value, so no
+fuzzy matching is needed on the WS side.
 
-## BAML mapping
+## Schema Coercion And coerce Backend Mapping
 
-This is the integration crux, and it is settled by evidence from BAML's
-Schema-Aligned Parsing (SAP) source (`baml-lib/jsonish`), not by assumption.
+This is the integration crux. coerce is one backend for schema coercion, and the
+coerce-specific behavior below is settled by evidence from coerce's Schema-Aligned
+Parsing (SAP) source (`coerce-lib/jsonish`), not by assumption.
 
-- A WS sum type corresponds to a **BAML union of classes**, each class
-  carrying the literal `variant` field plus payload. WhippleScript generates
-  no BAML source: as with all `coerce` output types today, the user defines
-  the type in a `.baml` file and WS references it by name. A WS data-carrying
-  enum is WS's typed, case-dispatchable **view** of that BAML union.
-- BAML union resolution is **deterministic scoring**, not best-effort JSON
+- A WS sum type corresponds to a **coerce union of classes**, each class carrying
+  the literal `variant` field plus payload. In generated mode, WhippleScript
+  declarations are the source of truth and the coerce artifact is emitted from
+  them. In interop mode, a user may bind an existing `.coerce` union explicitly,
+  and the checker must cross-validate it against the WS sum type. A WS
+  data-carrying enum is WS's typed, case-dispatchable view of that coerced
+  value.
+- coerce union resolution is **deterministic scoring**, not best-effort JSON
   parsing: SAP coerces the model output against every variant, assigns a
   penalty score, and picks the lowest (`coerce_union.rs`). A literal
   discriminant is decisive — the matching arm scores 0 and short-circuits; a
@@ -172,20 +177,20 @@ Schema-Aligned Parsing (SAP) source (`baml-lib/jsonish`), not by assumption.
   strip-punctuation → case-insensitive → unaccented → substring), so a model
   emitting `"approved"`, `"APPROVED."`, or `" approved "` still resolves to
   the canonical `"Approved"` before WS sees the fact.
-- BAML's own suite covers exactly this shape (`test_unions.rs`: discriminated
+- coerce's own suite covers exactly this shape (`test_unions.rs`: discriminated
   picker unions, action-type unions), so the union-of-tagged-classes path is
   proven, not speculative — no live-model spike required.
 - Graceful failure: if the model emits something so far off that no variant
-  scores acceptably, BAML returns a coerce **failure**, which surfaces as
+  scores acceptably, coerce returns a coerce **failure**, which surfaces as
   `after <coerce> fails` — an existing, modeled branch. The feature degrades
   into a path the language already handles.
-- `check` cross-validates the WS enum against the referenced BAML type through
-  the schema hashes already carried in the coerce request, so WS-side
-  variants and the BAML union cannot silently diverge.
+- `check` cross-validates the WS enum against the generated or referenced coerce
+  type through schema hashes carried in the coerce request, so WS-side variants
+  and the coerce union cannot silently diverge.
 
 ## Fixture
 
-`fixture_baml_value` returns one tagged variant deterministically (the first
+`fixture_coerce_value` returns one tagged variant deterministically (the first
 declared variant) so local fixture runs exercise the success path; a
 `--variant <name>` fixture knob selects another arm to exercise its `case`
 branch without a real provider.
@@ -198,8 +203,8 @@ branch without a real provider.
 - Payload field access outside a matched `case` branch is a check error.
 - `case` over a sum type must be exhaustive (or carry `_`/`default`), reusing
   the existing coverage checker.
-- A sum type used as a `coerce` output is cross-validated against the
-  referenced BAML type.
+- A sum type used as a `coerce` output is cross-validated against the selected
+  schema-coercion backend artifact.
 - Bare-only enums are unaffected: no new diagnostics fire for them.
 
 ## Scope and staging
@@ -225,8 +230,8 @@ discriminated union plus `case` dispatch, all visible to inspection.
   branch; no value matches two variants (property test over generated tags).
 - Exhaustiveness soundness: a `case` accepted as exhaustive handles every
   variant a value can hold; a `_`-free `case` missing a variant is rejected.
-- BAML round-trip: a value BAML produces for the referenced union parses back
+- coerce round-trip: a value coerce produces for the referenced union parses back
   into exactly the WS variant whose `variant` tag it carries (golden tests
-  against the BAML fixture).
+  against the coerce fixture).
 - Failure path: a coerce whose output matches no variant lands `failed` and
   routes to `after <coerce> fails`, never an untagged or partial fact.

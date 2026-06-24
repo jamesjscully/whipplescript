@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whipplescript.local/schemas/artifact_model_search_obligations_v0.schema.json",
+  "title": "WhippleScript artifact model-search obligations v0",
+  "type": "object",
+  "required": [
+    "schema",
+    "source_hash",
+    "ir_hash",
+    "package_contract_digest",
+    "construct_graph_id",
+    "accepted_program_digest",
+    "generator",
+    "obligations"
+  ],
+  "properties": {
+    "schema": {"const": "whipplescript.artifact_model_search_obligations.v0"},
+    "source_hash": {"$ref": "#/$defs/stable_digest"},
+    "ir_hash": {"$ref": "#/$defs/stable_digest"},
+    "package_contract_digest": {"$ref": "#/$defs/digest"},
+    "construct_graph_id": {"type": "string", "minLength": 1},
+    "accepted_program_digest": {"$ref": "#/$defs/digest"},
+    "generator": {"type": "string", "minLength": 1},
+    "obligations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/artifact_model_search_obligation"}
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "stable_digest": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+    "span": {
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "path": {"type": ["string", "null"]},
+        "start": {"type": "integer", "minimum": 0},
+        "end": {"type": "integer", "minimum": 0},
+        "construct": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "artifact_model_search_obligation": {
+      "type": "object",
+      "required": [
+        "category",
+        "index",
+        "description",
+        "upstream",
+        "predicate",
+        "downstream",
+        "expected",
+        "source_span"
+      ],
+      "properties": {
+        "category": {
+          "enum": [
+            "artifact.construct_graph",
+            "artifact.lowered_ir",
+            "artifact.platform_catalog"
+          ]
+        },
+        "index": {"type": "integer", "minimum": 1},
+        "description": {"type": "string", "minLength": 1},
+        "upstream": {"type": "string", "minLength": 1},
+        "predicate": {"type": "string", "minLength": 1},
+        "downstream": {"type": "string", "minLength": 1},
+        "expected": {"enum": ["solution", "no_solution"]},
+        "source_span": {"$ref": "#/$defs/span"}
+      },
+      "additionalProperties": true
+    }
+  }
+}

@@ -1,12 +1,12 @@
 use std::fs;
 
 use whipplescript_kernel::{
-    coerce::{BamlCoerceRequest, FakeBamlClient},
+    coerce::{CoerceRequest, FakeCoerceClient},
     harness::MockAgentHarness,
     idempotency_key,
     loft::{FakeLoftClient, LoftAction, LoftEffectRequest},
     trace::check_trace,
-    AgentTurnExecution, BamlCoerceExecution, HumanAskExecution, LoftEffectExecution,
+    AgentTurnExecution, CoerceExecution, HumanAskExecution, LoftEffectExecution,
     ProgramVersionInput, RuntimeKernel,
 };
 use whipplescript_parser::compile_program;
@@ -205,25 +205,25 @@ fn e2e_coerce_success_and_failure_branches_are_deterministic() {
         &success_instance,
         effect(
             "classification",
-            "baml.coerce",
+            "coerce",
             r#"{"function_name":"classifyMessage"}"#,
         ),
         "classify_request",
     );
     let request = coerce_request();
     success_kernel
-        .run_baml_coerce(
-            BamlCoerceExecution {
+        .run_coerce(
+            CoerceExecution {
                 instance_id: &success_instance,
                 effect_id: "classification",
                 run_id: "run-classification",
-                provider: "fake-baml",
+                provider: "fake-coerce",
                 worker_id: "worker-1",
                 lease_id: "lease-classification",
                 lease_expires_at: "2030-01-01T00:00:00Z",
                 request: &request,
             },
-            &FakeBamlClient::succeeds(
+            &FakeCoerceClient::succeeds(
                 r#"{"priority":"Urgent","summary":"triage now","confidence":0.99}"#,
             ),
         )
@@ -234,13 +234,13 @@ fn e2e_coerce_success_and_failure_branches_are_deterministic() {
         .list_facts(&success_instance)
         .expect("facts list")
         .iter()
-        .any(|fact| fact.name == "baml.coerce.succeeded"));
+        .any(|fact| fact.name == "coerce.succeeded"));
 
     let (mut failure_kernel, failure_instance) = kernel_from_source("CoerceBranch", source);
     let effects = [
         effect(
             "classification",
-            "baml.coerce",
+            "coerce",
             r#"{"function_name":"classifyMessage"}"#,
         ),
         effect("fallback", "human.ask", r#"{"prompt":"classify manually"}"#),
@@ -265,18 +265,18 @@ fn e2e_coerce_success_and_failure_branches_are_deterministic() {
         })
         .expect("coerce failure rule commits");
     failure_kernel
-        .run_baml_coerce(
-            BamlCoerceExecution {
+        .run_coerce(
+            CoerceExecution {
                 instance_id: &failure_instance,
                 effect_id: "classification",
                 run_id: "run-classification",
-                provider: "fake-baml",
+                provider: "fake-coerce",
                 worker_id: "worker-1",
                 lease_id: "lease-classification",
                 lease_expires_at: "2030-01-01T00:00:00Z",
                 request: &request,
             },
-            &FakeBamlClient::fails("invalid classification"),
+            &FakeCoerceClient::fails("invalid classification"),
         )
         .expect("coerce failure records");
     failure_kernel
@@ -302,7 +302,7 @@ fn e2e_coerce_success_and_failure_branches_are_deterministic() {
     let facts = failure_store
         .list_facts(&failure_instance)
         .expect("facts list");
-    assert!(facts.iter().any(|fact| fact.name == "baml.coerce.failed"));
+    assert!(facts.iter().any(|fact| fact.name == "coerce.failed"));
     assert!(facts.iter().any(|fact| fact.name == "human.ask.created"));
 }
 
@@ -440,8 +440,8 @@ fn e2e_lease_expiry_and_retry_recover_effects() {
 
 #[test]
 fn e2e_capability_denial_blocks_with_useful_status() {
-    let source = include_str!("../../../examples/plugin-memory.whip");
-    let (mut kernel, instance_id) = kernel_from_source("PluginMemory", source);
+    let source = include_str!("../../../examples/package-memory.whip");
+    let (mut kernel, instance_id) = kernel_from_source("PackageMemory", source);
     let denied = NewEffect {
         timeout_seconds: None,
         effect_id: "write",
@@ -480,15 +480,17 @@ fn e2e_capability_denial_blocks_with_useful_status() {
 }
 
 #[test]
-fn e2e_plugin_registered_effect_runs_through_outbox() {
-    let source = include_str!("../../../examples/plugin-memory.whip");
+fn e2e_legacy_manifest_registered_effect_runs_through_outbox() {
+    let source = include_str!("../../../examples/package-memory.whip");
     let compiled = compile_program(source);
     assert_eq!(compiled.diagnostics, Vec::new());
     let ir = compiled.ir.expect("source compiles");
     let store = SqliteStore::open_in_memory().expect("store opens");
     store
-        .register_plugin_manifest(include_str!("../../../examples/plugins/memory.json"))
-        .expect("memory plugin registers");
+        .register_package_manifest(include_str!(
+            "../../../examples/legacy-plugin-manifests/memory.json"
+        ))
+        .expect("legacy memory manifest registers");
     let mut kernel = RuntimeKernel::new(store);
     let version = kernel
         .create_program_version(ProgramVersionInput {
@@ -526,19 +528,19 @@ fn e2e_plugin_registered_effect_runs_through_outbox() {
             instance_id: &instance_id,
             effect_id: "context",
             run_id: "run-context",
-            provider: "memory-plugin",
+            provider: "memory-legacy-provider",
             worker_id: "worker-1",
             lease_id: "lease-context",
             lease_expires_at: "2030-01-01T00:00:00Z",
             metadata_json: "{}",
         })
-        .expect("plugin effect starts");
+        .expect("legacy package effect starts");
     kernel
         .complete_run(EffectCompletion {
             instance_id: &instance_id,
             effect_id: "context",
             run_id: "run-context",
-            provider: "memory-plugin",
+            provider: "memory-legacy-provider",
             worker_id: "worker-1",
             status: "ignored",
             exit_code: Some(0),
@@ -546,9 +548,9 @@ fn e2e_plugin_registered_effect_runs_through_outbox() {
             metadata_json: r#"{"records":[]}"#,
             idempotency_key: Some("complete-context"),
         })
-        .expect("plugin effect completes");
+        .expect("legacy package effect completes");
 
-    assert_e2e_trace("plugin-effect", &kernel);
+    assert_e2e_trace("legacy-package-effect", &kernel);
     let store = kernel.into_store();
     let effects = store.list_effects(&instance_id).expect("effects list");
     assert_eq!(effects[0].kind, "memory.query");
@@ -702,8 +704,8 @@ fn e2e_pause_resume_and_cancel_gate_provider_starts() {
 
 #[test]
 fn e2e_restart_rebuilds_projection_from_event_log() {
-    let source = include_str!("../../../examples/plugin-memory.whip");
-    let (mut kernel, instance_id) = kernel_from_source("PluginMemory", source);
+    let source = include_str!("../../../examples/package-memory.whip");
+    let (mut kernel, instance_id) = kernel_from_source("PackageMemory", source);
     let effects = [
         effect("context", "memory.query", r#"{"query":"issue"}"#),
         effect("tell", "agent.tell", r#"{"prompt":"use memory"}"#),
@@ -1355,12 +1357,12 @@ fn loft_claim_request(issue_id: &str, command_id: &str) -> LoftEffectRequest {
     }
 }
 
-fn coerce_request() -> BamlCoerceRequest {
-    BamlCoerceRequest {
+fn coerce_request() -> CoerceRequest {
+    CoerceRequest {
         function_name: "classifyMessage".to_owned(),
         arguments_json: r#"{"title":"pager","body":"production is down"}"#.to_owned(),
         output_type: "MessageClassification".to_owned(),
-        generated_baml_source_hash: "baml-source".to_owned(),
+        generated_coerce_source_hash: "coerce-source".to_owned(),
         input_schema_hash: "input-schema".to_owned(),
         output_schema_hash: "output-schema".to_owned(),
     }

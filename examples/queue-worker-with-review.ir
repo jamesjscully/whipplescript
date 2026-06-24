@@ -31,7 +31,7 @@ rules
     effects
       lease kind=queue.claim binding=lease key=252c03eef6eb637c
       turn kind=agent.tell binding=turn key=1d124f49240816a7
-      review kind=baml.coerce binding=review key=59e9a2973cc477c2
+      review kind=coerce binding=review key=d9e1c7e7a0918dcc
       effect4 kind=queue.finish binding=- key=aabf35896b0239ad
       effect5 kind=queue.release binding=- key=3b95f9b3fc1d5dba
       effect6 kind=human.ask binding=- key=631378576107ef4f

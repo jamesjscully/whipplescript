@@ -22,15 +22,43 @@ use crate::{
 /// use it.
 pub const FLOW_STATE_PREFIX: &str = "FlowAwait_";
 
-pub fn expand_flow(flow: FlowDecl, diagnostics: &mut Vec<Diagnostic>) -> Vec<Item> {
+pub fn expand_flow(
+    flow: FlowDecl,
+    diagnostics: &mut Vec<Diagnostic>,
+    warnings: &mut Vec<Diagnostic>,
+) -> Vec<Item> {
     let (ast, body_diagnostics) =
         body::parse_rule_body(&flow.body.text, flow.body.span.start, BodyMode::Flow);
     diagnostics.extend(body_diagnostics);
 
+    // Liveness: when a flow is a terminal path (it contains an inline `complete`/
+    // `fail`), every branch — each `on fails`/`on timeout` handler and both arms of
+    // every internal `when ... { } else { }` — must reach a workflow terminal, or
+    // the workflow can stall on that branch (spec/static-analysis.md "Flow
+    // liveness"). Severity is `warning`. Modeled in models/maude/flow-liveness.maude.
+    check_flow_liveness(&flow.name.name, &ast.statements, warnings);
+
+    // 503 auto-fail scope: only a self-terminating flow (one that owns reaching a
+    // terminal via an inline `complete`/`fail`) auto-fails an unhandled effect
+    // failure. A pure fact-hand-off flow is left to the broader workflow-liveness
+    // analysis — the same scoping `check_flow_liveness` uses. Modeled in
+    // models/maude/flow-autofail.maude.
+    let flow_self_terminating = flow_contains_terminal(&ast.statements);
+
+    // Only a CLASS trigger can be carried across an `askHuman` boundary: its
+    // flow-state field is typed `Ref(schema)` (see `await_class`). A SIGNAL
+    // trigger has a dotted schema (e.g. `deploy.finished`) with no class to
+    // reference, so `await_class` omits the `t` field — and the post-ask
+    // segments must omit reading `flowState.t` to match, or they reference a
+    // field that was never written (`class FlowAwait_<flow>_<n> has no field t`).
+    // Dropping it here keeps read and write consistent; a post-ask segment that
+    // genuinely needs a signal-trigger field then gets a clear unknown-binding
+    // error instead of a confusing internal one.
     let trigger_binding = flow
         .whens
         .iter()
-        .find_map(|when| crate::binding_from_when(&when.text));
+        .find_map(|when| crate::binding_from_when(&when.text))
+        .filter(|(_, schema)| !schema.contains('.'));
 
     // Split at human-ask boundaries. A `when/else` branch is only valid as
     // the first statement of a post-ask segment (its condition reads the
@@ -41,7 +69,7 @@ pub fn expand_flow(flow: FlowDecl, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ite
         match statement {
             BodyStmt::Effect(effect) if matches!(effect.kind, BodyEffectKind::AskHuman { .. }) => {
                 let binding = effect.binding.clone().unwrap_or_else(|| {
-                    diagnostics.push(Diagnostic {
+                    diagnostics.push(Diagnostic { related: Vec::new(),
                         span: effect.span,
                         message: format!(
                             "flow `{}` has an `askHuman` step without an `as` binding",
@@ -70,16 +98,23 @@ pub fn expand_flow(flow: FlowDecl, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ite
                 segments.push(Segment::default());
             }
             BodyStmt::Branch(branch) => {
+                // A `when/else` branch is only valid as the FIRST statement of a
+                // POST-ask segment (it decides on the human answer). An ask always
+                // opens a new segment, so `segments.len() == 1` means we are still
+                // in the initial pre-ask segment — a branch there has no answer to
+                // read and otherwise silently lowers to seg rules that consume an
+                // unestablished `flowState` (a confusing internal error).
+                let is_pre_ask = segments.len() == 1;
                 let segment = segments.last_mut().expect("segment exists");
-                if !segment.statements.is_empty() || segment.branch.is_some() {
-                    diagnostics.push(Diagnostic {
+                if is_pre_ask || !segment.statements.is_empty() || segment.branch.is_some() {
+                    diagnostics.push(Diagnostic { related: Vec::new(),
                         span: branch.span,
                         message: format!(
                             "flow `{}` has a `when/else` branch that does not directly follow an `askHuman` step",
                             flow.name.name
                         ),
                         suggestion: Some(
-                            "v1 flow branches decide on a human answer; place `when ... { } else { }` immediately after the ask"
+                            "a v1 flow `when/else` decides on a human answer — place it immediately after an `askHuman`; to branch on a fact, use a rule with `case`"
                                 .to_owned(),
                         ),
                     });
@@ -88,11 +123,27 @@ pub fn expand_flow(flow: FlowDecl, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ite
                 segment.branch = Some(branch);
             }
             other => {
-                segments
-                    .last_mut()
-                    .expect("segment exists")
-                    .statements
-                    .push(other);
+                let segment = segments.last_mut().expect("segment exists");
+                // A `when/else` branch ends its segment — each arm decides the
+                // flow's continuation. A statement after the branch in the same
+                // segment otherwise lowers to a generated rule that reads a
+                // flow-state field the branch never wrote (`class FlowAwait_…
+                // has no field <x>`), so reject it with a clear message.
+                if segment.branch.is_some() {
+                    diagnostics.push(Diagnostic { related: Vec::new(),
+                        span: flow.span,
+                        message: format!(
+                            "flow `{}` has a statement after a `when/else` branch",
+                            flow.name.name
+                        ),
+                        suggestion: Some(
+                            "a flow `when/else` branch ends its segment — each arm decides the outcome; move trailing work into the branch arms"
+                                .to_owned(),
+                        ),
+                    });
+                    continue;
+                }
+                segment.statements.push(other);
             }
         }
     }
@@ -100,6 +151,58 @@ pub fn expand_flow(flow: FlowDecl, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ite
     let mut items = Vec::new();
     let flow_name = flow.name.name.clone();
     let segment_count = segments.len();
+
+    // Bindings shared across `askHuman` boundaries (a flow is "one fixed sequence
+    // with shared bindings"). A pre-ask `tell` result REFERENCED in a later
+    // segment is carried through flow state; they are typed `AgentTurn` (tell
+    // results — no SemanticContext needed). `carried_per_segment[k]` is the set
+    // available to segment k. Only referenced bindings are carried (no bloat, and
+    // no snapshot churn for flows that don't reach back across the boundary).
+    let pre_ask_tells: Vec<(String, usize)> = segments
+        .iter()
+        .enumerate()
+        .flat_map(|(i, segment)| {
+            segment
+                .statements
+                .iter()
+                .filter_map(move |statement| match statement {
+                    BodyStmt::Effect(effect)
+                        if matches!(effect.kind, BodyEffectKind::Tell { .. }) =>
+                    {
+                        effect.binding.clone().map(|binding| (binding, i))
+                    }
+                    _ => None,
+                })
+        })
+        .collect();
+    let candidate_names: Vec<String> = pre_ask_tells
+        .iter()
+        .map(|(binding, _)| binding.clone())
+        .collect();
+    // Reference text marks each candidate binding with a sentinel ONLY where it
+    // appears in a value position (the serializer applies the renamer to values,
+    // not field names) — so a field named like a binding (`plan signoff.text`)
+    // does not count as a reference.
+    let reference_sentinel = |name: &str| format!("\u{1}{name}\u{1}");
+    let segment_texts: Vec<String> = segments
+        .iter()
+        .map(|segment| segment_reference_text(segment, &candidate_names, &reference_sentinel))
+        .collect();
+    let carried_per_segment: Vec<Vec<String>> = (0..segment_count)
+        .map(|k| {
+            let mut carried = Vec::new();
+            for (binding, defined_at) in &pre_ask_tells {
+                let sentinel = reference_sentinel(binding);
+                if *defined_at < k
+                    && !carried.contains(binding)
+                    && (k..segment_count).any(|s| segment_texts[s].contains(&sentinel))
+                {
+                    carried.push(binding.clone());
+                }
+            }
+            carried
+        })
+        .collect();
 
     // The ask binding ending each segment leads into the next segment, where
     // it is renamed to `answer`. Captured explicitly here so post-ask
@@ -119,6 +222,7 @@ pub fn expand_flow(flow: FlowDecl, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ite
                 &flow_name,
                 index + 1,
                 trigger_binding.as_ref(),
+                &carried_per_segment[index + 1],
                 flow.span,
             )));
         }
@@ -127,10 +231,26 @@ pub fn expand_flow(flow: FlowDecl, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ite
     for (index, segment) in segments.into_iter().enumerate() {
         let prior_ask = prior_ask_bindings.get(index).cloned().flatten();
         let entry = index == 0;
-        let rename = if entry {
+        // Post-ask segments rewrite references to the trigger fact and to any
+        // carried pre-ask bindings so they read from flow state. The renamer is
+        // applied only to statement value-positions (via `print_statement_rn`),
+        // so field names — including the carried binding names in the boundary
+        // `record` below — are never corrupted.
+        let trigger_name: Option<String> = if entry {
             None
         } else {
             trigger_binding.as_ref().map(|(binding, _)| binding.clone())
+        };
+        let carried_here = &carried_per_segment[index];
+        let renamer = |text: &str| -> String {
+            let mut renamed = text.to_owned();
+            if let Some(trigger) = &trigger_name {
+                renamed = rename_text(&renamed, Some(trigger), "flowState.t");
+            }
+            for carried in carried_here {
+                renamed = rename_text(&renamed, Some(carried), &format!("flowState.{carried}"));
+            }
+            renamed
         };
 
         let mut body_text = String::new();
@@ -165,42 +285,65 @@ pub fn expand_flow(flow: FlowDecl, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ite
                         }
                         None => (false, 1),
                     };
-                    print_statement(
+                    print_statement_rn(
                         &BodyStmt::Effect(effect),
                         body_depth,
-                        rename.as_deref(),
+                        &renamer,
                         &mut body_text,
                     );
                     if open_depth {
                         push_stmt_line(&mut body_text, 1, "}");
                     }
                     // Immediate handlers become sibling failure branches.
+                    let mut has_on_fails = false;
                     while matches!(statements.peek(), Some(BodyStmt::Handler(_))) {
                         if let Some(BodyStmt::Handler(handler)) = statements.next() {
                             let predicate = match handler.kind {
                                 HandlerKind::OnFails => "fails",
-                                HandlerKind::OnTimeout => "completes",
+                                // `on timeout` fires only on a timeout — NOT on
+                                // success. (Was wrongly `completes`, which fires on
+                                // any terminal, so the handler ran on success.)
+                                HandlerKind::OnTimeout => "times out",
                             };
+                            if handler.kind == HandlerKind::OnFails {
+                                has_on_fails = true;
+                            }
                             push_stmt_line(
                                 &mut body_text,
                                 1,
                                 &format!("after {step_binding} {predicate} {{"),
                             );
                             for inner in &handler.body {
-                                print_statement(inner, 2, rename.as_deref(), &mut body_text);
+                                print_statement_rn(inner, 2, &renamer, &mut body_text);
                             }
                             push_stmt_line(&mut body_text, 1, "}");
                         }
+                    }
+                    // 503 auto-fail: in a self-terminating flow, an effect step with
+                    // no `on fails` handler has an unhandled failure path that would
+                    // otherwise stall the workflow forever. Route it to the generic
+                    // `flowfail` terminal (kernel `fail_instance_internal`). Skipped
+                    // when the author wrote an `on fails` handler (the failure is
+                    // handled) or when the flow is not self-terminating (deferred to
+                    // workflow-liveness). Modeled in models/maude/flow-autofail.maude.
+                    if flow_self_terminating && !has_on_fails {
+                        push_stmt_line(
+                            &mut body_text,
+                            1,
+                            &format!("after {step_binding} fails {{"),
+                        );
+                        push_stmt_line(&mut body_text, 2, "flowfail");
+                        push_stmt_line(&mut body_text, 1, "}");
                     }
                     previous_step = Some(step_binding);
                 }
                 other => match &previous_step {
                     Some(previous) => {
                         push_stmt_line(&mut body_text, 1, &format!("after {previous} succeeds {{"));
-                        print_statement(other, 2, rename.as_deref(), &mut body_text);
+                        print_statement_rn(other, 2, &renamer, &mut body_text);
                         push_stmt_line(&mut body_text, 1, "}");
                     }
-                    None => print_statement(other, 1, rename.as_deref(), &mut body_text),
+                    None => print_statement_rn(other, 1, &renamer, &mut body_text),
                 },
             }
         }
@@ -212,10 +355,10 @@ pub fn expand_flow(flow: FlowDecl, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ite
                 }
                 None => (false, 1),
             };
-            print_statement(
+            print_statement_rn(
                 &BodyStmt::Effect(boundary.ask.clone()),
                 body_depth,
-                rename.as_deref(),
+                &renamer,
                 &mut body_text,
             );
             if open_depth {
@@ -224,7 +367,8 @@ pub fn expand_flow(flow: FlowDecl, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ite
             for handler in &boundary.handlers {
                 let predicate = match handler.kind {
                     HandlerKind::OnFails => "fails",
-                    HandlerKind::OnTimeout => "completes",
+                    // `on timeout` fires only on a timeout, not on success.
+                    HandlerKind::OnTimeout => "times out",
                 };
                 push_stmt_line(
                     &mut body_text,
@@ -232,7 +376,7 @@ pub fn expand_flow(flow: FlowDecl, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ite
                     &format!("after {} {predicate} {{", boundary.ask_binding),
                 );
                 for statement in &handler.body {
-                    print_statement(statement, 2, rename.as_deref(), &mut body_text);
+                    print_statement_rn(statement, 2, &renamer, &mut body_text);
                 }
                 push_stmt_line(&mut body_text, 1, "}");
             }
@@ -251,6 +395,19 @@ pub fn expand_flow(flow: FlowDecl, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ite
                     "flowState.t".to_owned()
                 };
                 push_stmt_line(&mut body_text, 3, &format!("t {source}"));
+            }
+            // Carry pre-ask bindings forward into the next segment's await state.
+            // A binding defined in THIS segment is a live binding here (source =
+            // its name); one carried from an earlier segment is already read from
+            // state (source = `flowState.<name>` — chaining). These lines are
+            // emitted manually, so the carried field names are not renamed.
+            for carried in &carried_per_segment[index + 1] {
+                let source = if carried_here.contains(carried) {
+                    format!("flowState.{carried}")
+                } else {
+                    carried.clone()
+                };
+                push_stmt_line(&mut body_text, 3, &format!("{carried} {source}"));
             }
             push_stmt_line(&mut body_text, 2, "}");
             push_stmt_line(&mut body_text, 1, "}");
@@ -302,19 +459,22 @@ pub fn expand_flow(flow: FlowDecl, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ite
                     if let Some((binding, _)) = trigger_binding.as_ref() {
                         text = rename_text(&text, Some(binding), "flowState.t");
                     }
+                    for carried in carried_here {
+                        text = rename_text(&text, Some(carried), &format!("flowState.{carried}"));
+                    }
                 }
                 rename_text(&text, prior_ask.as_deref(), "answer")
             };
             let mut then_text = String::from("  done flowState\n");
             for statement in &branch.then_body {
-                print_statement(statement, 1, rename.as_deref(), &mut then_text);
+                print_statement_rn(statement, 1, &renamer, &mut then_text);
             }
             let then_text = rename_text(&then_text, prior_ask.as_deref(), "answer");
             items.push(make_rule("_then", Some(condition.clone()), then_text));
             if let Some(else_body) = &branch.else_body {
                 let mut else_text = String::from("  done flowState\n");
                 for statement in else_body {
-                    print_statement(statement, 1, rename.as_deref(), &mut else_text);
+                    print_statement_rn(statement, 1, &renamer, &mut else_text);
                 }
                 let else_text = rename_text(&else_text, prior_ask.as_deref(), "answer");
                 items.push(make_rule(
@@ -339,6 +499,176 @@ pub fn expand_flow(flow: FlowDecl, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ite
     items
 }
 
+/// Flow branch-completeness liveness (spec/static-analysis.md). Gated on the flow
+/// being a terminal path — i.e. it contains an inline `complete`/`fail` somewhere.
+/// In that case every explicitly-branching position (each `on fails`/`on timeout`
+/// handler body and both arms of every `when ... { } else { }`, including a missing
+/// `else`) must reach a workflow terminal, or the workflow can stall on that branch.
+/// Pure fact-hand-off flows (no inline terminal) are deferred to the broader
+/// workflow-liveness lint. Severity is `warning`. Modeled in
+/// `models/maude/flow-liveness.maude`.
+fn check_flow_liveness(flow_name: &str, statements: &[BodyStmt], warnings: &mut Vec<Diagnostic>) {
+    if !flow_contains_terminal(statements) {
+        return;
+    }
+    check_flow_branches(flow_name, statements, warnings);
+    check_flow_effect_timeouts(flow_name, statements, warnings);
+}
+
+/// An effect with an explicit `timeout <duration>` anticipates timing out, yet a
+/// flow only routes the timeout to a terminal through an `on timeout` handler (it
+/// lowers to an `after <effect> times out { ... }` block). An effect that sets a
+/// timeout but attaches no `on timeout` handler leaves the timeout path with no
+/// workflow terminal — the flow stalls when it fires (spec/static-analysis.md). The
+/// failure path is deliberately NOT required here: any effect can fail, so requiring
+/// `on fails` everywhere would over-report; an explicit timeout is opt-in intent.
+fn check_flow_effect_timeouts(
+    flow_name: &str,
+    statements: &[BodyStmt],
+    warnings: &mut Vec<Diagnostic>,
+) {
+    for (index, statement) in statements.iter().enumerate() {
+        match statement {
+            BodyStmt::Effect(effect) if effect.timeout_seconds.is_some() => {
+                // Handlers attach as the sibling `BodyStmt::Handler`s immediately
+                // following the effect in the same body.
+                let handled = statements[index + 1..]
+                    .iter()
+                    .take_while(|s| matches!(s, BodyStmt::Handler(_)))
+                    .any(|s| {
+                        matches!(
+                            s,
+                            BodyStmt::Handler(handler) if handler.kind == HandlerKind::OnTimeout
+                        )
+                    });
+                if !handled {
+                    warnings.push(Diagnostic { related: Vec::new(),
+                        span: effect.span,
+                        message: format!(
+                            "flow `{flow_name}` effect sets a `timeout` but has no `on timeout` handler: the timeout path reaches no workflow terminal"
+                        ),
+                        suggestion: Some(
+                            "add `on timeout { ... }` reaching a `complete`/`fail`, or drop the `timeout`".to_owned(),
+                        ),
+                    });
+                }
+            }
+            BodyStmt::After(after) => check_flow_effect_timeouts(flow_name, &after.body, warnings),
+            BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    check_flow_effect_timeouts(flow_name, &branch.body, warnings);
+                }
+            }
+            BodyStmt::Branch(branch) => {
+                check_flow_effect_timeouts(flow_name, &branch.then_body, warnings);
+                if let Some(else_body) = &branch.else_body {
+                    check_flow_effect_timeouts(flow_name, else_body, warnings);
+                }
+            }
+            BodyStmt::Handler(handler) => {
+                check_flow_effect_timeouts(flow_name, &handler.body, warnings)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `statements` reach an inline `complete`/`fail` along any nested path.
+fn flow_contains_terminal(statements: &[BodyStmt]) -> bool {
+    statements.iter().any(|statement| match statement {
+        BodyStmt::Terminal(_) => true,
+        BodyStmt::After(after) => flow_contains_terminal(&after.body),
+        BodyStmt::Case(case) => case
+            .branches
+            .iter()
+            .any(|branch| flow_contains_terminal(&branch.body)),
+        BodyStmt::Branch(branch) => {
+            flow_contains_terminal(&branch.then_body)
+                || branch
+                    .else_body
+                    .as_deref()
+                    .is_some_and(flow_contains_terminal)
+        }
+        BodyStmt::Handler(handler) => flow_contains_terminal(&handler.body),
+        _ => false,
+    })
+}
+
+/// Whether a branch body "settles": reaches a workflow terminal or a fact hand-off
+/// (a `record`, or a `done … -> record …`) a workflow rule can complete from. The
+/// fact hand-off is a conservative escape so the lint never flags a branch that
+/// advances the workflow indirectly (zero false positives, at the cost of missing a
+/// hand-off whose fact no rule actually terminates).
+fn flow_branch_settles(statements: &[BodyStmt]) -> bool {
+    statements.iter().any(|statement| match statement {
+        BodyStmt::Terminal(_) | BodyStmt::Record(_) => true,
+        BodyStmt::Done { replacement, .. } => replacement.is_some(),
+        BodyStmt::After(after) => flow_branch_settles(&after.body),
+        BodyStmt::Case(case) => case
+            .branches
+            .iter()
+            .any(|branch| flow_branch_settles(&branch.body)),
+        BodyStmt::Branch(branch) => {
+            flow_branch_settles(&branch.then_body)
+                || branch.else_body.as_deref().is_some_and(flow_branch_settles)
+        }
+        BodyStmt::Handler(handler) => flow_branch_settles(&handler.body),
+        _ => false,
+    })
+}
+
+/// Walk every branching position, flagging arms that do not settle, then descend so
+/// nested branches inside a settling arm are still checked at their own granularity.
+fn check_flow_branches(flow_name: &str, statements: &[BodyStmt], warnings: &mut Vec<Diagnostic>) {
+    let stall = |warnings: &mut Vec<Diagnostic>, span: SourceSpan, what: &str| {
+        warnings.push(Diagnostic { related: Vec::new(),
+            span,
+            message: format!(
+                "flow `{flow_name}` {what} reaches no workflow terminal: every branch of a terminal flow must `complete` or `fail`"
+            ),
+            suggestion: Some(
+                "reach a terminal on this branch — `complete`/`fail`, or record a fact a workflow rule completes from".to_owned(),
+            ),
+        });
+    };
+    for statement in statements {
+        match statement {
+            BodyStmt::Handler(handler) => {
+                if !flow_branch_settles(&handler.body) {
+                    let what = match handler.kind {
+                        HandlerKind::OnFails => "`on fails` handler",
+                        HandlerKind::OnTimeout => "`on timeout` handler",
+                    };
+                    stall(warnings, handler.span, what);
+                }
+                check_flow_branches(flow_name, &handler.body, warnings);
+            }
+            BodyStmt::Branch(branch) => {
+                if !flow_branch_settles(&branch.then_body) {
+                    stall(warnings, branch.span, "`when` branch");
+                }
+                match &branch.else_body {
+                    None => stall(warnings, branch.span, "`when` branch without an `else`"),
+                    Some(else_body) => {
+                        if !flow_branch_settles(else_body) {
+                            stall(warnings, branch.span, "`else` branch");
+                        }
+                        check_flow_branches(flow_name, else_body, warnings);
+                    }
+                }
+                check_flow_branches(flow_name, &branch.then_body, warnings);
+            }
+            BodyStmt::After(after) => check_flow_branches(flow_name, &after.body, warnings),
+            BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    check_flow_branches(flow_name, &branch.body, warnings);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[derive(Default)]
 struct Segment {
     statements: Vec<BodyStmt>,
@@ -356,6 +686,7 @@ fn await_class(
     flow_name: &str,
     index: usize,
     trigger: Option<&(String, String)>,
+    carried: &[String],
     span: SourceSpan,
 ) -> ClassDecl {
     let mut fields = vec![ClassField {
@@ -367,6 +698,7 @@ fn await_class(
             name: "string".to_owned(),
             span,
         },
+        is_key: false,
         span,
     }];
     if let Some((_, schema)) = trigger {
@@ -382,9 +714,27 @@ fn await_class(
                         span,
                     },
                 },
+                is_key: false,
                 span,
             });
         }
+    }
+    // Carried pre-ask bindings are tell results, typed `AgentTurn`.
+    for binding in carried {
+        fields.push(ClassField {
+            name: Ident {
+                name: binding.clone(),
+                span,
+            },
+            ty: TypeSyntax::Ref {
+                name: Ident {
+                    name: "AgentTurn".to_owned(),
+                    span,
+                },
+            },
+            is_key: false,
+            span,
+        });
     }
     ClassDecl {
         name: Ident {
@@ -394,6 +744,55 @@ fn await_class(
         fields,
         span,
     }
+}
+
+/// Serializes a segment's content (statements, branch, boundary ask + handlers)
+/// for binding-reference detection. Each candidate binding is rewritten to its
+/// sentinel via the serializer's value-position renamer, so the sentinel appears
+/// only where the binding is read as a VALUE — not where it is a field name.
+fn segment_reference_text(
+    segment: &Segment,
+    candidates: &[String],
+    sentinel: &dyn Fn(&str) -> String,
+) -> String {
+    let renamer = |text: &str| -> String {
+        let mut renamed = text.to_owned();
+        for candidate in candidates {
+            renamed = rename_text(&renamed, Some(candidate), &sentinel(candidate));
+        }
+        renamed
+    };
+    let mut text = String::new();
+    for statement in &segment.statements {
+        print_statement_rn(statement, 0, &renamer, &mut text);
+    }
+    if let Some(branch) = &segment.branch {
+        // The condition is a value expression; mark candidate references in it.
+        text.push_str(&renamer(&branch.condition_source));
+        text.push('\n');
+        for statement in &branch.then_body {
+            print_statement_rn(statement, 0, &renamer, &mut text);
+        }
+        if let Some(else_body) = &branch.else_body {
+            for statement in else_body {
+                print_statement_rn(statement, 0, &renamer, &mut text);
+            }
+        }
+    }
+    if let Some(boundary) = &segment.boundary {
+        print_statement_rn(
+            &BodyStmt::Effect(boundary.ask.clone()),
+            0,
+            &renamer,
+            &mut text,
+        );
+        for handler in &boundary.handlers {
+            for statement in &handler.body {
+                print_statement_rn(statement, 0, &renamer, &mut text);
+            }
+        }
+    }
+    text
 }
 
 fn push_stmt_line(out: &mut String, indent: usize, line: &str) {
@@ -409,7 +808,10 @@ fn push_stmt_line(out: &mut String, indent: usize, line: &str) {
 /// `{{ ... }}` template interpolations, where bindings are real references
 /// that must be renamed. This prevents corrupting a literal value like
 /// `event_type "ticket"` while still rewriting `"... {{ ticket.title }} ..."`.
-fn rename_text(source: &str, binding: Option<&str>, replacement: &str) -> String {
+///
+/// `pub(crate)` so `action_expand` reuses the exact same reference-renaming
+/// semantics for parameter substitution and binding hygiene.
+pub(crate) fn rename_text(source: &str, binding: Option<&str>, replacement: &str) -> String {
     let Some(binding) = binding else {
         return source.to_owned();
     };
@@ -463,16 +865,17 @@ fn rename_text(source: &str, binding: Option<&str>, replacement: &str) -> String
 
 /// Prints a body statement back to source text. Covers the statement subset
 /// flows accept; the generated text re-enters the ordinary rule pipeline.
-fn print_statement(
+/// The serializer body, parameterized by an arbitrary reference renamer `rn`.
+/// Field names and schema names are emitted verbatim; only value/expression
+/// positions pass through `rn`. `action_expand` reuses this to apply parameter
+/// substitution + binding hygiene without corrupting field names that happen to
+/// share a parameter's name (e.g. `record R { provider provider }`).
+pub(crate) fn print_statement_rn(
     statement: &BodyStmt,
     indent: usize,
-    rename_trigger: Option<&str>,
+    rn: &dyn Fn(&str) -> String,
     out: &mut String,
 ) {
-    let rn = |text: &str| match rename_trigger {
-        Some(binding) => rename_text(text, Some(binding), "flowState.t"),
-        None => text.to_owned(),
-    };
     match statement {
         BodyStmt::Record(record) => print_record(record, indent, &rn, out, "record"),
         BodyStmt::Done {
@@ -510,7 +913,7 @@ fn print_statement(
                 ),
             );
             for statement in &after.body {
-                print_statement(statement, indent + 1, rename_trigger, out);
+                print_statement_rn(statement, indent + 1, rn, out);
             }
             push_stmt_line(out, indent, "}");
         }
@@ -534,7 +937,7 @@ fn print_statement(
                     &format!("{}{binding} => {{", branch.pattern),
                 );
                 for statement in &branch.body {
-                    print_statement(statement, indent + 2, rename_trigger, out);
+                    print_statement_rn(statement, indent + 2, rn, out);
                 }
                 push_stmt_line(out, indent + 1, "}");
             }
@@ -573,9 +976,17 @@ fn print_terminal(
     rn: &dyn Fn(&str) -> String,
     out: &mut String,
 ) {
+    // The generated-only auto-fail terminal is a bare keyword with no name or
+    // payload; it must serialize without the `<name> { ... }` block the typed
+    // terminals carry.
+    if terminal.kind == body::TerminalKind::FailInternal {
+        push_stmt_line(out, indent, "flowfail");
+        return;
+    }
     let keyword = match terminal.kind {
         body::TerminalKind::Complete => "complete",
         body::TerminalKind::Fail => "fail",
+        body::TerminalKind::FailInternal => unreachable!("handled above"),
     };
     push_stmt_line(out, indent, &format!("{keyword} {} {{", terminal.name));
     print_fields(&terminal.fields, indent + 1, rn, out);
@@ -632,8 +1043,42 @@ fn print_effect(
         .map(|seconds| format!(" timeout {seconds}s"))
         .unwrap_or_default();
     let header = match &effect.kind {
-        BodyEffectKind::Tell { target } => {
-            format!("tell {}{requires}{binding}{timeout}", rn(target))
+        BodyEffectKind::Tell {
+            target,
+            access_grants,
+        } => {
+            // Re-serialize `with access to <resource> { <op clauses> }` grants so a
+            // flow `tell` preserves its turn-access metadata. `for <target>` refs are
+            // flow bindings (renamed); resource names and globs are literals.
+            let grants = access_grants
+                .iter()
+                .map(|grant| {
+                    let ops = grant
+                        .operations
+                        .iter()
+                        .map(|op| {
+                            let mut clause = op.operation.clone();
+                            if let Some(target) = &op.target {
+                                clause.push_str(&format!(" for {}", rn(target)));
+                            }
+                            if !op.globs.is_empty() {
+                                clause.push_str(&format!(
+                                    " [{}]",
+                                    op.globs
+                                        .iter()
+                                        .map(|glob| format!("{glob:?}"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ));
+                            }
+                            clause
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!(" with access to {} {{ {ops} }}", grant.resource)
+                })
+                .collect::<String>();
+            format!("tell {}{requires}{binding}{timeout}{grants}", rn(target))
         }
         BodyEffectKind::AskHuman { choices } => {
             let choices = if choices.is_empty() {
@@ -697,6 +1142,39 @@ fn print_effect(
                 indent,
                 &format!("call {capability}{argument}{binding}{timeout}"),
             );
+            return;
+        }
+        BodyEffectKind::ConstructCapabilityCall {
+            keyword, fields, ..
+        } => {
+            if keyword == "recall" {
+                let pool = fields
+                    .iter()
+                    .find(|field| field.name == "pool")
+                    .map(|field| field.source.as_str())
+                    .unwrap_or_default();
+                let query = fields
+                    .iter()
+                    .find(|field| field.name == "query")
+                    .map(|field| field.source.as_str())
+                    .unwrap_or_default();
+                push_stmt_line(
+                    out,
+                    indent,
+                    &format!("recall {pool} for {query}{binding}{timeout}"),
+                );
+            } else {
+                let field_source = fields
+                    .iter()
+                    .map(|field| field.source.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                push_stmt_line(
+                    out,
+                    indent,
+                    &format!("{keyword} {field_source}{binding}{timeout}"),
+                );
+            }
             return;
         }
         BodyEffectKind::Invoke { workflow, payload } => {
@@ -784,7 +1262,7 @@ fn print_effect(
             push_stmt_line(
                 out,
                 indent,
-                &format!("notify {} event {event} {{", rn(target_expr)),
+                &format!("emit signal {event} to {} {{", rn(target_expr)),
             );
             print_fields(fields, indent + 1, &rn, out);
             push_stmt_line(out, indent, &format!("}}{binding}"));
@@ -799,6 +1277,70 @@ fn print_effect(
                 push_stmt_line(out, indent, "}");
                 return;
             }
+        }
+        BodyEffectKind::FileRead {
+            format,
+            store,
+            path,
+        } => {
+            format!(
+                "read {format} from {} at {}{requires}{binding}{timeout}",
+                rn(store),
+                rn(path)
+            )
+        }
+        BodyEffectKind::FileWrite {
+            format,
+            store,
+            path,
+            body,
+            mode,
+        } => {
+            push_stmt_line(
+                out,
+                indent,
+                &format!("write {format} to {} at {} {{", rn(store), rn(path)),
+            );
+            push_stmt_line(out, indent + 1, &format!("body {}", rn(body)));
+            push_stmt_line(out, indent + 1, &format!("mode {mode}"));
+            push_stmt_line(out, indent, &format!("}}{requires}{binding}{timeout}"));
+            return;
+        }
+        BodyEffectKind::FileImport {
+            format,
+            schema,
+            store,
+            path,
+        } => {
+            format!(
+                "import {format} {schema} from {} at {}{requires}{binding}{timeout}",
+                rn(store),
+                rn(path)
+            )
+        }
+        BodyEffectKind::FileExport {
+            format,
+            schema,
+            store,
+            path,
+            predicate,
+            mode,
+        } => {
+            push_stmt_line(
+                out,
+                indent,
+                &format!(
+                    "export {format} {schema} to {} at {} {{",
+                    rn(store),
+                    rn(path)
+                ),
+            );
+            if let Some(predicate) = predicate {
+                push_stmt_line(out, indent + 1, &format!("where {}", rn(predicate)));
+            }
+            push_stmt_line(out, indent + 1, &format!("mode {mode}"));
+            push_stmt_line(out, indent, &format!("}}{requires}{binding}{timeout}"));
+            return;
         }
     };
     match &effect.prompt {
@@ -865,6 +1407,400 @@ flow triage
 }
 "#;
 
+    fn liveness_warnings(source: &str) -> Vec<String> {
+        compile_program(source)
+            .warnings
+            .into_iter()
+            .filter(|w| w.message.contains("reaches no workflow terminal"))
+            .map(|w| w.message)
+            .collect()
+    }
+
+    /// Concatenated body text of every generated `flow.*` rule for `source`.
+    fn flow_rule_bodies(source: &str) -> String {
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new(), "{source}");
+        compiled
+            .ir
+            .expect("lowered IR")
+            .rules
+            .into_iter()
+            .filter(|rule| rule.name.starts_with("flow."))
+            .map(|rule| rule.body)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn flow_autofail_generates_flowfail_for_unhandled_effect() {
+        // TRIAGE is self-terminating (it has inline `complete`/`fail`). Its `tell`
+        // step has no `on fails` handler, so 503 auto-fail routes the unhandled
+        // failure to the generic `flowfail` terminal.
+        let bodies = flow_rule_bodies(TRIAGE);
+        assert!(
+            bodies.contains("after turn fails {"),
+            "expected an auto-fail branch for the tell step: {bodies}"
+        );
+        assert!(
+            bodies.contains("flowfail"),
+            "expected the generated flowfail terminal: {bodies}"
+        );
+    }
+
+    #[test]
+    fn flow_autofail_skips_effect_with_on_fails_handler() {
+        // With an author `on fails` handler the failure is handled, so no auto-fail
+        // is generated for that step — the handler's own terminal fires instead.
+        let with_handler = TRIAGE.replace(
+            r#"tell triager as turn "Plan {{ ticket.title }}.""#,
+            "tell triager as turn \"Plan {{ ticket.title }}.\"\n  on fails { fail error { reason \"planning failed\" } }",
+        );
+        assert_ne!(with_handler, TRIAGE);
+        let bodies = flow_rule_bodies(&with_handler);
+        assert!(
+            bodies.contains("reason \"planning failed\""),
+            "the author on-fails handler must be lowered: {bodies}"
+        );
+        assert!(
+            !bodies.contains("flowfail"),
+            "a handled failure must not also auto-fail: {bodies}"
+        );
+    }
+
+    #[test]
+    fn flow_autofail_skips_non_self_terminating_flow() {
+        // A pure fact-hand-off flow (no inline terminal) is left to the broader
+        // workflow-liveness analysis — never auto-failed.
+        let source = r#"
+@service
+workflow Handoff
+
+class Ticket { id string  status "open" }
+class Done { id string }
+
+agent reviewer { provider fixture  profile "r"  capacity 1 }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+flow f
+  when Ticket as ticket where ticket.status == "open"
+  when reviewer is available
+{
+  tell reviewer as turn "Do work."
+
+  record Done { id ticket.id }
+}
+
+rule finish
+  when Done as d
+=> {
+  done d
+}
+"#;
+        let bodies = flow_rule_bodies(source);
+        assert!(
+            !bodies.contains("flowfail"),
+            "a non-self-terminating flow must not auto-fail: {bodies}"
+        );
+    }
+
+    #[test]
+    fn flow_tell_preserves_turn_access_grants_through_expansion() {
+        // A `with access to` grant on a flow `tell` must survive flow re-serialization
+        // and lower onto the generated rule's agent.tell effect (target refs renamed).
+        use crate::IrEffectKind;
+        let source = r#"
+@service
+workflow FlowGrant
+
+output result R
+failure error E
+class R { ok bool }
+class E { reason string }
+class Ticket { id string  status "open" }
+
+agent coder { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+flow handle
+  when Ticket as ticket where ticket.status == "open"
+  when coder is available
+{
+  tell coder as turn timeout 10m
+    with access to project_memory {
+      recall for ticket
+    }
+  "Work {{ ticket.id }}."
+  on timeout { fail error { reason "timed out" } }
+
+  complete result { ok true }
+}
+"#;
+        let ir = compile_program(source).ir.expect("compiles");
+        let tell = ir
+            .rules
+            .iter()
+            .flat_map(|rule| rule.metadata.effects.iter())
+            .find(|effect| effect.kind == IrEffectKind::AgentTell)
+            .expect("agent.tell effect from the flow");
+        assert_eq!(
+            tell.access_grants.len(),
+            1,
+            "grant preserved through flow expansion"
+        );
+        assert_eq!(tell.access_grants[0].resource, "project_memory");
+        assert_eq!(tell.access_grants[0].operations[0].operation, "recall");
+    }
+
+    #[test]
+    fn flow_liveness_clean_flow_has_no_warning() {
+        // Every branch of TRIAGE reaches a terminal (then `complete`, else `fail`),
+        // so the liveness lint is silent.
+        assert!(
+            liveness_warnings(TRIAGE).is_empty(),
+            "{:?}",
+            liveness_warnings(TRIAGE)
+        );
+    }
+
+    #[test]
+    fn flow_liveness_flags_stalling_else_branch() {
+        // Gutting the else arm to a bare `done` (no terminal, no fact hand-off)
+        // leaves that branch with no workflow terminal — a warning, but the program
+        // still compiles (liveness is `warning` severity).
+        let stalled = TRIAGE.replace(
+            "  } else {\n    fail error {\n      reason \"rejected\"\n    }\n  }",
+            "  } else {\n    done ticket\n  }",
+        );
+        assert_ne!(stalled, TRIAGE, "the else arm should have been rewritten");
+        let compiled = compile_program(&stalled);
+        assert!(compiled.ir.is_some(), "liveness is a warning, not an error");
+        let warnings = liveness_warnings(&stalled);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("`else` branch"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn flow_liveness_flags_missing_else() {
+        // Dropping the else entirely leaves the else path with no terminal.
+        let no_else = TRIAGE.replace(
+            "  } else {\n    fail error {\n      reason \"rejected\"\n    }\n  }",
+            "  }",
+        );
+        assert_ne!(no_else, TRIAGE, "the else arm should have been removed");
+        let warnings = liveness_warnings(&no_else);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("without an `else`"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn flow_liveness_flags_timeout_without_on_timeout_handler() {
+        // An effect that sets a `timeout` but has no `on timeout` handler leaves the
+        // timeout path with no terminal. TRIAGE has no timeout; add one without a
+        // handler and expect a warning (the program still compiles).
+        let with_timeout = TRIAGE.replace(
+            r#"tell triager as turn "Plan {{ ticket.title }}.""#,
+            r#"tell triager as turn timeout 10m "Plan {{ ticket.title }}.""#,
+        );
+        assert_ne!(
+            with_timeout, TRIAGE,
+            "the tell should have gained a timeout"
+        );
+        let warnings = liveness_warnings(&with_timeout);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("no `on timeout` handler"),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn flow_liveness_accepts_timeout_with_on_timeout_handler() {
+        // The same timeout, paired with an `on timeout` handler that reaches a
+        // terminal, is silent.
+        let with_handler = TRIAGE.replace(
+            r#"tell triager as turn "Plan {{ ticket.title }}.""#,
+            "tell triager as turn timeout 10m \"Plan {{ ticket.title }}.\"\n  on timeout { fail error { reason \"timed out\" } }",
+        );
+        assert_ne!(with_handler, TRIAGE);
+        assert!(
+            liveness_warnings(&with_handler).is_empty(),
+            "{:?}",
+            liveness_warnings(&with_handler)
+        );
+    }
+
+    #[test]
+    fn flow_liveness_skips_non_self_terminating_flow() {
+        // A flow with NO inline terminal (pure fact hand-off) is deferred to the
+        // broader workflow-liveness lint, so an empty else here is not flagged.
+        let source = r#"
+@service
+workflow Handoff
+
+class Ticket { id string  status "open" }
+class Done { id string }
+
+agent reviewer { provider fixture  profile "r"  capacity 1 }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+flow f
+  when Ticket as ticket where ticket.status == "open"
+  when reviewer is available
+{
+  tell reviewer as turn "Do work."
+
+  when turn.summary == "ok" {
+    record Done { id ticket.id }
+  } else {
+  }
+}
+
+rule finish
+  when Done as d
+=> {
+  done d
+}
+"#;
+        assert!(
+            liveness_warnings(source).is_empty(),
+            "non-self-terminating flow must not be flagged: {:?}",
+            liveness_warnings(source)
+        );
+    }
+
+    #[test]
+    fn on_timeout_handler_fires_only_on_timeout_not_success() {
+        // Regression: `on timeout { ... }` mapped to the `completes` predicate,
+        // which fires on ANY terminal (including success) — so a flow with a
+        // timeout-fail handler failed on successful completion. It must map to
+        // `times out`.
+        let source = r#"
+@service
+workflow TimeoutHandler
+
+class Ticket { id string  status "open" }
+
+agent reviewer { provider fixture  profile "r"  capacity 1 }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+flow f
+  when Ticket as ticket where ticket.status == "open"
+  when reviewer is available
+{
+  tell reviewer as turn timeout 10m "Do work."
+  on timeout { done ticket }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(
+            compiled.diagnostics,
+            Vec::new(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("flow compiles");
+        let seg0 = ir
+            .rules
+            .iter()
+            .find(|rule| rule.name == "flow.f.seg0")
+            .expect("seg0 rule");
+        assert!(
+            seg0.body.contains("times out"),
+            "on-timeout handler uses the `times out` predicate: {}",
+            seg0.body
+        );
+        assert!(
+            !seg0.body.contains("turn completes"),
+            "on-timeout handler must NOT fire on success via `completes`: {}",
+            seg0.body
+        );
+    }
+
+    #[test]
+    fn carries_pre_ask_binding_across_ask_boundary() {
+        // A pre-ask `tell` result referenced after the `askHuman` boundary is
+        // carried through flow state (shared bindings). Before this it was a
+        // dangling reference in the generated post-ask rule.
+        let source = r#"
+workflow CarryFwd
+
+output result Decision
+failure error Rejected
+
+class Ticket { id string  status "open" }
+class Decision { summary string }
+class Rejected { reason string }
+
+agent reviewer { provider fixture  profile "r"  capacity 1 }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+flow f
+  when Ticket as ticket where ticket.status == "open"
+  when reviewer is available
+{
+  tell reviewer as turn "Propose a plan."
+  askHuman as signoff choices ["approve", "reject"] "Approve {{ turn.summary }}?"
+  when signoff.choice == "approve" {
+    done ticket
+    complete result { summary turn.summary }
+  } else {
+    done ticket
+    fail error { reason "rejected" }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(
+            compiled.diagnostics,
+            Vec::new(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("flow compiles");
+
+        // The await-state class carries `turn` typed as `AgentTurn`.
+        let await_class = ir
+            .schemas
+            .iter()
+            .find_map(|schema| match schema {
+                crate::IrSchema::Class(class)
+                    if class.name.starts_with(super::FLOW_STATE_PREFIX) =>
+                {
+                    Some(class)
+                }
+                _ => None,
+            })
+            .expect("await state class generated");
+        assert!(
+            await_class.fields.iter().any(|field| field.name == "turn"),
+            "carried binding field present: {:?}",
+            await_class.fields
+        );
+
+        // The post-ask rule reads the carried binding from flow state.
+        let then = ir
+            .rules
+            .iter()
+            .find(|rule| rule.name == "flow.f.seg1_then")
+            .expect("then rule");
+        assert!(
+            then.body.contains("flowState.turn.summary"),
+            "post-ask reads carried binding via state: {}",
+            then.body
+        );
+        assert!(
+            !then.body.contains("summary turn.summary"),
+            "raw pre-ask binding not left dangling: {}",
+            then.body
+        );
+    }
+
     #[test]
     fn flow_lowers_to_visible_named_rules_and_state_class() {
         let compiled = compile_program(TRIAGE);
@@ -876,12 +1812,8 @@ flow triage
         assert!(rule_names
             .iter()
             .any(|name| name.starts_with("flow.triage.seg0")));
-        assert!(rule_names
-            .iter()
-            .any(|name| *name == "flow.triage.seg1_then"));
-        assert!(rule_names
-            .iter()
-            .any(|name| *name == "flow.triage.seg1_else"));
+        assert!(rule_names.contains(&"flow.triage.seg1_then"));
+        assert!(rule_names.contains(&"flow.triage.seg1_else"));
 
         // The await-state class is reserved-namespaced and typed.
         let await_class = ir

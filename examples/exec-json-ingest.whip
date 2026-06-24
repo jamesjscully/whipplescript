@@ -32,7 +32,7 @@ rule run_test_report
 
   after report fails as failure {
     fail error {
-      reason failure.reason
+      reason failure.message
     }
   }
 }

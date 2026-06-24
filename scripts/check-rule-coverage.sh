@@ -16,7 +16,17 @@ run_whip() {
 
 # Examples that need real providers, multiple roots, or explicit inputs are
 # exercised elsewhere; everything else must reach full rule coverage here.
-SKIP="revision-parent-child revision-validation-approval revision-repair-planner revision-running-cancel revision-ticket-v1 revision-ticket-v2 revision-validation-approval"
+#   - tested-agent-turn: requires `given input` (no `--input` here); covered by `whip test`.
+#   - package-memory: imports the non-`std.` `memory` package, so it needs a
+#     `whip.lock`; covered by the `dev_capability_call_*` / `check_discovers_*` tests.
+#   - exec-json-ingest: runs a raw `exec` that needs `WHIPPLESCRIPT_EXEC_ALLOW`,
+#     which this lock-free fixture run does not grant.
+#   - deterministic-validation: same — its deterministic checker is a raw `exec`
+#     gated on `WHIPPLESCRIPT_EXEC_ALLOW`, ungranted in this fixture run.
+#   - event-bridge: an `@service` workflow whose only rule fires on an external
+#     `deploy.finished` signal (injected with `whip signal`); a no-signal fixture
+#     run records nothing, so its `assert count(...) == 1` cannot hold here.
+SKIP="revision-parent-child revision-validation-approval revision-repair-planner revision-running-cancel revision-ticket-v1 revision-ticket-v2 revision-validation-approval tested-agent-turn package-memory exec-json-ingest deterministic-validation event-bridge"
 
 failures=0
 for workflow in "$ROOT"/examples/*.whip; do

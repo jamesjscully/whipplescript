@@ -13,7 +13,7 @@ auditable and policy-controlled.
 ```text
 program declarations
 environment policy
-installed plugin manifests
+installed package manifests
 operator configuration
 provider self-reported capabilities
 ```
@@ -93,12 +93,19 @@ Safer local mode:
 repo-reader
 repo-writer
 internet-research
-review-only
+human-review
 ```
 
 This separates read/write repo authority from internet research. It is the
 minimum useful discipline for agent workflows that should not let the same turn
 both fetch arbitrary internet content and write project files.
+
+These runtime profile *objects* and the `std.agent` canonical preset list
+([`decision-records/0009-agent-package.md`](decision-records/0009-agent-package.md))
+share one vocabulary. The review role is named `human-review` everywhere — spec,
+implementation plan, and code (the shipped default profile). Earlier drafts also
+called it `review-only` here and `reviewer` in the std.agent preset list; those are
+the same role and have been unified to `human-review`.
 
 Enterprise mode is configuration-driven. Operators can define their own
 profiles, descriptions, provider bindings, credentials, retention policies, and
@@ -139,9 +146,9 @@ whip capabilities list
 whip capabilities show <id>
 whip profiles list
 whip profiles show <id>
-whip plugins list
-whip plugins enable <package>
-whip plugins disable <package>
+whip packages list
+whip packages enable <package>
+whip packages disable <package>
 ```
 
 The status view for a blocked effect must show which capability or profile

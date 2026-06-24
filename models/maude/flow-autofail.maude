@@ -1,0 +1,53 @@
+--- Flow unhandled-failure auto-fail, per spec/static-analysis.md Flow liveness
+--- and the 503 decision: auto-fail, not stall. Companion to flow-liveness.maude.
+--- Where flow-liveness warns at compile time about a branch that reaches no
+--- terminal, this model pins the runtime consequence the author opted into when
+--- the flow is a terminal path: an effect whose failure is genuinely unhandled
+--- drives the workflow to a failed terminal rather than stalling forever.
+---
+--- The invariant is scoped exactly as flow-liveness is. Auto-fail applies only
+--- when the flow is self-terminating, meaning it contains an inline terminal so
+--- the flow itself rather than a downstream fact-handler owns reaching a
+--- terminal, AND some effect failure is unhandled, meaning no on-fails handler
+--- routes it and no downstream dependency settles it.
+--- Each effect failure is abstracted to one of two dispositions: unhandled, the
+--- failure reaches no terminal; or handled, an on-fails handler or downstream
+--- dependency settles it. The model checks by reachability search that:
+---   a self-terminating flow with an unhandled failed effect reaches the failed
+---     terminal, so auto-fail fires and the workflow does not stall;
+---   a handled failed effect settles via its own terminal, never the auto-fail;
+---   auto-fail fires only in a self-terminating flow and only on an unhandled
+---     failure. A handled failure, or a non-self-terminating flow, never
+---     auto-fails. The latter is left to the broader workflow-liveness lint, the
+---     same scoping flow-liveness uses.
+mod WHIPPLESCRIPT-FLOW-AUTOFAIL is
+  protecting BOOL .
+
+  sorts Eff Cfg .
+
+  ops e1 e2 : -> Eff [ctor] .   --- flow effects, the steps
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op flowSelfTerminating : -> Cfg [ctor] .   --- flow contains an inline terminal
+  op running : -> Cfg [ctor] .                --- instance is running
+  op effFailedUnhandled : Eff -> Cfg [ctor] . --- failed effect whose failure reaches no terminal
+  op effFailedHandled : Eff -> Cfg [ctor] .   --- failed effect routed to a settling handler or dependency
+  op settled : Eff -> Cfg [ctor] .            --- a handled failure resolved via its own terminal
+  op instanceFailed : -> Cfg [ctor] .         --- the auto-fail terminal, fail_instance_internal
+
+  var E : Eff .
+
+  --- A self-terminating flow with a genuinely-unhandled failed effect auto-fails
+  --- the instance. The LHS requires both flowSelfTerminating and an
+  --- effFailedUnhandled, so neither a non-self-terminating flow nor a handled
+  --- failure can ever match. That is the scoping bite.
+  rl [autofail] : flowSelfTerminating effFailedUnhandled(E) running
+      => flowSelfTerminating instanceFailed .
+
+  --- A handled failure settles through its own on-fails or dependency terminal;
+  --- it never routes to the generic auto-fail. Leaving running untouched lets a
+  --- sibling unhandled failure in the same flow still auto-fail.
+  rl [handled] : effFailedHandled(E) => settled(E) .
+endm

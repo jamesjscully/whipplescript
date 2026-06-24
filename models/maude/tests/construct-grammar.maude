@@ -1,0 +1,281 @@
+load ../kernel.maude
+load ../construct-grammar.maude
+
+--- A memory recall construct can be accepted when all source interfaces and
+--- capability contracts resolve through the locked construct graph.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedFamily(effectOperation)
+  acceptedLowering(capabilityCall)
+  loweringAllowsFamily(capabilityCall, effectOperation)
+  constructCandidate(goodMemoryRecall)
+  constructFamily(goodMemoryRecall, effectOperation)
+  constructKeyword(goodMemoryRecall, recallKeyword)
+  constructLowering(goodMemoryRecall, capabilityCall)
+  noKeywordConflict(goodMemoryRecall)
+  noHiddenRuntime(goodMemoryRecall)
+  noDirectFactWrite(goodMemoryRecall)
+  lockedConstructVersion(goodMemoryRecall, v1)
+  requiresInterface(goodMemoryRecall, memoryPoolInterface)
+  providesInterface(memoryPoolInterface)
+  requiresInterface(goodMemoryRecall, capabilityInterface(memoryQuery))
+  providesInterface(capabilityInterface(memoryQuery))
+  constructTargetCapability(goodMemoryRecall, memoryQuery)
+  constructEffectContract(goodMemoryRecall, e1, memoryContext, v1)
+  effectRequiresCapability(e1, memoryQuery)
+  =>*
+  acceptedConstruct(goodMemoryRecall)
+  acceptedConstructContract(goodMemoryRecall, e1, memoryContext, memoryQuery, v1)
+  providesInterface(effectHandleInterface(memoryContext)) .
+
+--- Accepted source lowers to an effect graph template with explicit required
+--- capability metadata. Kernel graph commit enqueues the effect later.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedConstruct(goodMemoryRecall)
+  acceptedConstructContract(goodMemoryRecall, e1, memoryContext, memoryQuery, v1)
+  constructUse(goodMemoryRecall, e2)
+  =>*
+  acceptedConstruct(goodMemoryRecall)
+  acceptedConstructContract(goodMemoryRecall, e1, memoryContext, memoryQuery, v1)
+  graph(g1, e2)
+  loweredConstructEffect(e2, goodMemoryRecall, memoryQuery, memoryContext, v1)
+  requiredCapability(e2, memoryQuery) .
+
+--- `after recall succeeds as memory` composes through the ordinary effect
+--- handle output type.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  loweredConstructEffect(e2, goodMemoryRecall, memoryQuery, memoryContext, v1)
+  afterSucceeds(e2)
+  =>*
+  loweredConstructEffect(e2, goodMemoryRecall, memoryQuery, memoryContext, v1)
+  terminalBinding(e2, memoryContext)
+  providesInterface(terminalOutputInterface(memoryContext))
+  providesInterface(valueInterface(memoryContext)) .
+
+--- A resource-qualified tracker projection feeds an ordinary typed rule
+--- binding.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  providesInterface(projectionInterface(githubBacklog, issueType))
+  projectionUse(projectionInterface(githubBacklog, issueType), issueFact)
+  =>*
+  providesInterface(projectionInterface(githubBacklog, issueType))
+  ruleBinding(issueFact, issueType)
+  providesInterface(valueInterface(issueType)) .
+
+--- Two resources of the same family/type can coexist when the source selects
+--- the intended named resource.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  providesInterface(projectionInterface(githubBacklog, issueType))
+  providesInterface(projectionInterface(linearBacklog, issueType))
+  projectionUse(projectionInterface(githubBacklog, issueType), issueFact)
+  =>*
+  providesInterface(projectionInterface(githubBacklog, issueType))
+  providesInterface(projectionInterface(linearBacklog, issueType))
+  ruleBinding(issueFact, issueType)
+  providesInterface(valueInterface(issueType)) .
+
+--- An operation is ready only when a compatible typed value is available.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedConstruct(agentTellOperation)
+  operationNeedsValue(agentTellOperation, memoryContext)
+  providesInterface(valueInterface(memoryContext))
+  =>*
+  acceptedConstruct(agentTellOperation)
+  operationNeedsValue(agentTellOperation, memoryContext)
+  providesInterface(valueInterface(memoryContext))
+  operationReady(agentTellOperation) .
+
+--- Generated operation input facts can require more values than the small
+--- hand-written arity-specific rules model directly.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedConstruct(agentTellOperation)
+  operationNeeds(agentTellOperation, typeCons(issueType, typeCons(memoryContext, typeCons(jsonType, typeCons(memoryContext, noTypes)))))
+  providesInterface(valueInterface(issueType))
+  providesInterface(valueInterface(memoryContext))
+  providesInterface(valueInterface(jsonType))
+  =>*
+  C:Cfg
+  operationReady(agentTellOperation) .
+
+--- Event sources emit ordinary durable events with typed payload metadata.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  providesInterface(eventSourceInterface(jsonType))
+  eventSourceTick(eventSourceInterface(jsonType), event1)
+  =>*
+  providesInterface(eventSourceInterface(jsonType))
+  event(event1)
+  eventPayload(event1, jsonType) .
+
+--- Runtime execution still needs the package/provider registry. Compile-time
+--- construct acceptance alone does not grant provider authority.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  effect(e2, queued)
+  requiredCapability(e2, memoryQuery)
+  runtimeCapability(memoryQuery)
+  runtimeProvider(memoryQuery, memoryProvider)
+  runtimeBinding(memoryQuery, memoryProvider)
+  =>*
+  effect(e2, queued)
+  requiredCapability(e2, memoryQuery)
+  runtimeAuthorized(e2, memoryProvider) .
+
+--- Missing resource/interface resolution blocks construct acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedFamily(effectOperation)
+  acceptedLowering(capabilityCall)
+  loweringAllowsFamily(capabilityCall, effectOperation)
+  constructCandidate(missingResourceRecall)
+  constructFamily(missingResourceRecall, effectOperation)
+  constructKeyword(missingResourceRecall, recallKeyword)
+  constructLowering(missingResourceRecall, capabilityCall)
+  noKeywordConflict(missingResourceRecall)
+  noHiddenRuntime(missingResourceRecall)
+  noDirectFactWrite(missingResourceRecall)
+  lockedConstructVersion(missingResourceRecall, v1)
+  requiresInterface(missingResourceRecall, memoryPoolInterface)
+  requiresInterface(missingResourceRecall, capabilityInterface(memoryQuery))
+  providesInterface(capabilityInterface(memoryQuery))
+  constructTargetCapability(missingResourceRecall, memoryQuery)
+  constructEffectContract(missingResourceRecall, e1, memoryContext, v1)
+  effectRequiresCapability(e1, memoryQuery)
+  =>*
+  acceptedConstruct(missingResourceRecall) .
+
+--- Missing capability interface resolution blocks construct acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedFamily(effectOperation)
+  acceptedLowering(capabilityCall)
+  loweringAllowsFamily(capabilityCall, effectOperation)
+  constructCandidate(missingCapabilityRecall)
+  constructFamily(missingCapabilityRecall, effectOperation)
+  constructKeyword(missingCapabilityRecall, recallKeyword)
+  constructLowering(missingCapabilityRecall, capabilityCall)
+  noKeywordConflict(missingCapabilityRecall)
+  noHiddenRuntime(missingCapabilityRecall)
+  noDirectFactWrite(missingCapabilityRecall)
+  lockedConstructVersion(missingCapabilityRecall, v1)
+  requiresInterface(missingCapabilityRecall, memoryPoolInterface)
+  providesInterface(memoryPoolInterface)
+  requiresInterface(missingCapabilityRecall, capabilityInterface(memoryQuery))
+  constructTargetCapability(missingCapabilityRecall, memoryQuery)
+  constructEffectContract(missingCapabilityRecall, e1, memoryContext, v1)
+  effectRequiresCapability(e1, memoryQuery)
+  =>*
+  acceptedConstruct(missingCapabilityRecall) .
+
+--- Ambiguous syntax blocks construct acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedFamily(effectOperation)
+  acceptedLowering(capabilityCall)
+  loweringAllowsFamily(capabilityCall, effectOperation)
+  constructCandidate(ambiguousRecall)
+  constructFamily(ambiguousRecall, effectOperation)
+  constructKeyword(ambiguousRecall, sharedKeyword)
+  constructLowering(ambiguousRecall, capabilityCall)
+  noHiddenRuntime(ambiguousRecall)
+  noDirectFactWrite(ambiguousRecall)
+  lockedConstructVersion(ambiguousRecall, v1)
+  requiresInterface(ambiguousRecall, memoryPoolInterface)
+  providesInterface(memoryPoolInterface)
+  requiresInterface(ambiguousRecall, capabilityInterface(memoryQuery))
+  providesInterface(capabilityInterface(memoryQuery))
+  constructTargetCapability(ambiguousRecall, memoryQuery)
+  constructEffectContract(ambiguousRecall, e1, memoryContext, v1)
+  effectRequiresCapability(e1, memoryQuery)
+  =>*
+  acceptedConstruct(ambiguousRecall) .
+
+--- Hidden runtime behavior blocks construct acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedFamily(effectOperation)
+  acceptedLowering(capabilityCall)
+  loweringAllowsFamily(capabilityCall, effectOperation)
+  constructCandidate(hiddenRuntimeRecall)
+  constructFamily(hiddenRuntimeRecall, effectOperation)
+  constructKeyword(hiddenRuntimeRecall, recallKeyword)
+  constructLowering(hiddenRuntimeRecall, capabilityCall)
+  noKeywordConflict(hiddenRuntimeRecall)
+  noDirectFactWrite(hiddenRuntimeRecall)
+  lockedConstructVersion(hiddenRuntimeRecall, v1)
+  requiresInterface(hiddenRuntimeRecall, memoryPoolInterface)
+  providesInterface(memoryPoolInterface)
+  requiresInterface(hiddenRuntimeRecall, capabilityInterface(memoryQuery))
+  providesInterface(capabilityInterface(memoryQuery))
+  constructTargetCapability(hiddenRuntimeRecall, memoryQuery)
+  constructEffectContract(hiddenRuntimeRecall, e1, memoryContext, v1)
+  effectRequiresCapability(e1, memoryQuery)
+  =>*
+  acceptedConstruct(hiddenRuntimeRecall) .
+
+--- Unknown lowering classes cannot be accepted as executable constructs.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedFamily(effectOperation)
+  acceptedLowering(capabilityCall)
+  loweringAllowsFamily(capabilityCall, effectOperation)
+  constructCandidate(unknownLoweringRecall)
+  constructFamily(unknownLoweringRecall, effectOperation)
+  constructKeyword(unknownLoweringRecall, recallKeyword)
+  constructLowering(unknownLoweringRecall, unknownLowering)
+  noKeywordConflict(unknownLoweringRecall)
+  noHiddenRuntime(unknownLoweringRecall)
+  noDirectFactWrite(unknownLoweringRecall)
+  lockedConstructVersion(unknownLoweringRecall, v1)
+  requiresInterface(unknownLoweringRecall, memoryPoolInterface)
+  providesInterface(memoryPoolInterface)
+  requiresInterface(unknownLoweringRecall, capabilityInterface(memoryQuery))
+  providesInterface(capabilityInterface(memoryQuery))
+  constructTargetCapability(unknownLoweringRecall, memoryQuery)
+  constructEffectContract(unknownLoweringRecall, e1, memoryContext, v1)
+  effectRequiresCapability(e1, memoryQuery)
+  =>*
+  acceptedConstruct(unknownLoweringRecall) .
+
+--- Resource identity matters. A Linear backlog projection cannot satisfy a
+--- source use of the GitHub backlog projection even when both payloads are
+--- Issue-shaped.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  providesInterface(projectionInterface(linearBacklog, issueType))
+  projectionUse(projectionInterface(githubBacklog, issueType), issueFact)
+  =>*
+  ruleBinding(issueFact, issueType) .
+
+--- Type identity matters. A MemoryContext value cannot satisfy an operation
+--- input that requires Issue.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedConstruct(agentTellOperation)
+  operationNeedsValue(agentTellOperation, issueType)
+  providesInterface(valueInterface(memoryContext))
+  =>*
+  operationReady(agentTellOperation) .
+
+--- Generated operation input facts also block readiness when any declared
+--- input type is missing.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedConstruct(agentTellOperation)
+  operationNeeds(agentTellOperation, typeCons(issueType, typeCons(memoryContext, typeCons(jsonType, noTypes))))
+  providesInterface(valueInterface(issueType))
+  providesInterface(valueInterface(memoryContext))
+  =>*
+  C:Cfg
+  operationReady(agentTellOperation) .
+
+--- An event source cannot bypass durable events and fire a rule directly.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  providesInterface(eventSourceInterface(jsonType))
+  eventSourceTick(eventSourceInterface(jsonType), event1)
+  =>*
+  directRuleFire(event1) .
+
+--- A source construct use cannot lower without an accepted construct contract.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  constructUse(unacceptedRecall, e2)
+  constructEffectContract(unacceptedRecall, e1, memoryContext, v1)
+  effectRequiresCapability(e1, memoryQuery)
+  =>*
+  graph(g1, e2) .
+
+--- Compile-time lowering does not itself authorize a runtime provider.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  effect(e2, queued)
+  requiredCapability(e2, memoryQuery)
+  =>*
+  runtimeAuthorized(e2, memoryProvider) .

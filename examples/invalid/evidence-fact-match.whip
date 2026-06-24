@@ -1,0 +1,12 @@
+workflow EvidenceFactMatch
+
+output result Result
+class Result { ok bool }
+
+# In-turn observations are evidence, never rule-matchable. Matching
+# `agent.turn.streamed` (evidence) is an error — see spec/agent-harness.md.
+rule react_to_stream
+  when fact agent.turn.streamed as ev
+=> {
+  complete result { ok true }
+}

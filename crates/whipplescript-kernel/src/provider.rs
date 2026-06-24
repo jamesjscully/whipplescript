@@ -11,7 +11,7 @@ pub enum ProviderKind {
     Pi,
     Fixture,
     Command,
-    Baml,
+    Coerce,
     Loft,
 }
 
@@ -23,7 +23,7 @@ impl ProviderKind {
             Self::Pi => "pi",
             Self::Fixture => "fixture",
             Self::Command => "command",
-            Self::Baml => "baml",
+            Self::Coerce => "coerce",
             Self::Loft => "loft",
         }
     }
@@ -35,7 +35,7 @@ impl ProviderKind {
             "pi" => Some(Self::Pi),
             "fixture" => Some(Self::Fixture),
             "command" => Some(Self::Command),
-            "baml" => Some(Self::Baml),
+            "coerce" => Some(Self::Coerce),
             "loft" => Some(Self::Loft),
             _ => None,
         }
@@ -50,7 +50,7 @@ pub enum AdapterSurface {
     PiRpc,
     Fixture,
     Command,
-    BamlHttp,
+    CoerceHttp,
     LoftCli,
 }
 
@@ -63,7 +63,7 @@ impl AdapterSurface {
             Self::PiRpc => "pi_rpc",
             Self::Fixture => "fixture",
             Self::Command => "command",
-            Self::BamlHttp => "baml_http",
+            Self::CoerceHttp => "coerce_http",
             Self::LoftCli => "loft_cli",
         }
     }
@@ -76,7 +76,7 @@ impl AdapterSurface {
             "pi_rpc" => Some(Self::PiRpc),
             "fixture" => Some(Self::Fixture),
             "command" => Some(Self::Command),
-            "baml_http" => Some(Self::BamlHttp),
+            "coerce_http" => Some(Self::CoerceHttp),
             "loft_cli" => Some(Self::LoftCli),
             _ => None,
         }

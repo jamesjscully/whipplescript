@@ -147,7 +147,7 @@ the workflow. Add the human gate and the two endings.
 rule request_signoff
   when TriagedTicket as ticket where ticket.severity == "high"
 => {
-  askHuman as signoff """markdown
+  askHuman as signoff choices ["approve", "reject"] """markdown
   {{ ticket.title }} was triaged with this plan:
 
   {{ ticket.plan }}
@@ -174,9 +174,11 @@ rule reject_plan
 }
 ```
 
-`askHuman` creates a `human.ask` effect that surfaces as an inbox item. When
-someone answers it, the runtime records a fact that `human answered ...`
-rules match; the answer payload carries `choice`, `text`, and `answered_by`.
+`askHuman` creates a `human.ask` effect that surfaces as an inbox item. The
+`choices` list limits the accepted answers and gives `answer.choice` a
+string-literal-union type. When someone answers it, the runtime records a fact
+that `human answered ...` rules match; the answer payload carries `choice`,
+`text`, and `answered_by`.
 
 Finally, add assertions — executable claims about the finished run that
 `dev` evaluates for you:
@@ -270,9 +272,9 @@ completed, one failed — coexist in the same store with full histories.
 ## Where to go next
 
 - Swap `provider fixture` for a real provider once you have one configured:
-  [providers & plugins](providers.md).
+  [providers & packages](providers.md).
 - Add a typed model review with `coerce` instead of trusting the turn
-  summary: see [`examples/queue-worker-with-review.whip`](../examples/queue-worker-with-review.whip).
+  summary: see [`examples/queue-worker-with-review.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/queue-worker-with-review.whip).
 - Read the [manual](manual.md) for authoring guidance — retries, branching,
   composition — and the [language reference](language-reference.md) for the
   full construct list.

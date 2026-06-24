@@ -1,33 +1,50 @@
-# Coordination resources: lease, ledger, counter
+# `std.coord`: lease, ledger, counter
 
-Status: spec drafted 2026-06-10 from decided design
-([`language-ergonomics-tracker.md`](language-ergonomics-tracker.md) C6).
+Status: spec revised 2026-06-14 from package design
+([`0013-coordination-package.md`](decision-records/0013-coordination-package.md)).
 Stage: spec -> modeling -> implementation + testing -> review.
 
 ## Framing
 
-**A closed family of shared coordination resources, generalizing coordination
-the language already hardcodes.**
+**A closed standard package for shared coordination resources, generalizing
+coordination the language already hardcodes without becoming arbitrary shared
+mutable state.**
 
-WhippleScript already has cross-instance mutable state: the work-queue's
-`items.sqlite` is workspace-scoped, shared across every instance, and supports
-an atomic claim. It is the existence proof and the architectural template. And
-the language already special-cases coordination for specific resources:
+WhippleScript already has cross-instance coordination: a workspace-scoped,
+shared atomic claim over work items. (The original `items.sqlite`-as-truth
+formulation in [`work-queues.md`](work-queues.md) is superseded — see
+[`std.tracker`](decision-records/0002-work-tracker-package.md) and the kernel
+lease primitive — but the *claim* it proved remains the architectural template.)
+The language already special-cases coordination for specific resources:
 
 - agent `capacity N` is a counting semaphore over turns,
 - queue `claim` is a lease over a work item,
 - a fact is a ledger entry that happens to be instance-local.
 
-`lease`, `ledger`, and `counter` generalize those into a **closed family** of
-shared resources alongside `queue`. Closed, not an open "shared cell with
-arbitrary operations" — you pick a resource kind from a fixed menu, each with a
-tiny verb vocabulary. That closure is what keeps the language from sliding into
-a transactional database.
+`std.coord` owns `lease`, `ledger`, and `counter` as a **closed family** of
+shared resources. Closed, not an open "shared cell with arbitrary operations" —
+you pick a resource kind from a fixed menu, each with a tiny verb vocabulary.
+That closure is what keeps the language from sliding into a transactional
+database.
 
-The coordination model is a **durable tuple-space, not message passing**
-(see [Messaging](#messaging-a-durable-tuple-space)). Instances never address
-each other; they read and write shared durable state, decoupled in identity and
-time. This is what preserves inspectability, replayability, and decoupling.
+The package state model follows the rest of WhippleScript's durable design:
+
+```text
+commands request coordination changes
+events record accepted coordination changes
+projections answer coordination state
+```
+
+`std.coord` is standard and privileged. Its source forms can be package-owned,
+but its checks are platform-enforced: release obligations, bounded waits,
+multi-lease ordering, counter caps, and ledger retention cannot be validated by
+a plain request/response provider call.
+
+The coordination model is a **durable tuple-space, not communication-platform
+messaging** (see [Coordination vs messaging](#coordination-vs-messaging)).
+Instances that use `std.coord` read and write shared durable state, decoupled in
+identity and time. Communication through Slack, email, desktop notifications,
+or other external channels belongs to `std.messaging`.
 
 ## The three architectural principles
 
@@ -59,7 +76,9 @@ Every resource in the family obeys the discipline the queue already proved:
 
 So the family is three non-overlapping shapes: `lease` (reservable, leak-safe,
 1-or-N slots), `ledger` (append-only, contention-free), `counter` (consumable,
-reset-scheduled).
+reset-scheduled). A `lease` with `slots 1` is a mutex; a `lease` with `slots N`
+is a semaphore. `mutex` and `semaphore` should not be separate resource kinds
+unless the slot model proves insufficient.
 
 ## Surface
 
@@ -67,6 +86,10 @@ Each resource is declared like a queue (workspace-scoped builtin), mutated by
 atomic branchable effects, and projected to facts. Operation outcomes **are sum
 types** ([`sum-types.md`](sum-types.md)) and the compiler enforces exhaustive
 handling.
+
+The long-term package lowering should be a modeled `resource_effect` class, not
+plain `capability_call`. Construct registration can describe the syntax, but
+the platform catalog owns the lowering semantics and reserved bare verbs.
 
 ### lease
 
@@ -90,6 +113,16 @@ rule ship
   after slot contended { ... }   # someone else holds this env; skip/retry
 }
 ```
+
+`std.coord.lease` does **not** implement leasing itself. It is a *surface* over
+the single kernel lease primitive (`acquire`/`renew`/`expire`/`recover`) that the
+kernel owns; `queue.claim` ([`work-queues.md`](work-queues.md)) and `std.tracker`
+claims are sibling surfaces over the same primitive, sharing its TTL, recovery,
+and lease-event vocabulary. The package contributes the typed-key declaration,
+the branchable outcomes, and the static safety checks below; the durable lease
+lifecycle (hold, renewal, TTL expiry, instance-terminal release, crash recovery)
+is kernel-owned. Lease holders and wait queues are ordinary recorded facts; only
+the lifecycle is a kernel primitive.
 
 `acquire` is **one atomic attempt**: it completes immediately as `held` or
 `contended` — the check and the act are one effect (principle 2), and the
@@ -118,6 +151,14 @@ conflating them would make `contended` ambiguous between "failed" and "queued".
 `acquire ... until ttl` is the explicit fire-and-forget form (no `release`
 obligation; TTL is the sole release). A semaphore is `slots N`.
 
+A fire-and-forget (`until ttl`) lease **does count as held** while its TTL is
+unexpired: it occupies a slot, so it counts toward the `slots N` / at-most-one
+budget the kernel enforces, and toward the at-most-one-held-lease static check
+that breaks hold-and-wait. The only difference from a `release`-obligated lease
+is the release trigger (TTL or instance-terminal, never an explicit `release`);
+its occupancy of the slot is identical. So acquiring a second lease while holding
+an `until ttl` lease still requires a declared `lease order`.
+
 ### ledger
 
 ```whip
@@ -145,8 +186,9 @@ Entries project as per-entry facts (consistent with queue items); aggregation
 ```whip
 counter model_budget {
   key Customer
-  cap 1000             # units (tokens/cents)
-  reset daily          # lazy: applied at the next consume (below)
+  cap 1000               # units (tokens/cents)
+  reset daily            # lazy: applied at the next consume (below)
+  timezone "UTC"         # required anchor for the reset period boundary
 }
 
 rule review
@@ -170,10 +212,62 @@ declines. A counter nobody consumes is never reset, which is unobservable and
 therefore free; the `CapInvariant` model treats reset as part of the consume
 action, which makes it smaller, not larger.
 
+A period boundary like `reset daily` is meaningless without an anchor, so
+`counter` must declare a `timezone`/anchor — the periodic-reset-anchor rule of
+[`admission-and-idempotency.md`](admission-and-idempotency.md#periodic-reset-anchor).
+If omitted, the checker defaults to UTC and emits a diagnostic (one
+`severity: warning` from the canonical `error | warning | info | hint` enum)
+recommending an explicit anchor; without it the period boundary, and therefore
+the reset firing, would be non-deterministic on replay. When a consume rolls the
+period, the reset firing is recorded as a fact (`counter.period_reset`, below):
+replay **re-reads** that recorded reset rather than recomputing the period from
+wall-clock time, so the same consume sequence reproduces the same counts. The
+anchored period boundary is the only clock-derived input, and it is recorded
+once.
+
 All operations carry instance/run provenance (the work-queue mechanism), so
 `whip leases` / `whip ledger` / `whip counters` can answer "*who* holds the
 prod slot / spent the budget / wrote this entry" — coordination state is fully
 attributable and inspectable.
+
+## Event And Projection Vocabulary
+
+Accepted coordination changes are append-only events:
+
+```text
+lease.declared
+lease.acquire_requested
+lease.acquired
+lease.contended
+lease.wait_enqueued
+lease.wait_timed_out
+lease.renewed
+lease.released
+lease.expired
+
+ledger.declared
+ledger.entry_appended
+ledger.entry_pruned
+
+counter.declared
+counter.consumed
+counter.over_limit
+counter.period_reset
+```
+
+The provider answers coordination questions through projections:
+
+```text
+active lease holders by resource/key
+lease wait queues by resource/key
+ledger entries by partition
+counter usage by key/period
+coordination history/audit
+```
+
+No workflow mutates a projection directly. Projections are rebuildable from the
+accepted coordination event stream plus runtime clock boundaries recorded by
+the provider.
 
 ## Safety model
 
@@ -236,27 +330,29 @@ instance-terminal release gives crash safety. `BoundedWait` is a property of
 the `acquire ... wait` form's queue; the plain `acquire` never waits, so its
 liveness is trivial (it always completes immediately, one way or the other).
 
-## Messaging: a durable tuple-space
+## Coordination vs messaging
 
-WhippleScript coordinates through shared state, not actor-style channels. Every
-messaging pattern is expressible as a coordination resource, and authors should
-reach for these rather than build channels:
+`std.coord` coordinates through shared state, not actor-style channels. These
+patterns remain coordination patterns:
 
 - **Broadcast / pub-sub** -> `ledger` (append; subscribers project).
 - **Work distribution / competing consumers** -> `queue` (claim).
 - **Spawn / delegate** -> `invoke` (parent -> child).
-- **Point-to-point mailbox** -> a `ledger` partitioned by recipient identity:
-  "instance B's mailbox" is the ledger partition keyed by B, which B projects
-  with `when mailbox has entry for self.id as m`. The pattern requires an
-  instance to name itself, which exists nowhere else in the language, so it is
-  pinned here: **`self.id`** is the builtin instance id, recorded at instance
-  start — a recorded value like any fact field, so expressions over it stay
-  pure and replay-safe. A durable, retained, inspectable mailbox with no new
-  primitive.
-- **Directed fire-and-forget** -> the in-workflow `notify` effect
-  ([`event-ingress.md`](event-ingress.md)), which injects a typed durable event
-  into a target instance — still "inject a durable event," not "open a
-  channel," so no liveness coupling.
+- **Internal per-recipient partitions** -> a `ledger` partitioned by an explicit
+  recipient key carried in workflow data. This is useful for durable tuple-space
+  patterns such as fan-out/fan-in barriers, but it is not a communication
+  channel and should not be described as a mailbox in source-facing docs. If the
+  language later needs a builtin current-instance identity value, that belongs in
+  a core instance-identity design, not as an incidental `std.coord` feature.
+- **Directed typed signal injection** -> the in-workflow signal injection effect
+  ([`event-ingress.md`](event-ingress.md)), which injects a typed durable
+  signal into a target instance.
+
+`std.messaging` is separate. It is for talking through communication platforms:
+local mailboxes, Slack, email, GitHub comments, desktop notifications, stdio,
+or similar channels. Messaging may use `std.ingress` for inbound observations,
+but it does not replace coordination resources and it does not produce arbitrary
+typed domain facts without an explicit signal or schema-coercion boundary.
 
 Synchronous peer request/reply is deliberately awkward: if you need a
 synchronous typed answer, you want an effect (`coerce`/`call`/`exec`), not a
@@ -276,18 +372,37 @@ the `invoke` + ledger-barrier pattern.
   `held`/`times out`; `contended` on a `wait` acquire is a check error.
 - `acquire ... wait` without a `timeout` is a check error (every wait is
   author-bounded).
-- `ledger` must declare `retain`; `counter` must declare `cap` and `reset`;
+- `ledger` must declare `retain`; `counter` must declare `cap` and `reset`, and
+  should declare a `timezone`/anchor for the reset period (default UTC + a
+  `severity: warning` diagnostic if omitted, per
+  [`admission-and-idempotency.md`](admission-and-idempotency.md#periodic-reset-anchor));
   `lease` must declare `ttl`.
 - No coordination resource is readable in a guard — only its projected facts
   and operation outcomes.
 
+## Non-Goals
+
+- No arbitrary shared cells.
+- No general SQL/document database surface.
+- No unbounded waits.
+- No read-then-act guard over coordination state.
+- No separate `mutex` or `semaphore` resource until `lease slots` fails.
+- No communication-platform channel semantics; those belong to `std.messaging`.
+
 ## Dependencies
 
 Generalizes the queue (precedent + template). Outcomes reuse sum-type
-exhaustiveness (C1); counter reset reuses scheduled time (C4); the `notify`
-effect and mailbox pattern compose with event ingress (C5); leases reuse the
-worker-lease TTL/instance-terminal runtime; formal models reuse the TLA+/Maude
-rig and trace-conformance refinement.
+exhaustiveness (C1); counter reset reuses core time plus `std.time` and the
+periodic-reset anchor of
+[`admission-and-idempotency.md`](admission-and-idempotency.md); typed signal
+injection and ledger partition/barrier patterns compose with ingress;
+`std.coord.lease` is a surface over the **single kernel lease primitive**
+(`acquire`/`renew`/`expire`/`recover`) — the same primitive
+[`work-queues.md`](work-queues.md)'s `queue.claim` and `std.tracker` claims use,
+not a second lease implementation; formal models reuse the TLA+/Maude rig and
+trace-conformance refinement. Coordination outcomes are recorded facts; the
+lease lifecycle is the kernel primitive (see
+[`admission-and-idempotency.md`](admission-and-idempotency.md)).
 
 ## Modeling notes
 

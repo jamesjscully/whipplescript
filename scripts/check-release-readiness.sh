@@ -60,6 +60,10 @@ CHECK_STATUSES=()
 CHECK_LOGS=()
 
 run_check required "shell syntax" "cd '$ROOT' && bash -n scripts/*.sh"
+run_check required "docs snippets" "cd '$ROOT' && scripts/check-docs-snippets.sh"
+run_check required "docs site" "cd '$ROOT' && scripts/check-docs-site.sh"
+run_check required "report schemas" "cd '$ROOT' && scripts/check-report-schemas.sh"
+run_check required "artifact admission differential" "cd '$ROOT' && scripts/check-artifact-admission-differential.sh"
 run_check required "format check" "cd '$ROOT' && cargo fmt --all -- --check"
 run_check required "diff whitespace check" "cd '$ROOT' && git diff --check"
 run_check required "Loft compatibility fixtures" "cd '$ROOT' && scripts/check-loft-fixtures.sh"

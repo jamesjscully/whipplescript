@@ -15,7 +15,7 @@ else
   fi
 fi
 
-for MODEL in "$ROOT/models/tla/ControlPlaneLifecycle.tla" "$ROOT/models/tla/NativeProviderLifecycle.tla"; do
+for MODEL in "$ROOT/models/tla/ControlPlaneLifecycle.tla" "$ROOT/models/tla/NativeProviderLifecycle.tla" "$ROOT/models/tla/ClockSourceLifecycle.tla"; do
   "${APALACHE[@]}" typecheck "$MODEL"
   "${APALACHE[@]}" check \
     --cinit=ConstInit \

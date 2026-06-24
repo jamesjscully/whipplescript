@@ -1,0 +1,49 @@
+--- Standard-library construct lock exemption, per the 1929 OPTION A decision in
+--- spec/implementation-plan.md Stage P4 messaging and spec/packages.md. A
+--- construct USE -- a ConstructCapabilityCall such as recall or send -- normally
+--- requires a package lock that authorizes it, so a third-party supply-chain
+--- construct cannot compile without a pinned, reviewed lock. Standard-library
+--- constructs such as std.messaging send are built into the compiler, not fetched
+--- from a supply chain, so they are EXEMPT from the lock requirement -- but only
+--- because the compiler itself registers them as built-ins. The exemption is
+--- keyed on being a recognized built-in standard construct, NOT merely on a name:
+--- a third-party package cannot bypass the lock by claiming the std namespace,
+--- because the compiler holds no built-in registration for it.
+---
+--- The model abstracts each construct use to one of three dispositions: a
+--- recognized standard built-in, a recognized third-party construct, or an
+--- unknown construct that claims authority the compiler does not register. It
+--- checks by reachability that:
+---   a standard built-in use is authorized with no lock, the exemption;
+---   a third-party use is authorized only when a lock authorizes it;
+---   a third-party use with no lock, and an unknown construct, are never
+---     authorized -- the lock requirement still bites for the supply chain, and
+---     the exemption does not leak to unregistered constructs.
+mod WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION is
+  protecting BOOL .
+
+  sorts Use Cfg .
+
+  ops send recall bogus : -> Use [ctor] .   --- sample construct uses
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op stdUse : Use -> Cfg [ctor] .        --- a recognized standard built-in construct use
+  op thirdPartyUse : Use -> Cfg [ctor] . --- a recognized third-party package construct use
+  op unknownUse : Use -> Cfg [ctor] .    --- a construct the compiler does not register
+  op locked : Use -> Cfg [ctor] .        --- a package lock authorizes this use
+  op authorized : Use -> Cfg [ctor] .    --- the use is authorized to compile
+
+  var U : Use .
+
+  --- Standard built-in constructs are exempt from the package lock: a recognized
+  --- std construct use authorizes with no locked premise. Keyed on stdUse, so the
+  --- exemption never reaches a third-party or unknown construct.
+  rl [std-exempt] : stdUse(U) => authorized(U) .
+
+  --- A third-party construct use authorizes only when a package lock authorizes
+  --- it. Without locked this rule cannot fire, so an unlocked third-party use
+  --- stays unauthorized -- the supply-chain lock requirement still bites.
+  rl [locked-ok] : thirdPartyUse(U) locked(U) => authorized(U) .
+endm

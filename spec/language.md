@@ -195,7 +195,7 @@ workflow = deployable runtime boundary
 pattern  = reusable compile-time building block
 rule     = atomic runtime rewrite
 include  = source composition
-use      = plugin import
+use      = package/library import
 apply    = compile-time pattern expansion
 invoke   = durable child workflow invocation
 complete = successful workflow terminal output
@@ -206,15 +206,15 @@ Patterns compose behavior into a workflow. Workflows run as durable instances.
 The compiler may share internal representation between them, but source
 semantics must not blur `apply` and `invoke`.
 
-`use` imports a plugin by name:
+`use` imports package/library surface by name:
 
 ```whip
 use memory
 ```
 
-Plugins may register capabilities, effect providers, fact schemas, prompt
-templates, resources, and optional skills. `use` does not import skills into
-agent context and does not include source files.
+Packages may register library contracts, capabilities, effect providers, fact
+schemas, prompt templates, resources, and optional skills. `use` does not grant
+runtime authority, import skills into agent context, or include source files.
 
 Skills are Claude-style agent context bundles. They are assigned to agents:
 
@@ -229,12 +229,13 @@ The intended file composition form is `include`, not `use`:
 
 ```whip
 include "schemas/common.whip"
-include "review.baml"
+include "review.coerce"
 ```
 
 `.whip` includes should splice ordinary WhippleScript declarations before
-analysis. `.baml` includes should make BAML functions/classes available to
-`coerce` lowering without pretending BAML is a skill. Include resolution,
+analysis. `.coerce` includes are schema-coercion backend interop artifacts: they
+make coerce functions/classes available to the `std.coercion` backend without
+pretending coerce is a skill or workflow-control surface. Include resolution,
 cycle detection, and source-map diagnostics are still implementation work.
 
 A `.whip` file contributes declarations to a source bundle. A deployable run
@@ -340,13 +341,51 @@ apply AgentReview<PhaseReviewRequest, PhaseReviewResult> as ReviewPlanPhase {
 ```
 
 Patterns may define local helper schemas/rules/effects. They produce ordinary
-facts/effects in the containing workflow after expansion. They do not use
-`complete` or `fail`; those are workflow-only terminal operations.
+facts/effects in the containing workflow after expansion. In v0, terminal actions
+(`complete`/`fail`) are **forbidden in pattern bodies**: a `complete`/`fail`
+inside a `pattern` is a compile-time error. Patterns elaborate into rules, and
+terminals belong to the workflow that owns the contract. A reusable body that
+should reach a terminal does so by recording a result fact that a workflow rule
+matches and turns into `complete`/`fail` (see the `ReviewPhaseBody` example
+below).
 
 The compiler must elaborate every pattern application into a finite first-order
-program before runtime. Recursive pattern use is allowed only under analyzable,
-structurally bounded strata. Unbounded pattern recursion is a compile-time
-diagnostic.
+program before runtime. In v0, pattern expansion is **non-recursive only**: an
+`apply` whose expansion (directly or transitively) reaches another `apply` of a
+pattern already on the active expansion stack is a compile-time error
+(`graph.unbounded_pattern_recursion`, severity `error`). The diagnostic names
+the expansion cycle (pattern -> apply -> pattern ...).
+
+Bounded recursive expansion is deferred. If it is added, it will require a
+statically-decreasing structural measure over a finite structure (each recursive
+`apply` must consume a strictly smaller piece of a finite, compile-time-known
+type/value), so that the elaborator can prove a finite expansion before runtime.
+Until that analysis exists, all recursive `apply` is rejected.
+
+`apply` arguments are written `name value` inside the application block and bind
+the pattern's declared parameters. Each argument is typed by the kind of
+parameter it names:
+
+```text
+type parameter   (e.g. <Input, Output>)  bound positionally by the <...> list;
+                                          each must name a known class/type
+agent parameter  (a parameter the pattern uses as a tell/route target)
+                                          the argument must name a declared agent
+                                          in the applying workflow, e.g.
+                                          `reviewer codex`
+input/fact parameter (`input Input as x`) the argument must name an in-scope fact
+                                          binding or fact class of the pattern's
+                                          declared input type, e.g. `item phase`
+value parameter  (a scalar/literal slot)  the argument must be a literal of the
+                                          parameter's declared type
+```
+
+An argument that names no pattern parameter, supplies the wrong kind (e.g. a
+literal where an agent is expected, or an agent name where the refined `AgentRef`
+domain does not include it), or whose type does not match the parameter's
+declared type is a compile-time error before expansion. All `apply` argument
+typing happens against the applying workflow's declarations; pattern expansion
+does not introduce new agents or facts on its own.
 
 Current implementation status: `apply Pattern<Type> as alias { ... }` expands
 pattern-local declarations with hygienic generated names such as
@@ -419,6 +458,18 @@ fail error {
 declared `failure`. A workflow may produce many intermediate facts, but none of
 them complete the workflow unless a rule executes `complete`.
 
+**Terminal tie-break.** Stepping is a deterministic fixpoint (see
+[semantics.md](semantics.md)): enabled rules fire in a fixed order (rule
+declaration order, then the earliest triggering fact sequence), and each
+application is its own sequenced step. If more than one rule would reach
+`complete`/`fail` from the same state, the **first committed terminal in that
+deterministic order wins**. The moment a terminal commits, the instance is
+terminal: no further effectful rule commits, and no second terminal can commit.
+A later rule that would also have reached `complete`/`fail` simply does not fire,
+because terminal commitment removes the state it would have matched (and the
+post-terminal guard rejects it regardless). This makes the winning terminal a
+deterministic, replayable function of the program and the input sequence.
+
 Imported workflows compose at runtime through `invoke`, not `apply`:
 
 ```whip
@@ -445,11 +496,46 @@ after review fails as failure {
 }
 ```
 
-`invoke` creates a durable child workflow instance or an equivalent invocation
-effect. In `after review succeeds as result`, `result` is the declared output
-payload, not an untyped envelope. The parent does not see or depend on the
-child's internal rules/facts except through declared outputs, failures, events,
-evidence, and artifacts.
+`invoke` creates a durable **child workflow instance**. It is not a synchronous
+call and not a bare invocation effect that merely names a target: the parent's
+`workflow.invoke` effect starts a real child instance that runs its own rules to
+a workflow terminal (`complete`/`fail`) under its own program version and its own
+revision epoch (see
+[workflow-revision-transition-tracker.md](workflow-revision-transition-tracker.md);
+the child may revise independently of the parent). In `after review succeeds as
+result`, `result` is the declared output payload, not an untyped envelope. The
+parent does not see or depend on the child's internal rules/facts except through
+declared outputs, failures, events, evidence, and artifacts.
+
+The child's lifecycle is the durable workflow lifecycle. Its terminal is
+projected back into the parent invocation through the canonical terminal-output
+union defined in [expression-kernel.md](expression-kernel.md):
+`Completed<O> | Failed<E> | TimedOut | Cancelled`, where `O` is the child's
+declared `output` type and `E` is the child's declared `failure` type. The
+parent matches it with the canonical branch keywords:
+
+```text
+after <child> succeeds as result   -> Completed<O> (child ran `complete`)
+after <child> fails as failure     -> Failed<E>    (child ran `fail`)
+after <child> times out as timeout -> TimedOut      (status `timed_out`)
+after <child> cancelled as cancel  -> Cancelled
+after <child> completes as outcome -> the full union (for `case`)
+```
+
+`TimedOut` and `Cancelled` are not child workflow outputs; they are
+invocation-level terminals and carry the generic union payloads from
+[expression-kernel.md](expression-kernel.md): `TimedOut { summary, effect_id,
+run_id }` and `Cancelled { summary, effect_id, run_id }`. Only `succeeds`/`fails`
+carry child-declared payloads.
+
+**Cancellation.** A child instance is cancelled by a control-plane operation on
+the child (an explicit cancel, or a revision cancellation policy that
+terminal-cancels the parent invocation effect / the child instance — see the
+revision tracker), not by an ordinary parent rule reaching into child state. When
+the child instance reaches the cancelled terminal, the parent's
+`workflow.invoke` effect is projected as `Cancelled` and the parent observes it
+through `after <child> cancelled` (or the `Cancelled` arm of `after <child>
+completes`).
 
 The compiler validates that the invoked workflow is declared in the source
 bundle and that the invocation payload uses the target workflow's declared
@@ -463,12 +549,14 @@ from the same source bundle, records a parent/child invocation link, and can
 either run the child to a terminal state within a bounded local loop or leave
 the parent effect running for a later worker pass to resume. Child
 `complete`/`fail` payloads are projected back into parent `after review
-succeeds/fails` blocks. If the child does not reach a workflow terminal state
-within the bounded loop, the parent invocation effect is marked `timed_out` and
-projected through `after review fails/completes`. If the child instance is
-cancelled, the parent invocation effect is marked `cancelled` and projected
-through `after review completes` as the `Cancelled` terminal branch. Invocation
-records include source-span metadata when the parent effect has it.
+succeeds`/`after review fails` blocks. If the child does not reach a workflow
+terminal state within the bounded loop, the parent invocation effect is marked
+`timed_out` and projected as the `TimedOut` terminal, matched by `after review
+times out` (or the `TimedOut` arm of `after review completes`). If the child
+instance is cancelled, the parent invocation effect is marked `cancelled` and
+projected as the `Cancelled` terminal, matched by `after review cancelled` (or
+the `Cancelled` arm of `after review completes`). Invocation records include
+source-span metadata when the parent effect has it.
 
 If the same logic should be usable inline and as a child workflow, define a
 pattern for the reusable body and wrap it in a workflow:
@@ -504,7 +592,7 @@ This keeps one way to compose each semantic layer:
 inline reuse       -> pattern + apply
 runtime child work -> workflow + invoke
 file composition   -> include
-plugin resources   -> use
+package/library surface -> use
 workflow return    -> complete/fail
 ```
 
@@ -514,17 +602,28 @@ Language constructs that touch the world lower into effect categories defined in
 [effects-and-capabilities.md](effects-and-capabilities.md):
 
 ```text
-tell       -> agent.tell
-askHuman   -> human.ask
-coerce     -> baml.coerce
-notify     -> event.notify
-call       -> capability.call
+tell        -> agent.tell
+askHuman    -> human.ask
+coerce      -> schema.coerce
+emit signal -> signal.emit
+call        -> capability.call
 ```
 
-Registered plugins may provide additional namespaced effects, but not new
-control-flow semantics. For example, a memory plugin may provide
-`memory.query`; a Thoth plugin may provide `thoth.verify`. Rules still compose
-those through ordinary durable effects and completion facts.
+The `emit signal` surface is the directed signal-injection construct
+(`signal_emit`): `emit signal <name> to <target> { <payload> } as <binding>`. It
+lowers to a durable `signal.emit` effect that validates the payload against the
+target program's declared signal and appends the signal fact to the target
+instance. See [event-ingress.md](event-ingress.md). This is the only `emit`
+surface; the bare `emit event.name` form is removed (see
+[Removed: bare `emit`](#removed-bare-emit) below).
+
+Current implementations may still report `coerce` effects as `coerce`;
+that is a backend-specific compatibility name, not the conceptual effect kind.
+
+Registered packages may provide additional namespaced effect contracts, but not
+new control-flow semantics. For example, a memory package may provide
+`memory.query`; a GitHub package may provide `github.comment`. Rules still
+compose those through ordinary durable effects and completion facts.
 
 Every effect has an idempotency key, required capabilities, and a completion
 contract.
@@ -543,13 +642,14 @@ effect is blocked before a provider run starts. The block reason is written to
 the event log and effect projection, so `status` and trace-conformance checks can
 explain why no worker was started.
 
-Plugins are loaded as manifests that register capability schemas, effect
-providers, optional profiles, and optional bindings. They extend the registry
-but do not receive mutable access to kernel state or control-flow semantics.
+Packages are loaded as manifests that register library/effect contracts,
+capability schemas, effect providers, optional profiles, and optional bindings.
+They extend the registry but do not receive mutable access to kernel state or
+control-flow semantics.
 
 All fact payloads, effect payloads, and `coerce` signatures use the type system
-defined in [type-system.md](type-system.md). WhippleScript supports BAML-compatible
-boundary types, but only a small pure expression kernel. It should not grow
+defined in [type-system.md](type-system.md). WhippleScript supports
+schema-coercion-compatible boundary types, but only a small pure expression kernel. It should not grow
 loops, collection pipelines, numeric libraries, or media manipulation.
 
 ## Parser Strategy
@@ -562,7 +662,7 @@ parser easy to adjust while preserving the properties the compiler needs:
 byte-accurate source spans
 recoverable diagnostics
 raw rule/effect block preservation
-typed top-level syntax nodes for workflow contracts, includes, plugin imports,
+typed top-level syntax nodes for workflow contracts, includes, package imports,
 schemas, agents, patterns, applications, coerces, assertions, and rules
 ```
 
@@ -580,7 +680,7 @@ Facts are durable workflow memory. Rules match facts in `when` clauses and
 produce facts with `record`.
 
 Every fact has provenance: runtime, rule-recorded, effect completion, external
-projection, or plugin projection. See
+projection, or package/provider projection. See
 [fact-provenance.md](fact-provenance.md).
 
 Typed fact declarations use classes:
@@ -635,7 +735,8 @@ rule run_codex_language_task
 
 The guard language must stay small and deterministic. It may read matched fact
 fields, literals, enums, null, booleans, scalar comparisons, membership, and
-presence checks. It must not call providers, `coerce`, plugins, host-language
+presence checks. It must not call providers, `coerce`, package capabilities,
+host-language
 functions, or string parsers. If a workflow needs semantic judgment, that
 judgment belongs in an explicit effect such as `coerce` or `call
 validator.checkScript`, and the resulting typed fact can be matched by a later
@@ -925,8 +1026,8 @@ must identify the target agent deterministically through either:
 The runtime must never ask a language model to decide which provider is being
 tested, which model is active, or which logical agent should receive a turn.
 Those values may be copied into result/audit facts by rule literals or typed
-metadata, but they should not be fields in BAML review output unless the review
-is explicitly about verifying observed provider evidence.
+metadata, but they should not be fields in schema-coercion output unless the
+coercion is explicitly about verifying observed provider evidence.
 
 Dynamic agent routing is typed:
 
@@ -1081,7 +1182,7 @@ rule run_language_task
 Descriptions are preserved in typed IR as source metadata. They do not change
 rule readiness, rule ordering, effect routing, capabilities, provider
 selection, assertion behavior, or runtime state. A description cannot attach to
-schemas, agents, harnesses, coerces, includes, plugins, workflow contracts,
+schemas, agents, harnesses, coerces, includes, package imports, workflow contracts,
 patterns, or applications in this slice.
 
 Repeated effect chains should be reusable without obscuring the durable graph.
@@ -1114,6 +1215,15 @@ action run_language_task(agent AgentRef, task LanguageTask, provider string) {
 This is syntactic reuse, not a general function system. Expansion must preserve
 source spans, idempotency keys, dependencies, and effect/fact provenance.
 
+Implemented per [DR-0023](decision-records/0023-action-block-rule-templates.md)
+(slices 1–2, 2026-06-17). The example above is illustrative; the v0 surface that
+shipped narrows it: a typed agent parameter is written `AgentRef<reviewer>` (the
+type grammar requires the angle-bracket form), calls are fire-and-forget (no `as`
+binding), and an action body holds the chain shape only — effect statements,
+`after` blocks, `record`, and `done`; `complete`/`fail`/`case`/`branch` and
+nested action calls stay in the calling rule. See `docs/language-reference.md`
+§`action` and `examples/reusable-action-chain.whip`.
+
 ## Deterministic Assertions
 
 Workflows and e2e tests need first-class deterministic assertions over facts and
@@ -1124,7 +1234,7 @@ wording:
 assert count(LanguageE2EResult where provider == "codex") == 2
 assert exists(LanguageE2EResult where language == "Japanese")
 assert count(effect kind agent.tell where status == completed) == 6
-assert count(effect kind baml.coerce where status == completed) == 6
+assert count(effect kind schema.coerce where status == completed) == 6
 ```
 
 Assertions are read-only and run after stepping or at named checkpoints. Failed
@@ -1155,25 +1265,32 @@ rule implement_claimed_issue
 `after` compiles to durable effect dependency edges. It is not a callback, not a
 subroutine, and not general control flow.
 
-Allowed v0 predicates:
+Allowed v0 predicates correspond to the canonical terminal-output union
+(`Completed<O> | Failed<E> | TimedOut | Cancelled`) defined in
+[expression-kernel.md](expression-kernel.md):
 
 ```text
-succeeds
-fails
-completes
+succeeds   -> Completed<O>
+fails      -> Failed<E>
+times out  -> TimedOut    (status `timed_out`)
+cancelled  -> Cancelled
+completes  -> the full union (binds the outcome for case)
 ```
 
-Effect outputs are available only after the matching dependency predicate is
-satisfied. The compiler rejects use of `claim.issue.title` outside the
-`after claim succeeds` scope.
+`times out` and `cancelled` matter mainly for effects that can reach those
+terminals, notably `invoke` (see
+[Workflow Contracts And Invocation](#workflow-contracts-and-invocation)) and any
+effect carrying a `timeout <duration>`. Effect outputs are available only after
+the matching dependency predicate is satisfied. The compiler rejects use of
+`claim.issue.title` outside the `after claim succeeds` scope.
 
 Joins should be expressed as normal rules over completion facts, not as nested
 effect graph syntax.
 
 ## Coerce
 
-`coerce` should read like a typed model decision, but it is semantically
-asynchronous and durable:
+`coerce` should read like typed schema coercion from messy external output into
+a declared shape, but it is semantically asynchronous and durable:
 
 ```whipplescript
 rule classify
@@ -1192,8 +1309,9 @@ rule accept
 }
 ```
 
-The first rule requests the BAML call. The second rule reacts when the typed
-coerce output has arrived. See [coerce.md](coerce.md).
+The first rule requests schema coercion. The second rule reacts when the typed
+coerce output has arrived. coerce may implement the backend, but it is not the
+control-flow concept. See [coerce.md](coerce.md).
 
 ## Design Pressure
 
@@ -1222,7 +1340,7 @@ The second form is friendly but still exposes the causal edge.
 ## Surface revisions (decided 2026-06-09)
 
 The following supersede earlier statements in this document where they
-conflict. Decision records: [`language-ergonomics-tracker.md`](language-ergonomics-tracker.md).
+conflict. Decision records: [`language-ergonomics-tracker.md`](decision-records/language-ergonomics-tracker.md).
 
 ### Readiness matching: general form and sugar
 
@@ -1272,11 +1390,12 @@ as x` effects, and the `cancel <binding>` body operation. See
 `queue <name> { tracker <kind> }`, the `file`/`claim`/`release`/`finish`
 verbs, and the builtin workspace tracker. See [`work-queues.md`](work-queues.md).
 
-### Inline typed decisions and choice types
+### Inline Typed Coercion And Choice Types
 
 `decide "<prompt>" -> { <fields> } as x` is anonymous-coercion sugar: it
 lowers to a generated `coerce` function and class with stable names and the
-ordinary `baml.coerce` effect. Promotion to a named `coerce` is a mechanical
+ordinary schema-coercion effect. Current implementations may still report the
+legacy `coerce` effect kind. Promotion to a named `coerce` is a mechanical
 refactor once a shape is reused.
 
 `case` is permitted over string-literal-union types with exhaustiveness
@@ -1299,7 +1418,12 @@ passes the typed record on stdin. Raw command strings are rejected in hosted
 checks and workers. Evidence records exit code, truncated stdout/stderr, and
 the executing hash for hosted capabilities.
 
-### Removed: `emit`
+### Removed: bare `emit`
 
-`emit event.name` is removed from the surface: it had no documented
-semantics and no usage. Events are the runtime's to append.
+The bare `emit event.name` form is removed from the surface: it had no
+documented semantics and no usage. Events are the runtime's to append. This does
+not remove `emit signal <name> to <target> { ... }` (construct `signal_emit`),
+which is the directed signal-injection effect documented in
+[External Effects](#external-effects) and
+[event-ingress.md](event-ingress.md). Only the undirected bare-event form is
+gone.

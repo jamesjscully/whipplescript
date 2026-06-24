@@ -27,7 +27,7 @@ error: rule `impossible_domain_equality` has statically unsatisfiable finite-dom
    |
 36 | => {
    |    ^
-   = help: compare domains with at least one shared value; left: codex, claude, right: pi, baml
+   = help: compare domains with at least one shared value; left: codex, claude, right: pi, coerce
 error: rule `impossible_domain_membership` has statically unsatisfiable finite-domain exclusion
    --> examples/invalid/bad-finite-domain.whip:41:4
    |

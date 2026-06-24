@@ -1,0 +1,29 @@
+load ../std-construct-authorization.maude
+
+--- Coverage: a standard built-in construct use is authorized with no lock (the
+--- 1929 OPTION A exemption).
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  stdUse(send)
+  =>* authorized(send) RESIDUAL:Cfg .
+
+--- Coverage: a third-party construct use authorizes when a lock authorizes it.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  thirdPartyUse(recall) locked(recall)
+  =>* authorized(recall) RESIDUAL:Cfg .
+
+--- Bite (supply-chain lock still required): a third-party construct use with no
+--- lock is never authorized. The RESIDUAL soup var means an authorization in any
+--- reachable state would be a solution, so No solution proves the lock
+--- requirement still bites. If [std-exempt] keyed on any use rather than only the
+--- standard built-in, this would find a solution.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  thirdPartyUse(recall)
+  =>* authorized(recall) RESIDUAL:Cfg .
+
+--- Bite (no name-only bypass): an unknown construct the compiler does not register
+--- is never authorized, even with no lock. The exemption is keyed on a recognized
+--- built-in registration, so a package cannot bypass the lock by claiming the std
+--- namespace without a compiler built-in behind it.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  unknownUse(bogus)
+  =>* authorized(bogus) RESIDUAL:Cfg .

@@ -71,6 +71,8 @@ impl CoordinationStore {
         let connection = Connection::open(path)?;
         connection.execute_batch(
             r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA busy_timeout = 5000;
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS leases (
                 resource TEXT NOT NULL,
@@ -117,7 +119,9 @@ impl CoordinationStore {
         ttl_seconds: i64,
         holder: &str,
     ) -> StoreResult<AcquireOutcome> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM leases WHERE resource = ?1 AND key = ?2 AND expires_at <= datetime('now')",
             params![resource, key],
@@ -182,7 +186,9 @@ impl CoordinationStore {
         appended_by: &str,
         retain_seconds: i64,
     ) -> StoreResult<i64> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT OR IGNORE INTO ledger_seq (ledger, next_seq) VALUES (?1, 1)",
             params![ledger],
@@ -215,7 +221,9 @@ impl CoordinationStore {
         cap: i64,
         period: &str,
     ) -> StoreResult<ConsumeOutcome> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT OR IGNORE INTO counters (counter, key, consumed, period) VALUES (?1, ?2, 0, ?3)",
             params![counter, key, period],

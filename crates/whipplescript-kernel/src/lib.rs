@@ -4,6 +4,7 @@ pub mod artifact_manifest;
 pub mod claude_agent_sdk;
 pub mod codex_app_server;
 pub mod coerce;
+pub mod coerce_native;
 pub mod harness;
 pub mod loft;
 pub mod native_lifecycle;
@@ -15,7 +16,7 @@ use artifact_manifest::{
     artifact_capture_failed_payload, provider_artifact_manifest, validate_artifact_manifest,
     ArtifactCaptureFailure,
 };
-use coerce::{BamlClient, BamlCoerceRequest, BamlCoerceResult, BamlCoerceStatus};
+use coerce::{CoerceClient, CoerceRequest, CoerceResult, CoerceStatus};
 use harness::{
     AgentHarness, AgentTurnRequest, ProviderFailure, ProviderRunResult, ProviderRunStatus,
 };
@@ -27,17 +28,19 @@ use provider::{
 };
 use serde_json::{json, Value};
 use trace::{DependencyEdge, EffectStatus, TraceEvent, TraceRecord};
+use whipplescript_core::Severity;
 use whipplescript_parser::{
     DependencyPredicate, IrEffectKind, IrPrimitiveType, IrProgram, IrSchema, IrType,
     IrWorkflowContractKind, SourceSpan,
 };
 use whipplescript_store::{
     ArtifactRecord, ClaimableEffect, DerivedFact, DiagnosticRecord, EffectCancellation,
-    EffectCompletion, EvidenceRecord, ExpiredLease, InstanceTransition, LeaseRenewal,
-    NewEffectDependency, NewEvent, NewFact, NewInboxItem, NewInstance, NewProgramVersion,
-    NewWorkflowInvocation, ProgramVersionRecord, RetryEffect, RevisionActivation, RuleCommit,
-    RuleCommitRevisionGuard, RunStart, SkillEvidence, SqliteStore, StoreError, StoreResult,
-    StoredEvent, TerminalDiagnosticRecord, WorkflowInvocationView, WorkflowRevisionView,
+    EffectCompletion, EvidenceRecord, ExpiredLease, FactBatch, FactBatchOutcome,
+    InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent, NewFact, NewInboxItem,
+    NewInstance, NewProgramVersion, NewWorkflowInvocation, ProgramVersionRecord, RetryEffect,
+    RevisionActivation, RuleCommit, RuleCommitRevisionGuard, RunStart, SkillEvidence, SqliteStore,
+    StoreError, StoreResult, StoredEvent, TerminalDiagnosticRecord, WorkflowInvocationView,
+    WorkflowRevisionView,
 };
 
 pub struct RuntimeKernel {
@@ -69,7 +72,7 @@ pub struct AgentTurnExecution<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BamlCoerceExecution<'a> {
+pub struct CoerceExecution<'a> {
     pub instance_id: &'a str,
     pub effect_id: &'a str,
     pub run_id: &'a str,
@@ -77,7 +80,7 @@ pub struct BamlCoerceExecution<'a> {
     pub worker_id: &'a str,
     pub lease_id: &'a str,
     pub lease_expires_at: &'a str,
-    pub request: &'a BamlCoerceRequest,
+    pub request: &'a CoerceRequest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -244,6 +247,12 @@ impl RuntimeKernel {
             causation_id,
             idempotency_key: event_idempotency_key,
         })
+    }
+
+    /// Admit a typed fact batch atomically from one validated effect outcome
+    /// (spec/admission-and-idempotency.md). Delegates to the store primitive.
+    pub fn admit_fact_batch(&mut self, batch: FactBatch<'_>) -> StoreResult<FactBatchOutcome> {
+        self.store.admit_fact_batch(batch)
     }
 
     /// Records a typed fact ingested from an effect's output bytes
@@ -426,6 +435,7 @@ impl RuntimeKernel {
             | Err(StoreError::CapacityBlocked { effect_id, reason }) => {
                 self.emit(TraceEvent::EffectBlocked {
                     effect_id: effect_id.clone(),
+                    status: None,
                     reason: reason.clone(),
                 });
                 return Err(StoreError::PolicyBlocked { effect_id, reason });
@@ -438,6 +448,27 @@ impl RuntimeKernel {
         self.emit(TraceEvent::RunStarted {
             run_id: run.run_id.to_owned(),
             effect_id: run.effect_id.to_owned(),
+        });
+        Ok(event)
+    }
+
+    /// Block an effect at provider-binding time (DR-0020): the worker found the
+    /// provider unbindable before provider execution. Delegates to the store's
+    /// idempotent binding-block and emits the blocked trace.
+    pub fn block_effect_binding(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        category: &str,
+        detail: &str,
+    ) -> StoreResult<StoredEvent> {
+        let event = self
+            .store
+            .block_effect_binding(instance_id, effect_id, category, detail)?;
+        self.emit(TraceEvent::EffectBlocked {
+            effect_id: effect_id.to_owned(),
+            status: Some("blocked".to_owned()),
+            reason: format!("{category}: {detail}"),
         });
         Ok(event)
     }
@@ -472,6 +503,30 @@ impl RuntimeKernel {
         let event = self
             .store
             .complete_effect_with_terminal_diagnostic(completion, diagnostic)?;
+        self.emit(TraceEvent::EffectTerminal {
+            run_id: completion.run_id.to_owned(),
+            effect_id: completion.effect_id.to_owned(),
+            status: EffectStatus::Failed,
+        });
+        Ok(event)
+    }
+
+    /// Recovery resolution terminal: the effect becomes `failed` (a Failed
+    /// subkind) but the run records the distinct `uncertain` status, so an
+    /// operator can tell "we don't know if the side effect happened" apart from
+    /// an ordinary provider failure. See admission-and-idempotency.md.
+    fn resolve_run_uncertain_with_diagnostic(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+    ) -> StoreResult<StoredEvent> {
+        let completion = EffectCompletion {
+            status: "failed",
+            ..completion
+        };
+        let event = self
+            .store
+            .resolve_effect_uncertain(completion, diagnostic)?;
         self.emit(TraceEvent::EffectTerminal {
             run_id: completion.run_id.to_owned(),
             effect_id: completion.effect_id.to_owned(),
@@ -572,7 +627,37 @@ impl RuntimeKernel {
             reason,
             idempotency_key,
         })?;
+        // A cancelled instance has reached a terminal: its pending human asks
+        // are moot, so retire them rather than leaving them answerable for a
+        // dead instance (holder-lifetime cleanup, mirrors lease/claim release).
+        self.store.cancel_pending_inbox_for_instance(instance_id)?;
         self.emit(TraceEvent::InstanceCancelled);
+        Ok(event)
+    }
+
+    /// Generic internal workflow failure (spec/implementation-plan.md flow
+    /// auto-fail): transitions the instance to `failed` with a plain reason and no
+    /// typed `failure` payload — used when an unhandled effect failure in a
+    /// self-terminating flow would otherwise stall the instance forever. Distinct
+    /// from an author `fail error { … }` (which produces the declared failure
+    /// type); this is a runtime/system failure the author did not handle. Mirrors
+    /// `cancel_instance`'s terminal cleanup (pending human asks are retired).
+    pub fn fail_instance_internal(
+        &mut self,
+        instance_id: &str,
+        reason: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        let event = self.store.transition_instance(InstanceTransition {
+            instance_id,
+            status: "failed",
+            reason: Some(reason),
+            idempotency_key,
+        })?;
+        // A failed instance has reached a terminal: retire its pending human asks
+        // (holder-lifetime cleanup, mirrors cancel/lease/claim release).
+        self.store.cancel_pending_inbox_for_instance(instance_id)?;
+        self.emit(TraceEvent::InstanceFailed);
         Ok(event)
     }
 
@@ -901,7 +986,7 @@ impl RuntimeKernel {
             instance_id: Some(execution.instance_id),
             program_id: None,
             program_version_id: None,
-            severity: "error",
+            severity: Severity::Error,
             code: Some(artifact_manifest::ARTIFACT_CAPTURE_FAILED_EVENT),
             message: &diagnostic_message,
             source_span_json: None,
@@ -1099,15 +1184,89 @@ impl RuntimeKernel {
             };
             if let Some(event) = self.recover_provider_terminal_from_evidence(execution)? {
                 recovered.push(event);
+            } else {
+                // No recoverable terminal evidence and no idempotent provider
+                // re-query: resolve the started-without-terminal run to a single
+                // `uncertain` terminal (a Failed subkind) rather than leaving it
+                // stuck or silently re-executing the external side effect. This is
+                // the admission-and-idempotency.md exactly-once recovery rule
+                // (TLA+ ResolveUncertainRun).
+                match self.resolve_uncertain_provider_run(execution) {
+                    Ok(event) => recovered.push(event),
+                    // A real terminal raced in between the run snapshot and this
+                    // resolution; the store row guard already prevented a double
+                    // terminal, so skip rather than aborting the whole sweep.
+                    Err(StoreError::Conflict(_)) => {}
+                    Err(err) => return Err(err),
+                }
             }
         }
         Ok(recovered)
     }
 
-    pub fn run_baml_coerce(
+    /// Recovery resolution for a run that started its external side effect but
+    /// whose worker crashed before any terminal or evidence was recorded, where
+    /// the provider offers no idempotent re-query. Resolves to a single
+    /// `uncertain` terminal (a Failed subkind) under a deterministic idempotency
+    /// key so re-running recovery cannot double-admit, and never re-executes the
+    /// external side effect.
+    fn resolve_uncertain_provider_run(
         &mut self,
-        execution: BamlCoerceExecution<'_>,
-        client: &dyn BamlClient,
+        execution: AgentTurnExecution<'_>,
+    ) -> StoreResult<StoredEvent> {
+        let provider_correlation_id =
+            provider_terminal_correlation_id(execution.instance_id, execution.run_id);
+        let summary = "recovery could not determine the provider outcome; resolved as uncertain";
+        let terminal_metadata_base = json!({
+            "recovery": "uncertain",
+            "provider_correlation_id": provider_correlation_id,
+        });
+        let terminal_hash = terminal_payload_hash(
+            provider_status(&ProviderRunStatus::Failed),
+            None,
+            Some(summary),
+            &terminal_metadata_base.to_string(),
+        );
+        let terminal_metadata = add_terminal_payload_hash(terminal_metadata_base, &terminal_hash);
+        let completion = EffectCompletion {
+            instance_id: execution.instance_id,
+            effect_id: execution.effect_id,
+            run_id: execution.run_id,
+            provider: execution.provider,
+            worker_id: execution.worker_id,
+            status: provider_status(&ProviderRunStatus::Failed),
+            exit_code: None,
+            summary: Some(summary),
+            metadata_json: &terminal_metadata,
+            idempotency_key: Some(&terminal_completion_idempotency_key(
+                execution.instance_id,
+                execution.run_id,
+                &provider_correlation_id,
+                &terminal_hash,
+            )),
+        };
+        let provider_evidence = ProviderEvidence {
+            evidence_id: None,
+            artifact_ids: Vec::new(),
+        };
+        let diagnostic = self.provider_terminal_diagnostic(
+            execution.instance_id,
+            execution.effect_id,
+            execution.run_id,
+            execution.provider,
+            provider_effect_status(&ProviderRunStatus::Failed),
+            summary,
+            Some("runtime.recovery_uncertain"),
+            &terminal_metadata,
+            &provider_evidence,
+        );
+        self.resolve_run_uncertain_with_diagnostic(completion, diagnostic)
+    }
+
+    pub fn run_coerce(
+        &mut self,
+        execution: CoerceExecution<'_>,
+        client: &dyn CoerceClient,
     ) -> StoreResult<StoredEvent> {
         self.start_run(RunStart {
             instance_id: execution.instance_id,
@@ -1121,14 +1280,14 @@ impl RuntimeKernel {
         })?;
 
         let result = client.coerce(execution.request);
-        let evidence = self.record_baml_result(execution, &result)?;
-        let metadata_json = baml_metadata(&result);
+        let evidence = self.record_coerce_result(execution, &result)?;
+        let metadata_json = coerce_metadata(&result);
         let safe_summary = redacted_provider_summary(&result.summary);
         self.emit_provider_diagnostic(
             execution.run_id,
             execution.effect_id,
             execution.provider,
-            baml_effect_status(&result.status),
+            coerce_effect_status(&result.status),
             &safe_summary,
             &metadata_json,
         );
@@ -1138,14 +1297,14 @@ impl RuntimeKernel {
             run_id: execution.run_id,
             provider: execution.provider,
             worker_id: execution.worker_id,
-            status: baml_status(&result.status),
-            exit_code: baml_exit_code(&result.status),
+            status: coerce_status(&result.status),
+            exit_code: coerce_exit_code(&result.status),
             summary: Some(&safe_summary),
             metadata_json: &metadata_json,
             idempotency_key: Some(&idempotency_key(&[
                 execution.instance_id,
                 execution.run_id,
-                "baml-terminal",
+                "coerce-terminal",
             ])),
         };
         let diagnostic = self.provider_terminal_diagnostic(
@@ -1153,25 +1312,23 @@ impl RuntimeKernel {
             execution.effect_id,
             execution.run_id,
             execution.provider,
-            baml_effect_status(&result.status),
+            coerce_effect_status(&result.status),
             &safe_summary,
             Some(match result.status {
-                BamlCoerceStatus::Succeeded => "baml.coerce.succeeded",
-                BamlCoerceStatus::Failed => "baml.coerce.failed",
-                BamlCoerceStatus::TimedOut => "baml.coerce.timed_out",
+                CoerceStatus::Succeeded => "coerce.succeeded",
+                CoerceStatus::Failed => "coerce.failed",
+                CoerceStatus::TimedOut => "coerce.timed_out",
             }),
             &metadata_json,
             &evidence,
         );
 
         let event = match result.status {
-            BamlCoerceStatus::Succeeded => self.complete_run(completion)?,
-            BamlCoerceStatus::Failed => self.fail_run_with_diagnostic(completion, diagnostic)?,
-            BamlCoerceStatus::TimedOut => {
-                self.timeout_run_with_diagnostic(completion, diagnostic)?
-            }
+            CoerceStatus::Succeeded => self.complete_run(completion)?,
+            CoerceStatus::Failed => self.fail_run_with_diagnostic(completion, diagnostic)?,
+            CoerceStatus::TimedOut => self.timeout_run_with_diagnostic(completion, diagnostic)?,
         };
-        self.append_baml_fact(execution, &result)?;
+        self.append_coerce_fact(execution, &result)?;
         Ok(event)
     }
 
@@ -1478,17 +1635,17 @@ impl RuntimeKernel {
         Ok(())
     }
 
-    fn record_baml_result(
+    fn record_coerce_result(
         &self,
-        execution: BamlCoerceExecution<'_>,
-        result: &BamlCoerceResult,
+        execution: CoerceExecution<'_>,
+        result: &CoerceResult,
     ) -> StoreResult<ProviderEvidence> {
         let metadata = json!({
             "effect_id": execution.effect_id,
             "function_name": execution.request.function_name,
             "arguments": json_payload_summary(&execution.request.arguments_json),
             "output_type": execution.request.output_type,
-            "generated_baml_source_hash": execution.request.generated_baml_source_hash,
+            "generated_coerce_source_hash": execution.request.generated_coerce_source_hash,
             "input_schema_hash": execution.request.input_schema_hash,
             "output_schema_hash": execution.request.output_schema_hash,
             "value": result.value_json.as_deref().map(json_payload_summary),
@@ -1499,14 +1656,14 @@ impl RuntimeKernel {
         .to_string();
         let evidence_id = self.store.record_evidence(EvidenceRecord {
             instance_id: execution.instance_id,
-            kind: "baml.coerce.provider",
+            kind: "coerce.provider",
             subject_type: "run",
             subject_id: execution.run_id,
             causation_id: Some(execution.effect_id),
             correlation_id: Some(&idempotency_key(&[
                 execution.instance_id,
                 execution.run_id,
-                "baml-provider",
+                "coerce-provider",
             ])),
             summary: Some(&redacted_provider_summary(&result.summary)),
             metadata_json: &metadata,
@@ -1517,16 +1674,16 @@ impl RuntimeKernel {
         })
     }
 
-    fn append_baml_fact(
+    fn append_coerce_fact(
         &mut self,
-        execution: BamlCoerceExecution<'_>,
-        result: &BamlCoerceResult,
+        execution: CoerceExecution<'_>,
+        result: &CoerceResult,
     ) -> StoreResult<()> {
-        let status = baml_status(&result.status);
+        let status = coerce_status(&result.status);
         let fact_name = match result.status {
-            BamlCoerceStatus::Succeeded => "baml.coerce.succeeded",
-            BamlCoerceStatus::Failed => "baml.coerce.failed",
-            BamlCoerceStatus::TimedOut => "baml.coerce.timed_out",
+            CoerceStatus::Succeeded => "coerce.succeeded",
+            CoerceStatus::Failed => "coerce.failed",
+            CoerceStatus::TimedOut => "coerce.timed_out",
         };
         let value = json!({
             "effect_id": execution.effect_id,
@@ -1535,7 +1692,7 @@ impl RuntimeKernel {
             "status": status,
             "output_type": execution.request.output_type,
             "value": result_value_payload(
-                matches!(result.status, BamlCoerceStatus::Succeeded),
+                matches!(result.status, CoerceStatus::Succeeded),
                 result.value_json.as_deref(),
             ),
             "error": result_error_payload(result.error_json.as_deref()),
@@ -1552,11 +1709,11 @@ impl RuntimeKernel {
             idempotency_key: Some(&idempotency_key(&[
                 execution.instance_id,
                 execution.run_id,
-                "baml-event",
+                "coerce-event",
             ])),
         })?;
-        let fact_id = idempotency_key(&[execution.instance_id, "baml", execution.run_id]);
-        let fact_key = idempotency_key(&[execution.instance_id, execution.run_id, "baml-fact"]);
+        let fact_id = idempotency_key(&[execution.instance_id, "coerce", execution.run_id]);
+        let fact_key = idempotency_key(&[execution.instance_id, execution.run_id, "coerce-fact"]);
         self.store.derive_fact(DerivedFact {
             instance_id: execution.instance_id,
             fact: NewFact {
@@ -1884,34 +2041,42 @@ impl RuntimeKernel {
                 "native-lifecycle-event",
             ])),
         })?;
-        let fact_id = idempotency_key(&[
-            execution.instance_id,
-            "native-agent-turn",
-            execution.run_id,
-            occurrence_key,
-        ]);
-        let fact_key = idempotency_key(&[
-            execution.instance_id,
-            execution.run_id,
-            occurrence_key,
-            "native-lifecycle-fact",
-        ]);
-        self.store.derive_fact(DerivedFact {
-            instance_id: execution.instance_id,
-            fact: NewFact {
-                fact_id: &fact_id,
-                name: event_type,
-                key: &fact_key,
-                value_json: &payload,
-                schema_id: None,
-                provenance_class: "effect",
-                correlation_id: Some(execution.effect_id),
-                source_span_json: None,
-            },
-            source: "kernel.native_provider",
-            causation_id: Some(execution.run_id),
-            idempotency_key: Some(&fact_key),
-        })?;
+        // In-turn observations (streamed/tool_requested/artifact_captured) are
+        // EVIDENCE only (recorded above) — never rule-matchable facts
+        // (spec/agent-harness.md). Only the durable lifecycle kinds
+        // (started/completed/failed/timed_out/cancelled) derive a fact; deriving
+        // a fact for the evidence kinds would inflate the fact set with values no
+        // rule may match (the compiler already forbids matching them).
+        if observation.kind.derives_rule_matchable_fact() {
+            let fact_id = idempotency_key(&[
+                execution.instance_id,
+                "native-agent-turn",
+                execution.run_id,
+                occurrence_key,
+            ]);
+            let fact_key = idempotency_key(&[
+                execution.instance_id,
+                execution.run_id,
+                occurrence_key,
+                "native-lifecycle-fact",
+            ]);
+            self.store.derive_fact(DerivedFact {
+                instance_id: execution.instance_id,
+                fact: NewFact {
+                    fact_id: &fact_id,
+                    name: event_type,
+                    key: &fact_key,
+                    value_json: &payload,
+                    schema_id: None,
+                    provenance_class: "effect",
+                    correlation_id: Some(execution.effect_id),
+                    source_span_json: None,
+                },
+                source: "kernel.native_provider",
+                causation_id: Some(execution.run_id),
+                idempotency_key: Some(&fact_key),
+            })?;
+        }
         Ok(event)
     }
 
@@ -1977,7 +2142,7 @@ impl RuntimeKernel {
         Some(TerminalDiagnosticRecord {
             program_id: None,
             program_version_id: None,
-            severity: "error".to_owned(),
+            severity: Severity::Error,
             code: code.map(str::to_owned),
             message,
             source_span_json,
@@ -1995,7 +2160,8 @@ impl RuntimeKernel {
 
 fn effect_status(status: &str) -> EffectStatus {
     match status {
-        "blocked_by_dependency"
+        "blocked"
+        | "blocked_by_dependency"
         | "blocked_by_capability"
         | "blocked_by_profile"
         | "blocked_by_capacity" => EffectStatus::Blocked,
@@ -2401,7 +2567,7 @@ fn ir_type_signature(ty: &IrType) -> String {
 fn effect_kind_name(kind: &IrEffectKind) -> &'static str {
     match kind {
         IrEffectKind::AgentTell => "agent.tell",
-        IrEffectKind::BamlCoerce => "baml.coerce",
+        IrEffectKind::Coerce => "coerce",
         IrEffectKind::LoftClaim => "loft.claim",
         IrEffectKind::HumanAsk => "human.ask",
         IrEffectKind::CapabilityCall => "capability.call",
@@ -2417,6 +2583,10 @@ fn effect_kind_name(kind: &IrEffectKind) -> &'static str {
         IrEffectKind::LedgerAppend => "ledger.append",
         IrEffectKind::CounterConsume => "counter.consume",
         IrEffectKind::EventNotify => "event.notify",
+        IrEffectKind::FileRead => "file.read",
+        IrEffectKind::FileWrite => "file.write",
+        IrEffectKind::FileImport => "file.import",
+        IrEffectKind::FileExport => "file.export",
     }
 }
 
@@ -2424,6 +2594,8 @@ fn dependency_predicate_name(predicate: &DependencyPredicate) -> &'static str {
     match predicate {
         DependencyPredicate::Succeeds => "succeeds",
         DependencyPredicate::Fails => "fails",
+        DependencyPredicate::TimedOut => "timed_out",
+        DependencyPredicate::Cancelled => "cancelled",
         DependencyPredicate::Completes => "completes",
     }
 }
@@ -3074,31 +3246,31 @@ fn provider_diagnostic_message(provider: &str, summary: &str, diagnostics_json: 
     redact_log_text(&message)
 }
 
-fn baml_status(status: &BamlCoerceStatus) -> &'static str {
+fn coerce_status(status: &CoerceStatus) -> &'static str {
     match status {
-        BamlCoerceStatus::Succeeded => "completed",
-        BamlCoerceStatus::Failed => "failed",
-        BamlCoerceStatus::TimedOut => "timed_out",
+        CoerceStatus::Succeeded => "completed",
+        CoerceStatus::Failed => "failed",
+        CoerceStatus::TimedOut => "timed_out",
     }
 }
 
-fn baml_effect_status(status: &BamlCoerceStatus) -> EffectStatus {
+fn coerce_effect_status(status: &CoerceStatus) -> EffectStatus {
     match status {
-        BamlCoerceStatus::Succeeded => EffectStatus::Completed,
-        BamlCoerceStatus::Failed => EffectStatus::Failed,
-        BamlCoerceStatus::TimedOut => EffectStatus::TimedOut,
+        CoerceStatus::Succeeded => EffectStatus::Completed,
+        CoerceStatus::Failed => EffectStatus::Failed,
+        CoerceStatus::TimedOut => EffectStatus::TimedOut,
     }
 }
 
-fn baml_exit_code(status: &BamlCoerceStatus) -> Option<i64> {
+fn coerce_exit_code(status: &CoerceStatus) -> Option<i64> {
     match status {
-        BamlCoerceStatus::Succeeded => Some(0),
-        BamlCoerceStatus::Failed => Some(1),
-        BamlCoerceStatus::TimedOut => None,
+        CoerceStatus::Succeeded => Some(0),
+        CoerceStatus::Failed => Some(1),
+        CoerceStatus::TimedOut => None,
     }
 }
 
-fn baml_metadata(result: &BamlCoerceResult) -> String {
+fn coerce_metadata(result: &CoerceResult) -> String {
     json!({
         "value": result.value_json.as_deref().map(json_payload_summary),
         "error": result_error_payload(result.error_json.as_deref()),
@@ -3214,7 +3386,7 @@ pub fn kernel_stage() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coerce::{BamlCoerceRequest, FakeBamlClient};
+    use coerce::{CoerceRequest, FakeCoerceClient};
     use harness::{
         ClaudeCodeAgentHarness, CodexAgentHarness, CommandLaunchPlan, MockAgentHarness,
         PiStyleAgentHarness,
@@ -3496,7 +3668,9 @@ rule start
         );
         assert!(kernel.trace().iter().any(|record| matches!(
             &record.event,
-            TraceEvent::EffectBlocked { effect_id, reason }
+            TraceEvent::EffectBlocked {
+                effect_id, reason, ..
+            }
                 if effect_id == "tell-two" && reason.contains("capacity exhausted")
         )));
         let store = kernel.into_store();
@@ -3979,18 +4153,54 @@ rule wait
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].kind, "diff");
         let facts = kernel.store.list_facts("instance-a").expect("facts list");
+        // Only the durable lifecycle kinds are rule-matchable facts
+        // (spec/agent-harness.md): started + completed here.
         assert!(facts.iter().any(|fact| fact.name == "agent.turn.started"));
+        assert!(facts.iter().any(|fact| fact.name == "agent.turn.completed"));
+        // In-turn observations are EVIDENCE, never facts — they must not appear
+        // in the fact set (where they would inflate `facts=N` with values no
+        // rule can match).
         assert_eq!(
             facts
                 .iter()
                 .filter(|fact| fact.name == "agent.turn.streamed")
                 .count(),
-            2
+            0,
+            "streamed observations must not be derived as facts"
         );
-        assert!(facts
+        assert!(
+            !facts
+                .iter()
+                .any(|fact| fact.name == "agent.turn.artifact_captured"),
+            "artifact_captured observations must not be derived as facts"
+        );
+        // They are recorded as evidence instead: every native lifecycle
+        // observation (terminal and in-turn) is durable evidence.
+        let evidence = kernel.store.list_evidence("instance-a").expect("evidence");
+        let streamed_evidence = evidence
             .iter()
-            .any(|fact| fact.name == "agent.turn.artifact_captured"));
-        assert!(facts.iter().any(|fact| fact.name == "agent.turn.completed"));
+            .filter(|record| {
+                record.kind == "agent.turn.native_event"
+                    && json_from_str(&record.metadata_json)
+                        .pointer("/status")
+                        .and_then(Value::as_str)
+                        == Some("streamed")
+            })
+            .count();
+        assert_eq!(
+            streamed_evidence, 2,
+            "streamed observations must be recorded as evidence"
+        );
+        assert!(
+            evidence.iter().any(|record| {
+                record.kind == "agent.turn.native_event"
+                    && json_from_str(&record.metadata_json)
+                        .pointer("/status")
+                        .and_then(Value::as_str)
+                        == Some("artifact_captured")
+            }),
+            "artifact_captured observation must be recorded as evidence"
+        );
     }
 
     #[test]
@@ -4229,6 +4439,38 @@ rule wait
     }
 
     #[test]
+    fn kernel_fail_instance_internal_marks_failed_terminal() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version(ProgramVersionInput {
+                program_name: "AutoFail",
+                source_hash: "source",
+                ir_hash: "ir",
+                compiler_version: "test",
+            })
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        // Generic internal failure (flow auto-fail): no typed `failure` payload.
+        kernel
+            .fail_instance_internal(
+                &instance_id,
+                "unhandled effect failure in flow review",
+                Some("autofail-1"),
+            )
+            .expect("instance fails internally");
+        let instance = kernel
+            .store
+            .get_instance(&instance_id)
+            .expect("instance loads")
+            .expect("instance exists");
+        assert_eq!(instance.status, "failed");
+        check_trace(kernel.trace()).expect("kernel trace conforms");
+    }
+
+    #[test]
     fn kernel_emits_trace_for_profile_policy_blocks() {
         let store = SqliteStore::open_in_memory().expect("store opens");
         let mut kernel = RuntimeKernel::new(store);
@@ -4284,7 +4526,9 @@ rule wait
         assert!(matches!(blocked, Err(StoreError::PolicyBlocked { .. })));
         assert!(kernel.trace().iter().any(|record| matches!(
             &record.event,
-            TraceEvent::EffectBlocked { effect_id, reason }
+            TraceEvent::EffectBlocked {
+                effect_id, reason, ..
+            }
                 if effect_id == "write" && reason.contains("repo.write")
         )));
         check_trace(kernel.trace()).expect("kernel trace conforms");
@@ -5371,6 +5615,154 @@ rule wait
         );
     }
 
+    fn start_running_agent_turn_without_evidence() -> (RuntimeKernel, String) {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version(ProgramVersionInput {
+                program_name: "UncertainRecovery",
+                source_hash: "source",
+                ir_hash: "ir",
+                compiler_version: "test",
+            })
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[NewEffect {
+                    timeout_seconds: None,
+                    effect_id: "tell",
+                    kind: "agent.tell",
+                    target: Some("worker"),
+                    input_json: r#"{"prompt":"go"}"#,
+                    status: "queued",
+                    idempotency_key: "rule=start;effect=tell",
+                    required_capabilities_json: "[]",
+                    profile: Some("repo-writer"),
+                    correlation_id: None,
+                    source_span_json: None,
+                }],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start-uncertain"),
+            })
+            .expect("rule commits");
+        kernel
+            .start_run(RunStart {
+                instance_id: &instance_id,
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "codex",
+                worker_id: "worker-1",
+                lease_id: "lease-tell",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        (kernel, instance_id)
+    }
+
+    #[test]
+    fn recovery_resolves_running_run_without_evidence_to_uncertain() {
+        let (mut kernel, instance_id) = start_running_agent_turn_without_evidence();
+
+        let recovered = kernel
+            .recover_running_provider_runs(&instance_id)
+            .expect("recovery sweep succeeds");
+        assert_eq!(
+            recovered.len(),
+            1,
+            "the started run resolves to one terminal"
+        );
+
+        check_trace(kernel.trace()).expect("kernel trace conforms");
+
+        let store = kernel.into_store();
+        // The effect is a Failed subkind...
+        let effects = store.list_effects(&instance_id).expect("effects list");
+        assert_eq!(effects[0].status, "failed");
+        // ...but the run records the distinct `uncertain` status (TLA+ ResolveUncertainRun).
+        let runs = store.list_runs(&instance_id).expect("runs list");
+        let run = runs.iter().find(|r| r.run_id == "run-tell").expect("run");
+        assert_eq!(run.status, "uncertain");
+        // Exactly one terminal for the run, marked as an uncertain recovery.
+        let events = store.list_events(&instance_id).expect("events list");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "effect.terminal"
+                    && event.payload_json.contains("\"run_id\":\"run-tell\""))
+                .count(),
+            1
+        );
+        let terminal = events
+            .iter()
+            .find(|event| event.event_type == "effect.terminal")
+            .expect("terminal event exists");
+        assert!(terminal.payload_json.contains("\"recovery\":\"uncertain\""));
+        // No success was fabricated.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "agent.turn.completed")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn recovery_resolving_uncertain_run_is_idempotent_on_rerun() {
+        let (mut kernel, instance_id) = start_running_agent_turn_without_evidence();
+
+        let first = kernel
+            .recover_running_provider_runs(&instance_id)
+            .expect("first recovery sweep succeeds");
+        assert_eq!(first.len(), 1);
+        // The run is now `uncertain` (terminal), so a re-run is a clean no-op,
+        // not a swallowed unique-index error.
+        let second = kernel
+            .recover_running_provider_runs(&instance_id)
+            .expect("rerun is idempotent");
+        assert!(second.is_empty());
+
+        let store = kernel.into_store();
+        let events = store.list_events(&instance_id).expect("events list");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "effect.terminal"
+                    && event.payload_json.contains("\"run_id\":\"run-tell\""))
+                .count(),
+            1,
+            "rerun must not double-admit a terminal"
+        );
+    }
+
+    #[test]
+    fn uncertain_terminal_idempotency_key_is_deterministic() {
+        let correlation_a = provider_terminal_correlation_id("inst", "run-tell");
+        let correlation_b = provider_terminal_correlation_id("inst", "run-tell");
+        assert_eq!(correlation_a, correlation_b);
+        let hash_a = terminal_payload_hash("failed", None, Some("uncertain"), "{}");
+        let hash_b = terminal_payload_hash("failed", None, Some("uncertain"), "{}");
+        assert_eq!(hash_a, hash_b);
+        let key_a =
+            terminal_completion_idempotency_key("inst", "run-tell", &correlation_a, &hash_a);
+        let key_b =
+            terminal_completion_idempotency_key("inst", "run-tell", &correlation_b, &hash_b);
+        assert_eq!(
+            key_a, key_b,
+            "uncertain terminal idempotency key must be deterministic"
+        );
+    }
+
     #[test]
     fn recovery_preserves_artifact_evidence_after_capture_before_terminal_gap() {
         let store = SqliteStore::open_in_memory().expect("store opens");
@@ -5810,7 +6202,7 @@ rule wait
     }
 
     #[test]
-    fn fake_baml_coerce_records_evidence_and_success_fact() {
+    fn fake_coerce_records_evidence_and_success_fact() {
         let store = SqliteStore::open_in_memory().expect("store opens");
         let mut kernel = RuntimeKernel::new(store);
         let version = kernel
@@ -5827,12 +6219,12 @@ rule wait
         let effects = [NewEffect {
             timeout_seconds: None,
             effect_id: "review",
-            kind: "baml.coerce",
+            kind: "coerce",
             target: None,
             input_json: r#"{"function_name":"reviewWork"}"#,
             status: "queued",
             idempotency_key: "rule=start;effect=review",
-            required_capabilities_json: r#"["baml.coerce"]"#,
+            required_capabilities_json: r#"["coerce"]"#,
             profile: Some("repo-writer"),
             correlation_id: None,
             source_span_json: None,
@@ -5851,27 +6243,27 @@ rule wait
             })
             .expect("rule commits");
 
-        let request = BamlCoerceRequest {
+        let request = CoerceRequest {
             function_name: "reviewWork".to_owned(),
             arguments_json: r#"{"summary":"done"}"#.to_owned(),
             output_type: "WorkReview".to_owned(),
-            generated_baml_source_hash: "baml-source".to_owned(),
+            generated_coerce_source_hash: "coerce-source".to_owned(),
             input_schema_hash: "input-schema".to_owned(),
             output_schema_hash: "output-schema".to_owned(),
         };
         let terminal = kernel
-            .run_baml_coerce(
-                BamlCoerceExecution {
+            .run_coerce(
+                CoerceExecution {
                     instance_id: &instance_id,
                     effect_id: "review",
                     run_id: "run-review",
-                    provider: "fake-baml",
+                    provider: "fake-coerce",
                     worker_id: "worker-1",
                     lease_id: "lease-review",
                     lease_expires_at: "2030-01-01T00:00:00Z",
                     request: &request,
                 },
-                &FakeBamlClient::succeeds(r#"{"status":"Accept","reason":"ok"}"#),
+                &FakeCoerceClient::succeeds(r#"{"status":"Accept","reason":"ok"}"#),
             )
             .expect("coerce runs");
 
@@ -5880,34 +6272,36 @@ rule wait
         let store = kernel.into_store();
         let evidence = store.list_evidence(&instance_id).expect("evidence lists");
         assert_eq!(evidence.len(), 2);
-        let baml_evidence = evidence
+        let coerce_evidence = evidence
             .iter()
-            .find(|evidence| evidence.kind == "baml.coerce.provider")
-            .expect("baml provider evidence recorded");
-        assert!(baml_evidence.metadata_json.contains("reviewWork"));
-        assert!(baml_evidence.metadata_json.contains("baml-source"));
-        let baml_metadata = serde_json::from_str::<Value>(&baml_evidence.metadata_json)
-            .expect("baml metadata json");
+            .find(|evidence| evidence.kind == "coerce.provider")
+            .expect("coerce provider evidence recorded");
+        assert!(coerce_evidence.metadata_json.contains("reviewWork"));
+        assert!(coerce_evidence.metadata_json.contains("coerce-source"));
+        let coerce_metadata = serde_json::from_str::<Value>(&coerce_evidence.metadata_json)
+            .expect("coerce metadata json");
         assert_eq!(
-            baml_metadata
+            coerce_metadata
                 .pointer("/arguments/redacted")
                 .and_then(Value::as_bool),
             Some(true)
         );
         assert_eq!(
-            baml_metadata
+            coerce_metadata
                 .pointer("/arguments/shape/type")
                 .and_then(Value::as_str),
             Some("object")
         );
-        assert!(!baml_evidence.metadata_json.contains(r#""summary":"done""#));
+        assert!(!coerce_evidence
+            .metadata_json
+            .contains(r#""summary":"done""#));
         let facts = store.list_facts(&instance_id).expect("facts list");
-        assert!(facts.iter().any(|fact| fact.name == "baml.coerce.succeeded"
+        assert!(facts.iter().any(|fact| fact.name == "coerce.succeeded"
             && fact.value_json.contains("\"status\":\"Accept\"")));
     }
 
     #[test]
-    fn fake_baml_coerce_failure_records_failed_fact() {
+    fn fake_coerce_failure_records_failed_fact() {
         let store = SqliteStore::open_in_memory().expect("store opens");
         let mut kernel = RuntimeKernel::new(store);
         let version = kernel
@@ -5924,12 +6318,12 @@ rule wait
         let effects = [NewEffect {
             timeout_seconds: None,
             effect_id: "review",
-            kind: "baml.coerce",
+            kind: "coerce",
             target: None,
             input_json: r#"{"function_name":"reviewWork"}"#,
             status: "queued",
             idempotency_key: "rule=start;effect=review",
-            required_capabilities_json: r#"["baml.coerce"]"#,
+            required_capabilities_json: r#"["coerce"]"#,
             profile: Some("repo-writer"),
             correlation_id: None,
             source_span_json: None,
@@ -5947,28 +6341,28 @@ rule wait
                 idempotency_key: Some("commit-start"),
             })
             .expect("rule commits");
-        let request = BamlCoerceRequest {
+        let request = CoerceRequest {
             function_name: "reviewWork".to_owned(),
             arguments_json: r#"{"summary":"done"}"#.to_owned(),
             output_type: "WorkReview".to_owned(),
-            generated_baml_source_hash: "baml-source".to_owned(),
+            generated_coerce_source_hash: "coerce-source".to_owned(),
             input_schema_hash: "input-schema".to_owned(),
             output_schema_hash: "output-schema".to_owned(),
         };
 
         kernel
-            .run_baml_coerce(
-                BamlCoerceExecution {
+            .run_coerce(
+                CoerceExecution {
                     instance_id: &instance_id,
                     effect_id: "review",
                     run_id: "run-review",
-                    provider: "fake-baml",
+                    provider: "fake-coerce",
                     worker_id: "worker-1",
                     lease_id: "lease-review",
                     lease_expires_at: "2030-01-01T00:00:00Z",
                     request: &request,
                 },
-                &FakeBamlClient::fails("invalid output"),
+                &FakeCoerceClient::fails("invalid output"),
             )
             .expect("failed coerce records terminal event");
 
@@ -5983,7 +6377,7 @@ rule wait
                 ..
             } if run_id == "run-review"
                 && effect_id == "review"
-                && provider == "fake-baml"
+                && provider == "fake-coerce"
                 && *status == EffectStatus::Failed
                 && diagnostics_json.contains("\"redacted\":true")
                 && !diagnostics_json.contains("invalid output")
@@ -5994,7 +6388,7 @@ rule wait
             .list_diagnostics(Some(&instance_id))
             .expect("diagnostics list");
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code.as_deref(), Some("baml.coerce.failed"));
+        assert_eq!(diagnostics[0].code.as_deref(), Some("coerce.failed"));
         assert_eq!(diagnostics[0].subject_id.as_deref(), Some("review"));
         assert_eq!(diagnostics[0].run_id.as_deref(), Some("run-review"));
         assert!(!diagnostics[0].message.contains("invalid output"));
@@ -6002,8 +6396,8 @@ rule wait
         let facts = store.list_facts(&instance_id).expect("facts list");
         let failed_fact = facts
             .iter()
-            .find(|fact| fact.name == "baml.coerce.failed")
-            .expect("failed baml fact");
+            .find(|fact| fact.name == "coerce.failed")
+            .expect("failed coerce fact");
         assert!(failed_fact.value_json.contains("\"redacted\":true"));
         assert!(!failed_fact.value_json.contains("invalid output"));
     }

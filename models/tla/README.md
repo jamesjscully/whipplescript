@@ -15,6 +15,8 @@ workers
 runs
 crash/recovery
 pause/resume/cancel
+revision cancellation policy
+terminal event records
 ```
 
 Current model:
@@ -32,13 +34,15 @@ derive projection cursor
 claim effect
 start run
 complete/fail/timeout run
-cancel run
+cancellation request acknowledgement
+cancel run after acknowledgement
 expire lease
 retry failed or timed-out effect
 start/finish recovery from the durable event log
 pause/resume/cancel
 workflow complete/fail terminal states
 dependency-gated claimability
+revision activation policies for old queued/running effects
 ```
 
 It names safety invariants for:
@@ -52,9 +56,13 @@ terminal instances not producing new claimable work
 cancelled/completed/failed instance states remaining mutually exclusive
 current terminal-effect set matching effect status
 run-scoped lease consistency
+at most one run executing a given effect at once (concurrent-worker safety)
 retry removing current terminal status before a new attempt
 projection cursor bounds
 recovery preserving event-log order
+recovery blocking live-state mutation until finish
+explicit terminal event records not duplicating a run/effect outcome
+revision cancellation policy and requestability gates
 basic type correctness
 ```
 
@@ -65,6 +73,7 @@ cancellation acknowledgement not fabricating terminal cancellation
 provider terminal evidence recovery
 required artifact-capture failure preventing successful completion
 duplicate terminal outcome prevention
+terminal event records matching the terminal set
 ```
 
 It also names weak-fairness and liveness goals:

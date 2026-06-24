@@ -21,7 +21,7 @@ rules
     writes
       schema:TerminalRoute
     effects
-      classification kind=baml.coerce binding=classification key=9cc6833fa173e479
+      classification kind=coerce binding=classification key=44dcf6a27fe54765
     terminal_outputs
       classification span=557..573
         Completed payload=ref<Classification> span=557..573

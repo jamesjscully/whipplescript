@@ -7,6 +7,7 @@ Before declaring v0 complete:
 - [x] `cargo fmt --all -- --check`
 - [x] `cargo clippy --workspace --all-targets -- -D warnings`
 - [x] `cargo test --workspace`
+- [x] `scripts/check-report-schemas.sh`
 - [x] `scripts/check-formal-models.sh`
 - [x] `scripts/check-tla-models.sh`
 - [x] `scripts/check-e2e.sh`
@@ -114,7 +115,7 @@ target/real-provider-reports/
 target/distrib/native-provider-config-examples.tar.gz
 ```
 
-Command-wrapper-only Loft/BAML/Codex checks do not satisfy this gate.
+Command-wrapper-only Loft/coerce/Codex checks do not satisfy this gate.
 
 Native provider gate result for v0.1: passed locally on 2026-06-02.
 Codex live app-server, interrupt, diff-artifact, error-shape, and source
@@ -135,12 +136,51 @@ updates:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+scripts/check-report-schemas.sh
+scripts/check-artifact-admission-differential.sh
 scripts/check-formal-models.sh
 scripts/check-tla-models.sh
 scripts/check-e2e.sh
 ```
 
 Result: passed.
+
+The report-schema gate includes native and schema validation for verified
+artifact bundles, including graph-only `--emit construct-graph` round trips and
+rejection when a graph-only bundle is later requested as `lowered-ir` or full
+`artifacts`.
+The artifact-admission differential mutates full check reports, compile
+reports, graph-only verified bundles, lowered-IR verified bundles, and full
+verified artifact bundles so Python and native admission stay aligned across
+the partial and full artifact surfaces. It covers verified-bundle envelope and
+entry closure, emit-specific `construct_graph`/`lowered_ir_report` presence,
+supported event/projection/diagnostic lowered-IR handoff entrypoints with
+missing or stale explicit refs, rehashed locked-package schema fragments, rehashed
+construct/input-field coverage, rehashed package construct vocabulary, and
+rehashed package construct/effect capability references, semantic package
+construct keyword duplicates, and shared report/package-contract fields such as
+source and IR hashes, snapshots, contract-registry diagnostics,
+package-contract digests, and platform catalogs. It also includes
+schema-valid semantic duplicate IDs for graph nodes, ports, edge refs,
+dependency refs, and lowered core objects.
+The report-schema gate additionally includes schema-valid stale construct graph
+fixtures for catalog-required lowering interfaces whose `node.interfaces`
+evidence has been rewritten to match the tampered graph, and duplicate platform
+catalog vocabulary plus duplicate verifier-catalog lowering IDs so standalone
+bridge runs cannot trust an ambiguous catalog path. It also includes a
+model-search fixture matrix where the ledger and IR-obligation artifact agree on
+stale guard, terminal-branch, dependency, assertion, and revision source spans,
+proving validators compare graph-backed IR spans against their unique
+construct-graph anchors. A native-only coordinated-tamper fixture also rewrites
+the guard ledger row, the embedded IR-obligation artifact, and the compiler-owned
+guard source anchor to the same stale span; standalone artifact validation
+accepts that self-consistent report, while `whip verify-report` rejects it
+through readable-source artifact re-emission. The same source-backed path is
+exercised for package-locked reports with a dependency-span fixture that
+rewrites the ledger row, IR-obligation artifact, and construct-graph dependency
+span together. Lowered-IR re-emission is covered by a schema/admission-valid
+fixture that changes only `lowered_ir_report.lowerer_version`, which ordinary
+artifact admission permits but native source-backed verification rejects.
 
 Additional release checks:
 
@@ -178,8 +218,16 @@ scripts/check-dist-archive.sh target/distrib/whipplescript-x86_64-unknown-linux-
 Result: `WHIPPLESCRIPT_RELEASE_READINESS_FULL=1
 scripts/check-release-readiness.sh` passed on 2026-06-02. Doctor output was
 reviewed; checked examples compiled; generated model searches passed for
-examples with dependencies; the full workspace tests, clippy, Maude checks, TLA
-checks, and e2e suite passed through the readiness wrapper. Loft
+examples with dependencies; report schemas and emitted check/compile artifact
+reports validated; schema/native artifact-admission parity was checked against a
+malformed-artifact matrix, including duplicate scalar construct-graph
+resolution, reserved construct-graph output vocabulary, construct-graph
+lifecycle profile mismatch, stale construct-graph evidence rejected by direct
+lowered-IR bridge admission, spoofed construct-graph providers rejected by
+direct lowered-IR bridge admission, and stale lowered output vocabulary; the full
+workspace tests,
+clippy, Maude checks, TLA checks, and e2e suite passed through the readiness
+wrapper. Loft
 compatibility-fixture shape checks passed against the manifest-driven rich
 issue, evidence, resource intent, lifecycle, lease, and retryable-error
 fixtures; Loft readiness scripts share the fixture manifest contract from
@@ -188,10 +236,10 @@ a temporary committed fixture repo; Loft source patch export was validated
 against a temporary local repo; Loft handoff reporting was validated with
 shell-quoted generated commands and is generated by release readiness; strict
 Loft submodule fixture mode and Loft submodule readiness both passed against
-`vendor/loft`. `scripts/check-openai-coerce.sh` passed against the local
-OpenAI-backed Coerce bridge using `OPENAI_API_KEY` from `.env`; real-provider
-report generation was validated against both the skipped-provider path and the
-OpenAI Coerce smoke path. CI runs fast release readiness and uploads
+`vendor/loft`. (The earlier local OpenAI Coerce bridge script was removed — the
+real coerce integration is provider-native structured outputs, a separate
+credential-gated build; see `spec/coerce.md`.) Real-provider report generation
+was validated against the skipped-provider path. CI runs fast release readiness and uploads
 `target/release-readiness-report.md`, `target/real-provider-smoke-report.md`,
 and `target/loft-handoff-report.md` as the `readiness-reports` artifact.
 Native-provider surface validation writes
@@ -199,10 +247,14 @@ Native-provider surface validation writes
 missing Codex, Claude, or Pi native surfaces as ship-blocking for the
 native-provider release track.
 Codex app-server schema validation writes
-`target/codex-app-server-schema-report.json` and compares against
-`spec/codex-app-server-schema.pin.json`; update the pin only after reviewing
-Codex CLI/schema changes and confirming the required lifecycle methods still
-exist.
+`target/codex-app-server-schema-report.json`, always requires `initialize`,
+`thread/start`, `turn/start`, `turn/started`, `turn/completed`,
+`turn/interrupt`, and `turn/diff/updated`, and compares the generated metadata
+against `spec/codex-app-server-schema.pin.json`. Exact pin drift is accepted by
+default when those adapter methods still exist, because developers may have
+different Codex CLI versions installed. Use
+`WHIPPLESCRIPT_CODEX_APP_SERVER_SCHEMA_STRICT_PIN=1` when reviewing a pin update
+or deliberately checking one exact Codex schema.
 Codex app-server live smoke validation writes
 `target/codex-app-server-live-smoke.json`; run it with
 `WHIPPLESCRIPT_CODEX_APP_SERVER_LIVE=1` only against a disposable read-only
@@ -219,8 +271,12 @@ Codex app-server returns a redacted JSON-RPC error shape for an invalid
 `turn/start` request.
 Claude Agent SDK surface validation writes
 `target/claude-agent-sdk-surface.json`; it records the selected TypeScript
-sidecar strategy, local Claude CLI version/flags, Node/npm posture, and current
-TypeScript/Python Agent SDK package versions.
+sidecar strategy, local Claude CLI version/required flags, declared and locked
+TypeScript SDK dependency, Node/npm posture, and optional TypeScript/Python
+Agent SDK registry metadata. Registry metadata is informational by default so
+different developer machines and temporary registry outages do not fail the
+ordinary gate; use `WHIPPLESCRIPT_CLAUDE_AGENT_SDK_STRICT_REGISTRY=1` when
+reviewing package freshness deliberately.
 Claude Agent SDK sidecar smoke validation writes
 `target/claude-agent-sdk-live-smoke.json`; by default it uses the deterministic
 fake sidecar path, and with `WHIPPLESCRIPT_CLAUDE_AGENT_SDK_LIVE=1` it starts a
@@ -312,10 +368,10 @@ submodules so validation keeps exercising the source-of-truth Loft fixture path.
 prerequisites should fail the readiness command.
 
 Real-provider readiness now also fails explicitly when provider tools,
-`WHIPPLESCRIPT_LOFT_TEST_ISSUE`, `WHIPPLESCRIPT_BAML_TEST_ENDPOINT`, BAML endpoint
-reachability, BAML smoke-test function metadata, tracked Loft spec/fixture
+`WHIPPLESCRIPT_LOFT_TEST_ISSUE`, `WHIPPLESCRIPT_COERCE_TEST_ENDPOINT`, coerce endpoint
+reachability, coerce smoke-test function metadata, tracked Loft spec/fixture
 files, or a clean Loft fixture repo are missing. Selected provider smoke runs
-can be scoped with `WHIPPLESCRIPT_REAL_PROVIDERS=loft`, `baml`, or `loft,baml`.
+can be scoped with `WHIPPLESCRIPT_REAL_PROVIDERS=loft`, `coerce`, or `loft,coerce`.
 Provider-destructive tests additionally require an explicit disposable target
 marker. Set `WHIPPLESCRIPT_REAL_PROVIDER_DESTRUCTIVE_TESTS=1` or the
 provider-specific destructive flag, then set a disposable target marker and an

@@ -9,7 +9,7 @@ implementation to the explicit composition model:
 - `pattern` is a compile-time reusable building block.
 - `rule` is the runtime rewrite unit.
 - `include` composes source files.
-- `use name` imports plugins.
+- `use name` imports package/library surface.
 - `apply` expands patterns before runtime.
 - `invoke` starts durable child workflows.
 - `complete` and `fail` are the only source-level workflow terminal actions.
@@ -26,7 +26,7 @@ The target behavior is specified in [language.md](language.md),
 | --- | --- | --- |
 | Conceptual spec | [x] | `workflow`, `pattern`, `rule`, `include`, `use`, `apply`, `invoke`, `complete`, and `fail` are described. |
 | Maude model | [x] | Pattern elaboration, workflow terminal actions, child invocation resolution, and cancellation are modeled. |
-| `use` cleanup | [x] | Source now uses `use memory` for plugin imports; removed `use plugin` and `use skill` forms are rejected. |
+| `use` cleanup | [x] | Source now uses `use memory` for package/library imports; removed `use plugin` and `use skill` forms are rejected. |
 | Parser/runtime implementation | [~] | `include` parsing, CLI source-bundle resolution, duplicate-include diagnostics, explicit multi-workflow root selection, workflow contract IR, class-shaped terminal payload validation, keyed workflow input validation/seeding, pattern expansion with type and simple value arguments, static workflow invocation target/input/direct-recursion validation, resumable dev-worker child workflow invocation with source-span records and success/failure/timeout/cancellation projection, status JSON parent/child invocation links, non-class terminal contract rejection, and basic `complete`/`fail` runtime terminal actions are implemented; scalar terminal payload syntax remains. |
 | Examples migration | [ ] | Existing examples still use the current implicit one-workflow file shape. |
 | E2E coverage | [~] | Parser/runtime e2e now covers `include`, explicit root selection, keyed workflow inputs, `pattern`/`apply` with simple value arguments, static workflow invocation target/input validation, `workflow.invoke` child success/failure/timeout/cancellation projection, resumable running invocation completion, status JSON invocation links, and `complete`/`fail`. |
@@ -64,7 +64,7 @@ The target behavior is specified in [language.md](language.md),
 ## Phase 1: Source Bundles And Imports
 
 - [x] Define concrete grammar for `include "path.whip"` and allowed path forms.
-- [ ] Decide whether BAML imports use `include "types.baml"`, a separate BAML
+- [ ] Decide whether coerce imports use `include "types.coerce"`, a separate coerce
   declaration, or generated source bundle members.
 - [~] Implement include resolution with cycle detection and stable ordering.
 - [~] Preserve per-file source spans through parse, typecheck, diagnostics, and
@@ -97,8 +97,18 @@ The target behavior is specified in [language.md](language.md),
 - [~] Generate hygienic names for expanded rules/effects/facts.
 - [~] Attach provenance for every generated declaration back to both the pattern
   definition and application site.
-- [~] Reject unbounded recursive pattern application; allow only structurally
-  bounded recursion if the analyzer can prove a finite expansion.
+- [x] Reject recursive pattern application. v0 decision: pattern expansion is
+  **non-recursive only**; any `apply` that reaches another `apply` of a pattern
+  already on the expansion stack is the compile-time error
+  `graph.unbounded_pattern_recursion` (severity `error`). Bounded recursion is
+  deferred and, when added, requires a statically-decreasing structural measure
+  over a finite structure. See [language.md](language.md#patterns) and
+  [static-analysis.md](static-analysis.md). **Implemented 2026-06-18:**
+  `detect_pattern_recursion` builds the pattern-application graph and rejects any
+  pattern reaching itself (self or transitive cycle), naming the cycle; modeled in
+  `models/maude/pattern-recursion.maude`; fixture
+  `examples/invalid/recursive-pattern.whip`. Non-recursive *nested* apply
+  expansion (transitive elaboration) remains a separate deferred slice (line 159).
 - [x] Add formatter support that preserves author-written `pattern` and `apply`
   syntax rather than formatting expanded output.
 - [~] Add golden IR snapshots that show generated declarations plus provenance.
@@ -109,11 +119,24 @@ The target behavior is specified in [language.md](language.md),
   `fail <failure-name> <payload>` in rule bodies.
 - [~] Typecheck terminal payloads against the current workflow contract.
 - [x] Reject `complete`/`fail` outside workflow rule bodies.
-- [ ] Reject terminal actions in pattern bodies unless the pattern contract
-  explicitly allows terminal expansion at the application site.
+- [~] Reject terminal actions in pattern bodies. v0 decision: `complete`/`fail`
+  inside a `pattern` body is always a compile-time error (severity `error`);
+  patterns elaborate into rules, and workflow terminals belong to the owning
+  workflow contract. A reusable body reaches a terminal by recording a result
+  fact that a workflow rule turns into `complete`/`fail`. (The earlier
+  "unless the pattern contract explicitly allows terminal expansion" option is
+  dropped for v0.)
 - [x] Make terminal action commits atomic with the rule commit.
 - [x] Persist workflow terminal events and terminal payloads in the store.
 - [~] Block further effectful rule commits after terminal state.
+- [~] Terminal tie-break: under the deterministic fixpoint (rule declaration
+  order, then earliest triggering fact sequence; see
+  [semantics.md](semantics.md)), the **first committed terminal wins**. Once a
+  `complete`/`fail` commits, the instance is terminal: no further effectful rule
+  commits and no second terminal commits. A later rule that would also have
+  reached a terminal does not fire (its matched state was consumed by the
+  terminal commit, and the post-terminal guard rejects it). See
+  [language.md](language.md#workflow-contracts-and-invocation).
 - [~] Add status/diagnostics output that clearly distinguishes workflow failure
   from provider/effect failure.
 
@@ -140,7 +163,12 @@ The target behavior is specified in [language.md](language.md),
   pattern-local scopes, and generated scopes.
 - [ ] Extend cycle analysis so compile-time pattern recursion and runtime
   workflow invocation cycles are checked separately.
-- [ ] Add termination/boundedness diagnostics for pattern expansion.
+- [x] Add termination/boundedness diagnostics for pattern expansion. v0 target:
+  emit `graph.unbounded_pattern_recursion` (severity `error`) for any recursive
+  `apply`; bounded-recursion analysis is deferred. **Done 2026-06-18** via
+  `detect_pattern_recursion` (reachability over the pattern-application graph);
+  the compile-time pattern-recursion half of the cycle-analysis line above (runtime
+  invocation-cycle analysis is separate, line 169).
 - [~] Add invocation graph diagnostics for missing root, ambiguous target,
   unauthorized target, and unsupported recursive invocation.
 - [ ] Generate Maude fixtures from compiled IR for workflow terminal and
@@ -193,12 +221,17 @@ The target behavior is specified in [language.md](language.md),
 - [ ] Exact syntax for workflow contracts:
   `input Name { ... }`, `output Name { ... }`, `failure Name { ... }`, or a
   compact signature form.
-- [ ] Whether BAML files are included directly or referenced through a generated
+- [ ] Whether coerce files are included directly or referenced through a generated
   source-bundle member.
-- [ ] Whether pattern bodies may contain terminal actions by default, or whether
-  terminal actions require an explicit pattern capability/contract.
-- [ ] Whether recursive workflow invocation is rejected in v0 or allowed only
-  with explicit policy limits.
+- [x] Whether pattern bodies may contain terminal actions: resolved. v0 forbids
+  `complete`/`fail` in pattern bodies entirely (compile-time `error`); no pattern
+  capability/contract escape hatch in v0.
+- [x] Whether recursive *pattern application* is allowed: resolved. v0 is
+  non-recursive-only (`graph.unbounded_pattern_recursion`); bounded recursion is
+  deferred pending a statically-decreasing structural measure.
+- [ ] Whether recursive *workflow invocation* (runtime `invoke` cycles, distinct
+  from compile-time `apply`) is rejected in v0 or allowed only with explicit
+  policy limits.
 - [ ] How much implicit compatibility syntax remains after examples migrate.
 
 ## Next Implementation Slice

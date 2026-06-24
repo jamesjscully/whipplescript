@@ -47,6 +47,8 @@ impl WorkItemStore {
         let connection = Connection::open(path)?;
         connection.execute_batch(
             r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA busy_timeout = 5000;
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS items (
                 item_id TEXT PRIMARY KEY,
@@ -85,7 +87,9 @@ impl WorkItemStore {
         metadata: &Value,
         filed_by: Option<&str>,
     ) -> StoreResult<WorkItem> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let next: i64 = tx.query_row(
             "UPDATE item_counter SET next_id = next_id + 1 WHERE singleton = 1 RETURNING next_id - 1",
             [],
@@ -163,7 +167,9 @@ impl WorkItemStore {
     /// Atomic claim: the tracker is the arbiter. "Already claimed" is a
     /// normal, branchable outcome, not an error.
     pub fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let changed = tx.execute(
             r#"
             UPDATE items
@@ -202,6 +208,23 @@ impl WorkItemStore {
             [item_id],
         )?;
         Ok(changed == 1)
+    }
+
+    /// Holder-lifetime release (spec/work-queues.md): when a claiming instance
+    /// reaches a terminal, every item it still holds `in_progress` returns to
+    /// `open` so another worker can claim it. Builtin-queue claims carry no TTL
+    /// backstop, so this terminal release is their only automatic recovery from
+    /// a dead holder. Returns the number of items released.
+    pub fn release_claims_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
+        let changed = self.connection.execute(
+            r#"
+            UPDATE items
+            SET status = 'open', claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE claimed_by = ?1 AND status = 'in_progress'
+            "#,
+            [holder],
+        )?;
+        Ok(changed)
     }
 
     /// Marks the item done. The optional summary is the agent-work audit
@@ -380,6 +403,43 @@ mod tests {
             }
         }
         assert_eq!(claimed, 1);
+    }
+
+    /// Holder-lifetime release: a terminal holder drops only its OWN
+    /// `in_progress` claims (back to `open`, re-claimable), leaving other
+    /// holders' items and already-`done` items untouched.
+    #[test]
+    fn release_claims_for_holder_frees_only_that_holders_in_progress_items() {
+        let mut store = open_memory();
+        let mine = store
+            .file_item("backlog", "mine", "", &[], &json!({}), None)
+            .expect("files");
+        let theirs = store
+            .file_item("backlog", "theirs", "", &[], &json!({}), None)
+            .expect("files");
+        store.claim_item(&mine.id, "w1").expect("claims mine");
+        store.claim_item(&theirs.id, "w2").expect("claims theirs");
+
+        assert_eq!(
+            store.release_claims_for_holder("w1").expect("releases"),
+            1,
+            "exactly w1's one in-progress claim is released"
+        );
+
+        let mine = store.get_item(&mine.id).expect("gets").expect("exists");
+        assert_eq!(mine.status, "open");
+        assert!(mine.claimed_by.is_none());
+        let theirs = store.get_item(&theirs.id).expect("gets").expect("exists");
+        assert_eq!(theirs.status, "in_progress", "w2's claim is untouched");
+        assert_eq!(theirs.claimed_by.as_deref(), Some("w2"));
+
+        // The released item is claimable again; a holder with nothing held is a
+        // no-op (e.g. an instance that already `finish`ed everything).
+        assert_eq!(
+            store.claim_item(&mine.id, "w3").expect("reclaims"),
+            ClaimOutcome::Claimed
+        );
+        assert_eq!(store.release_claims_for_holder("w1").expect("noop"), 0);
     }
 
     #[test]

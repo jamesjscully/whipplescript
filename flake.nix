@@ -36,11 +36,15 @@
       devShells = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
+          python = pkgs.python3.withPackages (pythonPackages: [
+            pythonPackages.jsonschema
+          ]);
         in {
           default = pkgs.mkShell {
             packages = [
               pkgs.jdk21
               pkgs.maude
+              python
               self.packages.${system}.apalache
             ];
           };

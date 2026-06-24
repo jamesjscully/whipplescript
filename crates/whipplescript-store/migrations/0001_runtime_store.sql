@@ -114,6 +114,7 @@ CREATE TABLE effects (
     required_capabilities TEXT NOT NULL DEFAULT '[]',
     profile TEXT,
     policy_block_reason TEXT,
+    policy_block_category TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(instance_id, idempotency_key)
@@ -282,8 +283,8 @@ CREATE UNIQUE INDEX diagnostics_version_idempotency_key_idx
     ON diagnostics(program_version_id, idempotency_key)
     WHERE instance_id IS NULL AND program_version_id IS NOT NULL AND idempotency_key IS NOT NULL;
 
-CREATE TABLE plugin_registrations (
-    plugin_id TEXT PRIMARY KEY,
+CREATE TABLE package_registrations (
+    package_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     version TEXT NOT NULL,
     manifest_json TEXT NOT NULL,
@@ -294,7 +295,7 @@ CREATE TABLE capability_schemas (
     capability TEXT PRIMARY KEY,
     description TEXT NOT NULL DEFAULT '',
     schema_json TEXT NOT NULL DEFAULT '{}',
-    registered_by_plugin_id TEXT REFERENCES plugin_registrations(plugin_id),
+    registered_by_package_id TEXT REFERENCES package_registrations(package_id),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -304,7 +305,7 @@ CREATE TABLE effect_providers (
     provider TEXT NOT NULL,
     capability TEXT NOT NULL REFERENCES capability_schemas(capability),
     config_json TEXT NOT NULL DEFAULT '{}',
-    registered_by_plugin_id TEXT REFERENCES plugin_registrations(plugin_id),
+    registered_by_package_id TEXT REFERENCES package_registrations(package_id),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(effect_kind, provider)
 );
@@ -371,7 +372,7 @@ CREATE TABLE inbox_items (
 INSERT INTO capability_schemas (capability, description, schema_json)
 VALUES
     ('agent.tell', 'Run an agent turn through a provider harness.', '{}'),
-    ('baml.coerce', 'Coerce unstructured data into a typed BAML-compatible value.', '{}'),
+    ('coerce', 'Coerce unstructured data into a typed value.', '{}'),
     ('loft.show', 'Read a Loft issue as JSON.', '{}'),
     ('loft.claim', 'Claim external work before provider execution.', '{}'),
     ('loft.renew', 'Renew a local Loft execution lease.', '{}'),
@@ -385,7 +386,8 @@ VALUES
     ('human.ask', 'Request a human decision.', '{}'),
     ('event.emit', 'Emit an external event.', '{}'),
     ('workflow.invoke', 'Start and observe a child workflow.', '{}'),
-    ('capability.call', 'Call a registered plugin capability.', '{}'),
+    ('capability.call', 'Call a registered package capability.', '{}'),
+    ('messaging.send', 'Send an outbound message through a std.messaging channel.', '{}'),
     ('repo.read', 'Read repository files and metadata.', '{}'),
     ('repo.write', 'Modify repository files and metadata.', '{}'),
     ('internet.research', 'Use networked research providers.', '{}');
@@ -393,7 +395,7 @@ VALUES
 INSERT INTO effect_providers (provider_id, effect_kind, provider, capability)
 VALUES
     ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell'),
-    ('provider_baml_coerce_builtin', 'baml.coerce', 'builtin-baml', 'baml.coerce'),
+    ('provider_coerce_builtin', 'coerce', 'builtin-coerce', 'coerce'),
     ('provider_loft_show_builtin', 'loft.show', 'builtin-loft', 'loft.show'),
     ('provider_loft_claim_builtin', 'loft.claim', 'builtin-loft', 'loft.claim'),
     ('provider_loft_renew_builtin', 'loft.renew', 'builtin-loft', 'loft.renew'),
@@ -407,20 +409,21 @@ VALUES
     ('provider_human_ask_builtin', 'human.ask', 'builtin-human-review', 'human.ask'),
     ('provider_event_emit_builtin', 'event.emit', 'builtin-event', 'event.emit'),
     ('provider_workflow_invoke_builtin', 'workflow.invoke', 'builtin-workflow-runtime', 'workflow.invoke'),
-    ('provider_capability_call_builtin', 'capability.call', 'builtin-plugin-call', 'capability.call');
+    ('provider_capability_call_builtin', 'capability.call', 'builtin-package-call', 'capability.call'),
+    ('provider_messaging_send_builtin', 'capability.call', 'builtin-messaging', 'messaging.send');
 
 INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities)
 VALUES
     ('profile_permissive', 'permissive', 'Allow all registered capabilities.', 'audit', '["*"]'),
-    ('profile_repo_reader', 'repo-reader', 'Allow repository reads and agent turns without writes.', 'enforce', '["agent.tell","repo.read","human.ask","baml.coerce","event.emit","workflow.invoke"]'),
-    ('profile_repo_writer', 'repo-writer', 'Allow repository-writing agent workflows.', 'enforce', '["agent.tell","repo.read","repo.write","loft.show","loft.claim","loft.renew","loft.release","loft.note","loft.transition","loft.evidence","loft.resource_intent","loft.complete","loft.fail","human.ask","baml.coerce","event.emit","workflow.invoke","capability.call"]'),
-    ('profile_internet_research', 'internet-research', 'Allow networked research workflows.', 'enforce', '["agent.tell","internet.research","human.ask","baml.coerce","event.emit","workflow.invoke"]'),
+    ('profile_repo_reader', 'repo-reader', 'Allow repository reads and agent turns without writes.', 'enforce', '["agent.tell","repo.read","human.ask","coerce","event.emit","workflow.invoke"]'),
+    ('profile_repo_writer', 'repo-writer', 'Allow repository-writing agent workflows.', 'enforce', '["agent.tell","repo.read","repo.write","loft.show","loft.claim","loft.renew","loft.release","loft.note","loft.transition","loft.evidence","loft.resource_intent","loft.complete","loft.fail","human.ask","coerce","event.emit","workflow.invoke","capability.call"]'),
+    ('profile_internet_research', 'internet-research', 'Allow networked research workflows.', 'enforce', '["agent.tell","internet.research","human.ask","coerce","event.emit","workflow.invoke"]'),
     ('profile_human_review', 'human-review', 'Allow human review requests and answers.', 'enforce', '["human.ask","event.emit","workflow.invoke"]');
 
 INSERT INTO capability_bindings (binding_id, program_id, capability, provider)
 VALUES
     ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness'),
-    ('binding_baml_coerce_builtin', NULL, 'baml.coerce', 'builtin-baml'),
+    ('binding_coerce_builtin', NULL, 'coerce', 'builtin-coerce'),
     ('binding_loft_show_builtin', NULL, 'loft.show', 'builtin-loft'),
     ('binding_loft_claim_builtin', NULL, 'loft.claim', 'builtin-loft'),
     ('binding_loft_renew_builtin', NULL, 'loft.renew', 'builtin-loft'),
@@ -434,6 +437,7 @@ VALUES
     ('binding_human_ask_builtin', NULL, 'human.ask', 'builtin-human-review'),
     ('binding_event_emit_builtin', NULL, 'event.emit', 'builtin-event'),
     ('binding_workflow_invoke_builtin', NULL, 'workflow.invoke', 'builtin-workflow-runtime'),
-    ('binding_capability_call_builtin', NULL, 'capability.call', 'builtin-plugin-call'),
+    ('binding_capability_call_builtin', NULL, 'capability.call', 'builtin-package-call'),
+    ('binding_messaging_send_builtin', NULL, 'messaging.send', 'builtin-messaging'),
     ('binding_repo_read_builtin', NULL, 'repo.read', 'builtin-agent-harness'),
     ('binding_repo_write_builtin', NULL, 'repo.write', 'builtin-agent-harness');

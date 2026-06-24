@@ -65,10 +65,11 @@ Why this script is important:
 - The worker prompt can use claim output only inside the success scope.
 - Claim failure is handled separately from worker failure.
 
-## Queue Worker With BAML Review
+## Queue Worker With Typed Review
 
-This example adds a typed model decision. It uses BAML-shaped `enum`, `class`,
-and `coerce` declarations, but keeps ordinary data operations small and pure.
+This example adds typed schema coercion. It uses backend-compatible `enum`,
+`class`, and `coerce` declarations, but keeps ordinary data operations small and
+pure. coerce is a current backend, not the language concept.
 
 ```whipplescript
 workflow QueueWorkerWithReview
@@ -149,7 +150,7 @@ rule start_ready_issue
 
   after review fails {
     askHuman """markdown
-    BAML review failed for this completed turn.
+    Typed review failed for this completed turn.
 
     Please inspect the turn artifacts and decide whether to accept, revise, or
     block the item.
@@ -200,7 +201,8 @@ rule escalate_blocked_review
 
 What transfers from the earlier expression design:
 
-- BAML-compatible scalar/container/schema types are still valid at boundaries.
+- Schema-coercion-compatible scalar/container/schema types are still valid at
+  boundaries.
 - Field access, equality, ordering, boolean logic, membership, object/list
   construction, and string interpolation are still the right small expression
   set.
@@ -209,11 +211,12 @@ What transfers from the earlier expression design:
 What changes:
 
 - `coerce` is no longer a synchronous `let`-style value operation.
-- `coerce` enqueues a durable `baml.coerce` effect.
+- `coerce` enqueues a durable `schema.coerce` effect. Current implementations
+  may still report this as `coerce`.
 - `after review succeeds` narrows `review` to the typed success payload.
 - `record ReviewedWork` creates a durable typed workflow fact.
-- Nontrivial data reasoning should happen in BAML or a capability, not inside
-  WhippleScript.
+- Nontrivial data reasoning should happen in a schema-coercion backend or a
+  capability, not inside WhippleScript.
 
 ## Ralph Loop
 
@@ -381,7 +384,7 @@ right but needs semantic discipline.
 ## OpenClaw-Lite Composition
 
 OpenClaw-lite is an example composition, not a special mode. It combines core
-registries with a few plugins:
+registries with package/provider capabilities:
 
 ```whipplescript
 workflow OpenClawLite
@@ -527,7 +530,7 @@ The curated checked examples in `examples/` are documented in
 - `minimal-noop.whip`: smallest complete workflow.
 - `human-review.whip`: manual approval with typed answer facts.
 - `triage-flow.whip`: sequential flow with branching and terminal outcomes.
-- `coerce-branch.whip`: typed model decision and explicit routing.
+- `coerce-branch.whip`: typed schema coercion and explicit routing.
 - `terminal-output-union.whip`: exhaustive effect-terminal handling.
 - `incident-router.whip`: rich guards, collection access, and `AgentRef`.
 - `scheduled-escalation.whip`: timeout, timer, cancellation, and escalation.
@@ -544,7 +547,7 @@ The curated checked examples in `examples/` are documented in
 - `gastown-lite.whip`: coding-agent queue/lease/review ledger.
 
 Runtime test fixtures such as `provider-language-e2e.whip`,
-`plugin-memory.whip`, and `queue-gated-smoke.whip` remain checked, but they are
+`package-memory.whip`, and `queue-gated-smoke.whip` remain checked, but they are
 not the curated authoring path.
 
 Each checked source has a matching `.ir` snapshot consumed by parser tests.
@@ -555,13 +558,13 @@ First authoring pass guesses:
 
 - Equality guards such as `when reviewed.status == Accept` feel natural, but
   the implemented grammar does not support guard expressions yet. For now this
-  is a hard diagnostic; authors should route through typed facts or a BAML
+  is a hard diagnostic; authors should route through typed facts or a coerce
   `coerce` result.
 - Binding an effect after a multi-line string, for example closing with
   `""" as plan`, also feels natural. The current parser only recognizes
   `as binding` on the effect line. This should become either a supported alias
   or a targeted diagnostic before v0.
-- Plugin-specific shorthand such as `memory.query item as context` is
+- Package-specific shorthand such as `memory.query item as context` is
   appealing, but the current durable surface is the generic `call` capability
-  effect. Keep shorthand out of the grammar until plugin effect registration
+  effect. Keep shorthand out of the grammar until package effect registration
   and docs can make the lowering auditable.

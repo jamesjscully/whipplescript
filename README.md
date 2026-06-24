@@ -10,6 +10,9 @@ A whippletree distributes load from different sources. So does this.
 > WhippleScript is pre-1.0. The language, CLI, and provider interfaces may
 > change between releases. See [current state](docs/current-state.md) for
 > what is stable enough to rely on today.
+>
+> The Markdown docs in this checkout track `main`. For exact released CLI
+> behavior, use the docs from the matching Git tag.
 
 ## Why
 
@@ -121,19 +124,39 @@ whip --store .whipplescript/quickstart.sqlite log    <instance_id>
 
 | | |
 | --- | --- |
+| [Docs home](docs/README.md) | Reading paths for humans and agents. |
 | [Quickstart](docs/quickstart.md) | Install, run an example, inspect the result. |
 | [Tutorial](docs/tutorial.md) | Build a triage workflow with a human approval gate. |
 | [Concepts](docs/concepts.md) | The execution model: facts, rules, effects, workers. |
 | [Language reference](docs/language-reference.md) | Every construct in `.whip` source. |
-| [CLI & API reference](docs/api-reference.md) | Commands, JSON shapes, status values, crate APIs. |
+| [CLI reference](docs/api-reference.md) | Commands, flags, exit behavior, and compact source construct index. |
+| [JSON reference](docs/json-reference.md) | Machine-readable reports, inspection output, and status/event shapes. |
+| [Diagnostics guide](docs/diagnostics.md) | Common compiler/runtime errors and repairs. |
+| [Rust API reference](docs/rust-api.md) | Internal-stability crate APIs for contributors. |
 | [Runtime & operations](docs/runtime-operations.md) | Stores, lifecycle, failures, revision, recovery. |
-| [Providers & plugins](docs/providers.md) | Fixture and native providers, credentials, plugins. |
+| [Providers & packages](docs/providers.md) | Fixture and native providers, credentials, packages. |
 | [Examples](docs/examples.md) | The checked example catalog. |
 | [Troubleshooting](docs/troubleshooting.md) | Common first-session problems. |
 | [Current state](docs/current-state.md) | What works today and what is still settling. |
 
 When pointing a coding agent at WhippleScript, start it with
 [`skills/whipplescript-author/SKILL.md`](skills/whipplescript-author/SKILL.md).
+
+The same Markdown docs can be served as a navigable site:
+
+```sh
+python3 -m pip install mkdocs
+mkdocs serve
+```
+
+Docs checks:
+
+```sh
+scripts/check-docs-quickstart.sh
+scripts/check-docs-examples.sh
+scripts/check-docs-snippets.sh
+scripts/check-docs-site.sh
+```
 
 ## Contributing
 
@@ -158,7 +181,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-`scripts/check-release-readiness.sh` runs the full release gate, including the
-formal model checks (a Nix dev shell with the tooling is provided:
-`nix develop`). Remaining work is tracked in
-[`spec/implementation-plan.md`](spec/implementation-plan.md).
+`scripts/check-release-readiness.sh` runs the full release gate, including
+report schema/artifact validation and the formal model checks (a Nix dev shell
+with the tooling is provided: `nix develop`; non-Nix environments can install
+Python script dependencies with `python3 -m pip install -r requirements-dev.txt`).
+Remaining work is tracked in [`spec/implementation-plan.md`](spec/implementation-plan.md).

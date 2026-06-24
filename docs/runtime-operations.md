@@ -18,6 +18,23 @@ The runtime separates deterministic progress from provider execution:
 `step` never executes providers. `worker` never invents policy. `dev`
 composes the loops for local convenience without changing the boundaries.
 
+### Concurrent effect execution
+
+A worker pass executes its ready set of effects concurrently on a bounded
+thread pool — the ready set is mutually independent (a dependent effect is not
+claimable until its dependency's terminal), and the durable lease plus per-row
+idempotency guarantee exactly-once even under concurrency (the
+`AtMostOneRunExecutingEffect` invariant in `models/tla/ControlPlaneLifecycle.tla`).
+This is what lets a fan-out of agent turns or `coerce` calls run in parallel
+instead of one at a time, and gives `agent X { capacity N }` real runtime
+meaning: a worker starts at most `N` turns of an agent at once and defers the
+rest to a later pass. `WHIPPLESCRIPT_WORKER_CONCURRENCY` sets the per-pass bound
+(default tracks available CPUs, capped); set it to `1` for a fully serial pass.
+Each effect runs synchronously on its own pool thread (whip is not async); WAL
+mode and a busy timeout let the per-effect store writes coexist safely, while
+the slow provider I/O runs outside any transaction. Scale further by running
+more worker processes against the same store.
+
 ## The store
 
 State lives in a SQLite file, by default `.whipplescript/store.sqlite`.
@@ -28,8 +45,8 @@ instance must use the store that created it.
 The store holds program versions, instances, the append-only event log, and
 projections over it: facts, effects and their dependencies, provider runs,
 leases, workflow invocations, inbox items, evidence, artifacts, and
-registered capabilities/profiles/plugins. The event log is the source of
-truth; everything else can be rebuilt from it.
+registered capabilities, profiles, packages, and providers. The event log is
+the source of truth; everything else can be rebuilt from it.
 
 ## Instance lifecycle
 
@@ -54,7 +71,18 @@ by a second worker.
 queued -> running -> completed | failed | timed_out | cancelled
 queued -> blocked_by_dependency | blocked_by_capacity
         | blocked_by_capability | blocked_by_profile
+queued -> blocked            (provider binding unavailable; recoverable)
 ```
+
+A **blocked** effect is recoverable, not terminal: a later worker pass runs it
+once the block clears. A provider-binding failure detected **before** provider
+execution — the provider sidecar cannot launch, or a present provider config
+lacks a required credential reference — blocks the effect rather than failing it,
+so fixing the binding lets the run resume without a manual re-trigger. Every
+blocked effect carries a categorized reason in `whip effects`/`status` as
+`policy_block: { category, detail }`, where `category` is one of `capability`,
+`profile`, `capacity`, `dependency` (scheduling-time) or `provider_health`,
+`credentials` (binding-time). The detail never contains secret values.
 
 A provider failure is recorded as effect/run state, events, and evidence — it
 does **not** fail the workflow. Rules decide policy: retry, escalate, ignore,
@@ -102,7 +130,13 @@ whip --store <store> retry  <instance> <effect>
 
 `retry` moves an eligible failed or timed-out effect back to `queued`.
 `recover` reconciles interrupted native provider runs from persisted
-evidence after a crash; see [providers & plugins](providers.md).
+evidence after a crash; see [providers & packages](providers.md). When a run
+started but crashed before any terminal or evidence was recorded and the
+provider offers no idempotent re-query, recovery resolves it to an **`uncertain`
+run terminal**: the effect becomes `failed` (so rules' `fails` branches react)
+and the run carries the `runtime.recovery_uncertain` diagnostic, marking "we
+could not confirm whether the external side effect happened." Recovery never
+silently re-runs such an effect; `retry` is an explicit operator decision.
 
 ## Child workflows
 
@@ -137,7 +171,7 @@ records the terminal outcome through the normal effect lifecycle.
 
 Revision is limited to the same root workflow in v0. Root changes and
 schema-breaking fact migrations are tracked in
-[`spec/workflow-revision-followups-tracker.md`](../spec/workflow-revision-followups-tracker.md).
+[`spec/workflow-revision-followups-tracker.md`](https://github.com/jamesjscully/whipplescript/blob/main/spec/workflow-revision-followups-tracker.md).
 
 ## Capturing an incident
 

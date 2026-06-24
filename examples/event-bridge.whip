@@ -1,8 +1,8 @@
 @service
 workflow EventBridge
 
-# Event schemas let external systems notify a workflow without inventing facts.
-event deploy.finished {
+# Signal schemas let external systems drive a workflow without inventing facts.
+signal deploy.finished {
   service string
   status "ok" | "failed"
 }
@@ -26,12 +26,12 @@ table peers as PeerInstance [
 
 assert count(DeploymentNotice where status == "notified") == 1
 
-# External systems inject deploy.finished with `whip notify`.
-rule notify_peer_after_successful_deploy
-  when fact deploy.finished as deployed where deployed.status == "ok"
+# External systems inject deploy.finished with `whip signal`.
+rule signal_peer_after_successful_deploy
+  when deploy.finished as deployed where deployed.status == "ok"
   when PeerInstance as peer where peer.service == deployed.service
 => {
-  notify peer.id event deploy.finished {
+  emit signal deploy.finished to peer.id {
     service deployed.service
     status deployed.status
   } as sent

@@ -37,7 +37,9 @@ table tickets as Ticket [
   }
 ]
 
-# A flow is for one fixed sequence with shared bindings.
+# A flow is for one fixed sequence with shared bindings: the pre-ask `tell`
+# result (`plan`) is carried across the `askHuman` boundary via flow state, so the
+# post-approval `complete` can record `plan.summary` directly.
 flow triage_ticket
   when Ticket as ticket where ticket.status == "open"
   when triager is available

@@ -26,7 +26,7 @@ Runtime              daemon/control-plane process
 Artifact             durable file/log/output associated with a run
 Evidence             causal record linking events, rules, effects, runs, and artifacts
 Skill                deterministic context bundle for an agent or turn
-Plugin               package-provided effect/fact-schema/resource extension
+PackageRegistration  locked package/library/provider registration metadata
 InboxItem            pending human review request
 ```
 
@@ -60,7 +60,7 @@ A compiled program records:
 - declared fact/event schemas
 - analysis results
 - optional generated verification artifacts
-- optional generated BAML artifacts
+- optional generated coerce artifacts
 
 Deploying a program does not run it. Starting creates an instance.
 
@@ -135,10 +135,10 @@ revise  = control-plane activation of a new program version for one instance
 ```
 
 Ordinary workflow rules cannot activate a revision. They may produce patch
-proposal artifacts, ask for human approval, call validation plugins, coerce a
-typed decision, tell an agent to prepare a change, or invoke a child workflow
-that produces a proposed source bundle. The active program changes only through
-`whip revise` or an authorized control-plane API.
+proposal artifacts, ask for human approval, call validation providers, perform
+typed schema coercion, tell an agent to prepare a change, or invoke a child
+workflow that produces a proposed source bundle. The active program changes
+only through `whip revise` or an authorized control-plane API.
 
 Revision activation is append-only and inspectable. A successful activation:
 
@@ -222,7 +222,7 @@ whip revise <instance> workflow.whip --root Workflow --cancel keep
 whip revise <instance> workflow.whip --root Workflow --cancel queued
 whip revise <instance> workflow.whip --root Workflow --cancel running
 
-whip plugins
+whip packages
 whip skills
 whip inbox
 whip trace <instance>
@@ -280,7 +280,7 @@ state, it should:
    - `NewFact` records for `record ...` blocks
    - consumed fact ids for `consume binding` / `done binding`
    - `NewEffect` records for `tell`, `coerce`, `claim`, `askHuman`, `call`,
-     `notify`, `exec`, and `timer`
+     `emit signal`, `exec`, and `timer`
    - `NewEffectDependency` records for `after` blocks
    - evidence/diagnostic records for policy decisions and lowering details
 6. Commit each rule atomically through the kernel.
@@ -300,7 +300,7 @@ Rule readiness includes pure guard evaluation. For a rule with `when Class as
 binding where <expr>`, the stepper must bind candidate facts first, evaluate the
 typed expression against those bindings, and discard candidates whose guard is
 false before lowering the rule body. Guard evaluation is part of deterministic
-stepping and must not consult providers, BAML, plugins, the filesystem, the
+stepping and must not consult providers, coerce, package capabilities, the filesystem, the
 network, wall-clock time, or random sources.
 
 `when` is the only source-level introducer for rule readiness. `with` is not an
@@ -346,6 +346,24 @@ append a durable event, update the run, and link evidence/artifacts before the
 worker reports completion. If the store cannot append a terminal event, the
 worker must leave the lease/run recoverable instead of reporting success out of
 band.
+
+Exactly-once for the external side effect is the dual-write problem and is
+resolved per [`admission-and-idempotency.md`](admission-and-idempotency.md): the
+worker durably records `claim + run-started` *before* invoking the provider, so
+recovery can find a started run with no terminal. Recovery must **not** blindly
+re-invoke an external effect that may have already succeeded:
+
+```text
+provider supports idempotent re-query (by run/thread/request id)
+  -> re-query and admit the discovered terminal
+provider has no idempotent re-query
+  -> resolve to an explicit `uncertain` terminal (a Failed subkind), surfaced to
+     the operator; never silently re-execute the external side effect
+```
+
+A genuine transient retry (failure before the side effect) reuses the same
+effect idempotency key, so a duplicate terminal admission is absorbed by the
+store's unique index.
 
 Provider and harness failures use one canonical terminal event type:
 
@@ -413,11 +431,11 @@ consume binding             -> consume the matched fact from current projection
 done binding                -> alias for consume binding
 done binding -> record ...  -> consume plus result record in one commit
 tell agent ...              -> agent.tell effect with target/profile/skills
-coerce function(...)        -> baml.coerce effect with function and arguments
+coerce function(...)        -> schema.coerce effect with function and arguments
 claim item                  -> queue.claim effect
 askHuman ...                -> human.ask effect
-call plugin.capability ...  -> capability.call effect
-notify instance event ...   -> event.notify effect
+call package.capability ... -> capability.call effect
+emit signal name to target  -> signal.emit effect
 exec capability with input  -> exec.command effect requiring script.<capability>
 invoke Workflow             -> workflow.invoke effect or child invocation record
 after effect succeeds       -> dependency edge
@@ -527,7 +545,7 @@ The control plane owns mechanical reliability:
 - record evidence linking events, rules, effects, runs, artifacts, skills, and
   policy decisions
 - expose status/log/fact/effect views
-- expose inbox, trace, evidence, plugin, and skill views
+- expose inbox, trace, evidence, package/provider, and skill views
 - pause/resume/cancel instances
 - recover abandoned leases
 
@@ -541,11 +559,11 @@ The source language owns policy:
 - which facts imply readiness
 - when to ask humans
 - when to retry or escalate
-- which typed model decisions are needed
+- which typed schema coercions are needed
 
 The control plane should not become a gateway that owns every integration.
-Plugins and separate kernels own domain behavior; the control plane owns
-durability, authority binding, visibility, and lifecycle.
+Packages, providers, and separate kernels own domain behavior; the control
+plane owns durability, authority binding, visibility, and lifecycle.
 
 ## Concurrency Model
 

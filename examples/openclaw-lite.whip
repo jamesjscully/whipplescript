@@ -12,6 +12,11 @@ class Plan {
   status "ready"
 }
 
+class ReviewDecision {
+  decision string
+  decidedBy string
+}
+
 queue backlog {
   tracker builtin
 }
@@ -29,7 +34,9 @@ agent reviewer {
 }
 
 assert count(Heartbeat where status == "observed") == 1
+
 assert count(Plan where status == "ready") == 1
+
 assert count(effect kind queue.file where status == completed) == 1
 
 # OpenClaw-like scheduling is modeled as an ordinary observed heartbeat.
@@ -68,9 +75,19 @@ rule escalate_plan_for_review
   when Plan as plan where plan.status == "ready"
   when reviewer is available
 => {
-  askHuman choices ["approve", "revise"] """markdown
+  askHuman as review choices ["approve", "revise"] """markdown
   Review the generated maintenance plan:
 
   {{ plan.summary }}
   """
+}
+
+# Record the reviewer's decision once the inbox item is answered.
+rule record_review_decision
+  when human answered review as answer
+=> {
+  record ReviewDecision {
+    decision answer.choice
+    decidedBy answer.answered_by
+  }
 }

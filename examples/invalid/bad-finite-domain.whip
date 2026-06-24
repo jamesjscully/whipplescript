@@ -8,7 +8,7 @@ enum ReviewStatus {
 class Task {
   status ReviewStatus
   provider "codex" | "claude"
-  route "pi" | "baml"
+  route "pi" | "coerce"
 }
 
 rule invalid_guard_literal

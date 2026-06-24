@@ -2,6 +2,9 @@
 
 Common problems in roughly the order new users hit them.
 
+For a searchable catalog of compiler, runtime, revision, assertion, and
+fixture diagnostics, see the [Diagnostics guide](diagnostics.md).
+
 ## `whip` is not found
 
 Cargo installs to `~/.cargo/bin`. Add it to `PATH` and open a new shell:
@@ -33,6 +36,29 @@ whip --store .whipplescript/quickstart.sqlite instances
 Every command that reads an instance needs that same `--store`, or set it
 once with `export WHIPPLESCRIPT_STORE=<path>`.
 
+## A counter/lease/queue example behaves differently on repeated runs
+
+Counters, leases, ledgers, and the builtin queue tracker live in a
+**workspace-scoped** coordination store (`.whipplescript/coordination.sqlite`,
+or `WHIPPLESCRIPT_COORDINATION_STORE`) that is *separate* from the per-instance
+run store and is **not** reset by `--store` / `WHIPPLESCRIPT_STORE`. This is by
+design — a `counter failure_budget { cap 3 reset daily }` is a budget shared by
+every instance for that key until the period rolls over.
+
+So re-running `examples/circuit-breaker.whip` four times in one day consumes the
+budget across runs: the first three failures land on the `ok` branch and the
+fourth trips to `over` (`whip counters` shows `consumed=3`). That is correct
+breaker behaviour, not a per-run bug. To exercise such an example from a clean
+budget, point the coordination store at a throwaway path too:
+
+```sh
+WHIPPLESCRIPT_COORDINATION_STORE=$(mktemp -u) \
+WHIPPLESCRIPT_STORE=$(mktemp -u) whip dev examples/circuit-breaker.whip --until idle
+```
+
+Inspect or confirm shared state with `whip counters`, `whip leases`, and
+`whip ledger`.
+
 ## Multiple workflows need `--root`
 
 When a source bundle declares several workflows, name the root:
@@ -62,8 +88,8 @@ tag the rule `@external`.
 
 ## `whip doctor` reports missing tools
 
-Most are optional. Fixture-backed development needs none of Maude, Apalache,
-BAML, Codex, Claude, Pi, or Loft. Install optional tools only for formal
+Most are optional. Fixture-backed development needs none of the formal-model,
+model-decision, or native-provider tools. Install optional tools only for formal
 checks or real-provider work.
 
 ## `cargo install --git` fails
@@ -83,7 +109,7 @@ Real-provider smoke tests are opt-in and gated by environment variables:
 
 ```sh
 WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \
-WHIPPLESCRIPT_REAL_PROVIDERS=loft,baml,codex \
+WHIPPLESCRIPT_REAL_PROVIDERS=coerce,codex \
 scripts/check-real-providers.sh
 ```
 
@@ -95,7 +121,7 @@ failures.
 
 ## Native provider strict mode fails
 
-Strict mode validates real native adapters, not compatibility wrappers:
+Strict mode validates real native adapters:
 
 ```sh
 WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \

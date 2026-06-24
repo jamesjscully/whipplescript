@@ -17,7 +17,8 @@ Common issues:
 - Effect outputs must be used inside a matching `after <effect> ...` block.
 - `as binding` must be on the effect line.
 - Unknown record fields are rejected.
-- BAML `coerce` calls must match declared function arity.
+- `coerce` calls must match declared function arity and the selected
+  schema-coercion backend's boundary types.
 
 ## Effect Does Not Run
 

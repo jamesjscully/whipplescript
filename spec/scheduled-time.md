@@ -1,7 +1,7 @@
 # Scheduled time: absolute deadlines and the `time` type
 
-Status: spec drafted 2026-06-10 from decided design
-([`language-ergonomics-tracker.md`](language-ergonomics-tracker.md) C4).
+Status: core time spec, package recurrence superseded by `std.time`
+([`language-ergonomics-tracker.md`](decision-records/language-ergonomics-tracker.md) C4).
 Stage: spec -> modeling -> implementation + testing -> review.
 
 Builds on the relative-time model ([`time.md`](time.md), A2): `timeout`
@@ -82,13 +82,10 @@ basis differs (absolute target vs. `created + duration`).
 
 ## Out of scope (v1)
 
-- **Recurrence / cron.** Exact "every day at 09:00:00" requires either the
-  daemon the design rejects or accepting approximate "at-or-after T, next
-  worker pass" semantics. v1 ships one-shot `until` only; recurring needs are
-  served by an external scheduler that pokes the workflow via
-  [`whip notify`](event-ingress.md) — which keeps the recurrence policy and
-  its clock outside the deterministic core. A recurring `timer` may be
-  revisited later, explicitly as approximate.
+- **Recurrence / cron in core.** v1 core ships one-shot `until` only.
+  Recurrence belongs to [`std.time`](std-time.md), which models time as a
+  clock source that emits typed signals. This keeps recurrence out of guards
+  and out of core one-shot timer semantics.
 - **Absolute `timeout` on effects.** `timeout` stays relative-only;
   deadlines-on-effects are naturally relative to effect creation. Absolute
   scheduling is `timer until`'s job.
@@ -118,7 +115,12 @@ Extends the A2 time pass ([`time.md`](time.md)) — the same `timer.wait`
 effect, store columns, and worker resolution, with an absolute deadline basis.
 Requires the `time` scalar in the type system (the kernel already carries an
 `ExprType::Time`). Pairs with [`event-ingress.md`](event-ingress.md) for
-externally-driven recurrence.
+externally-driven recurrence; recurrence proper lives in
+[`std.time`](std-time.md)'s `clock_source`, whose occurrence admission identity
+and dedup are defined in
+[`admission-and-idempotency.md`](admission-and-idempotency.md) (clock-occurrence
+key `H(source_id, scheduled_occurrence_instant)`). Core `timer.fired` here is a
+one-shot effect terminal, not a clock occurrence.
 
 ## Modeling notes
 

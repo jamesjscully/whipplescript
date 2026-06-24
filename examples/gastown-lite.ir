@@ -60,7 +60,7 @@ rules
       turn kind=agent.tell binding=turn key=0f484580de9b735e
       effect4 kind=queue.release binding=- key=c073a6ab53599798
       effect5 kind=human.ask binding=- key=22a2e9667ad9099f
-      review kind=baml.coerce binding=review key=06b1101194f13e5d
+      review kind=coerce binding=review key=26c43d260ec4c541
       log_entry kind=ledger.append binding=log_entry key=486742921bd48ea1
       effect8 kind=queue.finish binding=- key=3d9ec6b22e572e38
       effect9 kind=queue.release binding=- key=e9dc4bfff08a3011

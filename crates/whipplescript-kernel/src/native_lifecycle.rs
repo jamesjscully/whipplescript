@@ -49,6 +49,20 @@ impl AgentTurnLifecycleKind {
             Self::Completed | Self::Failed | Self::TimedOut | Self::Cancelled
         )
     }
+
+    /// Per spec/agent-harness.md, the only durable, rule-matchable lifecycle
+    /// facts are `agent.turn.started/completed/failed/timed_out/cancelled`. The
+    /// in-turn observations `streamed`/`tool_requested`/`artifact_captured` are
+    /// EVIDENCE only — turn-internal activity that is inspectable but never an
+    /// event-sourced fact that later rules pattern-match (the compiler enforces
+    /// the matching ban via `validate_evidence_fact_not_matched`; this keeps the
+    /// storage side honest so they never inflate the fact set in the first place).
+    pub fn derives_rule_matchable_fact(self) -> bool {
+        !matches!(
+            self,
+            Self::Streamed | Self::ToolRequested | Self::ArtifactCaptured
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

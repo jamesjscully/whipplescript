@@ -1,0 +1,467 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whipplescript.dev/schemas/package_manifest_v0.schema.json",
+  "title": "WhippleScript Package Manifest v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "package_id", "name", "version"],
+  "properties": {
+    "schema": {
+      "const": "whipplescript.package_manifest.v0"
+    },
+    "package_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "libraries": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/library"
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/capability"
+      }
+    },
+    "providers": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/provider"
+      }
+    },
+    "profiles": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/profile"
+      }
+    },
+    "bindings": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/binding"
+      }
+    },
+    "fixture_outcomes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/fixtureOutcome"
+      }
+    }
+  },
+  "$defs": {
+    "stringArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "schemaFragment": true,
+    "library": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "standard": {
+          "type": "boolean"
+        },
+        "effect_contracts": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/effectContract"
+          }
+        },
+        "effects": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/effectContract"
+          }
+        },
+        "constructs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/construct"
+          }
+        }
+      }
+    },
+    "construct": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "construct_family", "keyword"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "construct_family": {
+          "comment": "Only platform families with a package-authorable lowering; matches PLATFORM_CONSTRUCT_CATALOG family_ids filtered to package_authorable (enforced by a CLI test).",
+          "enum": [
+            "declaration_block",
+            "effect_operation"
+          ]
+        },
+        "keyword": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "enum": ["top_level", "rule_body", "workflow_body", "expression"]
+        },
+        "fields": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/constructField"
+          }
+        },
+        "requires": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/constructInterface"
+          }
+        },
+        "provides": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/constructInterface"
+          }
+        },
+        "lowering_target": {
+          "enum": ["metadata_only", "capability_call", "typed_effect_call"]
+        },
+        "target_capability": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "constructField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": [
+            "identifier",
+            "string",
+            "number",
+            "boolean",
+            "duration",
+            "type_ref",
+            "provider_ref",
+            "capability_ref",
+            "event_ref",
+            "effect_ref",
+            "expression",
+            "predicate",
+            "list",
+            "record",
+            "enum"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "constructInterface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "Resource",
+            "Projection",
+            "Event",
+            "SignalSource",
+            "EffectContract",
+            "Operation",
+            "Capability",
+            "ProviderKind",
+            "Profile",
+            "Binding",
+            "EffectHandle",
+            "TerminalOutput",
+            "Value",
+            "ContextArtifact",
+            "Diagnostic"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type_ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "phase": {
+          "enum": ["compile", "runtime", "compile/runtime"]
+        },
+        "cardinality": {
+          "enum": ["exactly-one", "optional-one", "many", "named-many"]
+        }
+      }
+    },
+    "effectContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effect_kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "core_effect_kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_forms": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "input_schema": {
+          "$ref": "#/$defs/schemaFragment"
+        },
+        "output_schema": {
+          "$ref": "#/$defs/schemaFragment"
+        },
+        "required_capabilities": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "provider_kinds": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "projected_facts": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "validation": {
+          "description": "Manifest input value. `runtime` is an accepted input alias for `runtime_boundary`; the canonical emitted value in package_contract/package_check artifacts is `runtime_boundary`.",
+          "enum": ["none", "runtime_boundary", "runtime"]
+        }
+      }
+    },
+    "surfaceClass": {
+      "enum": [
+        "effect_operation",
+        "agent_turn",
+        "schema_coercion",
+        "claim_operation",
+        "signal_source",
+        "clock_source",
+        "resource_read",
+        "resource_write",
+        "message_send",
+        "memory_recall",
+        "memory_learn",
+        "script_run"
+      ]
+    },
+    "fixtureOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["surface", "surface_class", "outcomes"],
+      "properties": {
+        "surface": {
+          "type": "string",
+          "minLength": 1
+        },
+        "surface_class": {
+          "$ref": "#/$defs/surfaceClass"
+        },
+        "domain_aliases": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "outcomes": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "$ref": "#/$defs/fixtureOutcomeCase"
+          }
+        }
+      }
+    },
+    "fixtureOutcomeCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "terminal": {
+          "enum": ["succeeded", "failed", "timed_out", "cancelled"]
+        },
+        "branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "diagnostic": {
+          "type": "string",
+          "minLength": 1
+        },
+        "input_schema": {
+          "$ref": "#/$defs/schemaFragment"
+        },
+        "output_schema": {
+          "$ref": "#/$defs/schemaFragment"
+        },
+        "projection_changes": {
+          "$ref": "#/$defs/stringArray"
+        }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        },
+        "schema": {
+          "$ref": "#/$defs/schemaFragment"
+        },
+        "input_schema": {
+          "$ref": "#/$defs/schemaFragment"
+        },
+        "output_schema": {
+          "$ref": "#/$defs/schemaFragment"
+        }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "provider_kind", "capability"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "provider_kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "capability": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effect_kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "core_effect_kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "config": {
+          "$ref": "#/$defs/schemaFragment"
+        }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "allowed_capabilities"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        },
+        "enforcement_mode": {
+          "enum": ["enforce", "warn", "off"]
+        },
+        "allowed_capabilities": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "config": {
+          "$ref": "#/$defs/schemaFragment"
+        }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "capability", "provider"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "program_id": {
+          "type": ["string", "null"]
+        },
+        "capability": {
+          "type": "string",
+          "minLength": 1
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1
+        },
+        "config": {
+          "$ref": "#/$defs/schemaFragment"
+        }
+      }
+    }
+  }
+}

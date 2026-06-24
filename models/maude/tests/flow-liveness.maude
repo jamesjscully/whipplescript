@@ -1,0 +1,25 @@
+load ../flow-liveness.maude
+
+--- Coverage: in a self-terminating flow, a stalling branch is flagged.
+search [1] in WHIPPLESCRIPT-FLOW-LIVENESS :
+  flowHasTerminal armStalls(a1) stalled(mtArms)
+  =>* C:Cfg stalled(a1 & S:ArmSet) .
+
+--- Coverage: with one settling and one stalling branch, only the stalling one is
+--- flagged -- the settling branch does not mask the stall.
+search [1] in WHIPPLESCRIPT-FLOW-LIVENESS :
+  flowHasTerminal armSettles(a1) armStalls(a2) stalled(mtArms)
+  =>* C:Cfg stalled(a2 & S:ArmSet) .
+
+--- Bite: a stalling branch in a flow with NO inline terminal is NOT flagged. The
+--- RESIDUAL soup var means any flag in any reachable state would be a solution, so
+--- No solution proves the pure-handoff flow is left to the broader liveness lint.
+search [1] in WHIPPLESCRIPT-FLOW-LIVENESS :
+  armStalls(a1) stalled(mtArms)
+  =>* stalled(A:Arm & S:ArmSet) RESIDUAL:Cfg .
+
+--- Bite: when every branch settles, nothing is flagged even though the flow is
+--- self-terminating.
+search [1] in WHIPPLESCRIPT-FLOW-LIVENESS :
+  flowHasTerminal armSettles(a1) armSettles(a2) stalled(mtArms)
+  =>* stalled(A:Arm & S:ArmSet) RESIDUAL:Cfg .

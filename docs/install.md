@@ -2,6 +2,11 @@
 
 The WhippleScript CLI is a single binary, `whip`.
 
+These instructions install the latest published release. If you are reading
+docs from a local checkout of `main`, the checkout may describe flags or JSON
+fields newer than that release. For exact release behavior, use the docs from
+the matching Git tag.
+
 ## Prebuilt binaries
 
 Releases publish archives, installers, and checksums for macOS
@@ -59,8 +64,16 @@ whip doctor
 whip check examples/minimal-noop.whip   # from a checkout
 ```
 
-`doctor` reports optional tooling (Maude, Apalache, provider CLIs). None of
-it is needed for fixture-backed development.
+`whip --version` prints the package version, for example
+`whipplescript 0.1.0`. `whip --help` also prints the implementation-stage
+label in parentheses; that label is for project tracking and does not replace
+the package version.
+
+`doctor` reports optional tooling (Maude, Apalache, Python `jsonschema`, and
+provider CLIs). None of it is needed for fixture-backed development. Generated
+formal checks and report-schema validation can use the Nix dev shell
+(`nix develop`) or `python3 -m pip install -r requirements-dev.txt` from a
+checkout.
 
 ## Running without installing
 
@@ -74,5 +87,5 @@ command. Use this for development on WhippleScript itself.
   the checksum.
 - **Linux libc:** binaries target GNU libc. On musl-based systems, install
   from source (a musl artifact is tracked in
-  [`spec/distribution-tracker.md`](../spec/distribution-tracker.md)).
+  [`spec/distribution-tracker.md`](https://github.com/jamesjscully/whipplescript/blob/main/spec/distribution-tracker.md)).
 - **Windows:** restart the terminal after the installer updates `PATH`.

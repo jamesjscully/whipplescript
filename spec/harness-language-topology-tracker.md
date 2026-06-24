@@ -1,41 +1,48 @@
 # Harness Language Topology Tracker
 
-Goal: make provider harness topology a first-class WhippleScript source concept
-so workflows can declare multiple harnesses and bind logical agents to them.
+Status: superseded target vocabulary.
+
+This tracker records an implementation-era harness topology experiment. The
+package-system target uses ordinary `provider` clauses on agent declarations and
+treats harnesses as implementation/provider-binding details. New package specs
+should not use header-level agent route syntax.
 
 ## Source Shape
 
 ```whip
-harness coder: codex
-harness reviewer: claude
-
-agent implementer using coder {
+agent implementer {
+  provider coder
   profile "repo-writer"
   capacity 1
 }
 
-agent critic using reviewer {
+agent critic {
+  provider reviewer
   profile "repo-reader"
   capacity 1
 }
 ```
 
-Source owns named harness topology and agent bindings. Runtime/provider config
-owns credentials, adapter surfaces, local paths, workspace policy, timeouts, and
-other environment-specific details.
+`coder` and `reviewer` are logical provider bindings supplied by package/operator
+configuration. Runtime/provider config owns credentials, adapter surfaces, local
+paths, workspace policy, timeouts, and other environment-specific details.
 
 ## Implementation Tracker
 
-- [x] Parser accepts top-level and workflow-body `harness name: kind`.
-- [x] Parser accepts optional `agent name using harnessName { ... }`.
+- [x] Parser accepted top-level and workflow-body harness declarations in the
+      implementation-era experiment.
+- [x] Parser accepted optional agent header route bindings in the
+      implementation-era experiment.
 - [x] Formatter preserves harness declarations and agent bindings.
 - [x] IR carries `IrHarness` declarations and `IrAgent.harness`.
 - [x] Compiler validates duplicate harness names.
 - [x] Compiler validates harness kind values.
-- [x] Compiler validates `agent ... using harnessName` references.
+- [x] Compiler validated agent header route references in the
+      implementation-era experiment.
 - [x] Program metadata records harness topology in declared profiles/analysis.
 - [x] Worker/dev dispatch derive provider selection from target agent harness.
-- [x] `--provider` remains a fallback for agents without `using`.
+- [x] `--provider` remains a fallback for agents without explicit source
+      provider bindings.
 - [x] Provider config can bind source harness ids to concrete native surfaces.
 - [x] CLI status/effects/runs JSON surfaces expose harness/provider selection.
 - [x] Docs explain source harness topology vs runtime provider configuration.

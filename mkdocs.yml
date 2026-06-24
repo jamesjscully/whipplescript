@@ -1,0 +1,32 @@
+site_name: WhippleScript
+site_description: Durable coordination language for multi-agent workflows.
+repo_url: https://github.com/jamesjscully/whipplescript
+docs_dir: docs
+site_dir: site
+strict: true
+
+theme:
+  name: readthedocs
+  highlightjs: true
+
+nav:
+  - Home: README.md
+  - Agent Guide: agent-guide.md
+  - Learn:
+      - Quickstart: quickstart.md
+      - Concepts: concepts.md
+      - Tutorial: tutorial.md
+      - Authoring Manual: manual.md
+      - Examples: examples.md
+  - Reference:
+      - Language Reference: language-reference.md
+      - CLI Reference: api-reference.md
+      - JSON Reference: json-reference.md
+      - Rust API Reference: rust-api.md
+      - Runtime & Operations: runtime-operations.md
+      - Providers & Plugins: providers.md
+  - Help:
+      - Install: install.md
+      - Diagnostics Guide: diagnostics.md
+      - Troubleshooting: troubleshooting.md
+      - Current State: current-state.md

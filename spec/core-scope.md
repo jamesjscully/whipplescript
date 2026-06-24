@@ -1,6 +1,11 @@
 # Core Scope
 
-Status: draft
+Status: draft, terminology under revision
+
+Direction note: this file predates the standard-library split proposed in
+[`decision-records/0007-core-standard-libraries-and-providers.md`](decision-records/0007-core-standard-libraries-and-providers.md).
+The current direction is a smaller kernel plus first-party standard libraries
+such as `std.tracker`, `std.coord`, `std.ingress`, and `std.messaging`.
 
 WhippleScript should keep a small core in the Pi style: enough stable machinery to
 compose serious agent systems, without baking every useful integration into the
@@ -21,35 +26,33 @@ durable effect outbox
 agent harness interface
 capability registry
 skill registry
-BAML-backed coerce
-Loft integration
-human review inbox
+typed schema-coercion effects (`coerce` / `decide`) and schema-coercion backend ABI
 artifact/evidence records
-observability/status views
+status views
 ```
 
 These are core because they define the trust boundary, static-analysis target,
 or minimum useful local workflow.
 
-## Plugin By Default
+## Package/Provider By Default
 
-Most domain-specific systems should be plugins:
+Most domain-specific systems should be packages, libraries, or providers:
 
 ```text
 memory systems
-Thoth governance
-GitHub / Linear / Jira integrations
+standard tracker providers (GitHub / Linear / Jira)
 browser automation
 web research
-notification systems
+communication channels and notification systems
 custom dashboards
 specialized evaluators
 repo-specific tools
 ```
 
-Plugins may register capabilities, effects, fact schemas, skills, status
-panels, and artifact renderers. They must not add arbitrary control flow to the
-restricted rule language, and they must not directly mutate instance facts.
+Packages may register library contracts, capabilities, providers, fact schemas,
+skills, status panels, and artifact renderers. They must not add arbitrary
+control flow to the restricted rule language, and providers must not directly
+mutate instance facts.
 
 ## Core Integration Standard
 
@@ -58,9 +61,9 @@ A feature earns core integration only if at least one is true:
 1. The compiler/analyzer must understand it to preserve safety.
 2. The runtime must enforce it to prevent duplicated effects or lost work.
 3. Every practical agent workflow needs it.
-4. It defines a stable substrate other plugins depend on.
+4. It defines a stable substrate other packages/providers depend on.
 
-Everything else should begin as a plugin.
+Everything else should begin as a package/provider.
 
 ## OpenClaw-Lite
 
@@ -72,9 +75,10 @@ should be able to provide:
 skills
 scheduled heartbeat events
 agent harness turns
-memory plugin access
-Loft work claims
-human review
+memory package access
+tracker claims
+typed signals
+messaging channels
 artifact/evidence tracing
 ```
 

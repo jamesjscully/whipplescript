@@ -1,0 +1,396 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whipplescript.dev/schemas/package_contract_v0.schema.json",
+  "title": "WhippleScript Package Contract Artifact v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "package_contract_digest",
+    "package_lock_digest",
+    "platform_version",
+    "manifests",
+    "platform_construct_catalog",
+    "contract_registry",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema": {
+      "const": "whipplescript.package_contract.v0"
+    },
+    "package_contract_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "package_lock_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "platform_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "manifests": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/manifest_summary"
+      }
+    },
+    "platform_construct_catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "families",
+        "lowerings",
+        "scopes",
+        "field_kinds",
+        "interface_kinds",
+        "interface_phases",
+        "interface_cardinalities",
+        "reserved_keywords",
+        "reserved_keyword_privileges"
+      ],
+      "properties": {
+        "schema": {
+          "const": "whipplescript.platform_construct_catalog.v0"
+        },
+        "families": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/platform_construct_family"
+          }
+        },
+        "lowerings": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/platform_construct_lowering"
+          }
+        },
+        "scopes": {
+          "$ref": "#/$defs/string_array"
+        },
+        "field_kinds": {
+          "$ref": "#/$defs/string_array"
+        },
+        "interface_kinds": {
+          "$ref": "#/$defs/string_array"
+        },
+        "interface_phases": {
+          "$ref": "#/$defs/string_array"
+        },
+        "interface_cardinalities": {
+          "$ref": "#/$defs/string_array"
+        },
+        "reserved_keywords": {
+          "$ref": "#/$defs/string_array"
+        },
+        "reserved_keyword_privileges": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/reserved_keyword_privilege"
+          }
+        }
+      }
+    },
+    "contract_registry": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "schema",
+        "libraries",
+        "constructs",
+        "effect_contracts",
+        "diagnostics"
+      ],
+      "properties": {
+        "schema": {
+          "const": "whipplescript.contract_registry.v0"
+        },
+        "libraries": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "constructs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "effect_contracts": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "fixture_outcomes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/fixture_outcome"
+          }
+        },
+        "diagnostics": {
+          "$ref": "#/$defs/diagnostics"
+        }
+      }
+    },
+    "diagnostics": {
+      "$ref": "#/$defs/diagnostics"
+    }
+  },
+  "$defs": {
+    "string_array": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "manifest_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "package_id", "name", "version", "manifest_sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "package_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "platform_construct_family": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "description"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "platform_construct_lowering": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "compatible_families",
+        "package_authorable",
+        "required_scope",
+        "target_capability",
+        "required_interfaces",
+        "provided_interfaces",
+        "lifecycle_profiles",
+        "authority_profile",
+        "static_guarantees"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "compatible_families": {
+          "$ref": "#/$defs/string_array"
+        },
+        "package_authorable": {
+          "type": "boolean"
+        },
+        "required_scope": {
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "target_capability": {
+          "enum": ["forbidden", "required_capability_call_contract"]
+        },
+        "required_interfaces": {
+          "$ref": "#/$defs/string_array"
+        },
+        "provided_interfaces": {
+          "$ref": "#/$defs/string_array"
+        },
+        "lifecycle_profiles": {
+          "$ref": "#/$defs/string_array"
+        },
+        "authority_profile": {
+          "enum": [
+            "none",
+            "capability_scoped",
+            "event_admission",
+            "projection_source"
+          ]
+        },
+        "static_guarantees": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "deterministic",
+              "contract_pinned",
+              "no_runtime_inputs",
+              "no_hidden_authority",
+              "no_package_scheduler",
+              "no_package_lifecycle",
+              "no_direct_fact_write",
+              "no_direct_rule_fire"
+            ]
+          }
+        }
+      }
+    },
+    "reserved_keyword_privilege": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "keyword",
+        "library_id",
+        "construct_family",
+        "scope",
+        "lowering_target"
+      ],
+      "properties": {
+        "keyword": {
+          "type": "string",
+          "minLength": 1
+        },
+        "library_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "construct_family": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1
+        },
+        "lowering_target": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "surface_class": {
+      "enum": [
+        "effect_operation",
+        "agent_turn",
+        "schema_coercion",
+        "claim_operation",
+        "signal_source",
+        "clock_source",
+        "resource_read",
+        "resource_write",
+        "message_send",
+        "memory_recall",
+        "memory_learn",
+        "script_run"
+      ]
+    },
+    "fixture_outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["surface", "surface_class", "outcomes"],
+      "properties": {
+        "surface": {
+          "type": "string",
+          "minLength": 1
+        },
+        "surface_class": {
+          "$ref": "#/$defs/surface_class"
+        },
+        "domain_aliases": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "outcomes": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "$ref": "#/$defs/fixture_outcome_case"
+          }
+        }
+      }
+    },
+    "fixture_outcome_case": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "terminal": {
+          "enum": ["succeeded", "failed", "timed_out", "cancelled"]
+        },
+        "branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "diagnostic": {
+          "type": "string",
+          "minLength": 1
+        },
+        "input_schema": true,
+        "output_schema": true,
+        "projection_changes": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "message"],
+        "properties": {
+          "code": {
+            "type": "string",
+            "minLength": 1
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

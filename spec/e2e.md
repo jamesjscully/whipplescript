@@ -21,15 +21,16 @@ test leaves the abstract lifecycle trace available for debugging.
 The deterministic CLI e2e suite includes `examples/provider-language-e2e.whip`
 and its acceptance fixture. That workflow drives logical `codex`, `claude`,
 and `pi` agents through six table-seeded language-generation tasks, then
-reviews every completed turn with a typed BAML `coerce`. The default run uses
+reviews every completed turn with typed schema coercion. The default run uses
 the fixture worker, so it checks orchestration, dependencies, effect/fact
 projection, assertion reads, trace summaries, provider-run/evidence metadata,
-and BAML argument rehydration without requiring real provider credentials.
+and coerce-backend argument rehydration without requiring real provider
+credentials.
 
 This workflow is also a language-feature regression target. The intended
 source shape is one shared `LanguageTask` schema with a typed
 `AgentRef<codex | claude | pi>` provider field, not one duplicate task class
-per provider. The test should not ask BAML or any language model to decide
+per provider. The test should not ask coerce or any language model to decide
 provider identity, model identity, or route selection.
 
 The deterministic suite also includes the companion-skill acceptance fixture.
@@ -38,7 +39,7 @@ That workflow seeds three phase-review tasks, routes them through typed
 the same visible tracker path, and records
 `CompanionReviewDispatch` facts after successful fixture turns. Source
 assertions prove one dispatch per logical reviewer and three completed
-`agent.tell` effects. The test fails if routing moves into BAML output, prompt
+`agent.tell` effects. The test fails if routing moves into coerce output, prompt
 text inspection, or duplicate provider-specific task schemas.
 
 The provider-language example encodes these assertions in WhippleScript source
@@ -49,13 +50,22 @@ count(LanguageE2EResult where provider == "codex") == 2
 count(LanguageE2EResult where provider == "claude") == 2
 count(LanguageE2EResult where provider == "pi") == 2
 count(agent.turn.completed) == 6
-count(baml.coerce.succeeded) == 6
+count(coerce.succeeded) == 6
 ```
 
-Language/script quality may be reviewed by BAML for local validation, but exact
+`coerce.succeeded` is the current fixture projection for the coerce-backed
+schema-coercion provider. The target semantic projection is
+`schema.coerce.succeeded`.
+
+Language/script quality may be reviewed by a schema-coercion backend for local
+validation, but exact
 script detection can also be tested through a deterministic validator
 capability. E2E coverage should include both paths: model-judged review for
-BAML integration and non-LLM validation for deterministic CI.
+coerce integration and non-LLM validation for deterministic CI. The deterministic
+path is the `exec "<validator>" -> Schema` form: a non-LLM checker emits a typed
+JSON verdict that rules branch on, with no provider access (see
+`examples/deterministic-validation.whip` and the Deterministic validation
+section of `docs/language-reference.md`).
 
 ## Expression Kernel Coverage
 
@@ -91,7 +101,7 @@ The companion-skill validation test authors deterministic routing and validation
 metadata directly in WhippleScript source:
 
 - provider/model identity is represented by literals, enums, or `AgentRef`
-  values supplied by the workflow, not by a BAML classifier or model answer
+  values supplied by the workflow, not by a coerce classifier or model answer
 - provider-language or phase-review tasks are seeded from typed facts with one
   shared task schema; provider-language now uses typed static table rows for
   deterministic fixture data
@@ -100,7 +110,8 @@ metadata directly in WhippleScript source:
   states
 - source assertions check counts, route coverage, and terminal effect states in
   CI; a deterministic validator capability for exact script/fixture properties
-  remains a future integration path, with BAML review kept separate
+  is realized by the `exec "<validator>" -> Schema` path (a non-LLM checker whose
+  typed verdict rules branch on), kept separate from typed schema-coercion review
 - assertions prove that all expected provider/language pairs completed and that
   no duplicate provider-specific task classes were needed
 
@@ -115,7 +126,7 @@ pre-kernel behavior:
 
 - provider-language fixtures with one task class per provider should become a
   shared schema plus guard or `AgentRef` routing
-- Rust-only assertions for provider counts, turn counts, and BAML counts should
+- Rust-only assertions for provider counts, turn counts, and coerce counts should
   move into source assertions where practical, leaving Rust to check CLI exit
   status and JSON shape
 - tests that inspect prompt text to recover route identity should use typed
@@ -132,17 +143,17 @@ Real-provider checks are opt-in:
 ```sh
 WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \
 WHIPPLESCRIPT_LOFT_TEST_ISSUE=iss_... \
-WHIPPLESCRIPT_BAML_TEST_ENDPOINT=http://127.0.0.1:... \
-WHIPPLESCRIPT_BAML_TEST_FUNCTION=classifyMessage \
-WHIPPLESCRIPT_BAML_TEST_ARGUMENTS_JSON='{"title":"Smoke","body":"Check"}' \
-WHIPPLESCRIPT_BAML_TEST_OUTPUT_TYPE=MessageClassification \
+WHIPPLESCRIPT_COERCE_TEST_ENDPOINT=http://127.0.0.1:... \
+WHIPPLESCRIPT_COERCE_TEST_FUNCTION=classifyMessage \
+WHIPPLESCRIPT_COERCE_TEST_ARGUMENTS_JSON='{"title":"Smoke","body":"Check"}' \
+WHIPPLESCRIPT_COERCE_TEST_OUTPUT_TYPE=MessageClassification \
 scripts/check-real-providers.sh
 ```
 
-Set `WHIPPLESCRIPT_REAL_PROVIDERS=loft`, `WHIPPLESCRIPT_REAL_PROVIDERS=baml`, or
+Set `WHIPPLESCRIPT_REAL_PROVIDERS=loft`, `WHIPPLESCRIPT_REAL_PROVIDERS=coerce`, or
 `WHIPPLESCRIPT_REAL_PROVIDERS=codex` to run a selected subset of no-mock smoke
-tests. Comma-separated subsets such as `loft,baml,codex` are accepted. The
-default is `loft,baml`.
+tests. Comma-separated subsets such as `loft,coerce,codex` are accepted. The
+default is `loft,coerce`.
 
 For the smallest real Codex provider smoke check, run:
 
@@ -171,7 +182,7 @@ Optional knobs:
 WHIPPLESCRIPT_LOFT_REPO=/path/to/tracked/loft
 WHIPPLESCRIPT_LOFT_CLI=/path/to/loft-wrapper
 WHIPPLESCRIPT_LOFT_SKIP_REPO_PREFLIGHT=1
-WHIPPLESCRIPT_BAML_HEALTH_PATH=/health
+WHIPPLESCRIPT_COERCE_HEALTH_PATH=/health
 ```
 
 Destructive provider tests are refused unless the target is explicitly marked
@@ -180,7 +191,7 @@ selected providers, or `WHIPPLESCRIPT_CODEX_DESTRUCTIVE_TESTS=1`,
 `WHIPPLESCRIPT_CLAUDE_DESTRUCTIVE_TESTS=1`,
 `WHIPPLESCRIPT_PI_DESTRUCTIVE_TESTS=1`,
 `WHIPPLESCRIPT_LOFT_DESTRUCTIVE_TESTS=1`, or
-`WHIPPLESCRIPT_BAML_DESTRUCTIVE_TESTS=1` for one provider. The matching run must
+`WHIPPLESCRIPT_COERCE_DESTRUCTIVE_TESTS=1` for one provider. The matching run must
 also set either provider-specific disposable marker variables, such as
 `WHIPPLESCRIPT_CODEX_DISPOSABLE_TARGET` and
 `WHIPPLESCRIPT_CODEX_DISPOSABLE_ACK`, or the global
@@ -192,28 +203,19 @@ exactly:
 I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE
 ```
 
-For local validation with only an OpenAI API key, put `OPENAI_API_KEY` in
-`.env` and run:
-
-```sh
-scripts/check-openai-coerce.sh
-```
-
-That starts `scripts/openai-coerce-server.mjs`, a local BAML-compatible bridge
-that serves `/coerce` on `http://127.0.0.1:18765` by default, then runs the same
-real-provider Coerce smoke path against it. The wrapper generates a per-run
-bearer token for `/coerce` unless `WHIPPLESCRIPT_OPENAI_COERCE_TOKEN` is already
-set.
+The earlier local coerce bridge (`scripts/check-openai-coerce.sh` +
+`scripts/openai-coerce-server.mjs`, which served a fictional `/coerce` endpoint)
+has been removed — no real provider implements that shape. The replacement is
+provider-native structured outputs (OpenAI Responses / Anthropic Messages),
+a separate credential-gated build (see `spec/coerce.md`). Until it lands, coerce
+is validated deterministically through `FakeCoerceClient` under the fixture
+provider.
 
 Required tools:
 
 ```text
 loft
-baml-cli or baml
 ```
-
-The OpenAI bridge path sets `WHIPPLESCRIPT_BAML_SKIP_CLI=1`, so it does not require
-`baml-cli` for local validation.
 
 To capture the real-provider smoke result as a local artifact while preserving
 the underlying check exit code, run:
@@ -248,10 +250,10 @@ provider config paths or required live prerequisites then fail the workflow.
 
 The real-provider script verifies prerequisite tools, required environment,
 Loft fixture repo readiness when Loft is selected, including tracked spec
-and fixture files, non-destructive BAML endpoint reachability when BAML is
+and fixture files, non-destructive coerce endpoint reachability when coerce is
 selected, `doctor`, example compilation, a read-only no-mock `loft.show`
-smoke call, a no-mock `baml.coerce` smoke call against the configured endpoint,
-and a one-message Codex smoke when `codex` is selected. Provider-destructive
+smoke call, a no-mock schema-coercion smoke call against the configured
+endpoint, and a one-message Codex smoke when `codex` is selected. Provider-destructive
 flows must pass the disposable-target marker gate before any provider test is
 allowed to run.
 

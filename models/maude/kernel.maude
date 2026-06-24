@@ -3,9 +3,10 @@ mod WHIPPLESCRIPT-KERNEL is
     EffectId FactId RunId EventId RuleId GraphId
     WorkflowId InstanceId PatternId ApplicationId OutputId FailureId InstanceStatus
     ProgramVersion RevisionEpoch CancellationPolicy
-    Predicate EffectStatus ProjectionStatus LeaseStatus GuardResult
+    Predicate EffectStatus TerminalStatus ProjectionStatus LeaseStatus GuardResult
     AssertionId AssertionResult AgentTarget Path Presence Value Domain
-    Scalar QueryId QueryCardinality Expr ExprList Entry EntryList TerminalTag Cfg .
+    Scalar QueryId QueryCardinality Expr ExprList Entry EntryList TerminalTag
+    ActionId CallId LocalBinding HBinding Cfg .
 
   --- Sample identifiers used by hand-written model tests.
   ops e1 e2 e3 : -> EffectId .
@@ -17,7 +18,7 @@ mod WHIPPLESCRIPT-KERNEL is
   ops ruleCommitEvt leaseExpiredEvt : -> EventId .
   ops workflowCompletedEvt workflowFailedEvt : -> EventId .
   op revisionActivatedEvt : -> EventId .
-  ops ralphRule coerceRule : -> RuleId .
+  ops externalEventRule coerceRule : -> RuleId .
   ops guardedRule agentRule : -> RuleId .
   ops rootWorkflow reviewWorkflow : -> WorkflowId .
   ops version1 version2 : -> ProgramVersion .
@@ -26,6 +27,11 @@ mod WHIPPLESCRIPT-KERNEL is
   ops rootInstance childInstance : -> InstanceId .
   op reviewPattern : -> PatternId .
   op phaseReviewApplication : -> ApplicationId .
+  ops runTask loopAct : -> ActionId .
+  ops callOne callTwo callRec : -> CallId .
+  op routeRule : -> RuleId .
+  op turnLocal : -> LocalBinding .
+  op hbind : CallId LocalBinding -> HBinding .
   ops reviewOutput reviewFailure : -> OutputId .
   op blockedFailure : -> FailureId .
   ops g1 g2 g3 : -> GraphId .
@@ -45,11 +51,9 @@ mod WHIPPLESCRIPT-KERNEL is
     blockedByCapacity
     claimed
     running
-    completed
-    failed
-    timedOut
-    cancelled
     : -> EffectStatus .
+  subsort TerminalStatus < EffectStatus .
+  ops completed failed timedOut cancelled : -> TerminalStatus .
 
   --- Projection and lease states.
   ops pending projected : -> ProjectionStatus .
@@ -90,11 +94,11 @@ mod WHIPPLESCRIPT-KERNEL is
   op requestable : EffectId -> Cfg .
   op cancellationRequested : EffectId -> Cfg .
   op cancellationAcknowledged : EffectId -> Cfg .
-  op providerEvidence : EffectId EffectStatus -> Cfg .
+  op providerEvidence : EffectId TerminalStatus -> Cfg .
   op requiredArtifactCaptureFailure : EffectId -> Cfg .
   op correlates : EffectId FactId -> Cfg .
   op projection : EventId FactId ProjectionStatus -> Cfg .
-  op completionProjection : EffectId EffectStatus FactId ProjectionStatus -> Cfg .
+  op completionProjection : EffectId TerminalStatus FactId ProjectionStatus -> Cfg .
   op rule : RuleId FactId GraphId -> Cfg .
   op scopedRule : InstanceId RuleId FactId GraphId -> Cfg .
   op scopedRuleV : InstanceId ProgramVersion RevisionEpoch RuleId FactId GraphId -> Cfg .
@@ -175,6 +179,17 @@ mod WHIPPLESCRIPT-KERNEL is
   op patternApp : PatternId ApplicationId RuleId FactId GraphId -> Cfg .
   op patternElaborated : PatternId ApplicationId RuleId FactId GraphId -> Cfg .
   op ruleProvenance : RuleId PatternId ApplicationId -> Cfg .
+  --- DR-0023 action-block expansion. An action call inlines its effect chain
+  --- into the calling rule body at compile time, the sibling of pattern
+  --- elaboration. acyclic marks an action the compiler proved non-recursive;
+  --- recursive marks one it rejected. boundEffect carries the inlined effect's
+  --- hygienic binding, keyed by call site so two calls never collide.
+  op actionCall : ActionId CallId RuleId -> Cfg .
+  op actionInlined : ActionId CallId RuleId -> Cfg .
+  op boundEffect : CallId HBinding -> Cfg .
+  op actionProvenance : RuleId ActionId CallId -> Cfg .
+  op acyclic : ActionId -> Cfg .
+  op recursive : ActionId -> Cfg .
   op workflowOutput : WorkflowId OutputId -> Cfg .
   op workflowFailure : WorkflowId FailureId -> Cfg .
   op completeWorkflow : InstanceId OutputId FactId -> Cfg .
@@ -200,19 +215,22 @@ mod WHIPPLESCRIPT-KERNEL is
   vars Ev : EventId .
   vars R : RuleId .
   vars G : GraphId .
+  vars Act : ActionId .
+  vars Call : CallId .
+  vars LB : LocalBinding .
   vars A : AssertionId .
   vars T : AgentTarget .
   vars X : Path .
   vars V : Value .
   vars Dm : Domain .
   vars P : Predicate .
-  vars S : EffectStatus .
+  var TS : TerminalStatus .
   vars Sc : Scalar .
   vars Q : QueryId .
   var C : QueryCardinality .
   vars Ex Ex1 Ex2 Ex3 : Expr .
   var EL : ExprList .
-  vars EN EN2 EN3 : Entry .
+  vars EN EN2 EN3 EN4 : Entry .
   var KL : EntryList .
   vars Tag Tag2 : TerminalTag .
   vars Rest Rest2 : Cfg .
@@ -255,7 +273,7 @@ mod WHIPPLESCRIPT-KERNEL is
   eq countEntries(entryCons(EN, entryNil)) = countOne .
   eq countEntries(entryCons(EN, entryCons(EN2, entryNil))) = countTwo .
   eq countEntries(entryCons(EN, entryCons(EN2, entryCons(EN3, entryNil)))) = countThree .
-  eq countEntries(entryCons(EN, entryCons(EN2, entryCons(EN3, entryCons(EN, KL))))) = countMany .
+  eq countEntries(entryCons(EN, entryCons(EN2, entryCons(EN3, entryCons(EN4, KL))))) = countMany .
   eq existsExpr(query(Q, qZero)) = boolFalse .
   eq existsExpr(query(Q, qOne)) = boolTrue .
   eq existsExpr(query(Q, qTwo)) = boolTrue .
@@ -284,10 +302,14 @@ mod WHIPPLESCRIPT-KERNEL is
   eq existsExpr(objectOf(KL)) = notExpr(eqExpr(countEntries(KL), countZero)) .
   eq emptyExpr(query(Q, qZero)) = boolTrue .
   eq emptyExpr(query(Q, qOne)) = boolFalse .
+  eq emptyExpr(query(Q, qTwo)) = boolFalse .
+  eq emptyExpr(query(Q, qThree)) = boolFalse .
   eq emptyExpr(query(Q, qMany)) = boolFalse .
   eq emptyExpr(query(Q, qError)) = exprError .
   eq emptyExpr(queryFilter(Q, boolTrue, qZero)) = boolTrue .
   eq emptyExpr(queryFilter(Q, boolTrue, qOne)) = boolFalse .
+  eq emptyExpr(queryFilter(Q, boolTrue, qTwo)) = boolFalse .
+  eq emptyExpr(queryFilter(Q, boolTrue, qThree)) = boolFalse .
   eq emptyExpr(queryFilter(Q, boolTrue, qMany)) = boolFalse .
   eq emptyExpr(queryFilter(Q, boolTrue, qError)) = exprError .
   eq emptyExpr(queryFilter(Q, boolFalse, C)) = boolTrue .
@@ -314,7 +336,11 @@ mod WHIPPLESCRIPT-KERNEL is
   eq orExpr(boolFalse, Ex) = Ex .
   eq orExpr(exprError, Ex) = exprError .
   eq eqExpr(scalar(Sc), scalar(Sc)) = boolTrue .
+  eq eqExpr(scalar(scalar1), scalar(scalar2)) = boolFalse .
+  eq eqExpr(scalar(scalar2), scalar(scalar1)) = boolFalse .
   eq neExpr(scalar(Sc), scalar(Sc)) = boolFalse .
+  eq neExpr(scalar(scalar1), scalar(scalar2)) = boolTrue .
+  eq neExpr(scalar(scalar2), scalar(scalar1)) = boolTrue .
   eq eqExpr(boolTrue, boolTrue) = boolTrue .
   eq eqExpr(boolTrue, boolFalse) = boolFalse .
   eq eqExpr(boolFalse, boolTrue) = boolFalse .
@@ -550,8 +576,8 @@ mod WHIPPLESCRIPT-KERNEL is
 
   --- Effect completion projection into typed lifecycle/domain facts.
   rl [derive-completion-fact] :
-    effect(E, S) completionProjection(E, S, F, pending)
-    => effect(E, S) completionProjection(E, S, F, projected) fact(F) .
+    effect(E, TS) completionProjection(E, TS, F, pending)
+    => effect(E, TS) completionProjection(E, TS, F, projected) fact(F) .
 
   --- Pattern applications are compile-time source elaboration. The runtime
   --- kernel only sees the generated first-order rule plus provenance; no
@@ -559,6 +585,19 @@ mod WHIPPLESCRIPT-KERNEL is
   rl [elaborate-pattern] :
     patternApp(Pat, App, R, F, G)
     => patternElaborated(Pat, App, R, F, G) rule(R, F, G) ruleProvenance(R, Pat, App) .
+
+  --- Action calls are compile-time inlining, the sibling of pattern
+  --- elaboration. A call inlines only for an action the compiler proved
+  --- acyclic; the inlined effect gets a hygienic binding keyed by its call
+  --- site, so two calls in one rule body cannot collide. The acyclic marker
+  --- is preserved so every call of the same action inlines. No instance,
+  --- event, or provider run happens during inlining.
+  rl [inline-action-call] :
+    acyclic(Act) actionCall(Act, Call, R)
+    => acyclic(Act)
+       actionInlined(Act, Call, R)
+       boundEffect(Call, hbind(Call, turnLocal))
+       actionProvenance(R, Act, Call) .
 
   --- Rules are one-shot rewrites over facts. The graph is committed later by
   --- the kernel; provider execution never happens during rule firing.
@@ -745,8 +784,8 @@ mod WHIPPLESCRIPT-KERNEL is
   rl [fail-run] : effect(E, running) providerRun(E) => effect(E, failed) providerRun(E) .
   rl [timeout-run] : effect(E, running) providerRun(E) => effect(E, timedOut) providerRun(E) .
   rl [recover-provider-terminal] :
-    effect(E, running) providerRun(E) providerEvidence(E, S)
-    => effect(E, S) providerRun(E) providerEvidence(E, S) .
+    effect(E, running) providerRun(E) providerEvidence(E, TS)
+    => effect(E, TS) providerRun(E) providerEvidence(E, TS) .
   rl [required-artifact-capture-failure] :
     effect(E, running) providerRun(E) requiredArtifactCaptureFailure(E)
     => effect(E, failed) providerRun(E) requiredArtifactCaptureFailure(E) .
