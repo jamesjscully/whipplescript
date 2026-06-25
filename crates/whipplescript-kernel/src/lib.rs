@@ -131,12 +131,159 @@ pub fn idempotency_key(parts: &[&str]) -> String {
     format!("key_{:016x}", stable_hash(&input))
 }
 
+/// Identifies the effect a brokered turn settles. The owned harness runner uses
+/// it to open the run, attribute evidence, and key the terminal fact.
+pub struct BrokeredTurnContext<'a> {
+    pub instance_id: &'a str,
+    pub effect_id: &'a str,
+    pub agent: &'a str,
+    pub profile: Option<&'a str>,
+}
+
+/// Evidence kind + shape-only metadata for one in-turn observation. Per DR-0024
+/// these are evidence, never facts (I2): no tool args or results content is
+/// recorded here, only the call shape (tool name, status, step).
+fn brokered_observation_evidence(
+    obs: &crate::harness_loop::LoopObservation,
+) -> (&'static str, Value) {
+    use crate::harness_loop::{LoopObservation, ToolStatus};
+    match obs {
+        LoopObservation::ModelRequest { step } => {
+            ("agent.turn.brokered.model_request", json!({ "step": step }))
+        }
+        LoopObservation::ToolRequested { call_id, name } => (
+            "agent.turn.tool_requested",
+            json!({ "call_id": call_id, "tool": name }),
+        ),
+        LoopObservation::ToolResult {
+            call_id,
+            name,
+            status,
+        } => (
+            "agent.turn.brokered.tool_result",
+            json!({
+                "call_id": call_id,
+                "tool": name,
+                "status": match status { ToolStatus::Ok => "ok", ToolStatus::Error => "error" },
+            }),
+        ),
+    }
+}
+
 impl RuntimeKernel {
     pub fn new(store: SqliteStore) -> Self {
         Self {
             store,
             trace: Vec::new(),
         }
+    }
+
+    /// Run one owned/brokered agent turn (DR-0024 slice 1).
+    ///
+    /// Opens the run, drives the pure brokered loop (the kernel executes every
+    /// requested tool via `executor` — I1), records each in-turn observation as
+    /// EVIDENCE only (I2: no rule-matchable fact), then settles the single
+    /// terminal and derives exactly one `agent.turn.<status>` fact (layer 3) so
+    /// `after <turn> succeeds` matches it just like the delegating harness.
+    pub fn run_brokered_agent_turn<C, E>(
+        &mut self,
+        ctx: &BrokeredTurnContext<'_>,
+        client: &C,
+        executor: &E,
+        input: &crate::harness_loop::BrokeredTurnInput,
+    ) -> StoreResult<StoredEvent>
+    where
+        C: crate::harness_loop::HarnessModelClient + ?Sized,
+        E: crate::harness_loop::ToolExecutor + ?Sized,
+    {
+        use crate::harness_loop::TurnStatus;
+
+        let run_id = idempotency_key(&[ctx.instance_id, ctx.effect_id, "brokered-run"]);
+        let lease_id = idempotency_key(&[ctx.instance_id, ctx.effect_id, "brokered-lease"]);
+        self.start_run(RunStart {
+            instance_id: ctx.instance_id,
+            effect_id: ctx.effect_id,
+            run_id: &run_id,
+            provider: "owned-harness",
+            worker_id: "whip-owned-harness",
+            lease_id: &lease_id,
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: &json!({ "agent": ctx.agent }).to_string(),
+        })?;
+
+        let outcome = crate::harness_loop::run_brokered_loop(client, executor, input);
+
+        // In-turn observations are evidence, never facts (leaf-ness, I2).
+        for (index, obs) in outcome.observations.iter().enumerate() {
+            let (kind, metadata) = brokered_observation_evidence(obs);
+            self.store.record_evidence(EvidenceRecord {
+                instance_id: ctx.instance_id,
+                kind,
+                subject_type: "run",
+                subject_id: &run_id,
+                causation_id: None,
+                correlation_id: None,
+                summary: None,
+                metadata_json: &json!({ "index": index, "observation": metadata }).to_string(),
+            })?;
+        }
+
+        let terminal_key = idempotency_key(&[ctx.instance_id, ctx.effect_id, "terminal"]);
+        let fact_key = idempotency_key(&[ctx.instance_id, ctx.effect_id, "brokered-fact"]);
+        let metadata_json = json!({
+            "steps": outcome.steps,
+            "usage": outcome.usage,
+            "agent": ctx.agent,
+        })
+        .to_string();
+
+        let (status, fact_name) = match outcome.status {
+            TurnStatus::Completed => ("completed", "agent.turn.completed"),
+            TurnStatus::Failed => ("failed", "agent.turn.failed"),
+            TurnStatus::TimedOut => ("timed_out", "agent.turn.timed_out"),
+        };
+
+        let completion = EffectCompletion {
+            instance_id: ctx.instance_id,
+            effect_id: ctx.effect_id,
+            run_id: &run_id,
+            provider: "owned-harness",
+            worker_id: "whip-owned-harness",
+            status,
+            exit_code: Some(if matches!(outcome.status, TurnStatus::Completed) {
+                0
+            } else {
+                1
+            }),
+            summary: Some(&outcome.summary),
+            metadata_json: &metadata_json,
+            idempotency_key: Some(&terminal_key),
+        };
+        let terminal = match outcome.status {
+            TurnStatus::Completed => self.complete_run(completion)?,
+            TurnStatus::Failed => self.fail_run(completion)?,
+            TurnStatus::TimedOut => self.timeout_run(completion)?,
+        };
+
+        // The single terminal fact (layer 3) -- the only fact a brokered turn
+        // derives. Same `agent.turn.<status>` shape the delegating harness emits.
+        self.derive_fact(
+            ctx.instance_id,
+            fact_name,
+            ctx.effect_id,
+            &json!({
+                "effect_id": ctx.effect_id,
+                "run_id": run_id,
+                "status": status,
+                "summary": outcome.summary,
+                "agent": ctx.agent,
+            })
+            .to_string(),
+            Some(&terminal.event_id),
+            Some(&fact_key),
+        )?;
+
+        Ok(terminal)
     }
 
     pub fn into_store(self) -> SqliteStore {
