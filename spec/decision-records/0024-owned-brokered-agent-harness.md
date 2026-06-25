@@ -308,6 +308,10 @@ atomic-turn isolation Roll a turn back cleanly (snapshot / git worktree /
                       whose workspace `lease` binds a worktree and whose `file
                       store` sandbox is scoped to it, committed on the success
                       terminal and discarded on failure. "Leave room to evolve."
+workflows as tools    Let the model invoke curated sub-workflows as typed tools
+                      (the workflow.invoke capability facade), held to a
+                      convergence invariant. Specified in DR-0025; also amends the
+                      slice-2 lease (re-entrant within an invoke subtree).
 ```
 
 ## Development process and slice plan
@@ -349,6 +353,8 @@ slice 1  Brokered loop + file tools (the spine). Model -> tool-use loop; whip
 slice 2  The enforced envelope. counter (budget -> loop terminates) and lease
          (workspace scope) actually bound the loop. Proves the core value prop
          (enforced boundaries) end to end; bite = budget/lease escape must fail.
+         NOTE: the per-turn lease keying is amended by DR-0025 to be re-entrant
+         within an invoke subtree (work-unit-scoped) once workflow-as-tool lands.
 slice 3  bash + sandbox. exec-capability confined bash, unified writable boundary
          (== file-store write region), command classification. Highest risk,
          isolated; bite = sandbox-escape fixtures must fail.

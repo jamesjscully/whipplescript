@@ -96,6 +96,13 @@ others are active workshop material.
   envelope on agent execution instead of advisory metadata. *Accepted (founding
   premise + invariants); durability granularity, governance map, sandbox, and
   lifecycle left open as steps 2–5.*
+- [0025-workflows-as-agent-tools.md](0025-workflows-as-agent-tools.md):
+  expose curated workflows as typed agent tools (the `workflow.invoke` capability
+  facade, synchronous), held to a **convergence invariant** — acyclic invoke-tool
+  graph + self-terminating, signal-free sub-workflows — so the whole agent tree
+  provably converges with non-termination confined to the root `@service` loop.
+  Amends DR-0024 slice 2: the workspace lease becomes re-entrant within an invoke
+  subtree. *Accepted (design); formal convergence model gates implementation.*
 
 ## Historical Decision Trackers
 
