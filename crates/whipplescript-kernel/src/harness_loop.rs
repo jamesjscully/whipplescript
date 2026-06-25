@@ -196,6 +196,10 @@ where
     let mut usage = Value::Null;
 
     for step in 0..input.max_steps {
+        // Compact the projected context before each model call: the durable
+        // observation stream is untouched (the runner records every step); only
+        // what the model re-reads is bounded (DR-0024 boundary corollary).
+        messages = compact_context(messages, COMPACT_MAX_MESSAGES, COMPACT_KEEP_RECENT);
         observations.push(LoopObservation::ModelRequest { step });
         let reply = match client.next(&messages, &input.tools) {
             Ok(reply) => reply,
@@ -259,6 +263,64 @@ where
         observations,
         usage,
     }
+}
+
+/// Compact when the projected context exceeds this many messages.
+const COMPACT_MAX_MESSAGES: usize = 40;
+/// Messages at the tail kept verbatim through compaction (the recent window).
+const COMPACT_KEEP_RECENT: usize = 12;
+
+/// Compact the projected context (DR-0024 boundary corollary, slice 5).
+///
+/// Two-tier eviction: when the context exceeds `max_messages`, older
+/// `ToolResults` are elided to a short reference while the System message, the
+/// first User message, and the last `keep_recent` messages are kept verbatim.
+/// Tool *call* records (the assistant turns) are preserved so the model retains
+/// what it did, only the bulky results are dropped. Idempotent: re-compacting an
+/// already-elided context changes nothing (anti-thrashing). This transforms only
+/// the model's working context; the durable observation stream is unaffected.
+pub fn compact_context(
+    messages: Vec<ChatMessage>,
+    max_messages: usize,
+    keep_recent: usize,
+) -> Vec<ChatMessage> {
+    let len = messages.len();
+    if len <= max_messages {
+        return messages;
+    }
+    let keep_from = len.saturating_sub(keep_recent);
+    messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| {
+            // Anchors: the System message and the first User message (indices 0
+            // and 1 in the loop's construction) and the recent tail survive.
+            let is_anchor = index < 2;
+            let in_recent_window = index >= keep_from;
+            if is_anchor || in_recent_window {
+                return message;
+            }
+            match message {
+                ChatMessage::ToolResults(results) => {
+                    ChatMessage::ToolResults(results.into_iter().map(elide_tool_result).collect())
+                }
+                other => other,
+            }
+        })
+        .collect()
+}
+
+/// Replace a tool result's content with a short reference. Idempotent.
+fn elide_tool_result(result: ToolResultMsg) -> ToolResultMsg {
+    if result.content.starts_with("[elided") {
+        return result;
+    }
+    let content = format!(
+        "[elided: {} result, {} bytes — recoverable from the durable log]",
+        result.tool_name,
+        result.content.len()
+    );
+    ToolResultMsg { content, ..result }
 }
 
 fn model_error_summary(error: &HarnessModelError) -> String {
@@ -531,6 +593,72 @@ mod tests {
         let outcome = run_brokered_loop(&client, &exec, &input(2));
         assert_eq!(outcome.status, TurnStatus::TimedOut);
         assert_eq!(outcome.steps, 2);
+    }
+
+    fn tool_result(tag: &str) -> ChatMessage {
+        ChatMessage::ToolResults(vec![ToolResultMsg {
+            tool_call_id: tag.to_string(),
+            tool_name: "read".to_string(),
+            content: format!("big content for {tag}"),
+            is_error: false,
+        }])
+    }
+
+    #[test]
+    fn compaction_is_a_noop_under_threshold() {
+        let messages = vec![
+            ChatMessage::System("s".into()),
+            ChatMessage::User("u".into()),
+            tool_result("a"),
+        ];
+        let out = compact_context(messages.clone(), 40, 12);
+        assert_eq!(out, messages);
+    }
+
+    #[test]
+    fn compaction_elides_old_tool_results_but_keeps_anchors_and_recent() {
+        let mut messages = vec![
+            ChatMessage::System("s".into()),
+            ChatMessage::User("u".into()),
+        ];
+        for i in 0..30 {
+            messages.push(tool_result(&format!("r{i}")));
+        }
+        let len = messages.len();
+        let out = compact_context(messages, 10, 5);
+        assert_eq!(out.len(), len, "compaction elides content, not messages");
+
+        // System + first User anchors are verbatim.
+        assert_eq!(out[0], ChatMessage::System("s".into()));
+        assert_eq!(out[1], ChatMessage::User("u".into()));
+
+        // A middle (old) tool result is elided to a reference.
+        if let ChatMessage::ToolResults(results) = &out[4] {
+            assert!(results[0].content.starts_with("[elided"));
+        } else {
+            panic!("expected tool results at index 4");
+        }
+
+        // The most recent entry is kept verbatim.
+        if let ChatMessage::ToolResults(results) = out.last().expect("last") {
+            assert!(results[0].content.starts_with("big content"));
+        } else {
+            panic!("expected tool results at the tail");
+        }
+    }
+
+    #[test]
+    fn compaction_is_idempotent_anti_thrashing() {
+        let mut messages = vec![
+            ChatMessage::System("s".into()),
+            ChatMessage::User("u".into()),
+        ];
+        for i in 0..30 {
+            messages.push(tool_result(&format!("r{i}")));
+        }
+        let once = compact_context(messages, 10, 5);
+        let twice = compact_context(once.clone(), 10, 5);
+        assert_eq!(once, twice, "re-compacting an elided context is a no-op");
     }
 
     #[test]

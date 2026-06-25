@@ -98,8 +98,12 @@ Current scope is **experimental**:
 - Envelope: a per-turn model-step budget (`WHIPPLESCRIPT_HARNESS_MAX_STEPS`,
   default 16) bounds the loop, and the turn holds a durable workspace lease for
   the duration (a contended workspace blocks, recoverable, rather than racing).
-- Still later slices: compaction projection and resume-from-crash. (Full OS-level
-  writable-root confinement for `bash` is a refinement over the allow-list.)
+- Context: the model's working context is compacted on long turns (old tool
+  results elided to references, the System message + first instruction + recent
+  window kept verbatim); this touches only what the model re-reads — the durable
+  observation stream is complete and unaffected.
+- Still later slice: resume-from-crash. (Full OS-level writable-root confinement
+  for `bash` is a refinement over the allow-list.)
 
 ```sh
 whip --store .whipplescript/owned.sqlite \
