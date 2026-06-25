@@ -120,6 +120,19 @@ prompts, or raw provider responses.
 Native adapters for Codex, Claude, and Pi are experimental: setup,
 cancellation behavior, artifact capture, and evidence shape may change.
 
+The Codex and Claude adapters are now **optional Cargo features** (`codex`,
+`claude`), on by default. The owned harness is the built-in path; a slimmer
+binary can drop the delegating adapters:
+
+```sh
+# whip without the Codex/Claude delegating adapters
+cargo install --path crates/whipplescript-cli --no-default-features
+```
+
+A workflow that selects `provider codex`/`claude` against a binary built without
+that feature fails the turn with a clear "provider not built into this whip"
+message rather than silently falling back.
+
 | Provider | Surface | Identity | Cancellation | Evidence |
 | --- | --- | --- | --- | --- |
 | Codex | app-server JSON-RPC | thread + turn id | `turn/interrupt` | notifications, tool/approval summaries, diff metadata |
