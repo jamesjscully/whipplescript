@@ -65,6 +65,7 @@ use whipplescript_store::{
 
 mod auth;
 mod coerce_runtime;
+mod harness_tools;
 
 const CORE_EFFECT_LOWERING_CLASS: &str = "core_effect";
 const SCHEDULE_LOWERING_CLASS: &str = "schedule_emitter";
