@@ -35,7 +35,7 @@ agent implementer {
 }
 ```
 
-- `provider` names the family (`codex`, `claude`, `pi`, `fixture`).
+- `provider` names the family (`owned`, `codex`, `claude`, `pi`, `fixture`).
 - `profile` describes authority, such as `repo-reader` or `repo-writer`.
 - `capacity` bounds concurrent turns.
 - `capabilities` lists what the agent may be asked to do.
@@ -48,6 +48,47 @@ fixture provider for a real one changes configuration, not rules.
 For the rare case where one provider family needs several configured
 endpoints, declare named endpoints with `harness` and bind agents with
 `agent ... using harness`; harness configs bind by harness name.
+
+## Owned harness (`provider owned`)
+
+The `codex`/`claude`/`pi` families **delegate** the whole agent turn to a
+provider's own harness; whip captures a redacted summary and cannot truly
+enforce what the turn does. The **owned** harness instead runs the tool-use loop
+itself: the model requests a tool, *whip* executes it, feeds the result back, and
+loops to a single terminal. Because whip is the executor, coordination primitives
+become an *enforced* envelope on the turn rather than advisory metadata. See
+[DR-0024](https://github.com/jamesjscully/whipplescript/blob/main/spec/decision-records/0024-owned-brokered-agent-harness.md)
+for the design.
+
+```whip
+agent helper {
+  provider owned
+  profile "repo-writer"
+  capacity 1
+}
+```
+
+Tool calls inside the turn are recorded as **evidence**, never as
+rule-matchable facts; only the single `agent.turn.<status>` terminal becomes a
+fact, so `when <agent> completed turn` / `after <turn> succeeds` work exactly as
+with the delegating families.
+
+Current scope (slice 1) is **experimental** and intentionally narrow:
+
+- Tools: `read`, `write`, `edit`, `grep`, `find`, `ls`, executed through the
+  `file store` path policy (no absolute/`..` escape). `bash` is not yet wired.
+- Workspace: the turn operates under `WHIPPLESCRIPT_HARNESS_WORKSPACE` (default:
+  the current directory).
+- Model: a deterministic, credential-free **fixture** model client drives the
+  loop today, so `dev`/CI need no credentials
+  (`WHIPPLESCRIPT_OWNED_FIXTURE_TOOL=read:<path>` makes it exercise one tool
+  call). The live provider model client, the budget/lease envelope, `bash`, and
+  resume-from-crash land in later slices.
+
+```sh
+whip --store .whipplescript/owned.sqlite \
+  dev examples/owned-harness-demo.whip --provider owned --until idle
+```
 
 ## Credentials and configuration
 

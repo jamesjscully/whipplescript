@@ -51,6 +51,12 @@ between releases.
 
 ## Experimental
 
+- The owned brokered harness (`provider owned`, DR-0024): whip runs the agent
+  tool-use loop itself and executes each requested file tool, settling to one
+  `agent.turn.<status>` fact. Slice 1 is in place (file tools over the file-store
+  boundary, driven by a deterministic fixture model client); the live provider
+  model client, the budget/lease envelope, `bash`/sandbox, and resume-from-crash
+  are later slices.
 - Native provider adapters (Codex, Claude, Pi) and their cancellation,
   artifact, and recovery behavior — live execution against real provider SDKs is
   credential-gated.
