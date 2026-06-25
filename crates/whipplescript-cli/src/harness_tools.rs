@@ -15,8 +15,11 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 use whipplescript_kernel::harness_loop::{
-    ToolCall, ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
+    BrokeredTurnInput, ChatMessage, HarnessModelClient, HarnessModelError, ModelReply, ToolCall,
+    ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
 };
+use whipplescript_kernel::{BrokeredTurnContext, RuntimeKernel};
+use whipplescript_store::{StoreResult, StoredEvent};
 
 pub const TOOL_READ: &str = "read";
 pub const TOOL_WRITE: &str = "write";
@@ -431,6 +434,107 @@ fn walk(root: &Path, dir: &Path, walked: &mut usize, visit: &mut dyn FnMut(&str)
             }
         }
     }
+}
+
+/// System prompt for the slice-1 owned harness.
+const OWNED_SYSTEM_PROMPT: &str =
+    "You are a coding agent. Use the provided file tools to do the task, then \
+     reply with a short summary and no further tool calls.";
+
+/// Hard safety bound on model steps for slice 1 (the governing budget is slice 2).
+const OWNED_MAX_STEPS: usize = 16;
+
+/// A deterministic, credential-free model client for dev/CI — the owned-harness
+/// analogue of the fixture provider. By default it completes immediately; setting
+/// `WHIPPLESCRIPT_OWNED_FIXTURE_TOOL=<tool>:<path>` makes its first reply issue
+/// one tool call (e.g. `read:README.md`) before completing, so the brokered
+/// loop's tool path is exercised without a live model.
+pub struct FixtureModelClient {
+    tool: Option<(String, String, Value)>,
+}
+
+impl FixtureModelClient {
+    pub fn from_env() -> Self {
+        let tool = std::env::var("WHIPPLESCRIPT_OWNED_FIXTURE_TOOL")
+            .ok()
+            .and_then(|spec| {
+                let (name, path) = spec.split_once(':')?;
+                Some((
+                    "fixture_call_1".to_string(),
+                    name.to_string(),
+                    json!({ "path": path }),
+                ))
+            });
+        Self { tool }
+    }
+}
+
+impl HarnessModelClient for FixtureModelClient {
+    fn next(
+        &self,
+        messages: &[ChatMessage],
+        _tools: &[ToolSpec],
+    ) -> Result<ModelReply, HarnessModelError> {
+        let already_acted = messages
+            .iter()
+            .any(|message| matches!(message, ChatMessage::Assistant { .. }));
+        if let Some((id, name, args)) = &self.tool {
+            if !already_acted {
+                return Ok(ModelReply {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments: args.clone(),
+                    }],
+                    usage: json!({ "output_tokens": 1 }),
+                });
+            }
+        }
+        Ok(ModelReply {
+            text: "owned-harness fixture turn complete".to_string(),
+            tool_calls: Vec::new(),
+            usage: json!({ "output_tokens": 1 }),
+        })
+    }
+}
+
+/// The workspace root a brokered turn operates in: `WHIPPLESCRIPT_HARNESS_WORKSPACE`
+/// if set, else the current directory. The FileToolExecutor's no-escape guard
+/// bounds all tools to this root.
+pub fn owned_workspace_root() -> PathBuf {
+    std::env::var_os("WHIPPLESCRIPT_HARNESS_WORKSPACE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// Run one owned/brokered agent turn (slice 1): file tools over the workspace
+/// root, the deterministic fixture model client, settled to a single terminal
+/// fact. The live provider model client is the credential-gated follow-on.
+#[allow(clippy::too_many_arguments)]
+pub fn run_owned_agent_turn(
+    kernel: &mut RuntimeKernel,
+    instance_id: &str,
+    effect_id: &str,
+    agent: &str,
+    profile: Option<&str>,
+    input_json: &str,
+) -> StoreResult<StoredEvent> {
+    let executor = FileToolExecutor::new(owned_workspace_root());
+    let client = FixtureModelClient::from_env();
+    let input = BrokeredTurnInput {
+        system: OWNED_SYSTEM_PROMPT.to_string(),
+        user: input_json.to_string(),
+        tools: file_tool_specs(),
+        max_steps: OWNED_MAX_STEPS,
+    };
+    let ctx = BrokeredTurnContext {
+        instance_id,
+        effect_id,
+        agent,
+        profile,
+    };
+    kernel.run_brokered_agent_turn(&ctx, &client, &executor, &input)
 }
 
 #[cfg(test)]

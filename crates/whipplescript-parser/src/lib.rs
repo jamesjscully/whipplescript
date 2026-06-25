@@ -5016,7 +5016,7 @@ fn lower_harness(harness: HarnessDecl, ir: &mut IrProgram, diagnostics: &mut Vec
 fn is_supported_harness_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "codex" | "claude" | "pi" | "fixture" | "native-fixture" | "command"
+        "codex" | "claude" | "pi" | "fixture" | "native-fixture" | "command" | "owned"
     )
 }
 
@@ -5090,7 +5090,7 @@ fn lower_agent(
                             agent.name.name, provider.name
                         ),
                         suggestion: Some(
-                            "supported providers are `codex`, `claude`, `pi`, `fixture`, `native-fixture`, and `command`"
+                            "supported providers are `owned`, `codex`, `claude`, `pi`, `fixture`, `native-fixture`, and `command`"
                                 .to_owned(),
                         ),
                     });

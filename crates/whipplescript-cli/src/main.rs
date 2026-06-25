@@ -20894,6 +20894,20 @@ fn run_agent_effect(
             }
         }
     }
+    if provider_selection.kind == "owned" {
+        // Owned brokered harness (DR-0024 slice 1): the kernel drives the model
+        // loop and executes each requested file tool itself, settling to one
+        // agent.turn.<status> fact. Slice 1 uses the deterministic fixture model
+        // client; the live provider client is the credential-gated follow-on.
+        return harness_tools::run_owned_agent_turn(
+            &mut kernel,
+            instance_id,
+            &effect.effect_id,
+            execution.agent,
+            execution.profile,
+            &input_json,
+        );
+    }
     if provider_selection.kind == "native-fixture" {
         let mut adapter = NativeFixtureAdapter::new(
             &provider_selection.provider_id,
@@ -21364,6 +21378,8 @@ fn fallback_provider_kind(provider: &str) -> &'static str {
         "claude"
     } else if is_pi_native_provider(provider) {
         "pi"
+    } else if provider == "owned" || provider == "owned-fixture" {
+        "owned"
     } else {
         "fixture"
     }
