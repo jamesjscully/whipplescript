@@ -6729,9 +6729,7 @@ fn validate_lowered_ir_core_object_kind_and_entrypoint(
         validate_lowered_ir_fact_entrypoint_refs(object, object_id, diagnostics);
     } else if object_kind == "event" {
         validate_lowered_ir_event_entrypoint_refs(object, object_id, diagnostics);
-    } else if object_kind == "signal_source" {
-        validate_lowered_ir_signal_source_entrypoint_refs(object, object_id, diagnostics);
-    } else if object_kind == "clock_source" {
+    } else if object_kind == "signal_source" || object_kind == "clock_source" {
         validate_lowered_ir_signal_source_entrypoint_refs(object, object_id, diagnostics);
     } else if object_kind == "schedule" {
         validate_lowered_ir_schedule_entrypoint_refs(object, object_id, diagnostics);
@@ -29839,6 +29837,7 @@ fn unwrap_optional_type(ty: &IrType) -> Option<&IrType> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_rule(
     instance_id: &str,
     program_version: &str,
@@ -31134,7 +31133,7 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
             let mut head_words = after_export.split_whitespace();
             let format = head_words.next().unwrap_or("jsonl").to_owned();
             let schema = head_words.next().unwrap_or_default().to_owned();
-            let after_to = after_export.splitn(2, " to ").nth(1).unwrap_or("");
+            let after_to = after_export.split_once(" to ").map_or("", |(_, rest)| rest);
             let mut at_split = after_to.splitn(2, " at ");
             let store = at_split.next().unwrap_or("").trim().to_owned();
             let path = at_split
@@ -41476,8 +41475,8 @@ coerce review() -> Review {
             .iter()
             .map(|entry| {
                 (
-                    entry["name"].as_str().unwrap().to_owned(),
-                    entry["package_id"].as_str().unwrap().to_owned(),
+                    entry["name"].as_str().expect("present").to_owned(),
+                    entry["package_id"].as_str().expect("present").to_owned(),
                 )
             })
             .collect::<Vec<_>>();

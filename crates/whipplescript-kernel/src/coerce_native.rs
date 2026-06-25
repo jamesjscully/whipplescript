@@ -691,9 +691,9 @@ mod tests {
         assert_eq!(schema["additionalProperties"], false);
         let required: Vec<&str> = schema["required"]
             .as_array()
-            .unwrap()
+            .expect("present")
             .iter()
-            .map(|v| v.as_str().unwrap())
+            .map(|v| v.as_str().expect("present"))
             .collect();
         // Strict mode: every property is required, including the optional one.
         assert!(required.contains(&"status"));
@@ -703,7 +703,7 @@ mod tests {
         assert!(
             schema["properties"]["score"]["anyOf"]
                 .as_array()
-                .unwrap()
+                .expect("present")
                 .iter()
                 .any(|variant| variant["type"] == "null"),
             "optional field is nullable"
@@ -864,7 +864,8 @@ mod tests {
         };
         let result = parse_response(CoerceProvider::OpenAi, &response, false);
         assert_eq!(result.status, CoerceStatus::Succeeded);
-        let value: Value = serde_json::from_str(result.value_json.as_ref().unwrap()).unwrap();
+        let value: Value =
+            serde_json::from_str(result.value_json.as_ref().expect("present")).expect("present");
         assert_eq!(value["status"], "Accepted");
         assert_eq!(
             result.usage_json,
@@ -894,7 +895,8 @@ mod tests {
         };
         let result = parse_response(CoerceProvider::OpenAi, &response, false);
         assert_eq!(result.status, CoerceStatus::Failed);
-        let error: Value = serde_json::from_str(result.error_json.as_ref().unwrap()).unwrap();
+        let error: Value =
+            serde_json::from_str(result.error_json.as_ref().expect("present")).expect("present");
         assert_eq!(error["provider_error"], "rate limited");
     }
 

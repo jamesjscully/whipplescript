@@ -144,7 +144,10 @@ mod tests {
         let path = temp_path("perms");
         let _ = std::fs::remove_file(&path);
         store_credential(&path, "openai", "sk").expect("store");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        let mode = std::fs::metadata(&path)
+            .expect("present")
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600, "auth config must be owner-only");
         let _ = std::fs::remove_file(&path);
     }

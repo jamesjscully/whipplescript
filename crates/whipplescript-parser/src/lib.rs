@@ -5862,7 +5862,7 @@ fn validate_message_from_channels(
         let Some(channel) = rest.split_whitespace().next() else {
             continue;
         };
-        if !semantic.channels.contains(&channel.to_owned()) {
+        if !semantic.channels.iter().any(|c| c.as_str() == channel) {
             diagnostics.push(Diagnostic {
                 related: Vec::new(),
                 span: when.span,
@@ -5886,7 +5886,6 @@ fn validate_send_channels(
     fn walk(
         statements: &[body::BodyStmt],
         semantic: &SemanticContext,
-        span: SourceSpan,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
         for statement in statements {
@@ -5918,26 +5917,24 @@ fn validate_send_channels(
                         }
                     }
                 }
-                body::BodyStmt::After(after) => walk(&after.body, semantic, span, diagnostics),
+                body::BodyStmt::After(after) => walk(&after.body, semantic, diagnostics),
                 body::BodyStmt::Case(case) => {
                     for branch in &case.branches {
-                        walk(&branch.body, semantic, span, diagnostics);
+                        walk(&branch.body, semantic, diagnostics);
                     }
                 }
                 body::BodyStmt::Branch(branch) => {
-                    walk(&branch.then_body, semantic, span, diagnostics);
+                    walk(&branch.then_body, semantic, diagnostics);
                     if let Some(else_body) = &branch.else_body {
-                        walk(else_body, semantic, span, diagnostics);
+                        walk(else_body, semantic, diagnostics);
                     }
                 }
-                body::BodyStmt::Handler(handler) => {
-                    walk(&handler.body, semantic, span, diagnostics)
-                }
+                body::BodyStmt::Handler(handler) => walk(&handler.body, semantic, diagnostics),
                 _ => {}
             }
         }
     }
-    walk(&ast.statements, semantic, rule.body.span, diagnostics);
+    walk(&ast.statements, semantic, diagnostics);
 }
 
 fn validate_flowfail_generated_only(rule: &RuleDecl, diagnostics: &mut Vec<Diagnostic>) {
@@ -6194,6 +6191,7 @@ fn validate_workflow_terminal_actions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_workflow_terminal_payload(
     rule: &RuleDecl,
     action: &str,
@@ -10359,6 +10357,7 @@ fn decide_field_type_syntax(ty: &str, span: SourceSpan) -> TypeSyntax {
 /// Collects every inline `decide … as <binding>` in a rule body — recursing
 /// through nested after/case/branch/handler blocks — yielding
 /// `(binding, result_fields, span)` for synthesis and type registration.
+#[allow(clippy::type_complexity)]
 fn collect_decide_effects<'a>(
     statements: &'a [body::BodyStmt],
     out: &mut Vec<(&'a str, &'a [(String, String)], SourceSpan)>,
@@ -13981,7 +13980,7 @@ fn format_block_body(body: &str, formatted: &mut String) {
         if opens_triple {
             // Collect the string content up to the closing `"""`.
             let mut end = index + 1;
-            while end < lines.len() && lines[end].matches("\"\"\"").count() % 2 == 0 {
+            while end < lines.len() && lines[end].matches("\"\"\"").count().is_multiple_of(2) {
                 end += 1;
             }
             let content = &lines[index + 1..end];
@@ -15810,9 +15809,7 @@ impl Parser<'_> {
         while matches!(
             self.peek().map(|token| &token.kind),
             Some(TokenKind::Ident(_))
-        ) && self
-            .peek()
-            .map_or(false, |token| token.span.start < line_end)
+        ) && self.peek().is_some_and(|token| token.span.start < line_end)
         {
             match self.parse_dotted_name("stub surface") {
                 Some(segment) => segments.push(segment),

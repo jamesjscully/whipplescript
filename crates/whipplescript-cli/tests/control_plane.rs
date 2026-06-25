@@ -6614,7 +6614,7 @@ test "unsupported stub outcome is invalid" {
     .expect("write workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "test", wf.to_str().unwrap()])
+        .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     // Failures present → non-zero exit.
@@ -6704,7 +6704,7 @@ test "wrong projection count fails" {
     .expect("write workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "test", wf.to_str().unwrap()])
+        .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -6796,7 +6796,7 @@ test "an unseeded path fails the read" {
     .expect("write workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "test", wf.to_str().unwrap()])
+        .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -6893,7 +6893,7 @@ test "injects blocked" {
     .expect("write workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "test", wf.to_str().unwrap()])
+        .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -6967,7 +6967,7 @@ test "gamma passes" {
 "#,
     )
     .expect("write workflow");
-    let path = wf.to_str().unwrap();
+    let path = wf.to_str().expect("present");
 
     let run = |extra: &[&str]| {
         let mut args = vec!["test", path];
@@ -7093,8 +7093,8 @@ test "two fails" {
 "#,
     )
     .expect("write two");
-    let one_path = one.to_str().unwrap();
-    let two_path = two.to_str().unwrap();
+    let one_path = one.to_str().expect("present");
+    let two_path = two.to_str().expect("present");
 
     // Both sources, JSON: three scenarios aggregated, overall failed (exit 1).
     let both = Command::new(bin)
@@ -7133,7 +7133,7 @@ test "two fails" {
     let bad = dir.join("bad.whip");
     fs::write(&bad, "workflow Bad\nrule oops =>\n").expect("write bad");
     let with_bad = Command::new(bin)
-        .args(["test", one_path, bad.to_str().unwrap()])
+        .args(["test", one_path, bad.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     assert_eq!(with_bad.status.code(), Some(2), "compile error → exit 2");
@@ -7196,7 +7196,7 @@ test "{test}" {{
     .expect("write hidden");
 
     let out = Command::new(bin)
-        .args(["--json", "test", dir.to_str().unwrap()])
+        .args(["--json", "test", dir.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     assert_eq!(out.status.code(), Some(0), "discovered scenarios all pass");
@@ -7250,7 +7250,7 @@ rule done_now
 "#,
     )
     .expect("write workflow");
-    let store_str = store.to_str().unwrap();
+    let store_str = store.to_str().expect("present");
 
     let dev = run_json(
         bin,
@@ -7259,7 +7259,7 @@ rule done_now
             store_str,
             "--json",
             "dev",
-            wf.to_str().unwrap(),
+            wf.to_str().expect("present"),
             "--provider",
             "fixture",
             "--until",
@@ -7351,7 +7351,7 @@ test "seeded issue is picked up" {
     .expect("write workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "test", wf.to_str().unwrap()])
+        .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -7446,7 +7446,7 @@ test "clock before the deadline holds it" {
     .expect("write workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "test", wf.to_str().unwrap()])
+        .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -7548,7 +7548,7 @@ test "interval clock holds before the first tick" {
     .expect("write clock workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "test", wf.to_str().unwrap()])
+        .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -7649,7 +7649,7 @@ test "calendar clock holds before the first occurrence" {
     .expect("write calendar clock workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "test", wf.to_str().unwrap()])
+        .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -7729,7 +7729,7 @@ rule run
     .expect("write lint workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "lint", wf.to_str().unwrap()])
+        .args(["--json", "lint", wf.to_str().expect("present")])
         .output()
         .expect("whip lint runs");
     assert!(output.status.success(), "lint should exit 0 on warnings");
@@ -7808,7 +7808,7 @@ rule run
 
     let codes = |path: &std::path::Path| -> Vec<String> {
         let output = Command::new(bin)
-            .args(["--json", "lint", path.to_str().unwrap()])
+            .args(["--json", "lint", path.to_str().expect("present")])
             .output()
             .expect("lint runs");
         let report: Value = serde_json::from_slice(&output.stdout).expect("lint JSON");
@@ -7873,7 +7873,7 @@ rule run
         .expect("dead coerce line") as u64;
 
     let output = Command::new(bin)
-        .args(["--json", "lint", wf.to_str().unwrap()])
+        .args(["--json", "lint", wf.to_str().expect("present")])
         .output()
         .expect("whip lint runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("lint report JSON");
@@ -7958,7 +7958,7 @@ fn lint_flags_deep_after_nesting() {
         let wf = dir.join("deep.whip");
         fs::write(&wf, nest(levels)).expect("write workflow");
         let output = Command::new(bin)
-            .args(["--json", "lint", wf.to_str().unwrap()])
+            .args(["--json", "lint", wf.to_str().expect("present")])
             .output()
             .expect("lint runs");
         let report: Value = serde_json::from_slice(&output.stdout).expect("lint JSON");
@@ -8015,7 +8015,7 @@ rule run
 
     // Directory discovery → a `reports` array with one entry per file.
     let output = Command::new(bin)
-        .args(["--json", "lint", dir.to_str().unwrap()])
+        .args(["--json", "lint", dir.to_str().expect("present")])
         .output()
         .expect("lint runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("lint JSON");
@@ -8027,7 +8027,12 @@ rule run
 
     // A denied finding in any discovered file fails the whole run.
     let denied = Command::new(bin)
-        .args(["lint", "--deny", "lint.unused_class", dir.to_str().unwrap()])
+        .args([
+            "lint",
+            "--deny",
+            "lint.unused_class",
+            dir.to_str().expect("present"),
+        ])
         .output()
         .expect("lint runs");
     assert!(
@@ -8078,7 +8083,7 @@ rule pick
         let wf = dir.join("store.whip");
         fs::write(&wf, program(glob)).expect("write workflow");
         let output = Command::new(bin)
-            .args(["--json", "lint", wf.to_str().unwrap()])
+            .args(["--json", "lint", wf.to_str().expect("present")])
             .output()
             .expect("lint runs");
         let report: Value = serde_json::from_slice(&output.stdout).expect("lint JSON");
@@ -8147,7 +8152,7 @@ rule run
     let codes = |args: &[&str]| -> Vec<String> {
         let mut full = vec!["--json", "lint"];
         full.extend_from_slice(args);
-        full.push(wf.to_str().unwrap());
+        full.push(wf.to_str().expect("present"));
         let output = Command::new(bin).args(&full).output().expect("lint runs");
         let report: Value = serde_json::from_slice(&output.stdout).expect("lint JSON");
         let mut found: Vec<String> = report
@@ -8183,7 +8188,7 @@ fn lint_deny_action_exits_nonzero() {
     let wf = lint_actions_workflow(&dir);
 
     let warn = Command::new(bin)
-        .args(["lint", wf.to_str().unwrap()])
+        .args(["lint", wf.to_str().expect("present")])
         .output()
         .expect("lint runs");
     assert!(
@@ -8192,7 +8197,12 @@ fn lint_deny_action_exits_nonzero() {
     );
 
     let deny = Command::new(bin)
-        .args(["lint", "--deny", "lint.unused_class", wf.to_str().unwrap()])
+        .args([
+            "lint",
+            "--deny",
+            "lint.unused_class",
+            wf.to_str().expect("present"),
+        ])
         .output()
         .expect("lint runs");
     assert!(!deny.status.success(), "a denied finding fails the run");
@@ -8213,7 +8223,7 @@ fn lint_allow_action_suppresses_finding() {
             "lint",
             "--allow",
             "lint.unused_class",
-            wf.to_str().unwrap(),
+            wf.to_str().expect("present"),
         ])
         .output()
         .expect("lint runs");
@@ -8244,13 +8254,18 @@ fn lint_config_file_applies_and_cli_overrides() {
     .expect("write lint config");
 
     let config_deny = Command::new(bin)
-        .args(["lint", wf.to_str().unwrap()])
+        .args(["lint", wf.to_str().expect("present")])
         .output()
         .expect("lint runs");
     assert!(!config_deny.status.success(), "config deny fails the run");
 
     let cli_override = Command::new(bin)
-        .args(["lint", "--allow", "lint.unused_class", wf.to_str().unwrap()])
+        .args([
+            "lint",
+            "--allow",
+            "lint.unused_class",
+            wf.to_str().expect("present"),
+        ])
         .output()
         .expect("lint runs");
     assert!(
@@ -8275,7 +8290,7 @@ fn lint_invalid_config_is_internal_error() {
     .expect("write lint config");
 
     let output = Command::new(bin)
-        .args(["lint", wf.to_str().unwrap()])
+        .args(["lint", wf.to_str().expect("present")])
         .output()
         .expect("lint runs");
     assert!(!output.status.success(), "invalid config fails the run");
@@ -8402,7 +8417,7 @@ rule drain
     .expect("write lint-res workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "lint", wf.to_str().unwrap()])
+        .args(["--json", "lint", wf.to_str().expect("present")])
         .output()
         .expect("whip lint runs");
     assert!(output.status.success(), "lint should exit 0 on warnings");
@@ -8488,7 +8503,7 @@ rule records
     .expect("write lint-noop workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "lint", wf.to_str().unwrap()])
+        .args(["--json", "lint", wf.to_str().expect("present")])
         .output()
         .expect("whip lint runs");
     assert!(output.status.success(), "lint should exit 0 on warnings");
@@ -8567,7 +8582,7 @@ rule r
     .expect("write lint-types workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "lint", wf.to_str().unwrap()])
+        .args(["--json", "lint", wf.to_str().expect("present")])
         .output()
         .expect("whip lint runs");
     assert!(output.status.success(), "lint should exit 0 on warnings");
@@ -9204,7 +9219,7 @@ test "alpha succeeds, beta fails" {
     .expect("write workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "test", wf.to_str().unwrap()])
+        .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -9294,7 +9309,7 @@ test "fails stub blocks completion" {
     .expect("write workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "test", wf.to_str().unwrap()])
+        .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -9415,7 +9430,7 @@ test "dotted matching is exact" {
     .expect("write workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "test", wf.to_str().unwrap()])
+        .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -9529,7 +9544,7 @@ test "successful run records no such diagnostic" {
     .expect("write workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "test", wf.to_str().unwrap()])
+        .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -9641,7 +9656,7 @@ test "one step is not yet complete" {
     .expect("write workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "test", wf.to_str().unwrap()])
+        .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -9751,7 +9766,7 @@ test "expect no agent.tell is false here" {
     .expect("write workflow");
 
     let output = Command::new(bin)
-        .args(["--json", "test", wf.to_str().unwrap()])
+        .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -9894,7 +9909,7 @@ test "input violating the contract is invalid" {
 
     let status_of = |path: &std::path::Path, id: &str| {
         let output = Command::new(bin)
-            .args(["--json", "test", path.to_str().unwrap()])
+            .args(["--json", "test", path.to_str().expect("present")])
             .output()
             .expect("whip test runs");
         let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -9944,7 +9959,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
     let plain = dir.join("plain.whip");
     fs::write(&plain, "workflow Demo\nclass Task {\n  title string\n}\n").expect("write plain");
     let check = Command::new(bin)
-        .args(["fmt", "--check", plain.to_str().unwrap()])
+        .args(["fmt", "--check", plain.to_str().expect("present")])
         .output()
         .expect("fmt --check runs");
     assert!(
@@ -9953,7 +9968,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
     );
 
     let format = Command::new(bin)
-        .args(["fmt", plain.to_str().unwrap()])
+        .args(["fmt", plain.to_str().expect("present")])
         .output()
         .expect("fmt runs");
     assert!(
@@ -9961,7 +9976,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         "fmt should succeed on a comment-free file"
     );
     let recheck = Command::new(bin)
-        .args(["fmt", "--check", plain.to_str().unwrap()])
+        .args(["fmt", "--check", plain.to_str().expect("present")])
         .output()
         .expect("fmt --check runs");
     assert!(
@@ -9978,7 +9993,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         "# keep me\nworkflow Demo2\n\nclass Task {  # header comment\n  title string\n}\n";
     fs::write(&commented, original).expect("write commented");
     let refused = Command::new(bin)
-        .args(["fmt", commented.to_str().unwrap()])
+        .args(["fmt", commented.to_str().expect("present")])
         .output()
         .expect("fmt runs");
     assert!(
@@ -10002,7 +10017,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
     )
     .expect("write top_trailing");
     let top_fmt = Command::new(bin)
-        .args(["fmt", top_trailing.to_str().unwrap()])
+        .args(["fmt", top_trailing.to_str().expect("present")])
         .output()
         .expect("fmt runs");
     assert!(
@@ -10017,7 +10032,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         "top-level trailing comment was dropped"
     );
     let top_recheck = Command::new(bin)
-        .args(["fmt", "--check", top_trailing.to_str().unwrap()])
+        .args(["fmt", "--check", top_trailing.to_str().expect("present")])
         .output()
         .expect("fmt --check runs");
     assert!(
@@ -10034,7 +10049,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
     )
     .expect("write leading");
     let leading_fmt = Command::new(bin)
-        .args(["fmt", leading.to_str().unwrap()])
+        .args(["fmt", leading.to_str().expect("present")])
         .output()
         .expect("fmt runs");
     assert!(
@@ -10048,7 +10063,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         "leading comments were dropped:\n{leading_out}"
     );
     let leading_recheck = Command::new(bin)
-        .args(["fmt", "--check", leading.to_str().unwrap()])
+        .args(["fmt", "--check", leading.to_str().expect("present")])
         .output()
         .expect("fmt --check runs");
     assert!(
@@ -10064,7 +10079,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
     )
     .expect("write body_comment");
     let body_fmt = Command::new(bin)
-        .args(["fmt", body_comment.to_str().unwrap()])
+        .args(["fmt", body_comment.to_str().expect("present")])
         .output()
         .expect("fmt runs");
     assert!(
@@ -10096,7 +10111,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
     );
     fs::write(&class_comment, class_src).expect("write class_comment");
     let class_fmt = Command::new(bin)
-        .args(["fmt", class_comment.to_str().unwrap()])
+        .args(["fmt", class_comment.to_str().expect("present")])
         .output()
         .expect("fmt runs");
     assert!(
@@ -10126,7 +10141,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         );
     }
     let class_recheck = Command::new(bin)
-        .args(["fmt", "--check", class_comment.to_str().unwrap()])
+        .args(["fmt", "--check", class_comment.to_str().expect("present")])
         .output()
         .expect("fmt --check runs");
     assert!(
@@ -10141,7 +10156,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
     let nested_src = "workflow Demo7\nenum E {\n  Data {\n    # the id\n    id string\n    score int  # the score\n  }\n}\n";
     fs::write(&nested, nested_src).expect("write nested_enum");
     let nested_fmt = Command::new(bin)
-        .args(["fmt", nested.to_str().unwrap()])
+        .args(["fmt", nested.to_str().expect("present")])
         .output()
         .expect("fmt runs");
     assert!(
@@ -10155,7 +10170,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         "nested enum-variant comments were dropped:\n{nested_out}"
     );
     let nested_recheck = Command::new(bin)
-        .args(["fmt", "--check", nested.to_str().unwrap()])
+        .args(["fmt", "--check", nested.to_str().expect("present")])
         .output()
         .expect("fmt --check runs");
     assert!(
@@ -10176,7 +10191,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
     );
     fs::write(&multiline, multiline_src).expect("write multiline");
     let format_ml = Command::new(bin)
-        .args(["fmt", multiline.to_str().unwrap()])
+        .args(["fmt", multiline.to_str().expect("present")])
         .output()
         .expect("fmt runs");
     assert!(
@@ -10191,7 +10206,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         "fmt corrupted multi-line string content:\n{formatted_ml}"
     );
     let recheck_ml = Command::new(bin)
-        .args(["fmt", "--check", multiline.to_str().unwrap()])
+        .args(["fmt", "--check", multiline.to_str().expect("present")])
         .output()
         .expect("fmt --check runs");
     assert!(
@@ -10903,9 +10918,9 @@ fn status_surfaces_pending_human_asks_with_answer_command() {
     Command::new(bin)
         .args([
             "--store",
-            store.to_str().unwrap(),
+            store.to_str().expect("present"),
             "dev",
-            example_path("triage-flow.whip").to_str().unwrap(),
+            example_path("triage-flow.whip").to_str().expect("present"),
             "--until",
             "idle",
         ])
@@ -10913,7 +10928,12 @@ fn status_surfaces_pending_human_asks_with_answer_command() {
         .expect("dev runs");
     let instances = run_json(
         bin,
-        &["--store", store.to_str().unwrap(), "--json", "instances"],
+        &[
+            "--store",
+            store.to_str().expect("present"),
+            "--json",
+            "instances",
+        ],
     );
     let instance_id = instances
         .as_array()
@@ -10923,7 +10943,12 @@ fn status_surfaces_pending_human_asks_with_answer_command() {
         .expect("instance id");
 
     let status = Command::new(bin)
-        .args(["--store", store.to_str().unwrap(), "status", instance_id])
+        .args([
+            "--store",
+            store.to_str().expect("present"),
+            "status",
+            instance_id,
+        ])
         .output()
         .expect("status runs");
     let out = String::from_utf8_lossy(&status.stdout);
@@ -10945,9 +10970,9 @@ fn dev_reports_the_final_instance_outcome() {
     let completed = Command::new(bin)
         .args([
             "--store",
-            temp_store_path().to_str().unwrap(),
+            temp_store_path().to_str().expect("present"),
             "dev",
-            example_path("minimal-noop.whip").to_str().unwrap(),
+            example_path("minimal-noop.whip").to_str().expect("present"),
             "--until",
             "idle",
         ])
@@ -10962,9 +10987,9 @@ fn dev_reports_the_final_instance_outcome() {
     let idle = Command::new(bin)
         .args([
             "--store",
-            temp_store_path().to_str().unwrap(),
+            temp_store_path().to_str().expect("present"),
             "dev",
-            example_path("triage-flow.whip").to_str().unwrap(),
+            example_path("triage-flow.whip").to_str().expect("present"),
             "--until",
             "idle",
         ])
