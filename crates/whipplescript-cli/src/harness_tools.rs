@@ -33,6 +33,10 @@ pub const TOOL_EDIT: &str = "edit";
 pub const TOOL_GREP: &str = "grep";
 pub const TOOL_FIND: &str = "find";
 pub const TOOL_LS: &str = "ls";
+pub const TOOL_BASH: &str = "bash";
+
+/// Default wall-clock cap for a single `bash` command, in seconds.
+const BASH_DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Default cap on a single tool's returned content. Full output recovery by event
 /// reference is a later slice; for now we bound what the model sees.
@@ -138,6 +142,21 @@ pub fn file_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
         },
+        ToolSpec {
+            name: TOOL_BASH.into(),
+            description: "Run a shell command in the workspace. Only commands allowed by the \
+                          operator's policy run; others are refused."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "timeout": { "type": "integer", "description": "seconds, optional" }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -148,19 +167,22 @@ pub struct FileToolExecutor {
     store_name: String,
     allow_read: Vec<String>,
     allow_write: Vec<String>,
+    bash_allow: Vec<String>,
     max_bytes: usize,
 }
 
 impl FileToolExecutor {
     /// A workspace-rooted executor. Empty glob lists apply only the
     /// absolute/`..`-escape guard (the basic slice-1 sandbox); the `file store`
-    /// glob policy is a slice-2 refinement.
+    /// glob policy is a slice-2 refinement. `bash` is default-deny: the allow-list
+    /// of command prefixes comes from `WHIPPLESCRIPT_HARNESS_BASH_ALLOW`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
             store_name: "workspace".to_string(),
             allow_read: Vec::new(),
             allow_write: Vec::new(),
+            bash_allow: bash_allow_from_env(),
             max_bytes: DEFAULT_MAX_BYTES,
         }
     }
@@ -189,9 +211,17 @@ impl FileToolExecutor {
         crate::file_path_policy_error(path, &self.store_name, globs, op)
     }
 
+    /// Override the bash allow-list (test/programmatic use).
+    #[allow(dead_code)]
+    pub fn with_bash_allow(mut self, allow: Vec<String>) -> Self {
+        self.bash_allow = allow;
+        self
+    }
+
     fn dispatch(&self, call: &ToolCall) -> Result<String, String> {
         let args = &call.arguments;
         match call.name.as_str() {
+            TOOL_BASH => self.bash(args),
             TOOL_READ => self.read(args),
             TOOL_WRITE => self.write(args),
             TOOL_EDIT => self.edit(args),
@@ -355,6 +385,116 @@ impl FileToolExecutor {
             Ok(bound(&hits.join("\n"), self.max_bytes))
         }
     }
+
+    /// Run a shell command in the workspace. Default-deny: the command must match
+    /// an allow-list prefix or it is refused (the sandbox boundary). Output is
+    /// combined stdout+stderr, truncated; a non-zero exit is an error result.
+    fn bash(&self, args: &Value) -> Result<String, String> {
+        let command = str_arg(args, "command")?;
+        if !self.command_allowed(command) {
+            return Err(format!(
+                "command refused: `{command}` is not permitted by WHIPPLESCRIPT_HARNESS_BASH_ALLOW"
+            ));
+        }
+        let timeout = std::time::Duration::from_secs(
+            args.get("timeout")
+                .and_then(Value::as_u64)
+                .unwrap_or(BASH_DEFAULT_TIMEOUT_SECS),
+        );
+        let output = run_bounded_command(command, &self.root, timeout)?;
+        let combined = bound(&output.combined, self.max_bytes);
+        match output.exit_code {
+            Some(0) => Ok(combined),
+            Some(code) => Err(format!("command exited with status {code}\n{combined}")),
+            None => Err(format!("command terminated by signal\n{combined}")),
+        }
+    }
+
+    /// A command is allowed if it equals an allow-list prefix or begins with one
+    /// followed by whitespace (so `git` permits `git status` but not `gitfoo`).
+    fn command_allowed(&self, command: &str) -> bool {
+        let command = command.trim();
+        self.bash_allow.iter().any(|prefix| {
+            let prefix = prefix.trim();
+            !prefix.is_empty()
+                && (command == prefix
+                    || command
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with(char::is_whitespace)))
+        })
+    }
+}
+
+/// Parse the bash allow-list from `WHIPPLESCRIPT_HARNESS_BASH_ALLOW` (comma- or
+/// newline-separated command prefixes). Unset/empty = deny all (the default).
+fn bash_allow_from_env() -> Vec<String> {
+    std::env::var("WHIPPLESCRIPT_HARNESS_BASH_ALLOW")
+        .ok()
+        .map(|raw| {
+            raw.split([',', '\n'])
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+struct CommandOutput {
+    combined: String,
+    exit_code: Option<i32>,
+}
+
+/// Run `command` via `sh -c` with `cwd = root`, killing it if it exceeds
+/// `timeout`. Returns combined stdout+stderr and the exit code.
+fn run_bounded_command(
+    command: &str,
+    root: &Path,
+    timeout: std::time::Duration,
+) -> Result<CommandOutput, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to spawn command: {error}"))?;
+
+    let start = std::time::Instant::now();
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "command exceeded the {}s timeout",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => return Err(format!("failed to wait on command: {error}")),
+        }
+    };
+
+    let mut combined = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut combined);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut combined);
+    }
+    Ok(CommandOutput {
+        combined,
+        exit_code: exit_status.code(),
+    })
 }
 
 impl ToolExecutor for FileToolExecutor {
@@ -816,6 +956,41 @@ mod tests {
         assert_eq!(l.status, ToolStatus::Ok);
         assert!(l.content.contains("a.rs"));
         assert!(l.content.contains("b.txt"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bash_default_deny_refuses_without_allow_list() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root).with_bash_allow(vec![]);
+        let r = exec.execute(&call(TOOL_BASH, json!({ "command": "echo hi" })));
+        assert_eq!(r.status, ToolStatus::Error);
+        assert!(r.content.contains("refused"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bash_runs_an_allowed_command() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root).with_bash_allow(vec!["echo".into()]);
+        let r = exec.execute(&call(TOOL_BASH, json!({ "command": "echo hello" })));
+        assert_eq!(r.status, ToolStatus::Ok);
+        assert!(r.content.contains("hello"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bash_refuses_command_outside_the_allow_list() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root).with_bash_allow(vec!["echo".into()]);
+        // A dangerous command that does NOT match the `echo` prefix is refused
+        // before any execution.
+        let r = exec.execute(&call(TOOL_BASH, json!({ "command": "rm -rf /" })));
+        assert_eq!(r.status, ToolStatus::Error);
+        assert!(r.content.contains("refused"));
+        // And a near-miss that only shares a prefix substring is also refused.
+        let r2 = exec.execute(&call(TOOL_BASH, json!({ "command": "echofoo bar" })));
+        assert_eq!(r2.status, ToolStatus::Error);
         std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -76,7 +76,11 @@ with the delegating families.
 Current scope (slice 1) is **experimental** and intentionally narrow:
 
 - Tools: `read`, `write`, `edit`, `grep`, `find`, `ls`, executed through the
-  `file store` path policy (no absolute/`..` escape). `bash` is not yet wired.
+  `file store` path policy (no absolute/`..` escape), plus `bash` — **default-deny**:
+  a command runs only if it matches an allow-list prefix in
+  `WHIPPLESCRIPT_HARNESS_BASH_ALLOW` (e.g. `git,cargo,ls`), runs with the
+  workspace as cwd, and is killed past a timeout. With no allow-list, every `bash`
+  command is refused.
 - Workspace: the turn operates under `WHIPPLESCRIPT_HARNESS_WORKSPACE` (default:
   the current directory).
 - Model: set `WHIPPLESCRIPT_HARNESS_PROVIDER` (`openai` or `anthropic`) plus
@@ -89,7 +93,8 @@ Current scope (slice 1) is **experimental** and intentionally narrow:
 - Envelope: a per-turn model-step budget (`WHIPPLESCRIPT_HARNESS_MAX_STEPS`,
   default 16) bounds the loop, and the turn holds a durable workspace lease for
   the duration (a contended workspace blocks, recoverable, rather than racing).
-- Still later slices: `bash`+sandbox, compaction, and resume-from-crash.
+- Still later slices: compaction projection and resume-from-crash. (Full OS-level
+  writable-root confinement for `bash` is a refinement over the allow-list.)
 
 ```sh
 whip --store .whipplescript/owned.sqlite \
