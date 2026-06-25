@@ -18,9 +18,15 @@ use whipplescript_core::{
     CONSTRUCT_LOWERING_METADATA_ONLY, CORE_CAPABILITY_CALL_CONSTRUCT_ID,
     PLATFORM_CONSTRUCT_CATALOG,
 };
+#[cfg(feature = "claude")]
+use whipplescript_kernel::claude_agent_sdk::{
+    ClaudeAgentSdkAdapter, ClaudeAgentSdkClient, StdioClaudeAgentSdkTransport,
+};
+#[cfg(feature = "codex")]
+use whipplescript_kernel::codex_app_server::{
+    CodexAppServerAdapter, CodexAppServerClient, StdioCodexAppServerTransport,
+};
 use whipplescript_kernel::{
-    claude_agent_sdk::{ClaudeAgentSdkAdapter, ClaudeAgentSdkClient, StdioClaudeAgentSdkTransport},
-    codex_app_server::{CodexAppServerAdapter, CodexAppServerClient, StdioCodexAppServerTransport},
     coerce::{CoerceRequest, FakeCoerceClient},
     harness::{CommandAgentHarness, CommandLaunchPlan},
     idempotency_key,
@@ -20924,58 +20930,76 @@ fn run_agent_effect(
         );
     }
     if provider_selection.kind == "codex" {
-        let request = codex_native_turn_request(
-            execution,
-            effect,
-            &input_json,
-            provider_selection.provider_config.as_ref(),
-        )?;
-        let mut adapter = match codex_app_server_adapter(&provider_selection.provider_id) {
-            Ok(healthy_adapter) => healthy_adapter,
-            Err(error) => {
-                return kernel.block_effect_binding(
-                    instance_id,
-                    &effect.effect_id,
-                    "provider_health",
-                    &binding_failure_detail(&error),
-                );
-            }
-        };
-        let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
-        return kernel.run_native_agent_turn_with_metadata(
-            execution,
-            request,
-            &mut adapter,
-            native_provider_max_events(),
-            &metadata_json,
-        );
+        // Codex is an optional provider (DR-0024). When the `codex` feature is not
+        // built, the kind is rejected cleanly rather than silently falling back.
+        #[cfg(feature = "codex")]
+        {
+            let request = codex_native_turn_request(
+                execution,
+                effect,
+                &input_json,
+                provider_selection.provider_config.as_ref(),
+            )?;
+            let mut adapter = match codex_app_server_adapter(&provider_selection.provider_id) {
+                Ok(healthy_adapter) => healthy_adapter,
+                Err(error) => {
+                    return kernel.block_effect_binding(
+                        instance_id,
+                        &effect.effect_id,
+                        "provider_health",
+                        &binding_failure_detail(&error),
+                    );
+                }
+            };
+            let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
+            return kernel.run_native_agent_turn_with_metadata(
+                execution,
+                request,
+                &mut adapter,
+                native_provider_max_events(),
+                &metadata_json,
+            );
+        }
+        #[cfg(not(feature = "codex"))]
+        return Err(StoreError::Conflict(
+            "provider `codex` is not built into this whip (the `codex` feature is disabled)"
+                .to_owned(),
+        ));
     }
     if provider_selection.kind == "claude" {
-        let request = claude_native_turn_request(
-            execution,
-            effect,
-            &input_json,
-            provider_selection.provider_config.as_ref(),
-        )?;
-        let mut adapter = match claude_agent_sdk_adapter(&provider_selection.provider_id) {
-            Ok(healthy_adapter) => healthy_adapter,
-            Err(error) => {
-                return kernel.block_effect_binding(
-                    instance_id,
-                    &effect.effect_id,
-                    "provider_health",
-                    &binding_failure_detail(&error),
-                );
-            }
-        };
-        let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
-        return kernel.run_native_agent_turn_with_metadata(
-            execution,
-            request,
-            &mut adapter,
-            native_provider_max_events(),
-            &metadata_json,
-        );
+        #[cfg(feature = "claude")]
+        {
+            let request = claude_native_turn_request(
+                execution,
+                effect,
+                &input_json,
+                provider_selection.provider_config.as_ref(),
+            )?;
+            let mut adapter = match claude_agent_sdk_adapter(&provider_selection.provider_id) {
+                Ok(healthy_adapter) => healthy_adapter,
+                Err(error) => {
+                    return kernel.block_effect_binding(
+                        instance_id,
+                        &effect.effect_id,
+                        "provider_health",
+                        &binding_failure_detail(&error),
+                    );
+                }
+            };
+            let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
+            return kernel.run_native_agent_turn_with_metadata(
+                execution,
+                request,
+                &mut adapter,
+                native_provider_max_events(),
+                &metadata_json,
+            );
+        }
+        #[cfg(not(feature = "claude"))]
+        return Err(StoreError::Conflict(
+            "provider `claude` is not built into this whip (the `claude` feature is disabled)"
+                .to_owned(),
+        ));
     }
     if provider_selection.kind == "pi" {
         let request = pi_native_turn_request(
@@ -21496,6 +21520,7 @@ fn is_pi_native_provider(provider: &str) -> bool {
     normalized == "pi" || normalized.starts_with("pi-")
 }
 
+#[cfg(feature = "codex")]
 fn codex_app_server_adapter(
     provider: &str,
 ) -> Result<CodexAppServerAdapter<StdioCodexAppServerTransport>, StoreError> {
@@ -21534,6 +21559,7 @@ fn codex_app_server_adapter(
     ))
 }
 
+#[cfg(feature = "codex")]
 fn codex_native_turn_request(
     execution: AgentTurnExecution<'_>,
     effect: &ClaimableEffect,
@@ -21571,6 +21597,7 @@ fn codex_native_turn_request(
     })
 }
 
+#[cfg(feature = "claude")]
 fn claude_agent_sdk_adapter(
     provider: &str,
 ) -> Result<ClaudeAgentSdkAdapter<StdioClaudeAgentSdkTransport>, StoreError> {
@@ -21598,6 +21625,7 @@ fn claude_agent_sdk_adapter(
     ))
 }
 
+#[cfg(feature = "claude")]
 fn claude_native_turn_request(
     execution: AgentTurnExecution<'_>,
     effect: &ClaimableEffect,
@@ -21738,6 +21766,7 @@ fn provider_credential_ref(config: Option<&ProviderBindingConfig>) -> Option<Str
     config.and_then(|config| config.credentials_ref.clone())
 }
 
+#[cfg(any(feature = "codex", feature = "claude"))]
 fn provider_model(config: Option<&ProviderBindingConfig>, env_key: &str, default: &str) -> String {
     config
         .and_then(|config| config.default_model.clone())
@@ -21750,6 +21779,7 @@ fn provider_model(config: Option<&ProviderBindingConfig>, env_key: &str, default
 /// then the `model` configured in `~/.codex/config.toml` (the same source the
 /// codex coerce path reads). Erroring when none resolves keeps the agent-turn
 /// path from silently pinning a model the operator never chose.
+#[cfg(feature = "codex")]
 fn codex_app_server_model(config: Option<&ProviderBindingConfig>) -> Result<String, StoreError> {
     config
         .and_then(|config| config.default_model.clone())
@@ -21763,6 +21793,7 @@ fn codex_app_server_model(config: Option<&ProviderBindingConfig>) -> Result<Stri
         })
 }
 
+#[cfg(any(feature = "codex", feature = "claude"))]
 fn provider_cwd(config: Option<&ProviderBindingConfig>) -> Result<String, StoreError> {
     if let Some(config) = config {
         if let Some(cwd) = optional_extra_string(config, "cwd")? {

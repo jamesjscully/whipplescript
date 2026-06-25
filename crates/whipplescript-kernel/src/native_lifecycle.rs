@@ -172,6 +172,7 @@ pub fn normalize_codex_app_server_event(message: &Value) -> Option<NativeAgentTu
 /// The Codex app-server reports a terminal failure reason under
 /// `params.turn.error.message` (with `codexErrorInfo` as a machine code). This is
 /// a control-plane error string, not model output.
+#[cfg(feature = "codex")]
 fn codex_terminal_error(params: &Value) -> Option<String> {
     params
         .pointer("/turn/error/message")
@@ -180,6 +181,7 @@ fn codex_terminal_error(params: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[cfg(feature = "codex")]
 fn codex_terminal_kind(params: &Value) -> AgentTurnLifecycleKind {
     match params
         .get("status")
