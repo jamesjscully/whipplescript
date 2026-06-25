@@ -55,8 +55,9 @@ between releases.
   tool-use loop itself and executes each requested file tool, settling to one
   `agent.turn.<status>` fact. In place: the file tools over the file-store
   boundary and a live model client (OpenAI/Anthropic, `WHIPPLESCRIPT_HARNESS_*`,
-  with a credential-free fixture fallback for CI). Later slices: the budget/lease
-  enforcement envelope, `bash`/sandbox, compaction, and resume-from-crash.
+  with a credential-free fixture fallback for CI), plus the enforced envelope (a
+  configurable per-turn step budget and a durable workspace lease). Later slices:
+  `bash`/sandbox, compaction, and resume-from-crash.
 - Native provider adapters (Codex, Claude, Pi) and their cancellation,
   artifact, and recovery behavior — live execution against real provider SDKs is
   credential-gated.

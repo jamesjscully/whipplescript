@@ -86,8 +86,10 @@ Current scope (slice 1) is **experimental** and intentionally narrow:
   Unset, a deterministic credential-free **fixture** client drives the loop so
   `dev`/CI need no credentials (`WHIPPLESCRIPT_OWNED_FIXTURE_TOOL=read:<path>`
   makes it exercise one tool call).
-- Still later slices: the budget/lease enforcement envelope, `bash`+sandbox,
-  compaction, and resume-from-crash.
+- Envelope: a per-turn model-step budget (`WHIPPLESCRIPT_HARNESS_MAX_STEPS`,
+  default 16) bounds the loop, and the turn holds a durable workspace lease for
+  the duration (a contended workspace blocks, recoverable, rather than racing).
+- Still later slices: `bash`+sandbox, compaction, and resume-from-crash.
 
 ```sh
 whip --store .whipplescript/owned.sqlite \
