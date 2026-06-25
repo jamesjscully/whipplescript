@@ -73,7 +73,7 @@ rule-matchable facts; only the single `agent.turn.<status>` terminal becomes a
 fact, so `when <agent> completed turn` / `after <turn> succeeds` work exactly as
 with the delegating families.
 
-Current scope (slice 1) is **experimental** and intentionally narrow:
+Current scope is **experimental**:
 
 - Tools: `read`, `write`, `edit`, `grep`, `find`, `ls`, executed through the
   `file store` path policy (no absolute/`..` escape), plus `bash` — **default-deny**:
@@ -81,6 +81,11 @@ Current scope (slice 1) is **experimental** and intentionally narrow:
   `WHIPPLESCRIPT_HARNESS_BASH_ALLOW` (e.g. `git,cargo,ls`), runs with the
   workspace as cwd, and is killed past a timeout. With no allow-list, every `bash`
   command is refused.
+- Tracker tools (`list_todos`/`add_todo`/`update_todo`), offered only when
+  `WHIPPLESCRIPT_HARNESS_TRACKER=<queue>` is set: the agent participates in the
+  durable work tracker (files/updates items the workflow's rules observe).
+  Per the refined I3, these write shared tracker *state*, never rule-matchable
+  facts; `add_todo` items are attributed to the agent (`source: "agent"`).
 - Workspace: the turn operates under `WHIPPLESCRIPT_HARNESS_WORKSPACE` (default:
   the current directory).
 - Model: set `WHIPPLESCRIPT_HARNESS_PROVIDER` (`openai` or `anthropic`) plus

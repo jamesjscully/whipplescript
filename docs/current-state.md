@@ -58,7 +58,9 @@ between releases.
   with a credential-free fixture fallback for CI), the enforced envelope (a
   configurable per-turn step budget and a durable workspace lease), and a
   default-deny `bash` tool (allow-list of command prefixes, workspace cwd,
-  timeout). Later slices: compaction and resume-from-crash.
+  timeout), and capability-gated tracker tools (`list/add/update_todo` over the
+  durable work tracker, refined-I3 shared-state participation). Later slices:
+  compaction and resume-from-crash.
 - Native provider adapters (Codex, Claude, Pi) and their cancellation,
   artifact, and recovery behavior — live execution against real provider SDKs is
   credential-gated.

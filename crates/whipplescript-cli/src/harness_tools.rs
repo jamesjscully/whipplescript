@@ -23,6 +23,7 @@ use whipplescript_kernel::harness_loop::{
 use whipplescript_kernel::harness_model::RealHarnessModelClient;
 use whipplescript_kernel::{BrokeredTurnContext, RuntimeKernel};
 use whipplescript_store::coordination::{AcquireOutcome, CoordinationStore};
+use whipplescript_store::items::WorkItemStore;
 use whipplescript_store::{StoreError, StoreResult, StoredEvent};
 
 use crate::coerce_runtime::{resolve_credential_with_source, UreqCoerceTransport};
@@ -34,9 +35,58 @@ pub const TOOL_GREP: &str = "grep";
 pub const TOOL_FIND: &str = "find";
 pub const TOOL_LS: &str = "ls";
 pub const TOOL_BASH: &str = "bash";
+pub const TOOL_LIST_TODOS: &str = "list_todos";
+pub const TOOL_ADD_TODO: &str = "add_todo";
+pub const TOOL_UPDATE_TODO: &str = "update_todo";
 
 /// Default wall-clock cap for a single `bash` command, in seconds.
 const BASH_DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// The tracker tools (slice 4): the agent participates in durable shared work
+/// state. Offered only when a tracker queue is configured
+/// (`WHIPPLESCRIPT_HARNESS_TRACKER`); facades over the builtin work tracker.
+pub fn tracker_tool_specs() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec {
+            name: TOOL_LIST_TODOS.into(),
+            description: "List work-tracker items (optionally filtered by status).".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+                },
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: TOOL_ADD_TODO.into(),
+            description:
+                "File a new work-tracker item (a durable to-do the workflow can react to).".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string" },
+                    "status": { "type": "string", "enum": ["pending"] }
+                },
+                "required": ["content"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: TOOL_UPDATE_TODO.into(),
+            description: "Change a tracker item's status by id.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+                },
+                "required": ["id", "status"],
+                "additionalProperties": false
+            }),
+        },
+    ]
+}
 
 /// Default cap on a single tool's returned content. Full output recovery by event
 /// reference is a later slice; for now we bound what the model sees.
@@ -168,6 +218,8 @@ pub struct FileToolExecutor {
     allow_read: Vec<String>,
     allow_write: Vec<String>,
     bash_allow: Vec<String>,
+    tracker_queue: Option<String>,
+    holder: String,
     max_bytes: usize,
 }
 
@@ -183,8 +235,19 @@ impl FileToolExecutor {
             allow_read: Vec::new(),
             allow_write: Vec::new(),
             bash_allow: bash_allow_from_env(),
+            tracker_queue: None,
+            holder: "agent".to_string(),
             max_bytes: DEFAULT_MAX_BYTES,
         }
+    }
+
+    /// Enable the tracker tools against a queue, attributing writes to `holder`
+    /// (so `list_todos` can show agent- vs rule-filed items). Without this the
+    /// tracker tools are refused (default-deny).
+    pub fn with_tracker(mut self, queue: impl Into<String>, holder: impl Into<String>) -> Self {
+        self.tracker_queue = Some(queue.into());
+        self.holder = holder.into();
+        self
     }
 
     // Wired to a source-declared `file store` policy in slice 2 (the governance
@@ -221,6 +284,9 @@ impl FileToolExecutor {
     fn dispatch(&self, call: &ToolCall) -> Result<String, String> {
         let args = &call.arguments;
         match call.name.as_str() {
+            TOOL_LIST_TODOS => self.list_todos(args),
+            TOOL_ADD_TODO => self.add_todo(args),
+            TOOL_UPDATE_TODO => self.update_todo(args),
             TOOL_BASH => self.bash(args),
             TOOL_READ => self.read(args),
             TOOL_WRITE => self.write(args),
@@ -422,6 +488,100 @@ impl FileToolExecutor {
                         .strip_prefix(prefix)
                         .is_some_and(|rest| rest.starts_with(char::is_whitespace)))
         })
+    }
+
+    fn tracker(&self) -> Result<(WorkItemStore, String), String> {
+        let queue = self.tracker_queue.clone().ok_or_else(|| {
+            "tracker tools are not enabled for this turn (no tracker configured)".to_string()
+        })?;
+        let store = WorkItemStore::open(crate::items_store_path())
+            .map_err(|error| format!("tracker store: {error:?}"))?;
+        Ok((store, queue))
+    }
+
+    /// File a new tracker item (shared-state participation, refined I3): produces
+    /// durable tracker state the workflow may observe, never a rule-matchable fact.
+    fn add_todo(&self, args: &Value) -> Result<String, String> {
+        let content = str_arg(args, "content")?;
+        let (mut store, queue) = self.tracker()?;
+        let holder = format!("agent:{}", self.holder);
+        let item = store
+            .file_item(&queue, content, "", &[], &json!({}), Some(&holder))
+            .map_err(|error| format!("file_item: {error:?}"))?;
+        Ok(json!({ "id": item.id }).to_string())
+    }
+
+    fn list_todos(&self, args: &Value) -> Result<String, String> {
+        let (store, queue) = self.tracker()?;
+        let status_filter = args
+            .get("status")
+            .and_then(Value::as_str)
+            .map(todo_to_item_status);
+        let items = store
+            .list_items(Some(&queue), status_filter.as_deref())
+            .map_err(|error| format!("list_items: {error:?}"))?;
+        let rows: Vec<Value> = items
+            .iter()
+            .map(|item| {
+                json!({
+                    "id": item.id,
+                    "content": item.title,
+                    "status": item_to_todo_status(&item.status),
+                    "source": if item.filed_by.as_deref().is_some_and(|f| f.starts_with("agent")) {
+                        "agent"
+                    } else {
+                        "rule"
+                    },
+                })
+            })
+            .collect();
+        Ok(Value::Array(rows).to_string())
+    }
+
+    fn update_todo(&self, args: &Value) -> Result<String, String> {
+        let id = str_arg(args, "id")?;
+        let status = str_arg(args, "status")?;
+        let (mut store, _queue) = self.tracker()?;
+        let holder = format!("agent:{}", self.holder);
+        match status {
+            "in_progress" => {
+                store
+                    .claim_item(id, &holder)
+                    .map_err(|error| format!("claim: {error:?}"))?;
+            }
+            "completed" => {
+                store
+                    .finish_item(id, None)
+                    .map_err(|error| format!("finish: {error:?}"))?;
+            }
+            "pending" => {
+                store
+                    .release_item(id)
+                    .map_err(|error| format!("release: {error:?}"))?;
+            }
+            other => return Err(format!("unknown status `{other}`")),
+        }
+        Ok(json!({ "id": id, "status": status }).to_string())
+    }
+}
+
+/// Map a TodoWrite-style status to the builtin tracker's item status.
+fn todo_to_item_status(todo: &str) -> String {
+    match todo {
+        "pending" => "open",
+        "in_progress" => "in_progress",
+        "completed" => "done",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Map a tracker item status back to the TodoWrite-style status.
+fn item_to_todo_status(item: &str) -> &'static str {
+    match item {
+        "in_progress" => "in_progress",
+        "done" | "cancelled" => "completed",
+        _ => "pending",
     }
 }
 
@@ -742,11 +902,20 @@ pub fn run_owned_agent_turn(
     // error never leaks a held lease.
     let model_config = resolve_harness_model_config().map_err(StoreError::Conflict)?;
     let workspace = owned_workspace_root();
-    let executor = FileToolExecutor::new(&workspace);
+    let mut executor = FileToolExecutor::new(&workspace);
+    let mut tools = file_tool_specs();
+    // Tracker tools (slice 4): offered only when a tracker queue is configured.
+    if let Some(queue) = std::env::var("WHIPPLESCRIPT_HARNESS_TRACKER")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        executor = executor.with_tracker(queue, instance_id);
+        tools.extend(tracker_tool_specs());
+    }
     let input = BrokeredTurnInput {
         system: OWNED_SYSTEM_PROMPT.to_string(),
         user: input_json.to_string(),
-        tools: file_tool_specs(),
+        tools,
         max_steps: owned_max_steps(),
     };
     let ctx = BrokeredTurnContext {
@@ -977,6 +1146,29 @@ mod tests {
         assert_eq!(r.status, ToolStatus::Ok);
         assert!(r.content.contains("hello"));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tracker_tools_refused_without_configuration() {
+        // Default-deny: without with_tracker (no WHIPPLESCRIPT_HARNESS_TRACKER),
+        // the tracker tools are refused before touching any store.
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        let r = exec.execute(&call(TOOL_ADD_TODO, json!({ "content": "do a thing" })));
+        assert_eq!(r.status, ToolStatus::Error);
+        assert!(r.content.contains("not enabled"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn todo_status_mapping_round_trips() {
+        assert_eq!(todo_to_item_status("pending"), "open");
+        assert_eq!(todo_to_item_status("in_progress"), "in_progress");
+        assert_eq!(todo_to_item_status("completed"), "done");
+        assert_eq!(item_to_todo_status("open"), "pending");
+        assert_eq!(item_to_todo_status("in_progress"), "in_progress");
+        assert_eq!(item_to_todo_status("done"), "completed");
+        assert_eq!(item_to_todo_status("cancelled"), "completed");
     }
 
     #[test]
