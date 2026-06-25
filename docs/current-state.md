@@ -53,10 +53,10 @@ between releases.
 
 - The owned brokered harness (`provider owned`, DR-0024): whip runs the agent
   tool-use loop itself and executes each requested file tool, settling to one
-  `agent.turn.<status>` fact. Slice 1 is in place (file tools over the file-store
-  boundary, driven by a deterministic fixture model client); the live provider
-  model client, the budget/lease envelope, `bash`/sandbox, and resume-from-crash
-  are later slices.
+  `agent.turn.<status>` fact. In place: the file tools over the file-store
+  boundary and a live model client (OpenAI/Anthropic, `WHIPPLESCRIPT_HARNESS_*`,
+  with a credential-free fixture fallback for CI). Later slices: the budget/lease
+  enforcement envelope, `bash`/sandbox, compaction, and resume-from-crash.
 - Native provider adapters (Codex, Claude, Pi) and their cancellation,
   artifact, and recovery behavior — live execution against real provider SDKs is
   credential-gated.

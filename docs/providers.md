@@ -79,11 +79,15 @@ Current scope (slice 1) is **experimental** and intentionally narrow:
   `file store` path policy (no absolute/`..` escape). `bash` is not yet wired.
 - Workspace: the turn operates under `WHIPPLESCRIPT_HARNESS_WORKSPACE` (default:
   the current directory).
-- Model: a deterministic, credential-free **fixture** model client drives the
-  loop today, so `dev`/CI need no credentials
-  (`WHIPPLESCRIPT_OWNED_FIXTURE_TOOL=read:<path>` makes it exercise one tool
-  call). The live provider model client, the budget/lease envelope, `bash`, and
-  resume-from-crash land in later slices.
+- Model: set `WHIPPLESCRIPT_HARNESS_PROVIDER` (`openai` or `anthropic`) plus
+  `WHIPPLESCRIPT_HARNESS_MODEL` to drive the loop with a **live** model
+  (credentials reused from the coerce resolver: env var → `whip auth` → Codex
+  OAuth; knobs `WHIPPLESCRIPT_HARNESS_BASE_URL` / `_MAX_TOKENS` / `_TIMEOUT_SECS`).
+  Unset, a deterministic credential-free **fixture** client drives the loop so
+  `dev`/CI need no credentials (`WHIPPLESCRIPT_OWNED_FIXTURE_TOOL=read:<path>`
+  makes it exercise one tool call).
+- Still later slices: the budget/lease enforcement envelope, `bash`+sandbox,
+  compaction, and resume-from-crash.
 
 ```sh
 whip --store .whipplescript/owned.sqlite \
