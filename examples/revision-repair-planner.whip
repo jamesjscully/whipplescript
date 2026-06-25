@@ -20,7 +20,7 @@ workflow RevisionRepairPlanner {
   }
 
   agent planner {
-  provider codex
+  provider owned
     profile "repo-writer"
     capacity 1
     skills ["whipplescript-author"]

@@ -7,6 +7,9 @@ queue backlog {
   tracker builtin
 }
 
+# Optional-provider exhibit: this example deliberately binds the Codex and Claude
+# delegating providers (opt-in Cargo features) to show two distinct agent families
+# with different capacities. Most examples use the built-in `owned` harness.
 agent implementer {
   provider codex
   profile "repo-writer"

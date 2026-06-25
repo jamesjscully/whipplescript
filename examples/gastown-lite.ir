@@ -23,8 +23,8 @@ schemas
 queues
   queue backlog tracker=builtin
 agents
-  agent frontend harness=<fallback> provider=codex profile=repo-writer capacity=1 skills=[] capabilities=[]
-  agent backend harness=<fallback> provider=codex profile=repo-writer capacity=1 skills=[] capabilities=[]
+  agent frontend harness=<fallback> provider=owned profile=repo-writer capacity=1 skills=[] capabilities=[]
+  agent backend harness=<fallback> provider=owned profile=repo-writer capacity=1 skills=[] capabilities=[]
 coerces
   coerce reviewPatch(ticketId string, summary string) -> ref<ReviewDecision>
 rules

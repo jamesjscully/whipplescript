@@ -1,6 +1,11 @@
 @service
 workflow IncidentRouter
 
+# Optional-provider exhibit: dynamic routing across the Codex, Claude, and Pi
+# delegating providers (opt-in Cargo features), including `AgentRef<codex | claude
+# | pi>`. Most examples use the built-in `owned` harness; this one showcases
+# binding and routing to distinct agent families.
+
 class Owner {
   name string
 }

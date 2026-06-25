@@ -47,13 +47,13 @@ queue backlog {
 }
 
 agent frontend {
-  provider codex
+  provider owned
   profile "repo-writer"
   capacity 1
 }
 
 agent backend {
-  provider codex
+  provider owned
   profile "repo-writer"
   capacity 1
 }

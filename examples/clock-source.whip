@@ -6,7 +6,7 @@ workflow ClockSource
 # admitted `triage.tick` signal. See spec/std-time.md.
 
 agent triager {
-  provider fixture
+  provider owned
   profile "repo-writer"
   capacity 1
 }

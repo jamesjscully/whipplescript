@@ -6,9 +6,12 @@ exists because it demonstrates a distinct language capability or a useful
 coordination pattern.
 
 Examples tagged `@service` intentionally idle or recur instead of completing.
-All examples below check with no credentials; fixture-backed `dev` runs use the
-deterministic fixture provider. The catalog commands are verified by
-`scripts/check-docs-examples.sh`.
+All examples below check with no credentials. Agent turns use the built-in
+**`owned`** brokered harness by default — whip runs the tool-use loop itself, and
+a credential-free fixture model client drives `dev`/CI. Two examples instead
+exhibit the **optional** delegating providers: `multi-agent-bounded-concurrency`
+(Codex + Claude) and `incident-router` (Codex/Claude/Pi routing). The catalog
+commands are verified by `scripts/check-docs-examples.sh`.
 
 ## Start Here
 
@@ -24,20 +27,21 @@ deterministic fixture provider. The catalog commands are verified by
 | --- | --- | --- |
 | [`coerce-branch.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/coerce-branch.whip) | `whip check examples/coerce-branch.whip` | Named typed model decision with a success fact and human fallback on failure. |
 | [`terminal-output-union.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/terminal-output-union.whip) | `whip check examples/terminal-output-union.whip` | Exhaustive `case` over an effect terminal union: completed, failed, timed out, cancelled. |
-| [`incident-router.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/incident-router.whip) | `whip check examples/incident-router.whip` | Rich guards and dynamic routing: arrays, maps, optionals, `exists`, `in`, assertions, `AgentRef`. |
+| [`incident-router.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/incident-router.whip) | `whip check examples/incident-router.whip` | Rich guards and dynamic routing: arrays, maps, optionals, `exists`, `in`, assertions, `AgentRef`. **Optional-provider exhibit**: routes across Codex/Claude/Pi. |
 | [`scheduled-escalation.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/scheduled-escalation.whip) | `whip check examples/scheduled-escalation.whip` | Time as effects: `timeout`, `timer until`, `cancel`, and terminal-union handling. |
 | [`exec-json-ingest.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/exec-json-ingest.whip) | `whip check examples/exec-json-ingest.whip` | Gated local commands with typed JSON output: `exec -> Type` and `exec -> each Type`. |
 | [`event-bridge.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/event-bridge.whip) | `whip check examples/event-bridge.whip` | External signal ingress (`whip signal`) and directed signal injection: `emit signal ... to <instance>` relays an acknowledgement into a live peer instance, which reacts via typed `when`. A missing target fails the effect with `target instance <id> not found`. |
 | [`reusable-review-pattern.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/reusable-review-pattern.whip) | `whip check examples/reusable-review-pattern.whip` | Compile-time reuse with `pattern` and `apply`; no hidden runtime subroutine. |
 | [`messaging-demo.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/messaging-demo.whip) | `whip check examples/messaging-demo.whip` | `std.messaging`: a `channel`, inbound `when message from <channel>` (binds the generic `Message`), and outbound `send via <channel>`. Inject inbound with `whip message`. |
 | [`file-store-demo.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/file-store-demo.whip) | `whip check examples/file-store-demo.whip` | `std.files`: a `file store` policy boundary with `allow read`/`allow write` globs; durable `write text ... mode upsert` then `read text ... as f` round-trip, completing with `f.content`. |
+| [`owned-harness-demo.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/owned-harness-demo.whip) | `whip check examples/owned-harness-demo.whip` | The built-in **`owned`** brokered harness (DR-0024): whip runs the agent tool-use loop itself; `when <agent> completed turn` settles to the same `agent.turn.<status>` fact as the delegating providers. Run with `--provider owned`. |
 
 ## Coordination Recipes
 
 | Example | Check command | Why it exists |
 | --- | --- | --- |
 | [`queue-worker-with-review.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/queue-worker-with-review.whip) | `whip check examples/queue-worker-with-review.whip` | Canonical work loop: claim queue item, run agent, typed review, finish/release/escalate. |
-| [`multi-agent-bounded-concurrency.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/multi-agent-bounded-concurrency.whip) | `whip check examples/multi-agent-bounded-concurrency.whip` | Two agents with different capacities and a reviewer handoff. |
+| [`multi-agent-bounded-concurrency.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/multi-agent-bounded-concurrency.whip) | `whip check examples/multi-agent-bounded-concurrency.whip` | Two agents with different capacities and a reviewer handoff. **Optional-provider exhibit**: binds Codex + Claude. |
 | [`circuit-breaker.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/circuit-breaker.whip) | `whip check examples/circuit-breaker.whip` | Resilience pattern expressed as facts, a bounded counter, and explicit failure policy. |
 | [`ralph.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/ralph.whip) | `whip check examples/ralph.whip` | Tiny recurring service: agent completion feeds the next turn, guarded by capacity. |
 

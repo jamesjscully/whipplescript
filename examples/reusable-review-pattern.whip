@@ -20,7 +20,7 @@ class ReviewBatch {
 }
 
 agent reviewer {
-  provider fixture
+  provider owned
   profile "repo-reader"
   capacity 1
 }

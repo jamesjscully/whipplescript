@@ -42,7 +42,7 @@ coerce reviewWork(itemTitle string, agentSummary string) -> WorkReview {
 }
 
 agent worker {
-  provider codex
+  provider owned
   profile "repo-writer"
   capacity 1
 }
