@@ -159,6 +159,9 @@ impl FileToolExecutor {
         }
     }
 
+    // Wired to a source-declared `file store` policy in slice 2 (the governance
+    // envelope); slice 1 only exercises it from tests, hence the allow.
+    #[allow(dead_code)]
     pub fn with_policy(
         mut self,
         store_name: impl Into<String>,
@@ -544,13 +547,13 @@ mod tests {
     fn temp_root() -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("clock after epoch")
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
             "whip-harness-tools-{nanos}-{:?}",
             std::thread::current().id()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("create temp root");
         dir
     }
 
