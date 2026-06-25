@@ -273,6 +273,7 @@ step 3  Event-stream + projection contract (reshaped by the boundary corollary;
         policy (which stream events persist in cleartext vs shape-redacted).
         Resume-from-projection (decided above) is the recovery instance of this
         same projection. Only decidable after steps 1-2.
+        Slice-1 concretization -> spec/owned-harness-loop-contract.md
 
 step 4  Governance-capability map + sandbox mechanism (parallelizable once step 3
         lands): which primitive gates which brokered tool (lease = workspace,
