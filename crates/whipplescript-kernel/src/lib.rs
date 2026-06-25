@@ -1,7 +1,9 @@
 //! Deterministic runtime kernel scaffold.
 
 pub mod artifact_manifest;
+#[cfg(feature = "claude")]
 pub mod claude_agent_sdk;
+#[cfg(feature = "codex")]
 pub mod codex_app_server;
 pub mod coerce;
 pub mod coerce_native;
@@ -229,7 +231,6 @@ impl RuntimeKernel {
         }
 
         let terminal_key = idempotency_key(&[ctx.instance_id, ctx.effect_id, "terminal"]);
-        let fact_key = idempotency_key(&[ctx.instance_id, ctx.effect_id, "brokered-fact"]);
         let metadata_json = json!({
             "steps": outcome.steps,
             "usage": outcome.usage,
@@ -266,22 +267,51 @@ impl RuntimeKernel {
         };
 
         // The single terminal fact (layer 3) -- the only fact a brokered turn
-        // derives. Same `agent.turn.<status>` shape the delegating harness emits.
-        self.derive_fact(
-            ctx.instance_id,
-            fact_name,
-            ctx.effect_id,
-            &json!({
-                "effect_id": ctx.effect_id,
-                "run_id": run_id,
-                "status": status,
-                "summary": outcome.summary,
-                "agent": ctx.agent,
-            })
-            .to_string(),
-            Some(&terminal.event_id),
-            Some(&fact_key),
-        )?;
+        // derives. Byte-for-byte the same `agent.turn.<status>` convention the
+        // delegating harness emits (fact keyed by run_id, correlated to the
+        // effect, provenance `effect`) so `after <turn> succeeds` /
+        // `when <agent> completed turn` resolve identically. Mirrors
+        // append_agent_turn_event_and_fact.
+        let fact_payload = json!({
+            "effect_id": ctx.effect_id,
+            "run_id": run_id,
+            "agent": ctx.agent,
+            "provider": "owned-harness",
+            "status": status,
+            "summary": outcome.summary,
+        })
+        .to_string();
+        let fact_id = idempotency_key(&[ctx.instance_id, "agent-turn", &run_id]);
+        let fact_event_key = idempotency_key(&[ctx.instance_id, &run_id, "agent-turn-fact"]);
+        self.store.append_event(NewEvent {
+            instance_id: ctx.instance_id,
+            event_type: fact_name,
+            payload_json: &fact_payload,
+            source: "kernel",
+            causation_id: Some(&run_id),
+            correlation_id: Some(ctx.effect_id),
+            idempotency_key: Some(&idempotency_key(&[
+                ctx.instance_id,
+                &run_id,
+                "agent-turn-event",
+            ])),
+        })?;
+        self.store.derive_fact(DerivedFact {
+            instance_id: ctx.instance_id,
+            fact: NewFact {
+                fact_id: &fact_id,
+                name: fact_name,
+                key: &run_id,
+                value_json: &fact_payload,
+                schema_id: None,
+                provenance_class: "effect",
+                correlation_id: Some(ctx.effect_id),
+                source_span_json: None,
+            },
+            source: "kernel",
+            causation_id: Some(&run_id),
+            idempotency_key: Some(&fact_event_key),
+        })?;
 
         Ok(terminal)
     }

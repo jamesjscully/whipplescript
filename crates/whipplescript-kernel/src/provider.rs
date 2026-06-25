@@ -713,36 +713,42 @@ fn native_boundary_error(
 }
 
 pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
-    vec![
-        ProviderCapability {
-            provider_kind: ProviderKind::Codex,
-            surface: AdapterSurface::CodexAppServer,
-            protocol_version: Some("codex-app-server-local-schema".to_owned()),
-            session_identity_fields: strings(&["thread_id", "turn_id", "item_id"]),
-            stream_event_kinds: strings(&[
-                "turn/started",
-                "turn/completed",
-                "turn/diff/updated",
-                "approval/requested",
-            ]),
-            tool_policy: "codex_approvals".to_owned(),
-            cancellation_depths: vec![CancellationDepth::NativeStop],
-            artifact_manifest: true,
-            health_checks: strings(&["codex_cli", "app_server_schema", "auth_status"]),
-            auth_requirements: strings(&["codex_login_or_openai_api_key"]),
-        },
-        ProviderCapability {
-            provider_kind: ProviderKind::Claude,
-            surface: AdapterSurface::ClaudeAgentSdk,
-            protocol_version: Some("anthropic-agent-sdk".to_owned()),
-            session_identity_fields: strings(&["session_id"]),
-            stream_event_kinds: strings(&["message", "tool_event", "hook_event", "result"]),
-            tool_policy: "claude_tools_permissions_hooks".to_owned(),
-            cancellation_depths: vec![CancellationDepth::CooperativeRequest],
-            artifact_manifest: true,
-            health_checks: strings(&["claude_sdk", "api_key", "tool_policy"]),
-            auth_requirements: strings(&["anthropic_api_key_or_provider_config_ref"]),
-        },
+    // Codex/Claude are optional providers (DR-0024): their capability entries are
+    // present only when the corresponding feature is built. Pi, Fixture, Command,
+    // and the owned harness are always available.
+    let mut caps: Vec<ProviderCapability> = Vec::new();
+    #[cfg(feature = "codex")]
+    caps.push(ProviderCapability {
+        provider_kind: ProviderKind::Codex,
+        surface: AdapterSurface::CodexAppServer,
+        protocol_version: Some("codex-app-server-local-schema".to_owned()),
+        session_identity_fields: strings(&["thread_id", "turn_id", "item_id"]),
+        stream_event_kinds: strings(&[
+            "turn/started",
+            "turn/completed",
+            "turn/diff/updated",
+            "approval/requested",
+        ]),
+        tool_policy: "codex_approvals".to_owned(),
+        cancellation_depths: vec![CancellationDepth::NativeStop],
+        artifact_manifest: true,
+        health_checks: strings(&["codex_cli", "app_server_schema", "auth_status"]),
+        auth_requirements: strings(&["codex_login_or_openai_api_key"]),
+    });
+    #[cfg(feature = "claude")]
+    caps.push(ProviderCapability {
+        provider_kind: ProviderKind::Claude,
+        surface: AdapterSurface::ClaudeAgentSdk,
+        protocol_version: Some("anthropic-agent-sdk".to_owned()),
+        session_identity_fields: strings(&["session_id"]),
+        stream_event_kinds: strings(&["message", "tool_event", "hook_event", "result"]),
+        tool_policy: "claude_tools_permissions_hooks".to_owned(),
+        cancellation_depths: vec![CancellationDepth::CooperativeRequest],
+        artifact_manifest: true,
+        health_checks: strings(&["claude_sdk", "api_key", "tool_policy"]),
+        auth_requirements: strings(&["anthropic_api_key_or_provider_config_ref"]),
+    });
+    caps.extend([
         ProviderCapability {
             provider_kind: ProviderKind::Pi,
             surface: AdapterSurface::PiRpc,
@@ -786,7 +792,8 @@ pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
             health_checks: strings(&["executable"]),
             auth_requirements: Vec::new(),
         },
-    ]
+    ]);
+    caps
 }
 
 pub fn validate_provider_binding(

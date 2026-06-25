@@ -14,6 +14,14 @@ whipplescript-parser = { version = "0.1.0", path = "../whipplescript-parser" }
 whipplescript-store = { version = "0.1.0", path = "../whipplescript-store" }
 serde_json = "1"
 
+[features]
+# The delegating provider adapters are optional (DR-0024): the owned brokered
+# harness is the built-in path; Codex/Claude are opt-in. Default-on preserves
+# current behavior; build with `--no-default-features` to exclude them.
+default = ["codex", "claude"]
+codex = []
+claude = []
+
 [lib]
 path = "src/lib.rs"
 

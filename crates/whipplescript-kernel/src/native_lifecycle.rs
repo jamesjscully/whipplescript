@@ -2,6 +2,7 @@
 
 use serde_json::{json, Value};
 
+#[cfg(feature = "claude")]
 use crate::claude_agent_sdk::ClaudeSidecarEvent;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +135,7 @@ impl NativeAgentTurnObservation {
     }
 }
 
+#[cfg(feature = "codex")]
 pub fn normalize_codex_app_server_event(message: &Value) -> Option<NativeAgentTurnObservation> {
     let method = message.get("method").and_then(Value::as_str)?;
     let params = message.get("params").unwrap_or(&Value::Null);
@@ -192,6 +194,7 @@ fn codex_terminal_kind(params: &Value) -> AgentTurnLifecycleKind {
     }
 }
 
+#[cfg(feature = "claude")]
 pub fn normalize_claude_agent_sdk_event(
     event: &ClaudeSidecarEvent,
 ) -> Option<NativeAgentTurnObservation> {
