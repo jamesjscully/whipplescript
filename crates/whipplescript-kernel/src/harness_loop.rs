@@ -169,6 +169,10 @@ pub struct BrokeredTurnInput {
     /// Hard safety bound on model calls for slice 1. The governing budget
     /// (counter) is slice 2; this just prevents an unbounded loop.
     pub max_steps: usize,
+    /// Resume-from-projection (slice 6): when non-empty, the loop continues from
+    /// this persisted transcript instead of starting fresh from system+user. A
+    /// dangling final tool-call (crash between request and result) is tolerated.
+    pub resume_from: Vec<ChatMessage>,
 }
 
 /// Drive a brokered tool-use loop to a single terminal.
@@ -183,15 +187,26 @@ pub fn run_brokered_loop<C, E>(
     client: &C,
     executor: &E,
     input: &BrokeredTurnInput,
+    checkpoint: &mut dyn FnMut(&[ChatMessage]),
 ) -> BrokeredTurnOutcome
 where
     C: HarnessModelClient + ?Sized,
     E: ToolExecutor + ?Sized,
 {
-    let mut messages = vec![
-        ChatMessage::System(input.system.clone()),
-        ChatMessage::User(input.user.clone()),
-    ];
+    let mut messages = if input.resume_from.is_empty() {
+        vec![
+            ChatMessage::System(input.system.clone()),
+            ChatMessage::User(input.user.clone()),
+        ]
+    } else {
+        // Resume-from-projection: continue from the persisted transcript, dropping
+        // a dangling final tool-call (a crash between request and result) so the
+        // model re-decides rather than the loop deadlocking on an unanswered call.
+        sanitize_resume_messages(input.resume_from.clone())
+    };
+    // Persist the (possibly resumed) starting context so a crash before the first
+    // model call still leaves a transcript to resume from.
+    checkpoint(&messages);
     let mut observations: Vec<LoopObservation> = Vec::new();
     let mut usage = Value::Null;
 
@@ -254,6 +269,9 @@ where
             });
         }
         messages.push(ChatMessage::ToolResults(results));
+        // Persist the transcript after the step so a crash mid-turn leaves a
+        // projection to resume from (DR-0024 resume-from-projection).
+        checkpoint(&messages);
     }
 
     BrokeredTurnOutcome {
@@ -308,6 +326,135 @@ pub fn compact_context(
             }
         })
         .collect()
+}
+
+/// Serialize a transcript to JSON for durable persistence (no serde derive dep).
+pub fn chat_messages_to_json(messages: &[ChatMessage]) -> Value {
+    Value::Array(messages.iter().map(chat_message_to_json).collect())
+}
+
+fn chat_message_to_json(message: &ChatMessage) -> Value {
+    match message {
+        ChatMessage::System(text) => json!({ "role": "system", "text": text }),
+        ChatMessage::User(text) => json!({ "role": "user", "text": text }),
+        ChatMessage::Assistant { text, tool_calls } => json!({
+            "role": "assistant",
+            "text": text,
+            "tool_calls": tool_calls
+                .iter()
+                .map(|call| json!({ "id": call.id, "name": call.name, "arguments": call.arguments }))
+                .collect::<Vec<_>>(),
+        }),
+        ChatMessage::ToolResults(results) => json!({
+            "role": "tool_results",
+            "results": results
+                .iter()
+                .map(|result| json!({
+                    "tool_call_id": result.tool_call_id,
+                    "tool_name": result.tool_name,
+                    "content": result.content,
+                    "is_error": result.is_error,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    }
+}
+
+/// Parse a transcript persisted by [`chat_messages_to_json`]. Unknown shapes are
+/// skipped (best-effort recovery).
+pub fn chat_messages_from_json(value: &Value) -> Vec<ChatMessage> {
+    value
+        .as_array()
+        .map(|items| items.iter().filter_map(chat_message_from_json).collect())
+        .unwrap_or_default()
+}
+
+fn chat_message_from_json(value: &Value) -> Option<ChatMessage> {
+    let text = |v: &Value| {
+        v.get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    match value.get("role").and_then(Value::as_str)? {
+        "system" => Some(ChatMessage::System(text(value))),
+        "user" => Some(ChatMessage::User(text(value))),
+        "assistant" => {
+            let tool_calls = value
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .map(|call| ToolCall {
+                            id: call
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            name: call
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            arguments: call.get("arguments").cloned().unwrap_or(Value::Null),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(ChatMessage::Assistant {
+                text: text(value),
+                tool_calls,
+            })
+        }
+        "tool_results" => {
+            let results = value
+                .get("results")
+                .and_then(Value::as_array)
+                .map(|rows| {
+                    rows.iter()
+                        .map(|row| ToolResultMsg {
+                            tool_call_id: row
+                                .get("tool_call_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            tool_name: row
+                                .get("tool_name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            content: row
+                                .get("content")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            is_error: row
+                                .get("is_error")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(ChatMessage::ToolResults(results))
+        }
+        _ => None,
+    }
+}
+
+/// Prepare a resumed transcript: drop a dangling final assistant tool-call that
+/// has no following results (a crash between request and execution), so the model
+/// re-decides on resume instead of the loop waiting on an unanswered call.
+/// Anti-idempotence makes this safe: a re-issued edit that already applied is
+/// just an informative error.
+fn sanitize_resume_messages(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    if let Some(ChatMessage::Assistant { tool_calls, .. }) = messages.last() {
+        if !tool_calls.is_empty() {
+            messages.pop();
+        }
+    }
+    messages
 }
 
 /// Replace a tool result's content with a short reference. Idempotent.
@@ -442,7 +589,13 @@ mod tests {
                 input_schema: json!({ "type": "object" }),
             }],
             max_steps,
+            resume_from: Vec::new(),
         }
+    }
+
+    /// A no-op checkpoint for tests that do not exercise persistence.
+    fn no_checkpoint() -> impl FnMut(&[ChatMessage]) {
+        |_messages: &[ChatMessage]| {}
     }
 
     #[test]
@@ -452,7 +605,7 @@ mod tests {
             status: ToolStatus::Ok,
             content: String::new(),
         });
-        let outcome = run_brokered_loop(&client, &exec, &input(8));
+        let outcome = run_brokered_loop(&client, &exec, &input(8), &mut no_checkpoint());
         assert_eq!(outcome.status, TurnStatus::Completed);
         assert_eq!(outcome.summary, "done");
         assert_eq!(outcome.steps, 1);
@@ -476,7 +629,7 @@ mod tests {
             status: ToolStatus::Ok,
             content: "hi".to_string(),
         });
-        let outcome = run_brokered_loop(&client, &exec, &input(8));
+        let outcome = run_brokered_loop(&client, &exec, &input(8), &mut no_checkpoint());
 
         assert_eq!(outcome.status, TurnStatus::Completed);
         assert_eq!(outcome.summary, "the readme says hi");
@@ -534,7 +687,7 @@ mod tests {
             status: ToolStatus::Ok,
             content: String::new(),
         });
-        let outcome = run_brokered_loop(&client, &exec, &input(8));
+        let outcome = run_brokered_loop(&client, &exec, &input(8), &mut no_checkpoint());
         assert_eq!(outcome.status, TurnStatus::Completed);
         assert_eq!(exec.calls.borrow().len(), 2);
 
@@ -563,7 +716,7 @@ mod tests {
             status: ToolStatus::Ok,
             content: String::new(),
         });
-        let outcome = run_brokered_loop(&client, &exec, &input(8));
+        let outcome = run_brokered_loop(&client, &exec, &input(8), &mut no_checkpoint());
         assert_eq!(outcome.status, TurnStatus::Failed);
         assert!(outcome.summary.contains("usage limit"));
     }
@@ -575,7 +728,7 @@ mod tests {
             status: ToolStatus::Ok,
             content: String::new(),
         });
-        let outcome = run_brokered_loop(&client, &exec, &input(8));
+        let outcome = run_brokered_loop(&client, &exec, &input(8), &mut no_checkpoint());
         assert_eq!(outcome.status, TurnStatus::TimedOut);
     }
 
@@ -590,7 +743,7 @@ mod tests {
             status: ToolStatus::Ok,
             content: String::new(),
         });
-        let outcome = run_brokered_loop(&client, &exec, &input(2));
+        let outcome = run_brokered_loop(&client, &exec, &input(2), &mut no_checkpoint());
         assert_eq!(outcome.status, TurnStatus::TimedOut);
         assert_eq!(outcome.steps, 2);
     }
@@ -659,6 +812,97 @@ mod tests {
         let once = compact_context(messages, 10, 5);
         let twice = compact_context(once.clone(), 10, 5);
         assert_eq!(once, twice, "re-compacting an elided context is a no-op");
+    }
+
+    #[test]
+    fn resume_continues_from_persisted_transcript_without_rerunning_tools() {
+        let client = ScriptedClient::new(vec![Ok(final_reply("resumed and done"))]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: String::new(),
+        });
+        let mut input = input(8);
+        input.resume_from = vec![
+            ChatMessage::System("s".into()),
+            ChatMessage::User("u".into()),
+            ChatMessage::Assistant {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "1".into(),
+                    name: "read".into(),
+                    arguments: json!({}),
+                }],
+            },
+            ChatMessage::ToolResults(vec![ToolResultMsg {
+                tool_call_id: "1".into(),
+                tool_name: "read".into(),
+                content: "x".into(),
+                is_error: false,
+            }]),
+        ];
+        let outcome = run_brokered_loop(&client, &exec, &input, &mut no_checkpoint());
+        assert_eq!(outcome.status, TurnStatus::Completed);
+        assert_eq!(outcome.summary, "resumed and done");
+        // The already-applied tool is NOT re-run on resume.
+        assert!(exec.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn resume_drops_a_dangling_tool_call() {
+        let messages = vec![
+            ChatMessage::System("s".into()),
+            ChatMessage::Assistant {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "1".into(),
+                    name: "read".into(),
+                    arguments: json!({}),
+                }],
+            },
+        ];
+        let out = sanitize_resume_messages(messages);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], ChatMessage::System(_)));
+    }
+
+    #[test]
+    fn transcript_json_round_trips() {
+        let messages = vec![
+            ChatMessage::System("s".into()),
+            ChatMessage::User("u".into()),
+            ChatMessage::Assistant {
+                text: "t".into(),
+                tool_calls: vec![ToolCall {
+                    id: "1".into(),
+                    name: "read".into(),
+                    arguments: json!({ "path": "a" }),
+                }],
+            },
+            ChatMessage::ToolResults(vec![ToolResultMsg {
+                tool_call_id: "1".into(),
+                tool_name: "read".into(),
+                content: "c".into(),
+                is_error: false,
+            }]),
+        ];
+        let json = chat_messages_to_json(&messages);
+        assert_eq!(chat_messages_from_json(&json), messages);
+    }
+
+    #[test]
+    fn checkpoint_is_invoked_during_the_loop() {
+        let client =
+            ScriptedClient::new(vec![Ok(tool_reply("c1", "read")), Ok(final_reply("done"))]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "r".into(),
+        });
+        let count = std::cell::Cell::new(0usize);
+        let mut checkpoint = |_messages: &[ChatMessage]| count.set(count.get() + 1);
+        let outcome = run_brokered_loop(&client, &exec, &input(8), &mut checkpoint);
+        assert_eq!(outcome.status, TurnStatus::Completed);
+        // Once for the initial context, once after the tool round.
+        assert!(count.get() >= 2, "checkpoint should fire per step");
     }
 
     #[test]

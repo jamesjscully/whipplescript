@@ -214,7 +214,48 @@ impl RuntimeKernel {
             metadata_json: &json!({ "agent": ctx.agent }).to_string(),
         })?;
 
-        let outcome = crate::harness_loop::run_brokered_loop(client, executor, input);
+        // Resume-from-projection (slice 6): if a prior interrupted run left a
+        // persisted transcript for this effect, continue from it; otherwise start
+        // fresh. The loop persists the transcript after each step via `checkpoint`.
+        let resume_from = self.load_brokered_transcript(ctx.instance_id, ctx.effect_id);
+        let resume_input;
+        let run_input: &crate::harness_loop::BrokeredTurnInput = if resume_from.is_empty() {
+            input
+        } else {
+            resume_input = crate::harness_loop::BrokeredTurnInput {
+                resume_from,
+                ..input.clone()
+            };
+            &resume_input
+        };
+        let outcome = {
+            let store = &self.store;
+            let mut step: usize = 0;
+            let mut checkpoint = |messages: &[crate::harness_loop::ChatMessage]| {
+                let key = idempotency_key(&[
+                    ctx.instance_id,
+                    ctx.effect_id,
+                    "transcript",
+                    &step.to_string(),
+                ]);
+                step += 1;
+                let payload = json!({
+                    "effect_id": ctx.effect_id,
+                    "messages": crate::harness_loop::chat_messages_to_json(messages),
+                })
+                .to_string();
+                let _ = store.append_event(NewEvent {
+                    instance_id: ctx.instance_id,
+                    event_type: "agent.turn.brokered.transcript",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: None,
+                    correlation_id: Some(ctx.effect_id),
+                    idempotency_key: Some(&key),
+                });
+            };
+            crate::harness_loop::run_brokered_loop(client, executor, run_input, &mut checkpoint)
+        };
 
         // In-turn observations are evidence, never facts (leaf-ness, I2).
         for (index, obs) in outcome.observations.iter().enumerate() {
@@ -315,6 +356,43 @@ impl RuntimeKernel {
         })?;
 
         Ok(terminal)
+    }
+
+    /// Load the latest persisted brokered-turn transcript for an effect, for
+    /// resume-from-projection. Empty when none was recorded (a fresh turn).
+    fn load_brokered_transcript(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+    ) -> Vec<crate::harness_loop::ChatMessage> {
+        let Ok(events) = self.store.list_events(instance_id) else {
+            return Vec::new();
+        };
+        let latest = events.iter().rev().find(|event| {
+            if event.event_type != "agent.turn.brokered.transcript" {
+                return false;
+            }
+            serde_json::from_str::<Value>(&event.payload_json)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("effect_id")
+                        .and_then(Value::as_str)
+                        .map(|id| id == effect_id)
+                })
+                .unwrap_or(false)
+        });
+        match latest {
+            Some(event) => serde_json::from_str::<Value>(&event.payload_json)
+                .ok()
+                .map(|payload| {
+                    crate::harness_loop::chat_messages_from_json(
+                        payload.get("messages").unwrap_or(&Value::Null),
+                    )
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
     }
 
     pub fn into_store(self) -> SqliteStore {

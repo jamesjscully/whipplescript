@@ -102,8 +102,12 @@ Current scope is **experimental**:
   results elided to references, the System message + first instruction + recent
   window kept verbatim); this touches only what the model re-reads — the durable
   observation stream is complete and unaffected.
-- Still later slice: resume-from-crash. (Full OS-level writable-root confinement
-  for `bash` is a refinement over the allow-list.)
+- Crash recovery: the turn transcript is persisted after each step; if a turn is
+  interrupted, a later worker pass resumes it from that projection (a dangling
+  final tool-call is dropped so the model re-decides) rather than re-running from
+  scratch.
+- Refinement still open: full OS-level writable-root confinement for `bash` (the
+  allow-list is the current boundary).
 
 ```sh
 whip --store .whipplescript/owned.sqlite \

@@ -917,6 +917,9 @@ pub fn run_owned_agent_turn(
         user: input_json.to_string(),
         tools,
         max_steps: owned_max_steps(),
+        // The runner populates resume_from from any persisted transcript on
+        // crash recovery (slice 6); a fresh turn starts empty.
+        resume_from: Vec::new(),
     };
     let ctx = BrokeredTurnContext {
         instance_id,
