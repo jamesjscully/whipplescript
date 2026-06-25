@@ -4362,6 +4362,91 @@ fn dev_openclaw_lite_observes_heartbeat_and_files_work() {
 }
 
 #[test]
+fn dev_owned_harness_completes_turn_with_leaf_invariants() {
+    // DR-0024 slice 1: `--provider owned` drives the brokered tool-use loop. The
+    // turn must settle to exactly one `agent.turn.completed` fact (single
+    // terminal), the in-turn observations must be EVIDENCE only (leaf-ness, I2),
+    // and the `finish` rule must fire off the turn fact (drop-in compatibility).
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let example = example_path("owned-harness-demo.whip");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            example.to_str().expect("utf-8 example path"),
+            "--provider",
+            "owned",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+    let fact_names: Vec<&str> = facts
+        .iter()
+        .filter_map(|fact| fact.get("name").and_then(Value::as_str))
+        .collect();
+    // Exactly one terminal turn fact (single terminal, layer 3).
+    assert_eq!(
+        fact_names
+            .iter()
+            .filter(|name| **name == "agent.turn.completed")
+            .count(),
+        1
+    );
+    // Leaf-ness (I2): no interior observation ever became a rule-matchable fact.
+    assert!(
+        !fact_names
+            .iter()
+            .any(|name| name.contains("brokered") || *name == "agent.turn.tool_requested"),
+        "interior observation leaked into a fact: {fact_names:?}"
+    );
+
+    // The interior observations are recorded as evidence instead.
+    let evidence = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "evidence",
+            instance_id,
+        ],
+    );
+    let evidence = evidence
+        .get("evidence")
+        .and_then(Value::as_array)
+        .expect("evidence array");
+    assert!(
+        evidence
+            .iter()
+            .any(|item| item.get("kind").and_then(Value::as_str)
+                == Some("agent.turn.brokered.model_request")),
+        "expected a model_request evidence row"
+    );
+
+    let _ = fs::remove_file(store_path);
+}
+
+#[test]
 fn dev_native_fixture_records_provider_lifecycle_and_artifacts_from_source_workflow() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
