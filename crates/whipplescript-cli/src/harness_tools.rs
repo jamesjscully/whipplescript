@@ -22,6 +22,7 @@ use whipplescript_kernel::harness_loop::{
 };
 use whipplescript_kernel::harness_model::RealHarnessModelClient;
 use whipplescript_kernel::{BrokeredTurnContext, RuntimeKernel};
+use whipplescript_store::coordination::{AcquireOutcome, CoordinationStore};
 use whipplescript_store::{StoreError, StoreResult, StoredEvent};
 
 use crate::coerce_runtime::{resolve_credential_with_source, UreqCoerceTransport};
@@ -449,8 +450,12 @@ const OWNED_SYSTEM_PROMPT: &str =
     "You are a coding agent. Use the provided file tools to do the task, then \
      reply with a short summary and no further tool calls.";
 
-/// Hard safety bound on model steps for slice 1 (the governing budget is slice 2).
+/// Default per-turn model-step budget (overridable via WHIPPLESCRIPT_HARNESS_MAX_STEPS).
 const OWNED_MAX_STEPS: usize = 16;
+
+/// TTL for the per-turn workspace lease, in seconds. Long enough for a turn;
+/// expiry reclaims the workspace if a worker dies mid-turn.
+const OWNED_LEASE_TTL_SECONDS: i64 = 1800;
 
 /// A deterministic, credential-free model client for dev/CI — the owned-harness
 /// analogue of the fixture provider. By default it completes immediately; setting
@@ -540,9 +545,11 @@ fn resolve_harness_model_config() -> Result<Option<HarnessModelConfig>, String> 
     let provider = match provider_name.as_str() {
         "openai" => CoerceProvider::OpenAi,
         "anthropic" => CoerceProvider::Anthropic,
-        other => return Err(format!(
+        other => {
+            return Err(format!(
             "unknown WHIPPLESCRIPT_HARNESS_PROVIDER `{other}` (expected `openai` or `anthropic`)"
-        )),
+        ))
+        }
     };
     let (api_key, _source) = resolve_credential_with_source(provider).ok_or_else(|| {
         format!("WHIPPLESCRIPT_HARNESS_PROVIDER={provider_name} is set but no credential resolved")
@@ -591,12 +598,16 @@ pub fn run_owned_agent_turn(
     profile: Option<&str>,
     input_json: &str,
 ) -> StoreResult<StoredEvent> {
-    let executor = FileToolExecutor::new(owned_workspace_root());
+    // Resolve the model client before taking the workspace lease, so a config
+    // error never leaks a held lease.
+    let model_config = resolve_harness_model_config().map_err(StoreError::Conflict)?;
+    let workspace = owned_workspace_root();
+    let executor = FileToolExecutor::new(&workspace);
     let input = BrokeredTurnInput {
         system: OWNED_SYSTEM_PROMPT.to_string(),
         user: input_json.to_string(),
         tools: file_tool_specs(),
-        max_steps: OWNED_MAX_STEPS,
+        max_steps: owned_max_steps(),
     };
     let ctx = BrokeredTurnContext {
         instance_id,
@@ -604,7 +615,27 @@ pub fn run_owned_agent_turn(
         agent,
         profile,
     };
-    match resolve_harness_model_config().map_err(StoreError::Conflict)? {
+
+    // Slice-2 envelope: hold a durable workspace lease for the turn so concurrent
+    // owned turns coordinate on a shared workspace. A contended workspace blocks
+    // (recoverable) rather than racing; a later worker pass runs it once free.
+    let resource = "owned.workspace";
+    let key = workspace.display().to_string();
+    let mut coordination = CoordinationStore::open(crate::coordination_store_path())?;
+    match coordination.try_acquire(resource, &key, 1, OWNED_LEASE_TTL_SECONDS, instance_id)? {
+        AcquireOutcome::Held => {}
+        AcquireOutcome::Contended { .. } => {
+            return kernel.block_effect_binding(
+                instance_id,
+                effect_id,
+                "workspace_lease",
+                &format!("workspace `{key}` is held by another agent turn"),
+            );
+        }
+    }
+    drop(coordination);
+
+    let result = match model_config {
         Some(config) => {
             let transport = UreqCoerceTransport::new(config.timeout);
             let client = RealHarnessModelClient::new(
@@ -621,7 +652,25 @@ pub fn run_owned_agent_turn(
             let client = FixtureModelClient::from_env();
             kernel.run_brokered_agent_turn(&ctx, &client, &executor, &input)
         }
+    };
+
+    // Release the workspace lease on every terminal (success or failure), mirroring
+    // release_holder_resources_on_terminal for effect-held coordination.
+    if let Ok(mut coordination) = CoordinationStore::open(crate::coordination_store_path()) {
+        let _ = coordination.release(resource, &key, instance_id);
     }
+
+    result
+}
+
+/// The per-turn model-step budget (the loop's enforced bound). Configurable via
+/// `WHIPPLESCRIPT_HARNESS_MAX_STEPS`; the model cannot exceed it.
+fn owned_max_steps() -> usize {
+    std::env::var("WHIPPLESCRIPT_HARNESS_MAX_STEPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|steps| *steps > 0)
+        .unwrap_or(OWNED_MAX_STEPS)
 }
 
 #[cfg(test)]
