@@ -88,6 +88,14 @@ others are active workshop material.
   hygienic, inline-expanded template over rule-body effect chains (`tell → coerce →
   record`), distinct from `pattern`/`apply` (which generate top-level declarations).
   *Accepted (design); fills the last copy-paste ergonomic gap (final-audit G-010).*
+- [0024-owned-brokered-agent-harness.md](0024-owned-brokered-agent-harness.md):
+  introduce an **owned (brokered)** harness mode alongside the existing
+  *delegating* one — whip executes every tool the model requests (I1), a turn
+  stays one leaf node (I2), and the loop never leaks control flow upward (I3) —
+  so that `lease`/`counter`/`file store`/`capability` become an *enforced*
+  envelope on agent execution instead of advisory metadata. *Accepted (founding
+  premise + invariants); durability granularity, governance map, sandbox, and
+  lifecycle left open as steps 2–5.*
 
 ## Historical Decision Trackers
 

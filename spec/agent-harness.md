@@ -2,6 +2,16 @@
 
 Status: draft
 
+> **Scope note (2026-06-24):** this document describes the **delegating** harness
+> mode — the provider's *native* harness runs the agent turn and its tools, and
+> whip captures a normalized terminal summary plus opaque evidence. A second,
+> **owned (brokered)** mode is being designed in
+> [DR-0024](decision-records/0024-owned-brokered-agent-harness.md), where whip
+> executes every tool the model requests so that coordination primitives become
+> an *enforced* envelope on the turn. Under DR-0024 the delegating mode below
+> becomes the opt-in "external harness" path rather than the default. The
+> leaf-node / evidence-not-facts rules in this document hold under both modes.
+
 The harness layer turns durable `agent.tell` effects into real agent turns.
 
 WhippleScript must not pretend an agent turn exists until this layer can start a
