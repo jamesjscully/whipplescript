@@ -12,14 +12,19 @@
 //! later refinements. `bash` and the budget/lease envelope are later slices.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_loop::{
     BrokeredTurnInput, ChatMessage, HarnessModelClient, HarnessModelError, ModelReply, ToolCall,
     ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
 };
+use whipplescript_kernel::harness_model::RealHarnessModelClient;
 use whipplescript_kernel::{BrokeredTurnContext, RuntimeKernel};
-use whipplescript_store::{StoreResult, StoredEvent};
+use whipplescript_store::{StoreError, StoreResult, StoredEvent};
+
+use crate::coerce_runtime::{resolve_credential_with_source, UreqCoerceTransport};
 
 pub const TOOL_READ: &str = "read";
 pub const TOOL_WRITE: &str = "write";
@@ -511,9 +516,72 @@ pub fn owned_workspace_root() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
-/// Run one owned/brokered agent turn (slice 1): file tools over the workspace
-/// root, the deterministic fixture model client, settled to a single terminal
-/// fact. The live provider model client is the credential-gated follow-on.
+/// Resolved configuration for the live owned-harness model client. Mirrors the
+/// coerce knobs but in the independent `WHIPPLESCRIPT_HARNESS_*` namespace.
+struct HarnessModelConfig {
+    provider: CoerceProvider,
+    api_key: String,
+    model: String,
+    base_url: String,
+    max_tokens: u64,
+    timeout: Duration,
+}
+
+/// Resolve the live model client config. `Ok(None)` means run the credential-free
+/// fixture client (dev/CI default); `Err` means the provider was requested but
+/// could not be configured (fail the turn rather than silently use the fixture).
+fn resolve_harness_model_config() -> Result<Option<HarnessModelConfig>, String> {
+    let Some(provider_name) = std::env::var("WHIPPLESCRIPT_HARNESS_PROVIDER")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let provider = match provider_name.as_str() {
+        "openai" => CoerceProvider::OpenAi,
+        "anthropic" => CoerceProvider::Anthropic,
+        other => return Err(format!(
+            "unknown WHIPPLESCRIPT_HARNESS_PROVIDER `{other}` (expected `openai` or `anthropic`)"
+        )),
+    };
+    let (api_key, _source) = resolve_credential_with_source(provider).ok_or_else(|| {
+        format!("WHIPPLESCRIPT_HARNESS_PROVIDER={provider_name} is set but no credential resolved")
+    })?;
+    let model = std::env::var("WHIPPLESCRIPT_HARNESS_MODEL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "WHIPPLESCRIPT_HARNESS_MODEL is required when WHIPPLESCRIPT_HARNESS_PROVIDER is set"
+                .to_string()
+        })?;
+    let base_url = std::env::var("WHIPPLESCRIPT_HARNESS_BASE_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| provider.default_base_url().to_string());
+    let max_tokens = std::env::var("WHIPPLESCRIPT_HARNESS_MAX_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4096);
+    let timeout = Duration::from_secs(
+        std::env::var("WHIPPLESCRIPT_HARNESS_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(120),
+    );
+    Ok(Some(HarnessModelConfig {
+        provider,
+        api_key,
+        model,
+        base_url,
+        max_tokens,
+        timeout,
+    }))
+}
+
+/// Run one owned/brokered agent turn: file tools over the workspace root, settled
+/// to a single terminal fact. Uses the live provider model client when
+/// `WHIPPLESCRIPT_HARNESS_PROVIDER` is set (credential-gated), else the
+/// deterministic fixture client so dev/CI need no credentials.
 #[allow(clippy::too_many_arguments)]
 pub fn run_owned_agent_turn(
     kernel: &mut RuntimeKernel,
@@ -524,7 +592,6 @@ pub fn run_owned_agent_turn(
     input_json: &str,
 ) -> StoreResult<StoredEvent> {
     let executor = FileToolExecutor::new(owned_workspace_root());
-    let client = FixtureModelClient::from_env();
     let input = BrokeredTurnInput {
         system: OWNED_SYSTEM_PROMPT.to_string(),
         user: input_json.to_string(),
@@ -537,7 +604,24 @@ pub fn run_owned_agent_turn(
         agent,
         profile,
     };
-    kernel.run_brokered_agent_turn(&ctx, &client, &executor, &input)
+    match resolve_harness_model_config().map_err(StoreError::Conflict)? {
+        Some(config) => {
+            let transport = UreqCoerceTransport::new(config.timeout);
+            let client = RealHarnessModelClient::new(
+                &transport,
+                config.provider,
+                config.api_key,
+                config.model,
+                config.base_url,
+                config.max_tokens,
+            );
+            kernel.run_brokered_agent_turn(&ctx, &client, &executor, &input)
+        }
+        None => {
+            let client = FixtureModelClient::from_env();
+            kernel.run_brokered_agent_turn(&ctx, &client, &executor, &input)
+        }
+    }
 }
 
 #[cfg(test)]

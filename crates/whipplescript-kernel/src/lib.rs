@@ -9,6 +9,7 @@ pub mod coerce;
 pub mod coerce_native;
 pub mod harness;
 pub mod harness_loop;
+pub mod harness_model;
 pub mod loft;
 pub mod native_lifecycle;
 pub mod pi_rpc;
