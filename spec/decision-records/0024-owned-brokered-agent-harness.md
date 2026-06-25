@@ -309,6 +309,58 @@ atomic-turn isolation Roll a turn back cleanly (snapshot / git worktree /
                       terminal and discarded on failure. "Leave room to evolve."
 ```
 
+## Development process and slice plan
+
+The standing project discipline applies — model-first, greenfield, per-piece gate:
+
+```text
+1. design discussion   prose, pros/cons before choosing (done for the foundation)
+2. prose spec          the DR + spec docs (this record; taxonomy; tool surface)
+3. formal model FIRST   before code. Review invariants for COVERAGE and BITE
+   (before code)        (a deliberately-broken/mutant fixture MUST fail; a Maude
+                        `=>*` target needs a residual soup variable or it is
+                        vacuously satisfied). Tool division: Maude for the
+                        rule-system / compiler / lowering surface; TLA+ for the
+                        distributed / lifecycle surface. Follow existing models/.
+4. greenfield impl      delete old code/fixtures, rebuild against the model, no
+                        backcompat. The model is the spec the code answers to.
+5. per-piece gate       each piece: review -> fixes -> verify -> docs (incl.
+                        user-facing docs/) before its tracker box is checked.
+6. full gate green      cargo fmt --all -- --check + scripts/check-release-
+                        readiness.sh (authoritative aggregate; some checks external)
+```
+
+Granularity: **per slice**, not one upfront model of the whole subsystem. Each
+slice runs its own 3->6 loop (model -> code -> review -> docs -> gate), so a
+working brokered loop ships early and nothing is modeled speculatively before it
+runs. Steps 3-4 of this record (event-stream/projection contract; governance
+map/sandbox) are remaining **prose design** and precede slice implementation.
+
+Tentative slice sequence (will firm up as step-3/4 prose lands; a checkbox
+tracker spawns when implementation begins):
+
+```text
+slice 1  Brokered loop + file tools (the spine). Model -> tool-use loop; whip
+         brokers read/write/edit/grep/find/ls through a file-store boundary;
+         events appended to the stream; basic projection assembles context; turn
+         produces a terminal consumed as the existing agent.tell leaf. Proves
+         I1/I2 + the stream/projection skeleton. No bash/resume/tracker/compaction.
+slice 2  The enforced envelope. counter (budget -> loop terminates) and lease
+         (workspace scope) actually bound the loop. Proves the core value prop
+         (enforced boundaries) end to end; bite = budget/lease escape must fail.
+slice 3  bash + sandbox. exec-capability confined bash, unified writable boundary
+         (== file-store write region), command classification. Highest risk,
+         isolated; bite = sandbox-escape fixtures must fail.
+slice 4  Tracker tools. list/add/update_todo as capability-facade projection;
+         refined-I3 enforcement; bite = model record/spawn/direct-control must be
+         rejected.
+slice 5  Compaction. Projection's full compaction (truncate-by-reference where the
+         ref is the event id, two-tier eviction, summarization-as-leaf-call,
+         anti-thrashing guard).
+slice 6  Resume-from-projection. Crash recovery; dangling-final-call tolerance;
+         depends on a solid slice-1 stream/projection.
+```
+
 ## Consequences
 
 What downstream work must preserve, in one place:
