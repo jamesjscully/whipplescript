@@ -35990,10 +35990,105 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
             .any(|effect| effect.kind == IrEffectKind::AgentTell)
     });
 
+    // Sub-workflow tool convergence (DR-0025). A `@tool` workflow is invoked
+    // synchronously from inside an agent turn, so it must be provably convergent
+    // or the turn could block forever. v1 admits the conservative leaf class:
+    // terminates (no `@service` escape), depends on no external input (no
+    // `@external` rules, no inbound messages), no human gate, and no nested
+    // `invoke`. Nested `@tool` composition — which needs the acyclic invoke-graph
+    // check the convergence model also covers — is a later refinement.
+    let tool_tagged = ir
+        .source_tags
+        .iter()
+        .any(|tag| tag.target_kind == "workflow" && tag.name == "tool");
+    if tool_tagged {
+        if service_tagged {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: SourceSpan { start: 0, end: 0 },
+                message: format!(
+                    "workflow `{}` is both `@tool` and `@service`; a `@tool` workflow must terminate",
+                    ir.workflow
+                ),
+                suggestion: Some(
+                    "remove `@service` — non-termination is a root-only privilege, not for an invokable sub-workflow"
+                        .to_owned(),
+                ),
+            });
+        }
+        if has_human_ask {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: SourceSpan { start: 0, end: 0 },
+                message: format!(
+                    "`@tool` workflow `{}` uses `askHuman`; a synchronously-invoked tool may not block on a human",
+                    ir.workflow
+                ),
+                suggestion: Some(
+                    "keep human gates at the root workflow, not in a `@tool` sub-workflow".to_owned(),
+                ),
+            });
+        }
+        let has_invoke = ir.rules.iter().any(|rule| {
+            rule.metadata
+                .effects
+                .iter()
+                .any(|effect| effect.kind == IrEffectKind::WorkflowInvoke)
+        });
+        if has_invoke {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: SourceSpan { start: 0, end: 0 },
+                message: format!(
+                    "`@tool` workflow `{}` invokes a sub-workflow; v1 `@tool` workflows must be leaves",
+                    ir.workflow
+                ),
+                suggestion: Some(
+                    "a `@tool` workflow may not `invoke` another workflow yet; nested tool composition (with the acyclic-invoke-graph check) is a later refinement"
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+
     for rule in &ir.rules {
         let external_tagged = ir.source_tags.iter().any(|tag| {
             tag.target_kind == "rule" && tag.target == rule.name && tag.name == "external"
         });
+        if tool_tagged {
+            // A @tool workflow may not depend on external arrival: @external (the
+            // "arrives from outside" escape) and inbound messaging break the
+            // termination guarantee a synchronous tool needs.
+            if external_tagged {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: SourceSpan { start: 0, end: 0 },
+                    message: format!(
+                        "`@tool` workflow `{}` rule `{}` is `@external`; a `@tool` workflow may not depend on external arrival",
+                        ir.workflow, rule.name
+                    ),
+                    suggestion: Some(
+                        "a `@tool` sub-workflow must be satisfiable from its own inputs and effects; external-event coordination belongs at the root"
+                            .to_owned(),
+                    ),
+                });
+            }
+            for when in &rule.whens {
+                if when.pattern.trim_start().starts_with("message from") {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: when.span,
+                        message: format!(
+                            "`@tool` workflow `{}` rule `{}` awaits an inbound message; a `@tool` workflow may not consume external signals",
+                            ir.workflow, rule.name
+                        ),
+                        suggestion: Some(
+                            "inbound messaging / signals belong at the root workflow".to_owned(),
+                        ),
+                    });
+                }
+            }
+        }
         if external_tagged {
             continue;
         }
