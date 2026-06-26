@@ -19,9 +19,9 @@ schemas
     route union<literal<"code"> | literal<"review"> | literal<"ops">>
     status literal<"routed">
 agents
-  agent codex harness=<fallback> provider=codex profile=repo-writer capacity=1 skills=[] capabilities=[]
-  agent claude harness=<fallback> provider=claude profile=repo-reader capacity=1 skills=[] capabilities=[]
-  agent pi harness=<fallback> provider=pi profile=repo-reader capacity=1 skills=[] capabilities=[]
+  agent codex harness=<fallback> provider=codex profile=repo-writer capacity=1 skills=[] capabilities=[] tools=[]
+  agent claude harness=<fallback> provider=claude profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[]
+  agent pi harness=<fallback> provider=pi profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[]
 assertions
   assert count(Incident where status == "open") == 0
     reads

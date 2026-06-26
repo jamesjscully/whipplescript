@@ -6,8 +6,8 @@ source_descriptions
 queues
   queue backlog tracker=builtin
 agents
-  agent implementer harness=<fallback> provider=codex profile=repo-writer capacity=2 skills=[] capabilities=[]
-  agent reviewer harness=<fallback> provider=claude profile=repo-reader capacity=1 skills=[] capabilities=[]
+  agent implementer harness=<fallback> provider=codex profile=repo-writer capacity=2 skills=[] capabilities=[] tools=[]
+  agent reviewer harness=<fallback> provider=claude profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[]
 rules
   rule implement_ready_work
     when backlog has ready item as item

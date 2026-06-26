@@ -958,6 +958,7 @@ fn python_module_available(python: &str, module: &str) -> bool {
 /// `whip check` reports. Carries a stable code + severity plus the declared entity
 /// `name` it concerns; `span` is resolved from that name against the source so the
 /// finding can point at a location (CLI line/col and LSP diagnostics).
+#[derive(Debug)]
 struct LintFinding {
     code: &'static str,
     severity: Severity,
@@ -1373,6 +1374,41 @@ fn lint_deep_after_nesting(ir: &IrProgram) -> Vec<LintFinding> {
         .collect()
 }
 
+/// A `tools [...]` grant (DR-0025) only takes effect in the owned harness: the
+/// grant is resolved and offered to the model exclusively when the agent runs
+/// `provider owned` (or a harness whose kind is `owned`). A grant on a
+/// codex/claude/fixture agent is dead — it can never be invoked — so flag it.
+/// Resolving the harness kind keeps this zero-false-positive on `using` agents.
+fn lint_tool_grant_requires_owned_harness(ir: &IrProgram) -> Vec<LintFinding> {
+    let harness_is_owned = |name: &str| {
+        ir.harnesses
+            .iter()
+            .find(|harness| harness.name == name)
+            .map(|harness| harness.kind == "owned")
+            .unwrap_or(false)
+    };
+    ir.agents
+        .iter()
+        .filter(|agent| !agent.tools.is_empty())
+        .filter(|agent| {
+            let direct_owned = agent.provider.as_deref() == Some("owned");
+            let harness_owned = agent.harness.as_deref().is_some_and(harness_is_owned);
+            !direct_owned && !harness_owned
+        })
+        .map(|agent| LintFinding {
+            code: "lint.tool_grant_requires_owned_harness",
+            severity: Severity::Warning,
+            message: format!(
+                "agent `{}` grants tools [{}] but does not use the owned harness; `tools` grants only take effect with `provider owned`",
+                agent.name,
+                agent.tools.join(", "),
+            ),
+            name: Some(agent.name.clone()),
+            span: None,
+        })
+        .collect()
+}
+
 fn lint_program(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     let mut findings = lint_unused_coerces(ir);
     findings.extend(lint_unused_coerce_results(ir));
@@ -1381,6 +1417,7 @@ fn lint_program(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     findings.extend(lint_unused_types(source, ir));
     findings.extend(lint_broad_file_grants(ir));
     findings.extend(lint_deep_after_nesting(ir));
+    findings.extend(lint_tool_grant_requires_owned_harness(ir));
     // Resolve each finding's declaration name to its source span. Top-level names are
     // program-unique, so a single `document_symbols` match is the declaration site.
     let symbols = whipplescript_parser::document_symbols(source);
@@ -2589,6 +2626,33 @@ fn check(options: &CliOptions) -> ExitCode {
                     }
                     continue;
                 }
+                let grant_diagnostics = lint_agent_tool_grants(
+                    Path::new(&path),
+                    &ir,
+                    check_options.package_lock_path.as_deref(),
+                );
+                if !grant_diagnostics.is_empty() {
+                    failed = true;
+                    if options.json {
+                        reports.push(json!({
+                            "schema": "whipplescript.check_report.v0",
+                            "path": display_path(&path),
+                            "status": "error",
+                            "error": {
+                                "kind": "diagnostics",
+                                "diagnostics": grant_diagnostics
+                                    .iter()
+                                    .map(parser_diagnostic_to_json)
+                                    .collect::<Vec<_>>(),
+                            },
+                        }));
+                    } else {
+                        for diagnostic in grant_diagnostics {
+                            eprint!("{}", render_diagnostic(&path, &source, &diagnostic));
+                        }
+                    }
+                    continue;
+                }
                 let construct_graph = construct_graph_json(
                     &path,
                     &source,
@@ -3491,6 +3555,7 @@ fn package_contract_json_from_manifests(
             .collect::<Vec<_>>(),
         "platform_construct_catalog": platform_construct_catalog_json(),
         "contract_registry": contract_registry_to_json(registry),
+        "workflow_tools": package_workflow_tool_attestations_json(manifests),
         "diagnostics": diagnostics,
     });
     let digest_input = canonical_json(&artifact);
@@ -3500,6 +3565,28 @@ fn package_contract_json_from_manifests(
         Value::String(sha256_hex(digest_input.as_bytes())),
     );
     artifact
+}
+
+/// The cross-package `@tool` attestation (DR-0025): for each workflow a package
+/// exports, the eligibility flag, the derived input/output tool schemas, and the
+/// outgoing invoke-tool edges. v1 `@tool` workflows are leaves, so `invokes` is
+/// always empty — the field is reserved for the deferred nested-composition
+/// acyclicity check. A consumer reads this to check a grant without the source.
+fn package_workflow_tool_attestations_json(manifests: &[PackageManifest]) -> Vec<Value> {
+    let mut attestations = Vec::new();
+    for manifest in manifests {
+        for tool in &manifest.workflow_tools {
+            attestations.push(json!({
+                "name": tool.name,
+                "package_id": manifest.package_id,
+                "convergence_eligible": true,
+                "input_schema": json_from_str(&tool.input_schema),
+                "output_schema": json_from_str(&tool.output_schema),
+                "invokes": [],
+            }));
+        }
+    }
+    attestations
 }
 
 fn package_contract_digest(
@@ -11218,6 +11305,7 @@ fn execute_scenario(
         agent_outcomes: scenario_agent_outcomes(&test.clauses),
         coerce_outputs: scenario_coerce_outputs(&test.clauses),
         virtual_now: scenario_virtual_now(&test.clauses),
+        work_unit_root: None,
     };
     let run_kind = scenario_run_kind(&test.clauses);
     let (max_rounds, drive_to_fixed_point) = match run_kind {
@@ -15373,6 +15461,23 @@ struct PackageManifest {
     name: String,
     version: String,
     registry: ContractRegistry,
+    /// `@tool` workflows this package exports for cross-package invocation
+    /// (DR-0025). Derived + convergence-checked when the manifest is loaded, so a
+    /// non-`@tool`/non-convergent export fails manifest validation on both the
+    /// producer (`whip package`) and the consumer (`use`) side.
+    workflow_tools: Vec<PackageWorkflowTool>,
+}
+
+/// A `@tool` workflow exported by a package (DR-0025 cross-package attestation):
+/// the tool name, the resolved source path it is driven from, and the derived
+/// input/output JSON schemas (canonical JSON strings) that make up its tool
+/// contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PackageWorkflowTool {
+    name: String,
+    source: PathBuf,
+    input_schema: String,
+    output_schema: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16342,6 +16447,7 @@ fn package_manifest_from_json(
     let registry =
         package_manifest_registry(path, &value, &name, &version, &capabilities, &providers)?;
     validate_package_manifest_consistency(path, &value, &capabilities, &providers, &registry)?;
+    let workflow_tools = package_manifest_workflow_tools(path, &value)?;
 
     Ok(PackageManifest {
         path: path.to_path_buf(),
@@ -16351,7 +16457,92 @@ fn package_manifest_from_json(
         name,
         version,
         registry,
+        workflow_tools,
     })
+}
+
+/// Parse, validate, and derive the attestation for a package's exported `@tool`
+/// workflows (DR-0025). Each entry names a workflow and a source path relative to
+/// the manifest; the source is compiled (with `root = name`) and convergence-
+/// checked here, so a non-`@tool`/non-convergent export fails manifest loading on
+/// both the producer and the consumer. The input/output contracts are derived
+/// into JSON schemas — the cross-package tool contract a consumer checks against.
+fn package_manifest_workflow_tools(
+    path: &Path,
+    value: &Value,
+) -> Result<Vec<PackageWorkflowTool>, String> {
+    let Some(entries) = value.get("workflow_tools") else {
+        return Ok(Vec::new());
+    };
+    let entries = entries.as_array().ok_or_else(|| {
+        format!(
+            "package manifest `{}` field `workflow_tools` must be an array",
+            path.display()
+        )
+    })?;
+    let manifest_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tools = Vec::new();
+    let mut seen = BTreeSet::new();
+    for entry in entries {
+        let name = required_json_string(entry, "name", "workflow_tools entry")?;
+        let source_rel = required_json_string(entry, "source", "workflow_tools entry")?;
+        if !seen.insert(name.clone()) {
+            return Err(format!(
+                "package manifest `{}` exports workflow tool `{name}` more than once",
+                path.display()
+            ));
+        }
+        let source = manifest_dir.join(&source_rel);
+        let (_, ir) =
+            compile_source_path_for_validation(source.to_str().unwrap_or_default(), Some(&name))
+                .map_err(|error| {
+                    format!(
+                        "package manifest `{}` workflow tool `{name}`: {}",
+                        path.display(),
+                        child_compile_error(&name, error)
+                    )
+                })?;
+        if ir.workflow != name {
+            return Err(format!(
+                "package manifest `{}` workflow tool `{name}`: source `{}` declares workflow `{}`",
+                path.display(),
+                source.display(),
+                ir.workflow
+            ));
+        }
+        let is_tool = ir.source_tags.iter().any(|tag| {
+            tag.target_kind == "workflow" && tag.target == ir.workflow && tag.name == "tool"
+        });
+        if !is_tool {
+            return Err(format!(
+                "package manifest `{}` exports `{name}` as a workflow tool, but it is not tagged `@tool`",
+                path.display()
+            ));
+        }
+        let input_schema = ir
+            .workflow_contracts
+            .iter()
+            .find(|contract| contract.kind == IrWorkflowContractKind::Input)
+            .map(|contract| {
+                whipplescript_kernel::coerce_native::json_schema_for_type(&contract.ty, &ir.schemas)
+            })
+            .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": false }));
+        let output_schema = ir
+            .workflow_contracts
+            .iter()
+            .find(|contract| contract.kind == IrWorkflowContractKind::Output)
+            .map(|contract| {
+                whipplescript_kernel::coerce_native::json_schema_for_type(&contract.ty, &ir.schemas)
+            })
+            .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": false }));
+        tools.push(PackageWorkflowTool {
+            name,
+            source,
+            input_schema: input_schema.to_string(),
+            output_schema: output_schema.to_string(),
+        });
+    }
+    Ok(tools)
 }
 
 fn validate_package_manifest_consistency(
@@ -16640,6 +16831,7 @@ fn validate_package_manifest_closed_shape(path: &Path, value: &Value) -> Result<
             "providers",
             "profiles",
             "bindings",
+            "workflow_tools",
         ],
         &mut problems,
     );
@@ -16648,6 +16840,17 @@ fn validate_package_manifest_closed_shape(path: &Path, value: &Value) -> Result<
         "package manifest",
         &["schema", "package_id", "name", "version"],
         &mut problems,
+    );
+    validate_manifest_array_objects(
+        value,
+        "package manifest",
+        "workflow_tools",
+        &mut problems,
+        |tool, label, problems| {
+            validate_manifest_object_fields(tool, &label, &["name", "source"], problems);
+            validate_manifest_required_fields(tool, &label, &["name", "source"], problems);
+            validate_manifest_string_fields(tool, &label, &["name", "source"], problems);
+        },
     );
     validate_manifest_string_fields(
         value,
@@ -19713,6 +19916,13 @@ struct WorkerOptions {
     /// set by `given clock at "…"`. `None` uses the wall clock (`'now'`), so
     /// `dev`/`worker` behavior is unchanged.
     virtual_now: Option<String>,
+    /// Work-unit root for the re-entrant owned-harness workspace lease (DR-0025).
+    /// `None` means this turn IS the root of its unit of work (it acquires and
+    /// releases the workspace lease under its own instance id). `Some(root)` means
+    /// this turn runs inside a synchronous sub-workflow invocation: it shares the
+    /// root's lease (keyed on `root`, so a parent and its descendants never
+    /// contend) and does not release it — only the root does.
+    work_unit_root: Option<String>,
 }
 
 impl WorkerOptions {
@@ -19835,6 +20045,7 @@ impl WorkerOptions {
             agent_outcomes: std::collections::BTreeMap::new(),
             coerce_outputs: std::collections::BTreeMap::new(),
             virtual_now: None,
+            work_unit_root: None,
         })
     }
 }
@@ -20910,6 +21121,13 @@ fn run_agent_effect(
             execution.agent,
             execution.profile,
             &input_json,
+            store_path,
+            options.max_child_iterations,
+            options.work_unit_root.as_deref(),
+            options.program_path.as_deref(),
+            options.root.as_deref(),
+            options.package_lock_path.as_deref(),
+            SubworkflowProviderContext::from_options(options),
         );
     }
     if provider_selection.kind == "native-fixture" {
@@ -25057,6 +25275,7 @@ fn run_workflow_invoke_effect(
             agent_outcomes: options.agent_outcomes.clone(),
             coerce_outputs: options.coerce_outputs.clone(),
             virtual_now: options.virtual_now.clone(),
+            work_unit_root: options.work_unit_root.clone(),
         };
         let worker_report = run_worker_once(store_path, &child_worker)?;
         let child = SqliteStore::open(store_path)?
@@ -25349,6 +25568,128 @@ fn workflow_terminal_summary_from_store(
     }))
 }
 
+/// Synchronously run a `@tool` sub-workflow (DR-0025) to its terminal and return
+/// the terminal summary. This is the brokered `workflow.invoke` facade driven
+/// directly from the owned harness tool layer (a model-issued tool call), as
+/// opposed to `run_workflow_invoke_effect` which drives the same create+step+run
+/// loop from a rule-issued `workflow.invoke` effect. The invoked workflow is
+/// convergence-checked at turn setup (see `harness_tools::load_workflow_tools`),
+/// so this drive is bounded: the sub-workflow provably terminates.
+///
+/// The child runs under the `fixture` provider by default: a `@tool` sub-workflow
+/// is a convergent leaf computation, and defaulting to the fixture provider keeps
+/// nested tool calls from making surprise live provider calls. A live sub-workflow
+/// provider is a later refinement.
+/// The parent turn's provider configuration, carried into a synchronous
+/// sub-workflow drive (DR-0025) so the child's own effects (`coerce`, `tell`,
+/// `exec`, nested agent turns) run under the **same** provider as the parent
+/// rather than always the fixture stub. Derived from the worker's [`WorkerOptions`]
+/// at the owned-turn boundary and threaded through to [`drive_subworkflow_tool`].
+#[derive(Clone)]
+struct SubworkflowProviderContext {
+    provider: String,
+    exec_profile: ExecProfile,
+    script_manifest_path: Option<PathBuf>,
+    package_lock_path: Option<PathBuf>,
+    provider_config_paths: Vec<PathBuf>,
+    agent_outcomes: std::collections::BTreeMap<String, FixtureOutcome>,
+    coerce_outputs: std::collections::BTreeMap<String, String>,
+    virtual_now: Option<String>,
+}
+
+impl SubworkflowProviderContext {
+    fn from_options(options: &WorkerOptions) -> Self {
+        Self {
+            provider: options.provider.clone(),
+            exec_profile: options.exec_profile,
+            script_manifest_path: options.script_manifest_path.clone(),
+            package_lock_path: options.package_lock_path.clone(),
+            provider_config_paths: options.provider_config_paths.clone(),
+            agent_outcomes: options.agent_outcomes.clone(),
+            coerce_outputs: options.coerce_outputs.clone(),
+            virtual_now: options.virtual_now.clone(),
+        }
+    }
+
+    /// A credential-free fixture context for tests: the child sub-workflow runs
+    /// under the deterministic fixture provider.
+    #[cfg(test)]
+    fn fixture() -> Self {
+        Self {
+            provider: "fixture".to_owned(),
+            exec_profile: ExecProfile::from_env(),
+            script_manifest_path: None,
+            package_lock_path: None,
+            provider_config_paths: Vec::new(),
+            agent_outcomes: std::collections::BTreeMap::new(),
+            coerce_outputs: std::collections::BTreeMap::new(),
+            virtual_now: None,
+        }
+    }
+}
+
+fn drive_subworkflow_tool(
+    store_path: &Path,
+    program_path: &Path,
+    root: &str,
+    input_json: &str,
+    max_child_iterations: usize,
+    work_unit_root: &str,
+    provider_ctx: &SubworkflowProviderContext,
+) -> Result<WorkflowTerminalSummary, StoreError> {
+    let (started, child_ir) =
+        start_child_workflow_instance(store_path, program_path, root, input_json)?;
+    let child_instance_id = started.instance_id;
+    let iterations = max_child_iterations.max(1);
+    for _ in 0..iterations {
+        let step_report = step_instance(
+            store_path,
+            &child_instance_id,
+            &child_ir,
+            Some(program_path),
+            None,
+        )?;
+        let child_worker = WorkerOptions {
+            instance_id: child_instance_id.clone(),
+            provider: provider_ctx.provider.clone(),
+            exec_profile: provider_ctx.exec_profile,
+            script_manifest_path: provider_ctx.script_manifest_path.clone(),
+            package_lock_path: provider_ctx.package_lock_path.clone(),
+            outcome: FixtureOutcome::Completed,
+            variant: None,
+            program_path: Some(program_path.to_path_buf()),
+            root: Some(root.to_owned()),
+            provider_config_paths: provider_ctx.provider_config_paths.clone(),
+            max_child_iterations: iterations,
+            agent_outcomes: provider_ctx.agent_outcomes.clone(),
+            coerce_outputs: provider_ctx.coerce_outputs.clone(),
+            virtual_now: provider_ctx.virtual_now.clone(),
+            // Descendants of the brokered turn share the work-unit root's
+            // workspace lease (DR-0025), so a nested owned turn re-enters the
+            // lease the still-running parent holds rather than self-deadlocking.
+            work_unit_root: Some(work_unit_root.to_owned()),
+        };
+        let worker_report = run_worker_once(store_path, &child_worker)?;
+        let child = SqliteStore::open(store_path)?
+            .get_instance(&child_instance_id)?
+            .ok_or_else(|| {
+                StoreError::Conflict("child workflow instance disappeared".to_owned())
+            })?;
+        if child.status != "running" {
+            break;
+        }
+        if step_report.committed_rules == 0 && worker_report.ran_effects == 0 {
+            break;
+        }
+    }
+    let store = SqliteStore::open(store_path)?;
+    workflow_terminal_summary_from_store(&store, &child_instance_id)?.ok_or_else(|| {
+        StoreError::Conflict(format!(
+            "`@tool` sub-workflow `{root}` did not reach a terminal within {iterations} iterations"
+        ))
+    })
+}
+
 /// Hand-tuned fixture coerce outputs for specific schemas whose exact values
 /// some tests assert (e.g. `MessageClassification.priority == "Normal"`). These
 /// take priority over schema-derived generation so those assertions stay stable.
@@ -25531,6 +25872,7 @@ fn dev(options: &CliOptions) -> ExitCode {
                 agent_outcomes: std::collections::BTreeMap::new(),
                 coerce_outputs: std::collections::BTreeMap::new(),
                 virtual_now: None,
+                work_unit_root: None,
             },
         ) {
             Ok(report) => report,
@@ -26373,6 +26715,7 @@ fn acceptance_dev_report(
                 agent_outcomes: std::collections::BTreeMap::new(),
                 coerce_outputs: std::collections::BTreeMap::new(),
                 virtual_now: None,
+                work_unit_root: None,
             },
         ) {
             Ok(report) => report,
@@ -36201,6 +36544,156 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
     diagnostics
 }
 
+/// Resolve and validate an agent tool grant (DR-0025): a granted name must name a
+/// workflow that is `@tool` and passes the convergence check. v1 resolves the
+/// name against the SAME program bundle (compile with `root = name`); the
+/// cross-package fallthrough is layered on by the caller. Returns the compiled
+/// tool IR on success, or a human-readable reason it is not an eligible tool.
+fn resolve_same_bundle_tool_grant(program_path: &Path, name: &str) -> Result<IrProgram, String> {
+    let (_, ir) =
+        compile_source_path_with_root(program_path.to_str().unwrap_or_default(), Some(name))
+            .map_err(|_| format!("`{name}` is not a workflow in this program"))?;
+    if ir.workflow != name {
+        return Err(format!("`{name}` is not a workflow in this program"));
+    }
+    let is_tool = ir.source_tags.iter().any(|tag| {
+        tag.target_kind == "workflow" && tag.target == ir.workflow && tag.name == "tool"
+    });
+    if !is_tool {
+        return Err(format!("`{name}` is not tagged `@tool`"));
+    }
+    let liveness = lint_workflow_liveness(&ir);
+    if let Some(first) = liveness.into_iter().next() {
+        return Err(format!(
+            "`{name}` is not convergence-eligible: {}",
+            first.message
+        ));
+    }
+    Ok(ir)
+}
+
+/// Static check for agent `tools [...]` grants (DR-0025): every granted workflow
+/// must resolve and be a convergence-eligible `@tool`. Emits the DR's intended
+/// diagnostic, *"agent A is granted Z, which is not `@tool`"*. v1 resolves grants
+/// against the same bundle; cross-package resolution extends `resolve_tool_grant`.
+fn lint_agent_tool_grants(
+    program_path: &Path,
+    ir: &IrProgram,
+    package_lock_path: Option<&Path>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for agent in &ir.agents {
+        for tool in &agent.tools {
+            if let Err(reason) = resolve_tool_grant(program_path, ir, tool, package_lock_path) {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: SourceSpan { start: 0, end: 0 },
+                    message: format!("agent `{}` is granted `{tool}`: {reason}", agent.name),
+                    suggestion: Some(
+                        "a granted tool must be a `@tool` workflow that passes the convergence check (same program or a `use`d package)"
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+    }
+    diagnostics
+}
+
+/// Resolve an agent tool grant, trying the same bundle first and then any `@tool`
+/// workflow exported by a `use`d package (DR-0025). Returns the tool's compiled
+/// IR or a reason it is not an eligible tool. The cross-package arm is filled in
+/// with the package attestation path.
+fn resolve_tool_grant(
+    program_path: &Path,
+    ir: &IrProgram,
+    name: &str,
+    package_lock_path: Option<&Path>,
+) -> Result<ResolvedToolGrant, String> {
+    match resolve_same_bundle_tool_grant(program_path, name) {
+        Ok(tool_ir) => Ok(ResolvedToolGrant {
+            tool_ir,
+            source_path: program_path.to_path_buf(),
+        }),
+        Err(local_reason) => {
+            match resolve_package_tool_grant(program_path, ir, name, package_lock_path) {
+                Ok(resolved) => Ok(resolved),
+                Err(package_reason) if package_reason.is_empty() => Err(local_reason),
+                Err(package_reason) => Err(package_reason),
+            }
+        }
+    }
+}
+
+/// A resolved tool grant: the compiled tool workflow IR and the source path it
+/// must be driven from (the same bundle, or a package's shipped workflow source).
+struct ResolvedToolGrant {
+    tool_ir: IrProgram,
+    source_path: PathBuf,
+}
+
+/// Resolve a tool grant against a `use`d package's exported `@tool` workflows
+/// (DR-0025 cross-package attestation). The package lock is discovered from the
+/// program's directory; each locked manifest's `workflow_tools` were already
+/// convergence-checked and attested when the manifest loaded, so resolution here
+/// just locates the exporting package and compiles its shipped source for the
+/// tool IR. An empty `Err("")` means "no package resolves this name" so the
+/// caller keeps the same-bundle reason; a non-empty `Err` is a concrete package
+/// rejection (e.g. a broken package lock).
+fn resolve_package_tool_grant(
+    program_path: &Path,
+    ir: &IrProgram,
+    name: &str,
+    package_lock_path: Option<&Path>,
+) -> Result<ResolvedToolGrant, String> {
+    let lock = match load_package_lock(package_lock_path, &[program_path]) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return Err(String::new()),
+        Err(error) => return Err(error),
+    };
+    // A grant resolves only against a package the program actually `use`s: the
+    // lock is the dependency set, but `use` is the explicit import. This keeps the
+    // invoke-tool graph's edges tied to declared dependencies.
+    let used = |manifest: &PackageManifest| ir.uses.iter().any(|decl| decl.name == manifest.name);
+    let resolved = lock.manifests.iter().find_map(|manifest| {
+        if !used(manifest) {
+            return None;
+        }
+        manifest
+            .workflow_tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .map(|tool| tool.source.clone())
+    });
+    let Some(source) = resolved else {
+        // A clearer message when the tool exists but its package is not `use`d.
+        if let Some(manifest) = lock
+            .manifests
+            .iter()
+            .find(|manifest| manifest.workflow_tools.iter().any(|tool| tool.name == name))
+        {
+            return Err(format!(
+                "`{name}` is exported by package `{}`, which this program does not `use` (add `use {}`)",
+                manifest.name, manifest.name
+            ));
+        }
+        return Err(String::new());
+    };
+    let (_, tool_ir) =
+        compile_source_path_with_root(source.to_str().unwrap_or_default(), Some(name)).map_err(
+            |error| {
+                format!(
+                    "package tool `{name}` failed to compile: {}",
+                    child_compile_error(name, error)
+                )
+            },
+        )?;
+    Ok(ResolvedToolGrant {
+        tool_ir,
+        source_path: source,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceBundle {
     source: String,
@@ -39784,6 +40277,97 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lint_flags_tool_grant_on_non_owned_agent_only() {
+        // DR-0025: a `tools [...]` grant only works under the owned harness. A
+        // non-owned agent's grant is dead → warn; an owned agent's grant is fine.
+        let owned = whipplescript_parser::compile_program(
+            "workflow W\nagent a {\n  provider owned\n  profile \"p\"\n  capacity 1\n  tools [Foo]\n}\n",
+        )
+        .ir
+        .expect("owned ir");
+        assert!(
+            lint_tool_grant_requires_owned_harness(&owned).is_empty(),
+            "owned agent grant should not warn"
+        );
+
+        let fixture = whipplescript_parser::compile_program(
+            "workflow W\nagent a {\n  provider fixture\n  profile \"p\"\n  capacity 1\n  tools [Foo]\n}\n",
+        )
+        .ir
+        .expect("fixture ir");
+        let findings = lint_tool_grant_requires_owned_harness(&fixture);
+        assert_eq!(
+            findings.len(),
+            1,
+            "non-owned grant should warn: {findings:?}"
+        );
+        assert_eq!(findings[0].code, "lint.tool_grant_requires_owned_harness");
+
+        // No grant → no finding regardless of provider.
+        let no_grant = whipplescript_parser::compile_program(
+            "workflow W\nagent a {\n  provider fixture\n  profile \"p\"\n  capacity 1\n}\n",
+        )
+        .ir
+        .expect("no-grant ir");
+        assert!(lint_tool_grant_requires_owned_harness(&no_grant).is_empty());
+    }
+
+    #[test]
+    fn lsp_tracks_agent_tool_grant_as_a_workflow_reference() {
+        // DR-0025: a workflow named in an agent `tools [...]` grant is a plain
+        // identifier reference, so the LSP's symbol-table + token-occurrence
+        // machinery (document_symbols + lsp_find_occurrences) resolves it for
+        // free — definition/references/rename/highlight all cover the grant. This
+        // pins that: the workflow is a document symbol, and find_occurrences over
+        // its name catches BOTH the `workflow EchoText` decl and `tools [EchoText]`.
+        let source = "\
+workflow Host {
+  agent worker {
+    provider owned
+    profile \"p\"
+    tools [EchoText]
+  }
+}
+
+@tool
+workflow EchoText {
+  input request R
+  output result Res
+  class R { text string }
+  class Res { echoed string }
+  rule echo
+    when R as request
+  => {
+    done request
+    complete result { echoed request.text }
+  }
+}
+";
+        let symbols = whipplescript_parser::document_symbols(source);
+        assert!(
+            symbols
+                .iter()
+                .any(|symbol| symbol.name == "EchoText" && symbol.kind == "workflow"),
+            "EchoText workflow should be a document symbol: {symbols:?}"
+        );
+        let occurrences = lsp_find_occurrences(source, "EchoText");
+        assert_eq!(
+            occurrences.len(),
+            2,
+            "expected the workflow decl and the tools grant to both match: {occurrences:?}"
+        );
+        // One occurrence is inside the `tools [EchoText]` grant.
+        let grant_offset =
+            source.find("tools [EchoText]").expect("grant present") + "tools [".len();
+        assert!(
+            occurrences
+                .iter()
+                .any(|(start, end)| *start == grant_offset && &source[*start..*end] == "EchoText"),
+            "the grant occurrence should be tracked: {occurrences:?}"
+        );
+    }
+
+    #[test]
     fn case_pattern_matches_bool_scrutinee_values() {
         // The runtime case matcher already compares a bool scrutinee against the
         // `true`/`false` literal patterns (parse_guard_literal -> Value::Bool),
@@ -41556,6 +42140,7 @@ coerce review() -> Review {
                 name: name.to_owned(),
                 version: "0.1.0".to_owned(),
                 registry: ContractRegistry::default(),
+                workflow_tools: Vec::new(),
             }
         }
         let manifests = vec![

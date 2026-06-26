@@ -16,7 +16,7 @@ schemas
   class ReviewBatch
     reviewed int
 agents
-  agent reviewer harness=<fallback> provider=owned profile=repo-reader capacity=1 skills=[] capabilities=[]
+  agent reviewer harness=<fallback> provider=owned profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[]
 assertions
   assert count(ChangeRequest where status == "queued") == 0
     reads

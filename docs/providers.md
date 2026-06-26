@@ -86,6 +86,30 @@ Current scope is **experimental**:
   durable work tracker (files/updates items the workflow's rules observe).
   Per the refined I3, these write shared tracker *state*, never rule-matchable
   facts; `add_todo` items are attributed to the agent (`source: "agent"`).
+- Sub-workflow tools ([DR-0025](https://github.com/jamesjscully/whipplescript/blob/main/spec/decision-records/0025-workflows-as-agent-tools.md)):
+  a `@tool` workflow becomes a typed agent tool (its `input` contract is the
+  tool's JSON schema) that the model may **invoke synchronously** mid-turn. The
+  call blocks the turn until the sub-workflow reaches its terminal, then returns
+  its `output` payload (a non-`completed` terminal surfaces as a tool error). A
+  `@tool` workflow is held to a **convergence check** (it must terminate — no
+  `@service`, no external-signal/`@external`/inbound-message readiness, no
+  `human.ask`, and for v1 no nested `invoke`), so the synchronous block is bounded:
+  it provably will not block forever. This is brokering, not shelling out — the
+  sub-workflow runs through the runtime with first-class parent↔child lineage,
+  durable events, and crash recovery, not as an opaque subprocess. Curation is
+  two-sided: a workflow opts in with `@tool`; an agent is **granted** specific
+  ones with a `tools [WordCount, OpenPr]` field — the in-program curation surface,
+  checked at `whip check` (a granted non-`@tool` is a compile error). Granted
+  names resolve against the same program bundle or a `use`d package; the operator
+  override `WHIPPLESCRIPT_HARNESS_TOOLS=<path>[,<path>…]` still lists out-of-tree
+  `@tool` sources for a turn (merged with the grant, which wins on a name clash).
+  A package exports a `@tool` workflow by shipping its source and listing it in
+  the manifest (`"workflow_tools": [{ "name": …, "source": … }]`); the package
+  contract then carries a convergence-eligibility **attestation** (the tool's
+  derived input/output schema), so a consumer's grant is checked against the
+  contract and the tool is driven from the package's shipped source. See
+  `examples/subworkflow-tool-consumer.whip` (grants the `toolkit` package's
+  `EchoText`).
 - Workspace: the turn operates under `WHIPPLESCRIPT_HARNESS_WORKSPACE` (default:
   the current directory).
 - Model: set `WHIPPLESCRIPT_HARNESS_PROVIDER` (`openai` or `anthropic`) plus
@@ -98,6 +122,10 @@ Current scope is **experimental**:
 - Envelope: a per-turn model-step budget (`WHIPPLESCRIPT_HARNESS_MAX_STEPS`,
   default 16) bounds the loop, and the turn holds a durable workspace lease for
   the duration (a contended workspace blocks, recoverable, rather than racing).
+  The lease is keyed on the **unit of work** (the top-level invocation), not the
+  individual turn, so a turn that synchronously invokes a sub-workflow tool shares
+  its own root's lease re-entrantly rather than self-deadlocking on it; only a
+  *different* unit of work contends ([DR-0025](https://github.com/jamesjscully/whipplescript/blob/main/spec/decision-records/0025-workflows-as-agent-tools.md)).
 - Context: the model's working context is compacted on long turns (old tool
   results elided to references, the System message + first instruction + recent
   window kept verbatim); this touches only what the model re-reads — the durable

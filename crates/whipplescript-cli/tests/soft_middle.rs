@@ -3022,3 +3022,90 @@ fn timer_until_static_checks_reject_bad_operands() {
         let _ = fs::remove_file(source);
     }
 }
+
+/// DR-0025 cross-package `@tool`: an owned-harness agent granted a workflow tool
+/// exported by a `use`d package resolves it from the package attestation, drives
+/// the package's shipped source synchronously, and the parent turn completes. The
+/// example program/lock/package are the committed fixtures. The parent's
+/// `after turn succeeds` only fires if the granted tool resolved and the turn
+/// succeeded, so a completed parent proves the cross-package grant ran end to end.
+#[test]
+fn cross_package_tool_grant_resolves_and_runs() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let consumer = examples.join("subworkflow-tool-consumer.whip");
+    let lock = examples.join("subworkflow-tool-consumer.lock.json");
+    let store = temp_path("xpkg-tool", "sqlite");
+    let workspace = temp_path("xpkg-tool-ws", "dir");
+    let coordination = temp_path("xpkg-tool-coord", "sqlite");
+    fs::create_dir_all(&workspace).expect("workspace dir");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store.to_str().expect("utf-8"),
+            "--json",
+            "dev",
+            consumer.to_str().expect("utf-8"),
+            "--package-lock",
+            lock.to_str().expect("utf-8"),
+            "--root",
+            "ConsumerFlow",
+            "--provider",
+            "owned",
+            "--input",
+            r#"{"request":{"task":"echo it"}}"#,
+            "--until",
+            "idle",
+        ])
+        .env(
+            "WHIPPLESCRIPT_OWNED_FIXTURE_TOOL",
+            r#"EchoText:{"request":{"text":"cross-package regression"}}"#,
+        )
+        .env("WHIPPLESCRIPT_HARNESS_WORKSPACE", &workspace)
+        .env("WHIPPLESCRIPT_COORDINATION_STORE", &coordination)
+        .output()
+        .expect("command runs");
+    assert!(
+        output.status.success(),
+        "dev failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let json_start = stdout.find(['{', '[']).expect("json output");
+    let dev: Value = serde_json::from_str(&stdout[json_start..]).expect("valid json");
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let store_str = store.to_str().expect("utf-8");
+    assert_eq!(
+        instance_status(bin, store_str, instance),
+        "completed",
+        "consumer flow did not complete: {dev}"
+    );
+    // The brokered turn requested and received a result for the granted package
+    // tool — the cross-package invoke path actually ran, not just type-checked.
+    let evidence_kinds = dev
+        .pointer("/provider_evidence/groups")
+        .and_then(Value::as_array)
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(|group| group.get("kind").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert!(
+        evidence_kinds
+            .iter()
+            .any(|kind| kind == "agent.turn.brokered.tool_result"),
+        "expected a brokered tool result from the package tool: {evidence_kinds:?}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(coordination);
+    let _ = fs::remove_dir_all(workspace);
+}

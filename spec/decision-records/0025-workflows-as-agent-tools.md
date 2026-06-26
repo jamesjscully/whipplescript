@@ -1,10 +1,26 @@
 # DR-0025: Workflows as agent tools — the convergence invariant
 
-Status: accepted 2026-06-25 (design). Builds on the owned brokered harness
-([DR-0024](0024-owned-brokered-agent-harness.md)): it extends the slice-4
-capability-facade mechanism to `workflow.invoke`, and it **amends DR-0024 slice 2**
-(the workspace lease becomes re-entrant within an invoke subtree). A follow-on
-implementation slice; the formal convergence model is the gate before code.
+Status: accepted 2026-06-25 (design); v1 implemented 2026-06-25. Builds on the
+owned brokered harness ([DR-0024](0024-owned-brokered-agent-harness.md)): it
+extends the slice-4 capability-facade mechanism to `workflow.invoke`, and it
+**amends DR-0024 slice 2** (the workspace lease becomes re-entrant within an
+invoke subtree). The formal convergence model
+(`models/maude/subworkflow-convergence.maude`) and the re-entrant-lease model
+(`models/maude/subworkflow-lease.maude`) gate the implementation.
+
+## v1 implementation status
+
+Landed (model-gated): the `@tool` tag + per-workflow convergence check
+(terminates, no `@service`, no external-signal/`@external`/inbound-message
+readiness, no `human.ask`, and — conservatively for v1 — must be a leaf with no
+nested `invoke`); synchronous `workflow.invoke` from inside a brokered turn
+(`drive_subworkflow_tool`), exposing each `@tool` workflow as a typed agent tool
+whose schema is its `input` contract; and the re-entrant workspace lease keyed on
+the work-unit root. Curation is the per-agent **`tools [Foo, Bar]` grant** (the
+in-program surface, checked at `whip check`), with `WHIPPLESCRIPT_HARNESS_TOOLS`
+as an operator override; granted names resolve against the same program bundle or
+a `use`d package (cross-package attestation below). Deferred: nested `@tool`
+composition with the acyclic invoke-graph check (still under design).
 
 ## Problem
 
@@ -154,12 +170,35 @@ transitive eligibility Acyclic ⇒ a well-founded bottom-up pass: a @tool workfl
 package boundary       A package exposing a @tool workflow attests in its contract:
                        convergence-eligible + its outgoing invoke edges, so a
                        consumer checks acyclicity/eligibility from the contract
-                       without the source (ATTESTATION FORMAT TBD -- see below).
+                       without the source (see "Attestation format", implemented).
 ```
 
 Failures are ordinary diagnostics: *"workflow X is `@tool` but is `@service` /
 reads signal Y / uses `human.ask`"*, *"invoke-tool cycle X -> Y -> X"*, *"agent A
 is granted Z, which is not `@tool`"*.
+
+### Attestation format (implemented)
+
+A package exports a `@tool` workflow by **shipping its source** and declaring it
+in the manifest:
+
+```json
+"workflow_tools": [ { "name": "EchoText", "source": "tools/echo-text.whip" } ]
+```
+
+When the manifest loads — on the producer (`whip package`) **and** the consumer
+(`use`) side — each entry's source is compiled (with `root = name`) and
+convergence-checked, so a non-`@tool`/non-convergent export fails manifest
+validation. From that the `package_contract_v0` artifact derives a `workflow_tools`
+**attestation** per exported tool: `{ name, package_id, convergence_eligible:
+true, input_schema, output_schema, invokes: [] }`. `input`/`output` become the
+typed tool schema; `invokes` is reserved (empty for v1 leaf tools) for the
+deferred nested-composition acyclicity check. A consumer's `tools [...]` grant
+resolves against the same bundle first, then a `use`d package's exported tools;
+at runtime the granted tool is driven from the package's shipped source through
+the same `drive_subworkflow_tool` facade, with full parent↔child lineage. Modeled
+in `subworkflow-attestation.maude` (the trust boundary: an accepted cross-package
+grant is always backed by a real convergence attestation).
 
 ### The admissible class is model-defined, not enumerated
 
@@ -213,11 +252,11 @@ numeric-bounded recursion  If self/mutual recursion is ever wanted, an explicit
 worktree sub-isolation   Running a sub-workflow in a branched worktree rather than
                          sharing the parent workspace (ties to the DR-0024 atomic-
                          turn-isolation hook).
-attestation format       The package-contract fields a @tool workflow exports for
-                         cross-package convergence checking (the eligibility flag +
-                         its outgoing invoke edges) and how they extend the existing
-                         package_contract_v0 schema. OPEN -- to be designed before
-                         packaged workflow-tools are supported.
+attestation format       IMPLEMENTED (see "Attestation format" above): the
+                         package_contract_v0 `workflow_tools` section attests
+                         eligibility + tool schema + (reserved) outgoing invoke
+                         edges; the manifest ships the tool source. The `invokes`
+                         edges stay empty until nested @tool composition lands.
 ```
 
 ## Formal model plan (gate before code)

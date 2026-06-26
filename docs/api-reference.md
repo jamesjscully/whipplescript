@@ -281,6 +281,10 @@ Other analyses:
   everything under the root (`**` / `**/*`): broader than any concrete call needs.
 - **`lint.deep_after_nesting`** (`info`) — a rule nesting `after` blocks ≥4 levels
   deep; a long effect chain reads more clearly as a `flow`.
+- **`lint.tool_grant_requires_owned_harness`** — an agent with a `tools [...]`
+  grant (DR-0025) that does not use the owned harness (`provider owned`, or a
+  harness of kind `owned`); the grant is dead because sub-workflow tools are only
+  resolved and offered in the owned brokered loop.
 
 Every finding resolves to the source span of the declaration it concerns. The text
 output prefixes each finding with `:line:col` (1-based) and `--json` emits one finding

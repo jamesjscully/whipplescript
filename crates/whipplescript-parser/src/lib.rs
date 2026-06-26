@@ -338,7 +338,13 @@ pub enum AgentField {
     Capacity(u32, SourceSpan),
     Skills(Vec<StringLiteral>, SourceSpan),
     Capabilities(Vec<StringLiteral>, SourceSpan),
-    Unknown { name: Ident, span: SourceSpan },
+    /// `tools [Foo, Bar]`: the workflows this agent may invoke as typed tools
+    /// (DR-0025). Entries are workflow names resolved against the program/packages.
+    Tools(Vec<Ident>, SourceSpan),
+    Unknown {
+        name: Ident,
+        span: SourceSpan,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1090,6 +1096,8 @@ pub struct IrAgent {
     pub capacity: Option<u32>,
     pub skills: Vec<String>,
     pub capabilities: Vec<String>,
+    /// Workflows this agent may invoke as typed tools (DR-0025 `tools [...]`).
+    pub tools: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2107,7 +2115,8 @@ fn agent_field_span(field: &AgentField) -> SourceSpan {
         AgentField::Profile(profile) => profile.span,
         AgentField::Capacity(_, span)
         | AgentField::Skills(_, span)
-        | AgentField::Capabilities(_, span) => *span,
+        | AgentField::Capabilities(_, span)
+        | AgentField::Tools(_, span) => *span,
         AgentField::Unknown { span, .. } => *span,
     }
 }
@@ -2132,6 +2141,14 @@ fn agent_field_line(field: &AgentField) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("  capabilities [{capabilities}]")
+        }
+        AgentField::Tools(tools, _) => {
+            let tools = tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("  tools [{tools}]")
         }
         AgentField::Unknown { name, .. } => format!("  {}", name.name),
     }
@@ -2623,11 +2640,16 @@ impl IrProgram {
                 } else {
                     format!("[{}]", agent.capabilities.join(", "))
                 };
+                let tools = if agent.tools.is_empty() {
+                    "[]".to_owned()
+                } else {
+                    format!("[{}]", agent.tools.join(", "))
+                };
                 push_line(
                     &mut snapshot,
                     format!(
-                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={}",
-                        agent.name, harness, provider, profile, capacity, skills, capabilities
+                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={} tools={}",
+                        agent.name, harness, provider, profile, capacity, skills, capabilities, tools
                     ),
                 );
             }
@@ -5034,6 +5056,7 @@ fn lower_agent(
         capacity: None,
         skills: Vec::new(),
         capabilities: Vec::new(),
+        tools: Vec::new(),
     };
 
     if let Some(harness) = &agent.harness {
@@ -5146,6 +5169,23 @@ fn lower_agent(
                     lowered.capabilities.push(capability.value);
                 }
             }
+            AgentField::Tools(tools, _) => {
+                let mut seen = BTreeSet::new();
+                for tool in tools {
+                    if !seen.insert(tool.name.clone()) {
+                        diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: tool.span,
+                            message: format!(
+                                "agent `{}` grants tool `{}` more than once",
+                                agent.name.name, tool.name
+                            ),
+                            suggestion: Some("remove the duplicate tool entry".to_owned()),
+                        });
+                    }
+                    lowered.tools.push(tool.name);
+                }
+            }
             AgentField::Unknown { name, .. } => {
                 diagnostics.push(Diagnostic { related: Vec::new(),
                     span: name.span,
@@ -5154,7 +5194,7 @@ fn lower_agent(
                         name.name, agent.name.name
                     ),
                     suggestion: Some(
-                        "supported agent fields are `provider`, `profile`, `capacity`, `skills`, and `capabilities`".to_owned(),
+                        "supported agent fields are `provider`, `profile`, `capacity`, `skills`, `capabilities`, and `tools`".to_owned(),
                     ),
                 });
             }
@@ -13581,6 +13621,14 @@ fn format_agent(agent: AgentDecl, formatted: &mut String) {
                     .join(", ");
                 push_line(formatted, format!("  capabilities [{capabilities}]"));
             }
+            AgentField::Tools(tools, _) => {
+                let tools = tools
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                push_line(formatted, format!("  tools [{tools}]"));
+            }
             AgentField::Unknown { name, .. } => {
                 push_line(formatted, format!("  {}", name.name));
             }
@@ -15439,6 +15487,13 @@ impl Parser<'_> {
                         self.synchronize_to_block_item();
                     }
                 }
+                "tools" => {
+                    if let Some((tools, span)) = self.parse_ident_list() {
+                        fields.push(AgentField::Tools(tools, span));
+                    } else {
+                        self.synchronize_to_block_item();
+                    }
+                }
                 _ => {
                     let span = field_name.span;
                     fields.push(AgentField::Unknown {
@@ -16967,6 +17022,27 @@ impl Parser<'_> {
         Some((values, open.span.join(close.span)))
     }
 
+    /// Parse a bracketed list of identifiers, e.g. `[WordCount, OpenPr]`. Used for
+    /// the agent `tools` grant, whose entries reference declared workflows by name.
+    fn parse_ident_list(&mut self) -> Option<(Vec<Ident>, SourceSpan)> {
+        let open = self.expect_symbol('[')?;
+        let mut values = Vec::new();
+
+        while !self.is_at_end() && !self.at_symbol(']') {
+            values.push(self.expect_ident("tool workflow name")?);
+            if self.at_symbol(',') {
+                self.advance();
+            } else if !self.at_symbol(']') {
+                self.unexpected("`,` or `]`");
+                self.synchronize_to_block_item();
+                break;
+            }
+        }
+
+        let close = self.expect_symbol(']')?;
+        Some((values, open.span.join(close.span)))
+    }
+
     fn expect_keyword(&mut self, keyword: &str) -> Option<Token> {
         if self.at_ident(keyword) {
             Some(self.advance().clone())
@@ -17176,6 +17252,7 @@ impl Parser<'_> {
                 || self.at_ident("capacity")
                 || self.at_ident("skills")
                 || self.at_ident("capabilities")
+                || self.at_ident("tools")
             {
                 return;
             }
@@ -18736,6 +18813,53 @@ rule missing_body
     }
 
     #[test]
+    fn lowers_and_formats_agent_tools_grant() {
+        // DR-0025: an agent may declare a `tools [...]` grant of workflows it can
+        // invoke as typed tools. The grant lowers to `IrAgent.tools`, survives a
+        // format round-trip, and de-duplicates entries with a diagnostic.
+        let source = r#"
+workflow GrantHost
+
+agent worker {
+  provider owned
+  profile "repo-writer"
+  capacity 1
+  tools [WordCount, OpenPr]
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("valid ir");
+        let agent = ir
+            .agents
+            .iter()
+            .find(|agent| agent.name == "worker")
+            .expect("worker agent");
+        assert_eq!(
+            agent.tools,
+            vec!["WordCount".to_owned(), "OpenPr".to_owned()]
+        );
+
+        let formatted = format_program(source).formatted.expect("formats");
+        assert!(
+            formatted.contains("tools [WordCount, OpenPr]"),
+            "formatted: {formatted}"
+        );
+
+        // A duplicate grant entry is rejected.
+        let dup = compile_program(
+            "workflow Dup\nagent a {\n  provider owned\n  profile \"p\"\n  tools [X, X]\n}\n",
+        );
+        assert!(
+            dup.diagnostics
+                .iter()
+                .any(|d| d.message.contains("grants tool `X` more than once")),
+            "diagnostics: {:?}",
+            dup.diagnostics
+        );
+    }
+
+    #[test]
     fn accepts_agent_ref_dynamic_tell_targets() {
         let source = r#"
 workflow AgentRefRouting
@@ -19449,7 +19573,7 @@ schemas
     title string
     files array<string>
 agents
-  agent worker harness=<fallback> provider=fixture profile=repo-writer capacity=2 skills=[loft-user] capabilities=[]
+  agent worker harness=<fallback> provider=fixture profile=repo-writer capacity=2 skills=[loft-user] capabilities=[] tools=[]
 rules
   rule start
     when Work as work

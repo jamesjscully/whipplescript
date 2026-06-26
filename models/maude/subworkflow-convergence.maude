@@ -23,6 +23,7 @@ mod WHIPPLESCRIPT-SUBWORKFLOW-CONVERGENCE is
 
   op toolNode : Node -> Cfg [ctor] .      --- a @tool workflow, model-invokable
   op invokes : Node Node -> Cfg [ctor] .  --- caller invokes target as a tool
+  op nonTool : Node -> Cfg [ctor] .       --- a granted invoke target that is NOT an eligible @tool
   op reaches : Node Node -> Cfg [ctor] .  --- transitive closure of invokes
   op signalReads : Node -> Cfg [ctor] .   --- workflow has external signal readiness
   op isService : Node -> Cfg [ctor] .     --- workflow is @service, non-terminating
@@ -48,4 +49,11 @@ mod WHIPPLESCRIPT-SUBWORKFLOW-CONVERGENCE is
 
   --- a @tool workflow tagged @service is non-terminating by construction.
   rl [service-tool] : toolNode(W) isService(W) => toolNode(W) isService(W) nonConvergent .
+
+  --- an agent grant is the source of an invoke edge: granting tool V to an agent
+  --- in workflow W means W can invoke V. If the granted target is not an eligible
+  --- @tool workflow, the invoke is into something the convergence check never
+  --- vetted, so the system is not provably convergent. This is the grant-validity
+  --- invariant: agent A granted Z, where Z is not @tool, is rejected.
+  rl [grant-nontool] : invokes(W, V) nonTool(V) => invokes(W, V) nonTool(V) nonConvergent .
 endm

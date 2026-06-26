@@ -15,13 +15,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use whipplescript_kernel::coerce_native::CoerceProvider;
+use whipplescript_kernel::coerce_native::{json_schema_for_type, CoerceProvider};
 use whipplescript_kernel::harness_loop::{
     BrokeredTurnInput, ChatMessage, HarnessModelClient, HarnessModelError, ModelReply, ToolCall,
     ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
 };
 use whipplescript_kernel::harness_model::RealHarnessModelClient;
 use whipplescript_kernel::{BrokeredTurnContext, RuntimeKernel};
+use whipplescript_parser::IrWorkflowContractKind;
 use whipplescript_store::coordination::{AcquireOutcome, CoordinationStore};
 use whipplescript_store::items::WorkItemStore;
 use whipplescript_store::{StoreError, StoreResult, StoredEvent};
@@ -210,6 +211,16 @@ pub fn file_tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// A registered `@tool` sub-workflow (DR-0025): the tool name the model sees, the
+/// source file to start, and the workflow root within it. Invocation drives the
+/// child synchronously to its terminal via the brokered `workflow.invoke` facade.
+#[derive(Clone)]
+pub struct WorkflowToolEntry {
+    name: String,
+    path: PathBuf,
+    root: String,
+}
+
 /// Executes the slice-1 file tools against a single workspace root, enforcing the
 /// `file store` path policy (no absolute/`..` escape; optional read/write globs).
 pub struct FileToolExecutor {
@@ -221,6 +232,19 @@ pub struct FileToolExecutor {
     tracker_queue: Option<String>,
     holder: String,
     max_bytes: usize,
+    /// Registered `@tool` sub-workflows (DR-0025), dispatched synchronously.
+    workflow_tools: Vec<WorkflowToolEntry>,
+    /// Run-store path the sub-workflow child instances are created in. Set
+    /// together with `workflow_tools`; `None` disables workflow-tool dispatch.
+    store_path: Option<PathBuf>,
+    /// Per-child iteration bound for the synchronous sub-workflow drive.
+    max_child_iterations: usize,
+    /// Work-unit root (DR-0025): the lease holder this turn runs under. Sub-workflow
+    /// children inherit it so they share the root's workspace lease re-entrantly.
+    work_unit: String,
+    /// The parent turn's provider configuration, carried into sub-workflow drives
+    /// so a `@tool` workflow's own effects run under the same provider (DR-0025).
+    provider_ctx: Option<crate::SubworkflowProviderContext>,
 }
 
 impl FileToolExecutor {
@@ -238,7 +262,32 @@ impl FileToolExecutor {
             tracker_queue: None,
             holder: "agent".to_string(),
             max_bytes: DEFAULT_MAX_BYTES,
+            workflow_tools: Vec::new(),
+            store_path: None,
+            max_child_iterations: 8,
+            work_unit: String::new(),
+            provider_ctx: None,
         }
+    }
+
+    /// Register `@tool` sub-workflows (DR-0025) for synchronous dispatch. The
+    /// child instances are created in `store_path`; each tool call drives one
+    /// child to its terminal (bounded by `max_child_iterations`) and returns its
+    /// output payload. Without this, a workflow-tool call is an unknown tool.
+    pub fn with_workflow_tools(
+        mut self,
+        workflow_tools: Vec<WorkflowToolEntry>,
+        store_path: impl Into<PathBuf>,
+        max_child_iterations: usize,
+        work_unit: impl Into<String>,
+        provider_ctx: crate::SubworkflowProviderContext,
+    ) -> Self {
+        self.workflow_tools = workflow_tools;
+        self.store_path = Some(store_path.into());
+        self.max_child_iterations = max_child_iterations.max(1);
+        self.work_unit = work_unit.into();
+        self.provider_ctx = Some(provider_ctx);
+        self
     }
 
     /// Enable the tracker tools against a queue, attributing writes to `holder`
@@ -294,7 +343,46 @@ impl FileToolExecutor {
             TOOL_GREP => self.grep(args),
             TOOL_FIND => self.find(args),
             TOOL_LS => self.ls(args),
-            other => Err(format!("unknown tool `{other}`")),
+            other => match self.workflow_tools.iter().find(|tool| tool.name == other) {
+                Some(tool) => self.invoke_workflow_tool(tool, args),
+                None => Err(format!("unknown tool `{other}`")),
+            },
+        }
+    }
+
+    /// Synchronously run a `@tool` sub-workflow (DR-0025) and return its output.
+    /// The child is convergence-checked at turn setup, so the drive is bounded;
+    /// the tool call blocks the turn until the sub-workflow reaches its terminal.
+    /// A non-`completed` terminal (failed/cancelled) surfaces as a tool error the
+    /// model sees, never a silent success.
+    fn invoke_workflow_tool(
+        &self,
+        tool: &WorkflowToolEntry,
+        args: &Value,
+    ) -> Result<String, String> {
+        let store_path = self.store_path.as_ref().ok_or_else(|| {
+            "workflow tools are not enabled for this turn (no store configured)".to_string()
+        })?;
+        let provider_ctx = self.provider_ctx.as_ref().ok_or_else(|| {
+            "workflow tools are not enabled for this turn (no provider context)".to_string()
+        })?;
+        let input_json = args.to_string();
+        let summary = crate::drive_subworkflow_tool(
+            store_path,
+            &tool.path,
+            &tool.root,
+            &input_json,
+            self.max_child_iterations,
+            &self.work_unit,
+            provider_ctx,
+        )
+        .map_err(|error| format!("sub-workflow `{}` failed to run: {error:?}", tool.name))?;
+        match summary.status.as_str() {
+            "completed" => Ok(summary.payload.to_string()),
+            other => Err(format!(
+                "sub-workflow `{}` terminated `{other}`: {}",
+                tool.name, summary.payload
+            )),
         }
     }
 
@@ -771,12 +859,15 @@ impl FixtureModelClient {
         let tool = std::env::var("WHIPPLESCRIPT_OWNED_FIXTURE_TOOL")
             .ok()
             .and_then(|spec| {
-                let (name, path) = spec.split_once(':')?;
-                Some((
-                    "fixture_call_1".to_string(),
-                    name.to_string(),
-                    json!({ "path": path }),
-                ))
+                let (name, rest) = spec.split_once(':')?;
+                // `tool:{json}` passes the JSON object as the call arguments
+                // verbatim (used for workflow tools, whose input is structured);
+                // `tool:value` is the shorthand for a file tool's `{ "path": value }`.
+                let arguments = match serde_json::from_str::<Value>(rest) {
+                    Ok(value @ Value::Object(_)) => value,
+                    _ => json!({ "path": rest }),
+                };
+                Some(("fixture_call_1".to_string(), name.to_string(), arguments))
             });
         Self { tool }
     }
@@ -810,6 +901,116 @@ impl HarnessModelClient for FixtureModelClient {
             usage: json!({ "output_tokens": 1 }),
         })
     }
+}
+
+/// Build the model-facing tool spec and the dispatch entry for one resolved
+/// `@tool` workflow (DR-0025): the tool name is the workflow name, its declared
+/// `input` contract is the JSON schema, its `description` (if any) the tool blurb,
+/// and `source_path`+root tell the dispatcher how to drive it.
+fn tool_spec_and_entry(
+    ir: &whipplescript_parser::IrProgram,
+    source_path: PathBuf,
+) -> (ToolSpec, WorkflowToolEntry) {
+    let input_schema = ir
+        .workflow_contracts
+        .iter()
+        .find(|contract| contract.kind == IrWorkflowContractKind::Input)
+        .map(|contract| json_schema_for_type(&contract.ty, &ir.schemas))
+        .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": false }));
+    let description = ir
+        .source_descriptions
+        .iter()
+        .find(|desc| desc.target_kind == "workflow" && desc.target == ir.workflow)
+        .map(|desc| desc.value.clone())
+        .unwrap_or_else(|| {
+            format!(
+                "Run the `{}` sub-workflow synchronously and return its output.",
+                ir.workflow
+            )
+        });
+    (
+        ToolSpec {
+            name: ir.workflow.clone(),
+            description,
+            input_schema,
+        },
+        WorkflowToolEntry {
+            name: ir.workflow.clone(),
+            path: source_path,
+            root: ir.workflow.clone(),
+        },
+    )
+}
+
+/// Discover `@tool` sub-workflows (DR-0025) from `WHIPPLESCRIPT_HARNESS_TOOLS`
+/// (comma/newline-separated source paths). This is the operator-level override
+/// for out-of-tree tool files; in-program curation is the per-agent `tools` grant
+/// (see [`load_agent_granted_tools`]). Each path is compiled *for validation* —
+/// running the convergence lint — so a non-`@tool` or non-convergent file fails
+/// the turn at setup rather than blocking it mid-run.
+fn load_workflow_tools() -> Result<(Vec<ToolSpec>, Vec<WorkflowToolEntry>), String> {
+    let Some(raw) = std::env::var("WHIPPLESCRIPT_HARNESS_TOOLS")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut specs = Vec::new();
+    let mut entries = Vec::new();
+    for path in raw
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (_, ir) = crate::compile_source_path_for_validation(path, None)
+            .map_err(|error| crate::child_compile_error(path, error))?;
+        let is_tool = ir.source_tags.iter().any(|tag| {
+            tag.target_kind == "workflow" && tag.target == ir.workflow && tag.name == "tool"
+        });
+        if !is_tool {
+            return Err(format!(
+                "workflow-tool file `{path}` declares `{}`, which is not tagged `@tool`",
+                ir.workflow
+            ));
+        }
+        let (spec, entry) = tool_spec_and_entry(&ir, PathBuf::from(path));
+        specs.push(spec);
+        entries.push(entry);
+    }
+    Ok((specs, entries))
+}
+
+/// Resolve the `tools [...]` grant of the agent running this turn (DR-0025): the
+/// in-program curation surface. Each granted name is resolved to a convergence-
+/// eligible `@tool` workflow (same bundle, or a `use`d package) and turned into a
+/// typed tool. An unresolvable or non-`@tool` grant fails the turn at setup — the
+/// same condition `whip check` rejects statically. Returns empty if the program/
+/// agent context is unavailable (e.g. an ad-hoc turn) or the agent grants nothing.
+fn load_agent_granted_tools(
+    program_path: Option<&Path>,
+    root: Option<&str>,
+    agent: &str,
+    package_lock_path: Option<&Path>,
+) -> Result<(Vec<ToolSpec>, Vec<WorkflowToolEntry>), String> {
+    let Some(program_path) = program_path else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let (_, ir) =
+        crate::compile_source_path_with_root(program_path.to_str().unwrap_or_default(), root)
+            .map_err(|_| "failed to recompile program to resolve agent tool grants".to_string())?;
+    let Some(agent_ir) = ir.agents.iter().find(|candidate| candidate.name == agent) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut specs = Vec::new();
+    let mut entries = Vec::new();
+    for tool in &agent_ir.tools {
+        let resolved = crate::resolve_tool_grant(program_path, &ir, tool, package_lock_path)
+            .map_err(|reason| format!("agent `{agent}` is granted `{tool}`: {reason}"))?;
+        let (spec, entry) = tool_spec_and_entry(&resolved.tool_ir, resolved.source_path);
+        specs.push(spec);
+        entries.push(entry);
+    }
+    Ok((specs, entries))
 }
 
 /// The workspace root a brokered turn operates in: `WHIPPLESCRIPT_HARNESS_WORKSPACE`
@@ -897,10 +1098,44 @@ pub fn run_owned_agent_turn(
     agent: &str,
     profile: Option<&str>,
     input_json: &str,
+    store_path: &Path,
+    max_child_iterations: usize,
+    work_unit_root: Option<&str>,
+    program_path: Option<&Path>,
+    root: Option<&str>,
+    package_lock_path: Option<&Path>,
+    provider_ctx: crate::SubworkflowProviderContext,
 ) -> StoreResult<StoredEvent> {
+    // Re-entrant workspace lease (DR-0025, amends slice 2). The lease holder is
+    // the *root of the unit of work*, not the turn: a turn nested inside a
+    // synchronous sub-workflow invocation (`work_unit_root` set) shares the
+    // root's lease rather than contending with the parent that holds it, and
+    // only the root releases. A top-level turn (`work_unit_root` None) is its own
+    // root and holds the lease under its own instance id.
+    let is_work_unit_root = work_unit_root.is_none();
+    let work_unit = work_unit_root.unwrap_or(instance_id);
     // Resolve the model client before taking the workspace lease, so a config
     // error never leaks a held lease.
     let model_config = resolve_harness_model_config().map_err(StoreError::Conflict)?;
+    // Discover `@tool` sub-workflows (DR-0025) up front: a non-convergent tool
+    // fails the turn at setup, before the lease, so it never leaks a lease. Two
+    // sources: the agent's in-program `tools [...]` grant (the curation surface)
+    // and the `WHIPPLESCRIPT_HARNESS_TOOLS` operator override, merged (the grant
+    // wins on a name collision).
+    let (mut workflow_tool_specs, mut workflow_tools) =
+        load_agent_granted_tools(program_path, root, agent, package_lock_path)
+            .map_err(StoreError::Conflict)?;
+    let (env_specs, env_entries) = load_workflow_tools().map_err(StoreError::Conflict)?;
+    for (spec, entry) in env_specs.into_iter().zip(env_entries) {
+        if workflow_tools
+            .iter()
+            .any(|existing| existing.name == entry.name)
+        {
+            continue;
+        }
+        workflow_tool_specs.push(spec);
+        workflow_tools.push(entry);
+    }
     let workspace = owned_workspace_root();
     let mut executor = FileToolExecutor::new(&workspace);
     let mut tools = file_tool_specs();
@@ -911,6 +1146,18 @@ pub fn run_owned_agent_turn(
     {
         executor = executor.with_tracker(queue, instance_id);
         tools.extend(tracker_tool_specs());
+    }
+    // Sub-workflow tools (DR-0025): curated, convergence-checked workflows the
+    // model may invoke synchronously as typed tools.
+    if !workflow_tools.is_empty() {
+        executor = executor.with_workflow_tools(
+            workflow_tools,
+            store_path,
+            max_child_iterations,
+            work_unit,
+            provider_ctx,
+        );
+        tools.extend(workflow_tool_specs);
     }
     let input = BrokeredTurnInput {
         system: OWNED_SYSTEM_PROMPT.to_string(),
@@ -928,13 +1175,16 @@ pub fn run_owned_agent_turn(
         profile,
     };
 
-    // Slice-2 envelope: hold a durable workspace lease for the turn so concurrent
-    // owned turns coordinate on a shared workspace. A contended workspace blocks
-    // (recoverable) rather than racing; a later worker pass runs it once free.
+    // Slice-2 envelope: hold a durable workspace lease for the unit of work so
+    // concurrent *root* owned turns coordinate on a shared workspace. A contended
+    // workspace blocks (recoverable) rather than racing; a later worker pass runs
+    // it once free. The lease is keyed on the work-unit root (DR-0025), so a
+    // sub-workflow turn re-acquires the lease its own root already holds (`Held`,
+    // idempotent) instead of self-deadlocking.
     let resource = "owned.workspace";
     let key = workspace.display().to_string();
     let mut coordination = CoordinationStore::open(crate::coordination_store_path())?;
-    match coordination.try_acquire(resource, &key, 1, OWNED_LEASE_TTL_SECONDS, instance_id)? {
+    match coordination.try_acquire(resource, &key, 1, OWNED_LEASE_TTL_SECONDS, work_unit)? {
         AcquireOutcome::Held => {}
         AcquireOutcome::Contended { .. } => {
             return kernel.block_effect_binding(
@@ -967,9 +1217,13 @@ pub fn run_owned_agent_turn(
     };
 
     // Release the workspace lease on every terminal (success or failure), mirroring
-    // release_holder_resources_on_terminal for effect-held coordination.
-    if let Ok(mut coordination) = CoordinationStore::open(crate::coordination_store_path()) {
-        let _ = coordination.release(resource, &key, instance_id);
+    // release_holder_resources_on_terminal for effect-held coordination. Only the
+    // work-unit root releases: a nested sub-workflow turn shares the root's lease
+    // and must not drop it out from under the still-running parent (DR-0025).
+    if is_work_unit_root {
+        if let Ok(mut coordination) = CoordinationStore::open(crate::coordination_store_path()) {
+            let _ = coordination.release(resource, &key, work_unit);
+        }
     }
 
     result
@@ -1172,6 +1426,124 @@ mod tests {
         assert_eq!(item_to_todo_status("in_progress"), "in_progress");
         assert_eq!(item_to_todo_status("done"), "completed");
         assert_eq!(item_to_todo_status("cancelled"), "completed");
+    }
+
+    /// A convergent `@tool` leaf workflow that echoes its input back as output,
+    /// so a test can assert input flowed in and the terminal payload flowed out.
+    const ECHO_TOOL_SRC: &str = r#"@tool
+description "Echo the request text back as the result."
+workflow EchoTool {
+  input request EchoRequest
+  output result EchoResult
+
+  class EchoRequest {
+    text string
+  }
+
+  class EchoResult {
+    echoed string
+  }
+
+  rule echo
+    when EchoRequest as request
+  => {
+    done request
+    complete result {
+      echoed request.text
+    }
+  }
+}
+"#;
+
+    /// A `@tool` leaf that always fails, to exercise non-`completed` surfacing.
+    const FAILING_TOOL_SRC: &str = r#"@tool
+workflow FailingTool {
+  input request FailReq
+  output result FailRes
+  failure error FailErr
+
+  class FailReq {
+    text string
+  }
+
+  class FailRes {
+    ok "yes"
+  }
+
+  class FailErr {
+    reason string
+  }
+
+  rule boom
+    when FailReq as request
+  => {
+    done request
+    fail error {
+      reason "tool refused"
+    }
+  }
+}
+"#;
+
+    fn workflow_tool_executor(root: &Path, src: &str, name: &str) -> FileToolExecutor {
+        let tool_path = root.join(format!("{name}.whip"));
+        std::fs::write(&tool_path, src).expect("write tool source");
+        let store_path = root.join("store.db");
+        let entry = WorkflowToolEntry {
+            name: name.to_owned(),
+            path: tool_path,
+            root: name.to_owned(),
+        };
+        FileToolExecutor::new(root).with_workflow_tools(
+            vec![entry],
+            store_path,
+            8,
+            "work-unit-root",
+            crate::SubworkflowProviderContext::fixture(),
+        )
+    }
+
+    #[test]
+    fn invokes_a_tool_subworkflow_synchronously_and_returns_its_payload() {
+        let root = temp_root();
+        let exec = workflow_tool_executor(&root, ECHO_TOOL_SRC, "EchoTool");
+        let out = exec.execute(&call(
+            "EchoTool",
+            json!({ "request": { "text": "alpha beta gamma" } }),
+        ));
+        assert_eq!(out.status, ToolStatus::Ok, "content: {}", out.content);
+        // The child's output payload comes back as the tool result: input flowed
+        // in (request.text) and the terminal `complete result` flowed out.
+        assert!(
+            out.content.contains("alpha beta gamma"),
+            "payload: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_failed_tool_subworkflow_surfaces_as_a_tool_error() {
+        let root = temp_root();
+        let exec = workflow_tool_executor(&root, FAILING_TOOL_SRC, "FailingTool");
+        let out = exec.execute(&call("FailingTool", json!({ "request": { "text": "x" } })));
+        assert_eq!(out.status, ToolStatus::Error, "content: {}", out.content);
+        assert!(
+            out.content.contains("failed") || out.content.contains("tool refused"),
+            "payload: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_unregistered_workflow_tool_is_an_unknown_tool() {
+        let root = temp_root();
+        let exec = workflow_tool_executor(&root, ECHO_TOOL_SRC, "EchoTool");
+        let out = exec.execute(&call("NotRegistered", json!({})));
+        assert_eq!(out.status, ToolStatus::Error);
+        assert!(out.content.contains("unknown tool"));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -147,6 +147,45 @@
     },
     "diagnostics": {
       "$ref": "#/$defs/diagnostics"
+    },
+    "workflow_tools": {
+      "type": "array",
+      "description": "Cross-package @tool workflow attestations (DR-0025): per exported @tool workflow, the eligibility flag, derived input/output tool schemas, and outgoing invoke-tool edges (empty for v1 leaf tools).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "package_id",
+          "convergence_eligible",
+          "input_schema",
+          "output_schema",
+          "invokes"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "package_id": {
+            "type": "string"
+          },
+          "convergence_eligible": {
+            "type": "boolean"
+          },
+          "input_schema": {
+            "type": "object"
+          },
+          "output_schema": {
+            "type": "object"
+          },
+          "invokes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
     }
   },
   "$defs": {
@@ -165,7 +204,13 @@
     "manifest_summary": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "package_id", "name", "version", "manifest_sha256"],
+      "required": [
+        "path",
+        "package_id",
+        "name",
+        "version",
+        "manifest_sha256"
+      ],
       "properties": {
         "path": {
           "type": "string",
@@ -191,7 +236,10 @@
     "platform_construct_family": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "description"],
+      "required": [
+        "id",
+        "description"
+      ],
       "properties": {
         "id": {
           "type": "string",
@@ -230,11 +278,17 @@
           "type": "boolean"
         },
         "required_scope": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1
         },
         "target_capability": {
-          "enum": ["forbidden", "required_capability_call_contract"]
+          "enum": [
+            "forbidden",
+            "required_capability_call_contract"
+          ]
         },
         "required_interfaces": {
           "$ref": "#/$defs/string_array"
@@ -323,7 +377,11 @@
     "fixture_outcome": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["surface", "surface_class", "outcomes"],
+      "required": [
+        "surface",
+        "surface_class",
+        "outcomes"
+      ],
       "properties": {
         "surface": {
           "type": "string",
@@ -354,7 +412,12 @@
       "minProperties": 1,
       "properties": {
         "terminal": {
-          "enum": ["succeeded", "failed", "timed_out", "cancelled"]
+          "enum": [
+            "succeeded",
+            "failed",
+            "timed_out",
+            "cancelled"
+          ]
         },
         "branch": {
           "type": "string",
@@ -379,7 +442,10 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["code", "message"],
+        "required": [
+          "code",
+          "message"
+        ],
         "properties": {
           "code": {
             "type": "string",

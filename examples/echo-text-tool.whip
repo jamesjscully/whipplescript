@@ -1,0 +1,31 @@
+# A `@tool` sub-workflow (DR-0025): a workflow that an owned-harness agent may
+# invoke synchronously as a typed tool. The `@tool` tag opts it in and subjects
+# it to the convergence check — it must terminate (no `@service`), depend only on
+# its own input (no external signals / `@external` rules / inbound messages), and
+# never block on a human. An operator exposes it to a turn by listing its path in
+# `WHIPPLESCRIPT_HARNESS_TOOLS`; its `input`/`output` contracts become the tool's
+# typed JSON schema, and the agent calls it like any other tool.
+@tool
+description "Return the text it is given, unchanged, as a typed result."
+workflow EchoText {
+  input request EchoRequest
+
+  output result EchoResult
+
+  class EchoRequest {
+    text string
+  }
+
+  class EchoResult {
+    echoed string
+  }
+
+  rule echo
+    when EchoRequest as request
+  => {
+    done request
+    complete result {
+      echoed request.text
+    }
+  }
+}
