@@ -11911,8 +11911,9 @@ fn gov(options: &CliOptions) -> ExitCode {
         Some("verify") => gov_verify(options),
         Some("escalate") => gov_escalate(options),
         Some("escalations") => gov_escalations(options),
+        Some("agent") => gov_agent(options),
         _ => {
-            eprintln!("usage: whip gov <sign|verify|escalate|escalations> [args]");
+            eprintln!("usage: whip gov <sign|verify|escalate|escalations|agent> [args]");
             ExitCode::from(2)
         }
     }
@@ -11950,6 +11951,73 @@ fn gov_escalate(options: &CliOptions) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `whip gov agent` — the interactive governance agent loop (DR-0028 D5). PRIVILEGED:
+/// it refuses to start without governance privilege. It reads commands from stdin
+/// (one per line) — the admin types them, or an LLM driver emits them; the loop is
+/// the same. It accumulates a draft governance config from `grant`/`delegate`/`party`
+/// lines, and acts on `show` / `sign <path>` / `escalations` / `quit`. The loop holds
+/// the only path to signing, so the whip agent can never reach it.
+fn gov_agent(_options: &CliOptions) -> ExitCode {
+    use std::io::BufRead;
+    if !gov::has_governance_privilege() {
+        eprintln!("the governance agent requires admin/governance privilege (run via sudo)");
+        return ExitCode::from(1);
+    }
+    let signer = env::var("WHIPPLESCRIPT_GOV_SIGNER").unwrap_or_else(|_| "admin".to_owned());
+    let mut draft = String::new();
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        let trimmed = line.trim();
+        if trimmed == "quit" {
+            break;
+        } else if trimmed.is_empty() {
+            continue;
+        } else if trimmed == "show" {
+            match ifc::Envelope::from_dsl(&draft) {
+                Ok(envelope) => println!("{}", envelope.to_canonical_json()),
+                Err(message) => println!("draft error: {message}"),
+            }
+        } else if let Some(out) = trimmed.strip_prefix("sign ") {
+            match gov::SignedEnvelope::sign(&draft, &signer) {
+                Ok(signed) => match std::fs::write(out.trim(), signed.to_json()) {
+                    Ok(()) => println!("signed and wrote {}", out.trim()),
+                    Err(err) => println!("write error: {err}"),
+                },
+                Err(message) => println!("sign error: {message}"),
+            }
+        } else if trimmed == "escalations" {
+            match env::var("WHIPPLESCRIPT_GOV_ESCALATIONS") {
+                Ok(path) => match gov::list_escalations(std::path::Path::new(&path)) {
+                    Ok(items) if items.is_empty() => println!("no pending escalations"),
+                    Ok(items) => {
+                        for escalation in items {
+                            println!("- from {}: {}", escalation.from, escalation.request);
+                        }
+                    }
+                    Err(message) => println!("{message}"),
+                },
+                Err(_) => println!("set WHIPPLESCRIPT_GOV_ESCALATIONS to review escalations"),
+            }
+        } else if trimmed.starts_with("grant ")
+            || trimmed.starts_with("delegate ")
+            || trimmed.starts_with("party ")
+        {
+            draft.push_str(trimmed);
+            draft.push('\n');
+            println!("ok");
+        } else {
+            println!(
+                "unknown: {trimmed} (commands: grant/delegate/party <…>, show, sign <path>, \
+                 escalations, quit)"
+            );
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// `whip gov escalations` — the governance agent (privileged) reviews pending requests.

@@ -3368,3 +3368,49 @@ fn ifc_escalation_channel_whip_files_gov_reviews() {
 
     let _ = fs::remove_file(&log);
 }
+
+/// End-to-end governance agent loop (DR-0028 D5): privileged, it reads commands
+/// from stdin, drafts a config, and signs; unprivileged, it refuses to start.
+#[test]
+fn ifc_governance_agent_loop_drafts_and_signs() {
+    use std::io::Write;
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let out = temp_path("gov-agent-out", "json");
+    let _ = fs::remove_file(&out);
+    let out_arg = out.to_str().expect("utf-8 path");
+    let script =
+        format!("grant file_store ledger -> file:/x readable by Operator\nsign {out_arg}\nquit\n");
+
+    // privileged: the agent loop drafts and signs
+    let mut child = Command::new(bin)
+        .args(["gov", "agent"])
+        .env("WHIPPLESCRIPT_GOV_ADMIN", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(script.as_bytes())
+        .expect("write script");
+    let output = child.wait_with_output().expect("wait");
+    assert!(output.status.success(), "gov agent loop should succeed");
+    let signed = fs::read_to_string(&out).expect("signed envelope written");
+    assert!(signed.contains("attestation"), "got: {signed}");
+
+    // unprivileged: the agent refuses to start
+    let denied = Command::new(bin)
+        .args(["gov", "agent"])
+        .env_remove("WHIPPLESCRIPT_GOV_ADMIN")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("command runs");
+    assert!(
+        !denied.status.success(),
+        "unprivileged gov agent must refuse"
+    );
+
+    let _ = fs::remove_file(&out);
+}
