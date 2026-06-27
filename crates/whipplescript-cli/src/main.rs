@@ -2654,6 +2654,11 @@ fn check(options: &CliOptions) -> ExitCode {
                     }
                     continue;
                 }
+                if !options.json {
+                    if let Some(report) = ifc::report_for_check(&ir) {
+                        eprint!("{report}");
+                    }
+                }
                 let ifc_diagnostics = ifc::check_ifc_program(&ir);
                 if !ifc_diagnostics.is_empty() {
                     failed = true;

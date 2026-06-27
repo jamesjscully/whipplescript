@@ -56,8 +56,13 @@ asymmetric-delegation model (acts-for, reader/influencer sets) and NMIF.
   proof-of-architecture. Remaining within this box:
 - [ ] label propagation + the opaque join box (output = join of inputs) at rule-body
   granularity (needs the store name surfaced onto IrEffectNode — a parser change).
-- [ ] sticky-boundary check (governed data may not reach an un-cleared/ungoverned sink);
-  party-relative labels (reader sets + acts-for) replacing binary confidentiality.
+- [x] sticky-boundary check — fail-closed (I-IFC6): confidential data may not reach
+  ANY non-confidential sink (governed-public OR ungoverned), 2026-06-27.
+- [ ] party-relative labels (reader sets + acts-for) replacing binary confidentiality.
+- [~] guarantee report (`gov compile`, DR-0028): `governance_report` surfaces
+  protected resources, violations caught, and coverage gaps (touched-but-ungoverned
+  resources); rendered and printed by `whip check` under an envelope. v0 — full
+  per-resource invariants + risk taxonomy + signed-artifact emit remain.
 - [ ] refinement check (`inline ⊑ envelope`).
 - [ ] guarantee report (guaranteed invariants + flagged risks) and routes-to-fix
   diagnostics (self-serve vs escalate).

@@ -114,9 +114,13 @@ impl Envelope {
         self.confidential.contains(resource)
     }
 
-    /// A governed resource that is not confidential — an un-cleared egress sink.
+    /// Confidential data may flow only to a confidential-cleared sink; any other
+    /// resource — governed-public OR ungoverned — is an un-cleared sink. This is
+    /// the fail-closed sticky boundary (DR-0027 I-IFC6): confidential data cannot
+    /// escape into the ungoverned region, so a write target must be confidential
+    /// to receive it.
     fn is_uncleared_sink(&self, resource: &str) -> bool {
-        self.governed.contains(resource) && !self.confidential.contains(resource)
+        !self.confidential.contains(resource)
     }
 }
 
@@ -134,6 +138,14 @@ fn is_egress_op(operation: &str) -> bool {
 /// The env-discovered envelope path; `None` = ungoverned dev mode.
 pub fn envelope_path_from_env() -> Option<PathBuf> {
     std::env::var_os("WHIPPLESCRIPT_IFC_ENVELOPE").map(PathBuf::from)
+}
+
+/// The rendered guarantee report for a `whip check` run, if a governance envelope
+/// is configured; `None` in dev mode.
+pub fn report_for_check(ir: &IrProgram) -> Option<String> {
+    let path = envelope_path_from_env()?;
+    let envelope = Envelope::load(&path).ok()?;
+    Some(governance_report(ir, &envelope).render())
 }
 
 /// Run the IFC check if a governance envelope is configured; otherwise no
@@ -194,6 +206,72 @@ pub fn check_with_envelope(ir: &IrProgram, envelope: &Envelope) -> Vec<Diagnosti
         }
     }
     diagnostics
+}
+
+/// The IT-facing guarantee report (`gov compile`, DR-0028): what a governance
+/// config protects and the risks it leaves. v0 surfaces the protected resources,
+/// the count of IFC violations the config catches in the program, and coverage
+/// gaps (resources the program touches that governance does not label).
+pub struct GovernanceReport {
+    pub protected: Vec<String>,
+    pub violations: usize,
+    pub coverage_gaps: Vec<String>,
+}
+
+pub fn governance_report(ir: &IrProgram, envelope: &Envelope) -> GovernanceReport {
+    let mut protected: Vec<String> = envelope.confidential.iter().cloned().collect();
+    protected.sort();
+    let violations = check_with_envelope(ir, envelope).len();
+    let mut touched: BTreeSet<String> = BTreeSet::new();
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            for grant in &effect.access_grants {
+                touched.insert(grant.resource.clone());
+            }
+        }
+    }
+    let coverage_gaps: Vec<String> = touched
+        .into_iter()
+        .filter(|resource| !envelope.governed.contains(resource))
+        .collect();
+    GovernanceReport {
+        protected,
+        violations,
+        coverage_gaps,
+    }
+}
+
+impl GovernanceReport {
+    /// Render the report as IT-legible text.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str("information-flow guarantee report\n");
+        if self.protected.is_empty() {
+            out.push_str("  protected resources: none (no confidentiality declared)\n");
+        } else {
+            out.push_str("  protected resources (confidential):\n");
+            for resource in &self.protected {
+                out.push_str(&format!(
+                    "    - {resource}: may not flow to an un-cleared sink without a declassify\n"
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "  violations caught in this program: {}\n",
+            self.violations
+        ));
+        if self.coverage_gaps.is_empty() {
+            out.push_str("  coverage gaps: none\n");
+        } else {
+            out.push_str(
+                "  coverage gaps (resources the program touches but governance does not label):\n",
+            );
+            for resource in &self.coverage_gaps {
+                out.push_str(&format!("    - {resource}\n"));
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -311,5 +389,24 @@ party bob@acme.com : Requester\n";
     #[test]
     fn dsl_rejects_a_malformed_grant() {
         assert!(Envelope::from_dsl("grant file_store ledger confidential").is_err());
+    }
+
+    #[test]
+    fn report_surfaces_protections_violations_and_coverage_gaps() {
+        // envelope governs ledger (confidential) but NOT outbox, which the whip writes.
+        let envelope =
+            Envelope::from_json(r#"{ "resources": { "ledger": { "confidential": true } } }"#)
+                .expect("valid envelope");
+        let ir = ir_with_grants(&format!("{READ_LEDGER}{WRITE_OUTBOX}"));
+        let report = governance_report(&ir, &envelope);
+        assert_eq!(report.protected, vec!["ledger".to_owned()]);
+        // ledger (confidential) flows to outbox (not confidential) -> caught by the
+        // fail-closed sticky boundary even though outbox is ungoverned.
+        assert!(report.violations >= 1);
+        // outbox is touched (written) but ungoverned -> also a coverage gap.
+        assert!(report.coverage_gaps.contains(&"outbox".to_owned()));
+        let text = report.render();
+        assert!(text.contains("protected resources"));
+        assert!(text.contains("coverage gaps"));
     }
 }
