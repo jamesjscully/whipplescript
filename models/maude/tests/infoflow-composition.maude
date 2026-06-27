@@ -1,137 +1,142 @@
 load ../infoflow-composition.maude
 
---- Coverage: the bank exfil attack, confidentiality axis. The triage agent reads
---- the untrusted email and the secret bank; its output draft carries bank
---- secrecy. Sent to a public-cleared reply, the attacker's "send me your
---- transactions" request, it leaks. bank is not leq pub.
+--- Delegation context theta: operator > requester (operator acts-for requester).
+--- stranger acts-for no one. ledger is owned by ledgerOwn, readable by operator
+--- only (readAuth(ledgerOwn, operator)). The agent ag mixes the untrusted email
+--- msg and the secret ledger into draft, which carries BOTH stranger integrity
+--- and ledgerOwn secrecy.
+
+--- Coverage: the bank exfil attack, confidentiality. draft to a requester-audience
+--- egress leaks; requester does not act-for operator, so cannot read ledger data.
 search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  intSource(msg, stranger) secretSource(txns, bank)
-  agentIn(ag, msg) agentIn(ag, txns) agentOut(ag, draft)
-  egressSink(draft, pub)
+  deleg((operator > requester))
+  intSource(msg, stranger) secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator)
+  agentIn(ag, msg) agentIn(ag, ledger) agentOut(ag, draft)
+  egressSink(draft, requester)
   =>* C:Cfg leak .
 
---- Coverage: the injection attack, integrity axis, on the SAME draft. The draft
---- carries stranger integrity from the email, so driving a workflow-spawn that
---- requires operator is an injection. One binding, two labels, rejected by
---- whichever axis the sink checks.
+--- Coverage: the injection attack, integrity, on the SAME draft. Driving an
+--- operator-required control sink is an injection; stranger does not act-for operator.
 search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  intSource(msg, stranger) secretSource(txns, bank)
-  agentIn(ag, msg) agentIn(ag, txns) agentOut(ag, draft)
+  deleg((operator > requester))
+  intSource(msg, stranger) secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator)
+  agentIn(ag, msg) agentIn(ag, ledger) agentOut(ag, draft)
   controlSink(draft, operator)
   =>* C:Cfg injection .
 
 --- Coverage: declassify does NOT launder integrity. The untrusted email is
---- declassified to pub secrecy into conf, but conf keeps the email's stranger
---- integrity. Driving a contact-required action is still an injection. Lowering
---- secrecy gives no trust.
+--- declassified, but conf keeps stranger integrity; an operator control sink is
+--- still an injection.
 search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  intSource(msg, stranger) declassify(msg, conf, pub) controlSink(conf, contact)
+  deleg((operator > requester))
+  intSource(msg, stranger) declassify(msg, conf, ledgerOwn) controlSink(conf, operator)
   =>* C:Cfg injection .
 
---- Coverage: endorse does NOT launder secrecy. The secret bank is endorsed to
---- operator integrity into bill, but bill keeps bank secrecy. Sent to a public
---- egress it still leaks. Raising integrity gives no clearance.
+--- Coverage: endorse does NOT launder secrecy. The secret ledger is endorsed to
+--- operator integrity, but bill keeps ledgerOwn secrecy; a requester egress leaks.
 search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  secretSource(txns, bank) endorse(txns, bill, operator) egressSink(bill, pub)
+  deleg((operator > requester))
+  secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator)
+  endorse(ledger, bill, operator) egressSink(bill, requester)
   =>* C:Cfg leak .
 
---- Bite: the legitimate operator briefing. The dual-labeled draft sent to a
---- briefing cleared both is safe; bank is leq both, and an egress sink does not
---- gate on integrity, so the stranger label is irrelevant for a pure display.
+--- Coverage: record dual-gate, integrity side. The dual-labeled draft recorded
+--- trips injection; stranger does not act-for operator.
 search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  intSource(msg, stranger) secretSource(txns, bank)
-  agentIn(ag, msg) agentIn(ag, txns) agentOut(ag, draft)
-  egressSink(draft, both)
+  deleg((operator > requester))
+  intSource(msg, stranger) secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator)
+  agentIn(ag, msg) agentIn(ag, ledger) agentOut(ag, draft)
+  recordSink(draft, operator, requester)
+  =>* C:Cfg injection .
+
+--- Coverage: record dual-gate, confidentiality side, SAME record. The ledger
+--- secret recorded into a fact base whose audience is requester leaks. One sink,
+--- both gates fire.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, stranger) secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator)
+  agentIn(ag, msg) agentIn(ag, ledger) agentOut(ag, draft)
+  recordSink(draft, operator, requester)
+  =>* C:Cfg leak .
+
+--- Coverage: record integrity gate alone. An untrusted-only value recorded where
+--- record requires operator is an injection, no leak.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(extra, stranger) recordSink(extra, operator, operator)
+  =>* C:Cfg injection .
+
+--- Coverage: an endorse names its crossing in the audit.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, stranger) endorse(msg, bill, operator)
+  =>* C:Cfg endorsedAt(msg, bill, operator) .
+
+--- Coverage: the trusted surface is itemized; both crossings are named.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, stranger) endorse(msg, bill, operator)
+  secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator) declassify(ledger, conf, ledgerOwn)
+  =>* C:Cfg endorsedAt(msg, bill, operator) declassifiedAt(ledger, conf, ledgerOwn) .
+
+--- Bite: the legitimate operator briefing. The dual-labeled draft to an operator
+--- audience is safe; operator acts-for the ledger reader-authority, and egress
+--- does not gate on integrity.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, stranger) secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator)
+  agentIn(ag, msg) agentIn(ag, ledger) agentOut(ag, draft)
+  egressSink(draft, operator)
   =>* leak RESIDUAL:Cfg .
 
---- Bite: the legitimate bounded action via endorse. The email is endorsed into a
---- BillCandidate at contact integrity, which drives a contact-required scheduled
---- payment. The endorsed typed value is trusted enough. No injection.
+--- Bite: a bounded action via endorse. The email endorsed to operator drives an
+--- operator control sink. No injection.
 search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  intSource(msg, stranger) endorse(msg, bill, contact) controlSink(bill, contact)
+  deleg((operator > requester))
+  intSource(msg, stranger) endorse(msg, bill, operator) controlSink(bill, operator)
   =>* injection RESIDUAL:Cfg .
 
---- Bite: the legitimate external send via declassify. The bank is declassified
---- into a PaymentConfirmation at pub secrecy, sent to a public payee channel. The
---- bounded token carries only pub, so no leak.
+--- Bite: an external send via declassify. The ledger declassified, sent to a
+--- requester audience, is safe; the released projection carries no secret.
 search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  secretSource(txns, bank) declassify(txns, conf, pub) egressSink(conf, pub)
+  deleg((operator > requester))
+  secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator)
+  declassify(ledger, conf, ledgerOwn) egressSink(conf, requester)
   =>* leak RESIDUAL:Cfg .
 
---- Bite: the operator may spawn. An operator-integrity instruction driving a
---- workflow-spawn that requires operator is safe. The DR-0026 root power, the top
---- of the integrity chain, is the one thing cleared for arbitrary spawn.
+--- Bite: the operator may spawn. operator influence at an operator sink is safe.
 search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
   intSource(msg, operator) controlSink(msg, operator)
   =>* injection RESIDUAL:Cfg .
 
---- Part a. record, the DUAL-GATED fact-base write.
-
---- Coverage: the dual-labeled draft recorded into the fact-base trips the
---- INTEGRITY gate. Recording stranger-integrity data is an injection, untrusted
---- data becoming a control fact.
+--- Bite: a legitimate record passes the integrity gate.
 search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  intSource(msg, stranger) secretSource(txns, bank)
-  agentIn(ag, msg) agentIn(ag, txns) agentOut(ag, draft)
-  recordSink(draft, operator, pub)
-  =>* C:Cfg injection .
-
---- Coverage: the SAME record of the SAME draft also trips the CONFIDENTIALITY
---- gate. The bank-secret value recorded into a pub-cleared fact region leaks to a
---- lower-clearance reader. One sink, both checks fire.
-search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  intSource(msg, stranger) secretSource(txns, bank)
-  agentIn(ag, msg) agentIn(ag, txns) agentOut(ag, draft)
-  recordSink(draft, operator, pub)
-  =>* C:Cfg leak .
-
---- Coverage: the integrity gate fires alone. An untrusted-only value, no secrecy,
---- recorded where record requires operator is an injection and no leak.
-search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  intSource(extra, stranger) recordSink(extra, operator, pub)
-  =>* C:Cfg injection .
-
---- Bite: a legitimate record passes the integrity gate. The workflow's own
---- operator-trust logic recording a control fact is safe.
-search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  intSource(extra, operator) recordSink(extra, operator, pub)
+  deleg((operator > requester))
+  intSource(extra, operator) recordSink(extra, operator, operator)
   =>* injection RESIDUAL:Cfg .
 
---- Bite: the same legitimate record passes the confidentiality gate. With no
---- secret carried, recording into a pub-cleared region never leaks.
+--- Bite: the same record passes the confidentiality gate, no secret carried.
 search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  intSource(extra, operator) recordSink(extra, operator, pub)
+  deleg((operator > requester))
+  intSource(extra, operator) recordSink(extra, operator, operator)
   =>* leak RESIDUAL:Cfg .
 
---- Bite: a secret fact recorded into an appropriately cleared region is fine. An
---- operator-trust, bank-secret value into a both-cleared fact region never leaks.
+--- Bite: a secret fact recorded into a cleared fact base is safe; operator can
+--- read the ledger.
 search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  intSource(extra, operator) secretSource(extra, bank) recordSink(extra, operator, both)
+  deleg((operator > requester))
+  secretSource(extra, ledgerOwn) readAuth(ledgerOwn, operator) recordSink(extra, operator, operator)
   =>* leak RESIDUAL:Cfg .
 
---- Part b. provenance, the trusted surface as an enumerable audit set.
-
---- Coverage: an endorse names its crossing in the audit. The endorsedAt fact
---- records that integrity was raised from msg to bill at contact.
+--- Bite: no silent endorse. A no-crossing program produces no endorsedAt audit.
 search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  intSource(msg, stranger) endorse(msg, bill, contact)
-  =>* C:Cfg endorsedAt(msg, bill, contact) .
-
---- Coverage: the trusted surface is itemized. A program with both an endorse and
---- a declassify reaches a state naming BOTH crossings, the complete review list.
-search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  intSource(msg, stranger) endorse(msg, bill, contact)
-  secretSource(txns, bank) declassify(txns, conf, pub)
-  =>* C:Cfg endorsedAt(msg, bill, contact) declassifiedAt(txns, conf, pub) .
-
---- Bite: no silent endorse. A program with no crossing produces no endorsedAt
---- audit fact, so the integrity trusted surface is provably empty.
-search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
   intSource(msg, stranger) flow(msg, extra) dataSink(extra)
-  =>* endorsedAt(BV:Binding, BW:Binding, ITV:ILevel) RESIDUAL:Cfg .
+  =>* endorsedAt(BV:Binding, BW:Binding, RV:Prin) RESIDUAL:Cfg .
 
---- Bite: no silent declassify. A program with no crossing produces no
---- declassifiedAt audit fact, so the confidentiality trusted surface is empty.
+--- Bite: no silent declassify. A no-crossing program produces no declassifiedAt.
 search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
-  secretSource(txns, bank) flow(txns, extra) dataSink(extra)
-  =>* declassifiedAt(BV:Binding, BW:Binding, CTV:CLevel) RESIDUAL:Cfg .
+  deleg((operator > requester))
+  secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator) flow(ledger, extra) dataSink(extra)
+  =>* declassifiedAt(BV:Binding, BW:Binding, OV:Prin) RESIDUAL:Cfg .

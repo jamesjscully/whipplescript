@@ -1,99 +1,98 @@
---- Information-flow control, the confidentiality lattice, multi-point. The
---- anti-exfiltration direction. EXPLORATORY research model for the information-
---- flow thread noted in DR-0026; not yet a decision record. Modeled first per
---- standing discipline. Generalizes the earlier two-point sketch to a real
---- lattice with more than two levels AND with incomparable elements.
+--- Information-flow control, the confidentiality lattice, PARTY-RELATIVE. The
+--- anti-exfiltration direction, dual of infoflow-integrity. Upgrades the earlier
+--- single-owner diamond to the decentralized / asymmetric-delegation model of
+--- DR-0027 I-IFC1: confidentiality is "who may read", principals are ordered by
+--- an ACTS-FOR relation, the delegation context theta, a general partial order.
 ---
---- Data leakage is a CONFIDENTIALITY violation: high-secrecy data reaching a sink
---- not cleared for it. Bell-LaPadula. Secrecy levels form a lattice; combining
---- data takes the JOIN, the least upper bound. A sink has a clearance C and
---- accepts a binding only when every secrecy level the binding carries is leq C.
+--- Each owner o protects its secret with a reader-authority r: the secret is
+--- readable by a party p iff p acts-for r -- p has at least r's authority. A leak
+--- is a carried owner-secret reaching a sink audience p that cannot read it.
+--- Different owners' reader authorities may be INCOMPARABLE, which is exactly
+--- "protected from whom": a bank-cleared party cannot read email-owned data.
 ---
---- The lattice here is the four-point DIAMOND, the powerset of two compartments:
----
----        both          top, carries bank AND email secrecy
----        /  \
----     bank   email     two INCOMPARABLE compartments
----        \  /
----         pub          bottom, public
----
---- bank and email are incomparable: neither leq the other. join(bank,email)=both.
---- This is what proves multi-tenant and multi-source separation: data in
---- compartment bank reaching a sink cleared only for email is a leak, because
---- bank is not leq email. A two-point lattice cannot express this; a chain cannot
---- either. The diamond is the smallest lattice that shows incomparability.
----
---- Encoding: rather than store one joined label per binding, each secrecy level a
---- binding carries is an independent token carriesC(B, L). A binding leaks at a
---- sink with clearance C iff ANY carried L has leq(L, C) = false. That is exactly
---- join(all carried) leq C, since join is the least upper bound, and it handles
---- incomparable carried levels with no extra machinery.
+--- Modeling note: an owner's reader set is the up-set of a single reader-authority
+--- r (all p with p acts-for r), which keeps the check pairwise (one canAct, like
+--- the integrity dual). General reader sets as unions of up-sets are a later
+--- refinement.
 ---
 --- Grounding in whipplescript constructs:
----   secretSource(B, L)    a file_store or memory pool read at secrecy level L:
----                         bank transactions at bank, an email body at email.
----   flow                  a binding use, a payload field, and an agent turn as a
----                         join box, an edge per input to its output.
----   declassify(B1, B2, T) an explicit declassify of a bounded typed value to a
----                         lower target level T. B2 carries only T, never B1's
----                         level. The type bounds the leak bandwidth.
----   egressSink(B, C)      a sink with clearance C: an external reply cleared pub,
----                         a bank portal cleared bank, your own briefing cleared
----                         both. Accepts B only when all carried levels leq C.
----
---- The marker leak records any path where a carried secrecy level exceeds the
---- sink clearance. A well-typed program never reaches it.
+---   secretSource(B, o)   B read from a resource owned by o at its classification.
+---   flow                 a binding use / payload field / agent join box.
+---   readAuth(o, r)       governance: o's secret is readable by parties acting-for r.
+---   declassify(B1,B2,o)  o's explicit, authority-scoped release: B2 is the public
+---                        projection, carrying none of o's secret.
+---   egressSink(B, p)     an outbound sink whose audience is party p.
+---   deleg(REL)           the delegation context theta as acts-for edges P > Q.
 mod WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY is
   protecting BOOL .
-  sorts Binding Level Cfg .
+  sorts Prin PSet Edge Rel Binding Cfg .
+  subsort Prin < PSet .
+  subsort Edge < Rel .
 
-  ops b1 b2 b3 b4 a1 : -> Binding [ctor] .
-  ops pub bank email both : -> Level [ctor] .
+  ops operator bankRole emailRole public : -> Prin [ctor] .
+  ops b1 b2 b3 b4 : -> Binding [ctor] .
 
-  --- the diamond join, least upper bound. comm so argument order is free.
-  op join : Level Level -> Level [comm] .
-  vars LA LB LC : Level .
-  eq join(pub, LA) = LA .          --- pub is bottom, the identity
-  eq join(both, LA) = both .       --- both is top, absorbing
-  eq join(LA, LA) = LA .           --- idempotent
-  eq join(bank, email) = both .    --- the two compartments join to the top
+  op noP : -> PSet [ctor] .
+  op _,_ : PSet PSet -> PSet [ctor assoc comm id: noP] .
+  eq P:Prin , P:Prin = P:Prin .
 
-  --- the induced order: LA leq LB iff joining them stays at LB
-  op leq : Level Level -> Bool .
-  eq leq(LA, LB) = join(LA, LB) == LB .
+  op _>_ : Prin Prin -> Edge [ctor] .
+  op emptyR : -> Rel [ctor] .
+  op _|_ : Rel Rel -> Rel [ctor assoc comm id: emptyR] .
+  eq E:Edge | E:Edge = E:Edge .
+
+  op inSet : Prin PSet -> Bool .
+  eq inSet(P:Prin, (P:Prin , S:PSet)) = true .
+  eq inSet(P:Prin, S:PSet) = false [owise] .
+
+  op succs : Prin Rel -> PSet .
+  eq succs(P:Prin, (P:Prin > Q:Prin) | R:Rel) = Q:Prin , succs(P:Prin, R:Rel) .
+  eq succs(P:Prin, R:Rel) = noP [owise] .
+
+  op canAct : Rel Prin Prin -> Bool .
+  op reach : Rel PSet Prin PSet -> Bool .
+  eq canAct(R:Rel, W:Prin, T:Prin) = reach(R:Rel, W:Prin, T:Prin, noP) .
+  eq reach(R:Rel, (T:Prin , F:PSet), T:Prin, V:PSet) = true .
+  eq reach(R:Rel, noP, T:Prin, V:PSet) = false .
+  ceq reach(R:Rel, (P:Prin , F:PSet), T:Prin, V:PSet)
+    = reach(R:Rel, F:PSet, T:Prin, V:PSet)
+    if P:Prin =/= T:Prin /\ inSet(P:Prin, V:PSet) .
+  ceq reach(R:Rel, (P:Prin , F:PSet), T:Prin, V:PSet)
+    = reach(R:Rel, (F:PSet , succs(P:Prin, R:Rel)), T:Prin, (P:Prin , V:PSet))
+    if P:Prin =/= T:Prin /\ inSet(P:Prin, V:PSet) =/= true .
 
   op none : -> Cfg [ctor] .
   op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
 
-  op secretSource : Binding Level -> Cfg [ctor] .   --- sensitive origin at level L
-  op flow : Binding Binding -> Cfg [ctor] .          --- data-flow edge B1 into B2
-  op declassify : Binding Binding Level -> Cfg [ctor] . --- bounded typed crossing to T
-  op egressSink : Binding Level -> Cfg [ctor] .      --- sink with clearance C
-  op carriesC : Binding Level -> Cfg [ctor] .        --- derived, B carries secrecy L
-  op leak : -> Cfg [ctor] .                          --- violation, secret exceeded a clearance
+  op deleg : Rel -> Cfg [ctor] .                  --- the delegation context theta
+  op secretSource : Binding Prin -> Cfg [ctor] .  --- B carries owner o's secret
+  op secretOf : Binding Prin -> Cfg [ctor] .      --- derived secret token
+  op flow : Binding Binding -> Cfg [ctor] .
+  op readAuth : Prin Prin -> Cfg [ctor] .         --- owner o readable by parties acting-for r
+  op declassify : Binding Binding Prin -> Cfg [ctor] . --- o releases B2 as public
+  op egressSink : Binding Prin -> Cfg [ctor] .    --- outbound sink, audience party p
+  op leak : -> Cfg [ctor] .                       --- violation
 
-  vars B B1 B2 : Binding .  var T : Level .  var C : Level .  var L : Level .
+  vars B B1 B2 : Binding .  vars O P R : Prin .  var REL : Rel .
 
-  --- idempotent derived facts so propagation reaches a finite fixpoint
-  eq carriesC(B, L) carriesC(B, L) = carriesC(B, L) .
+  eq secretOf(B, O) secretOf(B, O) = secretOf(B, O) .
   eq leak leak = leak .
 
-  --- seed each sensitive source with its secrecy level
-  rl [seed] : secretSource(B, L) => secretSource(B, L) carriesC(B, L) .
+  --- seed secrets at sources
+  rl [seed] : secretSource(B, O) => secretSource(B, O) secretOf(B, O) .
 
-  --- secrecy propagates along every flow edge, including through an agent join
-  --- box. Each carried level propagates independently, so a join box that mixes
-  --- bank and email ends up carrying both, exceeding any single-compartment sink.
-  rl [prop] : carriesC(B1, L) flow(B1, B2) => carriesC(B1, L) flow(B1, B2) carriesC(B2, L) .
+  --- secrecy propagates along every flow edge (the agent join box is the same)
+  rl [prop] : secretOf(B1, O) flow(B1, B2) => secretOf(B1, O) flow(B1, B2) secretOf(B2, O) .
 
-  --- declassify yields a fresh binding carrying ONLY the bounded target level T,
-  --- never the source level. There is no rule crossing the source level over a
-  --- declassify, which is what makes the declassified-path bite hold.
-  rl [declassify-seed] : declassify(B1, B2, T) => declassify(B1, B2, T) carriesC(B2, T) .
+  --- declassify has NO rule: there is no flow into B2 and no rule crosses a secret
+  --- over a declassify, so B2 is the public projection carrying none of o's secret.
+  --- Adding such a rule would make the declassified-path bite satisfiable.
+  --- (Grant-authorization of the declassify is the NMIF increment, modeled next.)
 
-  --- violation: a carried secrecy level not cleared by the sink. With more than
-  --- two levels this fires both for too-high data and for incomparable data, a
-  --- bank value reaching an email-cleared sink.
-  crl [exfil] : carriesC(B, L) egressSink(B, C) => carriesC(B, L) egressSink(B, C) leak
-    if leq(L, C) = false .
+  --- violation: a carried owner-secret reaching a sink audience p who cannot read
+  --- it, p does not act-for o's reader authority r. Fires for too-low parties and
+  --- for incomparable ones, an email-cleared party reaching bank-owned data.
+  crl [exfil] : secretOf(B, O) egressSink(B, P) deleg(REL) readAuth(O, R)
+    => secretOf(B, O) egressSink(B, P) deleg(REL) readAuth(O, R) leak
+    if canAct(REL, P, R) =/= true .
 endm

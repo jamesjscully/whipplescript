@@ -21,10 +21,12 @@ asymmetric-delegation model (acts-for, reader/influencer sets) and NMIF.
 - [x] integrity model party-relative — acts-for reflexive-transitive closure
   (`canAct`), influence tokens, control sink requiring authority; 4 coverage + 4
   bite, gate-green (`models/maude/infoflow-integrity.maude`), 2026-06-27.
-- [ ] confidentiality model party-relative — owner-secret tokens + allowed-readers
-  with acts-for closure; incomparable readers.
-- [ ] composition model party-relative — both axes, explicit join node, dual-gated
-  `record`, the audited trusted surface.
+- [x] confidentiality model party-relative — owner-secret tokens + reader-authority
+  (`readAuth`) with acts-for closure; incomparable compartments; 4+4 gate-green
+  (`models/maude/infoflow-confidentiality.maude`), 2026-06-27.
+- [x] composition model party-relative — both axes, explicit join node, dual-gated
+  `record`, axis-locked endorse/declassify, the audited trusted surface; 9+9
+  gate-green (`models/maude/infoflow-composition.maude`), 2026-06-27.
 - [ ] NMIF increment — robust downgrade: an `endorse`/`declassify` may not be
   influenced by an attacker; grant-authorization of the crossing.
 - [ ] TLA+ — durable label carriage (I-IFC7) + envelope versioning / non-retroactive
