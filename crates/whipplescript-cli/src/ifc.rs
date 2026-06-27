@@ -1,0 +1,234 @@
+//! Information-flow control checking (DR-0027 / DR-0028) — first vertical slice.
+//!
+//! A governance envelope (JSON; the signed-artifact form that the DR-0028
+//! governance DSL will compile to) labels real resources by confidentiality. This
+//! slice enforces the **turn-level join box** (DR-0027 I-IFC2): an agent turn
+//! granted a READ on a confidential resource and a WRITE/egress on an un-cleared
+//! resource could carry the confidential data out, so it is rejected — unless the
+//! contexts are separated or the value is declassified.
+//!
+//! Scope of this slice: binary confidentiality, turn-grant granularity. The
+//! party-relative labels (the gate-green Maude models) and the source crossings
+//! (`endorsed` / `declassify`) arrive in later slices.
+//!
+//! Discovery follows the gradual model (DR-0027 I-IFC6): `WHIPPLESCRIPT_IFC_ENVELOPE`
+//! points at the envelope; unset = ungoverned dev mode (a plain whip making no IFC
+//! claim).
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use whipplescript_parser::{Diagnostic, IrProgram};
+
+/// Resource confidentiality, projected from the governance envelope.
+pub struct Envelope {
+    confidential: BTreeSet<String>,
+    governed: BTreeSet<String>,
+}
+
+impl Envelope {
+    /// Parse the JSON envelope. Shape:
+    /// `{ "resources": { "<name>": { "confidential": true|false }, ... } }`.
+    pub fn from_json(text: &str) -> Result<Self, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|err| format!("invalid IFC envelope: {err}"))?;
+        let mut confidential = BTreeSet::new();
+        let mut governed = BTreeSet::new();
+        if let Some(map) = value.get("resources").and_then(|res| res.as_object()) {
+            for (name, label) in map {
+                governed.insert(name.clone());
+                if label
+                    .get("confidential")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    confidential.insert(name.clone());
+                }
+            }
+        }
+        Ok(Self {
+            confidential,
+            governed,
+        })
+    }
+
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|err| format!("cannot read IFC envelope {}: {err}", path.display()))?;
+        Self::from_json(&text)
+    }
+
+    fn is_confidential(&self, resource: &str) -> bool {
+        self.confidential.contains(resource)
+    }
+
+    /// A governed resource that is not confidential — an un-cleared egress sink.
+    fn is_uncleared_sink(&self, resource: &str) -> bool {
+        self.governed.contains(resource) && !self.confidential.contains(resource)
+    }
+}
+
+fn is_read_op(operation: &str) -> bool {
+    matches!(operation, "read" | "recall" | "get" | "list" | "import")
+}
+
+fn is_egress_op(operation: &str) -> bool {
+    matches!(
+        operation,
+        "write" | "learn" | "send" | "notify" | "emit" | "export" | "append" | "queue"
+    )
+}
+
+/// The env-discovered envelope path; `None` = ungoverned dev mode.
+pub fn envelope_path_from_env() -> Option<PathBuf> {
+    std::env::var_os("WHIPPLESCRIPT_IFC_ENVELOPE").map(PathBuf::from)
+}
+
+/// Run the IFC check if a governance envelope is configured; otherwise no
+/// constraints apply (dev mode) and this returns no diagnostics.
+pub fn check_ifc_program(ir: &IrProgram) -> Vec<Diagnostic> {
+    let Some(path) = envelope_path_from_env() else {
+        return Vec::new();
+    };
+    match Envelope::load(&path) {
+        Ok(envelope) => check_with_envelope(ir, &envelope),
+        // A malformed envelope is the governance compiler's error to report (a
+        // later slice), not `whip check`'s; do not block the check on it.
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The turn-level join-box check: a turn that reads a confidential resource and
+/// egresses to an un-cleared one is flagged.
+pub fn check_with_envelope(ir: &IrProgram, envelope: &Envelope) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            let mut confidential_read: Option<&str> = None;
+            let mut uncleared_sink: Option<&str> = None;
+            for grant in &effect.access_grants {
+                let resource = grant.resource.as_str();
+                for op in &grant.operations {
+                    if confidential_read.is_none()
+                        && is_read_op(&op.operation)
+                        && envelope.is_confidential(resource)
+                    {
+                        confidential_read = Some(resource);
+                    }
+                    if uncleared_sink.is_none()
+                        && is_egress_op(&op.operation)
+                        && envelope.is_uncleared_sink(resource)
+                    {
+                        uncleared_sink = Some(resource);
+                    }
+                }
+            }
+            if let (Some(src), Some(sink)) = (confidential_read, uncleared_sink) {
+                diagnostics.push(Diagnostic {
+                    span: effect.span,
+                    message: format!(
+                        "information-flow violation in rule `{rule}`: this turn may read \
+                         confidential `{src}` and write un-cleared `{sink}`, so the confidential \
+                         data could flow out",
+                        rule = rule.name,
+                    ),
+                    suggestion: Some(format!(
+                        "separate the contexts — read `{src}` in a distinct turn and pass only a \
+                         bounded result; or declassify the value before writing `{sink}`"
+                    )),
+                    related: Vec::new(),
+                });
+            }
+        }
+    }
+    diagnostics
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use whipplescript_parser::compile_program;
+
+    const ENVELOPE: &str = r#"{ "resources": {
+        "ledger": { "confidential": true },
+        "outbox": { "confidential": false }
+    } }"#;
+
+    /// Build a whip whose single turn carries the given `with access to` grant
+    /// blocks, declaring both a `ledger` (read) and `outbox` (write) file store.
+    fn ir_with_grants(grants: &str) -> IrProgram {
+        let program = format!(
+            r#"@service
+workflow IfcTest
+
+output result R
+class R {{ ok bool }}
+class Ticket {{ id string  status "open" }}
+
+agent coder {{ provider fixture  profile "repo-writer"  capacity 1 }}
+
+file store ledger {{ root "./ledger"  allow read ["**"] }}
+file store outbox {{ root "./outbox"  allow write ["**"] }}
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+  when coder is available
+=> {{
+  tell coder as turn
+{grants}  "go"
+
+  after turn succeeds as outcome {{
+    complete result {{ ok true }}
+  }}
+}}
+"#
+        );
+        let compiled = compile_program(&program);
+        compiled.ir.unwrap_or_else(|| {
+            panic!(
+                "fixture should compile, diagnostics: {:?}",
+                compiled
+                    .diagnostics
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            )
+        })
+    }
+
+    const READ_LEDGER: &str = "    with access to ledger {\n      read [\"**\"]\n    }\n";
+    const WRITE_OUTBOX: &str = "    with access to outbox {\n      write [\"**\"]\n    }\n";
+
+    #[test]
+    fn flags_turn_reading_confidential_and_writing_uncleared() {
+        let ir = ir_with_grants(&format!("{READ_LEDGER}{WRITE_OUTBOX}"));
+        let envelope = Envelope::from_json(ENVELOPE).expect("valid envelope");
+        let diagnostics = check_with_envelope(&ir, &envelope);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("information-flow violation")
+                    && d.message.contains("ledger")
+                    && d.message.contains("outbox")),
+            "expected an IFC violation, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn allows_turn_reading_confidential_only() {
+        let ir = ir_with_grants(READ_LEDGER);
+        let envelope = Envelope::from_json(ENVELOPE).expect("valid envelope");
+        assert!(check_with_envelope(&ir, &envelope).is_empty());
+    }
+
+    #[test]
+    fn ungoverned_resources_are_unconstrained() {
+        let ir = ir_with_grants(&format!("{READ_LEDGER}{WRITE_OUTBOX}"));
+        // empty envelope: nothing is governed, so the gradual model imposes nothing.
+        let envelope = Envelope::from_json(r#"{ "resources": {} }"#).expect("valid envelope");
+        assert!(check_with_envelope(&ir, &envelope).is_empty());
+    }
+}

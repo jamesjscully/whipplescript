@@ -41,8 +41,18 @@ asymmetric-delegation model (acts-for, reader/influencer sets) and NMIF.
 
 ## Phase 3 — Compiler IFC pass
 
-- [ ] label propagation + the opaque join box (output = join of inputs).
-- [ ] sticky-boundary check (governed data may not reach an un-cleared/ungoverned sink).
+- [~] **Slice 1 (vertical, landed 2026-06-27):** `crates/whipplescript-cli/src/ifc.rs`
+  — a JSON governance envelope labels resources by confidentiality; the
+  **turn-level join box** flags an agent turn granted READ on a confidential
+  resource and WRITE/egress on an un-cleared one, wired into `whip check`,
+  env-discovered via `WHIPPLESCRIPT_IFC_ENVELOPE` (unset = dev mode). Diagnostic
+  carries routes-to-fix (separate / declassify). 3 unit + 1 end-to-end test,
+  fmt+clippy clean. Scope: binary confidentiality, turn-grant granularity — the
+  proof-of-architecture. Remaining within this box:
+- [ ] label propagation + the opaque join box (output = join of inputs) at rule-body
+  granularity (needs the store name surfaced onto IrEffectNode — a parser change).
+- [ ] sticky-boundary check (governed data may not reach an un-cleared/ungoverned sink);
+  party-relative labels (reader sets + acts-for) replacing binary confidentiality.
 - [ ] refinement check (`inline ⊑ envelope`).
 - [ ] guarantee report (guaranteed invariants + flagged risks) and routes-to-fix
   diagnostics (self-serve vs escalate).

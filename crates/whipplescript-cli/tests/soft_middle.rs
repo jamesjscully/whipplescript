@@ -3109,3 +3109,82 @@ fn cross_package_tool_grant_resolves_and_runs() {
     let _ = fs::remove_file(coordination);
     let _ = fs::remove_dir_all(workspace);
 }
+
+const IFC_BAD_WHIP: &str = r#"@service
+workflow IfcCheck
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+
+agent coder { provider fixture  profile "repo-writer"  capacity 1 }
+
+file store ledger { root "./ledger"  allow read ["**"] }
+file store outbox { root "./outbox"  allow write ["**"] }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+  when coder is available
+=> {
+  tell coder as turn
+    with access to ledger {
+      read ["**"]
+    }
+    with access to outbox {
+      write ["**"]
+    }
+  "go"
+
+  after turn succeeds as outcome {
+    complete result { ok true }
+  }
+}
+"#;
+
+const IFC_ENVELOPE: &str = r#"{ "resources": {
+  "ledger": { "confidential": true },
+  "outbox": { "confidential": false }
+} }"#;
+
+/// End-to-end: with a governance envelope a turn that reads a confidential
+/// resource and writes an un-cleared one is rejected by `whip check`; without the
+/// envelope the same whip passes (the gradual / dev mode).
+#[test]
+fn ifc_check_rejects_confidential_to_uncleared_flow_under_envelope() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let whip = temp_path("ifc-whip", "whip");
+    let envelope = temp_path("ifc-env", "json");
+    fs::write(&whip, IFC_BAD_WHIP).expect("write whip");
+    fs::write(&envelope, IFC_ENVELOPE).expect("write envelope");
+
+    let governed = Command::new(bin)
+        .args(["check", whip.to_str().expect("utf-8 path")])
+        .env("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope)
+        .output()
+        .expect("command runs");
+    let governed_stderr = String::from_utf8_lossy(&governed.stderr);
+    assert!(
+        !governed.status.success(),
+        "expected check to fail under governance\nstderr:\n{governed_stderr}"
+    );
+    assert!(
+        governed_stderr.contains("information-flow violation"),
+        "expected an IFC violation\nstderr:\n{governed_stderr}"
+    );
+
+    let dev = Command::new(bin)
+        .args(["check", whip.to_str().expect("utf-8 path")])
+        .env_remove("WHIPPLESCRIPT_IFC_ENVELOPE")
+        .output()
+        .expect("command runs");
+    assert!(
+        dev.status.success(),
+        "expected dev-mode check to pass (no envelope)\nstderr:\n{}",
+        String::from_utf8_lossy(&dev.stderr)
+    );
+
+    let _ = fs::remove_file(&whip);
+    let _ = fs::remove_file(&envelope);
+}

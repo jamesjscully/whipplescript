@@ -72,6 +72,7 @@ use whipplescript_store::{
 mod auth;
 mod coerce_runtime;
 mod harness_tools;
+mod ifc;
 
 const CORE_EFFECT_LOWERING_CLASS: &str = "core_effect";
 const SCHEDULE_LOWERING_CLASS: &str = "schedule_emitter";
@@ -2648,6 +2649,29 @@ fn check(options: &CliOptions) -> ExitCode {
                         }));
                     } else {
                         for diagnostic in grant_diagnostics {
+                            eprint!("{}", render_diagnostic(&path, &source, &diagnostic));
+                        }
+                    }
+                    continue;
+                }
+                let ifc_diagnostics = ifc::check_ifc_program(&ir);
+                if !ifc_diagnostics.is_empty() {
+                    failed = true;
+                    if options.json {
+                        reports.push(json!({
+                            "schema": "whipplescript.check_report.v0",
+                            "path": display_path(&path),
+                            "status": "error",
+                            "error": {
+                                "kind": "diagnostics",
+                                "diagnostics": ifc_diagnostics
+                                    .iter()
+                                    .map(parser_diagnostic_to_json)
+                                    .collect::<Vec<_>>(),
+                            },
+                        }));
+                    } else {
+                        for diagnostic in ifc_diagnostics {
                             eprint!("{}", render_diagnostic(&path, &source, &diagnostic));
                         }
                     }
