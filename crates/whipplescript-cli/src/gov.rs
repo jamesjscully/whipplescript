@@ -174,10 +174,10 @@ grant file_store outbox -> file:/srv/outbox public\n";
         let signed =
             SignedEnvelope::sign_with_privilege(CONFIG, "alice@admin", true).expect("privileged");
         let json = signed.to_json();
-        // flip ledger from confidential to public without re-signing
+        // flip ledger's reader authority to public without re-signing
         let tampered = json.replace(
-            "\"ledger\":{\"confidential\":true}",
-            "\"ledger\":{\"confidential\":false}",
+            "\"ledger\":{\"reader\":\"Operator\"}",
+            "\"ledger\":{\"reader\":\"public\"}",
         );
         assert_ne!(tampered, json, "test should actually modify the content");
         assert!(SignedEnvelope::verify(&tampered).is_err());

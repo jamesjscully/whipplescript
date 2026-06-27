@@ -15,53 +15,81 @@
 //! points at the envelope; unset = ungoverned dev mode (a plain whip making no IFC
 //! claim).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use whipplescript_parser::{Diagnostic, IrProgram};
 
-/// Resource confidentiality, projected from the governance envelope.
+/// The bottom reader-authority: data readable by `public` is readable by anyone,
+/// and `public` itself holds no authority above itself.
+const PUBLIC: &str = "public";
+
+/// The party-relative confidentiality projection of the governance envelope
+/// (DR-0027 I-IFC1): each governed resource has a **reader authority** (a role);
+/// the secret is readable by any party that acts-for that role. The delegation
+/// context is the acts-for edge set, closed reflexive-transitively by `can_act`.
 pub struct Envelope {
-    confidential: BTreeSet<String>,
+    /// resource handle -> reader-authority role (absent = `public`, the bottom).
+    readers: BTreeMap<String, String>,
     governed: BTreeSet<String>,
+    /// acts-for edges `(p, q)`: `p` acts-for `q` (has at least `q`'s authority).
+    deleg: Vec<(String, String)>,
 }
 
 impl Envelope {
-    /// Parse the JSON envelope. Shape:
-    /// `{ "resources": { "<name>": { "confidential": true|false }, ... } }`.
+    /// Parse the JSON envelope. Resources carry a `reader` role (or, for
+    /// back-compat, a `confidential` bool: true = reader `confidential`, false =
+    /// public). Optional `delegations` is an array of `[p, q]` acts-for pairs.
     pub fn from_json(text: &str) -> Result<Self, String> {
         let value: serde_json::Value =
             serde_json::from_str(text).map_err(|err| format!("invalid IFC envelope: {err}"))?;
-        let mut confidential = BTreeSet::new();
+        let mut readers = BTreeMap::new();
         let mut governed = BTreeSet::new();
+        let mut deleg = Vec::new();
         if let Some(map) = value.get("resources").and_then(|res| res.as_object()) {
             for (name, label) in map {
                 governed.insert(name.clone());
-                if label
+                if let Some(reader) = label.get("reader").and_then(serde_json::Value::as_str) {
+                    if reader != PUBLIC {
+                        readers.insert(name.clone(), reader.to_owned());
+                    }
+                } else if label
                     .get("confidential")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false)
                 {
-                    confidential.insert(name.clone());
+                    readers.insert(name.clone(), "confidential".to_owned());
+                }
+            }
+        }
+        if let Some(pairs) = value.get("delegations").and_then(|d| d.as_array()) {
+            for pair in pairs {
+                if let Some(items) = pair.as_array() {
+                    if let (Some(left), Some(right)) = (
+                        items.first().and_then(serde_json::Value::as_str),
+                        items.get(1).and_then(serde_json::Value::as_str),
+                    ) {
+                        deleg.push((left.to_owned(), right.to_owned()));
+                    }
                 }
             }
         }
         Ok(Self {
-            confidential,
+            readers,
             governed,
+            deleg,
         })
     }
 
-    /// Parse the readable governance DSL (DR-0028) into the envelope. v0 grammar,
-    /// one statement per line (`#` starts a comment):
-    ///   `grant <kind> <handle> -> <resource-id> <label>`
-    /// where `<label>` is a `readable by <roles>` clause (confidential) or an
-    /// `audience { … }` / `public` clause (un-cleared sink). `party` / `delegate`
-    /// statements are accepted and ignored in this binary v0 (they carry the
-    /// party-relative content of a later slice).
+    /// Parse the readable governance DSL (DR-0028), one statement per line:
+    ///   `grant <kind> <handle> -> <resource-id> readable by <Role>`  (reader = Role)
+    ///   `grant <kind> <handle> -> <resource-id> public | audience { … }` (public)
+    ///   `delegate <P> acts-for <Q> [for <axis>]`  (acts-for edge P -> Q)
+    /// `party` lines are accepted and ignored (the runtime binds parties to roles).
     pub fn from_dsl(text: &str) -> Result<Self, String> {
-        let mut confidential = BTreeSet::new();
+        let mut readers = BTreeMap::new();
         let mut governed = BTreeSet::new();
+        let mut deleg = Vec::new();
         for (index, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -69,7 +97,20 @@ impl Envelope {
             }
             let tokens: Vec<&str> = line.split_whitespace().collect();
             match tokens.first().copied() {
-                Some("party") | Some("delegate") => continue,
+                Some("party") => continue,
+                Some("delegate") => {
+                    let Some(pos) = tokens.iter().position(|tok| *tok == "acts-for") else {
+                        return Err(format!("line {}: delegate needs `acts-for`", index + 1));
+                    };
+                    if pos < 1 || pos + 1 >= tokens.len() {
+                        return Err(format!(
+                            "line {}: delegate needs `delegate <P> acts-for <Q>`",
+                            index + 1
+                        ));
+                    }
+                    deleg.push((tokens[pos - 1].to_owned(), tokens[pos + 1].to_owned()));
+                    continue;
+                }
                 Some("grant") => {}
                 _ => {
                     return Err(format!(
@@ -86,15 +127,21 @@ impl Envelope {
                 ));
             };
             let handle = tokens[arrow - 1].to_owned();
-            let label = tokens[arrow + 2..].join(" ");
             governed.insert(handle.clone());
-            if label.contains("readable by") || label == "confidential" {
-                confidential.insert(handle);
+            let label = &tokens[arrow + 2..];
+            // `readable by <Role>` sets a non-public reader authority.
+            if let Some(by) = label.iter().position(|tok| *tok == "by") {
+                if let Some(role) = label.get(by + 1) {
+                    if *role != PUBLIC {
+                        readers.insert(handle, (*role).to_owned());
+                    }
+                }
             }
         }
         Ok(Self {
-            confidential,
+            readers,
             governed,
+            deleg,
         })
     }
 
@@ -110,31 +157,67 @@ impl Envelope {
         }
     }
 
-    /// The canonical signed-artifact JSON: every governed resource with its
-    /// confidentiality, in sorted order (so the hash is deterministic). This is
-    /// what the governance agent signs (DR-0028).
+    /// The canonical signed-artifact JSON: every governed resource with its reader
+    /// authority, plus the delegation edges, all sorted (deterministic hash).
     pub fn to_canonical_json(&self) -> String {
         let mut resources = serde_json::Map::new();
         for name in &self.governed {
             resources.insert(
                 name.clone(),
-                serde_json::json!({ "confidential": self.confidential.contains(name) }),
+                serde_json::json!({ "reader": self.reader_authority(name) }),
             );
         }
-        serde_json::json!({ "resources": resources }).to_string()
+        let mut edges: Vec<(String, String)> = self.deleg.clone();
+        edges.sort();
+        let delegations: Vec<serde_json::Value> = edges
+            .iter()
+            .map(|(left, right)| serde_json::json!([left, right]))
+            .collect();
+        serde_json::json!({ "resources": resources, "delegations": delegations }).to_string()
     }
 
-    fn is_confidential(&self, resource: &str) -> bool {
-        self.confidential.contains(resource)
+    /// The reader authority of a resource; `public` (the bottom) if unlabeled.
+    fn reader_authority(&self, resource: &str) -> &str {
+        self.readers
+            .get(resource)
+            .map(String::as_str)
+            .unwrap_or(PUBLIC)
     }
 
-    /// Confidential data may flow only to a confidential-cleared sink; any other
-    /// resource — governed-public OR ungoverned — is an un-cleared sink. This is
-    /// the fail-closed sticky boundary (DR-0027 I-IFC6): confidential data cannot
-    /// escape into the ungoverned region, so a write target must be confidential
-    /// to receive it.
-    fn is_uncleared_sink(&self, resource: &str) -> bool {
-        !self.confidential.contains(resource)
+    /// `p` acts-for `q`: reflexive-transitive over the delegation edges, with
+    /// `public` as the universal bottom (everyone acts-for `public`; `public`
+    /// acts-for nothing but itself). Cycle-safe via a visited set.
+    fn can_act(&self, p: &str, q: &str) -> bool {
+        if q == PUBLIC || p == q {
+            return true;
+        }
+        if p == PUBLIC {
+            return false;
+        }
+        let mut frontier = vec![p.to_owned()];
+        let mut visited = BTreeSet::new();
+        while let Some(current) = frontier.pop() {
+            if current == q {
+                return true;
+            }
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            for (left, right) in &self.deleg {
+                if *left == current {
+                    frontier.push(right.clone());
+                }
+            }
+        }
+        false
+    }
+
+    /// Does data from `source` leak when written to `sink`? Safe iff every party
+    /// that can read `sink` can also read `source` — i.e. `sink`'s reader authority
+    /// acts-for `source`'s. Otherwise some reader of `sink` is not cleared for
+    /// `source`, and it leaks (the fail-closed sticky boundary, DR-0027 I-IFC6).
+    fn leaks(&self, source: &str, sink: &str) -> bool {
+        !self.can_act(self.reader_authority(sink), self.reader_authority(source))
     }
 }
 
@@ -193,39 +276,45 @@ pub fn check_ifc_program(ir: &IrProgram) -> Vec<Diagnostic> {
     }
 }
 
-/// The turn-level join-box check: a turn that reads a confidential resource and
-/// egresses to an un-cleared one is flagged.
+/// The turn-level join-box check: for a turn that reads resource `src` and writes
+/// resource `sink`, flag the pair when data from `src` may leak to a reader of
+/// `sink` not cleared for `src` (party-relative, via the acts-for closure).
 pub fn check_with_envelope(ir: &IrProgram, envelope: &Envelope) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     for rule in &ir.rules {
         for effect in &rule.metadata.effects {
-            let mut confidential_read: Option<&str> = None;
-            let mut uncleared_sink: Option<&str> = None;
+            let mut reads: Vec<&str> = Vec::new();
+            let mut writes: Vec<&str> = Vec::new();
             for grant in &effect.access_grants {
                 let resource = grant.resource.as_str();
                 for op in &grant.operations {
-                    if confidential_read.is_none()
-                        && is_read_op(&op.operation)
-                        && envelope.is_confidential(resource)
-                    {
-                        confidential_read = Some(resource);
+                    if is_read_op(&op.operation) {
+                        reads.push(resource);
                     }
-                    if uncleared_sink.is_none()
-                        && is_egress_op(&op.operation)
-                        && envelope.is_uncleared_sink(resource)
-                    {
-                        uncleared_sink = Some(resource);
+                    if is_egress_op(&op.operation) {
+                        writes.push(resource);
                     }
                 }
             }
-            if let (Some(src), Some(sink)) = (confidential_read, uncleared_sink) {
+            let mut leak: Option<(&str, &str)> = None;
+            'pairs: for &src in &reads {
+                for &sink in &writes {
+                    if envelope.leaks(src, sink) {
+                        leak = Some((src, sink));
+                        break 'pairs;
+                    }
+                }
+            }
+            if let Some((src, sink)) = leak {
                 diagnostics.push(Diagnostic {
                     span: effect.span,
                     message: format!(
-                        "information-flow violation in rule `{rule}`: this turn may read \
-                         confidential `{src}` and write un-cleared `{sink}`, so the confidential \
-                         data could flow out",
+                        "information-flow violation in rule `{rule}`: this turn may read `{src}` \
+                         (readable by {src_reader}) and write `{sink}` (readable by {sink_reader}), \
+                         so data from `{src}` could reach a party not cleared for it",
                         rule = rule.name,
+                        src_reader = envelope.reader_authority(src),
+                        sink_reader = envelope.reader_authority(sink),
                     ),
                     suggestion: Some(format!(
                         "separate the contexts — read `{src}` in a distinct turn and pass only a \
@@ -250,7 +339,8 @@ pub struct GovernanceReport {
 }
 
 pub fn governance_report(ir: &IrProgram, envelope: &Envelope) -> GovernanceReport {
-    let mut protected: Vec<String> = envelope.confidential.iter().cloned().collect();
+    // protected = governed resources whose reader authority is not public.
+    let mut protected: Vec<String> = envelope.readers.keys().cloned().collect();
     protected.sort();
     let violations = check_with_envelope(ir, envelope).len();
     let mut touched: BTreeSet<String> = BTreeSet::new();
@@ -402,11 +492,12 @@ party bob@acme.com : Requester\n";
     #[test]
     fn dsl_parses_to_the_same_labels_as_json() {
         let from_dsl = Envelope::from_dsl(DSL).expect("valid DSL");
-        // ledger confidential, outbox governed-but-public — same as the JSON envelope.
-        assert!(from_dsl.is_confidential("ledger"));
-        assert!(!from_dsl.is_confidential("outbox"));
-        assert!(from_dsl.is_uncleared_sink("outbox"));
-        assert!(!from_dsl.is_uncleared_sink("ledger"));
+        // ledger has reader authority Operator; outbox is public.
+        assert_eq!(from_dsl.reader_authority("ledger"), "Operator");
+        assert_eq!(from_dsl.reader_authority("outbox"), "public");
+        // ledger (Operator) -> outbox (public) leaks; the reverse does not.
+        assert!(from_dsl.leaks("ledger", "outbox"));
+        assert!(!from_dsl.leaks("outbox", "ledger"));
 
         let ir = ir_with_grants(&format!("{READ_LEDGER}{WRITE_OUTBOX}"));
         assert!(
@@ -420,6 +511,27 @@ party bob@acme.com : Requester\n";
     #[test]
     fn dsl_rejects_a_malformed_grant() {
         assert!(Envelope::from_dsl("grant file_store ledger confidential").is_err());
+    }
+
+    #[test]
+    fn acts_for_delegation_clears_a_flow() {
+        // ledger is Operator-readable; auditbox is Auditor-readable. Operator data
+        // to an Auditor sink normally leaks...
+        let base = "\
+grant file_store ledger -> file:/srv/ledger.db readable by Operator\n\
+grant file_store auditbox -> file:/srv/auditbox readable by Auditor\n";
+        let without = Envelope::from_dsl(base).expect("valid");
+        assert!(without.leaks("ledger", "auditbox"));
+
+        // ...but a delegation `Auditor acts-for Operator` clears it: an auditor is
+        // cleared for operator data, so the flow is safe.
+        let with = Envelope::from_dsl(&format!(
+            "{base}delegate Auditor acts-for Operator for confidentiality\n"
+        ))
+        .expect("valid");
+        assert!(!with.leaks("ledger", "auditbox"));
+        // the reverse remains a leak — Operator does not act-for Auditor here.
+        assert!(with.leaks("auditbox", "ledger"));
     }
 
     #[test]

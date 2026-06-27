@@ -58,7 +58,14 @@ asymmetric-delegation model (acts-for, reader/influencer sets) and NMIF.
   granularity (needs the store name surfaced onto IrEffectNode — a parser change).
 - [x] sticky-boundary check — fail-closed (I-IFC6): confidential data may not reach
   ANY non-confidential sink (governed-public OR ungoverned), 2026-06-27.
-- [ ] party-relative labels (reader sets + acts-for) replacing binary confidentiality.
+- [x] party-relative labels replacing binary confidentiality (2026-06-27): each
+  resource carries a **reader authority**; a flow `src -> sink` leaks unless
+  `sink`'s reader authority **acts-for** `src`'s, via a reflexive-transitive
+  `can_act` closure (ported from the Maude models) over the envelope's `delegate`
+  edges. DSL `readable by <Role>` + `delegate <P> acts-for <Q>`; binary JSON
+  (`confidential: bool`) still parses (back-compat). Verified incl. an acts-for
+  delegation clearing a flow. Remaining: per-resource reader *sets* (unions of
+  up-sets) and the integrity axis (endorse).
 - [~] guarantee report (`gov compile`, DR-0028): `governance_report` surfaces
   protected resources, violations caught, and coverage gaps (touched-but-ungoverned
   resources); rendered and printed by `whip check` under an envelope. v0 — full
