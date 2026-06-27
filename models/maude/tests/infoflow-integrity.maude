@@ -1,55 +1,66 @@
 load ../infoflow-integrity.maude
 
---- Coverage: a stranger input reaching workflow-spawn, which requires operator,
---- is an injection. An inbound email trying to spawn an arbitrary whip. stranger
---- is not geq operator.
+--- Delegation context theta for these fixtures: operator > manager > clerk, so
+--- operator acts-for manager and transitively clerk, and manager acts-for clerk.
+--- stranger acts-for no one but itself.
+
+--- Coverage: untrusted input cannot drive even the lowest-authority sink. A
+--- stranger-influenced value at a clerk-required control sink is an injection,
+--- because stranger does not act-for clerk.
 search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
-  intSource(b1, stranger) flow(b1, b2) controlSink(b2, operator)
+  deleg((operator > manager) | (manager > clerk))
+  intSource(b1, stranger) flow(b1, b2) controlSink(b2, clerk)
   =>* C:Cfg injection .
 
---- Coverage: a stranger input reaching a contact-required bounded action is an
---- injection. Even a mid-tier control point is closed to strangers. stranger is
---- not geq contact. A two-point lattice cannot express this middle tier.
+--- Coverage: a LOWER authority cannot drive a HIGHER sink. A clerk-influenced
+--- value at an operator-required sink is an injection; clerk does not act-for
+--- operator. A fixed chain cannot express this partial-order direction cleanly.
 search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
-  intSource(b1, stranger) flow(b1, b2) controlSink(b2, contact)
+  deleg((operator > manager) | (manager > clerk))
+  intSource(b1, clerk) flow(b1, b2) controlSink(b2, operator)
   =>* C:Cfg injection .
 
---- Coverage: MEET through an agent join box. The agent a1 mixes an operator
---- instruction b1 with a stranger email b2; its output b3 carries stranger too,
---- so it fails a contact requirement. One untrusted input drags the box down.
+--- Coverage: join box. b3 is influenced by both an operator input and a stranger
+--- input; at a manager-required sink it is an injection, because stranger does
+--- not act-for manager -- one untrusted influencer drags the decision down.
 search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  deleg((operator > manager) | (manager > clerk))
   intSource(b1, operator) intSource(b2, stranger)
-  flow(b1, a1) flow(b2, a1) flow(a1, b3) controlSink(b3, contact)
+  flow(b1, b3) flow(b2, b3) controlSink(b3, operator)
   =>* C:Cfg injection .
 
---- Coverage: even a known contact cannot spawn arbitrary whips. A contact input
---- reaching workflow-spawn, which requires operator, is an injection. contact is
---- not geq operator. This is the DR-0026 operator-only root power, proven.
+--- Coverage: endorsing to an INSUFFICIENT authority does not pass a higher sink.
+--- Endorsing a stranger value to clerk, then driving an operator sink, is an
+--- injection: clerk does not act-for operator.
 search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
-  intSource(b1, contact) flow(b1, b2) controlSink(b2, operator)
+  deleg((operator > manager) | (manager > clerk))
+  intSource(b1, stranger) endorse(b1, b2, clerk) controlSink(b2, operator)
   =>* C:Cfg injection .
 
---- Bite: the operator may spawn. An operator input reaching a workflow-spawn that
---- requires operator is safe; operator geq operator. No solution.
+--- Bite: an authority drives its own sink. operator influence at an operator
+--- sink is safe; canAct is reflexive. No solution.
 search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  deleg((operator > manager) | (manager > clerk))
   intSource(b1, operator) flow(b1, b2) controlSink(b2, operator)
   =>* injection RESIDUAL:Cfg .
 
---- Bite: the core property. A stranger input reaching a contact-required action
---- THROUGH an endorse to contact is safe; the validated typed value carries
---- contact, which meets the requirement.
+--- Bite: a HIGHER authority drives a LOWER sink. manager influence at a
+--- clerk-required sink is safe; manager acts-for clerk (direct edge).
 search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
-  intSource(b1, stranger) endorse(b1, b2, contact) controlSink(b2, contact)
+  deleg((operator > manager) | (manager > clerk))
+  intSource(b1, manager) flow(b1, b2) controlSink(b2, clerk)
   =>* injection RESIDUAL:Cfg .
 
---- Bite: a mid-tier input drives a mid-tier action. A contact input reaching a
---- contact-required bounded action is safe; contact geq contact.
+--- Bite: TRANSITIVE trust. operator influence at a clerk sink is safe via
+--- operator > manager > clerk. No solution proves the closure follows two hops.
 search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
-  intSource(b1, contact) flow(b1, b2) controlSink(b2, contact)
+  deleg((operator > manager) | (manager > clerk))
+  intSource(b1, operator) flow(b1, b2) controlSink(b2, clerk)
   =>* injection RESIDUAL:Cfg .
 
---- Bite: untrusted input is fine AS DATA. A stranger input reaching a data-only
---- sink, an echoed reply, is never an injection, because only control is gated.
+--- Bite: endorsing to a SUFFICIENT authority passes. Endorsing a stranger value
+--- to operator, then driving a manager sink, is safe: operator acts-for manager.
 search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
-  intSource(b1, stranger) flow(b1, b2) dataSink(b2)
+  deleg((operator > manager) | (manager > clerk))
+  intSource(b1, stranger) endorse(b1, b2, operator) controlSink(b2, manager)
   =>* injection RESIDUAL:Cfg .

@@ -81,10 +81,12 @@ This is what makes "open at compile time, finite at runtime" work (DR-0027's
 bounded label polymorphism): a workflow is written once against roles
 (`Requester`, `Approver`, `Operator`, `Auditor`) and checked against them; the
 governance layer maps who fills each role. It cleanly separates *what the workflow
-guarantees* (roles, in source, compile-checked) from *who is who* (parties, in
-governance, deployment-specific). The end user never hand-writes a label; labels
-appear only at boundaries and crossings and are mostly agent-generated or
-IT-configured, with everything intermediate inferred.
+guarantees* (roles, compile-checked) from *who is who* (parties, in governance,
+deployment-specific). Under the gradual surface, boundary labels live on the
+**governance grants over real resources** (not in source); source carries a label
+only at the explicit `endorsed`/`declassify` crossings, where it references a role,
+with everything else inferred (see the
+[information-flow surface](../information-flow-surface.md)).
 
 ### D3 — Trust required equals authority delegated; the agent acts for its user
 
@@ -96,7 +98,8 @@ This single law resolves both cases and is the heart of the record:
 
 ```text
 Case 1, guaranteed safety with zero trust in the agent for protected data.
-  The data owner authors the envelope externally and locks it (DR-0026 Option A).
+  The data owner authors and signs the envelope on the separate, sudo-gated
+  governance agent (D5).
   The user is a principal in it - say role User - and protected data, say Ledger,
   is readable by Operator with User not in the readers and User holding no
   declassify authority over it. The agent acts-for User. The moment a whip would
@@ -110,18 +113,20 @@ Case 1, guaranteed safety with zero trust in the agent for protected data.
 Case 2, trust-but-verify because the agent holds the user's own authority.
   The user owns their data, so delegating authority to the agent gives it the
   user's authority to declassify the user's own data - which is exactly why this
-  case requires trust and Case 1 does not. The agent DRAFTS envelope-level
-  protections and inline labels from the NL intent, surfaces them back in plain
-  language, the user RATIFIES, and they LOCK into the envelope (DR-0026 Option B).
-  After locking it is enforced identically to Case 1. The agent PROPOSES; the
+  case requires trust and Case 1 does not. On the sudo-gated governance agent (the
+  user acting as their own admin, D5), the agent DRAFTS the envelope protections
+  from the NL intent, surfaces them back in plain language, the user RATIFIES, and
+  they LOCK into the envelope. After locking it is enforced identically to Case 1.
+  The agent PROPOSES; the
   human DISPOSES; the locked result BINDS future agent actions. The NMIF / trusted
   -surface audit (DR-0027 I-IFC3) is what makes "trust but verify" real - every
   protection and every downgrade is enumerable and shown back for confirmation.
 ```
 
-The agent may write inline labels freely and may **propose** envelope changes, but
-may **never self-apply** an envelope change. That is DR-0026's "kernel enforces,
-agent cannot self-widen", now carrying IFC content.
+The whip agent may author whips freely — including the `endorsed`/`declassify`
+crossings — and may **propose** envelope changes, but may **never self-apply** an
+envelope change. That is DR-0026's "kernel enforces, agent cannot self-widen", now
+carrying IFC content.
 
 ### D4 — Envelope changes are versioned and non-retroactive
 
@@ -223,11 +228,12 @@ the consideration, we do not mandate it.
   and bound to runs (D4). Remaining-open within it: the attestation record's exact
   format and the gov DSL grammar.
 
-- The natural-language-to-policy authoring path (Case 2 / DR-0026 Option B):
-  DEFERRED, not in the v1 lifecycle. The v1 model is IT-drafts-and-signs-once with
-  users authoring whips freely under enforcement (see the
-  [governance lifecycle spec](../information-flow-governance.md)); the agent drafts
-  whips, not governance. Option B remains a deferred hook with the same sign+lock.
+- The natural-language-to-policy authoring UX. The assisted-authoring path is IN
+  v1 — it runs on the sudo-gated governance agent (D5), with the admin drafting via
+  NL or by hand and signing (see the
+  [governance lifecycle spec](../information-flow-governance.md)). What remains open
+  is the detailed NL-to-diff rendering and the ratify interaction, not whether it
+  exists.
 
 - The refinement check itself (inline ⊑ envelope) as a compiler pass: deferred to
   DR-0027's label-algebra and checking step; this record locks that it MUST hold,
@@ -263,7 +269,7 @@ cross-envelope flow       data crossing between two separately-governed envelope
 - The agent acts for its user and holds only that user's authority; trust required
   equals authority delegated; Case 1 is guaranteed-safe with no trust over
   protected data, Case 2 is trust-but-verify over the user's own data, and both
-  are DR-0026 Options A and B (D3).
+  are authored on the sudo-gated governance agent (D3, D5).
 - The agent may propose but never self-apply an envelope change; the human or
   external authority ratifies, the kernel enforces (D3).
 - Envelope changes are versioned and forward-only: they do not retroactively

@@ -97,6 +97,32 @@ The ONLY sound ways to be more permissive are:
 NEVER by trusting the model more about what it did with its context.
 ```
 
+Lever (b) has sound, *construction-based* forms we do rely on for ergonomics:
+staged turns (a public phase produces the public-facing output having never seen
+the secret), commit-then-fill (the model fixes an output *shape* with the secret
+absent, then fills it under the shape's bounded capacity), and trusted **input
+coarsening** (the harness shows the model `balance: >$1000` instead of `$4,237`,
+lowering the input — and thus the output — bound). These eliminate or shrink the
+flow by construction, without trusting the model.
+
+### Quantitative information flow is out of scope (not deferred)
+
+The box is **binary**: a value that touched a secret is secret. A *quantitative*
+box — crediting an output's bounded **type** as a leak ceiling (a turn reading the
+whole ledger and emitting a 3-valued enum leaks ≤ log₂3 bits) and tracking a
+depleting **leak budget** — is strictly richer, sound in principle, and would
+dissolve the "read secret, emit benign summary" conservatism. We **deliberately
+keep it out of scope**, not merely deferred, because quantitative leak accounting
+is delicate (adaptive adversaries, channel composition, correlated values) and a
+*subtly wrong* bound is worse than an honest binary one — the binary box's value
+is precisely that its soundness is believable. The one place we already bound
+*quantity* is the **mandatory bounded type on an explicit, audited `declassify`/
+`endorse` crossing** (I-IFC3): quantitative bounding stays confined to those
+declared crossings, never a pervasive automatic budget. If the binary box's
+rejection rate ever proves to be the real bottleneck, the sound escalation order
+is the construction-based levers above *first*, and a quantitative budget only as a
+last resort, heavily modeled.
+
 ### I-IFC3 — Downgrading is explicit, authority-scoped, and nonmalleable
 
 > The only operations that lower confidentiality (**declassify**) or raise
@@ -288,10 +314,12 @@ discipline):
   written generic over principals and bound to a finite runtime set. Adopt and
   adapt the asymmetric-delegation line; do not reinvent.
 
-- Construct grounding. Mapping label-carrying positions onto concrete
-  whipplescript constructs: source labels on channel / file_store / signal,
-  endorse on coerce / exec -> Schema, declassify as an explicit op, the dual-gated
-  record sink, sink checks on send / spawn / record. Only decidable after syntax.
+- Construct grounding. DRAFTED in the [information-flow surface](../information-flow-surface.md):
+  labels live on governance grants over real resources (typed `kind:address`), not
+  in source; the source crossings are the explicit `endorsed` marker (over a
+  structural `coerce`) and `declassify`; stores and `record` are dual-gated; sink
+  checks on send / spawn / record. The construct/boundary audit (with the five
+  non-obvious doors) is there too.
 
 - Formal-model upgrade. The exploratory models are 2-and-multi-point single-owner
   lattices. Upgrade to party-relative labels with acts-for, NMIF, and the

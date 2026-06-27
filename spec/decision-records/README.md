@@ -108,8 +108,9 @@ others are active workshop material.
   itself a root whip (one harness, DR-0024 reused) and the only loop allowed to
   author and spawn arbitrary (individually-bounded) whips. Bounded by a signed
   **policy envelope** it cannot self-widen; escalation is reactive over
-  `human.ask` with kernel enforcement (governance **Option A — no second
-  agent**). Observed via a versioned, cursor-tailed **session-event stream** over
+  `human.ask` with kernel enforcement; governance authoring runs on a **separate
+  sudo-gated agent** (DR-0028 D5). Observed via a versioned, cursor-tailed
+  **session-event stream** over
   the existing durable log (protocol, not TUI). Relocates DR-0024 I3's
   no-self-escalation to the envelope; keeps spawn-and-observe distinct from
   `workflow.invoke`. *Accepted (design); the information-flow lattice is a
@@ -131,12 +132,14 @@ others are active workshop material.
 - [0028-information-flow-authority.md](0028-information-flow-authority.md): policy
   is two tiers — a **locked governance envelope** holding authority (role
   hierarchy, delegation context, ownership, protected-from, downgrade rights) plus
-  **inline usage** proven to refine it (`inline ⊑ envelope`). Roles in source,
-  parties bound in governance; the agent **acts for its user** so **trust required
-  equals authority delegated** — an IT-owner envelope is guaranteed-safe with no
-  trust over protected data (Option A), an agent-drafted-then-ratified envelope is
-  trust-but-verify over the user's own data (Option B). Envelope changes are
-  versioned and non-retroactive — they never authorize past flows, and in-flight
+  **inline usage** proven to refine it (`inline ⊑ envelope`). The agent **acts for
+  its user** so **trust required equals authority delegated** — an IT-owner
+  envelope is guaranteed-safe with no trust over protected data, an
+  agent-drafted-then-ratified envelope is trust-but-verify over the user's own
+  data. Governance and whip authoring split across **two root agents separated by
+  OS privilege** (D5): a sudo-gated governance agent that alone signs policy, and
+  an unprivileged whip agent. Envelope changes are versioned and non-retroactive —
+  they never authorize past flows, and in-flight
   work is bound to its version. *Accepted (authority model); the governance half
   of DR-0027; extends DR-0026's envelope.*
 

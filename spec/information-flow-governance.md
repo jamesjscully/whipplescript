@@ -198,10 +198,10 @@ we do not mandate it.
 ## Deferred
 
 ```text
-agent-drafted governance (DR-0028 Option B / Case 2)
-    the agent drafting a governance DIFF from NL intent for the user to ratify.
-    NOT in the v1 lifecycle: here IT drafts governance, the agent drafts only
-    whips. Kept as a deferred hook; if added, ratification is the same sign+lock.
+NL authoring UX (the assisted-authoring detail)
+    the governance agent's assisted authoring is IN v1 (DR-0028 D5); what remains
+    open is the detailed NL-to-diff rendering and the ratify interaction, not
+    whether it exists. The whip agent still drafts only whips.
 multi-account / cross-account governance
     one envelope per user account in v1; sharing/inheriting policy across accounts
     is a later concern.

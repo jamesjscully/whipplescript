@@ -99,7 +99,7 @@ authority" holds at the root too** — the root simply has more *base* authority
 approval) than a leaf (static envelope). No agent in the system, root or leaf,
 can escalate itself.
 
-### D3 — Bounding the root: a signed policy envelope the root cannot self-widen (governance Option A)
+### D3 — Bounding the root: a signed policy envelope the root cannot self-widen
 
 Governance options considered (UPDATED — see the note below):
 
@@ -151,7 +151,8 @@ the capability / grant system, `exec` allow-lists):
 The property this buys, by construction: **the root cannot broaden its own
 envelope.** A confused or injected root can only operate within the signed
 bound; escalation requires a human signature. This is privilege separation
-without a second agent.
+enforced by the locked envelope — and, per [DR-0028](0028-information-flow-authority.md)
+D5, by the sudo gate on the separate governance agent that signs it.
 
 Precise wording on "no egress" (it bites): for *any* agent loop, the model call
 itself is network egress to the provider endpoint. The envelope therefore
@@ -281,8 +282,8 @@ What downstream work must preserve, in one place:
 - I1 holds at the root and is the policy-enforcement point; I2 is N/A; I3's
   no-self-escalation holds, relocated to the signed envelope (D2).
 - Enforcement is in the kernel, never an agent. The root cannot widen its own
-  envelope; only a human-signed policy change can (D3, Option A — no second
-  agent).
+  envelope; only a human-signed policy change can, applied by the separate
+  sudo-gated governance agent (D3; DR-0028 D5).
 - Arbitrary spawned children are spawn-and-observe over the shared store, kept
   distinct from typed `workflow.invoke` (D4); no convergence guarantee at the
   root, with each child still individually bounded (D5).

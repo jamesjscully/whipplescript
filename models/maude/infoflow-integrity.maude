@@ -1,105 +1,99 @@
---- Information-flow control, the integrity lattice, multi-point. The anti-prompt-
---- injection direction, and the exact DUAL of infoflow-confidentiality.
---- EXPLORATORY research model for the information-flow thread noted in DR-0026;
---- not yet a decision record. Modeled first per standing discipline. Generalizes
---- the earlier two-point sketch to a multi-tier trust chain.
+--- Information-flow control, the integrity lattice, PARTY-RELATIVE. The anti-
+--- prompt-injection direction. Upgrades the earlier single-owner chain to the
+--- decentralized / asymmetric-delegation model (DR-0027 I-IFC1): integrity is
+--- "who may influence / who vouches", principals are ordered by an ACTS-FOR
+--- relation given as the delegation context (theta), and the order is a general
+--- partial order, not a fixed chain.
 ---
---- Prompt injection is an INTEGRITY violation: low-integrity data, untrusted
---- input, reaching a high-integrity decision, control. Biba. Integrity levels
---- form a lattice; combining data takes the MEET, the greatest lower bound, so a
---- result is only as trustworthy as its least trustworthy input. A control sink
---- requires a minimum integrity R and accepts a binding only when every integrity
---- level it carries is geq R.
----
---- The lattice here is the three-tier trust CHAIN:
----
----        operator        the main user, top integrity
----           |
----        contact         a known, pre-approved party
----           |
----        stranger        anyone, bottom integrity
----
---- The chain grounds the DR-0026 root power: workflow-spawn, generating and
---- running arbitrary whips, requires the TOP level operator. The check then
---- proves no contact and no stranger input can ever reach it. A bounded action
---- such as scheduling a known payment requires only contact. A reply is a data
---- sink with no integrity requirement.
----
---- Encoding mirrors the confidentiality dual: each integrity level a binding
---- carries is an independent token carriesI(B, L). A binding is rejected at a
---- control sink requiring R iff ANY carried L has geq(L, R) = false. That is
---- exactly meet(all carried) geq R, since meet is the greatest lower bound: one
---- low-integrity input drags the whole binding below the requirement.
+--- A control sink requires an authority R. Data influenced by principal W is
+--- acceptable iff W acts-for R -- W has at least R's authority, so a
+--- higher-or-equal authority's influence is trusted. Injection is W influencing
+--- an R-sink without acting-for R. acts-for is reflexive and transitive over the
+--- delegation edges, computed by canAct.
 ---
 --- Grounding in whipplescript constructs:
----   intSource(B, L)      an origin at integrity L: an inbound message at
----                        stranger, a known contact at contact, the operator at
----                        operator.
----   flow                 a binding use, a payload field, and an agent turn as a
----                        join box, an edge per input to its output.
----   endorse(B1, B2, T)   a coerce or exec into a Schema that validates untrusted
----                        text into a bounded typed value at a raised integrity T.
----                        B2 carries only T, never B1's low level.
----   controlSink(B, R)    a control point requiring minimum integrity R:
----                        workflow-spawn requires operator, a bounded scheduled
----                        action requires contact, record requires contact.
----   dataSink(B)          a data-only use, an echoed reply, with no requirement.
----
---- The marker injection records any path where a carried integrity level is below
---- the sink requirement. A well-typed program never reaches it.
+---   intSource(B, W)      B originates influenced by principal W: an inbound
+---                        message at 'stranger', a known party at its role.
+---   flow                 a binding use / payload field / agent join box.
+---   endorse(B1, B2, R)   the explicit, authority-scoped integrity raise (the
+---                        'endorsed' marker over a structural coerce): B2 is
+---                        vouched by authority R, carrying only R's influence.
+---   controlSink(B, R)    a control point requiring authority R: workflow-spawn,
+---                        record, instance advance.
+---   deleg(REL)           the delegation context theta as acts-for edges P > Q.
 mod WHIPPLESCRIPT-INFOFLOW-INTEGRITY is
   protecting BOOL .
-  sorts Binding Level Cfg .
+  sorts Prin PSet Edge Rel Binding Cfg .
+  subsort Prin < PSet .
+  subsort Edge < Rel .
 
-  ops b1 b2 b3 b4 a1 : -> Binding [ctor] .
-  ops stranger contact operator : -> Level [ctor] .
+  ops operator manager clerk stranger : -> Prin [ctor] .
+  ops b1 b2 b3 b4 : -> Binding [ctor] .
 
-  --- the chain meet, greatest lower bound. comm so argument order is free.
-  op meet : Level Level -> Level [comm] .
-  vars LA LB : Level .
-  eq meet(stranger, LA) = stranger .   --- stranger is bottom, absorbing
-  eq meet(operator, LA) = LA .         --- operator is top, the identity
-  eq meet(LA, LA) = LA .               --- idempotent, covers contact with contact
+  --- principal sets, for the closure's frontier and visited accumulators
+  op noP : -> PSet [ctor] .
+  op _,_ : PSet PSet -> PSet [ctor assoc comm id: noP] .
+  eq P:Prin , P:Prin = P:Prin .
 
-  --- the induced order: LA geq LB iff their meet stays at LB
-  op geq : Level Level -> Bool .
-  eq geq(LA, LB) = meet(LA, LB) == LB .
+  --- the delegation relation: edges P > Q meaning P acts-for Q
+  op _>_ : Prin Prin -> Edge [ctor] .
+  op emptyR : -> Rel [ctor] .
+  op _|_ : Rel Rel -> Rel [ctor assoc comm id: emptyR] .
+  eq E:Edge | E:Edge = E:Edge .
 
+  --- acts-for closure, reflexive-transitive, with a visited set so cycles end
+  op inSet : Prin PSet -> Bool .
+  eq inSet(P:Prin, (P:Prin , S:PSet)) = true .
+  eq inSet(P:Prin, S:PSet) = false [owise] .
+
+  op succs : Prin Rel -> PSet .
+  eq succs(P:Prin, (P:Prin > Q:Prin) | R:Rel) = Q:Prin , succs(P:Prin, R:Rel) .
+  eq succs(P:Prin, R:Rel) = noP [owise] .
+
+  op canAct : Rel Prin Prin -> Bool .
+  op reach : Rel PSet Prin PSet -> Bool .
+  eq canAct(R:Rel, W:Prin, T:Prin) = reach(R:Rel, W:Prin, T:Prin, noP) .
+  eq reach(R:Rel, (T:Prin , F:PSet), T:Prin, V:PSet) = true .
+  eq reach(R:Rel, noP, T:Prin, V:PSet) = false .
+  ceq reach(R:Rel, (P:Prin , F:PSet), T:Prin, V:PSet)
+    = reach(R:Rel, F:PSet, T:Prin, V:PSet)
+    if P:Prin =/= T:Prin /\ inSet(P:Prin, V:PSet) .
+  ceq reach(R:Rel, (P:Prin , F:PSet), T:Prin, V:PSet)
+    = reach(R:Rel, (F:PSet , succs(P:Prin, R:Rel)), T:Prin, (P:Prin , V:PSet))
+    if P:Prin =/= T:Prin /\ inSet(P:Prin, V:PSet) =/= true .
+
+  --- the configuration soup
   op none : -> Cfg [ctor] .
   op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
 
-  op intSource : Binding Level -> Cfg [ctor] .      --- origin at integrity level L
-  op flow : Binding Binding -> Cfg [ctor] .          --- data-flow edge B1 into B2
-  op endorse : Binding Binding Level -> Cfg [ctor] . --- validated typed crossing to T
-  op controlSink : Binding Level -> Cfg [ctor] .     --- control point requiring R
-  op dataSink : Binding -> Cfg [ctor] .              --- data-only sink, no requirement
-  op carriesI : Binding Level -> Cfg [ctor] .        --- derived, B carries integrity L
-  op injection : -> Cfg [ctor] .                     --- violation, integrity below a requirement
+  op deleg : Rel -> Cfg [ctor] .                  --- the delegation context theta
+  op intSource : Binding Prin -> Cfg [ctor] .     --- origin influenced by W
+  op influencedBy : Binding Prin -> Cfg [ctor] .  --- derived influence token
+  op flow : Binding Binding -> Cfg [ctor] .
+  op endorse : Binding Binding Prin -> Cfg [ctor] . --- authority-scoped integrity raise to R
+  op controlSink : Binding Prin -> Cfg [ctor] .   --- control point requiring authority R
+  op injection : -> Cfg [ctor] .                  --- violation
 
-  vars B B1 B2 : Binding .  var T : Level .  var R : Level .  var L : Level .
+  vars B B1 B2 : Binding .  vars W R : Prin .  var REL : Rel .
 
-  --- idempotent derived facts so propagation reaches a finite fixpoint
-  eq carriesI(B, L) carriesI(B, L) = carriesI(B, L) .
+  eq influencedBy(B, W) influencedBy(B, W) = influencedBy(B, W) .
   eq injection injection = injection .
 
-  --- seed each source with its integrity level
-  rl [seed] : intSource(B, L) => intSource(B, L) carriesI(B, L) .
+  --- seed influence at sources
+  rl [seed] : intSource(B, W) => intSource(B, W) influencedBy(B, W) .
 
-  --- integrity propagates along every flow edge, including through an agent join
-  --- box. Each carried level propagates independently, so a join box that mixes
-  --- an operator instruction with a stranger email carries stranger too, dragging
-  --- the output below any requirement above stranger.
-  rl [prop] : carriesI(B1, L) flow(B1, B2) => carriesI(B1, L) flow(B1, B2) carriesI(B2, L) .
+  --- influence propagates along every flow edge (the agent join box is the same:
+  --- an output binding has a flow edge from each of its inputs)
+  rl [prop] : influencedBy(B1, W) flow(B1, B2) => influencedBy(B1, W) flow(B1, B2) influencedBy(B2, W) .
 
-  --- endorse yields a fresh binding carrying ONLY the raised target level T, the
-  --- validated typed value, never the source's low level. There is no rule
-  --- crossing the low level over an endorse, which is what makes the
-  --- endorsed-path bite hold.
-  rl [endorse-seed] : endorse(B1, B2, T) => endorse(B1, B2, T) carriesI(B2, T) .
+  --- endorse yields a binding influenced ONLY by the vouching authority R; the
+  --- low source taint does not cross, which is what makes the endorsed-path bite
+  --- hold. (Grant-authorization of the endorse is the NMIF increment, modeled next.)
+  rl [endorse-seed] : endorse(B1, B2, R) => endorse(B1, B2, R) influencedBy(B2, R) .
 
-  --- violation: a carried integrity level below the sink requirement. With more
-  --- than two tiers this fires for stranger reaching a contact-required action and
-  --- for contact reaching an operator-required workflow-spawn.
-  crl [inject] : carriesI(B, L) controlSink(B, R) => carriesI(B, L) controlSink(B, R) injection
-    if geq(L, R) = false .
+  --- violation: a control sink requiring R is influenced by W where W does not
+  --- act-for R, so W lacks R's authority and its influence taints the decision.
+  crl [inject] : influencedBy(B, W) controlSink(B, R) deleg(REL)
+    => influencedBy(B, W) controlSink(B, R) deleg(REL) injection
+    if canAct(REL, W, R) =/= true .
 endm
