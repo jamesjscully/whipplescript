@@ -163,11 +163,28 @@ pub fn report_for_check(ir: &IrProgram) -> Option<String> {
 }
 
 /// Run the IFC check if a governance envelope is configured; otherwise no
-/// constraints apply (dev mode) and this returns no diagnostics.
+/// constraints apply (dev mode) and this returns no diagnostics. A *signed*
+/// envelope (one carrying an `attestation`) is verified first: the whip agent
+/// refuses to enforce a tampered policy.
 pub fn check_ifc_program(ir: &IrProgram) -> Vec<Diagnostic> {
     let Some(path) = envelope_path_from_env() else {
         return Vec::new();
     };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    if text.contains("\"attestation\"") {
+        if let Err(message) = crate::gov::SignedEnvelope::verify(&text) {
+            return vec![Diagnostic {
+                span: whipplescript_parser::SourceSpan { start: 0, end: 0 },
+                message: format!("governance envelope rejected: {message}"),
+                suggestion: Some(
+                    "re-sign the envelope with `whip gov sign` after editing it".to_owned(),
+                ),
+                related: Vec::new(),
+            }];
+        }
+    }
     match Envelope::load(&path) {
         Ok(envelope) => check_with_envelope(ir, &envelope),
         // A malformed envelope is the governance compiler's error to report (a

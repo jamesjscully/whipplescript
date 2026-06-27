@@ -3250,3 +3250,70 @@ fn ifc_two_agent_sign_requires_governance_privilege() {
     let _ = fs::remove_file(&config);
     let _ = fs::remove_file(&signed_file);
 }
+
+/// End-to-end trust root: a SIGNED envelope drives `whip check` enforcement, and a
+/// tampered signed envelope is rejected (the whip agent refuses a tampered policy).
+#[test]
+fn ifc_check_enforces_and_rejects_tampered_signed_envelope() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let config = temp_path("gov-cfg2", "gov");
+    fs::write(
+        &config,
+        "grant file_store ledger -> file:/srv/ledger.db readable by Operator\n\
+         grant file_store outbox -> file:/srv/outbox public\n",
+    )
+    .expect("write config");
+
+    // governance agent signs
+    let signed = Command::new(bin)
+        .args(["gov", "sign", config.to_str().expect("utf-8 path")])
+        .env("WHIPPLESCRIPT_GOV_ADMIN", "1")
+        .output()
+        .expect("command runs");
+    assert!(signed.status.success(), "sign should succeed");
+    let signed_json = String::from_utf8_lossy(&signed.stdout).to_string();
+    let signed_file = temp_path("gov-signed2", "json");
+    fs::write(&signed_file, &signed_json).expect("write signed");
+
+    let whip = temp_path("ifc-whip2", "whip");
+    fs::write(&whip, IFC_BAD_WHIP).expect("write whip");
+
+    // a verified signed envelope enforces: the bad flow is rejected
+    let enforced = Command::new(bin)
+        .args(["check", whip.to_str().expect("utf-8 path")])
+        .env("WHIPPLESCRIPT_IFC_ENVELOPE", &signed_file)
+        .output()
+        .expect("command runs");
+    assert!(!enforced.status.success(), "signed envelope should enforce");
+    assert!(
+        String::from_utf8_lossy(&enforced.stderr).contains("information-flow violation"),
+        "stderr: {}",
+        String::from_utf8_lossy(&enforced.stderr)
+    );
+
+    // tamper the signed envelope: flip ledger to public without re-signing
+    let tampered = signed_json.replace(
+        "\"ledger\":{\"confidential\":true}",
+        "\"ledger\":{\"confidential\":false}",
+    );
+    assert_ne!(tampered, signed_json, "tamper must change the content");
+    fs::write(&signed_file, &tampered).expect("write tampered");
+    let rejected = Command::new(bin)
+        .args(["check", whip.to_str().expect("utf-8 path")])
+        .env("WHIPPLESCRIPT_IFC_ENVELOPE", &signed_file)
+        .output()
+        .expect("command runs");
+    assert!(
+        !rejected.status.success(),
+        "tampered envelope must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("governance envelope rejected"),
+        "stderr: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    let _ = fs::remove_file(&config);
+    let _ = fs::remove_file(&signed_file);
+    let _ = fs::remove_file(&whip);
+}
