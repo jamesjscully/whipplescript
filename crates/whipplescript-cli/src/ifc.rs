@@ -52,10 +52,62 @@ impl Envelope {
         })
     }
 
+    /// Parse the readable governance DSL (DR-0028) into the envelope. v0 grammar,
+    /// one statement per line (`#` starts a comment):
+    ///   `grant <kind> <handle> -> <resource-id> <label>`
+    /// where `<label>` is a `readable by <roles>` clause (confidential) or an
+    /// `audience { … }` / `public` clause (un-cleared sink). `party` / `delegate`
+    /// statements are accepted and ignored in this binary v0 (they carry the
+    /// party-relative content of a later slice).
+    pub fn from_dsl(text: &str) -> Result<Self, String> {
+        let mut confidential = BTreeSet::new();
+        let mut governed = BTreeSet::new();
+        for (index, raw) in text.lines().enumerate() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            match tokens.first().copied() {
+                Some("party") | Some("delegate") => continue,
+                Some("grant") => {}
+                _ => {
+                    return Err(format!(
+                        "line {}: unrecognized governance statement",
+                        index + 1
+                    ));
+                }
+            }
+            let arrow = tokens.iter().position(|tok| *tok == "->");
+            let Some(arrow) = arrow.filter(|pos| *pos >= 3 && *pos + 1 < tokens.len()) else {
+                return Err(format!(
+                    "line {}: grant needs `grant <kind> <handle> -> <resource-id> <label>`",
+                    index + 1
+                ));
+            };
+            let handle = tokens[arrow - 1].to_owned();
+            let label = tokens[arrow + 2..].join(" ");
+            governed.insert(handle.clone());
+            if label.contains("readable by") || label == "confidential" {
+                confidential.insert(handle);
+            }
+        }
+        Ok(Self {
+            confidential,
+            governed,
+        })
+    }
+
+    /// Load a governance envelope, auto-detecting JSON (the signed artifact) from
+    /// the readable DSL by the first non-whitespace character.
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|err| format!("cannot read IFC envelope {}: {err}", path.display()))?;
-        Self::from_json(&text)
+        if text.trim_start().starts_with('{') {
+            Self::from_json(&text)
+        } else {
+            Self::from_dsl(&text)
+        }
     }
 
     fn is_confidential(&self, resource: &str) -> bool {
@@ -230,5 +282,34 @@ rule work
         // empty envelope: nothing is governed, so the gradual model imposes nothing.
         let envelope = Envelope::from_json(r#"{ "resources": {} }"#).expect("valid envelope");
         assert!(check_with_envelope(&ir, &envelope).is_empty());
+    }
+
+    const DSL: &str = "\
+# governance for the IFC test\n\
+grant file_store ledger -> file:/srv/ledger.db readable by Operator\n\
+grant file_store outbox -> file:/srv/outbox audience { Requester }\n\
+party bob@acme.com : Requester\n";
+
+    #[test]
+    fn dsl_parses_to_the_same_labels_as_json() {
+        let from_dsl = Envelope::from_dsl(DSL).expect("valid DSL");
+        // ledger confidential, outbox governed-but-public — same as the JSON envelope.
+        assert!(from_dsl.is_confidential("ledger"));
+        assert!(!from_dsl.is_confidential("outbox"));
+        assert!(from_dsl.is_uncleared_sink("outbox"));
+        assert!(!from_dsl.is_uncleared_sink("ledger"));
+
+        let ir = ir_with_grants(&format!("{READ_LEDGER}{WRITE_OUTBOX}"));
+        assert!(
+            check_with_envelope(&ir, &from_dsl)
+                .iter()
+                .any(|d| d.message.contains("information-flow violation")),
+            "DSL-derived envelope should reject the bad flow"
+        );
+    }
+
+    #[test]
+    fn dsl_rejects_a_malformed_grant() {
+        assert!(Envelope::from_dsl("grant file_store ledger confidential").is_err());
     }
 }

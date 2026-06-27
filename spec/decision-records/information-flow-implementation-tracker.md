@@ -34,7 +34,12 @@ asymmetric-delegation model (acts-for, reader/influencer sets) and NMIF.
 
 ## Phase 2 — Parser / IR
 
-- [ ] governance DSL grammar (`grant`/`party`/`delegate`), separate from `.whip`.
+- [~] governance DSL grammar (`grant`/`party`/`delegate`), separate from `.whip`:
+  v0 line parser landed in `ifc.rs` (`Envelope::from_dsl`), `grant <kind> <handle>
+  -> <id> <label>` with `readable by` = confidential; `Envelope::load`
+  auto-detects DSL vs the JSON signed-artifact. `party`/`delegate` accepted+ignored
+  (party-relative content is a later slice). Unit-tested. Remaining: full grammar +
+  the canonical signed-JSON emit + the `gov compile` report.
 - [ ] source crossings: the `endorsed` marker (over `coerce`), the `declassify`
   construct, role references; everything else label-free.
 - [ ] IR label representation (party-relative labels; the `kind:address` resource id).
