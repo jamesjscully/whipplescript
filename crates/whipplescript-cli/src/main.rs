@@ -144,6 +144,7 @@ fn main() -> ExitCode {
         Some("package") => package(&options),
         Some("check") => check(&options),
         Some("gov") => gov(&options),
+        Some("agent") => whip_agent(&options),
         Some("lint") => lint(&options),
         Some("lsp") => lsp(&options),
         Some("fmt") => fmt(&options),
@@ -11951,6 +11952,61 @@ fn gov_escalate(options: &CliOptions) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `whip agent` — the interactive whip agent loop (DR-0026/0028). UNPRIVILEGED: the
+/// user-facing agent that authors and checks whips under the active envelope. It can
+/// `check <file>` (run the IFC check) and `escalate <request>` (file a low-integrity
+/// request for the admin), but it has NO path to signing governance — a `sign` is
+/// refused. An LLM driver or a human user feeds it the same stdin.
+fn whip_agent(_options: &CliOptions) -> ExitCode {
+    use std::io::BufRead;
+    println!("whip agent (unprivileged): check <file> | escalate <request> | quit");
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        let trimmed = line.trim();
+        if trimmed == "quit" {
+            break;
+        } else if trimmed.is_empty() {
+            continue;
+        } else if let Some(path) = trimmed.strip_prefix("check ") {
+            match std::fs::read_to_string(path.trim()) {
+                Ok(source) => match whipplescript_parser::compile_program(&source).ir {
+                    Some(ir) => {
+                        let diagnostics = ifc::check_ifc_program(&ir);
+                        if diagnostics.is_empty() {
+                            println!("ok: no information-flow violations");
+                        } else {
+                            for diagnostic in diagnostics {
+                                println!("- {}", diagnostic.message);
+                            }
+                        }
+                    }
+                    None => println!("compile error in {}", path.trim()),
+                },
+                Err(err) => println!("cannot read {}: {err}", path.trim()),
+            }
+        } else if let Some(request) = trimmed.strip_prefix("escalate ") {
+            match env::var("WHIPPLESCRIPT_GOV_ESCALATIONS") {
+                Ok(log) => {
+                    let from = env::var("WHIPPLESCRIPT_USER").unwrap_or_else(|_| "user".to_owned());
+                    match gov::file_escalation(std::path::Path::new(&log), request, &from) {
+                        Ok(()) => println!("escalation filed for admin review"),
+                        Err(message) => println!("{message}"),
+                    }
+                }
+                Err(_) => println!("set WHIPPLESCRIPT_GOV_ESCALATIONS to escalate"),
+            }
+        } else if trimmed.starts_with("sign") {
+            println!("refused: the whip agent cannot sign governance — escalate to the admin");
+        } else {
+            println!("unknown: {trimmed} (check <file> | escalate <request> | quit)");
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// `whip gov agent` — the interactive governance agent loop (DR-0028 D5). PRIVILEGED:

@@ -3414,3 +3414,42 @@ fn ifc_governance_agent_loop_drafts_and_signs() {
 
     let _ = fs::remove_file(&out);
 }
+
+/// End-to-end whip agent loop (DR-0026/0028): the unprivileged whip agent can
+/// `check` a whip but is refused if it tries to `sign` governance.
+#[test]
+fn ifc_whip_agent_loop_checks_and_refuses_to_sign() {
+    use std::io::Write;
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let whip = temp_path("whip-agent-whip", "whip");
+    fs::write(&whip, IFC_BAD_WHIP).expect("write whip");
+    let whip_arg = whip.to_str().expect("utf-8 path");
+    let script = format!("check {whip_arg}\nsign anything\nquit\n");
+
+    let mut child = Command::new(bin)
+        .args(["agent"])
+        .env_remove("WHIPPLESCRIPT_IFC_ENVELOPE")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(script.as_bytes())
+        .expect("write script");
+    let output = child.wait_with_output().expect("wait");
+    assert!(output.status.success(), "whip agent loop should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("no information-flow violations"),
+        "dev-mode check should pass: {stdout}"
+    );
+    assert!(
+        stdout.contains("cannot sign governance"),
+        "whip agent must refuse to sign: {stdout}"
+    );
+
+    let _ = fs::remove_file(&whip);
+}
