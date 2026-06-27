@@ -462,6 +462,43 @@ pub fn check_with_envelope(ir: &IrProgram, envelope: &Envelope) -> Vec<Diagnosti
                     }
                 }
             }
+            // Provider egress (DR-0027 provider-as-principal): a turn ships its
+            // context to the agent's model provider, so a read-confidential turn
+            // whose provider is not cleared leaks to the model.
+            if effect.kind == IrEffectKind::AgentTell {
+                if let Some(provider) = effect
+                    .agent
+                    .as_deref()
+                    .and_then(|name| ir.agents.iter().find(|a| a.name == name))
+                    .and_then(|a| a.provider.as_deref())
+                {
+                    for grant in &effect.access_grants {
+                        let resource = grant.resource.as_str();
+                        let reads_resource =
+                            grant.operations.iter().any(|op| is_read_op(&op.operation));
+                        if reads_resource && envelope.leaks(resource, provider) {
+                            diagnostics.push(Diagnostic {
+                                span: effect.span,
+                                message: format!(
+                                    "provider-egress violation in rule `{rule}`: a turn reads \
+                                     `{resource}` (readable by {rr}) but its provider `{provider}` \
+                                     (clearance {pr}) is not cleared, so the turn's context egresses \
+                                     to an uncleared model",
+                                    rule = rule.name,
+                                    rr = envelope.reader_authority(resource),
+                                    pr = envelope.reader_authority(provider),
+                                ),
+                                suggestion: Some(format!(
+                                    "bind the agent to a provider cleared for `{resource}`, or \
+                                     declassify before the turn"
+                                )),
+                                related: Vec::new(),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
         }
         let report_span = span.unwrap_or(whipplescript_parser::SourceSpan { start: 0, end: 0 });
         let mut leak: Option<(&str, &str)> = None;
@@ -674,10 +711,34 @@ rule work
     }
 
     #[test]
-    fn allows_turn_reading_confidential_only() {
+    fn allows_turn_reading_confidential_only_when_provider_cleared() {
         let ir = ir_with_grants(READ_LEDGER);
-        let envelope = Envelope::from_json(ENVELOPE).expect("valid envelope");
+        // the agent's `fixture` provider is cleared for confidential data, so a
+        // read-only turn with no egress is fine.
+        let envelope = Envelope::from_json(
+            r#"{ "resources": {
+                "ledger": { "confidential": true },
+                "fixture": { "reader": "confidential" }
+            } }"#,
+        )
+        .expect("valid envelope");
         assert!(check_with_envelope(&ir, &envelope).is_empty());
+    }
+
+    #[test]
+    fn flags_provider_egress_to_uncleared_provider() {
+        let ir = ir_with_grants(READ_LEDGER);
+        // ledger confidential, fixture provider unlabeled (public clearance): the
+        // turn's context egresses to an uncleared model.
+        let envelope =
+            Envelope::from_json(r#"{ "resources": { "ledger": { "confidential": true } } }"#)
+                .expect("valid envelope");
+        assert!(
+            check_with_envelope(&ir, &envelope)
+                .iter()
+                .any(|d| d.message.contains("provider-egress violation")),
+            "reading confidential data with an uncleared provider should be flagged"
+        );
     }
 
     #[test]

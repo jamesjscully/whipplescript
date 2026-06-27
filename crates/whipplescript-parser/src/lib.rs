@@ -1201,6 +1201,10 @@ pub struct IrEffectNode {
     /// see rule-body data flows, not just turn-access grants. `None` for effects
     /// that touch no named resource. Not part of the `.ir` snapshot.
     pub resource: Option<String>,
+    /// The agent a `tell` addresses (its `target`), surfaced so information-flow
+    /// analysis can model the turn's egress to that agent's provider. `None` for
+    /// non-`tell` effects. Not part of the `.ir` snapshot.
+    pub agent: Option<String>,
 }
 
 /// A lowered turn-access grant: the granted operations narrow the turn's effective
@@ -6711,6 +6715,7 @@ fn analyze_rule(
                 // below (which carries the real grants); empty here is fine.
                 access_grants: Vec::new(),
                 resource: None,
+                agent: None,
             });
         }
     }
@@ -7344,6 +7349,15 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
     }
 }
 
+/// The agent a `tell` addresses, surfaced for information-flow analysis of the
+/// turn's egress to the agent's provider. `None` for non-`tell` effects.
+fn agent_for_body(kind: &body::BodyEffectKind) -> Option<String> {
+    match kind {
+        body::BodyEffectKind::Tell { target, .. } => Some(target.clone()),
+        _ => None,
+    }
+}
+
 /// The named resource a direct file/channel effect touches, surfaced for
 /// information-flow analysis. `None` for effects with no named resource.
 fn resource_for_body(kind: &body::BodyEffectKind) -> Option<String> {
@@ -7512,6 +7526,7 @@ fn walk_effects(
                 let construct_use = construct_use_for_body(&effect.kind);
                 let access_grants = ir_access_grants_for_body(&effect.kind);
                 let resource = resource_for_body(&effect.kind);
+                let agent = agent_for_body(&effect.kind);
                 effects.push(IrEffectNode {
                     id,
                     kind,
@@ -7523,6 +7538,7 @@ fn walk_effects(
                     timeout_seconds: effect.timeout_seconds,
                     access_grants,
                     resource,
+                    agent,
                 });
             }
             body::BodyStmt::After(after) => {
