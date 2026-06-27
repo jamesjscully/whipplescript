@@ -37,6 +37,13 @@ pub struct Envelope {
     /// declassify grants `(resource, role)`: `resource` may be released to any
     /// party that acts-for `role`. These are the audited trusted-surface holes.
     declassify: Vec<(String, String)>,
+    /// integrity (writer/vouching) authority per resource (absent = `public`, the
+    /// untrusted bottom). A control sink requiring integrity `r` accepts data only
+    /// from a source whose integrity acts-for `r` (DR-0027 I-IFC1, integrity axis).
+    integrity: BTreeMap<String, String>,
+    /// endorse grants `(resource, role)`: `resource`'s data may be raised to `role`
+    /// integrity — the audited integrity-axis crossing.
+    endorse: Vec<(String, String)>,
 }
 
 impl Envelope {
@@ -50,6 +57,8 @@ impl Envelope {
         let mut governed = BTreeSet::new();
         let mut deleg = Vec::new();
         let mut declassify = Vec::new();
+        let mut integrity = BTreeMap::new();
+        let mut endorse = Vec::new();
         if let Some(map) = value.get("resources").and_then(|res| res.as_object()) {
             for (name, label) in map {
                 governed.insert(name.clone());
@@ -63,6 +72,23 @@ impl Envelope {
                     .unwrap_or(false)
                 {
                     readers.insert(name.clone(), "confidential".to_owned());
+                }
+                if let Some(writer) = label.get("writer").and_then(serde_json::Value::as_str) {
+                    if writer != PUBLIC {
+                        integrity.insert(name.clone(), writer.to_owned());
+                    }
+                }
+            }
+        }
+        if let Some(pairs) = value.get("endorsements").and_then(|d| d.as_array()) {
+            for pair in pairs {
+                if let Some(items) = pair.as_array() {
+                    if let (Some(res), Some(role)) = (
+                        items.first().and_then(serde_json::Value::as_str),
+                        items.get(1).and_then(serde_json::Value::as_str),
+                    ) {
+                        endorse.push((res.to_owned(), role.to_owned()));
+                    }
                 }
             }
         }
@@ -95,6 +121,8 @@ impl Envelope {
             governed,
             deleg,
             declassify,
+            integrity,
+            endorse,
         })
     }
 
@@ -108,29 +136,37 @@ impl Envelope {
         let mut governed = BTreeSet::new();
         let mut deleg = Vec::new();
         let mut declassify = Vec::new();
+        let mut integrity = BTreeMap::new();
+        let mut endorse = Vec::new();
         for (index, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
                 continue;
             }
             let tokens: Vec<&str> = line.split_whitespace().collect();
-            // `grant declassify <resource> to <role>` — the audited escape hatch.
+            // `grant declassify|endorse <resource> to <role>` — the audited crossings.
             if tokens.first().copied() == Some("grant")
-                && tokens.get(1).copied() == Some("declassify")
+                && matches!(tokens.get(1).copied(), Some("declassify") | Some("endorse"))
             {
+                let kind = tokens[1];
                 let Some(to) = tokens.iter().position(|tok| *tok == "to") else {
                     return Err(format!(
-                        "line {}: declassify grant needs `to <role>`",
+                        "line {}: {kind} grant needs `to <role>`",
                         index + 1
                     ));
                 };
                 if to < 3 || to + 1 >= tokens.len() {
                     return Err(format!(
-                        "line {}: declassify grant needs `grant declassify <resource> to <role>`",
+                        "line {}: {kind} grant needs `grant {kind} <resource> to <role>`",
                         index + 1
                     ));
                 }
-                declassify.push((tokens[2].to_owned(), tokens[to + 1].to_owned()));
+                let pair = (tokens[2].to_owned(), tokens[to + 1].to_owned());
+                if kind == "declassify" {
+                    declassify.push(pair);
+                } else {
+                    endorse.push(pair);
+                }
                 continue;
             }
             match tokens.first().copied() {
@@ -170,7 +206,15 @@ impl Envelope {
             if let Some(by) = label.iter().position(|tok| *tok == "by") {
                 if let Some(role) = label.get(by + 1) {
                     if *role != PUBLIC {
-                        readers.insert(handle, (*role).to_owned());
+                        readers.insert(handle.clone(), (*role).to_owned());
+                    }
+                }
+            }
+            // `from <Role>` sets the integrity (vouching) authority.
+            if let Some(from) = label.iter().position(|tok| *tok == "from") {
+                if let Some(role) = label.get(from + 1) {
+                    if *role != PUBLIC {
+                        integrity.insert(handle, (*role).to_owned());
                     }
                 }
             }
@@ -180,6 +224,8 @@ impl Envelope {
             governed,
             deleg,
             declassify,
+            integrity,
+            endorse,
         })
     }
 
@@ -202,9 +248,18 @@ impl Envelope {
         for name in &self.governed {
             resources.insert(
                 name.clone(),
-                serde_json::json!({ "reader": self.reader_authority(name) }),
+                serde_json::json!({
+                    "reader": self.reader_authority(name),
+                    "writer": self.integrity_authority(name),
+                }),
             );
         }
+        let mut endorsed: Vec<(String, String)> = self.endorse.clone();
+        endorsed.sort();
+        let endorsements: Vec<serde_json::Value> = endorsed
+            .iter()
+            .map(|(res, role)| serde_json::json!([res, role]))
+            .collect();
         let mut edges: Vec<(String, String)> = self.deleg.clone();
         edges.sort();
         let delegations: Vec<serde_json::Value> = edges
@@ -221,6 +276,7 @@ impl Envelope {
             "resources": resources,
             "delegations": delegations,
             "declassifications": declassifications,
+            "endorsements": endorsements,
         })
         .to_string()
     }
@@ -274,6 +330,32 @@ impl Envelope {
         }
         for (resource, role) in &self.declassify {
             if resource == source && self.can_act(sink_reader, role) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The integrity (vouching) authority of a resource; `public` (the untrusted
+    /// bottom) if unlabeled.
+    fn integrity_authority(&self, resource: &str) -> &str {
+        self.integrity
+            .get(resource)
+            .map(String::as_str)
+            .unwrap_or(PUBLIC)
+    }
+
+    /// Does reading `read` and writing `write` inject? Untrusted data pollutes a
+    /// trusted sink: safe iff `read`'s integrity acts-for `write`'s requirement (the
+    /// dual of `leaks`), OR an endorse grant raises `read` to a role that meets the
+    /// requirement (the audited integrity crossing, DR-0027 I-IFC3).
+    fn injects(&self, read: &str, write: &str) -> bool {
+        let requirement = self.integrity_authority(write);
+        if self.can_act(self.integrity_authority(read), requirement) {
+            return false;
+        }
+        for (resource, role) in &self.endorse {
+            if resource == read && self.can_act(role, requirement) {
                 return false;
             }
         }
@@ -357,11 +439,14 @@ pub fn check_with_envelope(ir: &IrProgram, envelope: &Envelope) -> Vec<Diagnosti
                 }
             }
             let mut leak: Option<(&str, &str)> = None;
-            'pairs: for &src in &reads {
+            let mut inject: Option<(&str, &str)> = None;
+            for &src in &reads {
                 for &sink in &writes {
-                    if envelope.leaks(src, sink) {
+                    if leak.is_none() && envelope.leaks(src, sink) {
                         leak = Some((src, sink));
-                        break 'pairs;
+                    }
+                    if inject.is_none() && envelope.injects(src, sink) {
+                        inject = Some((src, sink));
                     }
                 }
             }
@@ -379,6 +464,24 @@ pub fn check_with_envelope(ir: &IrProgram, envelope: &Envelope) -> Vec<Diagnosti
                     suggestion: Some(format!(
                         "separate the contexts — read `{src}` in a distinct turn and pass only a \
                          bounded result; or declassify the value before writing `{sink}`"
+                    )),
+                    related: Vec::new(),
+                });
+            }
+            if let Some((src, sink)) = inject {
+                diagnostics.push(Diagnostic {
+                    span: effect.span,
+                    message: format!(
+                        "integrity violation in rule `{rule}`: this turn may let untrusted `{src}` \
+                         (integrity {src_int}) influence `{sink}` (requires integrity {sink_int}), \
+                         an injection into a more-trusted sink",
+                        rule = rule.name,
+                        src_int = envelope.integrity_authority(src),
+                        sink_int = envelope.integrity_authority(sink),
+                    ),
+                    suggestion: Some(format!(
+                        "endorse `{src}` to the required integrity (a `grant endorse {src} to …`), \
+                         or do not let `{src}` influence `{sink}`"
                     )),
                     related: Vec::new(),
                 });
@@ -609,6 +712,24 @@ grant file_store auditbox -> file:/srv/auditbox readable by Auditor\n";
         assert!(!with.leaks("ledger", "auditbox"));
         // the reverse remains a leak — Operator does not act-for Auditor here.
         assert!(with.leaks("auditbox", "ledger"));
+    }
+
+    #[test]
+    fn integrity_injection_and_endorse() {
+        // intake is untrusted (from Requester... here unlabeled = untrusted bottom);
+        // ledger requires Operator integrity to write. Letting intake influence
+        // ledger is an injection.
+        let base = "\
+grant channel intake -> imap:in from public\n\
+grant file_store ledger -> file:/srv/ledger.db from Operator\n";
+        let env = Envelope::from_dsl(base).expect("valid");
+        assert!(env.injects("intake", "ledger"));
+        // an endorse grant raising intake to Operator clears it.
+        let with = Envelope::from_dsl(&format!("{base}grant endorse intake to Operator\n"))
+            .expect("valid");
+        assert!(!with.injects("intake", "ledger"));
+        // trusted -> untrusted sink never injects.
+        assert!(!env.injects("ledger", "intake"));
     }
 
     #[test]

@@ -3292,10 +3292,7 @@ fn ifc_check_enforces_and_rejects_tampered_signed_envelope() {
     );
 
     // tamper the signed envelope: flip ledger's reader to public without re-signing
-    let tampered = signed_json.replace(
-        "\"ledger\":{\"reader\":\"Operator\"}",
-        "\"ledger\":{\"reader\":\"public\"}",
-    );
+    let tampered = signed_json.replace("\"reader\":\"Operator\"", "\"reader\":\"public\"");
     assert_ne!(tampered, signed_json, "tamper must change the content");
     fs::write(&signed_file, &tampered).expect("write tampered");
     let rejected = Command::new(bin)
