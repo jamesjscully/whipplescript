@@ -34,6 +34,12 @@ asymmetric-delegation model (acts-for, reader/influencer sets) and NMIF.
 
 ## Phase 2 — Parser / IR
 
+- [~] **declassify escape hatch** (2026-06-27, governance granularity): DSL
+  `grant declassify <resource> to <role>` clears a flow whose sink reader is
+  cleared for `<role>` (the audited trusted surface, surfaced in the guarantee
+  report). v0 — at governance granularity, not yet a per-crossing *source*
+  construct (`endorsed`/`declassify` in `.whip` needs parser work). Integrity axis
+  (`endorse`) still open.
 - [~] governance DSL grammar (`grant`/`party`/`delegate`), separate from `.whip`:
   v0 line parser landed in `ifc.rs` (`Envelope::from_dsl`), `grant <kind> <handle>
   -> <id> <label>` with `readable by` = confidential; `Envelope::load`

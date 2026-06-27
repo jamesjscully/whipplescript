@@ -34,6 +34,9 @@ pub struct Envelope {
     governed: BTreeSet<String>,
     /// acts-for edges `(p, q)`: `p` acts-for `q` (has at least `q`'s authority).
     deleg: Vec<(String, String)>,
+    /// declassify grants `(resource, role)`: `resource` may be released to any
+    /// party that acts-for `role`. These are the audited trusted-surface holes.
+    declassify: Vec<(String, String)>,
 }
 
 impl Envelope {
@@ -46,6 +49,7 @@ impl Envelope {
         let mut readers = BTreeMap::new();
         let mut governed = BTreeSet::new();
         let mut deleg = Vec::new();
+        let mut declassify = Vec::new();
         if let Some(map) = value.get("resources").and_then(|res| res.as_object()) {
             for (name, label) in map {
                 governed.insert(name.clone());
@@ -74,10 +78,23 @@ impl Envelope {
                 }
             }
         }
+        if let Some(pairs) = value.get("declassifications").and_then(|d| d.as_array()) {
+            for pair in pairs {
+                if let Some(items) = pair.as_array() {
+                    if let (Some(res), Some(role)) = (
+                        items.first().and_then(serde_json::Value::as_str),
+                        items.get(1).and_then(serde_json::Value::as_str),
+                    ) {
+                        declassify.push((res.to_owned(), role.to_owned()));
+                    }
+                }
+            }
+        }
         Ok(Self {
             readers,
             governed,
             deleg,
+            declassify,
         })
     }
 
@@ -90,12 +107,32 @@ impl Envelope {
         let mut readers = BTreeMap::new();
         let mut governed = BTreeSet::new();
         let mut deleg = Vec::new();
+        let mut declassify = Vec::new();
         for (index, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
                 continue;
             }
             let tokens: Vec<&str> = line.split_whitespace().collect();
+            // `grant declassify <resource> to <role>` — the audited escape hatch.
+            if tokens.first().copied() == Some("grant")
+                && tokens.get(1).copied() == Some("declassify")
+            {
+                let Some(to) = tokens.iter().position(|tok| *tok == "to") else {
+                    return Err(format!(
+                        "line {}: declassify grant needs `to <role>`",
+                        index + 1
+                    ));
+                };
+                if to < 3 || to + 1 >= tokens.len() {
+                    return Err(format!(
+                        "line {}: declassify grant needs `grant declassify <resource> to <role>`",
+                        index + 1
+                    ));
+                }
+                declassify.push((tokens[2].to_owned(), tokens[to + 1].to_owned()));
+                continue;
+            }
             match tokens.first().copied() {
                 Some("party") => continue,
                 Some("delegate") => {
@@ -142,6 +179,7 @@ impl Envelope {
             readers,
             governed,
             deleg,
+            declassify,
         })
     }
 
@@ -173,7 +211,18 @@ impl Envelope {
             .iter()
             .map(|(left, right)| serde_json::json!([left, right]))
             .collect();
-        serde_json::json!({ "resources": resources, "delegations": delegations }).to_string()
+        let mut declass: Vec<(String, String)> = self.declassify.clone();
+        declass.sort();
+        let declassifications: Vec<serde_json::Value> = declass
+            .iter()
+            .map(|(res, role)| serde_json::json!([res, role]))
+            .collect();
+        serde_json::json!({
+            "resources": resources,
+            "delegations": delegations,
+            "declassifications": declassifications,
+        })
+        .to_string()
     }
 
     /// The reader authority of a resource; `public` (the bottom) if unlabeled.
@@ -214,10 +263,21 @@ impl Envelope {
 
     /// Does data from `source` leak when written to `sink`? Safe iff every party
     /// that can read `sink` can also read `source` — i.e. `sink`'s reader authority
-    /// acts-for `source`'s. Otherwise some reader of `sink` is not cleared for
-    /// `source`, and it leaks (the fail-closed sticky boundary, DR-0027 I-IFC6).
+    /// acts-for `source`'s — OR a declassify grant releases `source` to a role the
+    /// `sink` reader is cleared for (the audited escape hatch, DR-0027 I-IFC3).
+    /// Otherwise some reader of `sink` is not cleared for `source`, and it leaks
+    /// (the fail-closed sticky boundary, DR-0027 I-IFC6).
     fn leaks(&self, source: &str, sink: &str) -> bool {
-        !self.can_act(self.reader_authority(sink), self.reader_authority(source))
+        let sink_reader = self.reader_authority(sink);
+        if self.can_act(sink_reader, self.reader_authority(source)) {
+            return false;
+        }
+        for (resource, role) in &self.declassify {
+            if resource == source && self.can_act(sink_reader, role) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -336,12 +396,20 @@ pub struct GovernanceReport {
     pub protected: Vec<String>,
     pub violations: usize,
     pub coverage_gaps: Vec<String>,
+    /// The audited trusted surface: each declassify grant `resource -> role`.
+    pub trusted_surface: Vec<String>,
 }
 
 pub fn governance_report(ir: &IrProgram, envelope: &Envelope) -> GovernanceReport {
     // protected = governed resources whose reader authority is not public.
     let mut protected: Vec<String> = envelope.readers.keys().cloned().collect();
     protected.sort();
+    let mut trusted_surface: Vec<String> = envelope
+        .declassify
+        .iter()
+        .map(|(resource, role)| format!("{resource} -> {role}"))
+        .collect();
+    trusted_surface.sort();
     let violations = check_with_envelope(ir, envelope).len();
     let mut touched: BTreeSet<String> = BTreeSet::new();
     for rule in &ir.rules {
@@ -359,6 +427,7 @@ pub fn governance_report(ir: &IrProgram, envelope: &Envelope) -> GovernanceRepor
         protected,
         violations,
         coverage_gaps,
+        trusted_surface,
     }
 }
 
@@ -389,6 +458,14 @@ impl GovernanceReport {
             );
             for resource in &self.coverage_gaps {
                 out.push_str(&format!("    - {resource}\n"));
+            }
+        }
+        if self.trusted_surface.is_empty() {
+            out.push_str("  trusted surface (declassify grants): none\n");
+        } else {
+            out.push_str("  trusted surface (audited declassify grants to review):\n");
+            for crossing in &self.trusted_surface {
+                out.push_str(&format!("    - {crossing}\n"));
             }
         }
         out
@@ -532,6 +609,29 @@ grant file_store auditbox -> file:/srv/auditbox readable by Auditor\n";
         assert!(!with.leaks("ledger", "auditbox"));
         // the reverse remains a leak — Operator does not act-for Auditor here.
         assert!(with.leaks("auditbox", "ledger"));
+    }
+
+    #[test]
+    fn declassify_grant_clears_a_flow() {
+        let base = "\
+grant file_store ledger -> file:/srv/ledger.db readable by Operator\n\
+grant channel reply -> smtp:out readable by Requester\n";
+        // ledger (Operator) -> reply (Requester) normally leaks.
+        assert!(Envelope::from_dsl(base)
+            .expect("valid")
+            .leaks("ledger", "reply"));
+        // a declassify grant releasing ledger to Requester clears it (audited hatch).
+        let with = Envelope::from_dsl(&format!("{base}grant declassify ledger to Requester\n"))
+            .expect("valid");
+        assert!(!with.leaks("ledger", "reply"));
+        // but it does not clear a flow to a sink the released role can't reach.
+        let with2 = Envelope::from_dsl(&format!(
+            "{base}grant channel pub -> smtp:pub public\ngrant declassify ledger to Requester\n"
+        ))
+        .expect("valid");
+        // reply is Requester-readable so cleared; a public sink is not Requester-... actually
+        // public is the bottom so canAct(public, Requester) is false -> still leaks to public.
+        assert!(with2.leaks("ledger", "pub"));
     }
 
     #[test]
