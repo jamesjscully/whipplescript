@@ -3314,3 +3314,57 @@ fn ifc_check_enforces_and_rejects_tampered_signed_envelope() {
     let _ = fs::remove_file(&signed_file);
     let _ = fs::remove_file(&whip);
 }
+
+/// End-to-end escalation channel (DR-0028 D5): the whip side files an escalation
+/// (unprivileged); only the governance agent (privileged) may review it.
+#[test]
+fn ifc_escalation_channel_whip_files_gov_reviews() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let log = temp_path("gov-escalations", "jsonl");
+    let _ = fs::remove_file(&log);
+    let log_arg = log.to_str().expect("utf-8 path");
+
+    // whip side (unprivileged) files a request
+    let filed = Command::new(bin)
+        .args(["gov", "escalate", "need declassify ledger to Auditor"])
+        .env("WHIPPLESCRIPT_GOV_ESCALATIONS", log_arg)
+        .env_remove("WHIPPLESCRIPT_GOV_ADMIN")
+        .output()
+        .expect("command runs");
+    assert!(
+        filed.status.success(),
+        "filing an escalation should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&filed.stderr)
+    );
+
+    // whip side (unprivileged) cannot review
+    let denied = Command::new(bin)
+        .args(["gov", "escalations"])
+        .env("WHIPPLESCRIPT_GOV_ESCALATIONS", log_arg)
+        .env_remove("WHIPPLESCRIPT_GOV_ADMIN")
+        .output()
+        .expect("command runs");
+    assert!(
+        !denied.status.success(),
+        "unprivileged review must be refused"
+    );
+
+    // governance agent (privileged) reviews the pending request
+    let reviewed = Command::new(bin)
+        .args(["gov", "escalations"])
+        .env("WHIPPLESCRIPT_GOV_ESCALATIONS", log_arg)
+        .env("WHIPPLESCRIPT_GOV_ADMIN", "1")
+        .output()
+        .expect("command runs");
+    assert!(
+        reviewed.status.success(),
+        "privileged review should succeed"
+    );
+    assert!(
+        String::from_utf8_lossy(&reviewed.stdout).contains("declassify ledger to Auditor"),
+        "stdout: {}",
+        String::from_utf8_lossy(&reviewed.stdout)
+    );
+
+    let _ = fs::remove_file(&log);
+}

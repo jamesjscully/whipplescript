@@ -12,6 +12,8 @@
 //! canonical envelope content bound to the signer identity. Tampering with the
 //! content breaks the hash, so the whip agent rejects it.
 
+use std::path::Path;
+
 use sha2::{Digest, Sha256};
 
 use crate::ifc::Envelope;
@@ -142,6 +144,71 @@ impl SignedEnvelope {
     }
 }
 
+/// An escalation request: the whip side asks the admin for a governance change
+/// (e.g. a missing declassify grant). It crosses to the governance side as
+/// LOW-INTEGRITY data (DR-0028 D5, the one whip->gov flow): the governance agent
+/// never auto-acts on it; the admin reviews and signs.
+pub struct Escalation {
+    pub request: String,
+    pub from: String,
+}
+
+/// File an escalation request — UNPRIVILEGED (the whip side files it). Appends a
+/// low-integrity request to the escalation log; it is data, never an action.
+pub fn file_escalation(log: &Path, request: &str, from: &str) -> Result<(), String> {
+    let line = serde_json::json!({ "request": request, "from": from }).to_string();
+    let mut contents = std::fs::read_to_string(log).unwrap_or_default();
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(&line);
+    contents.push('\n');
+    std::fs::write(log, contents)
+        .map_err(|err| format!("cannot write escalation log {}: {err}", log.display()))
+}
+
+/// Review pending escalations — PRIVILEGED (only the governance agent, G1). The
+/// requests are surfaced for the admin to decide on; reviewing them never applies
+/// them (the admin signs a new envelope separately).
+pub fn list_escalations(log: &Path) -> Result<Vec<Escalation>, String> {
+    list_escalations_with_privilege(log, has_governance_privilege())
+}
+
+fn list_escalations_with_privilege(
+    log: &Path,
+    privileged: bool,
+) -> Result<Vec<Escalation>, String> {
+    if !privileged {
+        return Err(
+            "reviewing escalations requires governance privilege (run via the governance agent)"
+                .to_owned(),
+        );
+    }
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(line).map_err(|err| format!("invalid escalation entry: {err}"))?;
+        out.push(Escalation {
+            request: value
+                .get("request")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            from: value
+                .get("from")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +234,26 @@ grant file_store outbox -> file:/srv/outbox public\n";
             SignedEnvelope::verify(&json).expect("verifies"),
             "alice@admin"
         );
+    }
+
+    #[test]
+    fn escalation_channel_files_low_integrity_and_only_gov_reviews() {
+        let log = std::env::temp_dir().join(format!(
+            "whip-gov-escalation-{}-{}.jsonl",
+            std::process::id(),
+            CONFIG.len()
+        ));
+        let _ = std::fs::remove_file(&log);
+        file_escalation(&log, "need declassify ledger to Auditor", "bob").expect("filed");
+        file_escalation(&log, "need endorse intake to Operator", "carol").expect("filed");
+        // the whip side (unprivileged) cannot review escalations (G1).
+        assert!(list_escalations_with_privilege(&log, false).is_err());
+        // the governance agent reviews them.
+        let items = list_escalations_with_privilege(&log, true).expect("review");
+        assert_eq!(items.len(), 2);
+        assert!(items[0].request.contains("declassify"));
+        assert_eq!(items[0].from, "bob");
+        let _ = std::fs::remove_file(&log);
     }
 
     #[test]

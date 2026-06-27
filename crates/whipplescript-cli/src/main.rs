@@ -11909,9 +11909,70 @@ fn gov(options: &CliOptions) -> ExitCode {
     match options.args.first().map(String::as_str) {
         Some("sign") => gov_sign(options),
         Some("verify") => gov_verify(options),
+        Some("escalate") => gov_escalate(options),
+        Some("escalations") => gov_escalations(options),
         _ => {
-            eprintln!("usage: whip gov <sign|verify> <file>");
+            eprintln!("usage: whip gov <sign|verify|escalate|escalations> [args]");
             ExitCode::from(2)
+        }
+    }
+}
+
+fn gov_escalation_log() -> Result<PathBuf, ExitCode> {
+    match env::var("WHIPPLESCRIPT_GOV_ESCALATIONS") {
+        Ok(path) => Ok(PathBuf::from(path)),
+        Err(_) => {
+            eprintln!("set WHIPPLESCRIPT_GOV_ESCALATIONS to the escalation log path");
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+/// `whip gov escalate <request>` — the whip side (unprivileged) files a low-integrity
+/// request for the admin to review.
+fn gov_escalate(options: &CliOptions) -> ExitCode {
+    let Some(request) = options.args.get(1) else {
+        eprintln!("usage: whip gov escalate <request>");
+        return ExitCode::from(2);
+    };
+    let log = match gov_escalation_log() {
+        Ok(log) => log,
+        Err(code) => return code,
+    };
+    let from = env::var("WHIPPLESCRIPT_USER").unwrap_or_else(|_| "user".to_owned());
+    match gov::file_escalation(&log, request, &from) {
+        Ok(()) => {
+            println!("escalation filed for admin review");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `whip gov escalations` — the governance agent (privileged) reviews pending requests.
+fn gov_escalations(options: &CliOptions) -> ExitCode {
+    let _ = options;
+    let log = match gov_escalation_log() {
+        Ok(log) => log,
+        Err(code) => return code,
+    };
+    match gov::list_escalations(&log) {
+        Ok(items) if items.is_empty() => {
+            println!("no pending escalations");
+            ExitCode::SUCCESS
+        }
+        Ok(items) => {
+            for escalation in items {
+                println!("- from {}: {}", escalation.from, escalation.request);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::from(1)
         }
     }
 }
