@@ -110,6 +110,20 @@ impl Envelope {
         }
     }
 
+    /// The canonical signed-artifact JSON: every governed resource with its
+    /// confidentiality, in sorted order (so the hash is deterministic). This is
+    /// what the governance agent signs (DR-0028).
+    pub fn to_canonical_json(&self) -> String {
+        let mut resources = serde_json::Map::new();
+        for name in &self.governed {
+            resources.insert(
+                name.clone(),
+                serde_json::json!({ "confidential": self.confidential.contains(name) }),
+            );
+        }
+        serde_json::json!({ "resources": resources }).to_string()
+    }
+
     fn is_confidential(&self, resource: &str) -> bool {
         self.confidential.contains(resource)
     }

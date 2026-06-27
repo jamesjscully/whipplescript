@@ -3188,3 +3188,65 @@ fn ifc_check_rejects_confidential_to_uncleared_flow_under_envelope() {
     let _ = fs::remove_file(&whip);
     let _ = fs::remove_file(&envelope);
 }
+
+/// End-to-end two-agent separation (DR-0028 D5): `whip gov sign` is refused
+/// without governance privilege (the whip agent) and succeeds with it (the
+/// governance agent); the resulting signed envelope verifies unprivileged.
+#[test]
+fn ifc_two_agent_sign_requires_governance_privilege() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let config = temp_path("gov-config", "gov");
+    fs::write(
+        &config,
+        "grant file_store ledger -> file:/srv/ledger.db readable by Operator\n",
+    )
+    .expect("write config");
+    let config_arg = config.to_str().expect("utf-8 path");
+
+    // whip agent (no privilege): sign refused (G4)
+    let unprivileged = Command::new(bin)
+        .args(["gov", "sign", config_arg])
+        .env_remove("WHIPPLESCRIPT_GOV_ADMIN")
+        .output()
+        .expect("command runs");
+    assert!(
+        !unprivileged.status.success(),
+        "unprivileged sign must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&unprivileged.stderr).contains("privilege"),
+        "stderr: {}",
+        String::from_utf8_lossy(&unprivileged.stderr)
+    );
+
+    // governance agent (privileged, sudo proxy): sign succeeds
+    let signed = Command::new(bin)
+        .args(["gov", "sign", config_arg])
+        .env("WHIPPLESCRIPT_GOV_ADMIN", "1")
+        .output()
+        .expect("command runs");
+    assert!(
+        signed.status.success(),
+        "privileged sign must succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+    let signed_json = String::from_utf8_lossy(&signed.stdout).to_string();
+    assert!(signed_json.contains("attestation"), "got: {signed_json}");
+
+    // whip agent (unprivileged) verifies the signed envelope
+    let signed_file = temp_path("gov-signed", "json");
+    fs::write(&signed_file, &signed_json).expect("write signed");
+    let verify = Command::new(bin)
+        .args(["gov", "verify", signed_file.to_str().expect("utf-8 path")])
+        .env_remove("WHIPPLESCRIPT_GOV_ADMIN")
+        .output()
+        .expect("command runs");
+    assert!(
+        verify.status.success(),
+        "verify must succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    let _ = fs::remove_file(&config);
+    let _ = fs::remove_file(&signed_file);
+}

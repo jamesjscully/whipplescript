@@ -71,6 +71,7 @@ use whipplescript_store::{
 
 mod auth;
 mod coerce_runtime;
+mod gov;
 mod harness_tools;
 mod ifc;
 
@@ -142,6 +143,7 @@ fn main() -> ExitCode {
         Some("doctor") => doctor(&options),
         Some("package") => package(&options),
         Some("check") => check(&options),
+        Some("gov") => gov(&options),
         Some("lint") => lint(&options),
         Some("lsp") => lsp(&options),
         Some("fmt") => fmt(&options),
@@ -11897,6 +11899,69 @@ fn compile(options: &CliOptions) -> ExitCode {
     } else {
         print!("{snapshot}");
         ExitCode::SUCCESS
+    }
+}
+
+/// The governance agent's command surface (DR-0028 D5): `gov sign` is the
+/// privileged operation that produces a signed envelope; `gov verify` is the
+/// unprivileged check the whip agent uses.
+fn gov(options: &CliOptions) -> ExitCode {
+    match options.args.first().map(String::as_str) {
+        Some("sign") => gov_sign(options),
+        Some("verify") => gov_verify(options),
+        _ => {
+            eprintln!("usage: whip gov <sign|verify> <file>");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn gov_sign(options: &CliOptions) -> ExitCode {
+    let Some(config_path) = options.args.get(1) else {
+        eprintln!("usage: whip gov sign <governance-config>");
+        return ExitCode::from(2);
+    };
+    let config_text = match std::fs::read_to_string(config_path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("cannot read {config_path}: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let signer = env::var("WHIPPLESCRIPT_GOV_SIGNER").unwrap_or_else(|_| "admin".to_owned());
+    match gov::SignedEnvelope::sign(&config_text, &signer) {
+        Ok(signed) => {
+            println!("{}", signed.to_json());
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn gov_verify(options: &CliOptions) -> ExitCode {
+    let Some(signed_path) = options.args.get(1) else {
+        eprintln!("usage: whip gov verify <signed-envelope>");
+        return ExitCode::from(2);
+    };
+    let signed_text = match std::fs::read_to_string(signed_path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("cannot read {signed_path}: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    match gov::SignedEnvelope::verify(&signed_text) {
+        Ok(signer) => {
+            println!("verified: signed by {signer}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::from(1)
+        }
     }
 }
 

@@ -77,9 +77,16 @@ asymmetric-delegation model (acts-for, reader/influencer sets) and NMIF.
 
 ## Phase 5 — Two-agent runtime (DR-0028 D5)
 
-- [ ] governance root agent — sudo-gated, fixed narrow surface (edit DSL / compile
-  / sign), admin-only input.
-- [ ] whip root agent — unprivileged, authors whips.
+- [~] **privilege-separation core landed** (`crates/whipplescript-cli/src/gov.rs`,
+  2026-06-27): `whip gov sign` is the privileged op (G1/G4) — refused without
+  governance privilege, gated by `WHIPPLESCRIPT_GOV_ADMIN` (the sudo/OS-install
+  proxy); produces a SHA-256 **attestation** (trust-root option C) binding the
+  canonical envelope to the signer. `whip gov verify` is the unprivileged
+  whip-agent check; a tamper breaks the hash. 3 unit + 1 e2e test. Remaining: the
+  governance *agent loop* (narrow tool surface), the whip-agent loop, and the
+  escalation channel; binding `whip check` to require a verified signed envelope.
+- [ ] governance root agent loop — narrow surface (edit DSL / compile / sign).
+- [ ] whip root agent loop — unprivileged, authors whips.
 - [ ] escalation channel — the one whip→gov flow, carried as low-integrity data.
 
 ## Phase 6 — Provider egress + integration
