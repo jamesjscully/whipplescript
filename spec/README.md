@@ -102,6 +102,9 @@ timeouts, and replay. The language owns policy.
   from the retired public plugin-system design
 - [skills.md](skills.md): deterministic skill registry and attachment model
 - [agent-harness.md](agent-harness.md): provider adapters for real agent turns
+- [information-flow-surface.md](information-flow-surface.md): IFC source surface and
+  governance grants — gradual labels on real resources, the `endorsed`/`declassify`
+  crossings, the construct/boundary audit, and the provider-egress check (DR-0027/0028)
 - [coerce.md](coerce.md): typed schema-coercion effects and backend/toolchain integration
 - [event-ingress.md](event-ingress.md): `std.ingress`, typed `signal`
   admission, and external delivery providers

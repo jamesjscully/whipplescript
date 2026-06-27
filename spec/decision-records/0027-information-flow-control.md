@@ -105,9 +105,16 @@ NEVER by trusting the model more about what it did with its context.
 > to **nonmalleable information flow (NMIF)**: a downgrade may not be influenced
 > by an attacker.
 
-`endorse` is grounded in `coerce` / `exec -> Schema` — untrusted text becomes a
-validated, bounded, typed value. `declassify` releases a bounded typed value to a
-wider reader set. The two hatches are **axis-locked**: endorse raises integrity
+Structural validation is **not** endorsement: `coerce` / `exec -> Schema` turns
+untrusted text into a typed value at the *same* integrity (well-shaped, still
+untrusted) and is free and unmarked. `endorse` is the *separate*, explicit,
+authority-scoped act that raises integrity — written as an explicit `endorsed`
+marker on the validated value, gated by a governance grant and audited (see the
+[information-flow surface](../information-flow-surface.md)). `declassify` releases
+a bounded typed value to a wider reader set. Both crossings carry a mandatory
+bounded type as their bandwidth ceiling, and their target level / audience comes
+from the governance grant, not the script. The two hatches are **axis-locked**:
+endorse raises integrity
 but preserves confidentiality (an endorsed secret is still secret); declassify
 lowers confidentiality but preserves integrity (a declassified untrusted value is
 still untrusted). The **audit set is the trusted surface** — enumerate the
@@ -147,19 +154,27 @@ adversarial setting raises the stakes on side channels even though they remain
 out of static scope. This is still categorically stronger than "one context,
 everything mixes."
 
-### I-IFC6 — Label totality, fail-closed
+### I-IFC6 — Governance-relative soundness, fail-closed at the governed boundary
 
-> Every source carries a label, and the analysis is sound under conservative
-> defaults. A flow reaching a labeled sink from a source that is unlabeled or
-> whose label cannot be inferred is **rejected, not allowed**. Inference never
-> under-approximates a label.
+> Soundness is **relative to the governance config**: an empty config protects
+> nothing (a plain whip runs unconstrained), and the guarantee equals exactly what
+> governance declares. Where a protection *is* declared, the analysis is
+> fail-closed **at the boundary of the governed surface** — **governed data may not
+> flow to an un-cleared or ungoverned sink**, and unlabeled intermediates within a
+> governed flow are treated conservatively. Inference never under-approximates a
+> label.
 
-Without this, the whole guarantee has a default-shaped hole: forgetting to label a
-sensitive source would silently make it public. Labeling lands at **trust
-boundaries** — where data enters the system and a human is already deciding trust
-— and inference fills the interior, but the failure mode is closed: unknown
-becomes rejected, never permitted. Confidentiality defaults to maximally secret
-and integrity to minimally trusted, so an omission fails safe on both axes.
+This is the gradual form (the
+[information-flow surface](../information-flow-surface.md)): IFC is opt-in via the
+governance config, so there is no global "every source must be labeled" demand —
+many whips need no config at all. The soundness comes instead from the **sticky
+boundary**: once a value derives from a protected real source, every one of its
+sinks must be governed and cleared, or the whip is rejected (the diagnostic names
+the real resource to label). Governed data cannot leak into the ungoverned region.
+Confidentiality defaults to maximally secret and integrity to minimally trusted, so
+an omission *inside* a governed flow fails safe on both axes. This refines, rather
+than contradicts, I-IFC5's policy-relative guarantee: the empty policy is the
+default floor.
 
 ### I-IFC7 — Labels are preserved across every durable and distributed boundary
 
@@ -259,11 +274,13 @@ Explicitly open, sequenced as later steps (modeled-first per standing
 discipline):
 
 ```text
-- Surface syntax. How labels attach to source. Lean recorded (DR-0028 and the
-  design discussion): coarse-by-default on channel / file_store, per-field opt-in
-  on schema, crossings (coerce/declassify) always explicit at the use site, and
-  everything intermediate inferred. Labels reference roles; concrete parties are
-  bound in governance. Its own spec doc; big UX surface, decide deliberately.
+- Surface syntax. DRAFTED in the [information-flow surface](../information-flow-surface.md):
+  governance grants bind+authorize+label real resources (typed `kind:address`),
+  source is label-free except the two explicit crossings (`endorsed` /
+  `declassify`, target from grant, bounded type), `coerce` is structural-only,
+  sinks and provider egress are implicit. Remaining-open within it: the governance
+  config's signed serialization, clearance-based provider routing, role-generics,
+  per-field labels beyond the channel/store grain.
 
 - The precise label algebra + checking + inference. Which formalization of
   party-relative labels and acts-for; the join/meet over principal sets; the NMIF
