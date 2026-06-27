@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use whipplescript_parser::{Diagnostic, IrProgram};
+use whipplescript_parser::{Diagnostic, IrEffectKind, IrProgram};
 
 /// The bottom reader-authority: data readable by `public` is readable by anyone,
 /// and `public` itself holds no authority above itself.
@@ -424,68 +424,87 @@ pub fn check_ifc_program(ir: &IrProgram) -> Vec<Diagnostic> {
 pub fn check_with_envelope(ir: &IrProgram, envelope: &Envelope) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     for rule in &ir.rules {
+        // Collect reads and writes across the whole rule (the rule-level join box):
+        // both `with access to` turn grants AND direct file effects in the body.
+        let mut reads: Vec<&str> = Vec::new();
+        let mut writes: Vec<&str> = Vec::new();
+        let mut span = None;
         for effect in &rule.metadata.effects {
-            let mut reads: Vec<&str> = Vec::new();
-            let mut writes: Vec<&str> = Vec::new();
+            if let Some(resource) = &effect.resource {
+                match effect.kind {
+                    IrEffectKind::FileRead | IrEffectKind::FileImport => {
+                        reads.push(resource.as_str());
+                        span.get_or_insert(effect.span);
+                    }
+                    IrEffectKind::FileWrite | IrEffectKind::FileExport => {
+                        writes.push(resource.as_str());
+                        span.get_or_insert(effect.span);
+                    }
+                    _ => {}
+                }
+            }
             for grant in &effect.access_grants {
                 let resource = grant.resource.as_str();
                 for op in &grant.operations {
                     if is_read_op(&op.operation) {
                         reads.push(resource);
+                        span.get_or_insert(effect.span);
                     }
                     if is_egress_op(&op.operation) {
                         writes.push(resource);
+                        span.get_or_insert(effect.span);
                     }
                 }
             }
-            let mut leak: Option<(&str, &str)> = None;
-            let mut inject: Option<(&str, &str)> = None;
-            for &src in &reads {
-                for &sink in &writes {
-                    if leak.is_none() && envelope.leaks(src, sink) {
-                        leak = Some((src, sink));
-                    }
-                    if inject.is_none() && envelope.injects(src, sink) {
-                        inject = Some((src, sink));
-                    }
+        }
+        let report_span = span.unwrap_or(whipplescript_parser::SourceSpan { start: 0, end: 0 });
+        let mut leak: Option<(&str, &str)> = None;
+        let mut inject: Option<(&str, &str)> = None;
+        for &src in &reads {
+            for &sink in &writes {
+                if leak.is_none() && envelope.leaks(src, sink) {
+                    leak = Some((src, sink));
+                }
+                if inject.is_none() && envelope.injects(src, sink) {
+                    inject = Some((src, sink));
                 }
             }
-            if let Some((src, sink)) = leak {
-                diagnostics.push(Diagnostic {
-                    span: effect.span,
-                    message: format!(
-                        "information-flow violation in rule `{rule}`: this turn may read `{src}` \
-                         (readable by {src_reader}) and write `{sink}` (readable by {sink_reader}), \
-                         so data from `{src}` could reach a party not cleared for it",
-                        rule = rule.name,
-                        src_reader = envelope.reader_authority(src),
-                        sink_reader = envelope.reader_authority(sink),
-                    ),
-                    suggestion: Some(format!(
-                        "separate the contexts — read `{src}` in a distinct turn and pass only a \
-                         bounded result; or declassify the value before writing `{sink}`"
-                    )),
-                    related: Vec::new(),
-                });
-            }
-            if let Some((src, sink)) = inject {
-                diagnostics.push(Diagnostic {
-                    span: effect.span,
-                    message: format!(
-                        "integrity violation in rule `{rule}`: this turn may let untrusted `{src}` \
-                         (integrity {src_int}) influence `{sink}` (requires integrity {sink_int}), \
-                         an injection into a more-trusted sink",
-                        rule = rule.name,
-                        src_int = envelope.integrity_authority(src),
-                        sink_int = envelope.integrity_authority(sink),
-                    ),
-                    suggestion: Some(format!(
-                        "endorse `{src}` to the required integrity (a `grant endorse {src} to …`), \
-                         or do not let `{src}` influence `{sink}`"
-                    )),
-                    related: Vec::new(),
-                });
-            }
+        }
+        if let Some((src, sink)) = leak {
+            diagnostics.push(Diagnostic {
+                span: report_span,
+                message: format!(
+                    "information-flow violation in rule `{rule}`: it may read `{src}` (readable by \
+                     {src_reader}) and write `{sink}` (readable by {sink_reader}), so data from \
+                     `{src}` could reach a party not cleared for it",
+                    rule = rule.name,
+                    src_reader = envelope.reader_authority(src),
+                    sink_reader = envelope.reader_authority(sink),
+                ),
+                suggestion: Some(format!(
+                    "separate the contexts — read `{src}` in a distinct turn and pass only a \
+                     bounded result; or declassify the value before writing `{sink}`"
+                )),
+                related: Vec::new(),
+            });
+        }
+        if let Some((src, sink)) = inject {
+            diagnostics.push(Diagnostic {
+                span: report_span,
+                message: format!(
+                    "integrity violation in rule `{rule}`: it may let untrusted `{src}` (integrity \
+                     {src_int}) influence `{sink}` (requires integrity {sink_int}), an injection \
+                     into a more-trusted sink",
+                    rule = rule.name,
+                    src_int = envelope.integrity_authority(src),
+                    sink_int = envelope.integrity_authority(sink),
+                ),
+                suggestion: Some(format!(
+                    "endorse `{src}` to the required integrity (a `grant endorse {src} to …`), or \
+                     do not let `{src}` influence `{sink}`"
+                )),
+                related: Vec::new(),
+            });
         }
     }
     diagnostics
@@ -691,6 +710,47 @@ party bob@acme.com : Requester\n";
     #[test]
     fn dsl_rejects_a_malformed_grant() {
         assert!(Envelope::from_dsl("grant file_store ledger confidential").is_err());
+    }
+
+    #[test]
+    fn rule_body_file_flow_is_checked() {
+        // a rule that directly reads a confidential store and writes a public one
+        // in its body (no agent turn) is flagged via the new resource surfacing.
+        let program = r#"@service
+workflow IfcBody
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+
+file store ledger { root "./ledger"  allow read ["**"] }
+file store outbox { root "./outbox"  allow write ["**"] }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from ledger at "data.txt" as loaded
+  write text to outbox at "out.txt" {
+    body "x"
+    mode replace
+  } as written
+  complete result { ok true }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope = Envelope::from_json(ENVELOPE).expect("valid");
+        let diagnostics = check_with_envelope(&ir, &envelope);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("information-flow violation")
+                    && d.message.contains("ledger")
+                    && d.message.contains("outbox")),
+            "rule-body read->write should be flagged, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

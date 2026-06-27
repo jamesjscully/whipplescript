@@ -1196,6 +1196,11 @@ pub struct IrEffectNode {
     /// Turn-access grants (`with access to …`) lowered onto an `agent.tell` effect as
     /// authority-narrowing metadata (Proposal A). Empty for non-grant effects.
     pub access_grants: Vec<IrAccessGrant>,
+    /// The named resource (file store / channel) a direct effect touches, if any —
+    /// e.g. the store of a `read`/`write`. Surfaced so information-flow analysis can
+    /// see rule-body data flows, not just turn-access grants. `None` for effects
+    /// that touch no named resource. Not part of the `.ir` snapshot.
+    pub resource: Option<String>,
 }
 
 /// A lowered turn-access grant: the granted operations narrow the turn's effective
@@ -6705,6 +6710,7 @@ fn analyze_rule(
                 // The line-scanner result is overwritten by collect_effects_from_ast
                 // below (which carries the real grants); empty here is fine.
                 access_grants: Vec::new(),
+                resource: None,
             });
         }
     }
@@ -7338,6 +7344,18 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
     }
 }
 
+/// The named resource a direct file/channel effect touches, surfaced for
+/// information-flow analysis. `None` for effects with no named resource.
+fn resource_for_body(kind: &body::BodyEffectKind) -> Option<String> {
+    match kind {
+        body::BodyEffectKind::FileRead { store, .. }
+        | body::BodyEffectKind::FileWrite { store, .. }
+        | body::BodyEffectKind::FileImport { store, .. }
+        | body::BodyEffectKind::FileExport { store, .. } => Some(store.clone()),
+        _ => None,
+    }
+}
+
 fn construct_use_for_body(kind: &body::BodyEffectKind) -> Option<IrConstructUse> {
     match kind {
         body::BodyEffectKind::ConstructCapabilityCall {
@@ -7486,6 +7504,7 @@ fn walk_effects(
                 required_capabilities.dedup();
                 let construct_use = construct_use_for_body(&effect.kind);
                 let access_grants = ir_access_grants_for_body(&effect.kind);
+                let resource = resource_for_body(&effect.kind);
                 effects.push(IrEffectNode {
                     id,
                     kind,
@@ -7496,6 +7515,7 @@ fn walk_effects(
                     span: effect.span,
                     timeout_seconds: effect.timeout_seconds,
                     access_grants,
+                    resource,
                 });
             }
             body::BodyStmt::After(after) => {
