@@ -101,13 +101,21 @@ can escalate itself.
 
 ### D3 — Bounding the root: a signed policy envelope the root cannot self-widen (governance Option A)
 
-Governance is **Option A: no second agent.** Three considered options:
+Governance options considered (UPDATED — see the note below):
 
 ```text
-(A) human + signed policy artifact + escalation-over-`human.ask`   <-- CHOSEN
-(B) (A) + an ephemeral, tool-less LLM chat that drafts policy diffs for signature
+(A) human + signed policy artifact + escalation-over-`human.ask`
+(B) (A) + an LLM that drafts policy diffs for the operator to sign
 (C) a standing second "governance" agent loop
 ```
+
+> **Amendment (DR-0028 D5):** the original framing chose Option A (no second
+> agent). It is superseded: governance authoring is now a *separate, privileged*
+> governance root agent, gated by admin/sudo and isolated from untrusted input
+> (Option B + C, made safe by OS privilege separation). The whip root agent
+> described in this record is the *unprivileged* half; it still cannot self-widen,
+> and now provably has no path to the governor. See
+> [DR-0028](0028-information-flow-authority.md) D5 (G1–G4).
 
 (C) is rejected for v1: a standing policy-writing agent moves the crown jewels
 rather than eliminating them — jailbreaking *it* becomes the escalation path —
@@ -241,12 +249,6 @@ discipline):
 ## Deferred capabilities (recorded hooks, not v1)
 
 ```text
-governance draft-chat (Option B)  An ephemeral, tool-less, no-arbitrary-egress
-                                  LLM chat whose ONLY output is a proposed policy
-                                  diff the operator signs. Adds NL policy authoring
-                                  with no standing capability holder. Trivial add
-                                  once D3's signed-artifact + signature flow exists.
-
 machine-baseline policy ceiling   A machine-wide envelope that per-session
                                   envelopes may only narrow; escalation within a
                                   session cannot exceed the baseline without a

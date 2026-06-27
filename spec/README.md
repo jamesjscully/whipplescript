@@ -105,6 +105,10 @@ timeouts, and replay. The language owns policy.
 - [information-flow-surface.md](information-flow-surface.md): IFC source surface and
   governance grants — gradual labels on real resources, the `endorsed`/`declassify`
   crossings, the construct/boundary audit, and the provider-egress check (DR-0027/0028)
+- [information-flow-governance.md](information-flow-governance.md): IFC governance
+  lifecycle — IT drafts the DSL once, `gov compile` returns a guarantee report,
+  signs (attestation); users author whips freely under enforcement with routes-to-fix
+  errors; the signed envelope extends DR-0026 (DR-0028)
 - [coerce.md](coerce.md): typed schema-coercion effects and backend/toolchain integration
 - [event-ingress.md](event-ingress.md): `std.ingress`, typed `signal`
   admission, and external delivery providers

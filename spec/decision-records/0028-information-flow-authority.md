@@ -142,6 +142,65 @@ property, verified in TLA+ (see
 with [DR-0027](0027-information-flow-control.md) I-IFC7: persisted data carries the
 label it was written under, so a later envelope change cannot relabel it in place.
 
+### D5 — Two root-agent kinds, separated by OS privilege
+
+> Authoring governance and authoring whips are split across **two separate
+> session-root agents** ([DR-0026](0026-session-root-agent.md)). The **governance
+> root agent** requires admin/sudo to run and is the only thing that may change
+> policy; the **whip root agent** is unprivileged and authors only whips under the
+> locked envelope. The OS privilege boundary is the enforcement.
+
+This un-defers DR-0026's governance Option B (agent-assisted policy authoring) and
+realizes it as a *privileged, isolated* agent rather than a feature of the whip
+agent. It also strengthens, not weakens, DR-0026's "the agent cannot self-widen":
+the whip agent has no path to the governor, and the governor is gated by sudo.
+
+```text
+                     governance root agent          whip root agent
+run privilege        admin / sudo REQUIRED          unprivileged
+talks to             the admin only                 the user
+tool surface         edit gov DSL, gov compile,      author / spawn / run whips
+                     read report, sign envelope      (DR-0026 + harness tools)
+envelope authority   signs new versions (admin)     read / enforce only
+input trust          admin input only                handles untrusted user/env input
+its own bounds       fixed narrow surface + sudo     the signed envelope (acts-for user)
+```
+
+Four invariants:
+
+```text
+G1 privileged governor   running the gov agent requires admin/sudo; the whip agent
+                         does not. OS-enforced.
+G2 untrusted-input       the gov agent's context holds only admin input + governance
+   isolation             artifacts, never untrusted user/environment data. Enforced
+                         by process + privilege separation, not convention. This is
+                         the structural form of the isolation a standing governance
+                         agent requires to be safe.
+G3 narrowly bounded      the gov agent's authority is a FIXED tool surface (edit DSL
+   governor              / compile / sign): no whip authoring, no protected-data
+                         access, no arbitrary egress. It changes policy, never runs
+                         workloads. Its own setup (provider, tool surface) is
+                         admin/install-owned and sudo-protected, not self-modifiable
+                         -- which stops the who-governs-the-governor regress.
+G4 single signer         only the gov agent, with admin authority (= the sudo
+                         identity = the attestation key, DR-0028 trust root), signs a
+                         new envelope version; the whip agent only reads and enforces.
+```
+
+The one flow from the whip side to the governance side is **escalation** (a user's
+whip needs an ungranted right). Because that request may be shaped by untrusted
+input, it crosses as **low-integrity data the admin reviews** (DR-0027 integrity
+applied to the governor itself): the gov agent may display it but never auto-acts on
+it; the admin decides. This preserves G2 — the escalation channel is not an
+injection path into the privileged agent.
+
+Out of scope (a deployment/documentation concern, not a system guarantee): *which*
+LLM provider each agent is wired to. WhippleScript enforces declared provider
+clearances (DR-0027 provider egress) but cannot verify a provider actually protects
+data — that trust is the admin's configuration choice. For the gov agent, whose
+context is the security policy itself, the provider choice is the admin's; we note
+the consideration, we do not mandate it.
+
 ## Why this split
 
 - It is the only structure that satisfies both cases without two mechanisms. Both
@@ -157,14 +216,18 @@ label it was written under, so a later envelope change cannot relabel it in plac
 ## What this record does not decide
 
 ```text
-- The envelope's concrete schema and on-disk form: how roles, parties, the
-  delegation context, ownership, protected-from, and downgrade authority are
-  expressed and signed. Extends the DR-0026 policy-artifact work; shares its
-  signing / ratify / lock flow.
+- The envelope's concrete schema and on-disk form: DRAFTED in the
+  [governance lifecycle spec](../information-flow-governance.md) — one signed
+  envelope extending DR-0026, authored via a single DSL surface, compiled to a
+  signed artifact, attested like a package lock (trust-root option C), versioned
+  and bound to runs (D4). Remaining-open within it: the attestation record's exact
+  format and the gov DSL grammar.
 
-- The natural-language-to-policy authoring path (Case 2 / DR-0026 Option B): how
-  the agent drafts a policy diff, renders it in plain language, and what the
-  ratify-and-lock interaction is. Depends on the envelope schema.
+- The natural-language-to-policy authoring path (Case 2 / DR-0026 Option B):
+  DEFERRED, not in the v1 lifecycle. The v1 model is IT-drafts-and-signs-once with
+  users authoring whips freely under enforcement (see the
+  [governance lifecycle spec](../information-flow-governance.md)); the agent drafts
+  whips, not governance. Option B remains a deferred hook with the same sign+lock.
 
 - The refinement check itself (inline ⊑ envelope) as a compiler pass: deferred to
   DR-0027's label-algebra and checking step; this record locks that it MUST hold,
@@ -206,3 +269,9 @@ cross-envelope flow       data crossing between two separately-governed envelope
 - Envelope changes are versioned and forward-only: they do not retroactively
   authorize past flows, and in-flight work is bound to and revalidated against its
   envelope version, never silently re-permitted (D4).
+- Governance and whip authoring split across two session-root agents separated by
+  OS privilege: a sudo-gated governance agent that alone may sign policy, and an
+  unprivileged whip agent; untrusted-input isolation is enforced by the privilege
+  boundary, escalation crosses as low-integrity data, and the governor is bounded
+  by a fixed admin-owned surface (D5, G1–G4). Provider trust is the admin's
+  documented config choice, not a system guarantee.
