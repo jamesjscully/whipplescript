@@ -103,6 +103,42 @@ others are active workshop material.
   provably converges with non-termination confined to the root `@service` loop.
   Amends DR-0024 slice 2: the workspace lease becomes re-entrant within an invoke
   subtree. *Accepted (design); formal convergence model gates implementation.*
+- [0026-session-root-agent.md](0026-session-root-agent.md):
+  run the harness as the top-level interface — a **session root** agent that is
+  itself a root whip (one harness, DR-0024 reused) and the only loop allowed to
+  author and spawn arbitrary (individually-bounded) whips. Bounded by a signed
+  **policy envelope** it cannot self-widen; escalation is reactive over
+  `human.ask` with kernel enforcement (governance **Option A — no second
+  agent**). Observed via a versioned, cursor-tailed **session-event stream** over
+  the existing durable log (protocol, not TUI). Relocates DR-0024 I3's
+  no-self-escalation to the envelope; keeps spawn-and-observe distinct from
+  `workflow.invoke`. *Accepted (design); the information-flow lattice is a
+  separate research thread it does not depend on.*
+- [0027-information-flow-control.md](0027-information-flow-control.md): make
+  prompt injection and data exfiltration **provable** at compile time via a
+  party-relative information-flow label system — confidentiality "who may read"
+  and integrity "who vouches", principals ordered by acts-for, the agent turn an
+  opaque **join box** enforced at boundaries, and downgrading
+  (declassify/endorse) explicit, authority-scoped, axis-locked, and **NMIF**-safe
+  with the audit set as the trusted surface. Labels are total and fail-closed,
+  survive every durable and cross-instance boundary, and cover the whole brokered
+  tool surface; the guarantee is policy-relative non-interference over
+  explicit/implicit flows, side channels out of scope. Verification splits across
+  Maude (compiler surface), TLA+ (durable/temporal invariants), and a proof
+  assistant scoped to deltas over the published algebra. *Accepted (8 invariants);
+  syntax, label algebra, NMIF checking, construct grounding, and slices left open;
+  exploratory Maude models gate it.*
+- [0028-information-flow-authority.md](0028-information-flow-authority.md): policy
+  is two tiers — a **locked governance envelope** holding authority (role
+  hierarchy, delegation context, ownership, protected-from, downgrade rights) plus
+  **inline usage** proven to refine it (`inline ⊑ envelope`). Roles in source,
+  parties bound in governance; the agent **acts for its user** so **trust required
+  equals authority delegated** — an IT-owner envelope is guaranteed-safe with no
+  trust over protected data (Option A), an agent-drafted-then-ratified envelope is
+  trust-but-verify over the user's own data (Option B). Envelope changes are
+  versioned and non-retroactive — they never authorize past flows, and in-flight
+  work is bound to its version. *Accepted (authority model); the governance half
+  of DR-0027; extends DR-0026's envelope.*
 
 ## Historical Decision Trackers
 

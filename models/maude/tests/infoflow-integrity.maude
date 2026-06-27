@@ -1,0 +1,55 @@
+load ../infoflow-integrity.maude
+
+--- Coverage: a stranger input reaching workflow-spawn, which requires operator,
+--- is an injection. An inbound email trying to spawn an arbitrary whip. stranger
+--- is not geq operator.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  intSource(b1, stranger) flow(b1, b2) controlSink(b2, operator)
+  =>* C:Cfg injection .
+
+--- Coverage: a stranger input reaching a contact-required bounded action is an
+--- injection. Even a mid-tier control point is closed to strangers. stranger is
+--- not geq contact. A two-point lattice cannot express this middle tier.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  intSource(b1, stranger) flow(b1, b2) controlSink(b2, contact)
+  =>* C:Cfg injection .
+
+--- Coverage: MEET through an agent join box. The agent a1 mixes an operator
+--- instruction b1 with a stranger email b2; its output b3 carries stranger too,
+--- so it fails a contact requirement. One untrusted input drags the box down.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  intSource(b1, operator) intSource(b2, stranger)
+  flow(b1, a1) flow(b2, a1) flow(a1, b3) controlSink(b3, contact)
+  =>* C:Cfg injection .
+
+--- Coverage: even a known contact cannot spawn arbitrary whips. A contact input
+--- reaching workflow-spawn, which requires operator, is an injection. contact is
+--- not geq operator. This is the DR-0026 operator-only root power, proven.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  intSource(b1, contact) flow(b1, b2) controlSink(b2, operator)
+  =>* C:Cfg injection .
+
+--- Bite: the operator may spawn. An operator input reaching a workflow-spawn that
+--- requires operator is safe; operator geq operator. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  intSource(b1, operator) flow(b1, b2) controlSink(b2, operator)
+  =>* injection RESIDUAL:Cfg .
+
+--- Bite: the core property. A stranger input reaching a contact-required action
+--- THROUGH an endorse to contact is safe; the validated typed value carries
+--- contact, which meets the requirement.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  intSource(b1, stranger) endorse(b1, b2, contact) controlSink(b2, contact)
+  =>* injection RESIDUAL:Cfg .
+
+--- Bite: a mid-tier input drives a mid-tier action. A contact input reaching a
+--- contact-required bounded action is safe; contact geq contact.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  intSource(b1, contact) flow(b1, b2) controlSink(b2, contact)
+  =>* injection RESIDUAL:Cfg .
+
+--- Bite: untrusted input is fine AS DATA. A stranger input reaching a data-only
+--- sink, an echoed reply, is never an injection, because only control is gated.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  intSource(b1, stranger) flow(b1, b2) dataSink(b2)
+  =>* injection RESIDUAL:Cfg .

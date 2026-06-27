@@ -1,0 +1,99 @@
+--- Information-flow control, the confidentiality lattice, multi-point. The
+--- anti-exfiltration direction. EXPLORATORY research model for the information-
+--- flow thread noted in DR-0026; not yet a decision record. Modeled first per
+--- standing discipline. Generalizes the earlier two-point sketch to a real
+--- lattice with more than two levels AND with incomparable elements.
+---
+--- Data leakage is a CONFIDENTIALITY violation: high-secrecy data reaching a sink
+--- not cleared for it. Bell-LaPadula. Secrecy levels form a lattice; combining
+--- data takes the JOIN, the least upper bound. A sink has a clearance C and
+--- accepts a binding only when every secrecy level the binding carries is leq C.
+---
+--- The lattice here is the four-point DIAMOND, the powerset of two compartments:
+---
+---        both          top, carries bank AND email secrecy
+---        /  \
+---     bank   email     two INCOMPARABLE compartments
+---        \  /
+---         pub          bottom, public
+---
+--- bank and email are incomparable: neither leq the other. join(bank,email)=both.
+--- This is what proves multi-tenant and multi-source separation: data in
+--- compartment bank reaching a sink cleared only for email is a leak, because
+--- bank is not leq email. A two-point lattice cannot express this; a chain cannot
+--- either. The diamond is the smallest lattice that shows incomparability.
+---
+--- Encoding: rather than store one joined label per binding, each secrecy level a
+--- binding carries is an independent token carriesC(B, L). A binding leaks at a
+--- sink with clearance C iff ANY carried L has leq(L, C) = false. That is exactly
+--- join(all carried) leq C, since join is the least upper bound, and it handles
+--- incomparable carried levels with no extra machinery.
+---
+--- Grounding in whipplescript constructs:
+---   secretSource(B, L)    a file_store or memory pool read at secrecy level L:
+---                         bank transactions at bank, an email body at email.
+---   flow                  a binding use, a payload field, and an agent turn as a
+---                         join box, an edge per input to its output.
+---   declassify(B1, B2, T) an explicit declassify of a bounded typed value to a
+---                         lower target level T. B2 carries only T, never B1's
+---                         level. The type bounds the leak bandwidth.
+---   egressSink(B, C)      a sink with clearance C: an external reply cleared pub,
+---                         a bank portal cleared bank, your own briefing cleared
+---                         both. Accepts B only when all carried levels leq C.
+---
+--- The marker leak records any path where a carried secrecy level exceeds the
+--- sink clearance. A well-typed program never reaches it.
+mod WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY is
+  protecting BOOL .
+  sorts Binding Level Cfg .
+
+  ops b1 b2 b3 b4 a1 : -> Binding [ctor] .
+  ops pub bank email both : -> Level [ctor] .
+
+  --- the diamond join, least upper bound. comm so argument order is free.
+  op join : Level Level -> Level [comm] .
+  vars LA LB LC : Level .
+  eq join(pub, LA) = LA .          --- pub is bottom, the identity
+  eq join(both, LA) = both .       --- both is top, absorbing
+  eq join(LA, LA) = LA .           --- idempotent
+  eq join(bank, email) = both .    --- the two compartments join to the top
+
+  --- the induced order: LA leq LB iff joining them stays at LB
+  op leq : Level Level -> Bool .
+  eq leq(LA, LB) = join(LA, LB) == LB .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op secretSource : Binding Level -> Cfg [ctor] .   --- sensitive origin at level L
+  op flow : Binding Binding -> Cfg [ctor] .          --- data-flow edge B1 into B2
+  op declassify : Binding Binding Level -> Cfg [ctor] . --- bounded typed crossing to T
+  op egressSink : Binding Level -> Cfg [ctor] .      --- sink with clearance C
+  op carriesC : Binding Level -> Cfg [ctor] .        --- derived, B carries secrecy L
+  op leak : -> Cfg [ctor] .                          --- violation, secret exceeded a clearance
+
+  vars B B1 B2 : Binding .  var T : Level .  var C : Level .  var L : Level .
+
+  --- idempotent derived facts so propagation reaches a finite fixpoint
+  eq carriesC(B, L) carriesC(B, L) = carriesC(B, L) .
+  eq leak leak = leak .
+
+  --- seed each sensitive source with its secrecy level
+  rl [seed] : secretSource(B, L) => secretSource(B, L) carriesC(B, L) .
+
+  --- secrecy propagates along every flow edge, including through an agent join
+  --- box. Each carried level propagates independently, so a join box that mixes
+  --- bank and email ends up carrying both, exceeding any single-compartment sink.
+  rl [prop] : carriesC(B1, L) flow(B1, B2) => carriesC(B1, L) flow(B1, B2) carriesC(B2, L) .
+
+  --- declassify yields a fresh binding carrying ONLY the bounded target level T,
+  --- never the source level. There is no rule crossing the source level over a
+  --- declassify, which is what makes the declassified-path bite hold.
+  rl [declassify-seed] : declassify(B1, B2, T) => declassify(B1, B2, T) carriesC(B2, T) .
+
+  --- violation: a carried secrecy level not cleared by the sink. With more than
+  --- two levels this fires both for too-high data and for incomparable data, a
+  --- bank value reaching an email-cleared sink.
+  crl [exfil] : carriesC(B, L) egressSink(B, C) => carriesC(B, L) egressSink(B, C) leak
+    if leq(L, C) = false .
+endm

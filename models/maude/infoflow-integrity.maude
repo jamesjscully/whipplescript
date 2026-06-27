@@ -1,0 +1,105 @@
+--- Information-flow control, the integrity lattice, multi-point. The anti-prompt-
+--- injection direction, and the exact DUAL of infoflow-confidentiality.
+--- EXPLORATORY research model for the information-flow thread noted in DR-0026;
+--- not yet a decision record. Modeled first per standing discipline. Generalizes
+--- the earlier two-point sketch to a multi-tier trust chain.
+---
+--- Prompt injection is an INTEGRITY violation: low-integrity data, untrusted
+--- input, reaching a high-integrity decision, control. Biba. Integrity levels
+--- form a lattice; combining data takes the MEET, the greatest lower bound, so a
+--- result is only as trustworthy as its least trustworthy input. A control sink
+--- requires a minimum integrity R and accepts a binding only when every integrity
+--- level it carries is geq R.
+---
+--- The lattice here is the three-tier trust CHAIN:
+---
+---        operator        the main user, top integrity
+---           |
+---        contact         a known, pre-approved party
+---           |
+---        stranger        anyone, bottom integrity
+---
+--- The chain grounds the DR-0026 root power: workflow-spawn, generating and
+--- running arbitrary whips, requires the TOP level operator. The check then
+--- proves no contact and no stranger input can ever reach it. A bounded action
+--- such as scheduling a known payment requires only contact. A reply is a data
+--- sink with no integrity requirement.
+---
+--- Encoding mirrors the confidentiality dual: each integrity level a binding
+--- carries is an independent token carriesI(B, L). A binding is rejected at a
+--- control sink requiring R iff ANY carried L has geq(L, R) = false. That is
+--- exactly meet(all carried) geq R, since meet is the greatest lower bound: one
+--- low-integrity input drags the whole binding below the requirement.
+---
+--- Grounding in whipplescript constructs:
+---   intSource(B, L)      an origin at integrity L: an inbound message at
+---                        stranger, a known contact at contact, the operator at
+---                        operator.
+---   flow                 a binding use, a payload field, and an agent turn as a
+---                        join box, an edge per input to its output.
+---   endorse(B1, B2, T)   a coerce or exec into a Schema that validates untrusted
+---                        text into a bounded typed value at a raised integrity T.
+---                        B2 carries only T, never B1's low level.
+---   controlSink(B, R)    a control point requiring minimum integrity R:
+---                        workflow-spawn requires operator, a bounded scheduled
+---                        action requires contact, record requires contact.
+---   dataSink(B)          a data-only use, an echoed reply, with no requirement.
+---
+--- The marker injection records any path where a carried integrity level is below
+--- the sink requirement. A well-typed program never reaches it.
+mod WHIPPLESCRIPT-INFOFLOW-INTEGRITY is
+  protecting BOOL .
+  sorts Binding Level Cfg .
+
+  ops b1 b2 b3 b4 a1 : -> Binding [ctor] .
+  ops stranger contact operator : -> Level [ctor] .
+
+  --- the chain meet, greatest lower bound. comm so argument order is free.
+  op meet : Level Level -> Level [comm] .
+  vars LA LB : Level .
+  eq meet(stranger, LA) = stranger .   --- stranger is bottom, absorbing
+  eq meet(operator, LA) = LA .         --- operator is top, the identity
+  eq meet(LA, LA) = LA .               --- idempotent, covers contact with contact
+
+  --- the induced order: LA geq LB iff their meet stays at LB
+  op geq : Level Level -> Bool .
+  eq geq(LA, LB) = meet(LA, LB) == LB .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op intSource : Binding Level -> Cfg [ctor] .      --- origin at integrity level L
+  op flow : Binding Binding -> Cfg [ctor] .          --- data-flow edge B1 into B2
+  op endorse : Binding Binding Level -> Cfg [ctor] . --- validated typed crossing to T
+  op controlSink : Binding Level -> Cfg [ctor] .     --- control point requiring R
+  op dataSink : Binding -> Cfg [ctor] .              --- data-only sink, no requirement
+  op carriesI : Binding Level -> Cfg [ctor] .        --- derived, B carries integrity L
+  op injection : -> Cfg [ctor] .                     --- violation, integrity below a requirement
+
+  vars B B1 B2 : Binding .  var T : Level .  var R : Level .  var L : Level .
+
+  --- idempotent derived facts so propagation reaches a finite fixpoint
+  eq carriesI(B, L) carriesI(B, L) = carriesI(B, L) .
+  eq injection injection = injection .
+
+  --- seed each source with its integrity level
+  rl [seed] : intSource(B, L) => intSource(B, L) carriesI(B, L) .
+
+  --- integrity propagates along every flow edge, including through an agent join
+  --- box. Each carried level propagates independently, so a join box that mixes
+  --- an operator instruction with a stranger email carries stranger too, dragging
+  --- the output below any requirement above stranger.
+  rl [prop] : carriesI(B1, L) flow(B1, B2) => carriesI(B1, L) flow(B1, B2) carriesI(B2, L) .
+
+  --- endorse yields a fresh binding carrying ONLY the raised target level T, the
+  --- validated typed value, never the source's low level. There is no rule
+  --- crossing the low level over an endorse, which is what makes the
+  --- endorsed-path bite hold.
+  rl [endorse-seed] : endorse(B1, B2, T) => endorse(B1, B2, T) carriesI(B2, T) .
+
+  --- violation: a carried integrity level below the sink requirement. With more
+  --- than two tiers this fires for stranger reaching a contact-required action and
+  --- for contact reaching an operator-required workflow-spawn.
+  crl [inject] : carriesI(B, L) controlSink(B, R) => carriesI(B, L) controlSink(B, R) injection
+    if geq(L, R) = false .
+endm

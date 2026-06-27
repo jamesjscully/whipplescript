@@ -1,0 +1,53 @@
+load ../infoflow-confidentiality.maude
+
+--- Coverage: bank data flowing into a public-cleared egress sink is a leak. Bank
+--- secrecy is not leq pub. The classic over-clearance exfiltration.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  secretSource(b1, bank) flow(b1, b2) egressSink(b2, pub)
+  =>* C:Cfg leak .
+
+--- Coverage: INCOMPARABLE compartments. Bank data flowing into a sink cleared
+--- only for email is a leak, because bank is not leq email. This is the
+--- multi-tenant separation property a two-point lattice cannot express.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  secretSource(b1, bank) flow(b1, b2) egressSink(b2, email)
+  =>* C:Cfg leak .
+
+--- Coverage: JOIN through an agent join box. The agent a1 mixes a bank input b1
+--- and an email input b2; its output b3 carries both, so it exceeds a sink
+--- cleared only for bank. Mixing two compartments outranks either alone.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  secretSource(b1, bank) secretSource(b2, email)
+  flow(b1, a1) flow(b2, a1) flow(a1, b3) egressSink(b3, bank)
+  =>* C:Cfg leak .
+
+--- Coverage: declassifying one derivation does not make the source safe for its
+--- OTHER uses. b1 is declassified to pub into b2, but b1 also flows raw into b3
+--- which feeds a public egress sink. The raw second path still leaks.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  secretSource(b1, bank) declassify(b1, b2, pub) flow(b1, b3) egressSink(b3, pub)
+  =>* C:Cfg leak .
+
+--- Bite: data reaching a sink cleared at or above its level is never a leak. Bank
+--- data to your own briefing cleared both, which dominates bank. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  secretSource(b1, bank) flow(b1, b2) egressSink(b2, both)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: the core property. Bank data reaching a public egress THROUGH a
+--- declassify to pub is safe; the bounded typed value carries only pub.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  secretSource(b1, bank) declassify(b1, b2, pub) egressSink(b2, pub)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: a compartment may reach a sink cleared for exactly that compartment.
+--- Bank data to a bank-cleared external bank portal is safe; bank leq bank.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  secretSource(b1, bank) flow(b1, b2) egressSink(b2, bank)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: a public-only program is never flagged. A pub-level source to a public
+--- egress sink, no secret anywhere above pub.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  secretSource(b1, pub) flow(b1, b2) egressSink(b2, pub)
+  =>* leak RESIDUAL:Cfg .
