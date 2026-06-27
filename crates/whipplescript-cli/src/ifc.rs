@@ -440,6 +440,12 @@ pub fn check_with_envelope(ir: &IrProgram, envelope: &Envelope) -> Vec<Diagnosti
                         writes.push(resource.as_str());
                         span.get_or_insert(effect.span);
                     }
+                    // `send via <channel>` lowers to a capability call carrying the
+                    // channel as its resource; it is an egress sink.
+                    IrEffectKind::CapabilityCall => {
+                        writes.push(resource.as_str());
+                        span.get_or_insert(effect.span);
+                    }
                     _ => {}
                 }
             }
@@ -772,6 +778,45 @@ grant file_store auditbox -> file:/srv/auditbox readable by Auditor\n";
         assert!(!with.leaks("ledger", "auditbox"));
         // the reverse remains a leak — Operator does not act-for Auditor here.
         assert!(with.leaks("auditbox", "ledger"));
+    }
+
+    #[test]
+    fn rule_body_send_via_channel_is_an_egress() {
+        // read a confidential store and `send via` a (public) channel -> leak.
+        let program = r##"@service
+workflow IfcSend
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+
+file store ledger { root "./ledger"  allow read ["**"] }
+channel reply { provider slack  destination "#out" }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from ledger at "data.txt" as loaded
+  send via reply { text "x" } as sent
+  complete result { ok true }
+}
+"##;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope =
+            Envelope::from_json(r#"{ "resources": { "ledger": { "confidential": true } } }"#)
+                .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &envelope);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("information-flow violation")
+                    && d.message.contains("ledger")
+                    && d.message.contains("reply")),
+            "send via a public channel should be flagged as egress, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

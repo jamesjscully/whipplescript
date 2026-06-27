@@ -7352,6 +7352,13 @@ fn resource_for_body(kind: &body::BodyEffectKind) -> Option<String> {
         | body::BodyEffectKind::FileWrite { store, .. }
         | body::BodyEffectKind::FileImport { store, .. }
         | body::BodyEffectKind::FileExport { store, .. } => Some(store.clone()),
+        // `send via <channel>` carries the channel as a construct field.
+        body::BodyEffectKind::ConstructCapabilityCall {
+            keyword, fields, ..
+        } if keyword == "send" => fields
+            .iter()
+            .find(|field| field.name == "channel")
+            .map(|field| field.source.clone()),
         _ => None,
     }
 }
