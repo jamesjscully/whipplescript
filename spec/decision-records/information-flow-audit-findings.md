@@ -97,8 +97,10 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   `provider`/`human` grants are tracked as principals (`principal: true` in the
   signed artifact); the report lists them under "cleared principals", not
   "protected resources".
-- **H6 — Diagnostic span is the whole rule.** Not the offending read/write pair.
-  **OPEN (usability).**
+- **H6 — Diagnostic span is the whole rule.** **ACCEPTED (by design).** The join
+  box is rule-level (I-IFC2: the rule is the unit of analysis), so the rule span is
+  the correct locus; the message names the exact `src`/`sink` pair. Per-effect span
+  pinpointing is a possible future nicety, not a soundness gap.
 - **H7 — Per-field / per-path labels.** Mixed-sensitivity stores must be split;
   labels attach to whole resources. **DEFERRED (recorded).**
 
@@ -194,9 +196,12 @@ highest-leverage corrections (the bug class + the unproven core) go first.
 - **Wave 1 (DONE 2026-06-27) — Closed the bug class end-to-end.** Rust
   `VerifiedEnvelope` boundary type (P1/H1); checker + report require it; Maude
   multi-consumer bite (M2); DR-0028 G5 phrased over the artifact (P1).
-- **Wave 2 — Close the unmonitored sinks.** Workflow-result channel (H2), inbound
-  message-trigger as integrity source (H3), the five doors (E2); each modeled then
-  checked. Small report fixes (H4, H5, H6) ride along.
+- **Wave 2 (DONE 2026-06-27) — Closed the unmonitored sinks.** `record`→fact-base
+  (H2 fact-base half), inbound message-trigger (H3), the five doors (E2: human.ask +
+  emit/notify→stream, with provider + record), endorse in trusted surface (H4),
+  principals tracked (H5), rule-span accepted by design (H6). REMAINING from Wave 2:
+  the `complete result`→invoker channel (H2 second half), folded into Wave 3 (it
+  overlaps the cross-package `@tool` result).
 - **Wave 3 — Cross-package governance.** Ratify X1–X8 as a DR amendment to DR-0025;
   add the `information_flow` block to `package_contract` (v1); two-sided check;
   extend attestation + the Maude attestation model to cover IFC (ties to M2).
