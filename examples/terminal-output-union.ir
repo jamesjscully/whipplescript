@@ -23,14 +23,14 @@ rules
     effects
       classification kind=coerce binding=classification key=44dcf6a27fe54765
     terminal_outputs
-      classification span=557..573
-        Completed payload=ref<Classification> span=557..573
-        Failed payload=object<{reason string, summary string, effect_id string, run_id string}> span=557..573
-        TimedOut payload=object<{summary string, effect_id string, run_id string}> span=557..573
-        Cancelled payload=object<{summary string, effect_id string, run_id string}> span=557..573
+      classification span=557..576
+        Completed payload=ref<Classification> span=557..576
+        Failed payload=object<{reason string, summary string, effect_id string, run_id string}> span=557..576
+        TimedOut payload=object<{summary string, effect_id string, run_id string}> span=557..576
+        Cancelled payload=object<{summary string, effect_id string, run_id string}> span=557..576
     terminal_branches
-      case classification Completed binding=result guard=- body_hash=68cc197fa99f85c2 span=557..573
-      case classification Failed binding=failure guard=- body_hash=2380b8f08533fbed span=695..709
-      case classification TimedOut binding=timeout guard=- body_hash=41b33e02ef29fa29 span=828..844
-      case classification Cancelled binding=cancel guard=- body_hash=52481a247ffe13d7 span=967..983
-    body_hash e7b3c42ca4066628
+      case classification Completed binding=result guard=- body_hash=68cc197fa99f85c2 span=557..576
+      case classification Failed binding=failure guard=- body_hash=2380b8f08533fbed span=698..715
+      case classification TimedOut binding=timeout guard=- body_hash=41b33e02ef29fa29 span=834..853
+      case classification Cancelled binding=cancel guard=- body_hash=52481a247ffe13d7 span=976..995
+    body_hash aea55cbe2812a73e

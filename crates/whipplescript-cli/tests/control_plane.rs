@@ -11943,22 +11943,22 @@ workflow Parent {
 
     after child completes {
       case child {
-        Completed result => {
+        Completed as result => {
           record ParentCancelled {
             reason result.title
           }
         }
-        Failed failure => {
+        Failed as failure => {
           record ParentCancelled {
             reason failure.reason
           }
         }
-        TimedOut timeout => {
+        TimedOut as timeout => {
           record ParentCancelled {
             reason timeout.summary
           }
         }
-        Cancelled cancel => {
+        Cancelled as cancel => {
           record ParentCancelled {
             reason cancel.summary
           }
@@ -13244,28 +13244,28 @@ rule classify_request
 
   after classification completes {
     case classification {
-      Completed result => {
+      Completed as result => {
         record TerminalRoute {
           branch "completed"
           detail result.summary
         }
         askHuman "completed branch effect"
       }
-      Failed failure => {
+      Failed as failure => {
         record TerminalRoute {
           branch "failed"
           detail failure.reason
         }
         askHuman "failed branch effect"
       }
-      TimedOut timeout => {
+      TimedOut as timeout => {
         record TerminalRoute {
           branch "timed_out"
           detail timeout.summary
         }
         askHuman "timed_out branch effect"
       }
-      Cancelled cancel => {
+      Cancelled as cancel => {
         record TerminalRoute {
           branch "cancelled"
           detail cancel.summary

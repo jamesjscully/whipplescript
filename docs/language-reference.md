@@ -677,10 +677,10 @@ Deterministic branching over an enum field or an effect's terminal union:
 ```whip
 after turn completes {
   case turn {
-    Completed completed => {
+    Completed as completed => {
       record TurnReport { branch "completed" summary completed.summary }
     }
-    Failed failure => {
+    Failed as failure => {
       record TurnReport { branch "failed" detail failure.reason }
     }
   }

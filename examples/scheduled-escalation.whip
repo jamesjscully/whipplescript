@@ -41,7 +41,7 @@ rule request_review_with_deadline
 
   after answer completes {
     case answer {
-      Completed decided => {
+      Completed as decided => {
         done review
         cancel deadline
         complete result {
@@ -49,21 +49,21 @@ rule request_review_with_deadline
           decision decided.choice
         }
       }
-      Failed failure => {
+      Failed as failure => {
         done review
         fail error {
           id review.id
           reason failure.reason
         }
       }
-      TimedOut timeout => {
+      TimedOut as timeout => {
         done review
         fail error {
           id review.id
           reason timeout.summary
         }
       }
-      Cancelled cancel => {
+      Cancelled as cancel => {
         done review
         fail error {
           id review.id

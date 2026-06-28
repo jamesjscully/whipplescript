@@ -7376,11 +7376,12 @@ fn parse_terminal_pattern_parts(pattern: &str) -> (Option<String>, Option<String
     }
     let mut parts = pattern.split_whitespace();
     let tag = parts.next().map(str::to_owned);
-    // Accept both `Tag binding` and `Tag as binding`.
+    // Binding is `Tag as binding` (Stage 1b: the space form `Tag binding` is gone).
     let second = parts.next();
     let binding = match second {
         Some("as") => parts.next().map(str::to_owned),
-        other => other.map(str::to_owned),
+        Some(_) => return (tag, None),
+        None => None,
     };
     if parts.next().is_some() {
         return (tag, None);
@@ -9631,7 +9632,7 @@ fn validate_case_blocks(
                     // Terminal-case guards are validated by
                     // `collect_terminal_case_metadata`, which is the only path
                     // with `effect_payload_types` and so the only one that can
-                    // bind the tag-refined payload (`Completed result where
+                    // bind the tag-refined payload (`Completed as result where
                     // result.x ...`) into the guard scope. Validating them here
                     // too would reject that binding as an unknown root.
                     if let Some(guard) = branch.guard.filter(|_| !terminal_case) {
@@ -9937,21 +9938,22 @@ fn validate_terminal_case_pattern(
     let Some(tag) = parts.next() else {
         return;
     };
-    // Accept both `Tag binding` and `Tag as binding` (the `as` form aligns terminal
-    // cases with enum-variant case binding; Stage 1b surface unification).
+    // Binding is `Tag as binding` (Stage 1b: the legacy space form `Tag binding` is
+    // no longer accepted — it aligns terminal cases with enum-variant `as` binding).
     let second = parts.next();
     let binding = match second {
         Some("as") => parts.next(),
         other => other,
     };
-    if parts.next().is_some() || binding.is_none() {
+    let uses_as = matches!(second, Some("as"));
+    if parts.next().is_some() || binding.is_none() || !uses_as {
         diagnostics.push(Diagnostic { related: Vec::new(),
             span,
             message: format!(
                 "rule `{}` has malformed terminal-output case pattern `{pattern}`",
                 rule.name.name
             ),
-            suggestion: Some("write `Completed as result`, `Failed as failure`, `TimedOut as timeout`, or `Cancelled as cancel`".to_owned()),
+            suggestion: Some("write `Completed as result`, `Failed as failure`, `TimedOut as timeout`, or `Cancelled as cancel` (the `as` is required)".to_owned()),
         });
         return;
     }
@@ -20866,25 +20868,25 @@ rule classify
 
   after classification completes {
     case classification {
-      Completed result => {
+      Completed as result => {
         record Routed {
           branch "completed"
           detail result.summary
         }
       }
-      Failed failure => {
+      Failed as failure => {
         record Routed {
           branch "failed"
           detail failure.reason
         }
       }
-      TimedOut timeout => {
+      TimedOut as timeout => {
         record Routed {
           branch "timed_out"
           detail timeout.summary
         }
       }
-      Cancelled cancel => {
+      Cancelled as cancel => {
         record Routed {
           branch "cancelled"
           detail cancel.summary
@@ -21135,22 +21137,22 @@ rule classify_work
 
   after classification completes {
     case classification {
-      Completed result => {
+      Completed as result => {
         record TerminalRoute {
           detail result.reason
         }
       }
-      Failed failure => {
+      Failed as failure => {
         record TerminalRoute {
           detail failure.reason
         }
       }
-      TimedOut timeout => {
+      TimedOut as timeout => {
         record TerminalRoute {
           detail timeout.summary
         }
       }
-      Cancelled cancel => {
+      Cancelled as cancel => {
         record TerminalRoute {
           detail cancel.summary
         }
@@ -21190,9 +21192,9 @@ rule classify
 
   after classification completes {
     case classification {
-      Success result => {
+      Success as result => {
       }
-      Completed result => {
+      Completed as result => {
       }
     }
   }
@@ -21254,7 +21256,7 @@ rule classify
         // rejected as an unknown root because `validate_case_blocks` could not
         // bind the terminal payload into the guard scope.
         let source = terminal_case_program(
-            "      Completed result where result.summary == \"ok\" => { record Routed { branch \"ok\" } }\n      _ => { record Routed { branch \"other\" } }",
+            "      Completed as result where result.summary == \"ok\" => { record Routed { branch \"ok\" } }\n      _ => { record Routed { branch \"other\" } }",
         );
         let compiled = compile_program(&source);
         assert_eq!(
@@ -21269,7 +21271,7 @@ rule classify
     #[test]
     fn rejects_terminal_case_guard_referencing_unknown_payload_field() {
         let source = terminal_case_program(
-            "      Completed result where result.nonexistent == \"ok\" => { record Routed { branch \"ok\" } }\n      _ => { record Routed { branch \"other\" } }",
+            "      Completed as result where result.nonexistent == \"ok\" => { record Routed { branch \"ok\" } }\n      _ => { record Routed { branch \"other\" } }",
         );
         let compiled = compile_program(&source);
         assert!(compiled.ir.is_none());
@@ -21285,7 +21287,7 @@ rule classify
     #[test]
     fn rejects_non_boolean_terminal_case_guard() {
         let source = terminal_case_program(
-            "      Completed result where result.summary => { record Routed { branch \"ok\" } }\n      _ => { record Routed { branch \"other\" } }",
+            "      Completed as result where result.summary => { record Routed { branch \"ok\" } }\n      _ => { record Routed { branch \"other\" } }",
         );
         let compiled = compile_program(&source);
         assert!(compiled.ir.is_none());
@@ -21302,7 +21304,7 @@ rule classify
     #[test]
     fn rejects_duplicate_terminal_output_case_tag() {
         let source = terminal_case_program(
-            "      Completed result => { record Routed { branch \"a\" } }\n      Completed other => { record Routed { branch \"b\" } }\n      Failed failure => { record Routed { branch \"f\" } }\n      TimedOut timeout => { record Routed { branch \"t\" } }\n      Cancelled cancel => { record Routed { branch \"c\" } }",
+            "      Completed as result => { record Routed { branch \"a\" } }\n      Completed as other => { record Routed { branch \"b\" } }\n      Failed as failure => { record Routed { branch \"f\" } }\n      TimedOut as timeout => { record Routed { branch \"t\" } }\n      Cancelled as cancel => { record Routed { branch \"c\" } }",
         );
         let compiled = compile_program(&source);
         assert!(compiled.ir.is_none());
@@ -21318,7 +21320,7 @@ rule classify
     #[test]
     fn rejects_terminal_output_case_branch_without_payload_binding() {
         let source = terminal_case_program(
-            "      Completed => { record Routed { branch \"a\" } }\n      Failed failure => { record Routed { branch \"f\" } }\n      TimedOut timeout => { record Routed { branch \"t\" } }\n      Cancelled cancel => { record Routed { branch \"c\" } }",
+            "      Completed => { record Routed { branch \"a\" } }\n      Failed as failure => { record Routed { branch \"f\" } }\n      TimedOut as timeout => { record Routed { branch \"t\" } }\n      Cancelled as cancel => { record Routed { branch \"c\" } }",
         );
         let compiled = compile_program(&source);
         assert!(compiled.ir.is_none());

@@ -387,25 +387,25 @@ case-branch form and binds the variant payload:
 ```whipplescript
 after classification completes {
   case classification {
-    Completed result => {
+    Completed as result => {
       record Routed {
         status "completed"
         summary result.summary
       }
     }
-    Failed failure => {
+    Failed as failure => {
       record Routed {
         status "failed"
         summary failure.reason
       }
     }
-    TimedOut timeout => {
+    TimedOut as timeout => {
       record Routed {
         status "timed_out"
         summary timeout.summary
       }
     }
-    Cancelled cancel => {
+    Cancelled as cancel => {
       record Routed {
         status "cancelled"
         summary cancel.summary

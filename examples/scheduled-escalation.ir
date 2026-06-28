@@ -34,16 +34,16 @@ rules
       answer kind=human.ask binding=answer key=2abf821e1bafa4c4
       deadline kind=timer.wait binding=deadline key=d9ba06787e26217c
     terminal_outputs
-      answer span=799..816
-        Completed payload=object<{summary string, effect_id string, run_id string}> span=799..816
-        Failed payload=object<{reason string, summary string, effect_id string, run_id string}> span=799..816
-        TimedOut payload=object<{summary string, effect_id string, run_id string}> span=799..816
-        Cancelled payload=object<{summary string, effect_id string, run_id string}> span=799..816
+      answer span=799..819
+        Completed payload=object<{summary string, effect_id string, run_id string}> span=799..819
+        Failed payload=object<{reason string, summary string, effect_id string, run_id string}> span=799..819
+        TimedOut payload=object<{summary string, effect_id string, run_id string}> span=799..819
+        Cancelled payload=object<{summary string, effect_id string, run_id string}> span=799..819
     terminal_branches
-      case answer Completed binding=decided guard=- body_hash=9afcab7326beff18 span=799..816
-      case answer Failed binding=failure guard=- body_hash=8afebbdef71e8afb span=973..987
-      case answer TimedOut binding=timeout guard=- body_hash=06b434c12a44aa2e span=1113..1129
-      case answer Cancelled binding=cancel guard=- body_hash=23748543a8172b33 span=1256..1272
-    body_hash 3e7587abca8e8e41
+      case answer Completed binding=decided guard=- body_hash=9afcab7326beff18 span=799..819
+      case answer Failed binding=failure guard=- body_hash=8afebbdef71e8afb span=976..993
+      case answer TimedOut binding=timeout guard=- body_hash=06b434c12a44aa2e span=1119..1138
+      case answer Cancelled binding=cancel guard=- body_hash=23748543a8172b33 span=1265..1284
+    body_hash 8fff80ba89d254a7
 rule_dependencies
   table_reviews --schema:ReviewRequest--> request_review_with_deadline

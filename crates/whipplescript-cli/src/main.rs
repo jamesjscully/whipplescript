@@ -31290,10 +31290,14 @@ fn case_pattern_matches(pattern: &str, value: &Value, context: &mut RuleContext)
         if pattern_tag != tag {
             return false;
         }
-        if let Some(binding) = parts.next() {
-            if parts.next().is_some() {
-                return false;
-            }
+        // `Tag as binding` binds the payload; bare `Tag` binds nothing (Stage 1b:
+        // the legacy space form `Tag binding` is no longer accepted).
+        let binding = match (parts.next(), parts.next(), parts.next()) {
+            (None, _, _) => None,
+            (Some("as"), Some(binding), None) => Some(binding),
+            _ => return false,
+        };
+        if let Some(binding) = binding {
             let payload = terminal_payload_for_tag(value, tag);
             context.bindings.push((
                 binding.to_owned(),
@@ -33636,7 +33640,7 @@ fn terminal_union_value(payload: &Value) -> Value {
         .or_else(|| {
             // A human answer carries no `value`/`output` field; its structured
             // answer (the chosen option and/or free text) is the terminal value,
-            // so `case ask { Completed decided => decided.choice }` resolves.
+            // so `case ask { Completed as decided => decided.choice }` resolves.
             (payload.get("inbox_item_id").is_some()
                 && (payload.get("choice").is_some() || payload.get("text").is_some()))
             .then(|| {
@@ -48576,13 +48580,13 @@ rule claim_ready
     fn selects_failed_terminal_case_branch_and_binds_payload() {
         let body = r#"
 case classification {
-  Completed result => {
+  Completed as result => {
     record TerminalRoute {
       branch "completed"
       detail result.summary
     }
   }
-  Failed failure => {
+  Failed as failure => {
     record TerminalRoute {
       branch "failed"
       detail failure.reason
@@ -48620,10 +48624,10 @@ case classification {
     fn terminal_case_guard_error_selects_no_sibling_branch() {
         let body = r#"
 case classification {
-  Completed result where result.summary => {
+  Completed as result where result.summary => {
     askHuman "should not commit"
   }
-  Failed failure => {
+  Failed as failure => {
     askHuman "failed sibling"
   }
 }

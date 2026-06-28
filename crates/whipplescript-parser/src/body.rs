@@ -3469,7 +3469,7 @@ mod tests {
     #[test]
     fn parses_case_with_branches() {
         let ast = parse_ok(
-            "after turn completes {\n  case turn {\n    Completed done => {\n      record Ok {\n        summary done.summary\n      }\n    }\n    Failed failure => {\n      record Bad {\n        reason failure.reason\n      }\n    }\n  }\n}",
+            "after turn completes {\n  case turn {\n    Completed as done => {\n      record Ok {\n        summary done.summary\n      }\n    }\n    Failed as failure => {\n      record Bad {\n        reason failure.reason\n      }\n    }\n  }\n}",
         );
         let BodyStmt::After(after) = &ast.statements[0] else {
             panic!("expected after");

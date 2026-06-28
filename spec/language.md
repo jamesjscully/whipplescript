@@ -915,11 +915,11 @@ Example tagged terminal-output branch:
 
 ```whipplescript
 case turn.output {
-  Completed result where exists result.artifactPath => record LanguageArtifact {
+  Completed as result where exists result.artifactPath => record LanguageArtifact {
     path result.artifactPath
     summary result.summary
   }
-  Failed failure => record ProviderFailure {
+  Failed as failure => record ProviderFailure {
     reason failure.reason
   }
   Blocked block => askHuman """markdown

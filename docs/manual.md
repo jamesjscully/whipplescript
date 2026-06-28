@@ -153,9 +153,9 @@ case review.status {
 ```whip
 after turn completes {
   case turn.output {
-    Completed result => { record TurnSucceeded { summary result.summary } }
+    Completed as result => { record TurnSucceeded { summary result.summary } }
     Failed failure   => { record TurnFailed { reason failure.reason } }
-    TimedOut timeout => { record TurnTimedOut { reason timeout.reason } }
+    TimedOut as timeout => { record TurnTimedOut { reason timeout.reason } }
     Cancelled c      => { record TurnCancelled { reason c.reason } }
   }
 }

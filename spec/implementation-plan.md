@@ -123,7 +123,7 @@ Track C (compile-time, unblocked now):
    green. (reviewed: the release-precision bug was caught during integration, not
    by the parser-only tests.) **Follow-up (2026-06-16):** fixed the runtime binding
    for a hand-written `case` over a **human-ask** terminal — `after <ask> completes
-   { case <ask> { Completed decided => decided.choice } }`. The ask emits both
+   { case <ask> { Completed as decided => decided.choice } }`. The ask emits both
    `human.ask.issued` (issuance ack) and `human.answer.received` (the answer);
    `effect_binding_value` now prefers the answer, `terminal_union_value` exposes the
    answer's `{choice,text}` as the terminal value, and `human.ask.issued` no longer

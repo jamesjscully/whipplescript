@@ -29,25 +29,25 @@ rule classify_work
 
   after classification completes {
     case classification {
-      Completed result => {
+      Completed as result => {
         record TerminalRoute {
           branch "completed"
           detail result.summary
         }
       }
-      Failed failure => {
+      Failed as failure => {
         record TerminalRoute {
           branch "failed"
           detail failure.reason
         }
       }
-      TimedOut timeout => {
+      TimedOut as timeout => {
         record TerminalRoute {
           branch "timed_out"
           detail timeout.summary
         }
       }
-      Cancelled cancel => {
+      Cancelled as cancel => {
         record TerminalRoute {
           branch "cancelled"
           detail cancel.summary

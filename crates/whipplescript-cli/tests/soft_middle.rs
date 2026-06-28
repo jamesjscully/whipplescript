@@ -1022,7 +1022,7 @@ fn flow_reject_path_fails() {
     assert_eq!(drive_triage_flow("reject"), "failed");
 }
 
-/// A hand-written `after <ask> completes { case <ask> { Completed decided => ...
+/// A hand-written `after <ask> completes { case <ask> { Completed as decided => ...
 /// decided.choice } }` must resolve the human answer's fields at runtime. The
 /// scheduled-escalation example answers before its deadline, so the Completed
 /// branch fires and the workflow completes carrying the answered choice — a
