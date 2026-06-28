@@ -75,8 +75,18 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   effect), not only at `whip check` time. *Deferred:* envelope versioning + run
   binding (D4) and dual-gated stores at the storage layer.
 - **E4 — Source crossings in `.whip` grammar.** `endorsed` marker, `declassify`
-  construct, role references; the trusted surface is not visible in source for
-  review. **OPEN.**
+  construct; trusted surface not visible in source. **OPEN — re-scoped CHEAP (spike
+  2026-06-28).** The "parser surgery + `.ir` golden" deferral was overstated:
+  (1) the `.ir` goldens are now a one-command-blessable gate
+  (`scripts/regen-ir-goldens.sh`), not manual churn; (2) `endorsed` rides the
+  existing `body.rs` effect-modifier path as an **annotation** on `coerce`/`exec` —
+  ~5 small additive edits (coerce/exec parser, a `BodyEffect` flag, an `IrEffectNode`
+  leaf field like `resource`/`agent` that is NOT serialized → zero golden/hash churn,
+  no new statement keyword, no new effect kind). The checker reads the flag; the
+  crossing is still authorized by a `grant endorse` (source marks WHERE, governance
+  authorizes). `declassify` is slightly more (a use-site value annotation needing a
+  short decision on the marker's attachment point) but also an annotation, not a new
+  statement. Net: `endorse` is a cheap follow-on.
 - **E5 — IR party-relative labels + `kind:address` resource ids.** Checker keys on
   handle names, not stable typed resource ids. **PARTIAL/OPEN.**
 - **E6 — Reader/writer SETS.** A single role up-set per resource today; real labels
@@ -129,14 +139,21 @@ ACROSS a package boundary, the **package contract** must carry an
   can perform. The compiler verifies the package's lowered effects ⊆ its declared
   surface. A package that can open a channel / exec / hit a URL outside its declared
   surface is unsound.
-- **X2 — Per-tool flow signature. DECIDED 2026-06-27: opaque join box only.** Every
-  exported tool's output carries the join of all inputs (I-IFC2); no per-tool flow
-  precision in v1. **Extension point reserved:** finer signatures may be added later
-  but ONLY when compiler-verified at package build (the producer runs the IFC check
-  on package internals and the attestation carries that machine-checked result) —
-  never merely asserted. QIF/entropy-budget precision is explicitly NOT adopted
-  (ideas brewing; do not design it in yet). Keep the contract field shaped so a
-  `flow_signature` can be added without a breaking change.
+- **X2 — Per-tool flow signature. DECIDED 2026-06-27: opaque join box only in v1.
+  EXTENSION DESIGNED 2026-06-28 in DR-0030.** Every exported tool's output carries
+  the join of all inputs (I-IFC2) by default; the reserved compiler-verified
+  refinement is now designed: a producer-attested **structural dependency matrix**
+  (reader/writer sets are consumer-derived, not attestable — labels are
+  party-relative), **whole-result v1 / per-field v2**, serialize **departures**
+  (`independent_of` + `mediated`, fail-closed; a dropped entry reverts to `direct`),
+  and a **mediated** edge = a consumer-granted declassify discount that falls back to
+  `direct` (never `absent`) when ungranted. The riskiest part (conditional mediation)
+  is modeled FIRST in `models/maude/infoflow-signature.maude` (in the gate; 3
+  coverage / 6 bites) and the soundness claim is machine-checked in
+  `models/lean/Whipple/FlowSignature.lean` (cut⇒bound, bypass-loses-bound,
+  fail-closed fallback, NMIF bridge; no sorry/axiom). QIF/entropy-budget precision
+  is still NOT adopted (DR-0030 Decision 0: bits are the wrong unit). NEXT: the
+  `flow_signature` schema field + producer reach-vector + consumer derive/gate impl.
 - **X3 — No package-asserted authority.** Crossings (`declassify`/`endorse`) and
   resource access require the CONSUMER's governance grant (I-IFC4). The package
   DECLARES required crossings/authority as obligations; undeclared crossings are
