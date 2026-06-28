@@ -3608,14 +3608,29 @@ fn package_workflow_tool_attestations_json(manifests: &[PackageManifest]) -> Vec
     let mut attestations = Vec::new();
     for manifest in manifests {
         for tool in &manifest.workflow_tools {
-            attestations.push(json!({
+            let mut entry = json!({
                 "name": tool.name,
                 "package_id": manifest.package_id,
                 "convergence_eligible": true,
                 "input_schema": json_from_str(&tool.input_schema),
                 "output_schema": json_from_str(&tool.output_schema),
                 "invokes": [],
-            }));
+            });
+            // DR-0029 X1/X5: attest the tool's information-flow surface. The surface
+            // is computed from the tool's lowered effects, so `lowered ⊆ declared`
+            // holds by construction; `flow` is the opaque join box (Fork A). Best
+            // effort — if the source cannot be compiled standalone, the optional
+            // block is omitted (the consumer then governs it fail-closed).
+            if let Ok(source) = std::fs::read_to_string(&tool.source) {
+                if let Some(tool_ir) = whipplescript_parser::compile_program(&source).ir {
+                    entry["information_flow"] = json!({
+                        "surface": ifc::ifc_surface(&tool_ir),
+                        "flow": "join_box",
+                        "ifc_attested": true,
+                    });
+                }
+            }
+            attestations.push(entry);
         }
     }
     attestations
