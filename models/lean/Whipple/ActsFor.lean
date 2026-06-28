@@ -113,4 +113,18 @@ theorem conf_to_public_needs_public_source (d : List (P × P)) (pub : P)
   rw [hsink] at h
   exact public_acts_for_only_public h
 
+/-- Confidentiality flow COMPOSES: if data may flow `a → b` and `b → c`, it may
+    flow `a → c`. The join box can chain stages without laundering — the safety of
+    a multi-stage pipeline follows from the safety of each stage, via transitivity
+    of the order. (Note the order reversal: `FlowConf _ a b` is `b.reader` acts-for
+    `a.reader`, so composition uses `actsFor_trans h2 h1`.) -/
+theorem flow_conf_trans (d : List (P × P)) (pub : P) {a b c : Label P}
+    (h1 : FlowConf d pub a b) (h2 : FlowConf d pub b c) : FlowConf d pub a c :=
+  actsFor_trans d pub h2 h1
+
+/-- Integrity flow COMPOSES, dually: trust carried `a → b → c` is trust `a → c`. -/
+theorem flow_integ_trans (d : List (P × P)) (pub : P) {a b c : Label P}
+    (h1 : FlowInteg d pub a b) (h2 : FlowInteg d pub b c) : FlowInteg d pub a c :=
+  actsFor_trans d pub h1 h2
+
 end Whipple
