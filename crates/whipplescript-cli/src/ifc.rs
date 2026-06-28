@@ -44,6 +44,11 @@ pub struct Envelope {
     /// endorse grants `(resource, role)`: `resource`'s data may be raised to `role`
     /// integrity — the audited integrity-axis crossing.
     endorse: Vec<(String, String)>,
+    /// handles that name a PRINCIPAL (a provider/model endpoint, a human) rather
+    /// than protected data. A principal carries a clearance (so it may be a sink
+    /// target), but it is not itself a secret — so it must not be listed as a
+    /// "protected resource" in the guarantee report (H5).
+    principals: BTreeSet<String>,
 }
 
 impl Envelope {
@@ -59,9 +64,17 @@ impl Envelope {
         let mut declassify = Vec::new();
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
+        let mut principals = BTreeSet::new();
         if let Some(map) = value.get("resources").and_then(|res| res.as_object()) {
             for (name, label) in map {
                 governed.insert(name.clone());
+                if label
+                    .get("principal")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    principals.insert(name.clone());
+                }
                 if let Some(reader) = label.get("reader").and_then(serde_json::Value::as_str) {
                     if reader != PUBLIC {
                         readers.insert(name.clone(), reader.to_owned());
@@ -123,6 +136,7 @@ impl Envelope {
             declassify,
             integrity,
             endorse,
+            principals,
         })
     }
 
@@ -138,6 +152,7 @@ impl Envelope {
         let mut declassify = Vec::new();
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
+        let mut principals = BTreeSet::new();
         for (index, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -201,6 +216,10 @@ impl Envelope {
             };
             let handle = tokens[arrow - 1].to_owned();
             governed.insert(handle.clone());
+            // a `provider` or `human` grant names a principal, not protected data.
+            if matches!(tokens.get(1).copied(), Some("provider") | Some("human")) {
+                principals.insert(handle.clone());
+            }
             let label = &tokens[arrow + 2..];
             // `readable by <Role>` sets a non-public reader authority.
             if let Some(by) = label.iter().position(|tok| *tok == "by") {
@@ -226,6 +245,7 @@ impl Envelope {
             declassify,
             integrity,
             endorse,
+            principals,
         })
     }
 
@@ -234,13 +254,14 @@ impl Envelope {
     pub fn to_canonical_json(&self) -> String {
         let mut resources = serde_json::Map::new();
         for name in &self.governed {
-            resources.insert(
-                name.clone(),
-                serde_json::json!({
-                    "reader": self.reader_authority(name),
-                    "writer": self.integrity_authority(name),
-                }),
-            );
+            let mut entry = serde_json::json!({
+                "reader": self.reader_authority(name),
+                "writer": self.integrity_authority(name),
+            });
+            if self.principals.contains(name) {
+                entry["principal"] = serde_json::Value::Bool(true);
+            }
+            resources.insert(name.clone(), entry);
         }
         let mut endorsed: Vec<(String, String)> = self.endorse.clone();
         endorsed.sort();
@@ -674,13 +695,30 @@ pub struct GovernanceReport {
     /// The audited trusted surface: each crossing, tagged by axis —
     /// `declassify <resource> -> <role>` and `endorse <resource> -> <role>`.
     pub trusted_surface: Vec<String>,
+    /// Principals (providers/humans) cleared for non-public data — readers, not
+    /// protected data (H5).
+    pub cleared_principals: Vec<String>,
 }
 
 pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> GovernanceReport {
     let envelope = verified.envelope();
-    // protected = governed resources whose reader authority is not public.
-    let mut protected: Vec<String> = envelope.readers.keys().cloned().collect();
+    // protected = governed resources whose reader authority is not public, EXCLUDING
+    // principals (a provider/human is a cleared reader, not protected data) (H5).
+    let mut protected: Vec<String> = envelope
+        .readers
+        .keys()
+        .filter(|name| !envelope.principals.contains(*name))
+        .cloned()
+        .collect();
     protected.sort();
+    // Principals (providers/humans) cleared for non-public data, listed separately.
+    let mut cleared_principals: Vec<String> = envelope
+        .principals
+        .iter()
+        .filter(|name| envelope.readers.contains_key(*name))
+        .map(|name| format!("{name} (cleared for {})", envelope.reader_authority(name)))
+        .collect();
+    cleared_principals.sort();
     // The audited trusted surface is BOTH axes' crossings: declassify (lowers
     // confidentiality) and endorse (raises integrity). Endorse is at least as
     // risky -- it lets less-trusted data drive a more-trusted sink -- so it must be
@@ -715,6 +753,7 @@ pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> Governa
         violations,
         coverage_gaps,
         trusted_surface,
+        cleared_principals,
     }
 }
 
@@ -753,6 +792,12 @@ impl GovernanceReport {
             out.push_str("  trusted surface (audited declassify/endorse crossings to review):\n");
             for crossing in &self.trusted_surface {
                 out.push_str(&format!("    - {crossing}\n"));
+            }
+        }
+        if !self.cleared_principals.is_empty() {
+            out.push_str("  cleared principals (providers/humans, not protected data):\n");
+            for principal in &self.cleared_principals {
+                out.push_str(&format!("    - {principal}\n"));
             }
         }
         out
@@ -1237,6 +1282,33 @@ rule finish
                     && d.message.contains("fact:Note")),
             "record of confidential-derived fact should leak to the fact-base, got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn provider_principal_is_not_listed_as_protected_data() {
+        // a provider cleared for Operator data is a principal (a reader), not a
+        // secret — it must not appear under "protected resources" (H5).
+        let envelope = Envelope::from_dsl(
+            "grant file_store crm -> file:/srv/crm readable by Operator\n\
+             grant provider fixture -> selfhost:llama readable by Operator\n",
+        )
+        .expect("valid");
+        let ir = ir_with_grants(READ_LEDGER);
+        let report = governance_report(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(report.protected.contains(&"crm".to_owned()));
+        assert!(
+            !report.protected.iter().any(|name| name == "fixture"),
+            "a provider principal must not be listed as protected data: {:?}",
+            report.protected
+        );
+        assert!(
+            report
+                .cleared_principals
+                .iter()
+                .any(|line| line.contains("fixture")),
+            "the cleared provider should be listed as a principal: {:?}",
+            report.cleared_principals
         );
     }
 

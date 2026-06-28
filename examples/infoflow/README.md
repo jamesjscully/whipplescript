@@ -150,10 +150,10 @@ These are real gaps observed while building the examples, not hypotheticals.
    (H4):* the trusted surface now audits BOTH axes — `declassify <r> -> <role>` and
    `endorse <r> -> <role>` — each tagged by axis.
 
-7. **Clearing a provider marks it "confidential".** Labeling a provider
-   `readable by Operator` (so a turn may ship data to it) makes the provider
-   itself appear under "protected resources (confidential)" in the report — a
-   confusing artifact, since a provider is a principal, not a secret.
+7. ~~**Clearing a provider marks it "confidential".**~~ *Fixed (H5):* `provider`
+   (and `human`) grants are tracked as **principals**; the report lists them under
+   "cleared principals (providers/humans, not protected data)", not "protected
+   resources".
 
 8. ~~**The guarantee report does not verify the attestation.**~~ *Fixed while
    writing these examples:* the report now verifies a signed envelope first and

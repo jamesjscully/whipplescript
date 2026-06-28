@@ -93,8 +93,10 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   source, so untrusted inbound content driving a more-trusted sink is caught.
 - **H4 — `endorse` crossings absent from the trusted-surface report.** **DONE
   (Wave 2)** — the report now audits both axes, tagged `declassify …` / `endorse …`.
-- **H5 — Clearing a provider marks it "confidential".** A principal appears as a
-  protected resource in the report. **OPEN (cosmetic/semantic).**
+- **H5 — Clearing a provider marks it "confidential".** **DONE (Wave 2)** —
+  `provider`/`human` grants are tracked as principals (`principal: true` in the
+  signed artifact); the report lists them under "cleared principals", not
+  "protected resources".
 - **H6 — Diagnostic span is the whole rule.** Not the offending read/write pair.
   **OPEN (usability).**
 - **H7 — Per-field / per-path labels.** Mixed-sensitivity stores must be split;
