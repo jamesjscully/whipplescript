@@ -205,11 +205,15 @@ highest-leverage corrections (the bug class + the unproven core) go first.
 - **Wave 3 — Cross-package governance.** *Design + model DONE 2026-06-27:*
   `infoflow-package.maude` (two-sided check, X1–X8, bite-tested); **DR-0029**;
   the `information_flow` block in `package_contract_v0` (non-breaking, `flow=join_box`).
-  *REMAINING (impl):* producer-side surface computation + IFC attestation during
-  package compile, and the consumer-side `surface ⊑ envelope` check during
-  `whip check` of an importing whip.
-- **Wave 4 — Algebra depth (Lean).** Reader/writer sets → semilattice (M1/E6), NMIF
-  (M1), non-interference-relative-to-policy (M1), agreement with published order.
+  *Impl primitive DONE:* `ifc::ifc_surface(ir)` computes a workflow's X1 surface
+  (every door it opens), shown in the guarantee report. *REMAINING (wiring):*
+  thread the surface into package-compile → manifest → contract (producer
+  attestation), and run the consumer-side `surface ⊑ envelope` check during
+  `whip check` of an importing whip (needs the package-import plumbing).
+- **Wave 4 — Algebra depth (Lean).** *Started:* flow-composition soundness proven
+  (`flow_conf_trans`/`flow_integ_trans` — pipelines compose). *REMAINING:*
+  reader/writer sets → semilattice (M1/E6), NMIF (M1),
+  non-interference-relative-to-policy (M1), agreement with the published order.
 - **Wave 5 — Refinement + kernel + source crossings.** `inline ⊑ envelope` (E1),
   kernel runtime enforcement (E3), `.whip` crossing grammar (E4), `kind:address`
   IR labels (E5), whip-agent account binding (E7).
