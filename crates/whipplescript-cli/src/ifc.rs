@@ -16,7 +16,7 @@
 //! claim).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use whipplescript_parser::{Diagnostic, IrEffectKind, IrProgram};
 
@@ -229,18 +229,6 @@ impl Envelope {
         })
     }
 
-    /// Load a governance envelope, auto-detecting JSON (the signed artifact) from
-    /// the readable DSL by the first non-whitespace character.
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|err| format!("cannot read IFC envelope {}: {err}", path.display()))?;
-        if text.trim_start().starts_with('{') {
-            Self::from_json(&text)
-        } else {
-            Self::from_dsl(&text)
-        }
-    }
-
     /// The canonical signed-artifact JSON: every governed resource with its reader
     /// authority, plus the delegation edges, all sorted (deterministic hash).
     pub fn to_canonical_json(&self) -> String {
@@ -379,70 +367,116 @@ pub fn envelope_path_from_env() -> Option<PathBuf> {
     std::env::var_os("WHIPPLESCRIPT_IFC_ENVELOPE").map(PathBuf::from)
 }
 
-/// The rendered guarantee report for a `whip check` run, if a governance envelope
-/// is configured; `None` in dev mode. A *signed* envelope is verified first: a
-/// tampered policy yields a refusal note, never a guarantee computed from
-/// tampered labels (the report must not vouch for content it cannot attest).
-pub fn report_for_check(ir: &IrProgram) -> Option<String> {
-    let path = envelope_path_from_env()?;
-    let text = std::fs::read_to_string(&path).ok()?;
-    report_for_envelope_text(ir, &text)
+/// An envelope that has crossed the trust boundary: a consumer may safely derive a
+/// trusted decision (enforce, or vouch in the guarantee report) from it. It is
+/// constructed ONLY by `VerifiedEnvelope::load_from_env`, which verifies a signed
+/// policy's attestation first; there is no public path from a signed artifact to a
+/// usable envelope that skips verification. So a new consumer cannot reintroduce the
+/// report-vs-check bug — it has nothing un-verified to consume. This is the Rust
+/// realization of `models/lean/Whipple/Boundary.lean`.
+pub struct VerifiedEnvelope {
+    envelope: Envelope,
 }
 
-/// Render the guarantee report for a given envelope text. A signed envelope is
-/// verified first: a tampered policy yields a refusal note, never a guarantee
-/// computed from tampered labels. `None` if the envelope text is unparseable.
-fn report_for_envelope_text(ir: &IrProgram, text: &str) -> Option<String> {
-    if text.contains("\"attestation\"") {
-        if let Err(message) = crate::gov::SignedEnvelope::verify(text) {
-            return Some(format!(
-                "information-flow guarantee report\n  REFUSED: {message}\n"
-            ));
+/// The outcome of crossing the trust boundary.
+pub enum EnvelopeStatus {
+    /// No envelope configured: ungoverned dev mode (the gradual model).
+    Ungoverned,
+    /// Present and authentic — an unsigned dev policy, or signed + verified.
+    Verified(VerifiedEnvelope),
+    /// Present but its attestation failed: a tampered or re-edited signed policy.
+    Rejected(String),
+}
+
+impl VerifiedEnvelope {
+    /// THE trust boundary. Reads the env-configured policy and, if it carries an
+    /// attestation, verifies it before yielding a usable envelope. Every consumer
+    /// goes through here, so verification is enforced once, for all of them.
+    pub fn load_from_env() -> EnvelopeStatus {
+        let Some(path) = envelope_path_from_env() else {
+            return EnvelopeStatus::Ungoverned;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return EnvelopeStatus::Ungoverned;
+        };
+        Self::from_text(&text)
+    }
+
+    /// Cross the boundary from envelope text (the testable core of `load_from_env`).
+    /// A signed policy (one carrying an `attestation`) must verify before it can be
+    /// wrapped; a tampered one is `Rejected` and never becomes a `VerifiedEnvelope`.
+    fn from_text(text: &str) -> EnvelopeStatus {
+        if text.contains("\"attestation\"") {
+            if let Err(message) = crate::gov::SignedEnvelope::verify(text) {
+                return EnvelopeStatus::Rejected(message);
+            }
+        }
+        let parsed = if text.trim_start().starts_with('{') {
+            Envelope::from_json(text)
+        } else {
+            Envelope::from_dsl(text)
+        };
+        match parsed {
+            Ok(envelope) => EnvelopeStatus::Verified(VerifiedEnvelope { envelope }),
+            // A malformed envelope is the governance compiler's error to report, not
+            // the checker's; treat as ungoverned (the prior behavior).
+            Err(_) => EnvelopeStatus::Ungoverned,
         }
     }
-    let envelope = if text.trim_start().starts_with('{') {
-        Envelope::from_json(text).ok()?
-    } else {
-        Envelope::from_dsl(text).ok()?
-    };
-    Some(governance_report(ir, &envelope).render())
+
+    /// The verified envelope. Crate-internal: only the gated consumers in this
+    /// module read it, and only once they hold a `VerifiedEnvelope`.
+    fn envelope(&self) -> &Envelope {
+        &self.envelope
+    }
+
+    /// Wrap a raw envelope as verified — TESTS ONLY (unit tests exercise the checker
+    /// algebra directly, without the signing boundary), mirroring
+    /// `gov::SignedEnvelope::sign_for_test`.
+    #[cfg(test)]
+    pub(crate) fn for_test(envelope: Envelope) -> Self {
+        Self { envelope }
+    }
+}
+
+/// The rendered guarantee report for a `whip check` run, if a governance envelope
+/// is configured; `None` in dev mode. Routes through the trust boundary: a tampered
+/// signed policy yields a refusal note, never a guarantee computed from tampered
+/// labels (the report must not vouch for content it cannot attest).
+pub fn report_for_check(ir: &IrProgram) -> Option<String> {
+    match VerifiedEnvelope::load_from_env() {
+        EnvelopeStatus::Ungoverned => None,
+        EnvelopeStatus::Rejected(message) => Some(format!(
+            "information-flow guarantee report\n  REFUSED: {message}\n"
+        )),
+        EnvelopeStatus::Verified(verified) => Some(governance_report(ir, &verified).render()),
+    }
 }
 
 /// Run the IFC check if a governance envelope is configured; otherwise no
-/// constraints apply (dev mode) and this returns no diagnostics. A *signed*
-/// envelope (one carrying an `attestation`) is verified first: the whip agent
-/// refuses to enforce a tampered policy.
+/// constraints apply (dev mode) and this returns no diagnostics. Routes through the
+/// trust boundary: a signed policy is verified first, and the whip agent refuses to
+/// enforce a tampered one.
 pub fn check_ifc_program(ir: &IrProgram) -> Vec<Diagnostic> {
-    let Some(path) = envelope_path_from_env() else {
-        return Vec::new();
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    if text.contains("\"attestation\"") {
-        if let Err(message) = crate::gov::SignedEnvelope::verify(&text) {
-            return vec![Diagnostic {
-                span: whipplescript_parser::SourceSpan { start: 0, end: 0 },
-                message: format!("governance envelope rejected: {message}"),
-                suggestion: Some(
-                    "re-sign the envelope with `whip gov sign` after editing it".to_owned(),
-                ),
-                related: Vec::new(),
-            }];
-        }
-    }
-    match Envelope::load(&path) {
-        Ok(envelope) => check_with_envelope(ir, &envelope),
-        // A malformed envelope is the governance compiler's error to report (a
-        // later slice), not `whip check`'s; do not block the check on it.
-        Err(_) => Vec::new(),
+    match VerifiedEnvelope::load_from_env() {
+        EnvelopeStatus::Ungoverned => Vec::new(),
+        EnvelopeStatus::Rejected(message) => vec![Diagnostic {
+            span: whipplescript_parser::SourceSpan { start: 0, end: 0 },
+            message: format!("governance envelope rejected: {message}"),
+            suggestion: Some(
+                "re-sign the envelope with `whip gov sign` after editing it".to_owned(),
+            ),
+            related: Vec::new(),
+        }],
+        EnvelopeStatus::Verified(verified) => check_with_envelope(ir, &verified),
     }
 }
 
 /// The turn-level join-box check: for a turn that reads resource `src` and writes
 /// resource `sink`, flag the pair when data from `src` may leak to a reader of
 /// `sink` not cleared for `src` (party-relative, via the acts-for closure).
-pub fn check_with_envelope(ir: &IrProgram, envelope: &Envelope) -> Vec<Diagnostic> {
+pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<Diagnostic> {
+    let envelope = verified.envelope();
     let mut diagnostics = Vec::new();
     for rule in &ir.rules {
         // Collect reads and writes across the whole rule (the rule-level join box):
@@ -586,7 +620,8 @@ pub struct GovernanceReport {
     pub trusted_surface: Vec<String>,
 }
 
-pub fn governance_report(ir: &IrProgram, envelope: &Envelope) -> GovernanceReport {
+pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> GovernanceReport {
+    let envelope = verified.envelope();
     // protected = governed resources whose reader authority is not public.
     let mut protected: Vec<String> = envelope.readers.keys().cloned().collect();
     protected.sort();
@@ -596,7 +631,7 @@ pub fn governance_report(ir: &IrProgram, envelope: &Envelope) -> GovernanceRepor
         .map(|(resource, role)| format!("{resource} -> {role}"))
         .collect();
     trusted_surface.sort();
-    let violations = check_with_envelope(ir, envelope).len();
+    let violations = check_with_envelope(ir, verified).len();
     let mut touched: BTreeSet<String> = BTreeSet::new();
     for rule in &ir.rules {
         for effect in &rule.metadata.effects {
@@ -719,7 +754,7 @@ rule work
     fn flags_turn_reading_confidential_and_writing_uncleared() {
         let ir = ir_with_grants(&format!("{READ_LEDGER}{WRITE_OUTBOX}"));
         let envelope = Envelope::from_json(ENVELOPE).expect("valid envelope");
-        let diagnostics = check_with_envelope(&ir, &envelope);
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
         assert!(
             diagnostics
                 .iter()
@@ -743,7 +778,7 @@ rule work
             } }"#,
         )
         .expect("valid envelope");
-        assert!(check_with_envelope(&ir, &envelope).is_empty());
+        assert!(check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope)).is_empty());
     }
 
     #[test]
@@ -755,7 +790,7 @@ rule work
             Envelope::from_json(r#"{ "resources": { "ledger": { "confidential": true } } }"#)
                 .expect("valid envelope");
         assert!(
-            check_with_envelope(&ir, &envelope)
+            check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
                 .iter()
                 .any(|d| d.message.contains("provider-egress violation")),
             "reading confidential data with an uncleared provider should be flagged"
@@ -767,7 +802,7 @@ rule work
         let ir = ir_with_grants(&format!("{READ_LEDGER}{WRITE_OUTBOX}"));
         // empty envelope: nothing is governed, so the gradual model imposes nothing.
         let envelope = Envelope::from_json(r#"{ "resources": {} }"#).expect("valid envelope");
-        assert!(check_with_envelope(&ir, &envelope).is_empty());
+        assert!(check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope)).is_empty());
     }
 
     const DSL: &str = "\
@@ -788,7 +823,7 @@ party bob@acme.com : Requester\n";
 
         let ir = ir_with_grants(&format!("{READ_LEDGER}{WRITE_OUTBOX}"));
         assert!(
-            check_with_envelope(&ir, &from_dsl)
+            check_with_envelope(&ir, &VerifiedEnvelope::for_test(from_dsl))
                 .iter()
                 .any(|d| d.message.contains("information-flow violation")),
             "DSL-derived envelope should reject the bad flow"
@@ -829,7 +864,7 @@ rule work
 "#;
         let ir = compile_program(program).ir.expect("compiles");
         let envelope = Envelope::from_json(ENVELOPE).expect("valid");
-        let diagnostics = check_with_envelope(&ir, &envelope);
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
         assert!(
             diagnostics
                 .iter()
@@ -889,7 +924,7 @@ rule work
         let envelope =
             Envelope::from_json(r#"{ "resources": { "ledger": { "confidential": true } } }"#)
                 .expect("valid");
-        let diagnostics = check_with_envelope(&ir, &envelope);
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
         assert!(
             diagnostics
                 .iter()
@@ -949,7 +984,7 @@ grant channel reply -> smtp:out readable by Requester\n";
             Envelope::from_json(r#"{ "resources": { "ledger": { "confidential": true } } }"#)
                 .expect("valid envelope");
         let ir = ir_with_grants(&format!("{READ_LEDGER}{WRITE_OUTBOX}"));
-        let report = governance_report(&ir, &envelope);
+        let report = governance_report(&ir, &VerifiedEnvelope::for_test(envelope));
         assert_eq!(report.protected, vec!["ledger".to_owned()]);
         // ledger (confidential) flows to outbox (not confidential) -> caught by the
         // fail-closed sticky boundary even though outbox is ungoverned.
@@ -967,18 +1002,21 @@ grant channel reply -> smtp:out readable by Requester\n";
         let config = "grant file_store ledger -> file:/srv/ledger.db readable by Operator\n";
         let signed = crate::gov::SignedEnvelope::sign_for_test(config, "admin");
         let json = signed.to_json();
-        // a valid signed envelope renders a normal guarantee report...
-        let ok = report_for_envelope_text(&ir, &json).expect("renders");
-        assert!(ok.contains("protected resources"));
-        assert!(!ok.contains("REFUSED"));
-        // ...but tampering with the labels makes the report REFUSE rather than
-        // vouch for content it cannot attest.
+        // a valid signed envelope crosses the boundary and renders a guarantee...
+        match VerifiedEnvelope::from_text(&json) {
+            EnvelopeStatus::Verified(verified) => {
+                let ok = governance_report(&ir, &verified).render();
+                assert!(ok.contains("protected resources"));
+            }
+            _ => panic!("genuine signed envelope should verify"),
+        }
+        // ...but tampering with the labels makes the boundary REJECT it, so neither
+        // the checker nor the report can vouch for content they cannot attest.
         let tampered = json.replace("\"reader\":\"Operator\"", "\"reader\":\"public\"");
         assert_ne!(tampered, json, "test should actually modify the content");
-        let refused = report_for_envelope_text(&ir, &tampered).expect("renders");
-        assert!(
-            refused.contains("REFUSED"),
-            "tampered signed envelope should refuse, got: {refused}"
-        );
+        match VerifiedEnvelope::from_text(&tampered) {
+            EnvelopeStatus::Rejected(_) => {}
+            _ => panic!("tampered signed envelope must be rejected"),
+        }
     }
 }
