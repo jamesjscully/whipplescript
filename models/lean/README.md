@@ -55,10 +55,14 @@ on **no axioms at all**.
 scripts/check-lean-models.sh   # builds + rejects any sorry/admit/axiom/native_decide
 ```
 
+`Whipple/ReaderSets.lean` — the label is a SET of compartments:
+- `canRead_nil` (∅ is the public bottom), `canRead_append` (union is the join — a
+  party reads the combination iff it reads both parts), `canRead_append_comm`,
+  `canRead_mono` (higher clearance reads at least as much). The confidentiality
+  label forms a join-semilattice; the single-authority `Label.reader` is the leaf.
+
 ## Not yet proven here (next obligations)
 
-- The reader/writer **sets** (a single up-set per resource is modeled; multi-reader
-  meet/join lattice is future).
 - **NMIF / robust declassification** (a downgrade not influenced by an attacker).
 - Durable **label carriage** across persistence/instance boundaries (I-IFC7) — that
   is a transition-system property; the natural home is Veil (Lean) or TLA+, not this
