@@ -205,11 +205,13 @@ highest-leverage corrections (the bug class + the unproven core) go first.
 - **Wave 3 — Cross-package governance.** *Design + model DONE 2026-06-27:*
   `infoflow-package.maude` (two-sided check, X1–X8, bite-tested); **DR-0029**;
   the `information_flow` block in `package_contract_v0` (non-breaking, `flow=join_box`).
-  *Impl primitive DONE:* `ifc::ifc_surface(ir)` computes a workflow's X1 surface
-  (every door it opens), shown in the guarantee report. *REMAINING (wiring):*
-  thread the surface into package-compile → manifest → contract (producer
-  attestation), and run the consumer-side `surface ⊑ envelope` check during
-  `whip check` of an importing whip (needs the package-import plumbing).
+  *Impl primitive DONE:* `ifc::ifc_surface(ir)` (the X1 surface), shown in the
+  guarantee report. *Producer side DONE:* the package contract now emits the
+  attested `information_flow` block (surface/flow/ifc_attested) per `@tool`,
+  computed from its lowered effects (verified e2e on toolkit.json, schema-valid).
+  *REMAINING:* the consumer-side `surface ⊑ envelope` + `required_crossings granted`
+  check during `whip check` of an importing whip (read imported contracts' surfaces
+  and verify against the consumer envelope).
 - **Wave 4 — Algebra depth (Lean).** *Started:* flow-composition soundness proven
   (`flow_conf_trans`/`flow_integ_trans` — pipelines compose). *REMAINING:*
   reader/writer sets → semilattice (M1/E6), NMIF (M1),
