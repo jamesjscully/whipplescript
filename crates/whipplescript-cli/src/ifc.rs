@@ -848,9 +848,15 @@ pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> Governa
     // claimed, not only that one is authorized.
     for rule in &ir.rules {
         for effect in &rule.metadata.effects {
+            let at = effect.binding.as_deref().unwrap_or("coerce");
             if effect.endorsed {
-                let at = effect.binding.as_deref().unwrap_or("coerce");
                 trusted_surface.push(format!("endorsed (source) at rule `{}` ({at})", rule.name));
+            }
+            if effect.declassified {
+                trusted_surface.push(format!(
+                    "declassified (source) at rule `{}` ({at})",
+                    rule.name
+                ));
             }
         }
     }

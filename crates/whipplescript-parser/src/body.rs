@@ -186,6 +186,11 @@ pub enum BodyEffectKind {
         /// coerce is an integrity-raising crossing, making the trusted surface
         /// visible at the crossing point. Authorization still lives in governance.
         endorsed: bool,
+        /// the `declassified` source marker (DR-0027 I-IFC3): the author declares
+        /// this coerce a confidentiality-lowering crossing. The coerce's OUTPUT
+        /// SCHEMA is the bounded type that bounds the leak — you cannot declassify
+        /// without passing through a bounded type. Authorization lives in governance.
+        declassified: bool,
     },
     AskHuman {
         choices: Vec<String>,
@@ -1551,13 +1556,24 @@ impl<'a> BodyParser<'a> {
         if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
             return None;
         }
-        // optional trailing `endorsed` source marker (I-IFC3); must come last.
-        let endorsed = self.consume_ident("endorsed");
+        // optional trailing source-crossing markers (I-IFC3); must come last.
+        let mut endorsed = false;
+        let mut declassified = false;
+        loop {
+            if self.consume_ident("endorsed") {
+                endorsed = true;
+            } else if self.consume_ident("declassified") {
+                declassified = true;
+            } else {
+                break;
+            }
+        }
         Some(BodyStmt::Effect(EffectStmt {
             kind: BodyEffectKind::Coerce {
                 name,
                 args,
                 endorsed,
+                declassified,
             },
             binding,
             requires,
@@ -3418,6 +3434,20 @@ mod tests {
             &effect.kind,
             BodyEffectKind::Coerce {
                 endorsed: false,
+                declassified: false,
+                ..
+            }
+        ));
+        // `declassified` sets its flag; both markers may appear together.
+        let both = parse_ok("coerce classify(msg.content) as verdict endorsed declassified");
+        let BodyStmt::Effect(effect) = &both.statements[0] else {
+            panic!("expected effect");
+        };
+        assert!(matches!(
+            &effect.kind,
+            BodyEffectKind::Coerce {
+                endorsed: true,
+                declassified: true,
                 ..
             }
         ));

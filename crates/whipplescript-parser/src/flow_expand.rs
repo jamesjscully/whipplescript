@@ -1099,18 +1099,20 @@ fn print_effect(
             name,
             args,
             endorsed,
+            declassified,
         } => {
             let args = args
                 .iter()
                 .map(|arg| rn(arg))
                 .collect::<Vec<_>>()
                 .join(", ");
-            // preserve the `endorsed` marker through flow expansion (trailing).
+            // preserve the source-crossing markers through flow expansion (trailing).
             let endorsed = if *endorsed { " endorsed" } else { "" };
+            let declassified = if *declassified { " declassified" } else { "" };
             push_stmt_line(
                 out,
                 indent,
-                &format!("coerce {name}({args}){binding}{timeout}{endorsed}"),
+                &format!("coerce {name}({args}){binding}{timeout}{endorsed}{declassified}"),
             );
             return;
         }

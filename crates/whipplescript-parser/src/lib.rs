@@ -1209,6 +1209,10 @@ pub struct IrEffectNode {
     /// (a `coerce`) an integrity-raising crossing. Surfaced so the trusted surface is
     /// visible at the source crossing point. Not part of the `.ir` snapshot.
     pub endorsed: bool,
+    /// The `declassified` source marker (DR-0027 I-IFC3): the author declared this
+    /// `coerce` a confidentiality-lowering crossing (its output schema bounds the
+    /// leak). Surfaced for audit. Not part of the `.ir` snapshot.
+    pub declassified: bool,
 }
 
 /// A lowered turn-access grant: the granted operations narrow the turn's effective
@@ -6721,6 +6725,7 @@ fn analyze_rule(
                 resource: None,
                 agent: None,
                 endorsed: false,
+                declassified: false,
             });
         }
     }
@@ -7369,6 +7374,18 @@ fn endorsed_for_body(kind: &body::BodyEffectKind) -> bool {
     matches!(kind, body::BodyEffectKind::Coerce { endorsed: true, .. })
 }
 
+/// Whether an effect carries the `declassified` source marker (I-IFC3) — a `coerce`
+/// the author declared a confidentiality-lowering crossing.
+fn declassified_for_body(kind: &body::BodyEffectKind) -> bool {
+    matches!(
+        kind,
+        body::BodyEffectKind::Coerce {
+            declassified: true,
+            ..
+        }
+    )
+}
+
 /// The named resource a direct file/channel effect touches, surfaced for
 /// information-flow analysis. `None` for effects with no named resource.
 fn resource_for_body(kind: &body::BodyEffectKind) -> Option<String> {
@@ -7539,6 +7556,7 @@ fn walk_effects(
                 let resource = resource_for_body(&effect.kind);
                 let agent = agent_for_body(&effect.kind);
                 let endorsed = endorsed_for_body(&effect.kind);
+                let declassified = declassified_for_body(&effect.kind);
                 effects.push(IrEffectNode {
                     id,
                     kind,
@@ -7552,6 +7570,7 @@ fn walk_effects(
                     resource,
                     agent,
                     endorsed,
+                    declassified,
                 });
             }
             body::BodyStmt::After(after) => {
