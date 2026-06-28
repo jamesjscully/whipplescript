@@ -684,6 +684,63 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
     diagnostics
 }
 
+/// The information-flow SURFACE of a workflow (DR-0029 X1): every resource, egress
+/// sink, and principal it can touch, as sorted ids. The producer of a `@tool`
+/// package declares this and attests `ifc_surface(ir) ⊆ declared`; the consumer
+/// checks the surface refines its envelope (no element is an ungoverned door).
+/// Mirrors the resource collection of `check_with_envelope`, so the surface is
+/// exactly the set of handles the checker would treat as a source or sink.
+pub fn ifc_surface(ir: &IrProgram) -> Vec<String> {
+    let mut surface: BTreeSet<String> = BTreeSet::new();
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            if let Some(resource) = &effect.resource {
+                surface.insert(resource.clone());
+            }
+            for grant in &effect.access_grants {
+                surface.insert(grant.resource.clone());
+            }
+            if effect.kind == IrEffectKind::HumanAsk {
+                surface.insert("human".to_owned());
+            }
+            if matches!(
+                effect.kind,
+                IrEffectKind::EventEmit | IrEffectKind::EventNotify
+            ) {
+                surface.insert("stream".to_owned());
+            }
+            if effect.kind == IrEffectKind::AgentTell {
+                if let Some(provider) = effect
+                    .agent
+                    .as_deref()
+                    .and_then(|name| ir.agents.iter().find(|a| a.name == name))
+                    .and_then(|a| a.provider.as_deref())
+                {
+                    surface.insert(provider.to_owned());
+                }
+            }
+        }
+        for write in &rule.metadata.fact_writes {
+            surface.insert(format!(
+                "fact:{}",
+                write.strip_prefix("schema:").unwrap_or(write)
+            ));
+        }
+        for when in &rule.whens {
+            let pattern = when.pattern.trim_start();
+            if let Some(rest) = pattern.strip_prefix("message from ") {
+                if let Some(channel) = rest.split_whitespace().next() {
+                    surface.insert(channel.to_owned());
+                }
+            }
+            if pattern.starts_with("human answered") {
+                surface.insert("human".to_owned());
+            }
+        }
+    }
+    surface.into_iter().collect()
+}
+
 /// The IT-facing guarantee report (`gov compile`, DR-0028): what a governance
 /// config protects and the risks it leaves. v0 surfaces the protected resources,
 /// the count of IFC violations the config catches in the program, and coverage
@@ -698,6 +755,8 @@ pub struct GovernanceReport {
     /// Principals (providers/humans) cleared for non-public data — readers, not
     /// protected data (H5).
     pub cleared_principals: Vec<String>,
+    /// The workflow's full IFC surface (DR-0029 X1): every door it opens.
+    pub surface: Vec<String>,
 }
 
 pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> GovernanceReport {
@@ -754,6 +813,7 @@ pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> Governa
         coverage_gaps,
         trusted_surface,
         cleared_principals,
+        surface: ifc_surface(ir),
     }
 }
 
@@ -798,6 +858,14 @@ impl GovernanceReport {
             out.push_str("  cleared principals (providers/humans, not protected data):\n");
             for principal in &self.cleared_principals {
                 out.push_str(&format!("    - {principal}\n"));
+            }
+        }
+        if self.surface.is_empty() {
+            out.push_str("  information-flow surface: none (opens no doors)\n");
+        } else {
+            out.push_str("  information-flow surface (every door this workflow opens):\n");
+            for door in &self.surface {
+                out.push_str(&format!("    - {door}\n"));
             }
         }
         out
@@ -1283,6 +1351,46 @@ rule finish
             "record of confidential-derived fact should leak to the fact-base, got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn ifc_surface_enumerates_every_door() {
+        // the surface (X1) is the full set of resources/egresses/principals a
+        // workflow touches — files, channels, the fact-base, providers, etc.
+        let program = r##"@service
+workflow IfcSurface
+
+output result R
+class R { ok bool }
+class Note { id string }
+class Ticket { id string  status "open" }
+
+agent coder { provider fixture  profile "p"  capacity 1 }
+file store crm { root "./crm"  allow read ["**"] }
+channel out { provider slack  destination "#out" }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from crm at "c.json" as loaded
+  after loaded succeeds as file {
+    send via out { text "hi" } as sent
+    after sent succeeds {
+      record Note { id "n1" }
+    }
+  }
+}
+"##;
+        let ir = compile_program(program).ir.expect("compiles");
+        let surface = ifc_surface(&ir);
+        for expected in ["crm", "out", "fact:Note"] {
+            assert!(
+                surface.iter().any(|d| d == expected),
+                "surface should include `{expected}`, got: {surface:?}"
+            );
+        }
     }
 
     #[test]
