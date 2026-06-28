@@ -116,13 +116,15 @@ it is not just blocking everything.
 
 These are real gaps observed while building the examples, not hypotheticals.
 
-1. **The workflow's own output is an unmonitored sink.** A rule can
-   `read text from crm ... { complete result { content customer.content } }` and
-   it is **not** flagged — `complete result` / `record` facts are not modeled as
-   egress. Confidential data returned as the workflow result flows back to the
-   caller (the root/parent agent) unchecked. This is the most significant gap:
-   the governed sinks are only the declared *external* resources (files,
-   channels, providers), not the result channel to the invoker.
+1. **The workflow's own output is a partly-unmonitored sink.** *`record` is now
+   governed (H2):* a recorded fact is a sink `fact:<schema>` (the DR-0026 stream and
+   other rules observe it), defaulting to public/fail-closed — so reading `crm` and
+   `record`ing a derived fact is flagged unless governance clears `fact:<schema>`
+   (see `fact:Reviewed` in `governance.policy`). **Still open:** `complete result`
+   (the result channel back to the *invoker*) is not yet a modeled sink — its
+   per-rule form isn't cleanly in the IR and it overlaps the cross-package `@tool`
+   result (opaque join box, Wave 3). So returning confidential data verbatim as the
+   workflow *result* is still unchecked for now.
 
 2. **Coarse, rule-level join box (no value tracking).** Any read in a rule is
    assumed to potentially reach any sink in the same rule. The safe refactor must

@@ -555,11 +555,28 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
                 }
             }
         }
+        // `record <Fact>` writes the durable fact-base, which other rules and the
+        // DR-0026 session-event stream observe — a governed egress sink (the
+        // recordSink of infoflow-composition, H2). Sink id `fact:<schema>`;
+        // unlabeled defaults to public (fail-closed), so confidential data cannot
+        // silently leave a governed flow via a recorded fact, and untrusted data
+        // cannot drive a high-integrity fact governance has labelled. `fact_writes`
+        // carries the recorded schemas as `schema:<Name>`.
+        let record_sinks: Vec<String> = rule
+            .metadata
+            .fact_writes
+            .iter()
+            .map(|write| format!("fact:{}", write.strip_prefix("schema:").unwrap_or(write)))
+            .collect();
         let report_span = span.unwrap_or(whipplescript_parser::SourceSpan { start: 0, end: 0 });
         let mut leak: Option<(&str, &str)> = None;
         let mut inject: Option<(&str, &str)> = None;
         for &src in &reads {
-            for &sink in &writes {
+            for sink in writes
+                .iter()
+                .copied()
+                .chain(record_sinks.iter().map(String::as_str))
+            {
                 if leak.is_none() && envelope.leaks(src, sink) {
                     leak = Some((src, sink));
                 }
@@ -1005,6 +1022,54 @@ grant channel reply -> smtp:out readable by Requester\n";
         let text = report.render();
         assert!(text.contains("protected resources"));
         assert!(text.contains("coverage gaps"));
+    }
+
+    #[test]
+    fn record_to_fact_base_is_a_governed_sink() {
+        // reading a confidential store and `record`ing a fact derived from it leaks
+        // to the fact-base, which other rules and the DR-0026 stream observe (H2).
+        // `fact:<schema>` defaults to public, so it is caught fail-closed.
+        let program = r#"@service
+workflow IfcRecord
+
+output result R
+class R { ok bool }
+class Note { id string }
+class Ticket { id string  status "open" }
+
+file store ledger { root "./ledger"  allow read ["**"] }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from ledger at "data.txt" as loaded
+  after loaded succeeds as file {
+    record Note { id file.content }
+  }
+}
+
+rule finish
+  when Note as note
+=> {
+  complete result { ok true }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope =
+            Envelope::from_json(r#"{ "resources": { "ledger": { "confidential": true } } }"#)
+                .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("information-flow violation")
+                    && d.message.contains("ledger")
+                    && d.message.contains("fact:Note")),
+            "record of confidential-derived fact should leak to the fact-base, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

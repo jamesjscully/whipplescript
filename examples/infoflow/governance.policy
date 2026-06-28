@@ -26,3 +26,7 @@ grant provider fixture -> selfhost:llama readable by Operator from Operator
 
 # An append-only event log of untrusted inbound activity (public, untrusted-OK).
 grant file_store audit_log -> file:/srv/audit.log readable by public from public
+
+# A recorded fact derived from CRM is Operator-only: only cleared subscribers of
+# the fact-base / session-event stream may read it (H2 -- record is a governed sink).
+grant factbase fact:Reviewed -> internal:reviewed readable by Operator from Operator

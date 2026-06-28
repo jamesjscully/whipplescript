@@ -78,9 +78,13 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
 - **H1 — report-vs-check tamper.** **DONE (Wave 1)** — subsumed by P1: the report
   routes through `VerifiedEnvelope` and refuses a tampered policy structurally; the
   point-fix is gone.
-- **H2 — Workflow-result channel is an unmonitored sink.** `complete result` /
-  `record` returns data to the invoker (the root/parent agent) and is NOT checked —
-  reading CRM and returning it verbatim passes. **OPEN — significant.**
+- **H2 — Workflow-result channel is an unmonitored sink.** **PARTIAL (Wave 2)** —
+  `record` is now a governed sink `fact:<schema>` (derived from `fact_writes`),
+  default public/fail-closed, so a fact derived from confidential data is caught
+  unless governance clears the fact (the recordSink of infoflow-composition,
+  realized). OPEN: `complete result` (the result channel to the *invoker*) — its
+  per-rule form isn't cleanly in the IR and it overlaps the cross-package `@tool`
+  result (Wave 3, opaque join box), so it is folded into Wave 3.
 - **H3 — Inbound message-trigger is not an integrity source.** `when message from`
   untrusted data isn't modeled as a read; injection only caught from file reads.
   **OPEN.**
