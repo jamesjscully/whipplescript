@@ -14,8 +14,8 @@
 --- The soundness property: a cross-package tool grant is accepted ONLY when the
 --- package is IFC-attested AND its declared surface fits the consumer envelope. An
 --- un-attested package, or one whose surface exceeds the envelope, is never
---- accepted (fail-closed, X8). This mirrors the convergence attestation
---- (subworkflow-attestation) but for the information-flow surface.
+--- accepted (fail-closed, X8). This mirrors the convergence attestation in
+--- subworkflow-attestation, but for the information-flow surface.
 mod WHIPPLESCRIPT-INFOFLOW-PACKAGE is
   sorts Tool Cfg .
 
