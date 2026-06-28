@@ -68,3 +68,39 @@ rule handle_review
     fail error { reason "review failed" }
   }
 }
+
+# `stub coerce <fn> returns { … }` constructs a specific variant value (the `variant`
+# field is the discriminant); the exhaustive `case` then dispatches to that arm.
+test "approved variant completes" {
+  workflow CoerceEnum
+
+  given input {
+    item { title "t" body "b" }
+  }
+
+  stub coerce reviewWork returns {
+    variant "Approved"
+    score 0.9
+  }
+
+  run until idle
+
+  expect workflow completed
+}
+
+test "rejected variant fails" {
+  workflow CoerceEnum
+
+  given input {
+    item { title "t" body "b" }
+  }
+
+  stub coerce reviewWork returns {
+    variant "Rejected"
+    reason "not good enough"
+  }
+
+  run until idle
+
+  expect workflow failed
+}
