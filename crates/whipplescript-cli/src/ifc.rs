@@ -380,10 +380,31 @@ pub fn envelope_path_from_env() -> Option<PathBuf> {
 }
 
 /// The rendered guarantee report for a `whip check` run, if a governance envelope
-/// is configured; `None` in dev mode.
+/// is configured; `None` in dev mode. A *signed* envelope is verified first: a
+/// tampered policy yields a refusal note, never a guarantee computed from
+/// tampered labels (the report must not vouch for content it cannot attest).
 pub fn report_for_check(ir: &IrProgram) -> Option<String> {
     let path = envelope_path_from_env()?;
-    let envelope = Envelope::load(&path).ok()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    report_for_envelope_text(ir, &text)
+}
+
+/// Render the guarantee report for a given envelope text. A signed envelope is
+/// verified first: a tampered policy yields a refusal note, never a guarantee
+/// computed from tampered labels. `None` if the envelope text is unparseable.
+fn report_for_envelope_text(ir: &IrProgram, text: &str) -> Option<String> {
+    if text.contains("\"attestation\"") {
+        if let Err(message) = crate::gov::SignedEnvelope::verify(text) {
+            return Some(format!(
+                "information-flow guarantee report\n  REFUSED: {message}\n"
+            ));
+        }
+    }
+    let envelope = if text.trim_start().starts_with('{') {
+        Envelope::from_json(text).ok()?
+    } else {
+        Envelope::from_dsl(text).ok()?
+    };
     Some(governance_report(ir, &envelope).render())
 }
 
@@ -938,5 +959,26 @@ grant channel reply -> smtp:out readable by Requester\n";
         let text = report.render();
         assert!(text.contains("protected resources"));
         assert!(text.contains("coverage gaps"));
+    }
+
+    #[test]
+    fn report_refuses_a_tampered_signed_envelope() {
+        let ir = ir_with_grants(&format!("{READ_LEDGER}{WRITE_OUTBOX}"));
+        let config = "grant file_store ledger -> file:/srv/ledger.db readable by Operator\n";
+        let signed = crate::gov::SignedEnvelope::sign_for_test(config, "admin");
+        let json = signed.to_json();
+        // a valid signed envelope renders a normal guarantee report...
+        let ok = report_for_envelope_text(&ir, &json).expect("renders");
+        assert!(ok.contains("protected resources"));
+        assert!(!ok.contains("REFUSED"));
+        // ...but tampering with the labels makes the report REFUSE rather than
+        // vouch for content it cannot attest.
+        let tampered = json.replace("\"reader\":\"Operator\"", "\"reader\":\"public\"");
+        assert_ne!(tampered, json, "test should actually modify the content");
+        let refused = report_for_envelope_text(&ir, &tampered).expect("renders");
+        assert!(
+            refused.contains("REFUSED"),
+            "tampered signed envelope should refuse, got: {refused}"
+        );
     }
 }

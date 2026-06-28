@@ -1,0 +1,36 @@
+# Governance policy for the support-triage workflow (DR-0028 governance DSL).
+#
+# This labels the REAL data sources in the environment — not variables in any
+# whip. IT signs this once; users then author whips freely and the compiler holds
+# them to it.
+#
+# Two axes per resource:
+#   readable by <Role>  — confidentiality: who is cleared to READ this data.
+#   from <Role>         — integrity: whose vouching is required to WRITE it.
+# `public` is the bottom of both: world-readable / untrusted.
+
+# The CRM holds customer PII. Only a party acting for Operator may read it, and
+# only Operator-vouched data may be written into it.
+grant file_store crm -> file:/srv/crm.db readable by Operator from Operator
+
+# Inbound email lands here as files. It is attacker-controllable: world-readable
+# (no secrets) and UNtrusted (public integrity — anyone could have sent it).
+grant file_store inbox -> maildir:/var/mail/support readable by public from public
+
+# The public reply channel goes back to the (untrusted) customer.
+grant channel public_reply -> smtp:out readable by public from public
+
+# Our in-house model is cleared to see Operator data; sending a turn's context to
+# it is not egress. (The provider is keyed by the agent's `provider` identifier.)
+grant provider fixture -> selfhost:llama readable by Operator from Operator
+
+# An append-only event log of untrusted inbound activity (public, untrusted-OK).
+grant file_store audit_log -> file:/srv/audit.log readable by public from public
+
+# --- Audited trusted surface (added after IT review) ---
+# The data subject is entitled to their OWN record, so releasing CRM content to
+# the customer's reply channel is an intentional, reviewed crossing.
+grant declassify crm to public
+# Inbound email is sanitized by an upstream filter before we trust it as a note,
+# so we vouch for it at Operator integrity.
+grant endorse inbox to Operator

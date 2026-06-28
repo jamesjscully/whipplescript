@@ -87,6 +87,13 @@ impl SignedEnvelope {
         })
     }
 
+    /// Sign with privilege forced on — for tests only (the crate forbids the
+    /// `set_var` that would drive the env-gated path).
+    #[cfg(test)]
+    pub(crate) fn sign_for_test(config_text: &str, signer: &str) -> Self {
+        Self::sign_with_privilege(config_text, signer, true).expect("privileged test sign")
+    }
+
     /// The on-disk signed-envelope JSON: the canonical content with an
     /// `attestation` block.
     pub fn to_json(&self) -> String {

@@ -1,0 +1,82 @@
+@service
+description "Support triage — SAFE: same job, contexts separated, passes the strict policy"
+workflow SupportTriageSafe
+
+# Same governance policy, same data sources, same useful work — but restructured
+# so no single rule both reads confidential data and egresses, and untrusted
+# inbound content never reaches a high-integrity store. This passes `whip check`
+# under the signed policy with NO declassify/endorse hatches: it is the
+# maximally-permissive-yet-safe shape, not a blocked one.
+
+output result Done
+class Done { ok bool }
+
+class Ticket { id string  status "open" }
+class Logged { ticket string }
+class Reviewed { ticket string }
+
+file store crm {
+  root "./.whipplescript/crm"
+  allow read ["**"]
+  allow write ["**"]
+}
+
+file store inbox {
+  root "./.whipplescript/inbox"
+  allow read ["**"]
+}
+
+# An untrusted-OK event log: governance marks it public integrity, so recording
+# attacker-controlled inbound content here is fine (it is not a trusted sink).
+file store audit_log {
+  root "./.whipplescript/audit"
+  allow write ["**"]
+}
+
+channel public_reply {
+  provider slack
+  destination "#out"
+}
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+# Rule 1: untrusted inbound email -> the public-integrity audit log. No leak
+# (inbox is public), no injection (audit_log requires only public integrity).
+rule log_inbound
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from inbox at "latest.eml" as inbound
+  after inbound succeeds as email {
+    write text to audit_log at "events.log" {
+      body email.content
+      mode append
+    } as logged
+    after logged succeeds {
+      record Logged { ticket ticket.id }
+    }
+  }
+}
+
+# Rule 2: read the confidential CRM, derive only a bounded internal fact. The read
+# is confidential but there is NO egress sink in this rule, so nothing leaks.
+rule review_record
+  when Logged as logged
+=> {
+  read text from crm at "customer.json" as crm_record
+  after crm_record succeeds as customer {
+    record Reviewed { ticket logged.ticket }
+  }
+}
+
+# Rule 3: reply to the customer with only public, bounded content (the ticket id).
+# No confidential read in this rule, so the egress is safe.
+rule acknowledge
+  when Reviewed as reviewed
+=> {
+  send via public_reply {
+    text "Thanks — your ticket {{ reviewed.ticket }} is being handled."
+  } as sent
+  after sent succeeds {
+    complete result { ok true }
+  }
+}

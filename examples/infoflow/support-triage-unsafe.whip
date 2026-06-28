@@ -1,0 +1,58 @@
+@service
+description "Support triage — UNSAFE: the lethal trifecta in a single rule"
+workflow SupportTriageUnsafe
+
+# A naive agent author wires up the obvious flow: pull the customer's record, log
+# whatever the inbound email said, and email a personalized reply. Each step looks
+# innocuous. Together they (1) leak confidential CRM data to an untrusted recipient
+# and (2) let attacker-controlled email content corrupt the CRM. Under the signed
+# governance policy, `whip check` rejects both.
+
+output result Done
+class Done { ok bool }
+
+class Ticket { id string  status "open" }
+
+# Confidential customer records (governance: readable by Operator, from Operator).
+file store crm {
+  root "./.whipplescript/crm"
+  allow read ["**"]
+  allow write ["**"]
+}
+
+# Inbound email files (governance: public reader, public/untrusted integrity).
+file store inbox {
+  root "./.whipplescript/inbox"
+  allow read ["**"]
+}
+
+# Public reply back to the customer (governance: public).
+channel public_reply {
+  provider slack
+  destination "#out"
+}
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule triage
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from crm at "customer.json" as crm_record
+  after crm_record succeeds as customer {
+    read text from inbox at "latest.eml" as inbound
+    after inbound succeeds as email {
+      write text to crm at "notes.txt" {
+        body email.content
+        mode append
+      } as noted
+      after noted succeeds {
+        send via public_reply {
+          text "Here is your record: {{ customer.content }}"
+        } as sent
+        after sent succeeds {
+          complete result { ok true }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,41 @@
+@service
+description "Provider egress — a turn that reads confidential data ships it to the model"
+workflow AgentEgress
+
+# Even with no file write or channel send, a `tell` egresses: the turn's context
+# (including anything it read) is shipped to the agent's model provider. If that
+# provider is not cleared for the data, that is a leak to the model. Governance
+# decides which providers are in the trust domain.
+
+output result Done
+class Done { ok bool }
+class Ticket { id string  status "open" }
+
+agent assistant {
+  provider fixture
+  profile "support"
+  capacity 1
+}
+
+file store crm {
+  root "./.whipplescript/crm"
+  allow read ["**"]
+  allow write ["**"]
+}
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule summarize
+  when Ticket as ticket where ticket.status == "open"
+  when assistant is available
+=> {
+  tell assistant as turn
+    with access to crm {
+      read ["**"]
+    }
+    "Summarize this customer's record."
+
+  after turn succeeds as outcome {
+    complete result { ok true }
+  }
+}
