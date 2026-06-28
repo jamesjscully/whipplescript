@@ -121,9 +121,13 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   `current_principal()` seam with pluggable backends (**`os`** default,
   **`env`**/launcher now, **`token`**/OIDC future) feeds the already-parsed
   `party <id> : <Role>` map; the resolved role is the agent's authority ceiling.
-  Enforcement is built for real; only the identity *source* is pluggable. **IMPL
-  OPEN:** the `principal` module + `os`/`env` backends + the role-ceiling check
-  (DR-0031 implementation sketch).
+  Enforcement is built for real; only the identity *source* is pluggable. **DONE
+  (v0, 2026-06-28):** `principal` module with `env`/`os` backends; `party` lines
+  parsed + round-tripped (canonical `parties`); `check_principal_ceiling` enforces D3
+  (an agent acting-for a low-clearance principal is refused a read beyond it; unknown
+  principal = public bottom, fail-closed), gated on `has_parties`. Unit + e2e tested.
+  *Future:* the `token`/OIDC backend (authenticated identity), and the integrity-axis
+  ceiling (writes vouched at the principal's level).
 
 ### H — Found hands-on (beyond the audit agents)
 - **H1 — report-vs-check tamper.** **DONE (Wave 1)** — subsumed by P1: the report
