@@ -699,6 +699,7 @@ fn await_class(
             span,
         },
         is_key: false,
+        presence_condition: None,
         span,
     }];
     if let Some((_, schema)) = trigger {
@@ -715,6 +716,7 @@ fn await_class(
                     },
                 },
                 is_key: false,
+                presence_condition: None,
                 span,
             });
         }
@@ -733,6 +735,7 @@ fn await_class(
                 },
             },
             is_key: false,
+            presence_condition: None,
             span,
         });
     }

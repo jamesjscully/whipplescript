@@ -419,6 +419,10 @@ pub struct ClassField {
     /// `@key`: this field is the class's natural key (used for import per-row
     /// idempotency, spec/std-library/files.md). At most one per class in v0.
     pub is_key: bool,
+    /// Family B (discriminant-string schemas): `<field> <Type> when <disc> == "<lit>"`
+    /// — this field is present only when the literal-union discriminant field `disc`
+    /// equals `lit`. `(discriminant field name, required literal)`.
+    pub presence_condition: Option<(String, String)>,
     pub span: SourceSpan,
 }
 
@@ -1056,6 +1060,10 @@ pub struct IrClassField {
     pub ty: IrType,
     /// `@key`: this field is the class's natural key (import per-row idempotency).
     pub is_key: bool,
+    /// Family B presence condition: `(discriminant field name, required literal)`.
+    /// When set, the field is present only when the discriminant equals the literal
+    /// (spec/decision-records/discriminated-families-design.md §5.7).
+    pub presence_condition: Option<(String, String)>,
     pub span: SourceSpan,
 }
 
@@ -5294,12 +5302,14 @@ fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Dia
             name: "variant".to_owned(),
             ty: IrType::LiteralString(variant.name.name.clone()),
             is_key: false,
+            presence_condition: None,
             span: variant.name.span,
         }];
         fields.extend(variant.fields.iter().map(|field| IrClassField {
             name: field.name.name.clone(),
             ty: lower_type(field.ty.clone()),
             is_key: false,
+            presence_condition: field.presence_condition.clone(),
             span: field.span,
         }));
         ir.schemas.push(IrSchema::Class(IrClass {
@@ -5513,6 +5523,8 @@ fn lower_event(event: EventDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
             });
         }
     }
+    validate_presence_conditions(&event.name, &event.fields, diagnostics);
+
     ir.events.push(IrEvent {
         name: event.name,
         fields: event
@@ -5522,11 +5534,87 @@ fn lower_event(event: EventDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                 name: field.name.name,
                 ty: lower_type(field.ty),
                 is_key: false,
+                presence_condition: field.presence_condition,
                 span: field.span,
             })
             .collect(),
         span: event.span,
     });
+}
+
+/// The string-literal values of a literal-union (or single-literal) type, or `None`
+/// if the type is not a pure string-literal union. Used to validate Family B
+/// discriminants.
+fn literal_union_values(ty: &TypeSyntax) -> Option<Vec<String>> {
+    match ty {
+        TypeSyntax::LiteralString { value, .. } => Some(vec![value.clone()]),
+        TypeSyntax::Union { variants, .. } => {
+            let values = variants
+                .iter()
+                .filter_map(|variant| match variant {
+                    TypeSyntax::LiteralString { value, .. } => Some(value.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (!values.is_empty() && values.len() == variants.len()).then_some(values)
+        }
+        _ => None,
+    }
+}
+
+/// Family B validation (spec/decision-records/discriminated-families-design.md §6.3):
+/// every `<field> <T> when <disc> is "<lit>"` must name a same-schema discriminant
+/// that is a string-literal union, and `<lit>` must be one of its values.
+fn validate_presence_conditions(
+    container: &str,
+    fields: &[ClassField],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for field in fields {
+        let Some((disc, literal)) = &field.presence_condition else {
+            continue;
+        };
+        let Some(disc_field) = fields.iter().find(|candidate| &candidate.name.name == disc)
+        else {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: field.span,
+                message: format!(
+                    "`{container}` field `{}` is conditioned on unknown discriminant `{disc}`",
+                    field.name.name
+                ),
+                suggestion: Some(
+                    "`when <field> is \"...\"` must name a literal-union field of the same schema"
+                        .to_owned(),
+                ),
+            });
+            continue;
+        };
+        match literal_union_values(&disc_field.ty) {
+            Some(values) if values.iter().any(|value| value == literal) => {}
+            Some(values) => diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: field.span,
+                message: format!(
+                    "`{container}` field `{}` is conditioned on `{disc} is \"{literal}\"`, which is not a value of `{disc}`",
+                    field.name.name
+                ),
+                suggestion: Some(format!("use one of: {}", values.join(", "))),
+            }),
+            None => diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: field.span,
+                message: format!(
+                    "`{container}` field `{}` is conditioned on `{disc}`, which is not a string-literal discriminant",
+                    field.name.name
+                ),
+                suggestion: Some(
+                    "the discriminant must be a string-literal union, e.g. `kind \"a\" | \"b\"`"
+                        .to_owned(),
+                ),
+            }),
+        }
+    }
 }
 
 fn lower_class(
@@ -5574,6 +5662,8 @@ fn lower_class(
         }
     }
 
+    validate_presence_conditions(&class_decl.name.name, &class_decl.fields, diagnostics);
+
     ir.schemas.push(IrSchema::Class(IrClass {
         name: class_decl.name.name,
         span: class_decl.span,
@@ -5584,6 +5674,7 @@ fn lower_class(
                 name: field.name.name,
                 ty: lower_type(field.ty),
                 is_key: field.is_key,
+                presence_condition: field.presence_condition,
                 span: field.span,
             })
             .collect(),
@@ -7306,6 +7397,7 @@ fn ir_field(name: &str, ty: IrType) -> IrClassField {
         name: name.to_owned(),
         ty,
         is_key: false,
+        presence_condition: None,
         span: SourceSpan { start: 0, end: 0 },
     }
 }
@@ -10593,6 +10685,7 @@ fn collect_inline_decide_schemas(
                     name: field_name.clone(),
                     ty: lower_type(ty.clone()),
                     is_key: false,
+                    presence_condition: None,
                     span,
                 });
                 syntax_fields.insert(field_name.clone(), ty);
@@ -15664,6 +15757,7 @@ impl Parser<'_> {
                         name: field_name,
                         ty,
                         is_key: false,
+                        presence_condition: None,
                     });
                 }
                 if let Some(close) = self.expect_symbol('}') {
@@ -15732,11 +15826,13 @@ impl Parser<'_> {
                 self.synchronize_to_block_item();
                 continue;
             };
+            let presence_condition = self.parse_field_presence_condition();
             fields.push(ClassField {
                 span: field_name.span.join(ty.span()),
                 name: field_name,
                 ty,
                 is_key: false,
+                presence_condition,
             });
         }
         let end = self
@@ -16518,12 +16614,14 @@ impl Parser<'_> {
                     }
                 }
             }
+            let presence_condition = self.parse_field_presence_condition();
             let span = field_name.span.join(ty.span());
             fields.push(ClassField {
                 span,
                 name: field_name,
                 ty,
                 is_key,
+                presence_condition,
             });
         }
 
@@ -17180,6 +17278,27 @@ impl Parser<'_> {
             self.expected(label);
             None
         }
+    }
+
+    /// Family B: an optional `when <discriminant> is "<literal>"` suffix on a
+    /// schema/signal field — the field is present only when the literal-union
+    /// discriminant field equals the literal. `is` is used instead of `==` to stay
+    /// within the declaration tokenizer; the meaning is equality
+    /// (spec/decision-records/discriminated-families-design.md §5.7).
+    fn parse_field_presence_condition(&mut self) -> Option<(String, String)> {
+        if !self.at_ident("when") {
+            return None;
+        }
+        self.advance(); // `when`
+        let disc = self.expect_ident("discriminant field name after `when`")?;
+        if self.at_ident("is") {
+            self.advance();
+        } else {
+            self.expected("`is` after the discriminant field");
+            return None;
+        }
+        let literal = self.expect_string("discriminant literal value")?;
+        Some((disc.name, literal.value))
     }
 
     fn expect_string(&mut self, label: &str) -> Option<StringLiteral> {
@@ -21042,6 +21161,58 @@ rule route
             "expected unreachable-after-wildcard diagnostic: {:?}",
             compiled.diagnostics
         );
+    }
+
+    #[test]
+    fn family_b_presence_condition_validates_discriminant() {
+        let program = |fields: &str| {
+            format!(
+                r#"
+workflow B
+input e Event
+output result Done
+class Done {{ ok bool }}
+class Event {{
+{fields}
+}}
+rule r
+  when Event as e
+=> {{
+  complete result {{ ok true }}
+}}
+"#
+            )
+        };
+        // Valid: a literal-union discriminant with an in-range `when` literal.
+        let ok = compile_program(&program(
+            "  kind \"deploy\" | \"rollback\"\n  region string when kind is \"deploy\"",
+        ));
+        assert_eq!(ok.diagnostics, Vec::new());
+        assert!(ok.ir.is_some());
+        // Unknown discriminant.
+        let bad1 = compile_program(&program(
+            "  kind \"deploy\" | \"rollback\"\n  region string when missing is \"deploy\"",
+        ));
+        assert!(bad1
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("unknown discriminant `missing`")));
+        // Literal not in the discriminant union.
+        let bad2 = compile_program(&program(
+            "  kind \"deploy\" | \"rollback\"\n  region string when kind is \"ship\"",
+        ));
+        assert!(bad2
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("not a value of `kind`")));
+        // Discriminant is not a string-literal union.
+        let bad3 = compile_program(&program(
+            "  kind string\n  region string when kind is \"deploy\"",
+        ));
+        assert!(bad3
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("not a string-literal discriminant")));
     }
 
     #[test]

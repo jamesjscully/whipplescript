@@ -695,18 +695,21 @@ mod tests {
                     name: "status".to_owned(),
                     ty: IrType::Ref("WorkStatus".to_owned()),
                     is_key: false,
+                    presence_condition: None,
                     span: span(),
                 },
                 IrClassField {
                     name: "reason".to_owned(),
                     ty: IrType::Primitive(IrPrimitiveType::String),
                     is_key: false,
+                    presence_condition: None,
                     span: span(),
                 },
                 IrClassField {
                     name: "score".to_owned(),
                     ty: IrType::Optional(Box::new(IrType::Primitive(IrPrimitiveType::Int))),
                     is_key: false,
+                    presence_condition: None,
                     span: span(),
                 },
             ],
@@ -753,12 +756,14 @@ mod tests {
             name: "variant".to_owned(),
             ty: IrType::LiteralString(value.to_owned()),
             is_key: false,
+            presence_condition: None,
             span: span(),
         };
         let payload_field = |name: &str, ty: IrType| IrClassField {
             name: name.to_owned(),
             ty,
             is_key: false,
+            presence_condition: None,
             span: span(),
         };
         let schemas = vec![
@@ -926,6 +931,7 @@ mod tests {
                 name: "items".to_owned(),
                 ty: IrType::Map(Box::new(IrType::Primitive(IrPrimitiveType::String))),
                 is_key: false,
+                presence_condition: None,
                 span: span(),
             }],
             span: span(),
