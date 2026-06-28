@@ -189,6 +189,16 @@
             "description": "Cross-package information-flow surface (DR-0029; the X1-X8 obligations). Optional: absent = the tool makes no IFC claim and is governed by the consumer's fail-closed defaults. Present = the producer's attested IFC surface that the consumer checks against its envelope.",
             "additionalProperties": false,
             "required": ["surface", "flow", "ifc_attested"],
+            "allOf": [
+              {
+                "if": { "required": ["flow"], "properties": { "flow": { "const": "signature" } } },
+                "then": { "required": ["flow_signature"] }
+              },
+              {
+                "if": { "required": ["flow"], "properties": { "flow": { "const": "join_box" } } },
+                "then": { "not": { "required": ["flow_signature"] } }
+              }
+            ],
             "properties": {
               "surface": {
                 "type": "array",
@@ -207,8 +217,29 @@
               },
               "flow": {
                 "type": "string",
-                "description": "X2 (per-tool flow signature). Fixed in v1 at the opaque join box: every output carries the join of all inputs (I-IFC2). A finer, compiler-verified signature is a reserved extension (add an enum value; non-breaking).",
-                "enum": ["join_box"]
+                "description": "X2 (per-tool flow signature). Default `join_box`: every output carries the join of all inputs (I-IFC2). `signature` selects a finer, producer-attested, compiler-verified dependency signature carried in `flow_signature` (DR-0030 Direction A). Extending the enum is non-breaking; a signature is never merely asserted.",
+                "enum": ["join_box", "signature"]
+              },
+              "flow_signature": {
+                "type": "object",
+                "description": "X2 refinement (DR-0030 A), present iff `flow` == `signature`. A producer-attested, LABEL-AGNOSTIC dependency signature, keyed by output port; v1 uses the single key `result` (whole-result), per-output-field keys are the non-breaking v2. Each entry lists only the DEPARTURES from the join box; the default per (input port, output port) edge is `direct`, so a dropped entry fails closed to `direct`. Reader/writer sets are NOT carried here — they are CONSUMER-derived by applying this matrix to the consumer's bound input labels (labels are party-relative, I-IFC1, so the producer cannot attest them). Modeled in `models/maude/infoflow-signature.maude`; soundness proven in `models/lean/Whipple/FlowSignature.lean`.",
+                "additionalProperties": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "description": "Departures from the join box for one output port. Any input port not listed here is `direct` (carries the join-box default).",
+                  "properties": {
+                    "independent_of": {
+                      "type": "array",
+                      "description": "Input ports this output provably does NOT depend on (a non-interference claim the producer proves on the package internals). Each must be an input port of the X1 `surface` / `resource_params` universe.",
+                      "items": { "type": "string" }
+                    },
+                    "mediated": {
+                      "type": "object",
+                      "description": "Input ports whose flow to this output passes ONLY through an internal crossing (a CUT, not mere reachance), mapping the input port to the `required_crossings` id that mediates it. A consumer-granted declassify discount: if the consumer does NOT grant the crossing, the edge falls back to `direct` (full label), never to `absent` (fail-closed). Each crossing id MUST appear in `required_crossings` (X3). v2.",
+                      "additionalProperties": { "type": "string" }
+                    }
+                  }
+                }
               },
               "ifc_attested": {
                 "type": "boolean",

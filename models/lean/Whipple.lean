@@ -3,3 +3,6 @@ import Whipple.Decide
 import Whipple.Boundary
 import Whipple.ReaderSets
 import Whipple.NMIF
+import Whipple.FlowSignature
+import Whipple.Staging
+import Whipple.CheckedDeclassify

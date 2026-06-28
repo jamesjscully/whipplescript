@@ -142,6 +142,19 @@ others are active workshop material.
   they never authorize past flows, and in-flight
   work is bound to its version. *Accepted (authority model); the governance half
   of DR-0027; extends DR-0026's envelope.*
+- [0029-cross-package-information-flow.md](0029-cross-package-information-flow.md):
+  a package that exports a `@tool` carries an attested **information-flow surface**
+  (X1–X8) in its contract; the check is two-sided — the producer proves its
+  internals stay within the declared surface, the consumer proves
+  `surface ⊑ envelope`. *Accepted; IFC lifted to the package boundary.*
+- [0030-refining-the-join-box.md](0030-refining-the-join-box.md): how to refine the
+  opaque join box **on the label axis, never the quantity axis** (entropy/QIF
+  rejected — bits are the wrong unit). Three directions: **(A)** per-tool flow
+  signatures as a producer-attested structural dependency matrix (decided +
+  modeled, `infoflow-signature.maude`), **(B)** phase/provenance-typed turn outputs
+  ("model fills, whip assembles" — zero new syntax), **(C)** semantic checked
+  declassifiers (NMIF-on-selector soundness, query-budget backstop). *Accepted
+  direction; A modeled, B/C staged; refines DR-0027/0029.*
 
 ## Historical Decision Trackers
 

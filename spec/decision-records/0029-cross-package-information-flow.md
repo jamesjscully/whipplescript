@@ -39,8 +39,12 @@ envelope, is **never** accepted (fail-closed).
    resource/effect/egress (`kind:address`) and brokered tool; the producer attests
    lowered effects ⊆ `surface`.
 2. **X2 — Per-tool flow signature.** Fixed at the **opaque join box** (output = join
-   of all inputs, I-IFC2). Finer signatures are a reserved, **compiler-verified**
-   extension — never asserted. QIF/entropy is out of scope.
+   of all inputs, I-IFC2) in v1. The reserved, **compiler-verified** finer-signature
+   extension is now designed in **DR-0030** (a producer-attested structural
+   dependency matrix; whole-result v1, per-field v2; serialize departures
+   `independent_of` + `mediated`; the mediated edge is a consumer-granted
+   declassify discount with a `direct` fail-closed fallback). Signatures are never
+   merely asserted. QIF/entropy stays out of scope (DR-0030 Decision 0).
 3. **X3 — No package-asserted authority.** Crossings the tool needs are declared in
    `required_crossings`; the **consumer's** governance must grant each (authority
    lives in the consumer envelope, I-IFC4). Undeclared crossings are forbidden and
@@ -64,7 +68,8 @@ envelope, is **never** accepted (fail-closed).
 
 `package_contract_v0.workflow_tools[].information_flow`:
 `surface` (X1), `resource_params` (X4), `required_crossings` (X3),
-`flow: "join_box"` (X2), `ifc_attested` (X5). `invokes` already gives X6; the lock
+`flow` (X2; `"join_box"` default or `"signature"` with the optional `flow_signature`
+dependency map — DR-0030), `ifc_attested` (X5). `invokes` already gives X6; the lock
 digest gives X7; the consumer check gives X8.
 
 ## Remaining implementation
