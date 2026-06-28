@@ -27,10 +27,23 @@ asymmetric-delegation model (acts-for, reader/influencer sets) and NMIF.
 - [x] composition model party-relative — both axes, explicit join node, dual-gated
   `record`, axis-locked endorse/declassify, the audited trusted surface; 9+9
   gate-green (`models/maude/infoflow-composition.maude`), 2026-06-27.
+- [x] Lean proof layer — the algebra, machine-checked (`models/lean`, hermetic,
+  Mathlib-free, pinned v4.30.0), 2026-06-27. `actsFor_refl`/`actsFor_trans` (preorder),
+  `public_is_bottom`/`public_acts_for_only_public` (bottom holds no authority),
+  `canAct_iff` (the reach algorithm is SOUND AND COMPLETE vs the order — axioms
+  `[propext, Quot.sound]`), `integ_is_conf_dual`, `conf_to_public_needs_public_source`,
+  and the `Verified` boundary discipline (the report-vs-check bug class). Gated by
+  `scripts/check-lean-models.sh` (rejects sorry/admit/axiom/native_decide, bite-tested).
+  CLOSES the audit finding that acts-for being a preorder + the closure being correct
+  were only ASSERTED in comments, never proven.
 - [ ] NMIF increment — robust downgrade: an `endorse`/`declassify` may not be
-  influenced by an attacker; grant-authorization of the crossing.
-- [ ] TLA+ — durable label carriage (I-IFC7) + envelope versioning / non-retroactive
-  (D4) + replay-stability.
+  influenced by an attacker; grant-authorization of the crossing. (Next Lean target.)
+- [ ] TLA+ / Veil — durable label carriage (I-IFC7) + envelope versioning / non-retroactive
+  (D4) + replay-stability (a transition-system property; Veil-on-Lean or TLA+).
+- [ ] Maude multi-consumer bite — `subworkflow-attestation` (and the infoflow sink
+  models) model a SINGLE consumer; add a second consumer of the attested/labelled
+  artifact with a bite that an un-gated consumer is caught. (The report-vs-check bug
+  class; the Lean `Verified` theorem covers it algebraically, Maude should bite it too.)
 
 ## Phase 2 — Parser / IR
 
