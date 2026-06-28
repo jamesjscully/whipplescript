@@ -106,10 +106,14 @@ ACROSS a package boundary, the **package contract** must carry an
   can perform. The compiler verifies the package's lowered effects ⊆ its declared
   surface. A package that can open a channel / exec / hit a URL outside its declared
   surface is unsound.
-- **X2 — Per-tool flow signature.** Each exported `@tool`/workflow declares its
-  sources and sinks and how labels flow. **Default: an opaque join box** — every
-  output carries the join of all inputs (I-IFC2). Finer signatures are allowed ONLY
-  when compiler-verified at package build (see fork below), never merely asserted.
+- **X2 — Per-tool flow signature. DECIDED 2026-06-27: opaque join box only.** Every
+  exported tool's output carries the join of all inputs (I-IFC2); no per-tool flow
+  precision in v1. **Extension point reserved:** finer signatures may be added later
+  but ONLY when compiler-verified at package build (the producer runs the IFC check
+  on package internals and the attestation carries that machine-checked result) —
+  never merely asserted. QIF/entropy-budget precision is explicitly NOT adopted
+  (ideas brewing; do not design it in yet). Keep the contract field shaped so a
+  `flow_signature` can be added without a breaking change.
 - **X3 — No package-asserted authority.** Crossings (`declassify`/`endorse`) and
   resource access require the CONSUMER's governance grant (I-IFC4). The package
   DECLARES required crossings/authority as obligations; undeclared crossings are
@@ -139,6 +143,32 @@ Checking is **two-sided**, and is exactly `⊑` (I-IFC4) lifted to packages:
 - **Consumer side:** proves the declared surface fits the consumer's governance —
   `package-surface ⊑ consumer-envelope` — i.e. the resource bindings land on
   governed resources and every required crossing is granted.
+
+## Decisions (2026-06-27)
+
+- **Flow signatures: opaque join box only** (Fork A), with a reserved
+  compiler-verified extension point; QIF/entropy not adopted. (See X2.)
+- **Sequencing: keep the wave order below** (Fork B) — local sinks before
+  cross-package.
+
+## Carried-forward commitments (do not lose)
+
+The four items agreed in discussion map onto the inventory as follows, so they
+are tracked by ID, not by memory:
+
+1. **`VerifiedEnvelope` boundary type in Rust** — realize `Boundary.lean` in code;
+   route checker AND report (and any future consumer) through a type that cannot be
+   constructed from a signed artifact without verification; subsumes the H1 point-fix
+   and makes a future third consumer a compile error. → **P1 / H1, Wave 1.**
+2. **Maude multi-consumer bite** — add a second consumer to `subworkflow-attestation`
+   so the model bites the bug class concretely (Lean covers it algebraically).
+   → **M2, Wave 1.**
+3. **Unmonitored sinks** — model `complete result`/`record` (the workflow→invoker
+   channel) and the five doors (telemetry, human.ask, session-event) as boundaries.
+   → **H2 + H3 + E2, Wave 2.**
+4. **Next Lean targets** — NMIF (robust declassification) and reader/writer sets;
+   then Veil/TLA+ for durable label carriage (I-IFC7), a transition-system property
+   and the natural home for Veil-on-Lean. → **M1/E6, Wave 4; M3, Wave 6.**
 
 ## Plan — waves
 
