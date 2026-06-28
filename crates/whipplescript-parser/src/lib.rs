@@ -6566,7 +6566,7 @@ fn analyze_rule(
             binding_types.insert(binding, schema);
         }
     }
-    let mut effect_payload_types = collect_effect_payload_types(rule, semantic);
+    let mut effect_payload_types = collect_effect_payload_types(rule, semantic, diagnostics);
     // `exec ... -> Schema as binding` is parsed from the AST (the command text
     // can itself contain `->`/` as `, so a text scan is unsafe), giving its
     // result the same after-binding type flow a named `coerce -> Schema` gets.
@@ -6910,6 +6910,7 @@ struct RuleCaseBranchSource {
 fn collect_effect_payload_types(
     rule: &RuleDecl,
     semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
 ) -> BTreeMap<String, IrType> {
     let mut payloads = BTreeMap::new();
     for statement in effect_payload_statements(&rule.body.text) {
@@ -6917,10 +6918,30 @@ fn collect_effect_payload_types(
         let Some((kind, Some(binding))) = parse_effect_line(line) else {
             continue;
         };
-        payloads.insert(
-            binding,
-            terminal_completed_payload_type(line, &kind, semantic),
-        );
+        let payload = terminal_completed_payload_type(line, &kind, semantic);
+        // A binding name keys the per-rule payload map, so reusing it for two effects
+        // with DIFFERENT result types makes `after <binding> …` ambiguous (§5.5).
+        // Same-type reuse (and mutually-exclusive `case` arms, which never both run)
+        // is harmless and left alone.
+        match payloads.get(&binding) {
+            Some(existing) if existing != &payload => {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` reuses effect binding `{binding}` for effects with conflicting result types",
+                        rule.name.name
+                    ),
+                    suggestion: Some(format!(
+                        "give each effect a distinct binding — `as {binding}` is reused with a different result type, so `after {binding} …` is ambiguous"
+                    )),
+                });
+            }
+            Some(_) => {}
+            None => {
+                payloads.insert(binding, payload);
+            }
+        }
     }
 
     payloads
@@ -21596,6 +21617,41 @@ rule r
                 .any(|d| d.message.contains("conditional field `e.region`")),
             "{:?}",
             wrong.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_reused_effect_binding() {
+        // Reusing an effect binding for two effects with DIFFERENT result types makes
+        // `after <binding> …` ambiguous (§5.5). Same-type reuse is harmless and allowed.
+        let source = r#"
+workflow D
+
+output result R
+class R { x string }
+class WorkItem { title string }
+class A { a string }
+class B { b string }
+
+coerce fa(t string) -> A { prompt "x" }
+coerce fb(t string) -> B { prompt "x" }
+
+rule r
+  when WorkItem as item
+=> {
+  coerce fa(item.title) as v
+  coerce fb(item.title) as v
+  complete result { x "done" }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("reuses effect binding `v`")),
+            "{:?}",
+            compiled.diagnostics
         );
     }
 
