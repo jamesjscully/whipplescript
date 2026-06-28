@@ -1375,6 +1375,10 @@ struct SchemaIndex {
     /// Declared external signals (spec/event-ingress.md); their payload
     /// schemas live in `classes` keyed by the dotted signal name.
     events: BTreeSet<String>,
+    /// Family B: per-schema field presence conditions, `schema -> field ->
+    /// (discriminant field, required literal)`. A conditioned field is readable
+    /// only inside a matching `case <root>.<disc>` arm.
+    presence: BTreeMap<String, BTreeMap<String, (String, String)>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4842,6 +4846,7 @@ impl SchemaIndex {
                         .map(|field| (field.name.name.clone(), field.ty.clone()))
                         .collect(),
                 );
+                self.insert_presence(&class_decl.name.name, &class_decl.fields);
             }
             Item::Event(event) => {
                 self.events.insert(event.name.clone());
@@ -4856,14 +4861,39 @@ impl SchemaIndex {
                         .map(|field| (field.name.name.clone(), field.ty.clone()))
                         .collect(),
                 );
+                self.insert_presence(&event.name, &event.fields);
             }
             _ => {}
         }
     }
 
+    /// Record Family B presence conditions for a schema's fields (if any).
+    fn insert_presence(&mut self, schema: &str, fields: &[ClassField]) {
+        let conditions: BTreeMap<String, (String, String)> = fields
+            .iter()
+            .filter_map(|field| {
+                field
+                    .presence_condition
+                    .clone()
+                    .map(|condition| (field.name.name.clone(), condition))
+            })
+            .collect();
+        if !conditions.is_empty() {
+            self.presence.insert(schema.to_owned(), conditions);
+        }
+    }
+
+    /// The presence condition `(discriminant, literal)` for a schema field, if any.
+    fn field_presence(&self, schema: &str, field: &str) -> Option<&(String, String)> {
+        self.presence
+            .get(schema)
+            .and_then(|fields| fields.get(field))
+    }
+
     fn merge(&mut self, other: SchemaIndex) {
         self.classes.extend(other.classes);
         self.enums.extend(other.enums);
+        self.presence.extend(other.presence);
     }
 
     fn class_exists(&self, name: &str) -> bool {
@@ -5574,8 +5604,7 @@ fn validate_presence_conditions(
         let Some((disc, literal)) = &field.presence_condition else {
             continue;
         };
-        let Some(disc_field) = fields.iter().find(|candidate| &candidate.name.name == disc)
-        else {
+        let Some(disc_field) = fields.iter().find(|candidate| &candidate.name.name == disc) else {
             diagnostics.push(Diagnostic {
                 related: Vec::new(),
                 span: field.span,
@@ -6650,6 +6679,16 @@ fn analyze_rule(
         diagnostics,
     );
     validate_coordination_discipline(rule, &body_ast.statements, diagnostics);
+    // Family B read-narrowing: a presence-conditioned field is readable only inside a
+    // matching `case <root>.<disc>` arm (starts with nothing allowed at the rule top).
+    validate_conditioned_field_reads(
+        rule,
+        &body_ast.statements,
+        semantic,
+        &binding_types,
+        &BTreeSet::new(),
+        diagnostics,
+    );
     let mut anonymous_effects = 0usize;
     let mut record_depth = 0i32;
 
@@ -11002,6 +11041,243 @@ fn for_each_body(statements: &[body::BodyStmt], visit: &mut impl FnMut(&body::Bo
             }
             body::BodyStmt::Handler(handler) => for_each_body(&handler.body, visit),
             _ => {}
+        }
+    }
+}
+
+/// Family B: the `(root, field)` pairs a `case <root>.<disc> { "<lit>" => ... }` arm
+/// makes readable — the fields conditioned on `<disc> is "<lit>"`. Empty unless the
+/// scrutinee is a single-level `<root>.<disc>` path bound to a schema and the arm
+/// pattern is the matching string literal.
+fn family_b_arm_allowed(
+    scrutinee: &str,
+    pattern: &str,
+    binding_types: &BTreeMap<String, String>,
+    semantic: &SemanticContext,
+) -> BTreeSet<(String, String)> {
+    let mut allowed = BTreeSet::new();
+    let Some((root, disc)) = scrutinee.split_once('.') else {
+        return allowed;
+    };
+    if disc.contains('.') {
+        return allowed;
+    }
+    let trimmed = pattern.trim();
+    if trimmed == "_" || trimmed == "default" {
+        return allowed;
+    }
+    let literal = trimmed.trim_matches('"');
+    if literal.is_empty() {
+        return allowed;
+    }
+    let Some(schema) = binding_types.get(root) else {
+        return allowed;
+    };
+    if let Some(conditions) = semantic.schemas.presence.get(schema) {
+        for (field, (cond_disc, cond_literal)) in conditions {
+            if cond_disc == disc && cond_literal == literal {
+                allowed.insert((root.to_owned(), field.clone()));
+            }
+        }
+    }
+    allowed
+}
+
+/// Reject reads of a Family B presence-conditioned field in `text` that are not
+/// permitted by `allowed` (the conditioned fields this scope's `case` arm makes
+/// present). `text` is any source fragment that may contain dotted field paths.
+fn check_conditioned_reads_in_text(
+    rule: &RuleDecl,
+    text: &str,
+    span: SourceSpan,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    allowed: &BTreeSet<(String, String)>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (root, path) in dotted_paths(text) {
+        let Some(first) = path.first() else {
+            continue;
+        };
+        let Some(schema) = binding_types.get(&root) else {
+            continue;
+        };
+        if let Some((disc, _literal)) = semantic.schemas.field_presence(schema, first) {
+            if !allowed.contains(&(root.clone(), first.clone())) {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span,
+                    message: format!(
+                        "rule `{}` reads conditional field `{root}.{first}` outside a matching `case {root}.{disc}` arm",
+                        rule.name.name
+                    ),
+                    suggestion: Some(format!(
+                        "read `{root}.{first}` inside `case {root}.{disc} {{ \"...\" => ... }}` — it is present only for a specific `{disc}`"
+                    )),
+                });
+            }
+        }
+    }
+}
+
+fn check_conditioned_reads_in_fields(
+    rule: &RuleDecl,
+    fields: &[body::FieldAssign],
+    span: SourceSpan,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    allowed: &BTreeSet<(String, String)>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for field in fields {
+        match &field.value {
+            body::FieldValue::Expr { source, .. } => check_conditioned_reads_in_text(
+                rule,
+                source,
+                field.span,
+                semantic,
+                binding_types,
+                allowed,
+                diagnostics,
+            ),
+            body::FieldValue::Nested { fields, .. } => check_conditioned_reads_in_fields(
+                rule,
+                fields,
+                span,
+                semantic,
+                binding_types,
+                allowed,
+                diagnostics,
+            ),
+            body::FieldValue::Shorthand => {}
+        }
+    }
+}
+
+/// Family B read-narrowing (discriminated-families-design.md §5.6/§5.7): walk the
+/// rule body and reject a read of a presence-conditioned field that is not inside a
+/// matching `case <root>.<disc>` arm. Each `case` arm extends `allowed` with the
+/// fields its discriminant=literal makes present. (v1 covers record/terminal/done
+/// values, branch conditions, and case guards; effect prompt/argument positions are
+/// a documented follow-up.)
+fn validate_conditioned_field_reads(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    allowed: &BTreeSet<(String, String)>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Record(record) => check_conditioned_reads_in_fields(
+                rule,
+                &record.fields,
+                record.span,
+                semantic,
+                binding_types,
+                allowed,
+                diagnostics,
+            ),
+            body::BodyStmt::Terminal(terminal) => check_conditioned_reads_in_fields(
+                rule,
+                &terminal.fields,
+                terminal.span,
+                semantic,
+                binding_types,
+                allowed,
+                diagnostics,
+            ),
+            body::BodyStmt::Done {
+                replacement: Some(record),
+                ..
+            } => check_conditioned_reads_in_fields(
+                rule,
+                &record.fields,
+                record.span,
+                semantic,
+                binding_types,
+                allowed,
+                diagnostics,
+            ),
+            body::BodyStmt::Done { .. }
+            | body::BodyStmt::Cancel { .. }
+            | body::BodyStmt::Effect(_) => {}
+            body::BodyStmt::After(after) => validate_conditioned_field_reads(
+                rule,
+                &after.body,
+                semantic,
+                binding_types,
+                allowed,
+                diagnostics,
+            ),
+            body::BodyStmt::Handler(handler) => validate_conditioned_field_reads(
+                rule,
+                &handler.body,
+                semantic,
+                binding_types,
+                allowed,
+                diagnostics,
+            ),
+            body::BodyStmt::Branch(branch) => {
+                check_conditioned_reads_in_text(
+                    rule,
+                    &branch.condition_source,
+                    branch.span,
+                    semantic,
+                    binding_types,
+                    allowed,
+                    diagnostics,
+                );
+                validate_conditioned_field_reads(
+                    rule,
+                    &branch.then_body,
+                    semantic,
+                    binding_types,
+                    allowed,
+                    diagnostics,
+                );
+                if let Some(else_body) = &branch.else_body {
+                    validate_conditioned_field_reads(
+                        rule,
+                        else_body,
+                        semantic,
+                        binding_types,
+                        allowed,
+                        diagnostics,
+                    );
+                }
+            }
+            body::BodyStmt::Case(case) => {
+                for arm in &case.branches {
+                    let mut arm_allowed = allowed.clone();
+                    arm_allowed.extend(family_b_arm_allowed(
+                        &case.scrutinee,
+                        &arm.pattern,
+                        binding_types,
+                        semantic,
+                    ));
+                    if let Some(guard) = &arm.guard {
+                        check_conditioned_reads_in_text(
+                            rule,
+                            guard,
+                            arm.span,
+                            semantic,
+                            binding_types,
+                            &arm_allowed,
+                            diagnostics,
+                        );
+                    }
+                    validate_conditioned_field_reads(
+                        rule,
+                        &arm.body,
+                        semantic,
+                        binding_types,
+                        &arm_allowed,
+                        diagnostics,
+                    );
+                }
+            }
         }
     }
 }
@@ -21213,6 +21489,57 @@ rule r
             .diagnostics
             .iter()
             .any(|d| d.message.contains("not a string-literal discriminant")));
+    }
+
+    #[test]
+    fn family_b_read_narrowing_restricts_conditioned_reads() {
+        let program = |body: &str| {
+            format!(
+                r#"
+workflow B
+input e Event
+output result Done
+class Done {{ region string }}
+class Event {{
+  kind "deploy" | "rollback"
+  region string when kind is "deploy"
+}}
+rule r
+  when Event as e
+=> {{
+{body}
+}}
+"#
+            )
+        };
+        // Outside any case arm: a conditioned read is rejected.
+        let outside = compile_program(&program("  complete result { region e.region }"));
+        assert!(
+            outside
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("conditional field `e.region`")),
+            "{:?}",
+            outside.diagnostics
+        );
+        // Inside the matching `deploy` arm: allowed.
+        let matching = compile_program(&program(
+            "  case e.kind {\n    \"deploy\" => { complete result { region e.region } }\n    \"rollback\" => { complete result { region \"none\" } }\n  }",
+        ));
+        assert_eq!(matching.diagnostics, Vec::new());
+        assert!(matching.ir.is_some());
+        // Inside the wrong (`rollback`) arm: rejected (region is a deploy-only field).
+        let wrong = compile_program(&program(
+            "  case e.kind {\n    \"deploy\" => { complete result { region \"x\" } }\n    \"rollback\" => { complete result { region e.region } }\n  }",
+        ));
+        assert!(
+            wrong
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("conditional field `e.region`")),
+            "{:?}",
+            wrong.diagnostics
+        );
     }
 
     #[test]
