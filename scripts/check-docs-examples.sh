@@ -23,6 +23,7 @@ check_example examples/minimal-noop.whip
 check_example examples/human-review.whip
 check_example examples/triage-flow.whip
 check_example examples/coerce-branch.whip
+check_example examples/coerce-enum.whip
 check_example examples/terminal-output-union.whip
 check_example examples/incident-router.whip
 check_example examples/scheduled-escalation.whip
