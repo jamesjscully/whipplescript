@@ -183,6 +183,38 @@
             "items": {
               "type": "string"
             }
+          },
+          "information_flow": {
+            "type": "object",
+            "description": "Cross-package information-flow surface (DR-0029; the X1-X8 obligations). Optional: absent = the tool makes no IFC claim and is governed by the consumer's fail-closed defaults. Present = the producer's attested IFC surface that the consumer checks against its envelope.",
+            "additionalProperties": false,
+            "required": ["surface", "flow", "ifc_attested"],
+            "properties": {
+              "surface": {
+                "type": "array",
+                "description": "X1 (no hidden doors): every resource/effect/egress the tool can perform, as kind:address ids. The producer attests its lowered effects are a subset of this.",
+                "items": { "type": "string" }
+              },
+              "resource_params": {
+                "type": "array",
+                "description": "X4 (resource parameterization): abstract resource handles the consumer binds to governed resources at import.",
+                "items": { "type": "string" }
+              },
+              "required_crossings": {
+                "type": "array",
+                "description": "X3 (no package-asserted authority): the declassify/endorse crossings the tool needs; the consumer's governance must grant each, or the import is rejected.",
+                "items": { "type": "string" }
+              },
+              "flow": {
+                "type": "string",
+                "description": "X2 (per-tool flow signature). Fixed in v1 at the opaque join box: every output carries the join of all inputs (I-IFC2). A finer, compiler-verified signature is a reserved extension (add an enum value; non-breaking).",
+                "enum": ["join_box"]
+              },
+              "ifc_attested": {
+                "type": "boolean",
+                "description": "X5 (attestation covers IFC): the producer ran the IFC check on the package internals against `surface` and vouches the surface is complete with no undeclared crossing. The consumer verifies this through the same trust boundary as convergence (VerifiedEnvelope)."
+              }
+            }
           }
         }
       }
