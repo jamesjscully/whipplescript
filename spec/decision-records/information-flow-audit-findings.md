@@ -1,0 +1,165 @@
+# Information-flow audit — findings, status, and fix plan
+
+Opened 2026-06-27 after the **report-vs-check bug**: the guarantee report rendered
+against a *tampered* signed envelope instead of refusing, because it was a SECOND
+consumer of the attested artifact that did not gate, while the checker did. That
+one bug triggered a full audit of the modeling surface and the plan execution.
+This document is the **single source of truth** for everything the audit found.
+Nothing here is closed until it has a model/proof AND an implementation AND a test.
+
+## The meta-lesson (root cause of the class)
+
+1. **Single-consumer / single-path modeling.** Invariants were phrased about ONE
+   consumer ("the whip agent only enforces") and models had ONE consumer of each
+   trusted artifact. A second consumer that skips the check is then both
+   unmodeled and permitted. Fix discipline: model the **artifact and ALL its
+   consumers**; phrase invariants over the **boundary**, not a path.
+2. **Bounded tests mistaken for proofs.** "We have formal models" meant Maude
+   `search` on 2–3-principal fixtures, not universal proofs. The load-bearing
+   algebra was asserted in comments. Fix discipline: **machine-check the algebra**
+   (Lean), keep Maude/TLA+ for bite on concrete programs.
+3. **Test cross-product gaps.** The `attestation × report` cell was never tested.
+   Fix discipline: **a negative bite per consumer**, per trusted artifact.
+
+## Issue inventory
+
+Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
+
+### M — Verification method
+- **M1 — Algebra only asserted.** Preorder, closure correctness, label semilattice,
+  non-interference, NMIF were comments, not proofs. **PARTIAL** — Lean now proves
+  the acts-for preorder, `public` bottom, `canAct` sound+complete (`canAct_iff`,
+  axioms `[propext, Quot.sound]`), the conf/integ duality, and the sticky boundary
+  (`models/lean/`). OPEN within M1: reader/writer **sets** → semilattice, NMIF,
+  non-interference-relative-to-policy as a theorem, and an **agreement** result
+  that our `canAct` instantiates the published asymmetric-delegation order.
+- **M2 — Maude models are single-consumer.** No model has multiple consumers of a
+  trusted artifact; `subworkflow-attestation` models only the enforce path, not the
+  report/guarantee path, so it could not bite this bug. **OPEN** — add a
+  second-consumer bite (an un-gated consumer is caught).
+- **M3 — No IFC TLA+/Veil.** Durable label carriage (I-IFC7), envelope versioning /
+  non-retroactivity (D4), replay-stability are temporal/distributed and unmodeled.
+  **OPEN.**
+- **M4 — Cross-product test discipline.** Institute "negative bite per consumer per
+  trusted artifact" as a standing rule. **OPEN (process).**
+
+### P — Invariant phrasing (path → artifact)
+- **P1 — Attestation/G4 phrased per-consumer.** "The whip agent only enforces"
+  permits other consumers to skip verify. **PARTIAL** — Lean `Verified` boundary
+  proves all consumers gate by construction; OPEN: re-phrase DR-0028 G-invariants
+  over the artifact, and land the Rust `VerifiedEnvelope` boundary type.
+- **P2 — I-IFC3 scoped to downgrades only.** Non-downgrade paths are implicitly
+  uncovered by its wording. **OPEN** — review/rephrase for completeness.
+
+### E — Enforcement / implementation (plan ~40% executed)
+- **E1 — Refinement check `inline ⊑ envelope` (I-IFC4).** A whip (or package) can
+  use data at weaker labels than declared without rejection. No model, no impl.
+  **OPEN.**
+- **E2 — Five-doors boundary checklist (I-IFC8).** telemetry/logs, session-event
+  stream, human.ask not registered as boundaries = unlabeled holes. **OPEN.**
+- **E3 — Kernel runtime enforcement (Phase 4).** Envelope load+attestation at the
+  kernel, dual-gated stores/`record`, envelope versioning + run binding (D4),
+  discovery. Currently check-time only. **OPEN.**
+- **E4 — Source crossings in `.whip` grammar.** `endorsed` marker, `declassify`
+  construct, role references; the trusted surface is not visible in source for
+  review. **OPEN.**
+- **E5 — IR party-relative labels + `kind:address` resource ids.** Checker keys on
+  handle names, not stable typed resource ids. **PARTIAL/OPEN.**
+- **E6 — Reader/writer SETS.** A single role up-set per resource today; real labels
+  are sets of principals (a lattice). **OPEN** (paired with M1).
+- **E7 — Whip-agent acts-for-user binding (D3).** Only OS-privilege proxy; no
+  account scoping enforced. **OPEN.**
+
+### H — Found hands-on (beyond the audit agents)
+- **H1 — report-vs-check tamper.** **DONE (point-fix)** `report_for_envelope_text`
+  verifies first; to be **subsumed by P1** (VerifiedEnvelope).
+- **H2 — Workflow-result channel is an unmonitored sink.** `complete result` /
+  `record` returns data to the invoker (the root/parent agent) and is NOT checked —
+  reading CRM and returning it verbatim passes. **OPEN — significant.**
+- **H3 — Inbound message-trigger is not an integrity source.** `when message from`
+  untrusted data isn't modeled as a read; injection only caught from file reads.
+  **OPEN.**
+- **H4 — `endorse` crossings absent from the trusted-surface report.** Only
+  `declassify` is surfaced for audit. **OPEN (small).**
+- **H5 — Clearing a provider marks it "confidential".** A principal appears as a
+  protected resource in the report. **OPEN (cosmetic/semantic).**
+- **H6 — Diagnostic span is the whole rule.** Not the offending read/write pair.
+  **OPEN (usability).**
+- **H7 — Per-field / per-path labels.** Mixed-sensitivity stores must be split;
+  labels attach to whole resources. **DEFERRED (recorded).**
+
+### X — Cross-package governance obligations (new; see next section)
+- **X1–X8** — what packages must guarantee for governance to compose across them.
+  **OPEN (design).** Detailed below.
+
+## Cross-package governance obligations
+
+Governance soundness depends on every boundary being labeled and every consumer
+gating. A **package** is imported code that can declare resources/constructs,
+broker tools, and run rules — so an unconstrained package is exactly the
+"unmodeled door = hole" (I-IFC8) at package granularity. For governance to hold
+ACROSS a package boundary, the **package contract** must carry an
+`information_flow` obligation block, and both sides must check it:
+
+- **X1 — Effect-surface completeness (no hidden doors).** The contract enumerates
+  every resource/effect/egress (`kind:address`) and every brokered tool the package
+  can perform. The compiler verifies the package's lowered effects ⊆ its declared
+  surface. A package that can open a channel / exec / hit a URL outside its declared
+  surface is unsound.
+- **X2 — Per-tool flow signature.** Each exported `@tool`/workflow declares its
+  sources and sinks and how labels flow. **Default: an opaque join box** — every
+  output carries the join of all inputs (I-IFC2). Finer signatures are allowed ONLY
+  when compiler-verified at package build (see fork below), never merely asserted.
+- **X3 — No package-asserted authority.** Crossings (`declassify`/`endorse`) and
+  resource access require the CONSUMER's governance grant (I-IFC4). The package
+  DECLARES required crossings/authority as obligations; undeclared crossings are
+  forbidden and attested-absent.
+- **X4 — Resource parameterization.** The package's abstract resource handles are
+  bound by the consumer at import to real governed `kind:address`. A package cannot
+  self-bind to an arbitrary real resource; the binding surface is part of the
+  contract (so the consumer's governance controls what backs each handle).
+- **X5 — Attestation covers IFC.** The producer attests surface-completeness,
+  no-undeclared-crossings, and flow-signature accuracy — not just convergence
+  (extends `subworkflow-attestation`). The consumer **verifies** the attestation
+  (the `Verified` boundary) and **every** consumer (checker, report, kernel) gates.
+- **X6 — Transitive composition.** If A uses B, A's surface ⊇ B's (or B is
+  encapsulated and re-attested). The transitive closure is explicit (mirrors the
+  convergence closure already modeled).
+- **X7 — Versioning / non-retroactivity (D4 at package scope).** The contract is
+  attested at a hash/version; the consumer's approval binds to that hash. A surface
+  change forces re-attestation and re-approval; the package-lock binds the hash.
+- **X8 — Fail-closed least authority.** A package gets only consumer-granted
+  authority; ungranted access ⇒ import rejected with a routes-to-fix. The sticky
+  boundary at package granularity.
+
+Checking is **two-sided**, and is exactly `⊑` (I-IFC4) lifted to packages:
+- **Producer side:** proves the package's code stays within its declared surface
+  and performs no undeclared crossing (runs the IFC check on package internals
+  against the declared surface; the result is what the attestation covers).
+- **Consumer side:** proves the declared surface fits the consumer's governance —
+  `package-surface ⊑ consumer-envelope` — i.e. the resource bindings land on
+  governed resources and every required crossing is granted.
+
+## Plan — waves
+
+Sequenced so each wave is model-first, then impl, then test, and so the
+highest-leverage corrections (the bug class + the unproven core) go first.
+
+- **Wave 0 (DONE).** Lean foundation: preorder, `canAct_iff`, duality, sticky
+  boundary, `Verified` boundary; gate `check-lean-models.sh`.
+- **Wave 1 — Close the bug class end-to-end.** Rust `VerifiedEnvelope` boundary type
+  (P1, subsumes H1); route checker + report + future consumers through it; Maude
+  multi-consumer bite (M2); re-phrase G-invariants (P1). 
+- **Wave 2 — Close the unmonitored sinks.** Workflow-result channel (H2), inbound
+  message-trigger as integrity source (H3), the five doors (E2); each modeled then
+  checked. Small report fixes (H4, H5, H6) ride along.
+- **Wave 3 — Cross-package governance.** Ratify X1–X8 as a DR amendment to DR-0025;
+  add the `information_flow` block to `package_contract` (v1); two-sided check;
+  extend attestation + the Maude attestation model to cover IFC (ties to M2).
+- **Wave 4 — Algebra depth (Lean).** Reader/writer sets → semilattice (M1/E6), NMIF
+  (M1), non-interference-relative-to-policy (M1), agreement with published order.
+- **Wave 5 — Refinement + kernel + source crossings.** `inline ⊑ envelope` (E1),
+  kernel runtime enforcement (E3), `.whip` crossing grammar (E4), `kind:address`
+  IR labels (E5), whip-agent account binding (E7).
+- **Wave 6 — Temporal.** TLA+/Veil for durable carriage + versioning (M3).
+- **Deferred (recorded, not lost):** per-field labels (H7); QIF (out of scope).
