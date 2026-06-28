@@ -144,10 +144,9 @@ These are real gaps observed while building the examples, not hypotheticals.
    only caught when untrusted data comes from a *file* read. (These examples model
    inbound email as files for exactly this reason.)
 
-6. **`endorse` crossings are absent from the trusted-surface report.** Only
-   `declassify` grants are surfaced for audit; the integrity hatch (`endorse`,
-   raising untrusted → trusted) is invisible in the report, though it is at least
-   as risky and arguably deserves more scrutiny.
+6. ~~**`endorse` crossings are absent from the trusted-surface report.**~~ *Fixed
+   (H4):* the trusted surface now audits BOTH axes — `declassify <r> -> <role>` and
+   `endorse <r> -> <role>` — each tagged by axis.
 
 7. **Clearing a provider marks it "confidential".** Labeling a provider
    `readable by Operator` (so a turn may ship data to it) makes the provider

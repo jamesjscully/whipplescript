@@ -616,7 +616,8 @@ pub struct GovernanceReport {
     pub protected: Vec<String>,
     pub violations: usize,
     pub coverage_gaps: Vec<String>,
-    /// The audited trusted surface: each declassify grant `resource -> role`.
+    /// The audited trusted surface: each crossing, tagged by axis —
+    /// `declassify <resource> -> <role>` and `endorse <resource> -> <role>`.
     pub trusted_surface: Vec<String>,
 }
 
@@ -625,10 +626,20 @@ pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> Governa
     // protected = governed resources whose reader authority is not public.
     let mut protected: Vec<String> = envelope.readers.keys().cloned().collect();
     protected.sort();
+    // The audited trusted surface is BOTH axes' crossings: declassify (lowers
+    // confidentiality) and endorse (raises integrity). Endorse is at least as
+    // risky -- it lets less-trusted data drive a more-trusted sink -- so it must be
+    // reviewable too (H4). Each is tagged with its axis.
     let mut trusted_surface: Vec<String> = envelope
         .declassify
         .iter()
-        .map(|(resource, role)| format!("{resource} -> {role}"))
+        .map(|(resource, role)| format!("declassify {resource} -> {role}"))
+        .chain(
+            envelope
+                .endorse
+                .iter()
+                .map(|(resource, role)| format!("endorse {resource} -> {role}")),
+        )
         .collect();
     trusted_surface.sort();
     let violations = check_with_envelope(ir, verified).len();
@@ -682,9 +693,9 @@ impl GovernanceReport {
             }
         }
         if self.trusted_surface.is_empty() {
-            out.push_str("  trusted surface (declassify grants): none\n");
+            out.push_str("  trusted surface (declassify + endorse grants): none\n");
         } else {
-            out.push_str("  trusted surface (audited declassify grants to review):\n");
+            out.push_str("  trusted surface (audited declassify/endorse crossings to review):\n");
             for crossing in &self.trusted_surface {
                 out.push_str(&format!("    - {crossing}\n"));
             }
@@ -994,6 +1005,35 @@ grant channel reply -> smtp:out readable by Requester\n";
         let text = report.render();
         assert!(text.contains("protected resources"));
         assert!(text.contains("coverage gaps"));
+    }
+
+    #[test]
+    fn trusted_surface_audits_both_declassify_and_endorse() {
+        // both crossings must be reviewable: declassify (lowers confidentiality)
+        // and endorse (raises integrity). The report tags each by axis (H4).
+        let envelope = Envelope::from_dsl(
+            "grant file_store ledger -> file:/srv/ledger.db readable by Operator from Operator\n\
+             grant channel intake -> imap:in from public\n\
+             grant declassify ledger to Requester\n\
+             grant endorse intake to Operator\n",
+        )
+        .expect("valid");
+        let ir = ir_with_grants(READ_LEDGER);
+        let report = governance_report(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            report
+                .trusted_surface
+                .contains(&"declassify ledger -> Requester".to_owned()),
+            "declassify crossing should be audited: {:?}",
+            report.trusted_surface
+        );
+        assert!(
+            report
+                .trusted_surface
+                .contains(&"endorse intake -> Operator".to_owned()),
+            "endorse crossing should be audited too (H4): {:?}",
+            report.trusted_surface
+        );
     }
 
     #[test]
