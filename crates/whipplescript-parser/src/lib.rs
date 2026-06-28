@@ -7355,7 +7355,12 @@ fn parse_terminal_pattern_parts(pattern: &str) -> (Option<String>, Option<String
     }
     let mut parts = pattern.split_whitespace();
     let tag = parts.next().map(str::to_owned);
-    let binding = parts.next().map(str::to_owned);
+    // Accept both `Tag binding` and `Tag as binding`.
+    let second = parts.next();
+    let binding = match second {
+        Some("as") => parts.next().map(str::to_owned),
+        other => other.map(str::to_owned),
+    };
     if parts.next().is_some() {
         return (tag, None);
     }
@@ -9911,7 +9916,13 @@ fn validate_terminal_case_pattern(
     let Some(tag) = parts.next() else {
         return;
     };
-    let binding = parts.next();
+    // Accept both `Tag binding` and `Tag as binding` (the `as` form aligns terminal
+    // cases with enum-variant case binding; Stage 1b surface unification).
+    let second = parts.next();
+    let binding = match second {
+        Some("as") => parts.next(),
+        other => other,
+    };
     if parts.next().is_some() || binding.is_none() {
         diagnostics.push(Diagnostic { related: Vec::new(),
             span,
@@ -9919,7 +9930,7 @@ fn validate_terminal_case_pattern(
                 "rule `{}` has malformed terminal-output case pattern `{pattern}`",
                 rule.name.name
             ),
-            suggestion: Some("write `Completed result`, `Failed failure`, `TimedOut timeout`, or `Cancelled cancel`".to_owned()),
+            suggestion: Some("write `Completed as result`, `Failed as failure`, `TimedOut as timeout`, or `Cancelled as cancel`".to_owned()),
         });
         return;
     }
@@ -20857,6 +20868,52 @@ rule classify
           branch "cancelled"
           detail cancel.summary
         }
+      }
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn accepts_terminal_output_case_as_binding_form() {
+        // `Completed as result` is accepted alongside the space form `Completed result`
+        // and binds/narrows identically (Stage 1b surface unification).
+        let source = r#"
+workflow T
+
+class WorkItem { title string }
+class MessageClassification { summary string }
+class Routed {
+  branch string
+  detail string
+}
+
+coerce classifyMessage(title string) -> MessageClassification {
+  prompt "Classify"
+}
+
+rule classify
+  when WorkItem as item
+=> {
+  coerce classifyMessage(item.title) as classification
+
+  after classification completes {
+    case classification {
+      Completed as result => {
+        record Routed { branch "completed" detail result.summary }
+      }
+      Failed as failure => {
+        record Routed { branch "failed" detail failure.reason }
+      }
+      TimedOut as timeout => {
+        record Routed { branch "timed_out" detail timeout.summary }
+      }
+      Cancelled as cancel => {
+        record Routed { branch "cancelled" detail cancel.summary }
       }
     }
   }
