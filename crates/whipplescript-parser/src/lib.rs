@@ -9811,6 +9811,7 @@ fn validate_terminal_case_coverage(
     branches: &[SpanCaseBranchHead<'_>],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    validate_unreachable_after_fallback(rule, branches, diagnostics);
     if branches.is_empty()
         || branches
             .iter()
@@ -9880,6 +9881,7 @@ fn validate_case_coverage(
     semantic: &SemanticContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    validate_unreachable_after_fallback(rule, branches, diagnostics);
     if branches.is_empty()
         || branches
             .iter()
@@ -9940,6 +9942,44 @@ fn validate_duplicate_case_patterns(
                         .to_owned(),
                 ),
             });
+        }
+    }
+}
+
+/// Flags case branches that can never be reached because an earlier *unguarded*
+/// wildcard (`_`/`default`) already matches everything. Shared by rule cases and
+/// terminal-output cases. Mirrors case-family.maude inv c (redundant-postwild): any
+/// arm after the wildcard is redundant. A *guarded* fallback (`_ where g`) does not
+/// shadow, since its guard can fail at runtime.
+fn validate_unreachable_after_fallback(
+    rule: &RuleDecl,
+    branches: &[SpanCaseBranchHead<'_>],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut ordered: Vec<&SpanCaseBranchHead<'_>> = branches.iter().collect();
+    ordered.sort_by_key(|branch| branch.pattern_span.start);
+    let mut fallback_span: Option<SourceSpan> = None;
+    for branch in ordered {
+        if let Some(prior) = fallback_span {
+            diagnostics.push(
+                Diagnostic {
+                    related: Vec::new(),
+                    span: branch.pattern_span,
+                    message: format!(
+                        "rule `{}` has an unreachable case branch after the `_` wildcard",
+                        rule.name.name
+                    ),
+                    suggestion: Some(
+                        "move this branch before the wildcard, or remove it".to_owned(),
+                    ),
+                }
+                .with_related(
+                    prior,
+                    "this unguarded wildcard already matches every remaining value",
+                ),
+            );
+        } else if branch.guard.is_none() && is_fallback_pattern(branch.pattern) {
+            fallback_span = Some(branch.pattern_span);
         }
     }
 }
@@ -20961,6 +21001,47 @@ rule route
         let compiled = compile_program(source);
         assert_eq!(compiled.diagnostics, Vec::new());
         assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn rejects_unreachable_case_branch_after_wildcard() {
+        // A branch placed after an unguarded `_` can never match (case-family.maude
+        // inv c, redundant-postwild).
+        let source = r#"
+workflow CaseUnreachableGuess
+
+enum ReviewStatus {
+  Accept
+  Revise
+  Blocked
+}
+
+class Review {
+  status ReviewStatus
+}
+
+rule route
+  when Review as review
+=> {
+  case review.status {
+    Accept => {
+    }
+    _ => {
+    }
+    Revise => {
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("unreachable case branch after the `_` wildcard")),
+            "expected unreachable-after-wildcard diagnostic: {:?}",
+            compiled.diagnostics
+        );
     }
 
     #[test]
