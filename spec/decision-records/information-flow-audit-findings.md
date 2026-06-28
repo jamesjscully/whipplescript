@@ -202,16 +202,17 @@ highest-leverage corrections (the bug class + the unproven core) go first.
   principals tracked (H5), rule-span accepted by design (H6). REMAINING from Wave 2:
   the `complete result`→invoker channel (H2 second half), folded into Wave 3 (it
   overlaps the cross-package `@tool` result).
-- **Wave 3 — Cross-package governance.** *Design + model DONE 2026-06-27:*
-  `infoflow-package.maude` (two-sided check, X1–X8, bite-tested); **DR-0029**;
-  the `information_flow` block in `package_contract_v0` (non-breaking, `flow=join_box`).
-  *Impl primitive DONE:* `ifc::ifc_surface(ir)` (the X1 surface), shown in the
-  guarantee report. *Producer side DONE:* the package contract now emits the
-  attested `information_flow` block (surface/flow/ifc_attested) per `@tool`,
-  computed from its lowered effects (verified e2e on toolkit.json, schema-valid).
-  *REMAINING:* the consumer-side `surface ⊑ envelope` + `required_crossings granted`
-  check during `whip check` of an importing whip (read imported contracts' surfaces
-  and verify against the consumer envelope).
+- **Wave 3 (DONE 2026-06-27) — Cross-package governance, end to end.**
+  `infoflow-package.maude` (two-sided check, X1–X8, bite-tested); **DR-0029**; the
+  `information_flow` block in `package_contract_v0` (`flow=join_box`); `ifc_surface`
+  (X1, in the guarantee report); **producer** attests the surface in the contract
+  (schema-valid e2e on toolkit.json); **consumer** `check_imported_tool_surfaces`
+  rejects an imported `@tool` whose surface opens a door the envelope does not
+  govern (X1/X8), with unit + e2e tests. The loop is closed: producer attests →
+  consumer checks surface ⊑ envelope. *Deferred refinements:* `required_crossings`
+  granting (X3) and resource-param binding (X4) are surfaced in the contract but the
+  consumer check is surface-coverage v0; trust the attested surface vs recompute
+  (X5 optimization) is a later step.
 - **Wave 4 — Algebra depth (Lean).** *Started:* flow-composition soundness proven
   (`flow_conf_trans`/`flow_integ_trans` — pipelines compose). *REMAINING:*
   reader/writer sets → semilattice (M1/E6), NMIF (M1),
