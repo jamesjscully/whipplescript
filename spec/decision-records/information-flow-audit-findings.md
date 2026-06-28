@@ -89,8 +89,24 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   `.ir` goldens a one-command-blessable gate (`scripts/regen-ir-goldens.sh`).
   *v0 is auditability:* authorization still lives in governance `grant endorse`/
   `declassify`; requiring the source marker for injection/leak clearing is v1.
-- **E5 — IR party-relative labels + `kind:address` resource ids.** Checker keys on
-  handle names, not stable typed resource ids. **PARTIAL/OPEN.**
+  **Cross-link (discriminated families):** now that source crossings exist, the
+  *selector doctrine* — a `case` discriminant is the selector for an in-arm crossing,
+  subject to NMIF — is activatable as soon as `case`/narrowing lands. Its combined
+  test lives at `case ∩ (endorsed/declassified)`; the discriminated-families DR §7.2
+  makes wiring it (discriminant → NMIF selector) + a Maude bite a Phase-1 capstone.
+  See `discriminated-families-design.md` §5.6 / §5.9 / §7.2.
+- **E5 — `kind:address` resource ids.** **DONE (2026-06-28).** *Binding-model
+  decision:* the governance grant `<kind> <handle> -> <kind:address> <label>` IS the
+  binding — the `kind:address` is the canonical identity, the handle is the
+  whip-facing name, the whip's local `root`/`destination` is just dev backing. The
+  checker resolves every resource to its address (`Envelope.address_of` + `resolve()`)
+  and keys all labels/reasoning/reporting by address. Two handles bound to the same
+  real resource share its label; the report shows `file:/srv/crm.db`, not `crm`;
+  unbound resources are their own identity; whips stay portable. Canonical JSON gains
+  a `bindings` map (signed envelopes round-trip; fixed `gov.rs` to sign/verify the
+  full content, not just `resources`). **This is also the cross-package X4 binding
+  model** — so X4 (resource parameterization) is unblocked by the same mechanism.
+  *Not the "blocked" item I claimed:* it was an unmade design decision, now made.
 - **E6 — Reader/writer SETS.** A single role up-set per resource today; real labels
   are sets of principals (a lattice). **OPEN** (paired with M1).
 - **E7 — Whip-agent acts-for-user binding (D3).** Only OS-privilege proxy; no
