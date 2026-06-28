@@ -202,9 +202,12 @@ highest-leverage corrections (the bug class + the unproven core) go first.
   principals tracked (H5), rule-span accepted by design (H6). REMAINING from Wave 2:
   the `complete result`→invoker channel (H2 second half), folded into Wave 3 (it
   overlaps the cross-package `@tool` result).
-- **Wave 3 — Cross-package governance.** Ratify X1–X8 as a DR amendment to DR-0025;
-  add the `information_flow` block to `package_contract` (v1); two-sided check;
-  extend attestation + the Maude attestation model to cover IFC (ties to M2).
+- **Wave 3 — Cross-package governance.** *Design + model DONE 2026-06-27:*
+  `infoflow-package.maude` (two-sided check, X1–X8, bite-tested); **DR-0029**;
+  the `information_flow` block in `package_contract_v0` (non-breaking, `flow=join_box`).
+  *REMAINING (impl):* producer-side surface computation + IFC attestation during
+  package compile, and the consumer-side `surface ⊑ envelope` check during
+  `whip check` of an importing whip.
 - **Wave 4 — Algebra depth (Lean).** Reader/writer sets → semilattice (M1/E6), NMIF
   (M1), non-interference-relative-to-policy (M1), agreement with published order.
 - **Wave 5 — Refinement + kernel + source crossings.** `inline ⊑ envelope` (E1),
