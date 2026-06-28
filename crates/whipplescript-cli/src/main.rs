@@ -2662,7 +2662,12 @@ fn check(options: &CliOptions) -> ExitCode {
                         eprint!("{report}");
                     }
                 }
-                let ifc_diagnostics = ifc::check_ifc_program(&ir);
+                let mut ifc_diagnostics = ifc::check_ifc_program(&ir);
+                // Consumer-side cross-package check (DR-0029): each imported @tool's
+                // IFC surface must be governed by the consumer envelope.
+                ifc_diagnostics.extend(ifc::check_imported_tool_surfaces(&imported_tool_surfaces(
+                    package_lock.as_ref(),
+                )));
                 if !ifc_diagnostics.is_empty() {
                     failed = true;
                     if options.json {
@@ -3604,6 +3609,24 @@ fn package_contract_json_from_manifests(
 /// outgoing invoke-tool edges. v1 `@tool` workflows are leaves, so `invokes` is
 /// always empty — the field is reserved for the deferred nested-composition
 /// acyclicity check. A consumer reads this to check a grant without the source.
+/// Each imported `@tool`'s name + computed IFC surface, for the consumer-side
+/// cross-package check (DR-0029). Recomputed from the tool source the lock pins.
+fn imported_tool_surfaces(package_lock: Option<&LoadedPackageLock>) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    if let Some(lock) = package_lock {
+        for manifest in &lock.manifests {
+            for tool in &manifest.workflow_tools {
+                if let Ok(source) = std::fs::read_to_string(&tool.source) {
+                    if let Some(tool_ir) = whipplescript_parser::compile_program(&source).ir {
+                        out.push((tool.name.clone(), ifc::ifc_surface(&tool_ir)));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 fn package_workflow_tool_attestations_json(manifests: &[PackageManifest]) -> Vec<Value> {
     let mut attestations = Vec::new();
     for manifest in manifests {

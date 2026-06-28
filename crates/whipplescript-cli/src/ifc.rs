@@ -493,6 +493,55 @@ pub fn check_ifc_program(ir: &IrProgram) -> Vec<Diagnostic> {
     }
 }
 
+/// The consumer-side cross-package check (DR-0029 X1/X8). For each imported `@tool`
+/// (its name + declared IFC surface), every surface element must be GOVERNED by the
+/// consumer's envelope — an ungoverned element is a door the consumer's governance
+/// cannot see, so the import is flagged fail-closed. Only applies under a governed,
+/// verified envelope (dev mode imposes nothing).
+pub fn check_imported_tool_surfaces(imported: &[(String, Vec<String>)]) -> Vec<Diagnostic> {
+    let EnvelopeStatus::Verified(verified) = VerifiedEnvelope::load_from_env() else {
+        return Vec::new();
+    };
+    imported_surface_gaps(imported, &verified)
+        .into_iter()
+        .map(|(tool, doors)| Diagnostic {
+            span: whipplescript_parser::SourceSpan { start: 0, end: 0 },
+            message: format!(
+                "cross-package information-flow violation: imported tool `{tool}` opens doors the \
+                 governance does not cover: {} — the consumer cannot see into the package, so an \
+                 ungoverned door is fail-closed (DR-0029 X1/X8)",
+                doors.join(", ")
+            ),
+            suggestion: Some(format!(
+                "govern these resources in the envelope (or bind them as resource params), or do \
+                 not import `{tool}`"
+            )),
+            related: Vec::new(),
+        })
+        .collect()
+}
+
+/// Core of the consumer cross-package check: for each imported tool, the surface
+/// elements NOT governed by the consumer envelope. Testable without env.
+fn imported_surface_gaps<'a>(
+    imported: &'a [(String, Vec<String>)],
+    verified: &VerifiedEnvelope,
+) -> Vec<(&'a str, Vec<&'a str>)> {
+    let envelope = verified.envelope();
+    let mut gaps = Vec::new();
+    for (tool, surface) in imported {
+        let ungoverned: Vec<&str> = surface
+            .iter()
+            .map(String::as_str)
+            .filter(|door| !envelope.governed.contains(*door))
+            .collect();
+        if !ungoverned.is_empty() {
+            gaps.push((tool.as_str(), ungoverned));
+        }
+    }
+    gaps
+}
+
 /// The turn-level join-box check: for a turn that reads resource `src` and writes
 /// resource `sink`, flag the pair when data from `src` may leak to a reader of
 /// `sink` not cleared for `src` (party-relative, via the acts-for closure).
@@ -1351,6 +1400,33 @@ rule finish
             "record of confidential-derived fact should leak to the fact-base, got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn imported_tool_surface_must_be_governed() {
+        // an imported @tool's surface must be covered by the consumer envelope; an
+        // ungoverned door is flagged fail-closed (DR-0029 X1/X8).
+        let envelope =
+            Envelope::from_json(r#"{ "resources": { "crm": { "reader": "Operator" } } }"#)
+                .expect("valid");
+        let verified = VerifiedEnvelope::for_test(envelope);
+        let imported = vec![
+            ("ToolA".to_owned(), vec!["crm".to_owned()]),
+            (
+                "ToolB".to_owned(),
+                vec!["crm".to_owned(), "secret_db".to_owned()],
+            ),
+        ];
+        let gaps = imported_surface_gaps(&imported, &verified);
+        assert!(
+            !gaps.iter().any(|(tool, _)| *tool == "ToolA"),
+            "a fully-governed tool surface has no gap: {gaps:?}"
+        );
+        let tool_b = gaps
+            .iter()
+            .find(|(tool, _)| *tool == "ToolB")
+            .expect("ToolB opens an ungoverned door");
+        assert_eq!(tool_b.1, vec!["secret_db"]);
     }
 
     #[test]

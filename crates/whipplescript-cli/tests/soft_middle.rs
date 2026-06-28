@@ -3148,6 +3148,149 @@ const IFC_ENVELOPE: &str = r#"{ "resources": {
   "outbox": { "confidential": false }
 } }"#;
 
+const XPKG_TOOL: &str = r#"@tool
+workflow LeakyTool
+output result R
+class R { ok bool }
+input request Q
+class Q { path string }
+file store secretz { root "./s"  allow read ["**"] }
+rule go
+  when started
+=> {
+  read text from secretz at "x" as loaded
+  after loaded succeeds as f { complete result { ok true } }
+}
+"#;
+
+const XPKG_MANIFEST: &str = r#"{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "package-leaky",
+  "name": "leaky",
+  "version": "0.1.0",
+  "workflow_tools": [ { "name": "LeakyTool", "source": "leaky-tool.whip" } ]
+}
+"#;
+
+const XPKG_CONSUMER: &str = r#"use leaky
+
+workflow ConsumerFlow {
+  input request ConsumerRequest
+  output result ConsumerResult
+  class ConsumerRequest { task string }
+  class ConsumerResult { summary string }
+
+  agent worker {
+    provider fixture
+    profile "p"
+    capacity 1
+    tools [LeakyTool]
+  }
+
+  rule dispatch
+    when ConsumerRequest as request
+    when worker is available
+  => {
+    tell worker as turn "Do: {{ request.task }}"
+    after turn succeeds {
+      done request
+      complete result { summary turn.summary }
+    }
+  }
+}
+"#;
+
+/// End-to-end cross-package IFC (DR-0029, Wave 3): a consuming whip imports a
+/// `@tool` whose surface opens a door (`secretz`) the consumer's governance does
+/// not cover, so `whip check` rejects the import fail-closed (X1/X8); governing the
+/// door clears it.
+#[test]
+fn ifc_cross_package_rejects_imported_tool_with_ungoverned_surface() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = std::env::temp_dir().join(format!(
+        "whip-xpkg-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).expect("mkdir");
+    let tool = dir.join("leaky-tool.whip");
+    let manifest = dir.join("leaky-toolkit.json");
+    let consumer = dir.join("consumer.whip");
+    let lock = dir.join("lock.json");
+    let envelope = dir.join("env.policy");
+    fs::write(&tool, XPKG_TOOL).expect("tool");
+    fs::write(&manifest, XPKG_MANIFEST).expect("manifest");
+    fs::write(&consumer, XPKG_CONSUMER).expect("consumer");
+    fs::write(
+        &envelope,
+        "grant file_store crm -> file:/srv/crm readable by Operator\n",
+    )
+    .expect("env");
+
+    let lock_out = Command::new(bin)
+        .args([
+            "package",
+            "lock",
+            "--output",
+            lock.to_str().expect("utf-8"),
+            manifest.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("lock runs");
+    assert!(
+        lock_out.status.success(),
+        "lock failed:\n{}",
+        String::from_utf8_lossy(&lock_out.stderr)
+    );
+
+    // governed, but `secretz` is uncovered -> cross-package violation.
+    let governed = Command::new(bin)
+        .args([
+            "check",
+            consumer.to_str().expect("utf-8"),
+            "--package-lock",
+            lock.to_str().expect("utf-8"),
+        ])
+        .env("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope)
+        .output()
+        .expect("check runs");
+    let stderr = String::from_utf8_lossy(&governed.stderr);
+    assert!(
+        !governed.status.success()
+            && stderr.contains("cross-package information-flow violation")
+            && stderr.contains("secretz"),
+        "expected a cross-package violation naming secretz\nstderr:\n{stderr}"
+    );
+
+    // govern `secretz` -> the import clears.
+    fs::write(
+        &envelope,
+        "grant file_store crm -> file:/srv/crm readable by Operator\n\
+         grant file_store secretz -> file:/srv/s readable by Operator\n",
+    )
+    .expect("env2");
+    let cleared = Command::new(bin)
+        .args([
+            "check",
+            consumer.to_str().expect("utf-8"),
+            "--package-lock",
+            lock.to_str().expect("utf-8"),
+        ])
+        .env("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope)
+        .output()
+        .expect("check runs");
+    let cleared_stderr = String::from_utf8_lossy(&cleared.stderr);
+    assert!(
+        !cleared_stderr.contains("cross-package"),
+        "governing secretz should clear the cross-package violation\nstderr:\n{cleared_stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// End-to-end: with a governance envelope a turn that reads a confidential
 /// resource and writes an un-cleared one is rejected by `whip check`; without the
 /// envelope the same whip passes (the gradual / dev mode).
