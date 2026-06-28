@@ -74,6 +74,7 @@ mod coerce_runtime;
 mod gov;
 mod harness_tools;
 mod ifc;
+mod principal;
 
 const CORE_EFFECT_LOWERING_CLASS: &str = "core_effect";
 const SCHEDULE_LOWERING_CLASS: &str = "schedule_emitter";

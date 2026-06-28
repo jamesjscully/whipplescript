@@ -56,6 +56,11 @@ pub struct Envelope {
     /// its label and the stable typed identity — not the script name — is what
     /// governance reasons about. A handle with no binding resolves to itself.
     address_of: BTreeMap<String, String>,
+    /// runtime identity -> acts-for role (DR-0031, the `party <id> : <Role>` map).
+    /// The agent serving a principal acts-for that principal's role, and no further:
+    /// the role is the agent's authority ceiling (D3). An identity with no party
+    /// entry is the public bottom (fail-closed). Empty = no per-user scoping declared.
+    party_of: BTreeMap<String, String>,
 }
 
 impl Envelope {
@@ -66,6 +71,20 @@ impl Envelope {
             .get(handle)
             .map(String::as_str)
             .unwrap_or(handle)
+    }
+
+    /// Whether governance declared any party (opted into per-user identity scoping).
+    fn has_parties(&self) -> bool {
+        !self.party_of.is_empty()
+    }
+
+    /// The acts-for role a principal holds; the public bottom if unmapped (an unknown
+    /// principal is cleared for nothing, fail-closed).
+    fn role_for_principal(&self, principal: &str) -> &str {
+        self.party_of
+            .get(principal)
+            .map(String::as_str)
+            .unwrap_or(PUBLIC)
     }
 }
 
@@ -84,12 +103,21 @@ impl Envelope {
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
         let mut address_of = BTreeMap::new();
+        let mut party_of = BTreeMap::new();
         // a signed/canonical envelope carries the handle -> address bindings; a
         // hand-written JSON without them treats each resource key as its own address.
         if let Some(map) = value.get("bindings").and_then(|b| b.as_object()) {
             for (handle, address) in map {
                 if let Some(address) = address.as_str() {
                     address_of.insert(handle.clone(), address.to_owned());
+                }
+            }
+        }
+        // identity -> role parties (DR-0031), round-tripped through the signed artifact.
+        if let Some(map) = value.get("parties").and_then(|p| p.as_object()) {
+            for (identity, role) in map {
+                if let Some(role) = role.as_str() {
+                    party_of.insert(identity.clone(), role.to_owned());
                 }
             }
         }
@@ -166,6 +194,7 @@ impl Envelope {
             endorse,
             principals,
             address_of,
+            party_of,
         })
     }
 
@@ -183,6 +212,7 @@ impl Envelope {
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
         let mut address_of: BTreeMap<String, String> = BTreeMap::new();
+        let mut party_of: BTreeMap<String, String> = BTreeMap::new();
         for (index, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -215,7 +245,19 @@ impl Envelope {
                 continue;
             }
             match tokens.first().copied() {
-                Some("party") => continue,
+                // `party <identity> : <Role>` binds a runtime identity to an acts-for
+                // role (DR-0031). The identity is whatever the principal seam asserts
+                // (an OS user, a launcher-passed id); the role becomes its ceiling.
+                Some("party") => {
+                    if let Some(colon) = tokens.iter().position(|tok| *tok == ":") {
+                        if colon >= 2 {
+                            if let Some(role) = tokens.get(colon + 1) {
+                                party_of.insert(tokens[1].to_owned(), (*role).to_owned());
+                            }
+                        }
+                    }
+                    continue;
+                }
                 Some("delegate") => {
                     let Some(pos) = tokens.iter().position(|tok| *tok == "acts-for") else {
                         return Err(format!("line {}: delegate needs `acts-for`", index + 1));
@@ -281,6 +323,7 @@ impl Envelope {
             endorse,
             principals,
             address_of,
+            party_of,
         })
     }
 
@@ -323,9 +366,15 @@ impl Envelope {
             .iter()
             .map(|(handle, address)| (handle.clone(), serde_json::Value::String(address.clone())))
             .collect();
+        let parties: serde_json::Map<String, serde_json::Value> = self
+            .party_of
+            .iter()
+            .map(|(identity, role)| (identity.clone(), serde_json::Value::String(role.clone())))
+            .collect();
         serde_json::json!({
             "resources": resources,
             "bindings": bindings,
+            "parties": parties,
             "delegations": delegations,
             "declassifications": declassifications,
             "endorsements": endorsements,
@@ -532,7 +581,25 @@ pub fn check_ifc_program(ir: &IrProgram) -> Vec<Diagnostic> {
             ),
             related: Vec::new(),
         }],
-        EnvelopeStatus::Verified(verified) => check_with_envelope(ir, &verified),
+        EnvelopeStatus::Verified(verified) => {
+            let mut diagnostics = check_with_envelope(ir, &verified);
+            // Principal ceiling (DR-0031 / D3): if governance declared parties, the
+            // agent acts-for the role of the principal the environment asserts, and
+            // may not read beyond that clearance. An unknown principal is the public
+            // bottom (fail-closed).
+            if verified.envelope().has_parties() {
+                let role: String = crate::principal::current_principal()
+                    .map(|principal| {
+                        verified
+                            .envelope()
+                            .role_for_principal(&principal)
+                            .to_owned()
+                    })
+                    .unwrap_or_else(|| PUBLIC.to_owned());
+                diagnostics.extend(check_principal_ceiling(ir, &verified, &role));
+            }
+            diagnostics
+        }
     }
 }
 
@@ -771,6 +838,69 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
                 )),
                 related: Vec::new(),
             });
+        }
+    }
+    diagnostics
+}
+
+/// The principal-ceiling check (DR-0031 / DR-0028 D3): an agent acts-for the
+/// principal it serves and no further, so every resource the program reads must be
+/// one the principal's role is cleared for — otherwise the agent would exceed the
+/// user's clearance. `principal_role` is the resolved acts-for role of the current
+/// principal (the public bottom for an unknown one). Only meaningful when governance
+/// declared parties; the caller gates on `has_parties`.
+pub fn check_principal_ceiling(
+    ir: &IrProgram,
+    verified: &VerifiedEnvelope,
+    principal_role: &str,
+) -> Vec<Diagnostic> {
+    let envelope = verified.envelope();
+    let mut diagnostics = Vec::new();
+    let mut flagged: BTreeSet<String> = BTreeSet::new();
+    for rule in &ir.rules {
+        let mut reads: Vec<(&str, whipplescript_parser::SourceSpan)> = Vec::new();
+        for effect in &rule.metadata.effects {
+            if let Some(resource) = &effect.resource {
+                if matches!(
+                    effect.kind,
+                    IrEffectKind::FileRead | IrEffectKind::FileImport
+                ) {
+                    reads.push((resource.as_str(), effect.span));
+                }
+            }
+            for grant in &effect.access_grants {
+                if grant.operations.iter().any(|op| is_read_op(&op.operation)) {
+                    reads.push((grant.resource.as_str(), effect.span));
+                }
+            }
+        }
+        for when in &rule.whens {
+            if let Some(rest) = when.pattern.trim_start().strip_prefix("message from ") {
+                if let Some(channel) = rest.split_whitespace().next() {
+                    reads.push((channel, when.span));
+                }
+            }
+        }
+        for (src, span) in reads {
+            let required = envelope.reader_authority(src);
+            if !envelope.can_act(principal_role, required)
+                && flagged.insert(format!("{}:{src}", rule.name))
+            {
+                diagnostics.push(Diagnostic {
+                    span,
+                    message: format!(
+                        "identity-ceiling violation in rule `{rule}`: the agent acts-for \
+                         `{principal_role}` but reads `{src}` (readable by {required}), exceeding the \
+                         user's clearance (DR-0028 D3)",
+                        rule = rule.name,
+                    ),
+                    suggestion: Some(format!(
+                        "the principal role `{principal_role}` is not cleared for `{src}`; serve a user \
+                         whose role acts-for {required}, or do not read `{src}`"
+                    )),
+                    related: Vec::new(),
+                });
+            }
         }
     }
     diagnostics
@@ -1568,6 +1698,40 @@ rule triage
                 .any(|c| c.contains("endorsed (source)") && c.contains("triage")),
             "source endorse should be surfaced: {:?}",
             report.trusted_surface
+        );
+    }
+
+    #[test]
+    fn principal_ceiling_caps_reads_to_the_users_clearance() {
+        // ledger is Operator-readable; an agent acting-for Requester (who does not
+        // act-for Operator) may not read it — exceeding the user's clearance (D3).
+        let env = Envelope::from_dsl(
+            "grant file_store ledger -> file:/srv/ledger.db readable by Operator\n\
+             party alice : Operator\n\
+             party bob : Requester\n",
+        )
+        .expect("valid");
+        assert!(env.has_parties());
+        assert_eq!(env.role_for_principal("bob"), "Requester");
+        // an unknown principal is the public bottom (fail-closed).
+        assert_eq!(env.role_for_principal("mallory"), "public");
+        let ir = ir_with_grants(READ_LEDGER);
+        let verified = VerifiedEnvelope::for_test(env);
+        // Requester is capped — refused the Operator read.
+        let requester = check_principal_ceiling(&ir, &verified, "Requester");
+        assert!(
+            requester
+                .iter()
+                .any(|d| d.message.contains("identity-ceiling") && d.message.contains("ledger")),
+            "Requester should be capped: {:?}",
+            requester.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        // Operator is cleared — no ceiling violation.
+        let operator = check_principal_ceiling(&ir, &verified, "Operator");
+        assert!(
+            operator.is_empty(),
+            "Operator should be cleared: {:?}",
+            operator.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 

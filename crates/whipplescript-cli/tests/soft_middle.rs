@@ -3200,6 +3200,68 @@ workflow ConsumerFlow {
 }
 "#;
 
+const IFC_CEILING_WHIP: &str = r#"@service
+workflow CeilingDemo
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+file store crm { root "./crm"  allow read ["**"] }
+table seed as Ticket [ { id "T1"  status "open" } ]
+rule review
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from crm at "c.json" as rec
+  after rec succeeds as r { complete result { ok true } }
+}
+"#;
+
+const IFC_CEILING_POLICY: &str = "\
+grant file_store crm -> file:/srv/crm.db readable by Operator from Operator\n\
+party alice@acme.com : Operator\n\
+party bob@acme.com : Requester\n";
+
+/// Identity boundary (DR-0031 / D3): the agent acts-for the principal the
+/// environment asserts (`WHIPPLESCRIPT_PRINCIPAL`, the launcher backend) and no
+/// further — a low-clearance principal is refused a read it is not cleared for; a
+/// cleared principal is allowed.
+#[test]
+fn ifc_principal_ceiling_caps_an_agent_to_the_users_clearance() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let whip = temp_path("ifc-prin-whip", "whip");
+    let envelope = temp_path("ifc-prin-env", "policy");
+    fs::write(&whip, IFC_CEILING_WHIP).expect("write whip");
+    fs::write(&envelope, IFC_CEILING_POLICY).expect("write envelope");
+
+    // a low-clearance principal (Requester) reading Operator data is refused.
+    let bob = Command::new(bin)
+        .args(["check", whip.to_str().expect("utf-8")])
+        .env("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope)
+        .env("WHIPPLESCRIPT_PRINCIPAL", "bob@acme.com")
+        .output()
+        .expect("command runs");
+    let bob_err = String::from_utf8_lossy(&bob.stderr);
+    assert!(
+        !bob.status.success() && bob_err.contains("identity-ceiling"),
+        "a Requester principal should be capped below Operator data\nstderr:\n{bob_err}"
+    );
+
+    // the cleared principal (Operator) is allowed.
+    let alice = Command::new(bin)
+        .args(["check", whip.to_str().expect("utf-8")])
+        .env("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope)
+        .env("WHIPPLESCRIPT_PRINCIPAL", "alice@acme.com")
+        .output()
+        .expect("command runs");
+    let alice_err = String::from_utf8_lossy(&alice.stderr);
+    assert!(
+        !alice_err.contains("identity-ceiling"),
+        "an Operator principal should be cleared\nstderr:\n{alice_err}"
+    );
+
+    let _ = fs::remove_file(&whip);
+    let _ = fs::remove_file(&envelope);
+}
+
 /// Runtime IFC admission (E3): `whip dev` refuses to RUN a whip that violates
 /// information flow under a governed envelope, before any side effect — enforcement
 /// at run time, not only at `whip check` time.
