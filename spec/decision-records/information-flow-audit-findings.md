@@ -41,7 +41,12 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   the No-solution to a Solution).
 - **M3 — No IFC TLA+/Veil.** Durable label carriage (I-IFC7), envelope versioning /
   non-retroactivity (D4), replay-stability are temporal/distributed and unmodeled.
-  **OPEN.**
+  **PARTIAL** — first IFC TLA+ model landed 2026-06-28:
+  `models/tla/InfoflowReleaseBudget.tla` (DR-0030 Direction C) checks the
+  release-budget-over-all-traces invariant and the no-adaptive-oracle selector-
+  provenance invariant (both bite-verified) under Apalache in `check-tla-models.sh`.
+  Still OPEN: I-IFC7 carriage temporal, D4 versioning/non-retroactivity, replay-
+  stability, and Veil (a planned stub, not yet a live gate).
 - **M4 — Cross-product test discipline.** Institute "negative bite per consumer per
   trusted artifact" as a standing rule. **OPEN (process).**
 
@@ -109,8 +114,16 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   *Not the "blocked" item I claimed:* it was an unmade design decision, now made.
 - **E6 — Reader/writer SETS.** A single role up-set per resource today; real labels
   are sets of principals (a lattice). **OPEN** (paired with M1).
-- **E7 — Whip-agent acts-for-user binding (D3).** Only OS-privilege proxy; no
-  account scoping enforced. **OPEN.**
+- **E7 — Whip-agent acts-for-user binding (D3).** **DESIGN LOCKED — DR-0031 (the
+  identity boundary).** Resolution: WhippleScript *consumes* an identity assertion
+  and never authenticates one. Three layers — identity (enterprise: OS login/SSO),
+  access control (OS/ACLs), flow control (WhippleScript) — that compose. A narrow
+  `current_principal()` seam with pluggable backends (**`os`** default,
+  **`env`**/launcher now, **`token`**/OIDC future) feeds the already-parsed
+  `party <id> : <Role>` map; the resolved role is the agent's authority ceiling.
+  Enforcement is built for real; only the identity *source* is pluggable. **IMPL
+  OPEN:** the `principal` module + `os`/`env` backends + the role-ceiling check
+  (DR-0031 implementation sketch).
 
 ### H — Found hands-on (beyond the audit agents)
 - **H1 — report-vs-check tamper.** **DONE (Wave 1)** — subsumed by P1: the report
