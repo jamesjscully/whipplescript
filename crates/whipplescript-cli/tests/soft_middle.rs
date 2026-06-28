@@ -3200,6 +3200,43 @@ workflow ConsumerFlow {
 }
 "#;
 
+/// Runtime IFC admission (E3): `whip dev` refuses to RUN a whip that violates
+/// information flow under a governed envelope, before any side effect — enforcement
+/// at run time, not only at `whip check` time.
+#[test]
+fn ifc_runtime_admission_refuses_a_violating_whip() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let whip = temp_path("ifc-rt-whip", "whip");
+    let envelope = temp_path("ifc-rt-env", "json");
+    let store = temp_path("ifc-rt-store", "db");
+    fs::write(&whip, IFC_BAD_WHIP).expect("write whip");
+    fs::write(&envelope, IFC_ENVELOPE).expect("write envelope");
+
+    let governed = Command::new(bin)
+        .args([
+            "--store",
+            store.to_str().expect("utf-8"),
+            "dev",
+            whip.to_str().expect("utf-8"),
+            "--root",
+            "IfcCheck",
+        ])
+        .env("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope)
+        .output()
+        .expect("command runs");
+    let stderr = String::from_utf8_lossy(&governed.stderr);
+    assert!(
+        !governed.status.success()
+            && stderr.contains("refusing to run")
+            && stderr.contains("information-flow violation"),
+        "expected runtime admission to refuse the violating whip\nstderr:\n{stderr}"
+    );
+
+    let _ = fs::remove_file(&whip);
+    let _ = fs::remove_file(&envelope);
+    let _ = fs::remove_file(&store);
+}
+
 /// End-to-end cross-package IFC (DR-0029, Wave 3): a consuming whip imports a
 /// `@tool` whose surface opens a door (`secretz`) the consumer's governance does
 /// not cover, so `whip check` rejects the import fail-closed (X1/X8); governing the

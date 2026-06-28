@@ -26082,6 +26082,27 @@ fn fixture_harness(provider: &str, fail: bool) -> CommandAgentHarness {
     CommandAgentHarness::new(CommandLaunchPlan::new(provider, "sh").arg("-c").arg(script))
 }
 
+/// Runtime IFC admission (E3): compile the program and enforce the information-flow
+/// check before execution. `Ok(())` admits the run (including ungoverned dev mode,
+/// where the check is empty); `Err(exit)` refuses it after printing the violations.
+fn ifc_admission(program_path: &str, root: Option<&str>) -> Result<(), ExitCode> {
+    let (source, ir) = match compile_source_path_with_root(program_path, root) {
+        Ok(compiled) => compiled,
+        Err(error) => return Err(report_compile_failure(program_path, error)),
+    };
+    let diagnostics = ifc::check_ifc_program(&ir);
+    if diagnostics.is_empty() {
+        return Ok(());
+    }
+    for diagnostic in &diagnostics {
+        eprint!("{}", render_diagnostic(program_path, &source, diagnostic));
+    }
+    eprintln!(
+        "refusing to run `{program_path}`: information-flow violation under the governance envelope"
+    );
+    Err(ExitCode::FAILURE)
+}
+
 fn dev(options: &CliOptions) -> ExitCode {
     let dev_options = match DevOptions::parse(&options.args) {
         Ok(options) => options,
@@ -26097,6 +26118,14 @@ fn dev(options: &CliOptions) -> ExitCode {
         dev_options.script_manifest_path.as_deref(),
         options.json,
     ) {
+        return code;
+    }
+    // Runtime IFC admission (DR-0027 I-IFC6 / E3): a governed envelope is enforced at
+    // RUN time, not only at `whip check` time. Refuse to start a whip that violates
+    // information flow (its own flows, a tampered policy, or an imported tool whose
+    // surface the envelope does not govern) BEFORE any side effect. Dev mode (no
+    // envelope) admits everything.
+    if let Err(code) = ifc_admission(&dev_options.program_path, dev_options.root.as_deref()) {
         return code;
     }
     let started = match start_workflow_instance(
