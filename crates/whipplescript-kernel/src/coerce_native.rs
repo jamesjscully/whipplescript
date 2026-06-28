@@ -152,7 +152,29 @@ fn schema_for_ref(name: &str, schemas: &[IrSchema], depth: usize) -> Value {
     for schema in schemas {
         match schema {
             IrSchema::Enum(enum_decl) if enum_decl.name == name => {
-                return json!({ "type": "string", "enum": enum_decl.variants.clone() });
+                // A payload-carrying (sum-type) enum lowers each data variant to a
+                // generated class `<Enum>.<Variant>` (with a synthesized `variant`
+                // const discriminant). Emit `anyOf` over the variants so the provider
+                // can construct payloads, not just a bare variant name; a variant with
+                // no generated class (a bare tag) stays a string `const`. A fully-bare
+                // enum collapses to a single string `enum` (cleaner, widely supported).
+                let mut alternatives = Vec::with_capacity(enum_decl.variants.len());
+                let mut any_payload = false;
+                for variant in &enum_decl.variants {
+                    let class_name = format!("{}.{}", enum_decl.name, variant);
+                    match find_class_fields(&class_name, schemas) {
+                        Some(fields) => {
+                            any_payload = true;
+                            alternatives.push(object_schema(fields, schemas, depth + 1));
+                        }
+                        None => alternatives.push(json!({ "type": "string", "const": variant })),
+                    }
+                }
+                return if any_payload {
+                    json!({ "anyOf": alternatives })
+                } else {
+                    json!({ "type": "string", "enum": enum_decl.variants.clone() })
+                };
             }
             IrSchema::Class(class_decl) if class_decl.name == name => {
                 return object_schema(&class_decl.fields, schemas, depth);
@@ -163,6 +185,17 @@ fn schema_for_ref(name: &str, schemas: &[IrSchema], depth: usize) -> Value {
     // Unknown ref (e.g. a built-in): leave unconstrained rather than reject — the
     // compiler already validates references, so this is a defensive fallback.
     json!({})
+}
+
+/// Look up a class declaration's fields by name (used to resolve a sum-type enum's
+/// generated `<Enum>.<Variant>` payload classes).
+fn find_class_fields<'a>(name: &str, schemas: &'a [IrSchema]) -> Option<&'a [IrClassField]> {
+    schemas.iter().find_map(|schema| match schema {
+        IrSchema::Class(class_decl) if class_decl.name == name => {
+            Some(class_decl.fields.as_slice())
+        }
+        _ => None,
+    })
 }
 
 fn object_schema(fields: &[IrClassField], schemas: &[IrSchema], depth: usize) -> Value {
@@ -709,6 +742,74 @@ mod tests {
             "optional field is nullable"
         );
         assert_eq!(schema["properties"]["status"]["enum"][0], "Accepted");
+    }
+
+    #[test]
+    fn sum_type_enum_schema_is_anyof_of_variant_objects() {
+        // A payload-carrying enum's generated `<Enum>.<Variant>` classes must drive an
+        // anyOf of object schemas, not a string `enum` (which drops the payload — the
+        // verified latent bug). A bare variant with no class stays a string const.
+        let variant_field = |value: &str| IrClassField {
+            name: "variant".to_owned(),
+            ty: IrType::LiteralString(value.to_owned()),
+            is_key: false,
+            span: span(),
+        };
+        let payload_field = |name: &str, ty: IrType| IrClassField {
+            name: name.to_owned(),
+            ty,
+            is_key: false,
+            span: span(),
+        };
+        let schemas = vec![
+            IrSchema::Enum(IrEnum {
+                name: "ReviewOutcome".to_owned(),
+                variants: vec![
+                    "Approved".to_owned(),
+                    "Rejected".to_owned(),
+                    "Blocked".to_owned(),
+                ],
+                span: span(),
+            }),
+            IrSchema::Class(IrClass {
+                name: "ReviewOutcome.Approved".to_owned(),
+                fields: vec![
+                    variant_field("Approved"),
+                    payload_field("score", IrType::Primitive(IrPrimitiveType::Float)),
+                ],
+                span: span(),
+            }),
+            IrSchema::Class(IrClass {
+                name: "ReviewOutcome.Rejected".to_owned(),
+                fields: vec![
+                    variant_field("Rejected"),
+                    payload_field("reason", IrType::Primitive(IrPrimitiveType::String)),
+                ],
+                span: span(),
+            }),
+        ];
+        let schema = json_schema_for_type(&IrType::Ref("ReviewOutcome".to_owned()), &schemas);
+        let alts = schema["anyOf"].as_array().expect("anyOf present");
+        assert_eq!(alts.len(), 3, "one alternative per variant");
+        // The Approved payload field survives (the bug dropped it to a string enum).
+        let approved = alts
+            .iter()
+            .find(|alt| alt["properties"]["variant"]["const"] == "Approved")
+            .expect("Approved object alternative");
+        assert_eq!(approved["type"], "object");
+        assert_eq!(approved["additionalProperties"], false);
+        assert_eq!(approved["properties"]["score"]["type"], "number");
+        // The bare `Blocked` variant (no generated class) is a string const.
+        assert!(
+            alts.iter().any(|alt| alt["const"] == "Blocked"),
+            "bare variant is a string const: {alts:?}"
+        );
+
+        // A fully-bare enum still collapses to a single string `enum`.
+        let bare =
+            json_schema_for_type(&IrType::Ref("WorkStatus".to_owned()), &[work_status_enum()]);
+        assert_eq!(bare["type"], "string");
+        assert_eq!(bare["enum"][0], "Accepted");
     }
 
     #[test]
