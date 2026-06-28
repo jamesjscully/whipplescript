@@ -47,8 +47,26 @@ pub struct Envelope {
     /// handles that name a PRINCIPAL (a provider/model endpoint, a human) rather
     /// than protected data. A principal carries a clearance (so it may be a sink
     /// target), but it is not itself a secret — so it must not be listed as a
-    /// "protected resource" in the guarantee report (H5).
+    /// "protected resource" in the guarantee report (H5). Keyed by `kind:address`.
     principals: BTreeSet<String>,
+    /// whip-facing handle -> canonical `kind:address` resource identity (DR-0027
+    /// E5). A governance grant `<kind> <handle> -> <kind:address>` binds the
+    /// handle (the script-local name) to the real resource. All labels above are
+    /// keyed by the ADDRESS, so two handles bound to the same real resource share
+    /// its label and the stable typed identity — not the script name — is what
+    /// governance reasons about. A handle with no binding resolves to itself.
+    address_of: BTreeMap<String, String>,
+}
+
+impl Envelope {
+    /// Resolve a whip-facing handle to its canonical `kind:address` identity; a
+    /// handle with no governance binding is its own identity.
+    fn resolve<'a>(&'a self, handle: &'a str) -> &'a str {
+        self.address_of
+            .get(handle)
+            .map(String::as_str)
+            .unwrap_or(handle)
+    }
 }
 
 impl Envelope {
@@ -65,6 +83,16 @@ impl Envelope {
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
+        let mut address_of = BTreeMap::new();
+        // a signed/canonical envelope carries the handle -> address bindings; a
+        // hand-written JSON without them treats each resource key as its own address.
+        if let Some(map) = value.get("bindings").and_then(|b| b.as_object()) {
+            for (handle, address) in map {
+                if let Some(address) = address.as_str() {
+                    address_of.insert(handle.clone(), address.to_owned());
+                }
+            }
+        }
         if let Some(map) = value.get("resources").and_then(|res| res.as_object()) {
             for (name, label) in map {
                 governed.insert(name.clone());
@@ -137,6 +165,7 @@ impl Envelope {
             integrity,
             endorse,
             principals,
+            address_of,
         })
     }
 
@@ -153,6 +182,7 @@ impl Envelope {
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
+        let mut address_of: BTreeMap<String, String> = BTreeMap::new();
         for (index, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -215,17 +245,21 @@ impl Envelope {
                 ));
             };
             let handle = tokens[arrow - 1].to_owned();
-            governed.insert(handle.clone());
+            // the `<kind:address>` after `->` is the canonical resource identity;
+            // bind the handle to it and key all labels by the ADDRESS (E5).
+            let address = tokens[arrow + 1].to_owned();
+            address_of.insert(handle, address.clone());
+            governed.insert(address.clone());
             // a `provider` or `human` grant names a principal, not protected data.
             if matches!(tokens.get(1).copied(), Some("provider") | Some("human")) {
-                principals.insert(handle.clone());
+                principals.insert(address.clone());
             }
             let label = &tokens[arrow + 2..];
             // `readable by <Role>` sets a non-public reader authority.
             if let Some(by) = label.iter().position(|tok| *tok == "by") {
                 if let Some(role) = label.get(by + 1) {
                     if *role != PUBLIC {
-                        readers.insert(handle.clone(), (*role).to_owned());
+                        readers.insert(address.clone(), (*role).to_owned());
                     }
                 }
             }
@@ -233,7 +267,7 @@ impl Envelope {
             if let Some(from) = label.iter().position(|tok| *tok == "from") {
                 if let Some(role) = label.get(from + 1) {
                     if *role != PUBLIC {
-                        integrity.insert(handle, (*role).to_owned());
+                        integrity.insert(address, (*role).to_owned());
                     }
                 }
             }
@@ -246,6 +280,7 @@ impl Envelope {
             integrity,
             endorse,
             principals,
+            address_of,
         })
     }
 
@@ -281,8 +316,16 @@ impl Envelope {
             .iter()
             .map(|(res, role)| serde_json::json!([res, role]))
             .collect();
+        // handle -> address bindings, so a signed envelope round-trips its identity
+        // resolution (E5). Sorted by the BTreeMap for a deterministic hash.
+        let bindings: serde_json::Map<String, serde_json::Value> = self
+            .address_of
+            .iter()
+            .map(|(handle, address)| (handle.clone(), serde_json::Value::String(address.clone())))
+            .collect();
         serde_json::json!({
             "resources": resources,
+            "bindings": bindings,
             "delegations": delegations,
             "declassifications": declassifications,
             "endorsements": endorsements,
@@ -293,7 +336,7 @@ impl Envelope {
     /// The reader authority of a resource; `public` (the bottom) if unlabeled.
     fn reader_authority(&self, resource: &str) -> &str {
         self.readers
-            .get(resource)
+            .get(self.resolve(resource))
             .map(String::as_str)
             .unwrap_or(PUBLIC)
     }
@@ -338,7 +381,7 @@ impl Envelope {
             return false;
         }
         for (resource, role) in &self.declassify {
-            if resource == source && self.can_act(sink_reader, role) {
+            if self.resolve(resource) == self.resolve(source) && self.can_act(sink_reader, role) {
                 return false;
             }
         }
@@ -349,7 +392,7 @@ impl Envelope {
     /// bottom) if unlabeled.
     fn integrity_authority(&self, resource: &str) -> &str {
         self.integrity
-            .get(resource)
+            .get(self.resolve(resource))
             .map(String::as_str)
             .unwrap_or(PUBLIC)
     }
@@ -364,7 +407,7 @@ impl Envelope {
             return false;
         }
         for (resource, role) in &self.endorse {
-            if resource == read && self.can_act(role, requirement) {
+            if self.resolve(resource) == self.resolve(read) && self.can_act(role, requirement) {
                 return false;
             }
         }
@@ -533,7 +576,7 @@ fn imported_surface_gaps<'a>(
         let ungoverned: Vec<&str> = surface
             .iter()
             .map(String::as_str)
-            .filter(|door| !envelope.governed.contains(*door))
+            .filter(|door| !envelope.governed.contains(envelope.resolve(door)))
             .collect();
         if !ungoverned.is_empty() {
             gaps.push((tool.as_str(), ungoverned));
@@ -872,7 +915,7 @@ pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> Governa
     }
     let coverage_gaps: Vec<String> = touched
         .into_iter()
-        .filter(|resource| !envelope.governed.contains(resource))
+        .filter(|resource| !envelope.governed.contains(envelope.resolve(resource)))
         .collect();
     GovernanceReport {
         protected,
@@ -1529,6 +1572,37 @@ rule triage
     }
 
     #[test]
+    fn two_handles_bound_to_same_address_share_the_label() {
+        // E5: handles `a` and `b` bound to the same `kind:address` are the same
+        // resource and share its label — governance reasons about the real resource,
+        // not the script name.
+        let env = Envelope::from_dsl(
+            "grant file_store a -> file:/srv/crm.db readable by Operator\n\
+             grant file_store b -> file:/srv/crm.db readable by Operator\n\
+             grant channel out -> smtp:out public\n",
+        )
+        .expect("valid");
+        assert_eq!(env.reader_authority("a"), "Operator");
+        assert_eq!(env.reader_authority("b"), "Operator");
+        // both leak to the public channel — they are the same secret.
+        assert!(env.leaks("a", "out"));
+        assert!(env.leaks("b", "out"));
+        // a declassify naming handle `a` clears `b` too (same address).
+        let with = Envelope::from_dsl(
+            "grant file_store a -> file:/srv/crm.db readable by Operator\n\
+             grant file_store b -> file:/srv/crm.db readable by Operator\n\
+             grant channel out -> smtp:out readable by Requester\n\
+             grant declassify a to Requester\n",
+        )
+        .expect("valid");
+        assert!(!with.leaks("a", "out"));
+        assert!(
+            !with.leaks("b", "out"),
+            "declassify of handle `a` should clear `b` too (same address)"
+        );
+    }
+
+    #[test]
     fn provider_principal_is_not_listed_as_protected_data() {
         // a provider cleared for Operator data is a principal (a reader), not a
         // secret — it must not appear under "protected resources" (H5).
@@ -1539,9 +1613,10 @@ rule triage
         .expect("valid");
         let ir = ir_with_grants(READ_LEDGER);
         let report = governance_report(&ir, &VerifiedEnvelope::for_test(envelope));
-        assert!(report.protected.contains(&"crm".to_owned()));
+        // the report names the canonical kind:address identity, not the handle (E5).
+        assert!(report.protected.contains(&"file:/srv/crm".to_owned()));
         assert!(
-            !report.protected.iter().any(|name| name == "fixture"),
+            !report.protected.iter().any(|name| name == "selfhost:llama"),
             "a provider principal must not be listed as protected data: {:?}",
             report.protected
         );
@@ -1549,7 +1624,7 @@ rule triage
             report
                 .cleared_principals
                 .iter()
-                .any(|line| line.contains("fixture")),
+                .any(|line| line.contains("selfhost:llama")),
             "the cleared provider should be listed as a principal: {:?}",
             report.cleared_principals
         );

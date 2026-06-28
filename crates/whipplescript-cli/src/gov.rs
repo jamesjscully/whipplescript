@@ -94,23 +94,23 @@ impl SignedEnvelope {
         Self::sign_with_privilege(config_text, signer, true).expect("privileged test sign")
     }
 
-    /// The on-disk signed-envelope JSON: the canonical content with an
-    /// `attestation` block.
+    /// The on-disk signed-envelope JSON: the FULL canonical content (resources,
+    /// bindings, delegations, declassifications, endorsements) with an `attestation`
+    /// block. The whole content is what the hash covers, so every field must survive
+    /// the round-trip — not just `resources`.
     pub fn to_json(&self) -> String {
-        let resources: serde_json::Value =
-            serde_json::from_str(&self.canonical).unwrap_or(serde_json::Value::Null);
-        let resources = resources
-            .get("resources")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        serde_json::json!({
-            "resources": resources,
-            "attestation": {
-                "envelope_hash": self.envelope_hash,
-                "signer": self.signer,
-            }
-        })
-        .to_string()
+        let mut value: serde_json::Value =
+            serde_json::from_str(&self.canonical).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "attestation".to_owned(),
+                serde_json::json!({
+                    "envelope_hash": self.envelope_hash,
+                    "signer": self.signer,
+                }),
+            );
+        }
+        value.to_string()
     }
 
     /// Verify a loaded signed-envelope JSON: the attested hash must match the hash
@@ -131,14 +131,14 @@ impl SignedEnvelope {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
             .to_owned();
-        // recompute the canonical content hash from the resources block
-        let resources = value
-            .get("resources")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let canonical = serde_json::json!({ "resources": resources }).to_string();
-        // re-canonicalize through the envelope so ordering matches signing
-        let recanonical = canonicalize(&canonical)?;
+        // recompute the canonical content hash from the FULL content (everything
+        // except the attestation), re-canonicalized through the envelope so ordering
+        // matches signing. A tamper to any covered field breaks the hash.
+        let mut content = value.clone();
+        if let Some(obj) = content.as_object_mut() {
+            obj.remove("attestation");
+        }
+        let recanonical = canonicalize(&content.to_string())?;
         if hash_hex(&recanonical) == attested_hash {
             Ok(signer)
         } else {
