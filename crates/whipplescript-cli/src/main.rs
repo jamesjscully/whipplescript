@@ -19410,6 +19410,21 @@ fn validate_json_for_object(
     }
     for field in fields {
         let field_path = format!("{path}.{}", field.name);
+        // Family B conditional required-presence (discriminated-families-design.md
+        // §5.7): a `when <disc> is "<lit>"` field is required only when its
+        // discriminant equals the literal. An inapplicable sibling (the discriminant
+        // names a different value) is neither required nor rejected nor validated —
+        // soundness needs only positive presence, and this admits the
+        // all-keys-present webhook shape.
+        if let Some((disc, lit)) = &field.presence_condition {
+            let applicable = object
+                .get(disc)
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == lit);
+            if !applicable {
+                continue;
+            }
+        }
         match object.get(&field.name) {
             Some(value) => validate_json_for_ir_type(ir, value, &field.ty, &field_path, errors),
             None if matches!(field.ty, IrType::Optional(_)) => {}

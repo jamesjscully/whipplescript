@@ -2712,6 +2712,99 @@ fn signal_rejects_bad_payload_and_unknown_signal() {
     let _ = fs::remove_file(source);
 }
 
+const FAMILY_B_SIGNAL_SOURCE: &str = r#"
+workflow FamilyBSignal
+
+output result Done
+
+class Done {
+  note string
+}
+
+signal deploy.finished {
+  kind "deploy" | "rollback"
+  region string when kind is "deploy"
+}
+
+rule on_deploy
+  when deploy.finished as d
+=> {
+  complete result {
+    note "{{ d.kind }}"
+  }
+}
+"#;
+
+/// Family B conditional required-presence at admission
+/// (discriminated-families-design.md §5.7): a `when <disc> is "<lit>"` field is
+/// required only when the discriminant equals the literal; an inapplicable present
+/// sibling is accepted (the all-keys-present webhook shape — positive presence only).
+#[test]
+fn signal_enforces_conditional_field_presence() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("signal-familyb", "sqlite");
+    let source = temp_path("signal-familyb", "whip");
+    fs::write(&source, FAMILY_B_SIGNAL_SOURCE).expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let source_str = source.to_str().expect("utf-8");
+    let dev = dev_until_idle(bin, store_str, source_str, &[]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // Applicable but missing: kind == "deploy" requires `region`; rejected at the
+    // boundary so no ill-typed fact lands and the instance keeps running.
+    let rejected = Command::new(bin)
+        .args([
+            "--store",
+            store_str,
+            "signal",
+            &instance,
+            "--name",
+            "deploy.finished",
+            "--data",
+            r#"{"kind":"deploy"}"#,
+            "--program",
+            source_str,
+        ])
+        .output()
+        .expect("command runs");
+    assert!(
+        !rejected.status.success(),
+        "kind==deploy with no region must be rejected"
+    );
+    assert_eq!(instance_status(bin, store_str, &instance), "running");
+
+    // Inapplicable present: kind == "rollback", so `region` (a deploy-only field) is
+    // neither required nor rejected when present — accepted.
+    let accepted = run_json(
+        bin,
+        &[
+            "--store",
+            store_str,
+            "--json",
+            "signal",
+            &instance,
+            "--name",
+            "deploy.finished",
+            "--data",
+            r#"{"kind":"rollback","region":"x"}"#,
+            "--program",
+            source_str,
+        ],
+    );
+    assert_eq!(
+        accepted.get("signal").and_then(Value::as_str),
+        Some("deploy.finished")
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
 /// Signal reactions are statically checked: the bare `when` form requires a
 /// declared signal, and field access on the binding is typed against the
 /// signal schema.
