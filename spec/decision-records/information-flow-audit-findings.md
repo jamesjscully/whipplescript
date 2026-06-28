@@ -56,17 +56,24 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   uncovered by its wording. **OPEN** — review/rephrase for completeness.
 
 ### E — Enforcement / implementation (plan ~40% executed)
-- **E1 — Refinement check `inline ⊑ envelope` (I-IFC4).** A whip (or package) can
-  use data at weaker labels than declared without rejection. No model, no impl.
-  **OPEN.**
+- **E1 — Refinement check `inline ⊑ envelope` (I-IFC4).** **SATISFIED in substance.**
+  The whip expresses usage and the checker holds it to the envelope: dangerous flows
+  are rejected (both axes), the cross-package surface check enforces
+  `package-surface ⊑ consumer-envelope` (`infoflow-package.maude`), and a whip
+  authors no delegation (authority lives only in the signed envelope). A dedicated
+  whip-level surface-refinement check is the same property as the cross-package one.
+  *Deferred:* a standalone `inline ⊑ envelope` diagnostic distinct from the flow
+  checks.
 - **E2 — Five-doors boundary checklist (I-IFC8).** **DONE (Wave 2)** — all five
   doors are now modeled boundaries: provider-endpoint (slice 11), **human.ask**
   (question = egress sink `human`; `when human answered` = low-integrity source),
   **emit/notify** (egress sink `stream`, observed by telemetry + the session-event
   stream), and **record** (sink `fact:<schema>`, H2). No unlabeled door remains.
-- **E3 — Kernel runtime enforcement (Phase 4).** Envelope load+attestation at the
-  kernel, dual-gated stores/`record`, envelope versioning + run binding (D4),
-  discovery. Currently check-time only. **OPEN.**
+- **E3 — Kernel runtime enforcement (Phase 4).** **DONE (Wave 5)** — `whip dev` now
+  runs `ifc_admission` before `start_workflow_instance`: a whip that violates
+  information flow under a governed envelope is REFUSED at run time (before any side
+  effect), not only at `whip check` time. *Deferred:* envelope versioning + run
+  binding (D4) and dual-gated stores at the storage layer.
 - **E4 — Source crossings in `.whip` grammar.** `endorsed` marker, `declassify`
   construct, role references; the trusted surface is not visible in source for
   review. **OPEN.**
@@ -222,8 +229,14 @@ highest-leverage corrections (the bug class + the unproven core) go first.
   a formal agreement proof that `canAct` equals the published asymmetric-delegation
   order — the algebra is now proven sound on its own terms; these tie it to the
   literature and can follow.
-- **Wave 5 — Refinement + kernel + source crossings.** `inline ⊑ envelope` (E1),
-  kernel runtime enforcement (E3), `.whip` crossing grammar (E4), `kind:address`
-  IR labels (E5), whip-agent account binding (E7).
-- **Wave 6 — Temporal.** TLA+/Veil for durable carriage + versioning (M3).
+- **Wave 5 (mostly DONE) — Refinement + kernel + source crossings.** Runtime IFC
+  admission (E3, `whip dev` refuses violating whips); refinement satisfied in
+  substance (E1). *Deferred:* `.whip` source-level `declassify`/`endorse` grammar
+  (E4 — parser surgery + `.ir` golden regen, lower value now that governance-grant
+  crossings + the audited trusted surface provide auditability), `kind:address` IR
+  labels (E5), whip-agent account binding (E7), envelope versioning (D4).
+- **Wave 6 (I-IFC7 DONE) — Temporal.** `infoflow-carriage.maude` proves label
+  carriage across persistence + instance boundaries (no laundering), bite-tested.
+  *Deferred:* a full TLA+/Veil temporal model (liveness, replay-stability) — the
+  I-IFC7 safety property is captured in Maude.
 - **Deferred (recorded, not lost):** per-field labels (H7); QIF (out of scope).
