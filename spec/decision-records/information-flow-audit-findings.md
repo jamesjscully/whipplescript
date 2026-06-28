@@ -85,9 +85,9 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   realized). OPEN: `complete result` (the result channel to the *invoker*) — its
   per-rule form isn't cleanly in the IR and it overlaps the cross-package `@tool`
   result (Wave 3, opaque join box), so it is folded into Wave 3.
-- **H3 — Inbound message-trigger is not an integrity source.** `when message from`
-  untrusted data isn't modeled as a read; injection only caught from file reads.
-  **OPEN.**
+- **H3 — Inbound message-trigger is not an integrity source.** **DONE (Wave 2)** —
+  `when message from <channel>` now contributes the channel as a low-integrity read
+  source, so untrusted inbound content driving a more-trusted sink is caught.
 - **H4 — `endorse` crossings absent from the trusted-surface report.** **DONE
   (Wave 2)** — the report now audits both axes, tagged `declassify …` / `endorse …`.
 - **H5 — Clearing a provider marks it "confidential".** A principal appears as a

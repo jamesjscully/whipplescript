@@ -141,10 +141,10 @@ These are real gaps observed while building the examples, not hypotheticals.
    whole `file store` / `channel`, not a path within it. Mixed-sensitivity stores
    must be physically split.
 
-5. **Inbound message triggers are not integrity sources.** `when message from
-   <channel>` untrusted trigger data is not modeled as a read, so injection is
-   only caught when untrusted data comes from a *file* read. (These examples model
-   inbound email as files for exactly this reason.)
+5. ~~**Inbound message triggers are not integrity sources.**~~ *Fixed (H3):* a rule
+   triggered by `when message from <channel>` now treats the channel as a
+   low-integrity read source, so attacker-controlled inbound content driving a
+   more-trusted sink is caught as an injection — not only file reads.
 
 6. ~~**`endorse` crossings are absent from the trusted-surface report.**~~ *Fixed
    (H4):* the trusted surface now audits BOTH axes — `declassify <r> -> <role>` and

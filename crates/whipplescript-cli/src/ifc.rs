@@ -568,10 +568,22 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
             .iter()
             .map(|write| format!("fact:{}", write.strip_prefix("schema:").unwrap_or(write)))
             .collect();
+        // Inbound `when message from <channel>` delivers attacker-controllable
+        // content: the channel is a low-integrity READ source (and public
+        // confidentiality), so untrusted inbound data driving a more-trusted sink is
+        // caught as an injection (H3). The IR pattern is `message from <channel>`.
+        let mut message_reads: Vec<&str> = Vec::new();
+        for when in &rule.whens {
+            if let Some(rest) = when.pattern.trim_start().strip_prefix("message from ") {
+                if let Some(channel) = rest.split_whitespace().next() {
+                    message_reads.push(channel);
+                }
+            }
+        }
         let report_span = span.unwrap_or(whipplescript_parser::SourceSpan { start: 0, end: 0 });
         let mut leak: Option<(&str, &str)> = None;
         let mut inject: Option<(&str, &str)> = None;
-        for &src in &reads {
+        for src in reads.iter().copied().chain(message_reads.iter().copied()) {
             for sink in writes
                 .iter()
                 .copied()
@@ -1022,6 +1034,51 @@ grant channel reply -> smtp:out readable by Requester\n";
         let text = report.render();
         assert!(text.contains("protected resources"));
         assert!(text.contains("coverage gaps"));
+    }
+
+    #[test]
+    fn inbound_message_is_a_low_integrity_source() {
+        // a rule triggered by `when message from <channel>` reads attacker-
+        // controllable content; letting it drive a high-integrity sink (here a
+        // file write to an Operator-integrity store) is an injection (H3).
+        let program = r##"@service
+workflow IfcInbound
+
+output result R
+class R { ok bool }
+
+channel intake { provider slack  destination "#in" }
+file store ledger { root "./ledger"  allow write ["**"] }
+
+rule ingest
+  when message from intake as msg
+=> {
+  write text to ledger at "notes.txt" {
+    body "{{ msg.text }}"
+    mode append
+  } as noted
+  after noted succeeds {
+    complete result { ok true }
+  }
+}
+"##;
+        let ir = compile_program(program).ir.expect("compiles");
+        // intake is untrusted (public integrity); ledger requires Operator integrity.
+        let envelope = Envelope::from_dsl(
+            "grant channel intake -> imap:in from public\n\
+             grant file_store ledger -> file:/srv/ledger.db from Operator\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("integrity violation")
+                    && d.message.contains("intake")
+                    && d.message.contains("ledger")),
+            "inbound message driving a trusted sink should be an injection, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
