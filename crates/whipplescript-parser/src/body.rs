@@ -182,6 +182,10 @@ pub enum BodyEffectKind {
     Coerce {
         name: String,
         args: Vec<String>,
+        /// the `endorsed` source marker (DR-0027 I-IFC3): the author declares this
+        /// coerce is an integrity-raising crossing, making the trusted surface
+        /// visible at the crossing point. Authorization still lives in governance.
+        endorsed: bool,
     },
     AskHuman {
         choices: Vec<String>,
@@ -1547,8 +1551,14 @@ impl<'a> BodyParser<'a> {
         if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
             return None;
         }
+        // optional trailing `endorsed` source marker (I-IFC3); must come last.
+        let endorsed = self.consume_ident("endorsed");
         Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::Coerce { name, args },
+            kind: BodyEffectKind::Coerce {
+                name,
+                args,
+                endorsed,
+            },
             binding,
             requires,
             timeout_seconds,
@@ -3386,6 +3396,31 @@ mod tests {
                 ..
             } if command == "scripts/run-tests.sh"));
         assert_eq!(effect.timeout_seconds, Some(300));
+    }
+
+    #[test]
+    fn parses_coerce_endorsed_marker() {
+        // the trailing `endorsed` source marker (I-IFC3) sets the flag.
+        let ast = parse_ok("coerce classify(msg.content) as verdict endorsed");
+        let BodyStmt::Effect(effect) = &ast.statements[0] else {
+            panic!("expected effect");
+        };
+        assert!(matches!(
+            &effect.kind,
+            BodyEffectKind::Coerce { name, endorsed: true, .. } if name == "classify"
+        ));
+        // without the marker, the flag is false.
+        let plain = parse_ok("coerce classify(msg.content) as verdict");
+        let BodyStmt::Effect(effect) = &plain.statements[0] else {
+            panic!("expected effect");
+        };
+        assert!(matches!(
+            &effect.kind,
+            BodyEffectKind::Coerce {
+                endorsed: false,
+                ..
+            }
+        ));
     }
 
     #[test]

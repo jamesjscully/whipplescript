@@ -842,6 +842,18 @@ pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> Governa
                 .map(|(resource, role)| format!("endorse {resource} -> {role}")),
         )
         .collect();
+    // Source-declared crossings (DR-0027 I-IFC3): an `endorsed` marker in a rule
+    // makes the integrity crossing visible at the source point. Surfaced alongside
+    // the governance grants so the audit picture is complete — where a crossing is
+    // claimed, not only that one is authorized.
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            if effect.endorsed {
+                let at = effect.binding.as_deref().unwrap_or("coerce");
+                trusted_surface.push(format!("endorsed (source) at rule `{}` ({at})", rule.name));
+            }
+        }
+    }
     trusted_surface.sort();
     let violations = check_with_envelope(ir, verified).len();
     let mut touched: BTreeSet<String> = BTreeSet::new();
@@ -1467,6 +1479,47 @@ rule work
                 "surface should include `{expected}`, got: {surface:?}"
             );
         }
+    }
+
+    #[test]
+    fn source_endorsed_marker_surfaces_in_trusted_surface() {
+        // a `coerce ... endorsed` source marker (I-IFC3) appears in the guarantee
+        // report's trusted surface, tied to its rule, so the crossing is visible at
+        // the source point — not only in governance.
+        let program = r#"@service
+workflow EndorseSurface
+
+output result R
+class R { ok bool }
+class Reviewed { verdict string }
+class Ticket { id string  status "open" }
+
+coerce review(content string) -> Reviewed {
+  prompt "classify {{ content }}"
+}
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule triage
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  coerce review("hi") as verdict endorsed
+  after verdict succeeds as v {
+    complete result { ok true }
+  }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope = Envelope::from_json(r#"{ "resources": {} }"#).expect("valid");
+        let report = governance_report(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            report
+                .trusted_surface
+                .iter()
+                .any(|c| c.contains("endorsed (source)") && c.contains("triage")),
+            "source endorse should be surfaced: {:?}",
+            report.trusted_surface
+        );
     }
 
     #[test]

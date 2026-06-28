@@ -1095,16 +1095,22 @@ fn print_effect(
             };
             format!("askHuman{binding}{choices}{timeout}")
         }
-        BodyEffectKind::Coerce { name, args } => {
+        BodyEffectKind::Coerce {
+            name,
+            args,
+            endorsed,
+        } => {
             let args = args
                 .iter()
                 .map(|arg| rn(arg))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // preserve the `endorsed` marker through flow expansion (trailing).
+            let endorsed = if *endorsed { " endorsed" } else { "" };
             push_stmt_line(
                 out,
                 indent,
-                &format!("coerce {name}({args}){binding}{timeout}"),
+                &format!("coerce {name}({args}){binding}{timeout}{endorsed}"),
             );
             return;
         }

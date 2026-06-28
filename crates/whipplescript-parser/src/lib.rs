@@ -1205,6 +1205,10 @@ pub struct IrEffectNode {
     /// analysis can model the turn's egress to that agent's provider. `None` for
     /// non-`tell` effects. Not part of the `.ir` snapshot.
     pub agent: Option<String>,
+    /// The `endorsed` source marker (DR-0027 I-IFC3): the author declared this effect
+    /// (a `coerce`) an integrity-raising crossing. Surfaced so the trusted surface is
+    /// visible at the source crossing point. Not part of the `.ir` snapshot.
+    pub endorsed: bool,
 }
 
 /// A lowered turn-access grant: the granted operations narrow the turn's effective
@@ -6716,6 +6720,7 @@ fn analyze_rule(
                 access_grants: Vec::new(),
                 resource: None,
                 agent: None,
+                endorsed: false,
             });
         }
     }
@@ -7358,6 +7363,12 @@ fn agent_for_body(kind: &body::BodyEffectKind) -> Option<String> {
     }
 }
 
+/// Whether an effect carries the `endorsed` source marker (I-IFC3) — a `coerce` the
+/// author declared an integrity-raising crossing.
+fn endorsed_for_body(kind: &body::BodyEffectKind) -> bool {
+    matches!(kind, body::BodyEffectKind::Coerce { endorsed: true, .. })
+}
+
 /// The named resource a direct file/channel effect touches, surfaced for
 /// information-flow analysis. `None` for effects with no named resource.
 fn resource_for_body(kind: &body::BodyEffectKind) -> Option<String> {
@@ -7527,6 +7538,7 @@ fn walk_effects(
                 let access_grants = ir_access_grants_for_body(&effect.kind);
                 let resource = resource_for_body(&effect.kind);
                 let agent = agent_for_body(&effect.kind);
+                let endorsed = endorsed_for_body(&effect.kind);
                 effects.push(IrEffectNode {
                     id,
                     kind,
@@ -7539,6 +7551,7 @@ fn walk_effects(
                     access_grants,
                     resource,
                     agent,
+                    endorsed,
                 });
             }
             body::BodyStmt::After(after) => {
