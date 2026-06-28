@@ -213,10 +213,15 @@ highest-leverage corrections (the bug class + the unproven core) go first.
   granting (X3) and resource-param binding (X4) are surfaced in the contract but the
   consumer check is surface-coverage v0; trust the attested surface vs recompute
   (X5 optimization) is a later step.
-- **Wave 4 — Algebra depth (Lean).** *Started:* flow-composition soundness proven
-  (`flow_conf_trans`/`flow_integ_trans` — pipelines compose). *REMAINING:*
-  reader/writer sets → semilattice (M1/E6), NMIF (M1),
-  non-interference-relative-to-policy (M1), agreement with the published order.
+- **Wave 4 (DONE 2026-06-28) — Algebra depth (Lean).** flow-composition soundness
+  (`flow_conf_trans`/`flow_integ_trans`); reader **sets** form a join-semilattice
+  (`ReaderSets.lean`: `canRead_nil`/`canRead_append`/`comm`/`mono`, M1/E6); **NMIF**
+  robust declassification (`NMIF.lean`: `untrusted_declassify_only_public` —
+  attacker-controlled data releases only to public, zero axioms; M1). *Deferred
+  (lower value):* a fully mechanized non-interference-relative-to-policy theorem and
+  a formal agreement proof that `canAct` equals the published asymmetric-delegation
+  order — the algebra is now proven sound on its own terms; these tie it to the
+  literature and can follow.
 - **Wave 5 — Refinement + kernel + source crossings.** `inline ⊑ envelope` (E1),
   kernel runtime enforcement (E3), `.whip` crossing grammar (E4), `kind:address`
   IR labels (E5), whip-agent account binding (E7).

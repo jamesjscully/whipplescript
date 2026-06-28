@@ -61,9 +61,13 @@ scripts/check-lean-models.sh   # builds + rejects any sorry/admit/axiom/native_d
   `canRead_mono` (higher clearance reads at least as much). The confidentiality
   label forms a join-semilattice; the single-authority `Label.reader` is the leaf.
 
-## Not yet proven here (next obligations)
+`Whipple/NMIF.lean` — robust declassification (nonmalleable information flow):
+- `untrusted_declassify_only_public` (the NMIF guarantee: attacker-controlled data
+  — integrity at the public bottom — can be released only to public, so an attacker
+  cannot influence a downgrade in their favor; **zero axioms**),
+  `endorsed_enables_declassify` (vouch first, then release), `robustDeclassify_mono`.
 
-- **NMIF / robust declassification** (a downgrade not influenced by an attacker).
+## Not yet proven here (next obligations)
 - Durable **label carriage** across persistence/instance boundaries (I-IFC7) — that
   is a transition-system property; the natural home is Veil (Lean) or TLA+, not this
   algebraic core.
