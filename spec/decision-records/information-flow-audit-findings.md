@@ -33,10 +33,12 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   (`models/lean/`). OPEN within M1: reader/writer **sets** → semilattice, NMIF,
   non-interference-relative-to-policy as a theorem, and an **agreement** result
   that our `canAct` instantiates the published asymmetric-delegation order.
-- **M2 — Maude models are single-consumer.** No model has multiple consumers of a
-  trusted artifact; `subworkflow-attestation` models only the enforce path, not the
-  report/guarantee path, so it could not bite this bug. **OPEN** — add a
-  second-consumer bite (an un-gated consumer is caught).
+- **M2 — Maude models are single-consumer.** No model had multiple consumers of a
+  trusted artifact; `subworkflow-attestation` modeled only the enforce path.
+  **DONE (Wave 1)** — added a second consumer (`publish`, the report analogue) held
+  to the same attestation gate; new coverage (genuine serves both) + bite (an
+  un-attested tool is never published either); bite-tested (an un-gated rule flips
+  the No-solution to a Solution).
 - **M3 — No IFC TLA+/Veil.** Durable label carriage (I-IFC7), envelope versioning /
   non-retroactivity (D4), replay-stability are temporal/distributed and unmodeled.
   **OPEN.**
@@ -45,9 +47,11 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
 
 ### P — Invariant phrasing (path → artifact)
 - **P1 — Attestation/G4 phrased per-consumer.** "The whip agent only enforces"
-  permits other consumers to skip verify. **PARTIAL** — Lean `Verified` boundary
-  proves all consumers gate by construction; OPEN: re-phrase DR-0028 G-invariants
-  over the artifact, and land the Rust `VerifiedEnvelope` boundary type.
+  permitted other consumers to skip verify. **DONE (Wave 1)** — Lean `Verified`
+  boundary proves all consumers gate; Rust `ifc::VerifiedEnvelope` is the only
+  env→envelope path and `check_with_envelope`/`governance_report` require it (a
+  third consumer is now a compile error); DR-0028 gains **G5 (verified-artifact
+  boundary)** phrased over the artifact, not a path.
 - **P2 — I-IFC3 scoped to downgrades only.** Non-downgrade paths are implicitly
   uncovered by its wording. **OPEN** — review/rephrase for completeness.
 
@@ -71,8 +75,9 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   account scoping enforced. **OPEN.**
 
 ### H — Found hands-on (beyond the audit agents)
-- **H1 — report-vs-check tamper.** **DONE (point-fix)** `report_for_envelope_text`
-  verifies first; to be **subsumed by P1** (VerifiedEnvelope).
+- **H1 — report-vs-check tamper.** **DONE (Wave 1)** — subsumed by P1: the report
+  routes through `VerifiedEnvelope` and refuses a tampered policy structurally; the
+  point-fix is gone.
 - **H2 — Workflow-result channel is an unmonitored sink.** `complete result` /
   `record` returns data to the invoker (the root/parent agent) and is NOT checked —
   reading CRM and returning it verbatim passes. **OPEN — significant.**
@@ -177,9 +182,9 @@ highest-leverage corrections (the bug class + the unproven core) go first.
 
 - **Wave 0 (DONE).** Lean foundation: preorder, `canAct_iff`, duality, sticky
   boundary, `Verified` boundary; gate `check-lean-models.sh`.
-- **Wave 1 — Close the bug class end-to-end.** Rust `VerifiedEnvelope` boundary type
-  (P1, subsumes H1); route checker + report + future consumers through it; Maude
-  multi-consumer bite (M2); re-phrase G-invariants (P1). 
+- **Wave 1 (DONE 2026-06-27) — Closed the bug class end-to-end.** Rust
+  `VerifiedEnvelope` boundary type (P1/H1); checker + report require it; Maude
+  multi-consumer bite (M2); DR-0028 G5 phrased over the artifact (P1).
 - **Wave 2 — Close the unmonitored sinks.** Workflow-result channel (H2), inbound
   message-trigger as integrity source (H3), the five doors (E2); each modeled then
   checked. Small report fixes (H4, H5, H6) ride along.

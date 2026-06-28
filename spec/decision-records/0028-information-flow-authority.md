@@ -190,7 +190,25 @@ G3 narrowly bounded      the gov agent's authority is a FIXED tool surface (edit
 G4 single signer         only the gov agent, with admin authority (= the sudo
                          identity = the attestation key, DR-0028 trust root), signs a
                          new envelope version; the whip agent only reads and enforces.
+G5 verified-artifact     NO consumer of a signed envelope -- the checker, the
+   boundary              guarantee report, the kernel, or any future reader -- may
+                         derive a trusted decision from it without first verifying
+                         its attestation. Verification is a property of the ARTIFACT
+                         at its trust boundary, not of any one consumer's code path.
 ```
+
+**On G5 (added 2026-06-27, after the report-vs-check bug).** G4 was phrased about a
+single consumer ("the whip agent reads and enforces"). That wording silently
+permitted a *second* consumer to skip verification: the guarantee report rendered
+against a tampered signed envelope because it read the policy without verifying,
+while the checker did. The fix is structural and is what G5 now mandates: a signed
+envelope is verified once, at a boundary that yields a `VerifiedEnvelope`, and every
+consumer takes that verified value -- so forgetting to verify is not expressible.
+This is realized in code as `ifc::VerifiedEnvelope` (the only env→envelope path,
+verifying signed policies) and proved in `models/lean/Whipple/Boundary.lean`
+(`consumer_relies_on_genuine`); the Maude `subworkflow-attestation` model bites the
+multi-consumer case concretely. The general discipline: **model the artifact and
+ALL its consumers, and phrase trust invariants over the boundary, never a path.**
 
 The one flow from the whip side to the governance side is **escalation** (a user's
 whip needs an ungranted right). Because that request may be shaped by untrusted
