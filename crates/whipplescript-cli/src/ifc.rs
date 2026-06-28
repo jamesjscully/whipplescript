@@ -517,6 +517,26 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
                     }
                 }
             }
+            // human.ask is a door (E2, one of the five non-obvious doors): the
+            // QUESTION egresses the turn's context to a human, so `askHuman` is an
+            // egress sink. (The answer is handled where it is consumed — the
+            // `when human answered` trigger below — as a low-integrity source.)
+            // Resource id `human`; unlabeled defaults to public (fail-closed).
+            if effect.kind == IrEffectKind::HumanAsk {
+                writes.push("human");
+                span.get_or_insert(effect.span);
+            }
+            // emit/notify publish an event to the durable log, which the DR-0026
+            // session-event stream and the telemetry export both observe (E2, the
+            // last two of the five doors). Egress sink `stream`; unlabeled defaults
+            // to public, so confidential data in an emitted event is caught.
+            if matches!(
+                effect.kind,
+                IrEffectKind::EventEmit | IrEffectKind::EventNotify
+            ) {
+                writes.push("stream");
+                span.get_or_insert(effect.span);
+            }
             // Provider egress (DR-0027 provider-as-principal): a turn ships its
             // context to the agent's model provider, so a read-confidential turn
             // whose provider is not cleared leaks to the model.
@@ -574,10 +594,16 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
         // caught as an injection (H3). The IR pattern is `message from <channel>`.
         let mut message_reads: Vec<&str> = Vec::new();
         for when in &rule.whens {
-            if let Some(rest) = when.pattern.trim_start().strip_prefix("message from ") {
+            let pattern = when.pattern.trim_start();
+            if let Some(rest) = pattern.strip_prefix("message from ") {
                 if let Some(channel) = rest.split_whitespace().next() {
                     message_reads.push(channel);
                 }
+            }
+            // `when human answered <X>` consumes the human's answer — untrusted,
+            // attacker-influenceable input, so a low-integrity source (E2).
+            if pattern.starts_with("human answered") {
+                message_reads.push("human");
             }
         }
         let report_span = span.unwrap_or(whipplescript_parser::SourceSpan { start: 0, end: 0 });
@@ -1034,6 +1060,91 @@ grant channel reply -> smtp:out readable by Requester\n";
         let text = report.render();
         assert!(text.contains("protected resources"));
         assert!(text.contains("coverage gaps"));
+    }
+
+    #[test]
+    fn emitted_event_is_a_stream_egress_door() {
+        // reading a confidential store and emitting an event publishes it to the
+        // durable log, observed by the DR-0026 session-event stream and telemetry
+        // export (E2): `emit` is a sink `stream`, default public.
+        let program = r#"@service
+workflow IfcEmit
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+
+signal app.ping { note string }
+file store ledger { root "./ledger"  allow read ["**"] }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule emit_it
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from ledger at "data.txt" as loaded
+  after loaded succeeds as file {
+    emit signal app.ping to ticket.id {
+      note file.content
+    } as sent
+  }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope =
+            Envelope::from_json(r#"{ "resources": { "ledger": { "confidential": true } } }"#)
+                .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("information-flow violation")
+                    && d.message.contains("ledger")
+                    && d.message.contains("stream")),
+            "confidential read + emit should leak to the event stream, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn human_ask_question_is_an_egress_door() {
+        // reading a confidential store and then asking a human egresses the turn's
+        // context to the human (E2): `askHuman` is a sink, `human` defaults public.
+        let program = r##"@service
+workflow IfcAsk
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+
+file store ledger { root "./ledger"  allow read ["**"] }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule ask
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from ledger at "data.txt" as loaded
+  after loaded succeeds as file {
+    askHuman as review choices ["ok", "no"] "Decide on: {{ file.content }}"
+    done ticket
+  }
+}
+"##;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope =
+            Envelope::from_json(r#"{ "resources": { "ledger": { "confidential": true } } }"#)
+                .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("information-flow violation")
+                    && d.message.contains("ledger")
+                    && d.message.contains("human")),
+            "confidential read + askHuman should leak to the human, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -59,8 +59,11 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
 - **E1 — Refinement check `inline ⊑ envelope` (I-IFC4).** A whip (or package) can
   use data at weaker labels than declared without rejection. No model, no impl.
   **OPEN.**
-- **E2 — Five-doors boundary checklist (I-IFC8).** telemetry/logs, session-event
-  stream, human.ask not registered as boundaries = unlabeled holes. **OPEN.**
+- **E2 — Five-doors boundary checklist (I-IFC8).** **DONE (Wave 2)** — all five
+  doors are now modeled boundaries: provider-endpoint (slice 11), **human.ask**
+  (question = egress sink `human`; `when human answered` = low-integrity source),
+  **emit/notify** (egress sink `stream`, observed by telemetry + the session-event
+  stream), and **record** (sink `fact:<schema>`, H2). No unlabeled door remains.
 - **E3 — Kernel runtime enforcement (Phase 4).** Envelope load+attestation at the
   kernel, dual-gated stores/`record`, envelope versioning + run binding (D4),
   discovery. Currently check-time only. **OPEN.**
