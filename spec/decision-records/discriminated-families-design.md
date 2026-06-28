@@ -399,6 +399,26 @@ Recommended phase order (full rationale in the chat thread; durable IFC side tra
 
 **Priority flip signal:** if the *read-secret/emit-benign* false positive (DR-0030's canonical pain case) is actively blocking real whips, pull Phase 3 → Phase 4 **ahead of** Phase 2 — it's the only deferred IFC item with user-facing bite. **Demand-gated / operational** (independent of both tracks): E7 (account binding), D4 (envelope versioning). **Free now:** adopt M4 ("negative bite per consumer per trusted artifact") as a standing review rule.
 
+### 7.3 Family C runtime design — GROUNDED (research 2026-06-28, de-risks the open runtime gap)
+
+The earlier worry was that Family C needs deep, net-new cross-instance runtime. Grounding in the actual runtime shows the opposite: it's **~90% reuse of the path that already delivers a child's terminal to its parent.** The runtime is **poll-based + fact-driven** — `whip dev --until idle` / `whip step` re-evaluate an instance's rules against its fact-base each tick (`ready_contexts`), and the parent's invoke effect **already derives facts into the parent's fact-base** from child state (`run_workflow_invoke_effect`, main.rs ~25631-25788: it reads the child's terminal and derives `workflow.invoke.succeeded`/`.failed` facts carrying the parent's `effect_id`). Milestones extend that exact mechanism mid-flight:
+
+- **Child side** — `emit milestone "<name>" { … }` records a durable **milestone fact** in the child instance's own base (reuse `derive_fact` / the `emit`/notify path). It is *additive signaling*: the child chooses what to project, so the terminal-only observation invariant holds (the parent can only see milestones the child declared/emitted).
+- **Parent side** — the parent's invoke effect, on each step, reads the child's emitted milestones (alongside the terminal it already reads) and **derives a `workflow.invoke.reached:<name>` fact** (keyed by the parent `effect_id` + milestone name) into the parent's fact-base. Idempotent via the existing `fact_id` keying (instance+rule+schema+fact_key, with the milestone name in the key) → each milestone delivered exactly once, no double-fire.
+- **`after p reaches "<name>" as m`** lowers to a reaction on that `reached` fact (the same shape as `after p succeeds`, which already matches `workflow.invoke.succeeded`); `m` binds the milestone payload. The lifecycle family's `tags()` = the child's declared milestone names ∪ the four terminals.
+
+**Net-new vs reuse:** reuse = `derive_fact`, the invoke-effect parent-fact-derivation path, `ready_contexts` matching, fact-id idempotency. Net-new = (1) parser for `emit milestone` (child) + `after … reaches` (parent), (2) the child-records-milestone-fact lowering, (3) the invoke effect reading child milestones and deriving `reached` facts, (4) a per-child milestone registry for `tags()`/exhaustiveness, (5) `milestone-signal.maude` (the §6.4 model). **Observation latency** is one parent step (the parent sees a milestone on its next tick) — consistent with the poll model and fine under `--until idle`. **Open design choice to confirm before building:** whether the parent's invoke effect *polls* child milestones each step (simplest, matches the model) vs the child *pushes* via notify into the parent (lower latency, but the child must resolve its parent instance) — the poll variant is recommended (it mirrors terminal propagation exactly and needs no child→parent addressing).
+
+### 7.4 Selector-doctrine IR design — GROUNDED (research 2026-06-28, de-risks Task 4)
+
+The blocker was that `ifc.rs` can't link a crossing-bearing effect to its enclosing case-arm discriminant. The clean fix is small and mirrors existing machinery:
+
+- **Lowering** — the effect walk `walk_effects` (lib.rs ~7672-7809) already threads an `after_stack` through nested blocks but **drops case context** when it descends into a `case` arm (~7764). Add a parallel **`case_stack: Vec<(scrutinee, literal)>`**, pushed/popped around each arm exactly like `after_stack`, and stamp the innermost entry onto each effect.
+- **IR** — add **`selected_by: Option<(String, String)>`** (scrutinee root + arm literal) to `IrEffectNode` (lib.rs ~1194-1224, beside the `endorsed`/`declassified` flags). Make it **non-serialized** (like those E4 flags) → **zero `.ir` golden/hash churn**.
+- **IFC** — in `check_with_envelope`, for an effect with `endorsed || declassified` AND `selected_by = Some((root, _))`, derive the discriminant's integrity from the root binding's source (reuse the existing low-integrity-source detection: `when message from <ch>` / `when human answered`, ifc.rs ~771-788, + `integrity_authority` ~442). If the discriminant is low-integrity, **reject** (NMIF-on-the-selector). This is the §5.6 channel-2 crossing rule, now implementable.
+
+**Net-new vs reuse:** reuse = the `after_stack` threading pattern, the low-integrity-source detection, `integrity_authority`. Net-new = the `case_stack` + `selected_by` field + the one IFC check + a `determine_binding_integrity(rule, root)` helper. The `case-selector.maude` bite already models the property. **Confirm before building:** the `selected_by` shape (scrutinee+literal vs a richer boundary) and that non-serialization is acceptable (it is, per the E4 precedent).
+
 ---
 
 ## 8. Non-Goals & Hard Corners
