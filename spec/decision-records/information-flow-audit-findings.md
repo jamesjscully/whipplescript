@@ -74,19 +74,21 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   information flow under a governed envelope is REFUSED at run time (before any side
   effect), not only at `whip check` time. *Deferred:* envelope versioning + run
   binding (D4) and dual-gated stores at the storage layer.
-- **E4 — Source crossings in `.whip` grammar.** `endorsed` marker, `declassify`
-  construct; trusted surface not visible in source. **OPEN — re-scoped CHEAP (spike
-  2026-06-28).** The "parser surgery + `.ir` golden" deferral was overstated:
-  (1) the `.ir` goldens are now a one-command-blessable gate
-  (`scripts/regen-ir-goldens.sh`), not manual churn; (2) `endorsed` rides the
-  existing `body.rs` effect-modifier path as an **annotation** on `coerce`/`exec` —
-  ~5 small additive edits (coerce/exec parser, a `BodyEffect` flag, an `IrEffectNode`
-  leaf field like `resource`/`agent` that is NOT serialized → zero golden/hash churn,
-  no new statement keyword, no new effect kind). The checker reads the flag; the
-  crossing is still authorized by a `grant endorse` (source marks WHERE, governance
-  authorizes). `declassify` is slightly more (a use-site value annotation needing a
-  short decision on the marker's attachment point) but also an annotation, not a new
-  statement. Net: `endorse` is a cheap follow-on.
+- **E4 — Source crossings in `.whip` grammar.** **DONE (2026-06-28).** Both
+  `endorsed` and `declassified` ship as trailing source markers on `coerce`
+  (`coerce f(x) as y endorsed` / `… declassified`; both may co-occur). I-IFC3
+  "explicit in source": the crossing is visible at the point it happens and surfaced
+  in the guarantee report's trusted surface as "endorsed/declassified (source) at
+  rule `<r>`". *Attachment decision:* `declassify` carries a bounded type (the leak
+  ceiling) and `coerce` already produces a bounded typed value (its output schema),
+  so `declassified`-on-coerce makes the schema the bound and enforces the safe
+  pattern by construction. As the spike predicted: leaf flags on
+  `BodyEffectKind::Coerce` + `IrEffectNode` (not serialized → **zero golden/hash
+  churn**), no new statement keyword, no new effect kind. The original "parser
+  surgery + golden" deferral was a misdiagnosis; the actual enabler was making the
+  `.ir` goldens a one-command-blessable gate (`scripts/regen-ir-goldens.sh`).
+  *v0 is auditability:* authorization still lives in governance `grant endorse`/
+  `declassify`; requiring the source marker for injection/leak clearing is v1.
 - **E5 — IR party-relative labels + `kind:address` resource ids.** Checker keys on
   handle names, not stable typed resource ids. **PARTIAL/OPEN.**
 - **E6 — Reader/writer SETS.** A single role up-set per resource today; real labels
