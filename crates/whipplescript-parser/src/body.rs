@@ -110,6 +110,19 @@ pub enum BodyStmt {
         binding: String,
         span: SourceSpan,
     },
+    /// `emit milestone "<name>" of <PayloadClass> { fields }` (Family C,
+    /// child-milestone lifecycle): a synchronous durable fact the child workflow
+    /// projects mid-flight for an observing parent. It is NOT an async effect —
+    /// it derives a `workflow.milestone:<name>` fact in the child's own base at
+    /// rule-commit time, mirroring `record`. `payload_class` types the parent's
+    /// `after p reaches "<name>" as m` binding. See
+    /// spec/decision-records/discriminated-families-design.md section 7.3.
+    Milestone {
+        name: String,
+        payload_class: Option<String>,
+        fields: Vec<FieldAssign>,
+        span: SourceSpan,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -343,6 +356,11 @@ pub struct AfterBlock {
     pub binding: String,
     pub predicate: AfterPredicate,
     pub alias: Option<String>,
+    /// For `after p reaches "<name>" as m`: the child milestone name being
+    /// observed (Family C). `None` for every other predicate. The name lives
+    /// here rather than on `AfterPredicate` so the predicate stays a fieldless
+    /// `Copy` enum (see `AfterPredicate::Reaches`).
+    pub milestone: Option<String>,
     pub body: Vec<BodyStmt>,
     pub span: SourceSpan,
 }
@@ -363,6 +381,12 @@ pub enum AfterPredicate {
     Contended,
     Ok,
     Over,
+    /// `after p reaches "<name>" as m` (Family C, child-milestone lifecycle): the
+    /// invoked child workflow `p` projected the named milestone mid-flight. The
+    /// milestone name is carried on `AfterBlock.milestone`, keeping this variant
+    /// fieldless/`Copy`. See spec/decision-records/discriminated-families-design.md
+    /// section 7.3.
+    Reaches,
 }
 
 impl AfterPredicate {
@@ -377,6 +401,10 @@ impl AfterPredicate {
             Self::Contended => "contended",
             Self::Ok => "ok",
             Self::Over => "over",
+            // The milestone name is rendered separately by the serializer
+            // (it lives on `AfterBlock.milestone`), so the bare keyword is
+            // all `as_str` carries here.
+            Self::Reaches => "reaches",
         }
     }
 }
@@ -2580,12 +2608,18 @@ impl<'a> BodyParser<'a> {
     fn parse_emit_signal(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
         self.pos += 1; // emit
+                       // `emit milestone "<name>" [of <PayloadClass>] { fields }` (Family C): a
+                       // synchronous milestone projection, distinct from the directed
+                       // `emit signal ... to ...` effect.
+        if self.at_ident("milestone") {
+            return self.parse_emit_milestone(start);
+        }
         if !self.consume_ident("signal") {
             let span = self.span_here();
             self.error(
                 span,
                 "the bare `emit <name>` statement was removed from the language; \
-                 `emit` must be followed by `signal`"
+                 `emit` must be followed by `signal` or `milestone`"
                     .to_owned(),
                 Some("write `emit signal deploy.finished to peer.id { ... }`".to_owned()),
             );
@@ -2621,6 +2655,44 @@ impl<'a> BodyParser<'a> {
             prompt: None,
             span: self.span_from(start),
         }))
+    }
+
+    /// `emit milestone "<name>" [of <PayloadClass>] { fields }` (Family C). The
+    /// caller has consumed `emit`; `self` is positioned at the `milestone`
+    /// keyword. `start` is the `emit` token index for span tracking.
+    fn parse_emit_milestone(&mut self, start: usize) -> Option<BodyStmt> {
+        self.pos += 1; // milestone
+        let Some(Tok::Str(name)) = self.peek().map(|t| t.tok.clone()) else {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected a quoted milestone name after `milestone`".to_owned(),
+                Some(
+                    "write `emit milestone \"canary_live\" of CanaryInfo { region \"us\" }`"
+                        .to_owned(),
+                ),
+            );
+            return None;
+        };
+        self.pos += 1;
+        // `of <PayloadClass>` is optional: a bare milestone carries no payload
+        // and the parent observes it with `after p reaches "<name>"` (no `as`).
+        let payload_class = if self.consume_ident("of") {
+            Some(self.ident_text("payload class after `of`")?)
+        } else {
+            None
+        };
+        let fields = if matches!(self.peek().map(|t| &t.tok), Some(Tok::Sym('{'))) {
+            self.parse_field_block(false)?
+        } else {
+            Vec::new()
+        };
+        Some(BodyStmt::Milestone {
+            name,
+            payload_class,
+            fields,
+            span: self.span_from(start),
+        })
     }
 
     /// A possibly-dotted identifier path, returned as source text.
@@ -2856,12 +2928,30 @@ impl<'a> BodyParser<'a> {
         let start = self.pos;
         self.pos += 1; // after
         let binding = self.ident_text("effect binding after `after`")?;
+        let mut milestone = None;
         let predicate = match self.advance().map(|t| t.tok) {
             Some(Tok::Ident(word)) => match word.as_str() {
                 "succeeds" => AfterPredicate::Succeeds,
                 "fails" => AfterPredicate::Fails,
                 "completes" => AfterPredicate::Completes,
                 "cancelled" => AfterPredicate::Cancelled,
+                // `after p reaches "<name>" as m` (Family C): the next token is a
+                // string literal naming the child milestone being observed. The
+                // name is stashed on `AfterBlock.milestone`.
+                "reaches" => {
+                    let Some(Tok::Str(name)) = self.peek().map(|t| t.tok.clone()) else {
+                        let span = self.span_here();
+                        self.error(
+                            span,
+                            "expected a quoted milestone name after `reaches`".to_owned(),
+                            Some("write `after p reaches \"canary_live\" as m { ... }`".to_owned()),
+                        );
+                        return None;
+                    };
+                    self.pos += 1;
+                    milestone = Some(name);
+                    AfterPredicate::Reaches
+                }
                 // `times out` is the two-token spelling of the `TimedOut`
                 // terminal status (spec/expression-kernel.md).
                 "times" => {
@@ -2914,6 +3004,7 @@ impl<'a> BodyParser<'a> {
             binding,
             predicate,
             alias,
+            milestone,
             body,
             span: self.span_from(start),
         }))

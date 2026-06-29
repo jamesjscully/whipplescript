@@ -358,6 +358,7 @@ fn statement_label(statement: &BodyStmt) -> &'static str {
         BodyStmt::Handler(_) => "handler",
         BodyStmt::Terminal(_) => "complete/fail",
         BodyStmt::Cancel { .. } => "cancel",
+        BodyStmt::Milestone { .. } => "milestone",
     }
 }
 

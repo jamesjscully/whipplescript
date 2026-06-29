@@ -906,14 +906,16 @@ pub(crate) fn print_statement_rn(
                 .as_ref()
                 .map(|alias| format!(" as {alias}"))
                 .unwrap_or_default();
+            // `reaches` carries a quoted milestone name (Family C); every other
+            // predicate is the bare keyword.
+            let predicate = match &after.milestone {
+                Some(name) => format!("{} {:?}", after.predicate.as_str(), name),
+                None => after.predicate.as_str().to_owned(),
+            };
             push_stmt_line(
                 out,
                 indent,
-                &format!(
-                    "after {} {}{alias} {{",
-                    after.binding,
-                    after.predicate.as_str()
-                ),
+                &format!("after {} {predicate}{alias} {{", after.binding),
             );
             for statement in &after.body {
                 print_statement_rn(statement, indent + 1, rn, out);
@@ -948,6 +950,24 @@ pub(crate) fn print_statement_rn(
         }
         BodyStmt::Branch(_) => {
             // Handled at segment level.
+        }
+        BodyStmt::Milestone {
+            name,
+            payload_class,
+            fields,
+            ..
+        } => {
+            let of = payload_class
+                .as_ref()
+                .map(|class| format!(" of {class}"))
+                .unwrap_or_default();
+            if fields.is_empty() {
+                push_stmt_line(out, indent, &format!("emit milestone {name:?}{of}"));
+            } else {
+                push_stmt_line(out, indent, &format!("emit milestone {name:?}{of} {{"));
+                print_fields(fields, indent + 1, rn, out);
+                push_stmt_line(out, indent, "}");
+            }
         }
     }
 }

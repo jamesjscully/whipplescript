@@ -1372,6 +1372,12 @@ struct SemanticContext {
 struct WorkflowInputSurface {
     inputs: BTreeMap<String, TypeSyntax>,
     schemas: SchemaIndex,
+    /// Milestones the workflow may project (Family C): name -> payload class
+    /// (empty string for a bare, payload-less milestone). Derived by scanning the
+    /// workflow's rule bodies for `emit milestone "<name>" [of <Class>]`. This is
+    /// the `declared(S)` set a parent's `after p reaches "<name>"` validates
+    /// against (reject-undeclared) and the source of the observing binding's type.
+    milestones: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4663,6 +4669,7 @@ fn collect_workflow_input_surfaces(program: &Program) -> BTreeMap<String, Workfl
             WorkflowInputSurface {
                 inputs,
                 schemas: top_level_schemas.clone(),
+                milestones: collect_milestone_declarations(&program.items),
             },
         );
     }
@@ -4675,11 +4682,208 @@ fn collect_workflow_input_surfaces(program: &Program) -> BTreeMap<String, Workfl
             WorkflowInputSurface {
                 inputs: workflow_inputs_for_items(&workflow.items),
                 schemas,
+                milestones: collect_milestone_declarations(&workflow.items),
             },
         );
     }
 
     surfaces
+}
+
+/// Scans a workflow's rule bodies for `emit milestone "<name>" [of <Class>]`
+/// projections (Family C) and returns the name -> payload-class map (empty class
+/// string for a bare milestone). The emit statement IS the declaration — the
+/// declared milestone set is exactly what the workflow's rules can project, which
+/// is what a parent's `after p reaches "<name>"` is validated against.
+fn collect_milestone_declarations(items: &[Item]) -> BTreeMap<String, String> {
+    let mut milestones = BTreeMap::new();
+    for item in items {
+        let Item::Rule(rule) = item else {
+            continue;
+        };
+        for (name, class) in milestone_emissions_in_body(&rule.body.text) {
+            milestones.entry(name).or_insert(class);
+        }
+    }
+    milestones
+}
+
+/// Validates Family C milestone statements in a rule (spec/decision-records/
+/// discriminated-families-design.md sections 6.4 / 7.3):
+///   - child `emit milestone "<name>" of <Class>` — `<Class>` must be a declared
+///     class (the payload the observing parent narrows into scope);
+///   - parent `after <p> reaches "<name>"` — `<p>` must be a workflow-invoke
+///     binding in this rule, and `<name>` must be a milestone that the invoked
+///     child workflow actually declares (the reject-undeclared / terminal-only
+///     observation invariant: a parent cannot observe a state the child never
+///     projects).
+fn validate_milestone_statements(
+    rule: &RuleDecl,
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    // Child side: every `emit milestone "<name>" of <Class>` payload class must
+    // exist.
+    for (name, class) in milestone_emissions_in_body(&rule.body.text) {
+        if !class.is_empty() && !semantic.schemas.class_exists(&class) {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` emits milestone `{name}` with unknown payload class `{class}`",
+                    rule.name.name
+                ),
+                suggestion: Some(format!("declare `class {class}` before projecting it")),
+            });
+        }
+    }
+
+    // Parent side: every `after <p> reaches "<name>"` must name a milestone the
+    // invoked child declares.
+    for (binding, milestone) in milestone_reaches_in_body(&rule.body.text) {
+        let Some(workflow) = invoke_binding_workflow(rule, &binding) else {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` has `after {binding} reaches \"{milestone}\"` for `{binding}`, which is not a workflow-invoke binding in this rule",
+                    rule.name.name
+                ),
+                suggestion: Some(
+                    "`reaches` observes a child workflow milestone; bind the child with `invoke W { ... } as <binding>` first"
+                        .to_owned(),
+                ),
+            });
+            continue;
+        };
+        let declared = semantic
+            .workflow_inputs
+            .get(&workflow)
+            .map(|surface| surface.milestones.contains_key(&milestone))
+            .unwrap_or(false);
+        if !declared {
+            let available = semantic
+                .workflow_inputs
+                .get(&workflow)
+                .map(|surface| {
+                    surface
+                        .milestones
+                        .keys()
+                        .map(|name| format!("\"{name}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let suggestion = if available.is_empty() {
+                format!("workflow `{workflow}` declares no milestones; add `emit milestone \"{milestone}\" ...` to it")
+            } else {
+                format!("workflow `{workflow}` declares: {available}")
+            };
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` reaches milestone `{milestone}` that workflow `{workflow}` does not declare",
+                    rule.name.name
+                ),
+                suggestion: Some(suggestion),
+            });
+        }
+    }
+}
+
+/// Parses `after <binding> reaches "<name>"` headers out of a rule body's text,
+/// returning (binding, milestone-name) pairs. Mirrors `milestone_emissions_in_body`.
+fn milestone_reaches_in_body(body: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for raw in body.lines() {
+        let trimmed = raw.trim();
+        let Some(rest) = trimmed.strip_prefix("after ") else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        let Some(binding) = words.next() else {
+            continue;
+        };
+        if words.next() != Some("reaches") {
+            continue;
+        }
+        let Some(quoted) = words.next() else {
+            continue;
+        };
+        if !(quoted.starts_with('"') && quoted.ends_with('"') && quoted.len() >= 2) {
+            continue;
+        }
+        out.push((binding.to_owned(), quoted.trim_matches('"').to_owned()));
+    }
+    out
+}
+
+/// Maps an `invoke <Workflow> { ... } as <binding>` binding to the invoked
+/// workflow name within a single rule, so a sibling `after <binding> reaches`
+/// can find the child workflow whose milestones it observes.
+fn invoke_binding_workflow(rule: &RuleDecl, binding: &str) -> Option<String> {
+    for statement in workflow_invoke_statements(&rule.body.text) {
+        let (target, _) = invoke_statement_parts(&statement)?;
+        if let Some(as_binding) = binding_after_as(&statement) {
+            if as_binding == binding {
+                return Some(target.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Resolves the payload class of a child milestone for `after <binding> reaches
+/// "<milestone>"`: follow `binding` to its invoked workflow, then look up the
+/// milestone in that workflow's declared set. `Some("")` means the milestone is
+/// declared but payload-less; `None` means undeclared (reject) or unresolvable.
+fn milestone_payload_class(
+    rule: &RuleDecl,
+    binding: &str,
+    milestone: &str,
+    semantic: &SemanticContext,
+) -> Option<String> {
+    let workflow = invoke_binding_workflow(rule, binding)?;
+    let surface = semantic.workflow_inputs.get(&workflow)?;
+    surface.milestones.get(milestone).cloned()
+}
+
+/// Parses `emit milestone "<name>" [of <Class>]` headers out of a rule body's
+/// text, returning (name, class) pairs (class is empty for a bare milestone).
+/// Text-based to mirror the other body scanners (`workflow_invoke_statements`)
+/// and stay independent of flow-vs-rule body provenance.
+fn milestone_emissions_in_body(body: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for raw in body.lines() {
+        let trimmed = raw.trim();
+        let Some(rest) = trimmed.strip_prefix("emit milestone ") else {
+            continue;
+        };
+        // The name is a quoted string literal; take the text between the first
+        // pair of quotes.
+        let rest = rest.trim_start();
+        if !rest.starts_with('"') {
+            continue;
+        }
+        let Some(close) = rest[1..].find('"') else {
+            continue;
+        };
+        let name = rest[1..=close].to_owned();
+        let after_name = rest[close + 2..].trim_start();
+        let class = after_name
+            .strip_prefix("of ")
+            .map(|tail| {
+                tail.trim_start()
+                    .split(|c: char| c.is_whitespace() || c == '{')
+                    .next()
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .unwrap_or_default();
+        out.push((name, class));
+    }
+    out
 }
 
 fn schema_index_for_items(items: &[Item]) -> SchemaIndex {
@@ -6604,6 +6808,28 @@ fn analyze_rule(
         let Some(predicate) = words.next() else {
             continue;
         };
+        // `after p reaches "<name>" as m` (Family C): the milestone name sits
+        // between the predicate and `as`, so the alias lands one token later.
+        // Type `m` to the child's declared milestone payload class.
+        if predicate == "reaches" {
+            let Some(quoted) = words.next() else {
+                continue;
+            };
+            let milestone = quoted.trim_matches('"');
+            let (Some("as"), Some(alias)) = (words.next(), words.next()) else {
+                continue;
+            };
+            let alias = alias.trim_end_matches('{').trim();
+            if alias.is_empty() {
+                continue;
+            }
+            if let Some(class) = milestone_payload_class(rule, binding, milestone, semantic) {
+                if !class.is_empty() {
+                    binding_types.insert(alias.to_owned(), class);
+                }
+            }
+            continue;
+        }
         // `times out` is the only two-token predicate; skip its second word so
         // the `as <alias>` clause lines up.
         if predicate == "times" && words.next() != Some("out") {
@@ -6674,6 +6900,7 @@ fn analyze_rule(
     validate_effect_payloads(rule, semantic, &binding_types, &known_roots, diagnostics);
     validate_effect_field_roots(rule, &body_ast.statements, &known_roots, diagnostics);
     validate_workflow_invocations(rule, semantic, &binding_types, &known_roots, diagnostics);
+    validate_milestone_statements(rule, semantic, diagnostics);
     let mut block_stack: Vec<BlockFrame> = Vec::new();
     let mut misplaced_effect_bindings = BTreeSet::new();
     seed_ast_only_effect_bindings(&body_ast.statements, &mut seen_bindings, &mut binding_types);
@@ -7760,6 +7987,13 @@ fn walk_effects(
                     | body::AfterPredicate::Contended
                     | body::AfterPredicate::Ok
                     | body::AfterPredicate::Over => DependencyPredicate::Completes,
+                    // `reaches "<name>"` (Family C) is completion-shaped for the
+                    // construct-graph provenance edge; the milestone-specific
+                    // gating happens at runtime against the
+                    // `workflow.invoke.reached:<name>` fact (text-keyed, see
+                    // `fact_matches_after_predicate`), so this IR predicate is
+                    // metadata only.
+                    body::AfterPredicate::Reaches => DependencyPredicate::Completes,
                 };
                 after_stack.push((after.binding.clone(), predicate));
                 walk_effects(
@@ -11254,6 +11488,15 @@ fn validate_conditioned_field_reads(
                 allowed,
                 diagnostics,
             ),
+            body::BodyStmt::Milestone { fields, span, .. } => check_conditioned_reads_in_fields(
+                rule,
+                fields,
+                *span,
+                semantic,
+                binding_types,
+                allowed,
+                diagnostics,
+            ),
             body::BodyStmt::Done { .. }
             | body::BodyStmt::Cancel { .. }
             | body::BodyStmt::Effect(_) => {}
@@ -11893,6 +12136,7 @@ fn collect_all_binding_names(statements: &[body::BodyStmt], out: &mut BTreeSet<S
             body::BodyStmt::Record(_)
             | body::BodyStmt::Done { .. }
             | body::BodyStmt::Terminal(_)
+            | body::BodyStmt::Milestone { .. }
             | body::BodyStmt::Cancel { .. } => {}
         }
     }
@@ -13669,6 +13913,21 @@ fn parse_after_line(line: &str) -> Option<(String, DependencyPredicate)> {
         // Coordination outcomes (spec/coordination.md) are completion-valued;
         // the arm dispatch happens on the outcome variant at lowering.
         "completes" | "held" | "contended" | "ok" | "over" => DependencyPredicate::Completes,
+        // `after p reaches "<name>" [as m]` (Family C): consume the quoted
+        // milestone name; the IR predicate is completion-shaped (runtime gating
+        // keys on the milestone-specific `reached` fact).
+        "reaches" => {
+            let name = parts.next()?;
+            if !(name.starts_with('"') && name.ends_with('"') && name.len() >= 2) {
+                return None;
+            }
+            match (parts.next(), parts.next(), parts.next()) {
+                (None, None, None) => {}
+                (Some("as"), Some(alias), None) if is_identifier(alias) => {}
+                _ => return None,
+            }
+            return Some((binding, DependencyPredicate::Completes));
+        }
         _ => return None,
     };
     match (parts.next(), parts.next(), parts.next()) {

@@ -25786,6 +25786,43 @@ fn run_workflow_invoke_effect(
             "workflow.invoke.completed",
         ])),
     )?;
+
+    // Family C (poll delivery): observe every milestone the child projected and
+    // re-derive it as a `workflow.invoke.reached:<name>` fact in the parent's own
+    // base, keyed by the parent effect id so a sibling `after p reaches "<name>"`
+    // reacts. Idempotent via fact_id (instance+effect+reached-name) — a milestone
+    // is delivered exactly once. A milestone the child never emitted yields no
+    // fact (terminal-only observation). See discriminated-families-design.md 7.3.
+    let child_store = SqliteStore::open(store_path)?;
+    for fact in child_store.list_facts(&child_instance_id)? {
+        let Some(milestone) = fact.name.strip_prefix("workflow.milestone:") else {
+            continue;
+        };
+        let child_payload = json_from_str(&fact.value_json);
+        let reached_name = format!("workflow.invoke.reached:{milestone}");
+        let reached_value = json!({
+            "effect_id": effect.effect_id,
+            "run_id": run_id,
+            "child_instance_id": child_instance_id,
+            "target_workflow": target_workflow,
+            "status": "completed",
+            "milestone": milestone,
+            "value": child_payload.get("value").cloned().unwrap_or(Value::Null),
+        })
+        .to_string();
+        kernel.derive_fact(
+            instance_id,
+            &reached_name,
+            &effect.effect_id,
+            &reached_value,
+            Some(&terminal_event.event_id),
+            Some(&idempotency_key(&[
+                instance_id,
+                &effect.effect_id,
+                &reached_name,
+            ])),
+        )?;
+    }
     Ok(terminal_event)
 }
 
@@ -30621,6 +30658,46 @@ fn lower_rule(
         });
     }
 
+    // Family C: `emit milestone "<name>" of <Class> { ... }` derives a durable
+    // `workflow.milestone:<name>` fact in the child's own base — a synchronous
+    // projection (NOT an async effect). The observing parent's invoke effect
+    // later reads these and re-derives `workflow.invoke.reached:<name>` facts.
+    for block in milestone_blocks(&pre_terminal_body) {
+        let payload = if block.body.trim().is_empty() {
+            serde_json::Map::new()
+        } else {
+            parse_record_fields(&block.body, &context, None, &mut lowering.errors)
+        };
+        let fact_name = format!("workflow.milestone:{}", block.name);
+        let value_json = json!({
+            "milestone": block.name,
+            "status": "completed",
+            "value": Value::Object(payload),
+        })
+        .to_string();
+        // One fact per (instance, rule, milestone, context) — idempotent across
+        // re-evaluations; the milestone name is in the key so distinct
+        // milestones never collide.
+        let fact_key = idempotency_key(&[instance_id, &rule.name, &fact_name]);
+        let fact_id = idempotency_key(&[instance_id, &rule.name, &fact_name, &fact_key]);
+        if existing_fact_ids
+            .iter()
+            .any(|existing| *existing == fact_id)
+        {
+            continue;
+        }
+        lowering.facts.push(OwnedFact {
+            fact_id,
+            name: fact_name,
+            key: fact_key,
+            value_json,
+            schema_id: None,
+            provenance_class: "rule".to_owned(),
+            correlation_id: context.identity.clone(),
+            source_span_json: None,
+        });
+    }
+
     let mut parsed_effects = parse_effect_statements(&pre_terminal_body, &context);
     rewrite_lease_releases(&mut parsed_effects, &rule.body);
     let parsed_effects = parsed_effects;
@@ -33408,6 +33485,94 @@ fn inline_block_body(line: &str) -> Option<String> {
     Some(line[open + 1..close].trim().to_owned())
 }
 
+/// A child-projected milestone (`emit milestone "<name>" [of <Class>] { fields }`,
+/// Family C). The runtime derives one durable `workflow.milestone:<name>` fact per
+/// block in the child's own base; the parent's invoke effect later observes it.
+struct MilestoneBlock {
+    name: String,
+    body: String,
+}
+
+/// Extracts top-level `emit milestone` projections from a rule body (skipping
+/// `after` blocks, which are processed in the after-pass). Mirrors
+/// `top_level_record_blocks`.
+fn milestone_blocks(body: &str) -> Vec<MilestoneBlock> {
+    let mut blocks = Vec::new();
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut index = 0;
+    let mut skip_depth = 0i32;
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        if skip_depth > 0 {
+            skip_depth += brace_delta(trimmed);
+            index += 1;
+            continue;
+        }
+        if trimmed.starts_with("after ") {
+            skip_depth += brace_delta(trimmed).max(1);
+            index += 1;
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("emit milestone ") else {
+            index += 1;
+            continue;
+        };
+        let Some((name, _class)) = parse_milestone_header(rest) else {
+            index += 1;
+            continue;
+        };
+        // Bare milestone (no `{ }`): a payload-less projection.
+        if !trimmed.contains('{') {
+            blocks.push(MilestoneBlock {
+                name,
+                body: String::new(),
+            });
+            index += 1;
+            continue;
+        }
+        if let Some(inner) = inline_block_body(trimmed) {
+            blocks.push(MilestoneBlock { name, body: inner });
+            index += 1;
+            continue;
+        }
+        let mut milestone_lines = Vec::new();
+        let mut depth = brace_delta(trimmed);
+        index += 1;
+        while index < lines.len() && depth > 0 {
+            let line = lines[index];
+            let before = depth;
+            depth += brace_delta(line);
+            if !(before == 1 && depth == 0 && line.trim() == "}") {
+                milestone_lines.push(line.to_owned());
+            }
+            index += 1;
+        }
+        blocks.push(MilestoneBlock {
+            name,
+            body: milestone_lines.join("\n"),
+        });
+    }
+    blocks
+}
+
+/// Parses `"<name>" [of <Class>]` from an `emit milestone ` statement tail,
+/// returning (name, optional class).
+fn parse_milestone_header(rest: &str) -> Option<(String, Option<String>)> {
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let close = rest.find('"')?;
+    let name = rest[..close].to_owned();
+    let after = rest[close + 1..].trim_start();
+    let class = after.strip_prefix("of ").map(|tail| {
+        tail.trim_start()
+            .split(|c: char| c.is_whitespace() || c == '{')
+            .next()
+            .unwrap_or("")
+            .to_owned()
+    });
+    Some((name, class))
+}
+
 fn top_level_terminal_blocks(body: &str) -> Vec<TerminalBlock> {
     let mut blocks = Vec::new();
     let lines = body.lines().collect::<Vec<_>>();
@@ -33580,6 +33745,20 @@ fn parse_after_header(rest: &str) -> Option<(String, String, Option<String>)> {
     let mut parts = before_body.split_whitespace();
     let binding = parts.next()?.to_owned();
     let predicate = parts.next()?.to_owned();
+    // `after p reaches "<name>" [as m]` (Family C): fold the quoted milestone
+    // name into the predicate string as `reaches:<name>` so the downstream
+    // matcher keys on the milestone-specific `workflow.invoke.reached:<name>`
+    // fact. The name lives in the predicate (not a separate slot) to reuse the
+    // existing (binding, predicate, alias) plumbing untouched everywhere else.
+    if predicate == "reaches" {
+        let name = parts.next()?.trim_matches('"').to_owned();
+        let alias = match (parts.next(), parts.next(), parts.next()) {
+            (None, None, None) => None,
+            (Some("as"), Some(alias), None) if is_identifier(alias) => Some(alias.to_owned()),
+            _ => return None,
+        };
+        return Some((binding, format!("reaches:{name}"), alias));
+    }
     let alias = match (parts.next(), parts.next(), parts.next()) {
         (None, None, None) => None,
         (Some("as"), Some(alias), None) if is_identifier(alias) => Some(alias.to_owned()),
@@ -33680,6 +33859,15 @@ fn fact_matches_after_predicate(name: &str, payload: &Value, predicate: &str) ->
                     || status == Some("completed"))
         }
         "fails" => name.ends_with(".failed") || matches!(status, Some("failed" | "timed_out")),
+        // `reaches:<name>` (Family C): the parent's invoke effect derives a
+        // `workflow.invoke.reached:<name>` fact for each child milestone it
+        // observed. Match exactly that milestone (never the terminal facts), so a
+        // milestone the child never emitted produces no reaction (terminal-only
+        // observation).
+        reaches if reaches.starts_with("reaches:") => {
+            let milestone = &reaches["reaches:".len()..];
+            name == format!("workflow.invoke.reached:{milestone}")
+        }
         // Coordination outcomes (spec/coordination.md): the op completed and
         // its sum-typed value carries the matching variant.
         "held" | "contended" | "ok" | "over" => {
