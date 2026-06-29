@@ -24138,6 +24138,115 @@ source clock as heartbeat {
     }
 
     #[test]
+    fn milestone_reaches_rejects_undeclared_milestone() {
+        // Family C terminal-only observation invariant: a parent cannot observe a
+        // milestone the invoked child never declares.
+        let source = r#"
+workflow Parent {
+  input task Task
+  class Task { title string }
+  class Saw { note string }
+
+  rule dispatch when Task as task => {
+    invoke Child { task { title task.title } } as child
+    after child reaches "never_declared" as m {
+      record Saw { note m.note }
+    }
+  }
+}
+
+workflow Child {
+  input task Task
+  output result R
+  class Task { title string }
+  class R { title string }
+  class P { note string }
+
+  rule go when Task as task => {
+    emit milestone "actually_declared" of P { note task.title }
+    complete result { title task.title }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Parent"));
+        assert!(
+            compiled.diagnostics.iter().any(|d| d.message.contains(
+                "reaches milestone `never_declared` that workflow `Child` does not declare"
+            )),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn emit_milestone_rejects_unknown_payload_class() {
+        let source = r#"
+workflow Child {
+  input task Task
+  output result R
+  class Task { title string }
+  class R { title string }
+
+  rule go when Task as task => {
+    emit milestone "m1" of Nonexistent { note task.title }
+    complete result { title task.title }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.iter().any(|d| d
+                .message
+                .contains("emits milestone `m1` with unknown payload class `Nonexistent`")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn milestone_reaches_accepts_declared_milestone() {
+        // The positive control: a declared milestone is accepted (no
+        // reject-undeclared / unknown-class diagnostics).
+        let source = r#"
+workflow Parent {
+  input task Task
+  class Task { title string }
+  class Saw { note string }
+
+  rule dispatch when Task as task => {
+    invoke Child { task { title task.title } } as child
+    after child reaches "halfway" as m {
+      record Saw { note m.note }
+    }
+  }
+}
+
+workflow Child {
+  input task Task
+  output result R
+  class Task { title string }
+  class R { title string }
+  class P { note string }
+
+  rule go when Task as task => {
+    emit milestone "halfway" of P { note task.title }
+    complete result { title task.title }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Parent"));
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("reaches milestone")
+                    || d.message.contains("unknown payload class")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
     fn recurring_clock_source_requires_missed() {
         let source = r#"
 workflow NeedsMissed
