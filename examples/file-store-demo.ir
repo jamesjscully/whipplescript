@@ -22,13 +22,13 @@ rules
       schema:Wrote
     effects
       written kind=file.write binding=written key=69c052e4ac5ac811
-    body_hash ae144b8402954777
+    body_hash a3e73a009d0fee04
   rule read_note
     when Wrote as wrote
     reads
       schema:Wrote
     effects
       loaded kind=file.read binding=loaded key=5c9d19a02da2ed23
-    body_hash a46847123124a6e2
+    body_hash 30ffacebe759990f
 rule_dependencies
   write_note --schema:Wrote--> read_note

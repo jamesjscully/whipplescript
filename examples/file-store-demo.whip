@@ -42,7 +42,7 @@ rule write_note
 
   after written fails as write_error {
     fail error {
-      reason write_error.message
+      reason write_error.reason
     }
   }
 }
@@ -60,7 +60,7 @@ rule read_note
 
   after loaded fails as read_error {
     fail error {
-      reason read_error.message
+      reason read_error.reason
     }
   }
 }

@@ -4958,6 +4958,10 @@ impl SchemaIndex {
                 ("summary", string_ty()),
                 ("effect_id", string_ty()),
                 ("run_id", string_ty()),
+                // DR-0032: `kind` names the failing effect — the `EffectError` base
+                // field that lets a future runtime union dispatch and that
+                // telemetry reads. Static narrowing does not require it.
+                ("kind", string_ty()),
             ],
         );
         index.insert_class(
@@ -6857,11 +6861,15 @@ fn analyze_rule(
             "cancelled" => {
                 binding_types.insert(alias.to_owned(), "TerminalCancelled".to_owned());
             }
-            // The `fails` branch carries the effect's FAILURE payload (e.g. an
-            // `exec` failure's `.message`, a `coerce`/workflow failure's
-            // `.reason`), never the completed success schema — so it must not
-            // inherit the success payload type.
-            "fails" => {}
+            // DR-0032: the `fails` branch binds the EffectError BASE — every
+            // effect's `.failed` fact now carries `value: {reason, summary,
+            // effect_id, run_id, kind}` (the `TerminalFailed` base schema). Per-kind
+            // failure extras (exec `exit_code`, …) are deferred behind static
+            // effect-kind narrowing (a future variant), so the base is what is
+            // typed today. This replaces the prior untyped no-op.
+            "fails" => {
+                binding_types.insert(alias.to_owned(), "TerminalFailed".to_owned());
+            }
             _ => {
                 if let Some(IrType::Ref(schema)) = effect_payload_types.get(binding) {
                     binding_types.insert(alias.to_owned(), schema.clone());
@@ -24135,6 +24143,77 @@ source clock as heartbeat {
             other => panic!("expected duration recurrence, got {other:?}"),
         }
         assert_eq!(ir.sources[0].missed, Some(MissedPolicy::Skip));
+    }
+
+    #[test]
+    fn fails_binding_types_to_effecterror_base() {
+        // DR-0032: `after <effect> fails as f` types `f` to the EffectError base
+        // (TerminalFailed: reason, summary, effect_id, run_id, kind). The base
+        // fields read cleanly.
+        let source = r#"
+workflow W {
+  input task T
+  output result R
+  failure error E
+  class T { x string }
+  class R { y string }
+  class E { reason string detail string }
+
+  rule go when T as task => {
+    exec "true" as e
+    after e fails as f {
+      fail error { reason f.reason detail f.kind }
+    }
+    after e succeeds {
+      complete result { y task.x }
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("invalid field path")),
+            "base fields should type-check: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn fails_binding_rejects_non_base_field() {
+        // The teeth of DR-0032 base typing: a non-base field read on the failure
+        // binding is a check error (extras are deferred behind narrowing).
+        let source = r#"
+workflow W {
+  input task T
+  output result R
+  failure error E
+  class T { x string }
+  class R { y string }
+  class E { reason string }
+
+  rule go when T as task => {
+    exec "true" as e
+    after e fails as f {
+      fail error { reason f.exit_code }
+    }
+    after e succeeds {
+      complete result { y task.x }
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("invalid field path `f.exit_code`")),
+            "{:?}",
+            compiled.diagnostics
+        );
     }
 
     #[test]

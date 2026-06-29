@@ -32,6 +32,6 @@ rules
       schema:Artifact
     effects
       check kind=exec.command binding=check key=9f679eb8f308ab6b
-    body_hash f3466d1085e662f8
+    body_hash b04c86aba98f210d
 rule_dependencies
   table_artifacts --schema:Artifact--> validate_artifact_script

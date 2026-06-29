@@ -1842,6 +1842,21 @@ impl RuntimeKernel {
     ) -> StoreResult<()> {
         let status = loft_status(&result.status);
         let fact_name = loft_fact_name(execution.request.action, &result.status);
+        let succeeded = matches!(result.status, LoftEffectStatus::Succeeded);
+        let summary = redacted_provider_summary(&result.summary);
+        // DR-0032: failure `value` is the EffectError base; success keeps the op
+        // output.
+        let value_field = if succeeded {
+            result_value_payload(true, result.value_json.as_deref())
+        } else {
+            Some(effect_failure_base(
+                execution.request.action.effect_kind(),
+                &failure_reason_of(result.error_json.as_deref(), &summary),
+                &summary,
+                execution.effect_id,
+                execution.run_id,
+            ))
+        };
         let value = json!({
             "effect_id": execution.effect_id,
             "run_id": execution.run_id,
@@ -1850,12 +1865,9 @@ impl RuntimeKernel {
             "lease_id": execution.request.lease_id,
             "command_id": execution.request.command_id,
             "status": status,
-            "value": result_value_payload(
-                matches!(result.status, LoftEffectStatus::Succeeded),
-                result.value_json.as_deref(),
-            ),
+            "value": value_field,
             "error": result_error_payload(result.error_json.as_deref()),
-            "summary": redacted_provider_summary(&result.summary),
+            "summary": summary,
         })
         .to_string();
         self.store.append_event(NewEvent {
@@ -1942,18 +1954,31 @@ impl RuntimeKernel {
             CoerceStatus::Failed => "coerce.failed",
             CoerceStatus::TimedOut => "coerce.timed_out",
         };
+        let succeeded = matches!(result.status, CoerceStatus::Succeeded);
+        let summary = redacted_provider_summary(&result.summary);
+        // DR-0032: on failure, `value` is the EffectError base (what `after f fails
+        // as e` binds); on success it is the coerced output. The prior `null` on
+        // failure shadowed the error blob, so the bound value was unreadable.
+        let value_field = if succeeded {
+            result_value_payload(true, result.value_json.as_deref())
+        } else {
+            Some(effect_failure_base(
+                "coerce",
+                &failure_reason_of(result.error_json.as_deref(), &summary),
+                &summary,
+                execution.effect_id,
+                execution.run_id,
+            ))
+        };
         let value = json!({
             "effect_id": execution.effect_id,
             "run_id": execution.run_id,
             "function_name": execution.request.function_name,
             "status": status,
             "output_type": execution.request.output_type,
-            "value": result_value_payload(
-                matches!(result.status, CoerceStatus::Succeeded),
-                result.value_json.as_deref(),
-            ),
+            "value": value_field,
             "error": result_error_payload(result.error_json.as_deref()),
-            "summary": redacted_provider_summary(&result.summary),
+            "summary": summary,
         })
         .to_string();
         self.store.append_event(NewEvent {
@@ -2206,17 +2231,37 @@ impl RuntimeKernel {
     ) -> StoreResult<()> {
         let status = provider_status(&result.status);
         let fact_name = format!("agent.turn.{status}");
-        let payload = json!({
+        let summary = redacted_provider_summary(&result.summary);
+        let mut payload_value = json!({
             "effect_id": execution.effect_id,
             "run_id": execution.run_id,
             "agent": execution.agent,
             "provider": execution.provider,
             "status": status,
-            "summary": redacted_provider_summary(&result.summary),
+            "summary": summary,
             "exit_code": result.exit_code,
             "failure": result.failure.as_ref().map(provider_failure_json),
-        })
-        .to_string();
+        });
+        // DR-0032: a failed turn carries the EffectError base under `value` (what
+        // `after turn fails as f` binds); the rich provider blob stays under
+        // `failure`. Success has no `value` here (the turn output is read via the
+        // whole payload), so we add `value` only on failure to avoid a null shadow.
+        if let Some(failure) = result.failure.as_ref() {
+            let reason = provider_failure_summary_message(&failure.message);
+            if let Some(object) = payload_value.as_object_mut() {
+                object.insert(
+                    "value".to_owned(),
+                    effect_failure_base(
+                        "agent.tell",
+                        &reason,
+                        &summary,
+                        execution.effect_id,
+                        execution.run_id,
+                    ),
+                );
+            }
+        }
+        let payload = payload_value.to_string();
         let fact_id = idempotency_key(&[execution.instance_id, "agent-turn", execution.run_id]);
         let fact_event_key =
             idempotency_key(&[execution.instance_id, execution.run_id, "agent-turn-fact"]);
@@ -2962,6 +3007,44 @@ fn result_value_payload(succeeded: bool, source: Option<&str>) -> Option<Value> 
 
 fn result_error_payload(source: Option<&str>) -> Option<Value> {
     source.map(json_payload_summary)
+}
+
+/// The `EffectError` base object (DR-0032) that `after <effect> fails as f` binds.
+/// Every effect kind's `.failed` fact carries this under its `value` key so the
+/// bound `f` is uniform: `reason`/`summary` are the human-facing failure text,
+/// `effect_id`/`run_id` locate the run, `kind` names the effect. Per-kind extras are
+/// kept elsewhere on the fact (raw, telemetry) and are not read by `f` until a
+/// variant exposes them.
+fn effect_failure_base(
+    kind: &str,
+    reason: &str,
+    summary: &str,
+    effect_id: &str,
+    run_id: &str,
+) -> Value {
+    json!({
+        "reason": reason,
+        "summary": summary,
+        "effect_id": effect_id,
+        "run_id": run_id,
+        "kind": kind,
+    })
+}
+
+/// The human-facing failure text for the base `reason`, pulled from an effect's
+/// error blob (`reason` or `message`, whichever it uses), falling back to the
+/// run summary when the blob carries neither.
+fn failure_reason_of(error_json: Option<&str>, fallback: &str) -> String {
+    error_json
+        .map(json_from_str)
+        .and_then(|value| {
+            value
+                .get("reason")
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| fallback.to_owned())
 }
 
 fn sanitized_provider_artifact_metadata(

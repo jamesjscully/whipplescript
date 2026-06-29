@@ -53,7 +53,7 @@ rule validate_artifact_script
 
   after check fails as failure {
     fail error {
-      reason failure.message
+      reason failure.reason
     }
   }
 }

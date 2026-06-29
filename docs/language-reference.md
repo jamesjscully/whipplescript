@@ -578,7 +578,7 @@ becomes an effect, and a later rule branches on its completion.
 | `consume <counter> for <key> amount <expr> as x` | Consume from a bounded counter; branch on `ok` or `over`. |
 | `invoke Workflow { ... } as x` | Start a durable child workflow. |
 | `after x succeeds as y { ... }` | Run when effect `x` completes successfully. |
-| `after x fails as y { ... }` | Run when effect `x` fails. |
+| `after x fails as y { ... }` | Run when effect `x` fails; `y` binds the failure base (see below). |
 | `after x completes { ... }` | Run on any terminal status of `x`. |
 | `emit milestone "<name>" of <Class> { ... }` | Project a named, durable milestone mid-flight for an observing parent (Family C). |
 | `after p reaches "<name>" as m { ... }` | Run when invoked child `p` projects milestone `<name>`; `m` binds its payload. |
@@ -597,6 +597,25 @@ events through ordinary effects and the facts their completions derive.
 Binding names introduced with `as` must not shadow operation keywords —
 `done`, `record`, `tell`, `complete`, `fail`, and the rest are rejected as
 binding names.
+
+### Typed effect failures (`after x fails as f`)
+
+When you bind a failure with `after x fails as f`, `f` carries a uniform **failure
+base** — the same shape for every effect kind:
+
+| Field | Meaning |
+|---|---|
+| `f.reason` | The human-facing failure text. |
+| `f.summary` | A short summary (often the same as `reason`). |
+| `f.effect_id` / `f.run_id` | Identifiers locating the failed effect run. |
+| `f.kind` | The failing effect kind (e.g. `"exec"`, `"coerce"`, `"workflow.invoke"`). |
+
+Reading any other field off `f` is a check error — effect-specific failure detail
+(an `exec` exit code, a provider error code) is **not** exposed yet; it is reserved
+for a future per-kind refinement and only reachable once that lands. Use `f.reason`
+for the failure text regardless of which effect failed. (Design: DR-0032 — effect
+failure is the `EffectError` discriminated family; the base is committed, per-kind
+extras are deferred behind narrowing.)
 
 ### Child-milestone lifecycle (`emit milestone` / `after ... reaches`)
 

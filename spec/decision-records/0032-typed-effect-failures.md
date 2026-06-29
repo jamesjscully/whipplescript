@@ -1,6 +1,9 @@
 # DR-0032 — Typed effect failures (the `EffectError` family)
 
-Status: **proposed (2026-06-29).** Design decided in principle; staged model-first.
+Status: **v1 SHIPPED (2026-06-29).** Base typing landed end-to-end on
+`infoflow-design` (all gates green): model-first layer + wire base-unification +
+`fails`-binds-the-base + docs. Per-effect variant extras + the runtime union remain
+deferred (additive). Originally proposed + staged model-first.
 Generalizes the terminal-outcome `Failed` tag into a discriminated family over
 effect kinds. Builds on the shipped narrowing core (discriminated-families-design.md
 Stage 1a) — this record adds a *family*, it does **not** add narrowing. Intersects
@@ -158,15 +161,26 @@ every narrowed scope), which is what makes the un-narrowed base read total.
 
 Model-first, each piece through the per-piece review gate:
 
-1. **This ADR** (the design + deferred scope). ← first.
-2. **Formal models** (`effect-error.maude` + the Lean lemma), wired into
-   `scripts/check-formal-models.sh` / `check-lean-models.sh`.
-3. **Wire base-unification (step 1/2 of the prior framing):** additive base on every
-   effect failure fact + fixture/golden migration. The breaking-now-free move; can
-   land early since it is independently good.
-4. **Base typing (step 3):** `fails as f` → the base; delete the `"fails" => {}`
-   no-op; corpus migration of `f.message` → `f.reason`.
-5. **Docs** (language-reference failure section) + per-piece gate green.
+1. **This ADR** (the design + deferred scope). ✅ DONE.
+2. **Formal models** ✅ DONE — `effect-error.maude` (4 Sol / 3 No-sol, gated) +
+   `Whipple/EffectError.lean` (base⊆variant, un-narrowed totality,
+   extras-behind-narrowing, additivity; no proof holes).
+3. **Wire base-unification** ✅ DONE — every `.failed` fact carries
+   `value:{reason,summary,effect_id,run_id,kind}` across all ~9 sites (kernel
+   Coerce/Loft/AgentTell + cli Capability×2/File×4/Exec/Queue/WorkflowInvoke) via
+   `effect_failure_base`; the `value:null` shadow (Coerce/Capability) is fixed; the
+   EventNotify failure-fact gap is closed. `.ir` goldens regenerated (3 migrated
+   examples; `kind` added no churn).
+4. **Base typing** ✅ DONE — `after x fails as f` types `f` to `TerminalFailed`
+   (the base, now with `kind`); the `"fails" => {}` no-op is replaced. Corpus
+   migrated (`f.message` → `f.reason` in exec-json-ingest / file-store-demo /
+   deterministic-validation). Tests: parser `fails_binding_types_to_effecterror_base`
+   + `fails_binding_rejects_non_base_field`; runtime
+   `failed_effect_binds_effecterror_base_reason` (the value-shadow fix, e2e).
+5. **Docs** ✅ DONE — language-reference "Typed effect failures" section + op-table.
+
+Gates green: parser 217, bin 284, control_plane 155, soft_middle 53, effect-error
+maude + Lean, fmt, docs-examples.
 
 Deferred slices (each its own future gate, demand-driven): per-effect variant field
 sets (with IFC review), and — only if a statically-unknown-kind failure value ever

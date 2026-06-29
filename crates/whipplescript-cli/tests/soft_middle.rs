@@ -263,6 +263,84 @@ rule give_up
     let _ = fs::remove_file(source);
 }
 
+/// DR-0032: a failed effect's `.failed` fact carries the EffectError base under
+/// `value`, so `after <effect> fails as f` binds `f.reason` to the actual failure
+/// text — not `null` (the prior value-shadow bug, where facts with `value: null`
+/// resolved the binding to null and shadowed the error). `--fail` forces the
+/// fixture turn to fail; the rule writes `f.reason` into the workflow failure.
+#[test]
+fn failed_effect_binds_effecterror_base_reason() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("effecterror-reason", "sqlite");
+    let source = temp_path("effecterror-reason", "whip");
+    fs::write(
+        &source,
+        r#"
+workflow W
+
+failure error E
+
+class Trigger {
+  id string
+}
+
+class E {
+  detail string
+}
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+table triggers as Trigger [
+  { id "t" }
+]
+
+rule go
+  when Trigger as trig
+  when worker is available
+=> {
+  tell worker as turn "do it"
+
+  after turn fails as f {
+    fail error {
+      detail f.reason
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &["--fail"]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "failed");
+    let log = run_json(bin, &["--store", store_str, "--json", "log", instance]);
+    let failed = log
+        .as_array()
+        .expect("log")
+        .iter()
+        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("workflow.failed"))
+        .expect("failed event");
+    let detail = failed
+        .pointer("/payload/payload/detail")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        !detail.is_empty(),
+        "f.reason must bind the failure text (the EffectError base), not null; failed event: {failed:#?}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
 /// 503 auto-fail: an effect whose failure is unhandled in a self-terminating flow
 /// drives the workflow to a `failed` terminal (instead of stalling forever) via the
 /// generic internal-failure path — no author `on fails` handler, no typed `failure`

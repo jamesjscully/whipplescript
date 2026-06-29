@@ -23189,7 +23189,7 @@ fn run_capability_effect(
             "run_id": run_id,
             "target": effect.target,
             "status": "failed",
-            "value": null,
+            "value": effect_failure_base("capability.call", "fixture capability failure", "fixture capability failure", &effect.effect_id, &run_id),
             "error": {
                 "kind": "fixture_failure",
                 "message": "fixture capability failure"
@@ -23248,7 +23248,7 @@ fn run_capability_effect(
                 "run_id": run_id,
                 "target": effect.target,
                 "status": "failed",
-                "value": null,
+                "value": effect_failure_base("capability.call", &error, "fixture capability output validation failed", &effect.effect_id, &run_id),
                 "error": {
                     "kind": "provider_output_validation",
                     "message": error,
@@ -23527,6 +23527,28 @@ fn run_notify_effect(
                 "terminal",
             ])),
         })?;
+        // DR-0032: derive the `.failed` fact so `after <notify> fails as f` has
+        // something to bind (previously this path emitted no fact at all). `value`
+        // is the EffectError base.
+        kernel.derive_fact(
+            instance_id,
+            "event.notify.failed",
+            &effect.effect_id,
+            &json!({
+                "effect_id": effect.effect_id,
+                "run_id": run_id,
+                "status": "failed",
+                "value": effect_failure_base("event.notify", &reason, &reason, &effect.effect_id, &run_id),
+                "error": {"message": reason},
+            })
+            .to_string(),
+            Some(&terminal.event_id),
+            Some(&idempotency_key(&[
+                instance_id,
+                &effect.effect_id,
+                "notify-fact",
+            ])),
+        )?;
         return Ok(terminal);
     }
 
@@ -23745,6 +23767,7 @@ fn run_file_effect(
                     "effect_id": effect.effect_id,
                     "run_id": run_id,
                     "status": "failed",
+                    "value": effect_failure_base("file.read", &reason, &reason, &effect.effect_id, &run_id),
                     "error": { "message": reason },
                 })
                 .to_string(),
@@ -23905,6 +23928,7 @@ fn run_file_write_effect(
                     "effect_id": effect.effect_id,
                     "run_id": run_id,
                     "status": "failed",
+                    "value": effect_failure_base("file.write", &reason, &reason, &effect.effect_id, &run_id),
                     "error": { "message": reason },
                 })
                 .to_string(),
@@ -24199,6 +24223,7 @@ fn run_file_import_effect(
                     "effect_id": effect.effect_id,
                     "run_id": run_id,
                     "status": "failed",
+                    "value": effect_failure_base("file.import", &reason, &reason, &effect.effect_id, &run_id),
                     "error": { "message": reason },
                 })
                 .to_string(),
@@ -24457,6 +24482,7 @@ fn run_file_export_effect(
                     "effect_id": effect.effect_id,
                     "run_id": run_id,
                     "status": "failed",
+                    "value": effect_failure_base("file.export", &reason, &reason, &effect.effect_id, &run_id),
                     "error": { "message": reason },
                 })
                 .to_string(),
@@ -25107,6 +25133,7 @@ fn run_exec_effect(
                 "status": "failed",
                 "mode": mode,
                 "capability": capability,
+                "value": effect_failure_base("exec", &reason, &reason, &effect.effect_id, &run_id),
                 "error": {"message": reason},
             })
             .to_string();
@@ -25283,6 +25310,7 @@ fn run_queue_effect(
                 "effect_id": effect.effect_id,
                 "run_id": run_id,
                 "status": "failed",
+                "value": effect_failure_base(&effect.kind, &reason, &reason, &effect.effect_id, &run_id),
                 "error": {"message": reason},
             })
             .to_string();
@@ -25751,13 +25779,31 @@ fn run_workflow_invoke_effect(
             ])),
         })?,
     };
+    // DR-0032: on a non-success terminal the bound `value` (what `after p fails as
+    // f` reads) is the EffectError base; on success it is the child's output. The
+    // raw child terminal payload is preserved under `output`.
+    let bound_value = if status == "completed" {
+        value.clone()
+    } else {
+        let reason = value
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or(summary);
+        effect_failure_base(
+            "workflow.invoke",
+            reason,
+            summary,
+            &effect.effect_id,
+            &run_id,
+        )
+    };
     let value_json = json!({
         "effect_id": effect.effect_id,
         "run_id": run_id,
         "child_instance_id": child_instance_id,
         "target_workflow": target_workflow,
         "status": status,
-        "value": value,
+        "value": bound_value,
         "output": value,
         "summary": summary,
     })
@@ -33765,6 +33811,27 @@ fn parse_after_header(rest: &str) -> Option<(String, String, Option<String>)> {
         _ => return None,
     };
     Some((binding, predicate, alias))
+}
+
+/// The `EffectError` base object (DR-0032) every effect `.failed` fact carries
+/// under its `value` key, so a downstream `after <effect> fails as f` binds a
+/// uniform `f` with `{reason, summary, effect_id, run_id, kind}`. Per-kind extras
+/// (exit_code, stderr, …) stay elsewhere on the fact and are not read by `f` until a
+/// variant exposes them. Mirrors the kernel-side `effect_failure_base`.
+fn effect_failure_base(
+    kind: &str,
+    reason: &str,
+    summary: &str,
+    effect_id: &str,
+    run_id: &str,
+) -> Value {
+    json!({
+        "reason": reason,
+        "summary": summary,
+        "effect_id": effect_id,
+        "run_id": run_id,
+        "kind": kind,
+    })
 }
 
 fn effect_binding_value(
