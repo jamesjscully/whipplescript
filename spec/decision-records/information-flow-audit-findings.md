@@ -155,6 +155,30 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   pinpointing is a possible future nicety, not a soundness gap.
 - **H7 — Per-field / per-path labels.** Mixed-sensitivity stores must be split;
   labels attach to whole resources. **DEFERRED (recorded).**
+- **H8 — Signal triggers are invisible sources (fail-OPEN).** **OPEN — DECISION
+  RECORDED 2026-06-29.** Source *recognition* is hardcoded by kind: only
+  `when message from <channel>` (H3) and `when human answered` are tracked as
+  inbound read-sources; a `when <Signal> as e` trigger is recognized as *nothing*,
+  so under a governed envelope an untrusted signal driving a trusted sink is not
+  caught at all (a fail-OPEN hole, unlike the fail-closed defaults elsewhere).
+  Integrity itself is *not* kind-hardcoded — `integrity_authority` (ifc.rs:442)
+  reads the envelope and defaults `public`; the wart is recognition, not the value.
+  **Decision (Jack):** make source recognition *uniform* — a signal trigger is a
+  tracked read of a governed resource, integrity envelope-declared, default
+  `public`/low (fail-closed), as channels already work; this also makes the
+  discriminated-families §5.6 channel-2 **selector check** live (a Family-B signal
+  discriminant gating a crossing). Two stages: **(a) way-station —
+  signal-name-as-resource** (`signal:<name>`, governance-labelled, default low; the
+  small near-term slice; caveat: unlabeled internal peer signals default low and
+  need vouching until (b) lands — do not let anything subtle depend on per-name
+  labels); **(b) destination — emitter-carried integrity** (a signal carries the
+  emitting instance's label across the boundary; only *external-entry* information
+  is ever hand-classified, internal flows propagate automatically — the only model
+  whose labeling burden stays `O(external entry points)` and cannot leak via a
+  forgotten re-label). (b) is **owned by the W6 carriage / DR-0029 boundary-label
+  track** (an `emit signal X to <peer>` carrying the emitter's label *is* a labeled
+  output port), not by discriminated families. Full rationale: discriminated-
+  families-design.md §7.4 (DECISION 2026-06-29) and §5.6 channel 2.
 
 ### X — Cross-package governance obligations (new; see next section)
 - **X1–X8** — what packages must guarantee for governance to compose across them.
