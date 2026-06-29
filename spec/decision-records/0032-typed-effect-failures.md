@@ -172,15 +172,17 @@ Deferred slices (each its own future gate, demand-driven): per-effect variant fi
 sets (with IFC review), and — only if a statically-unknown-kind failure value ever
 arises — the runtime-caseable `EffectError` union.
 
-## Open questions
+## Resolved questions (Jack, 2026-06-29)
 
-1. **Base field set.** Is `{reason, summary, effect_id, run_id}` exactly right, or
-   does a `kind: string` belong in the base now (cheap, forward-compatible with a
-   future runtime union; useful for telemetry) even though static narrowing does not
-   require it? Leaning: include `kind` (harmless, future-proofing), exclude
-   everything else.
-2. **First variant as a proof-of-shape.** Do we ship *one* real variant (likely
-   `ExecFailure`, the richest) in the first build to exercise the
-   extras-behind-narrowing path end-to-end, or keep v1 strictly base-only and prove
-   the path with a fixture? Leaning: base-only v1 + a fixture that adds a stub
-   variant in the model, so the additive path is *modeled* before it is *built*.
+1. **Base field set — RESOLVED: include `kind: string` in the base now.** Base is
+   `{reason, summary, effect_id, run_id, kind}`. `kind` is harmless future-proofing
+   (forward-compatible with a future runtime union; useful for telemetry) even
+   though static narrowing does not require it. Nothing else is promoted to the base.
+2. **First variant — RESOLVED: base-only v1 + a *modeled* stub variant.** v1 ships
+   strictly base-only (no real per-effect extras). The extras-behind-narrowing path
+   is exercised in the **formal model** by a stub variant (a kind with one extra
+   field) so the additive path is *modeled* before it is *built*. The first real
+   variant lands later, demand-driven, with IFC review (Decision 4).
+3. **Static-narrow-only for v1 — BLESSED.** No runtime `EffectError` union / kind
+   tag in v1 (no site has a statically-unknown failing-effect kind); future
+   extension only.

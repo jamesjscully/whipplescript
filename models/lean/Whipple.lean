@@ -8,3 +8,4 @@ import Whipple.Staging
 import Whipple.CheckedDeclassify
 import Whipple.Narrowing
 import Whipple.Refinement
+import Whipple.EffectError
