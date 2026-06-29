@@ -580,6 +580,8 @@ becomes an effect, and a later rule branches on its completion.
 | `after x succeeds as y { ... }` | Run when effect `x` completes successfully. |
 | `after x fails as y { ... }` | Run when effect `x` fails. |
 | `after x completes { ... }` | Run on any terminal status of `x`. |
+| `emit milestone "<name>" of <Class> { ... }` | Project a named, durable milestone mid-flight for an observing parent (Family C). |
+| `after p reaches "<name>" as m { ... }` | Run when invoked child `p` projects milestone `<name>`; `m` binds its payload. |
 | `case value { Pattern => { ... } }` | Branch over a finite-domain or union value. |
 | `complete output { ... }` | Emit the declared workflow output; the instance completes. |
 | `fail failure { ... }` | Emit the declared failure payload; the instance fails. |
@@ -587,13 +589,58 @@ becomes an effect, and a later rule branches on its completion.
 `consume binding` is a deprecated alias for `done binding`; it compiles with
 a warning and will be removed — prefer `done`.
 
-The `emit` action has been removed from the language; using it is now a check
-error. Workflows append durable events through ordinary effects and the facts
-their completions derive.
+The bare `emit <name>` action has been removed from the language; `emit` must be
+followed by `signal` (directed event injection to a peer instance) or `milestone`
+(a child-milestone projection — see below). Workflows otherwise append durable
+events through ordinary effects and the facts their completions derive.
 
 Binding names introduced with `as` must not shadow operation keywords —
 `done`, `record`, `tell`, `complete`, `fail`, and the rest are rejected as
 binding names.
+
+### Child-milestone lifecycle (`emit milestone` / `after ... reaches`)
+
+A child workflow can project named, durable **milestones** that an invoking
+parent observes mid-flight — generalizing the terminal outcome family
+(`succeeds`/`fails`/`completes`) to a lifecycle family over states the child
+explicitly declares:
+
+```whip
+// in the child workflow
+class Progress { detail string }
+
+rule do_work when Task as task => {
+  emit milestone "work_started" of Progress { detail task.title }
+  tell worker as turn """..."""
+  after turn succeeds { complete result { ... } }
+}
+
+// in the parent workflow
+rule orchestrate when Task as task => {
+  invoke Child { task { title task.title } } as child
+
+  after child reaches "work_started" as m {   // m : Progress
+    record ParentProgress { note m.detail }
+  }
+  after child succeeds as r { complete result { ... } }
+}
+```
+
+Rules:
+
+- A milestone is *declared by emitting it*: `emit milestone "<name>" of <Class>`
+  names the projection and types its payload `<Class>`. The `of <Class>` clause
+  is optional for a payload-less milestone.
+- `after p reaches "<name>" as m` reacts when the invoked child `p` projects that
+  milestone; `m` binds the milestone payload. The terminal handlers
+  (`after p succeeds` / `fails`) are independent and unchanged — milestone
+  observation does not displace terminal observation.
+- The name in `reaches` must be one the invoked child actually declares; reaching
+  an undeclared milestone is a check error (a parent cannot observe a state the
+  child never projects — the *terminal-only observation* invariant).
+- Delivery is poll-based and exactly-once: the parent observes each emitted
+  milestone on a single derived fact; a milestone the child never emits produces
+  no reaction. Observation latency is bounded by the parent's invoke step.
 
 ### Turn-access grants
 

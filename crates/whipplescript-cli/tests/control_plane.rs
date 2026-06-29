@@ -11339,6 +11339,159 @@ workflow Child {
     let _ = fs::remove_file(workflow_path);
 }
 
+/// Family C (child-milestone lifecycle, discriminated-families-design.md 7.3): a
+/// child `emit milestone "<name>" of <Class>` projects a mid-flight milestone the
+/// parent observes via `after child reaches "<name>" as m`, binding the milestone
+/// payload, alongside the terminal — both through the unified after-machinery.
+#[test]
+fn dev_observes_child_milestone_via_reaches() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let workflow_path = temp_workflow_path("workflow-milestone");
+    fs::write(
+        &workflow_path,
+        r#"
+workflow Parent {
+  input task Task
+
+  class Task {
+    title string
+  }
+
+  class ParentSaw {
+    note string
+  }
+
+  class ParentDone {
+    title string
+  }
+
+  rule dispatch
+    when Task as task
+  => {
+    invoke Child { task { title task.title } } as child
+
+    after child reaches "halfway" as m {
+      record ParentSaw {
+        note m.note
+      }
+    }
+
+    after child succeeds as result {
+      record ParentDone {
+        title result.title
+      }
+    }
+  }
+}
+
+workflow Child {
+  input task Task
+  output result ChildResult
+
+  class Task {
+    title string
+  }
+
+  class ChildResult {
+    title string
+  }
+
+  class Progress {
+    note string
+  }
+
+  rule complete_child
+    when Task as task
+  => {
+    emit milestone "halfway" of Progress {
+      note task.title
+    }
+
+    complete result {
+      title task.title
+    }
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--input",
+            r#"{"task":{"title":"Milestone smoke"}}"#,
+            "--json",
+            "dev",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--root",
+            "Parent",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+
+    // The parent re-derived the milestone as a `reached` fact keyed by the
+    // milestone name, carrying the child's projected payload.
+    assert!(
+        facts.iter().any(|fact| {
+            fact.get("name").and_then(Value::as_str) == Some("workflow.invoke.reached:halfway")
+                && fact
+                    .get("value")
+                    .and_then(|value| value.get("value"))
+                    .and_then(|value| value.get("note"))
+                    .and_then(Value::as_str)
+                    == Some("Milestone smoke")
+        }),
+        "expected a workflow.invoke.reached:halfway fact, facts: {facts:#?}"
+    );
+
+    // The `after child reaches "halfway" as m` arm fired and bound `m.note`.
+    assert!(
+        facts.iter().any(|fact| {
+            fact.get("name").and_then(Value::as_str) == Some("ParentSaw")
+                && fact
+                    .get("value")
+                    .and_then(|value| value.get("note"))
+                    .and_then(Value::as_str)
+                    == Some("Milestone smoke")
+        }),
+        "expected the reaches arm to fire (ParentSaw), facts: {facts:#?}"
+    );
+
+    // The terminal is still observed independently (defense in depth: milestone
+    // observation does not displace terminal observation).
+    assert!(facts.iter().any(|fact| {
+        fact.get("name").and_then(Value::as_str) == Some("ParentDone")
+            && fact
+                .get("value")
+                .and_then(|value| value.get("title"))
+                .and_then(Value::as_str)
+                == Some("Milestone smoke")
+    }));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
 #[test]
 fn worker_resumes_running_workflow_invocation() {
     let bin = env!("CARGO_BIN_EXE_whip");
