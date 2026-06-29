@@ -839,6 +839,60 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
                 related: Vec::new(),
             });
         }
+
+        // NMIF-on-the-selector (DR §5.6 / §7.4): a crossing (`endorsed`/`declassified`)
+        // inside a `case <disc> { … }` arm whose discriminant is low-integrity is
+        // rejected — the attacker must not steer which declassify/endorse runs. The
+        // discriminant is low-integrity when its root binding comes from a
+        // low-integrity `when` source (an inbound message / a human answer).
+        let low_integrity_bindings: Vec<&str> = rule
+            .whens
+            .iter()
+            .filter_map(|when| {
+                let pattern = when.pattern.trim_start();
+                if !(pattern.starts_with("message from ") || pattern.starts_with("human answered"))
+                {
+                    return None;
+                }
+                let mut tokens = pattern.split_whitespace();
+                while let Some(token) = tokens.next() {
+                    if token == "as" {
+                        return tokens.next();
+                    }
+                }
+                None
+            })
+            .collect();
+        for effect in &rule.metadata.effects {
+            if !(effect.endorsed || effect.declassified) {
+                continue;
+            }
+            let Some((scrutinee, pattern)) = &effect.selected_by else {
+                continue;
+            };
+            let root = scrutinee.split('.').next().unwrap_or(scrutinee.as_str());
+            if low_integrity_bindings.contains(&root) {
+                let crossing = if effect.declassified {
+                    "declassify"
+                } else {
+                    "endorse"
+                };
+                diagnostics.push(Diagnostic {
+                    span: effect.span,
+                    message: format!(
+                        "integrity violation in rule `{rule}`: a {crossing} crossing is selected by \
+                         the low-integrity discriminant `{scrutinee}` (arm `{pattern}`) — an \
+                         attacker-steered crossing (NMIF-on-the-selector)",
+                        rule = rule.name,
+                    ),
+                    suggestion: Some(format!(
+                        "do not branch a crossing on untrusted `{scrutinee}`; gate the `case` on \
+                         high-integrity data, or endorse `{root}` before the `case`"
+                    )),
+                    related: Vec::new(),
+                });
+            }
+        }
     }
     diagnostics
 }

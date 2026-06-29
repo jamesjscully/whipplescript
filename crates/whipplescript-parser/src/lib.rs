@@ -1221,6 +1221,12 @@ pub struct IrEffectNode {
     /// `coerce` a confidentiality-lowering crossing (its output schema bounds the
     /// leak). Surfaced for audit. Not part of the `.ir` snapshot.
     pub declassified: bool,
+    /// The innermost `case <scrutinee> { <pattern> => … }` arm this effect sits in,
+    /// as `(scrutinee, pattern)` — the discriminated-families *selector*. Lets the
+    /// IFC checker apply NMIF-on-the-selector: a crossing (`endorsed`/`declassified`)
+    /// selected by a low-integrity discriminant is rejected (DR §5.6 / §7.4). `None`
+    /// for effects outside any `case`. Not part of the `.ir` snapshot.
+    pub selected_by: Option<(String, String)>,
 }
 
 /// A lowered turn-access grant: the granted operations narrow the turn's effective
@@ -6856,6 +6862,7 @@ fn analyze_rule(
                 agent: None,
                 endorsed: false,
                 declassified: false,
+                selected_by: None,
             });
         }
     }
@@ -7658,11 +7665,13 @@ fn collect_effects_from_ast(
     let mut dependencies = Vec::new();
     let mut counter = 0usize;
     let mut after_stack: Vec<(String, DependencyPredicate)> = Vec::new();
+    let mut case_stack: Vec<(String, String)> = Vec::new();
     walk_effects(
         statements,
         rule_name,
         &mut counter,
         &mut after_stack,
+        &mut case_stack,
         &mut effects,
         &mut dependencies,
     );
@@ -7674,6 +7683,7 @@ fn walk_effects(
     rule_name: &str,
     counter: &mut usize,
     after_stack: &mut Vec<(String, DependencyPredicate)>,
+    case_stack: &mut Vec<(String, String)>,
     effects: &mut Vec<IrEffectNode>,
     dependencies: &mut Vec<IrEffectDependency>,
 ) {
@@ -7729,6 +7739,7 @@ fn walk_effects(
                     agent,
                     endorsed,
                     declassified,
+                    selected_by: case_stack.last().cloned(),
                 });
             }
             body::BodyStmt::After(after) => {
@@ -7756,6 +7767,7 @@ fn walk_effects(
                     rule_name,
                     counter,
                     after_stack,
+                    case_stack,
                     effects,
                     dependencies,
                 );
@@ -7763,14 +7775,19 @@ fn walk_effects(
             }
             body::BodyStmt::Case(case) => {
                 for branch in &case.branches {
+                    // Record the selector: an effect in this arm is gated by
+                    // `case <scrutinee> { <pattern> => … }` (DR §7.4).
+                    case_stack.push((case.scrutinee.clone(), branch.pattern.clone()));
                     walk_effects(
                         &branch.body,
                         rule_name,
                         counter,
                         after_stack,
+                        case_stack,
                         effects,
                         dependencies,
                     );
+                    case_stack.pop();
                 }
             }
             body::BodyStmt::Branch(branch) => {
@@ -7779,6 +7796,7 @@ fn walk_effects(
                     rule_name,
                     counter,
                     after_stack,
+                    case_stack,
                     effects,
                     dependencies,
                 );
@@ -7788,6 +7806,7 @@ fn walk_effects(
                         rule_name,
                         counter,
                         after_stack,
+                        case_stack,
                         effects,
                         dependencies,
                     );
@@ -7799,6 +7818,7 @@ fn walk_effects(
                     rule_name,
                     counter,
                     after_stack,
+                    case_stack,
                     effects,
                     dependencies,
                 );
@@ -21569,6 +21589,57 @@ rule r
             .diagnostics
             .iter()
             .any(|d| d.message.contains("not a string-literal discriminant")));
+    }
+
+    #[test]
+    fn case_arm_effect_records_its_selector() {
+        // An effect inside a `case <scrutinee> { <pattern> => … }` arm records the
+        // selector `(scrutinee, pattern)` so the IFC checker can apply
+        // NMIF-on-the-selector to a crossing (DR §7.4).
+        let source = r#"
+workflow S
+
+input item WorkItem
+output result R
+class WorkItem { kind "a" | "b" }
+class R { ok bool }
+class V { ok bool }
+
+coerce f(t string) -> V { prompt "x" }
+
+rule r
+  when WorkItem as item
+=> {
+  case item.kind {
+    "a" => {
+      coerce f("hi") as v
+      after v succeeds {
+        complete result { ok v.ok }
+      }
+    }
+    "b" => {
+      complete result { ok false }
+    }
+  }
+}
+"#;
+        let ir = compile_program(source).ir.expect("compiles");
+        let rule = ir.rules.iter().find(|r| r.name == "r").expect("rule r");
+        let coerce = rule
+            .metadata
+            .effects
+            .iter()
+            .find(|e| e.binding.as_deref() == Some("v"))
+            .expect("coerce effect v");
+        let (scrutinee, pattern) = coerce
+            .selected_by
+            .as_ref()
+            .expect("coerce in a case arm records its selector");
+        assert_eq!(scrutinee, "item.kind");
+        assert_eq!(pattern, "\"a\"");
+        // An effect outside any case (the `complete` is in an arm, but there are no
+        // top-level effects here) — sanity: a fresh top-level coerce has no selector.
+        // (Covered by every other example whose effects are top-level: selected_by None.)
     }
 
     #[test]
