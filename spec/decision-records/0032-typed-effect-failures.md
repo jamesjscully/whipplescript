@@ -172,6 +172,56 @@ Deferred slices (each its own future gate, demand-driven): per-effect variant fi
 sets (with IFC review), and — only if a statically-unknown-kind failure value ever
 arises — the runtime-caseable `EffectError` union.
 
+## Wire-unification spec (from the 2026-06-29 failure-shape audit)
+
+The audit of what each effect kind actually emits on failure changed the size and
+shape of step D2. Findings:
+
+- **It is ~9 independent fact-build sites, not one.** The shared
+  `effect_completion_payload` (store/lib.rs:7599) builds the `effect.terminal`
+  *event*, but the `.failed` *fact* that `after x fails as f` binds is built
+  per-handler: CapabilityCall, the 4 File handlers, Exec, Queue, WorkflowInvoke (in
+  cli/main.rs) + Coerce, Loft, AgentTell (in kernel/lib.rs).
+- **The human-facing text is nested and inconsistently named**, not just
+  `message`-vs-`reason`: `error.message` (Exec, File×4, Queue, Capability),
+  `error.reason` (Coerce, Loft), `value.reason` (WorkflowInvoke, author-typed),
+  `failure.message` (AgentTell). `reason` is **never top-level**; `kind` is **never a
+  field** (only in the fact name); `summary`/`effect_id`/`run_id` are present
+  unevenly and hand-repeated.
+- **Two latent bugs the audit surfaced:**
+  - *`value: null` shadow.* `effect_binding_value` (main.rs:33770) returns
+    `payload["value"]` first, and `.get("value")` on an explicit `null` returns
+    `Some(Null)`. Coerce and Capability emit `"value": null`, so `after coerce
+    fails as f` binds `f = null` today — `f.reason` is silently null. (Workflow
+    "works" only because its `value` is the child's failure payload.)
+  - *EventNotify derives no failure fact* (main.rs:23514), so `after notify fails`
+    has nothing to bind.
+- **Kinds with no `.failed` fact** (out of scope for v1 base typing): Lease/Ledger/
+  Counter (contention/over are *success* variants; hard errors are worker errors),
+  Timer (deadline expiry times out a *different* run), HumanAsk, EventEmit.
+
+**Target layout (THE fork — see below): every failure fact carries
+`value: { reason, summary, effect_id, run_id, kind }`** — the base object under the
+`value` key. Then `after x fails as f` binds `f = value` with **no change to
+`effect_binding_value`** (it already returns `value` first), symmetric with the
+success path (success `value` = output object; failure `value` = base object), and
+the `value: null` shadow is *fixed for free* (value is now the base, never null).
+Per-kind `reason` mapping: `error.message`/`error.reason`/`value.reason`/
+`failure.message` → `value.reason`. Extras (exec `exit_code`/`stderr`, agent
+`phase`/`error_kind`, provider blob) are **preserved** elsewhere on the fact (raw,
+for telemetry + future variants), not read by `f` until a variant lands.
+
+**Migration touched by the rename** (ours, all of it): examples reading
+`failure.message`/`failure.reason`/`*_error.message`/`childFailure.reason`
+(exec-json-ingest, file-store-demo, deterministic-validation,
+revision-validation-approval, revision-parent-child, scheduled-escalation,
+terminal-output-union); tests in control_plane.rs / soft_middle.rs including
+pointer assertions on `/value/error/message` and `/error/message`.
+
+EventNotify's missing failure fact: **fix in this piece** (derive a
+`event.notify.failed` fact with the base) — it is the same omission class and cheap
+once we are normalizing.
+
 ## Resolved questions (Jack, 2026-06-29)
 
 1. **Base field set — RESOLVED: include `kind: string` in the base now.** Base is
