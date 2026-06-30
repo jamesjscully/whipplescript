@@ -962,6 +962,64 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
 /// `signal:X`, so a cross-package internal signal propagates the emitter's trust just
 /// as an in-program one does. `imports` are the pinned tool IRs, compiled by the
 /// consumer; labels are computed under the consumer's envelope.
+/// The read-source resources a program touches across ALL its rules — the opaque
+/// tool-level join box (DR-0030 X2 baseline A: the result carries the join of
+/// everything the tool reads).
+fn program_read_resources(ir: &IrProgram) -> Vec<String> {
+    let signal_names: BTreeSet<&str> = ir.events.iter().map(|e| e.name.as_str()).collect();
+    let mut reads: BTreeSet<String> = BTreeSet::new();
+    for rule in &ir.rules {
+        reads.extend(rule_read_resources(rule, &signal_names));
+    }
+    reads.into_iter().collect()
+}
+
+/// The read resources an imported tool's RESULT provably depends on (DR-0030 X2
+/// Direction A, the reach refinement — computed consumer-side from the pinned tool
+/// source, since structural reach is label-agnostic and the consumer recompiles the
+/// source anyway). The result depends only on the reads of the rules that **reach a
+/// completing rule** — itself plus every transitive upstream rule whose recorded fact
+/// it consumes. A resource read ONLY by rules that never feed a `complete` is
+/// `independent_of` the result (a proven non-interference, `noReach`) and is dropped,
+/// so the result carries a smaller join than the whole-tool baseline. Whole-result v1:
+/// reads are attributed at rule granularity (no per-field value-flow), so the cut is
+/// the rule-dependency graph. Falls back to all reads if the tool never completes.
+fn result_dependency_reads(tool: &IrProgram) -> Vec<String> {
+    let completing: BTreeSet<&str> = tool
+        .rules
+        .iter()
+        .filter(|rule| !rule.metadata.terminal_completes.is_empty())
+        .map(|rule| rule.name.as_str())
+        .collect();
+    if completing.is_empty() {
+        return program_read_resources(tool);
+    }
+    // Reverse-reachability over the fact-dependency graph (producer -> consumer): the
+    // set of rules that transitively feed a completing rule.
+    let mut contributing = completing;
+    loop {
+        let mut added = false;
+        for dep in &tool.rule_dependencies {
+            if contributing.contains(dep.consumer.as_str())
+                && contributing.insert(dep.producer.as_str())
+            {
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    let signal_names: BTreeSet<&str> = tool.events.iter().map(|e| e.name.as_str()).collect();
+    let mut reads: BTreeSet<String> = BTreeSet::new();
+    for rule in &tool.rules {
+        if contributing.contains(rule.name.as_str()) {
+            reads.extend(rule_read_resources(rule, &signal_names));
+        }
+    }
+    reads.into_iter().collect()
+}
+
 pub fn check_with_envelope_imports(
     ir: &IrProgram,
     verified: &VerifiedEnvelope,
@@ -980,6 +1038,16 @@ pub fn check_with_envelope_imports(
     // internal flows propagate the emitter's trust automatically.
     let programs: Vec<&IrProgram> = std::iter::once(ir).chain(imports.iter()).collect();
     let derived = derived_signal_integrity(&programs, envelope);
+    // A `@tool` workflow's `complete result` crosses a PACKAGE boundary: its invoker
+    // is a future consumer whose clearance is party-relative and unknown at the
+    // producer, so the result is governed CONSUMER-side by the flow signature
+    // (DR-0030 X2), never as a local sink here. A `@service`/top-level workflow's
+    // result returns to the operator in the SAME governance domain, so its
+    // `complete result` IS a local egress sink (the invoker boundary), governed below.
+    let is_tool = ir
+        .source_tags
+        .iter()
+        .any(|tag| tag.target_kind == "workflow" && tag.name == "tool");
     let mut diagnostics = Vec::new();
     for rule in &ir.rules {
         // Collect reads and writes across the whole rule (the rule-level join box):
@@ -1091,6 +1159,50 @@ pub fn check_with_envelope_imports(
             .iter()
             .map(|write| format!("fact:{}", write.strip_prefix("schema:").unwrap_or(write)))
             .collect();
+        // `complete result {…}` returns a value to the workflow's invoker — an egress
+        // sink at the invoker boundary (DR-0030 X2, top-level half). For a
+        // `@service`/top-level workflow the invoker is the operator in the same
+        // governance domain, so the result is a local confidentiality sink named by the
+        // output binding, default public/fail-closed and cleared by a grant
+        // (`grant <kind> <handle> -> <binding> readable by <role>`). Whole-result v1
+        // (no per-field value-flow): the result conservatively carries the join of the
+        // completing rule's read sources, exactly as any file/channel egress does — so
+        // a rule that both reads confidential data and completes must clear the invoker
+        // or separate the contexts (the safe shape). A `@tool` result is NOT here (it
+        // crosses a package boundary, governed consumer-side by the flow signature).
+        let result_sinks: Vec<String> = if is_tool {
+            Vec::new()
+        } else {
+            rule.metadata.terminal_completes.clone()
+        };
+        // DR-0030 X2 (cross-package): a `tell <agent>` turn whose agent may call an
+        // imported `@tool` (DR-0025 `tools [...]`) can pull that tool's result into the
+        // turn — and the tool may read confidential/low-integrity data the consumer
+        // never touched directly. So the imported tool's RESULT reads (resolved in the
+        // shared governance envelope) become read SOURCES of the turn's rule, and a
+        // tool whose result then flows to a consumer sink is caught on both axes.
+        // `result_dependency_reads` is the Direction-A reach refinement: only the reads
+        // that reach a completing rule (the rest are `independent_of` the result and
+        // dropped). It degrades to the whole-tool join box when the tool's result
+        // depends on everything. Imported tools are matched to the agent's `tools` list
+        // by workflow name.
+        let mut tool_result_reads: Vec<String> = Vec::new();
+        for effect in &rule.metadata.effects {
+            if effect.kind != IrEffectKind::AgentTell {
+                continue;
+            }
+            let Some(agent_name) = &effect.agent else {
+                continue;
+            };
+            let Some(agent) = ir.agents.iter().find(|a| &a.name == agent_name) else {
+                continue;
+            };
+            for tool_name in &agent.tools {
+                if let Some(tool) = imports.iter().find(|t| &t.workflow == tool_name) {
+                    tool_result_reads.extend(result_dependency_reads(tool));
+                }
+            }
+        }
         // Inbound `when message from <channel>` delivers attacker-controllable
         // content: the channel is a low-integrity READ source (and public
         // confidentiality), so untrusted inbound data driving a more-trusted sink is
@@ -1145,12 +1257,14 @@ pub fn check_with_envelope_imports(
             .copied()
             .chain(message_reads.iter().copied())
             .chain(signal_reads.iter().map(String::as_str))
+            .chain(tool_result_reads.iter().map(String::as_str))
         {
             let src_integrity = source_integrity(src);
             for sink in writes
                 .iter()
                 .copied()
                 .chain(record_sinks.iter().map(String::as_str))
+                .chain(result_sinks.iter().map(String::as_str))
             {
                 if leak.is_none() && envelope.leaks(src, sink) {
                     leak = Some((src.to_owned(), sink.to_owned()));
@@ -1679,12 +1793,16 @@ rule work
     #[test]
     fn allows_turn_reading_confidential_only_when_provider_cleared() {
         let ir = ir_with_grants(READ_LEDGER);
-        // the agent's `fixture` provider is cleared for confidential data, so a
-        // read-only turn with no egress is fine.
+        // a turn reading confidential data is fine when BOTH egress boundaries are
+        // cleared: the agent's `fixture` provider (the model the turn ships context
+        // to) and `result` (the workflow's invoker — `complete result` is an egress to
+        // it, DR-0030 X2 top-level). With both cleared for confidential data there is
+        // no leak.
         let envelope = Envelope::from_json(
             r#"{ "resources": {
                 "ledger": { "confidential": true },
-                "fixture": { "reader": "confidential" }
+                "fixture": { "reader": "confidential" },
+                "result": { "reader": "confidential" }
             } }"#,
         )
         .expect("valid envelope");
@@ -1935,6 +2053,220 @@ grant channel reply -> smtp:out readable by Requester\n";
         // reply is Requester-readable so cleared; a public sink is not Requester-... actually
         // public is the bottom so canAct(public, Requester) is false -> still leaks to public.
         assert!(with2.leaks("ledger", "pub"));
+    }
+
+    #[test]
+    fn top_level_complete_result_is_an_egress_to_the_invoker() {
+        // DR-0030 X2 (top-level): a @service rule that reads confidential `ledger` and
+        // `complete result {…}` returns to its invoker — an egress. With `result`
+        // uncleared (default public) this leaks; clearing the invoker fixes it.
+        let ir = ir_with_grants(READ_LEDGER);
+        let leaks = Envelope::from_json(
+            r#"{ "resources": {
+            "ledger": { "confidential": true },
+            "fixture": { "reader": "confidential" }
+        } }"#,
+        )
+        .expect("valid");
+        assert!(
+            check_with_envelope(&ir, &VerifiedEnvelope::for_test(leaks))
+                .iter()
+                .any(|d| d.message.contains("information-flow violation")
+                    && d.message.contains("ledger")
+                    && d.message.contains("result")),
+            "ledger -> result should leak to an uncleared invoker"
+        );
+        // clearing the invoker (`result` readable for confidential) removes it.
+        let cleared = Envelope::from_json(
+            r#"{ "resources": {
+            "ledger": { "confidential": true },
+            "fixture": { "reader": "confidential" },
+            "result": { "reader": "confidential" }
+        } }"#,
+        )
+        .expect("valid");
+        assert!(
+            !check_with_envelope(&ir, &VerifiedEnvelope::for_test(cleared))
+                .iter()
+                .any(|d| d.message.contains("result"))
+        );
+    }
+
+    #[test]
+    fn tool_complete_result_is_not_a_local_sink() {
+        // a @tool's `complete result` crosses a PACKAGE boundary; its invoker's
+        // clearance is party-relative and unknown at the producer, so it is governed
+        // consumer-side by the flow signature, NOT as a local sink. So the same
+        // confidential read + complete does NOT flag when the program is a @tool.
+        let program = r#"@tool
+workflow ToolWf
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+
+file store ledger { root "./ledger"  allow read ["**"] }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from ledger at "data.txt" as loaded
+  after loaded succeeds as v {
+    complete result { ok true }
+  }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope =
+            Envelope::from_json(r#"{ "resources": { "ledger": { "confidential": true } } }"#)
+                .expect("valid");
+        assert!(
+            !check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+                .iter()
+                .any(|d| d.message.contains("result")),
+            "a @tool result is consumer-governed, not a local sink"
+        );
+    }
+
+    #[test]
+    fn imported_tool_result_carries_the_tools_reads() {
+        // DR-0030 X2 (cross-package baseline): an imported @tool reads a confidential
+        // store and returns it; the consumer's agent may call that tool (DR-0025
+        // `tools [Fetcher]`) and writes the turn result to a public outbox. The tool's
+        // confidential read flows out via the turn result, so the egress must be
+        // flagged — even though the consumer rule reads nothing confidential directly.
+        // Folding the imported tool IR is what closes it.
+        let tool = compile_program(
+            r#"@tool
+workflow Fetcher {
+  input request Req
+  output result R
+  class Req { id string }
+  class R { data string }
+  file store secret { root "./secret"  allow read ["**"] }
+  rule fetch
+    when Req as request
+  => {
+    read text from secret at "in.txt" as loaded
+    after loaded succeeds as v {
+      complete result { data v.content }
+    }
+  }
+}
+"#,
+        )
+        .ir
+        .expect("tool compiles");
+        let consumer = compile_program(
+            r#"@service
+workflow Consumer
+
+output result R2
+class R2 { ok bool }
+class Req { id string  status "open" }
+
+agent worker { provider fixture  profile "p"  capacity 1  tools [Fetcher] }
+file store outbox { root "./outbox"  allow write ["**"] }
+
+table seed as Req [ { id "T1"  status "open" } ]
+
+rule use
+  when Req as request where request.status == "open"
+  when worker is available
+=> {
+  tell worker as turn "go"
+  after turn succeeds as outcome {
+    write text to outbox at "out.txt" {
+      body "x"
+      mode replace
+    } as written
+    complete result { ok true }
+  }
+}
+"#,
+        )
+        .ir
+        .expect("consumer compiles");
+        let envelope = Envelope::from_dsl(
+            "grant file_store secret -> file:/srv/secret readable by Operator\n\
+             grant file_store outbox -> file:/srv/out readable by public\n\
+             grant provider fixture -> selfhost:llama readable by Operator\n",
+        )
+        .expect("valid");
+        let verified = VerifiedEnvelope::for_test(envelope);
+        // With the tool folded, the secret -> outbox leak via the turn result is caught.
+        assert!(
+            check_with_envelope_imports(&consumer, &verified, std::slice::from_ref(&tool))
+                .iter()
+                .any(|d| d.message.contains("information-flow violation")
+                    && d.message.contains("secret")),
+            "the imported tool's confidential read should flow out via the turn result: {:?}",
+            check_with_envelope_imports(&consumer, &verified, std::slice::from_ref(&tool))
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+        // Without the import, the tool result is untracked — the gap this closes.
+        assert!(!check_with_envelope_imports(&consumer, &verified, &[])
+            .iter()
+            .any(|d| d.message.contains("secret")));
+    }
+
+    #[test]
+    fn result_dependency_reads_drops_inputs_the_result_is_independent_of() {
+        // DR-0030 X2 Direction A (reach refinement): the tool reads `secret` in a side
+        // rule whose recorded fact NO completing rule consumes, and reads `public_in`
+        // in the rule that completes. The result provably does not depend on `secret`
+        // (it never reaches a `complete`), so the refinement drops it — the result
+        // carries only `public_in`, a strictly smaller join than the whole-tool box.
+        let tool = compile_program(
+            r#"@tool
+workflow Refiner {
+  input request Req
+  output result R
+  class Req { id string }
+  class R { data string }
+  class Logged { note string }
+  file store secret { root "./secret"  allow read ["**"] }
+  file store public_in { root "./pin"  allow read ["**"] }
+
+  rule audit
+    when Req as request
+  => {
+    read text from secret at "s.txt" as s
+    after s succeeds as sv {
+      record Logged { note sv.content }
+    }
+  }
+
+  rule produce
+    when Req as request
+  => {
+    read text from public_in at "p.txt" as p
+    after p succeeds as pv {
+      complete result { data pv.content }
+    }
+  }
+}
+"#,
+        )
+        .ir
+        .expect("tool compiles");
+        // the whole-tool baseline sees BOTH reads.
+        let all = program_read_resources(&tool);
+        assert!(all.contains(&"secret".to_owned()) && all.contains(&"public_in".to_owned()));
+        // the reach refinement keeps only what the result depends on.
+        let deps = result_dependency_reads(&tool);
+        assert!(
+            deps.contains(&"public_in".to_owned()),
+            "the completing rule's read must be kept: {deps:?}"
+        );
+        assert!(
+            !deps.contains(&"secret".to_owned()),
+            "a read the result is independent of must be dropped: {deps:?}"
+        );
     }
 
     #[test]

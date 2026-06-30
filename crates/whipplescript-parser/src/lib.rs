@@ -1157,6 +1157,13 @@ pub struct IrRuleMetadata {
     pub case_branches: Vec<IrRuleCaseBranch>,
     pub terminal_outputs: Vec<IrTerminalOutput>,
     pub terminal_branches: Vec<IrTerminalCaseBranch>,
+    /// The output bindings this rule `complete`s (the `name` of each `complete
+    /// <binding> {…}` in the body, recursing into after/case/branch/handler blocks).
+    /// Surfaced for the information-flow checker: a `complete result` returns a value
+    /// to the workflow's invoker, an egress sink at the invoker boundary (DR-0030 X2).
+    /// IFC-only — deliberately NOT rendered in the `.ir` snapshot, so it adds no
+    /// golden/hash churn.
+    pub terminal_completes: Vec<String>,
     /// Maximum nesting depth of `after` blocks in the rule body (0 = no `after`,
     /// 1 = a top-level `after`, 2 = an `after` inside an `after`, …). Surfaced for the
     /// `lint.deep_after_nesting` maintainability check.
@@ -7121,6 +7128,9 @@ fn analyze_rule(
     metadata.fact_consumes.dedup();
     metadata.terminal_outputs = terminal_metadata.outputs;
     metadata.terminal_branches = terminal_metadata.branches;
+    collect_terminal_complete_bindings(&body_ast.statements, &mut metadata.terminal_completes);
+    metadata.terminal_completes.sort();
+    metadata.terminal_completes.dedup();
     metadata
 }
 
@@ -7896,6 +7906,37 @@ fn seed_ast_only_effect_bindings(
 /// Derives effect nodes and dependency edges from the body AST, in document
 /// order, with ids and idempotency keys identical to the historical
 /// line-scanner derivation.
+/// Collect the output bindings a rule `complete`s, recursing through the body's
+/// nested blocks (after / case / branch / handler). A `complete <binding> {…}` is the
+/// workflow's output to its invoker; the IFC checker treats it as an egress sink at
+/// the invoker boundary (DR-0030 X2). `fail`/`flowfail` terminals are NOT collected —
+/// they carry an error to the runtime, not a value to the invoker.
+fn collect_terminal_complete_bindings(statements: &[body::BodyStmt], out: &mut Vec<String>) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Terminal(terminal) if terminal.kind == body::TerminalKind::Complete => {
+                out.push(terminal.name.clone());
+            }
+            body::BodyStmt::After(after) => collect_terminal_complete_bindings(&after.body, out),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_terminal_complete_bindings(&branch.body, out);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                collect_terminal_complete_bindings(&branch.then_body, out);
+                if let Some(else_body) = branch.else_body.as_deref() {
+                    collect_terminal_complete_bindings(else_body, out);
+                }
+            }
+            body::BodyStmt::Handler(handler) => {
+                collect_terminal_complete_bindings(&handler.body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn collect_effects_from_ast(
     statements: &[body::BodyStmt],
     rule_name: &str,

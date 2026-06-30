@@ -154,15 +154,24 @@ and an **escalate** route that needs a governance grant (`grant declassify …` 
 
 These are real gaps observed while building the examples, not hypotheticals.
 
-1. **The workflow's own output is a partly-unmonitored sink.** *`record` is now
-   governed (H2):* a recorded fact is a sink `fact:<schema>` (the DR-0026 stream and
-   other rules observe it), defaulting to public/fail-closed — so reading `crm` and
-   `record`ing a derived fact is flagged unless governance clears `fact:<schema>`
-   (see `fact:Reviewed` in `governance.policy`). **Still open:** `complete result`
-   (the result channel back to the *invoker*) is not yet a modeled sink — its
-   per-rule form isn't cleanly in the IR and it overlaps the cross-package `@tool`
-   result (opaque join box, Wave 3). So returning confidential data verbatim as the
-   workflow *result* is still unchecked for now.
+1. **The workflow's own output is a governed sink.** *`record` is governed (H2):* a
+   recorded fact is a sink `fact:<schema>` (the DR-0026 stream and other rules observe
+   it), defaulting to public/fail-closed — so reading `crm` and `record`ing a derived
+   fact is flagged unless governance clears `fact:<schema>` (see `fact:Reviewed` in
+   `governance.policy`). *`complete result` is now governed too (DR-0030 X2,
+   top-level):* for a `@service` workflow it is an egress sink at the invoker boundary
+   named by the output binding (e.g. `result`), default public/fail-closed — so a rule
+   that reads `crm` and `complete`s a result is flagged unless governance clears the
+   invoker (`grant … -> result readable by <role>`) or the contexts are separated (the
+   safe shape). Whole-result v1: the result conservatively carries the join of the
+   completing rule's reads (no per-field value-flow). *The cross-package `@tool` result
+   is governed too (DR-0030 X2):* a turn whose agent may call an imported tool folds the
+   tool's result reads into the turn — so a tool that reads confidential data the
+   consumer never touched, whose result then egresses, is caught. The **Direction A
+   reach refinement** keeps only the tool reads that reach a completing rule (inputs the
+   result is `independent_of` are dropped); it is computed consumer-side from the pinned
+   tool source. **Still deferred:** per-field value-flow (v2) — at whole-result v1 a
+   tool that reads confidential data anywhere taints its whole result.
 
 2. **Coarse, rule-level join box (no value tracking).** Any read in a rule is
    assumed to potentially reach any sink in the same rule. The safe refactor must

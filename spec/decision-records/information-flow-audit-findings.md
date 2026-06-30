@@ -178,7 +178,20 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   the correct locus; the message names the exact `src`/`sink` pair. Per-effect span
   pinpointing is a possible future nicety, not a soundness gap.
 - **H7 — Per-field / per-path labels.** Mixed-sensitivity stores must be split;
-  labels attach to whole resources. **DEFERRED (recorded).**
+  labels attach to whole resources. **IN PROGRESS (substrate modeled 2026-06-30).** The
+  per-field label algebra is now machine-checked — `models/lean/Whipple/Redaction.lean`
+  (a record = labelled fields; redaction projects to kept fields) proves the three
+  load-bearing properties: (1) `canRead_redact` — the release of a redaction is
+  determined ONLY by the kept fields (dropped fields non-interfering); (2)
+  `redact_refines` — redaction only ever lowers the label (a conservative refinement of
+  the opaque box); (3) `redact_keep_all` — keeping every field IS the whole-record
+  opaque box (so the I-IFC2 default is the degenerate redaction). Concrete bite in
+  `models/maude/infoflow-redaction.maude` (2 coverage / 3 bite: keeping the secret leaks
+  to a public sink, dropping it does not, a cleared sink needs no redaction). This is the
+  substrate for the `redact` construct (Tier 1) and label-driven auto-redaction +
+  per-field flow signatures (Tier 2). Framing: the default analysis stays rule-level
+  opaque (I-IFC2); explicit, audited crossings (`redact`, `declassify`) get LOCAL
+  value-precision — a refinement of I-IFC2, not a reversal. Checker build is next.
 - **H8 — Signal triggers are invisible sources (fail-OPEN).** **DONE 2026-06-30 —
   BOTH stages.** Stage (b) — emitter-carried integrity — landed: a signal governance
   marks `internal` (`grant signal X -> signal:X internal`) has its integrity DERIVED
@@ -269,8 +282,20 @@ ACROSS a package boundary, the **package contract** must carry an
   coverage / 6 bites) and the soundness claim is machine-checked in
   `models/lean/Whipple/FlowSignature.lean` (cut⇒bound, bypass-loses-bound,
   fail-closed fallback, NMIF bridge; no sorry/axiom). QIF/entropy-budget precision
-  is still NOT adopted (DR-0030 Decision 0: bits are the wrong unit). NEXT: the
-  `flow_signature` schema field + producer reach-vector + consumer derive/gate impl.
+  is still NOT adopted (DR-0030 Decision 0: bits are the wrong unit).
+  **IMPLEMENTED 2026-06-30 (whole-result v1).** The cross-package `@tool` RESULT is now
+  governed at the consumer: an agent turn that may call an imported tool (`tools [...]`)
+  folds the tool's RESULT reads into the turn's read-sources (`ifc.rs`
+  `result_dependency_reads`), so a tool that reads confidential/low-integrity data whose
+  result then flows to a consumer sink is caught on both axes. Baseline A = the
+  whole-tool join box; **Direction A reach** refines it to only the reads that reach a
+  completing rule (`independent_of`/`noReach` inputs dropped). **Computed CONSUMER-side
+  from the pinned tool source**, not via a producer-attested contract — structural reach
+  is label-agnostic, so this needs no attestation and matches the H8 carriage precedent.
+  This SUPERSEDES the producer-attest `flow_signature`-contract plan: with pinned-source
+  recompilation already the model, consumer-recompute is sound, simpler, and trust-free.
+  The top-level `@service` `complete result` is governed as an egress sink in the same
+  pass. Per-field v2 (value-flow attribution) remains deferred.
 - **X3 — No package-asserted authority.** Crossings (`declassify`/`endorse`) and
   resource access require the CONSUMER's governance grant (I-IFC4). The package
   DECLARES required crossings/authority as obligations; undeclared crossings are

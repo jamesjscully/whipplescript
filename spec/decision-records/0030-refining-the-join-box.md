@@ -313,6 +313,22 @@ a planned stub, not a live gate).
   updates → v1 producer reach-vector + consumer derive/gate → B value-flow → v2
   per-field + conditional discount → C if demanded.
 
+### Implementation note (2026-06-30) — consumer-recompute supersedes producer-attest for v1
+
+Whole-result v1 shipped in `ifc.rs` (`result_dependency_reads`, called from
+`check_with_envelope_imports`). It departs from A.1's producer-attest path in one
+deliberate way: the **reach matrix is recomputed CONSUMER-side from the pinned tool
+source**, not read from a producer-attested `flow_signature` contract field. Rationale:
+the structural reach is *label-agnostic* (A.1's reason to attest was that reader/writer
+*sets* are party-relative — but the dependency *structure* is not), and the consumer
+**already recompiles the pinned tool source** under its own envelope (the H8 cross-package
+carriage precedent, DR-0029). So the consumer can derive the matrix directly — sound,
+trust-free (no attestation to verify), and consistent with carriage. The `flow_signature`
+contract field stays reserved for the case where a consumer does *not* have the source
+(a binary/attested-only package); it is not needed while pinned-source recompilation is
+the model. The top-level `@service` `complete result` is governed as an egress sink in
+the same pass. Per-field v2 (value-flow attribution) remains deferred.
+
 ## Non-goals
 
 - QIF / entropy budgets as a pervasive automatic mechanism (Decision 0).

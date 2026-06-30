@@ -15,18 +15,19 @@ phase each run their own model → code → review → docs → gate loop.
 
 **Status (2026-06-30): all phases reconciled against the shipped code + the durable
 [audit-findings](information-flow-audit-findings.md) tracker.** Every soundness-bearing
-item is `[x]` done with a test/proof; no `[ ]` remains. The 6 `[~]` boxes are each a
-recorded **deferral with cause** (not unstarted work): D4 envelope versioning /
-replay-stability liveness + Veil (temporal research; I-IFC7 carriage safety is checked —
-`InfoflowLabelCarriage.tla`); the `gov compile` *signed-artifact emit*; a standalone
-`inline ⊑ envelope` diagnostic (satisfied in substance by the flow checks); storage-layer
-dual-gating (defense-in-depth over the check-time gate) + the `complete result`→invoker
-channel (owned by the X2 flow signature, DR-0030); and a dedicated field-level `redact`
-construct (an additive ergonomic lever — the safe shape is already expressible). Net this
-session: NMIF increment, rule-body join box, per-resource guaranteed invariants +
-flagged-risks + self-serve/escalate routes, provider egress, the two agent loops +
-escalation channel verified shipped; `InfoflowLabelCarriage.tla` authored + bite-verified
-+ gated.
+item is `[x]` done with a test/proof; no `[ ]` remains. **The `complete result` → invoker
+channel (X2) is now DONE** — top-level `@service` (egress sink) + cross-package `@tool`
+(consumer-side reach refinement, `result_dependency_reads`), whole-result v1. The
+remaining `[~]` boxes are each a recorded **deferral with cause** (5 themes): D4 envelope
+versioning / replay-stability liveness + Veil (temporal research; I-IFC7 carriage safety
+is checked — `InfoflowLabelCarriage.tla`); the `gov compile` *signed-artifact emit*; a
+standalone `inline ⊑ envelope` diagnostic (satisfied in substance by the flow checks);
+storage-layer dual-gating (defense-in-depth over the check-time gate); and a dedicated
+field-level `redact` construct + per-field flow-signature **v2** (additive precision —
+the safe shape is already expressible and whole-result v1 is sound). Net recent work:
+NMIF increment, rule-body join box, per-resource invariants + flagged-risks +
+self-serve/escalate routes, provider egress, the two agent loops + escalation channel,
+`InfoflowLabelCarriage.tla` (bite-verified), and the X2 `complete result` channel.
 
 ## Phase 1 — Formal-model upgrade (party-relative + NMIF)
 
@@ -180,20 +181,30 @@ asymmetric-delegation model (acts-for, reader/influencer sets) and NMIF.
   low-integrity source), `emit`/`notify` (egress sink `stream`), `record` (sink
   `fact:<schema>`), and `when message from <channel>` / `when <Signal>` inbound sources.
   No unlabeled door remains. Audit findings **E2 (Wave 2) + H8 (2026-06-30)**.
-- [~] dual-gated stores / `record`. `record` is a governed sink `fact:<schema>`
-  (default public/fail-closed) at check time — the recordSink of
+- [x] `complete result` → invoker channel (H2 second half / X2). **DONE 2026-06-30,
+  both halves.** (1) **Top-level** (`@service`): `complete result` is an egress sink at
+  the invoker boundary named by the output binding (default public/fail-closed, cleared
+  by `grant … -> result readable by <role>`). Whole-result v1 (decision: defer
+  per-field): the result conservatively carries the join of the completing rule's reads,
+  exactly as any other egress. A precise IFC-only `terminal_completes` IR field
+  (zero `.ir` golden churn) backs it; it does NOT fire for `@tool` (cross-package). (2)
+  **Cross-package** (`@tool` called by an agent via `tools [...]`): the imported tool's
+  RESULT reads become read-sources of the calling turn's rule — baseline A = the
+  whole-tool join box (`program_read_resources`), refined by **Direction A reach**
+  (`result_dependency_reads`) to only the reads that reach a completing rule (inputs the
+  result is `independent_of`, i.e. `noReach`, are dropped). Computed CONSUMER-side from
+  the pinned tool source (consistent with the H8 carriage precedent — structural reach
+  is label-agnostic, so no producer attestation/contract round-trip is needed; this
+  supersedes DR-0030's producer-attest plan given pinned-source recompilation is already
+  the model). Backed by the proven `infoflow-signature.maude` + `FlowSignature.lean`
+  (cut⇒bound). 4 ifc tests (top-level leaks/clears, `@tool`-not-local, cross-package
+  carries reads, reach drops independent). Per-field v2 remains deferred.
+- [~] dual-gated stores / `record` (storage layer). `record` is a governed sink
+  `fact:<schema>` (default public/fail-closed) at check time — the recordSink of
   `infoflow-composition`, realized (H2 fact-base half). **DEFERRED, with cause:**
-  (1) dual-gating at the *storage* layer is kernel-runtime enforcement (E3 family) —
-  the check-time gate already rejects violating flows before any side effect, so the
-  storage-layer gate is defense-in-depth, not a soundness gap. (2) The
-  `complete result`→invoker channel (H2 second half) is **owned by the X2 flow
-  signature** (DR-0030), not a blanket sink: `IrTerminalOutput` carries the payload
-  *types* but not value-level data provenance, and a coarse public `result` sink would
-  be unsound-by-overstrictness — it would forbid returning *any* bounded function of
-  confidential data to a cleared invoker (it would reject the safe-shape example whose
-  whole point is exactly that). The sound treatment is per-field reach (X2,
-  `infoflow-signature.maude` + `FlowSignature.lean`, designed; impl is the `flow_signature`
-  schema + producer/consumer build), tracked in audit-findings X2.
+  dual-gating at the *storage* layer is kernel-runtime enforcement (E3 family) — the
+  check-time gate already rejects violating flows before any side effect, so the
+  storage-layer gate is defense-in-depth, not a soundness gap.
 - [~] envelope versioning + run binding (D4); discovery; ungoverned dev mode.
   Discovery via `WHIPPLESCRIPT_IFC_ENVELOPE` (unset = ungoverned dev mode) is **DONE**.
   **D4 versioning/non-retroactivity/run-binding DEFERRED** (audit-findings M3/E3): it is
