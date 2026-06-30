@@ -1172,6 +1172,13 @@ pub struct IrRuleMetadata {
     /// models/lean/Whipple/Redaction.lean). IFC-only — NOT rendered in the `.ir`
     /// snapshot, so it adds no golden/hash churn.
     pub redactions: Vec<IrRedaction>,
+    /// Per `complete <binding>` egress, the set of binding roots its payload
+    /// references (union across branches). IFC-only (NOT in the `.ir` snapshot). The
+    /// information-flow engine uses this to recognize a FULLY-REDACTED egress — a
+    /// `complete` whose payload references only redaction outputs — and govern it by
+    /// the projection's per-field label rather than the rule's whole read set
+    /// (DR-0027 redact, the static refinement).
+    pub terminal_complete_reads: BTreeMap<String, BTreeSet<String>>,
     /// Maximum nesting depth of `after` blocks in the rule body (0 = no `after`,
     /// 1 = a top-level `after`, 2 = an `after` inside an `after`, …). Surfaced for the
     /// `lint.deep_after_nesting` maintainability check.
@@ -1186,6 +1193,14 @@ pub struct IrRedaction {
     pub source: String,
     pub keep: Vec<String>,
     pub binding: String,
+    /// The schema of the source binding, when resolvable (a matched class, a
+    /// coerce/decide/exec result, an `after … as` alias, or an earlier redaction's
+    /// output). The information-flow engine derives the projection's confidentiality
+    /// from the kept fields of this schema (`<schema>.<field>` labels), so a redacted
+    /// egress needs only the kept fields' clearance, not the whole record's. `None`
+    /// when the source type is not statically known (the engine then stays
+    /// conservative for that redaction).
+    pub source_schema: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7172,14 +7187,34 @@ fn analyze_rule(
     collect_terminal_complete_bindings(&body_ast.statements, &mut metadata.terminal_completes);
     metadata.terminal_completes.sort();
     metadata.terminal_completes.dedup();
-    collect_redaction_metadata(&body_ast.statements, &mut metadata.redactions);
+    collect_redaction_metadata(
+        &body_ast.statements,
+        &binding_types,
+        &mut metadata.redactions,
+    );
+    let mut complete_reads = Vec::new();
+    collect_terminal_complete_reads(&body_ast.statements, &mut complete_reads);
+    for (binding, roots) in complete_reads {
+        metadata
+            .terminal_complete_reads
+            .entry(binding)
+            .or_default()
+            .extend(roots);
+    }
     metadata
 }
 
 /// Collects the `redact <source> keep [..] as <out>` projections of a rule body
 /// (recursing into nested blocks) as IFC value-flow metadata, preserving body
 /// order so a chained redaction's source resolves against the earlier projection.
-fn collect_redaction_metadata(statements: &[body::BodyStmt], out: &mut Vec<IrRedaction>) {
+/// `binding_types` (the rule's fully-resolved binding -> schema map, including
+/// redaction outputs via their synthetic class) supplies each source's schema so
+/// the IFC engine can derive the projection's per-field label.
+fn collect_redaction_metadata(
+    statements: &[body::BodyStmt],
+    binding_types: &BTreeMap<String, String>,
+    out: &mut Vec<IrRedaction>,
+) {
     let mut redacts = Vec::new();
     collect_redact_effects(statements, &mut redacts);
     for (source, keep, binding, _span) in redacts {
@@ -7187,7 +7222,147 @@ fn collect_redaction_metadata(statements: &[body::BodyStmt], out: &mut Vec<IrRed
             source: source.to_owned(),
             keep: keep.to_vec(),
             binding: binding.to_owned(),
+            source_schema: binding_types.get(source).cloned(),
         });
+    }
+}
+
+/// Collect EVERY binding root referenced by an expression, for the information-flow
+/// value-flow engine. SOUNDNESS: a missed reference under-approximates a payload's
+/// sources — so this over-collects (an over-collected name that is not a relevant
+/// binding contributes nothing downstream). It walks every `Expr` variant and, for
+/// string literals, extracts `{{ … }}` interpolation roots (those refs live as raw
+/// text inside the literal, not as structured nodes). A bare identifier parses as
+/// `Literal(Ident)`, a dotted ref as `Path` — both are roots.
+fn collect_expr_binding_roots(expr: &Expr, out: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Literal(ExprLiteral::String(text)) => collect_template_binding_roots(text, out),
+        Expr::Literal(ExprLiteral::Ident(name)) => {
+            out.insert(name.clone());
+        }
+        Expr::Literal(ExprLiteral::Number(_) | ExprLiteral::Bool(_) | ExprLiteral::Null) => {}
+        Expr::Path(segments) => {
+            if let Some(root) = segments.first() {
+                out.insert(root.clone());
+            }
+        }
+        Expr::Index { target, key } => {
+            collect_expr_binding_roots(target, out);
+            collect_expr_binding_roots(key, out);
+        }
+        Expr::Array(items) => {
+            for item in items {
+                collect_expr_binding_roots(item, out);
+            }
+        }
+        Expr::Object(fields) => {
+            for field in fields {
+                collect_expr_binding_roots(&field.value, out);
+            }
+        }
+        Expr::Unary { expr, .. } => collect_expr_binding_roots(expr, out),
+        Expr::Binary { left, right, .. } => {
+            collect_expr_binding_roots(left, out);
+            collect_expr_binding_roots(right, out);
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_expr_binding_roots(arg, out);
+            }
+        }
+        Expr::Query { head, guard, .. } => {
+            out.insert(head.clone());
+            if let Some(guard) = guard {
+                collect_expr_binding_roots(guard, out);
+            }
+        }
+    }
+}
+
+/// Collect every binding root inside `{{ … }}` interpolations of a string. Unlike
+/// `interpolation_roots` (first root per interpolation), value-flow needs EVERY
+/// root, so `{{ a.b + c.d }}` yields both `a` and `c`. Each interpolation body is
+/// parsed and walked; an unparseable body falls back to a conservative identifier
+/// scan (over-collection is sound).
+fn collect_template_binding_roots(text: &str, out: &mut BTreeSet<String>) {
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        let after_open = &rest[open + 2..];
+        let Some(close) = after_open.find("}}") else {
+            break;
+        };
+        let body = after_open[..close].trim();
+        if let Ok(expr) = parse_expression(body) {
+            collect_expr_binding_roots(&expr, out);
+        } else {
+            for token in body.split(|ch: char| !ch.is_alphanumeric() && ch != '_') {
+                if token
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| is_ident_start(*byte))
+                {
+                    out.insert(token.to_owned());
+                }
+            }
+        }
+        rest = &after_open[close + 2..];
+    }
+}
+
+/// Collect the binding roots a payload field list references, threading the
+/// enclosing `from <binding>` source so a `Shorthand` field resolves to it.
+fn collect_payload_field_roots(
+    fields: &[body::FieldAssign],
+    from_binding: Option<&str>,
+    out: &mut BTreeSet<String>,
+) {
+    for field in fields {
+        match &field.value {
+            body::FieldValue::Shorthand => {
+                if let Some(root) = from_binding {
+                    out.insert(root.to_owned());
+                }
+            }
+            body::FieldValue::Expr { expr, .. } => collect_expr_binding_roots(expr, out),
+            body::FieldValue::Nested { fields, .. } => {
+                collect_payload_field_roots(fields, from_binding, out)
+            }
+        }
+    }
+}
+
+/// For each `complete <binding> { … }` in a rule body (recursing into nested
+/// blocks), the set of binding roots its payload references. Surfaced so the IFC
+/// engine can recognize a FULLY-REDACTED egress — a `complete` whose payload
+/// references only redaction outputs (and constants) — and govern it by the
+/// projection's per-field label instead of the rule's whole read set. A `complete`
+/// with no recorded entry references nothing resolvable (treated as public-only).
+fn collect_terminal_complete_reads(
+    statements: &[body::BodyStmt],
+    out: &mut Vec<(String, BTreeSet<String>)>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Terminal(terminal) if terminal.kind == body::TerminalKind::Complete => {
+                let mut roots = BTreeSet::new();
+                collect_payload_field_roots(&terminal.fields, None, &mut roots);
+                out.push((terminal.name.clone(), roots));
+            }
+            body::BodyStmt::After(after) => collect_terminal_complete_reads(&after.body, out),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_terminal_complete_reads(&branch.body, out);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                collect_terminal_complete_reads(&branch.then_body, out);
+                if let Some(else_body) = &branch.else_body {
+                    collect_terminal_complete_reads(else_body, out);
+                }
+            }
+            body::BodyStmt::Handler(handler) => collect_terminal_complete_reads(&handler.body, out),
+            _ => {}
+        }
     }
 }
 

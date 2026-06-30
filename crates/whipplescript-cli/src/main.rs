@@ -41176,6 +41176,7 @@ workflow EchoText {
             source: "cust".to_owned(),
             keep: vec!["id".to_owned(), "status".to_owned()],
             binding: "safe".to_owned(),
+            source_schema: Some("Customer".to_owned()),
         }];
         materialize_redactions(&mut context, &redactions);
         let safe = context

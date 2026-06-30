@@ -442,6 +442,25 @@ impl Envelope {
         label_text(&self.reader_set(resource))
     }
 
+    /// The reader-authority of a `redact <source> keep [..]` PROJECTION: the JOIN
+    /// (union of compartments — a combined value is readable only by a party cleared
+    /// for every part) of the kept fields' per-field labels. Per-field labels are
+    /// envelope resources keyed `<schema>.<field>` (e.g. `Customer.ssn`), so an
+    /// unlabeled field is public and `keep`ing only public fields yields a public
+    /// projection — exactly the per-field non-interference proven in
+    /// `models/lean/Whipple/Redaction.lean` (`canRead_redact`) and
+    /// `models/maude/infoflow-redaction.maude` (`projReaders`). Keeping every field
+    /// recovers the whole-record join (`redact_keep_all` = the opaque box). The
+    /// dropped fields never contribute — they are physically removed at runtime, so
+    /// they cannot leak.
+    fn projected_reader_set(&self, schema: &str, keep: &[String]) -> BTreeSet<String> {
+        let mut readers = BTreeSet::new();
+        for field in keep {
+            readers.extend(self.reader_set(&format!("{schema}.{field}")));
+        }
+        readers
+    }
+
     /// `provider` DOMINATES `required` iff every required compartment is covered by
     /// some provider compartment (via acts-for) — the leak/inject decision, proven
     /// sound in `ReaderSets.lean` (`leak_safe`). An empty `required` is vacuously
@@ -1170,11 +1189,69 @@ pub fn check_with_envelope_imports(
         // a rule that both reads confidential data and completes must clear the invoker
         // or separate the contexts (the safe shape). A `@tool` result is NOT here (it
         // crosses a package boundary, governed consumer-side by the flow signature).
-        let result_sinks: Vec<String> = if is_tool {
-            Vec::new()
-        } else {
-            rule.metadata.terminal_completes.clone()
+        // DR-0027 redact (the static refinement): a `complete <b>` whose payload
+        // references ONLY redaction outputs is a FULLY-REDACTED egress. The runtime
+        // physically projects each such binding to its kept fields, so the egress
+        // carries only those — its confidentiality is the kept fields' per-field
+        // label join (`projected_reader_set`), NOT the rule's whole read set. Such an
+        // egress is governed by the projected label below and EXCLUDED from the
+        // conservative read×sink loop. The projection is sound only when every
+        // referenced redaction resolves a source schema (else stay conservative).
+        let redacted_projection = |binding: &str| -> Option<BTreeSet<String>> {
+            let redaction = rule
+                .metadata
+                .redactions
+                .iter()
+                .find(|redaction| redaction.binding == binding)?;
+            let schema = redaction.source_schema.as_deref()?;
+            Some(envelope.projected_reader_set(schema, &redaction.keep))
         };
+        let mut result_sinks: Vec<String> = Vec::new();
+        if !is_tool {
+            for complete in &rule.metadata.terminal_completes {
+                let roots = rule.metadata.terminal_complete_reads.get(complete);
+                let fully_redacted = roots.is_some_and(|roots| {
+                    !roots.is_empty()
+                        && roots.iter().all(|root| redacted_projection(root).is_some())
+                });
+                if fully_redacted {
+                    // The egress carries only the projections — its required clearance
+                    // is the join of the kept fields' labels.
+                    let projected: BTreeSet<String> = roots
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|root| redacted_projection(root))
+                        .flatten()
+                        .collect();
+                    if !envelope.dominates(&envelope.reader_set(complete), &projected) {
+                        diagnostics.push(Diagnostic {
+                            span: rule
+                                .metadata
+                                .effects
+                                .first()
+                                .map(|effect| effect.span)
+                                .unwrap_or(whipplescript_parser::SourceSpan { start: 0, end: 0 }),
+                            message: format!(
+                                "information-flow violation in rule `{rule}`: the redacted result \
+                                 `{complete}` still carries fields readable by {proj}, but the \
+                                 invoker `{complete}` is readable by {sink}",
+                                rule = rule.name,
+                                proj = label_text(&projected),
+                                sink = envelope.reader_label(complete),
+                            ),
+                            suggestion: Some(format!(
+                                "keep fewer / less-sensitive fields in the redaction, or clear the \
+                                 invoker with `grant … -> {complete} readable by <role>`"
+                            )),
+                            related: Vec::new(),
+                        });
+                    }
+                } else {
+                    // Not provably narrowed — governed conservatively (whole read set).
+                    result_sinks.push(complete.clone());
+                }
+            }
+        }
         // DR-0030 X2 (cross-package): a `tell <agent>` turn whose agent may call an
         // imported `@tool` (DR-0025 `tools [...]`) can pull that tool's result into the
         // turn — and the tool may read confidential/low-integrity data the consumer
@@ -2089,6 +2166,84 @@ grant channel reply -> smtp:out readable by Requester\n";
             !check_with_envelope(&ir, &VerifiedEnvelope::for_test(cleared))
                 .iter()
                 .any(|d| d.message.contains("result"))
+        );
+    }
+
+    const REDACT_COMPLETE: &str = r#"@service
+workflow RedactIfc
+
+input customer Customer
+output result PublicView
+
+class Customer { id string  ssn string }
+class PublicView { who string  detail string }
+
+rule r
+  when Customer as c
+=> {
+  redact c keep [KEEP] as safe
+  complete result {
+    who safe.id
+    detail FIELD
+  }
+}
+"#;
+
+    #[test]
+    fn redacted_egress_keeping_only_public_fields_does_not_leak() {
+        // DR-0027 redact static refinement: a `complete result` that references ONLY
+        // the redacted projection is governed by the kept fields' per-field label,
+        // not the whole record. Keeping only public `id` (Customer.ssn is the only
+        // confidential field) yields a public projection — no leak, even though the
+        // result sink is public.
+        let program = REDACT_COMPLETE
+            .replace("KEEP", "id")
+            .replace("FIELD", "safe.id");
+        let ir = compile_program(&program).ir.expect("compiles");
+        let envelope = Envelope::from_json(
+            r#"{ "resources": { "Customer.ssn": { "reader": "confidential" } } }"#,
+        )
+        .expect("valid");
+        assert!(
+            !check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+                .iter()
+                .any(|d| d.message.contains("result")),
+            "a projection keeping only public fields must not leak to a public invoker"
+        );
+    }
+
+    #[test]
+    fn redacted_egress_keeping_a_confidential_field_leaks() {
+        // The bite: keeping the confidential `ssn` makes the projection confidential,
+        // so the public invoker is not cleared — flagged (the dropped fields are
+        // non-interfering, but a KEPT confidential field is not).
+        let program = REDACT_COMPLETE
+            .replace("KEEP", "id, ssn")
+            .replace("FIELD", "safe.ssn");
+        let ir = compile_program(&program).ir.expect("compiles");
+        let confidential = r#"{ "resources": { "Customer.ssn": { "reader": "confidential" } } }"#;
+        let leak_env = Envelope::from_json(confidential).expect("valid");
+        assert!(
+            check_with_envelope(&ir, &VerifiedEnvelope::for_test(leak_env))
+                .iter()
+                .any(
+                    |d| d.message.contains("redacted result") && d.message.contains("confidential")
+                ),
+            "keeping a confidential field must leak to a public invoker"
+        );
+        // Clearing the invoker for `confidential` removes it.
+        let cleared = Envelope::from_json(
+            r#"{ "resources": {
+                "Customer.ssn": { "reader": "confidential" },
+                "result": { "reader": "confidential" }
+            } }"#,
+        )
+        .expect("valid");
+        assert!(
+            !check_with_envelope(&ir, &VerifiedEnvelope::for_test(cleared))
+                .iter()
+                .any(|d| d.message.contains("redacted result")),
+            "clearing the invoker for the kept fields' label removes the leak"
         );
     }
 
