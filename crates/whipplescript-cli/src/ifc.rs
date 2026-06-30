@@ -1039,6 +1039,69 @@ fn result_dependency_reads(tool: &IrProgram) -> Vec<String> {
     reads.into_iter().collect()
 }
 
+/// Partition egress sinks (`complete` bindings or `fact:<Schema>` record sinks)
+/// into those handled by the redact static refinement and the conservative
+/// remainder. A sink whose payload references ONLY redaction outputs (each with a
+/// resolvable source schema) is FULLY-REDACTED: its required clearance is the JOIN
+/// of those projections' kept-field labels (`projected_reader_set`), checked here
+/// against the sink's own label — a leak is flagged, and the sink is dropped from
+/// the returned conservative list (the runtime physically projects, so the egress
+/// provably carries only the kept fields; DR-0027, proven in
+/// `models/lean/Whipple/Redaction.lean`). A mixed egress (references a non-redacted
+/// binding) or one whose redaction has no resolved source schema stays conservative.
+fn partition_redacted_egresses(
+    candidates: &[String],
+    rule: &IrRule,
+    envelope: &Envelope,
+    span: whipplescript_parser::SourceSpan,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<String> {
+    let projected_for = |binding: &str| -> Option<BTreeSet<String>> {
+        let redaction = rule
+            .metadata
+            .redactions
+            .iter()
+            .find(|redaction| redaction.binding == binding)?;
+        let schema = redaction.source_schema.as_deref()?;
+        Some(envelope.projected_reader_set(schema, &redaction.keep))
+    };
+    let mut conservative = Vec::new();
+    for sink in candidates {
+        let roots = rule.metadata.egress_payload_reads.get(sink);
+        let fully_redacted = roots.is_some_and(|roots| {
+            !roots.is_empty() && roots.iter().all(|r| projected_for(r).is_some())
+        });
+        if !fully_redacted {
+            conservative.push(sink.clone());
+            continue;
+        }
+        let projected: BTreeSet<String> = roots
+            .into_iter()
+            .flatten()
+            .filter_map(|root| projected_for(root))
+            .flatten()
+            .collect();
+        if !envelope.dominates(&envelope.reader_set(sink), &projected) {
+            diagnostics.push(Diagnostic {
+                span,
+                message: format!(
+                    "information-flow violation in rule `{rule}`: the redacted egress `{sink}` \
+                     still carries fields readable by {proj}, but `{sink}` is readable by {have}",
+                    rule = rule.name,
+                    proj = label_text(&projected),
+                    have = envelope.reader_label(sink),
+                ),
+                suggestion: Some(format!(
+                    "keep fewer / less-sensitive fields in the redaction, or clear the sink with \
+                     `grant … -> {sink} readable by <role>`"
+                )),
+                related: Vec::new(),
+            });
+        }
+    }
+    conservative
+}
+
 pub fn check_with_envelope_imports(
     ir: &IrProgram,
     verified: &VerifiedEnvelope,
@@ -1172,7 +1235,7 @@ pub fn check_with_envelope_imports(
         // silently leave a governed flow via a recorded fact, and untrusted data
         // cannot drive a high-integrity fact governance has labelled. `fact_writes`
         // carries the recorded schemas as `schema:<Name>`.
-        let record_sinks: Vec<String> = rule
+        let record_candidates: Vec<String> = rule
             .metadata
             .fact_writes
             .iter()
@@ -1183,75 +1246,36 @@ pub fn check_with_envelope_imports(
         // `@service`/top-level workflow the invoker is the operator in the same
         // governance domain, so the result is a local confidentiality sink named by the
         // output binding, default public/fail-closed and cleared by a grant
-        // (`grant <kind> <handle> -> <binding> readable by <role>`). Whole-result v1
-        // (no per-field value-flow): the result conservatively carries the join of the
-        // completing rule's read sources, exactly as any file/channel egress does — so
-        // a rule that both reads confidential data and completes must clear the invoker
-        // or separate the contexts (the safe shape). A `@tool` result is NOT here (it
-        // crosses a package boundary, governed consumer-side by the flow signature).
-        // DR-0027 redact (the static refinement): a `complete <b>` whose payload
-        // references ONLY redaction outputs is a FULLY-REDACTED egress. The runtime
-        // physically projects each such binding to its kept fields, so the egress
-        // carries only those — its confidentiality is the kept fields' per-field
+        // (`grant <kind> <handle> -> <binding> readable by <role>`). A `@tool` result
+        // is NOT here (it crosses a package boundary, governed consumer-side).
+        //
+        // DR-0027 redact (the static refinement): an egress (a `complete` OR a
+        // `record`) whose payload references ONLY redaction outputs is FULLY-REDACTED.
+        // The runtime physically projects each such binding to its kept fields, so the
+        // egress carries only those — its confidentiality is the kept fields' per-field
         // label join (`projected_reader_set`), NOT the rule's whole read set. Such an
-        // egress is governed by the projected label below and EXCLUDED from the
-        // conservative read×sink loop. The projection is sound only when every
-        // referenced redaction resolves a source schema (else stay conservative).
-        let redacted_projection = |binding: &str| -> Option<BTreeSet<String>> {
-            let redaction = rule
-                .metadata
-                .redactions
-                .iter()
-                .find(|redaction| redaction.binding == binding)?;
-            let schema = redaction.source_schema.as_deref()?;
-            Some(envelope.projected_reader_set(schema, &redaction.keep))
+        // egress is governed by its projected label here and EXCLUDED from the
+        // conservative read×sink loop; a mixed or unresolved egress stays conservative.
+        let redact_span = span.unwrap_or(whipplescript_parser::SourceSpan { start: 0, end: 0 });
+        let result_candidates: Vec<String> = if is_tool {
+            Vec::new()
+        } else {
+            rule.metadata.terminal_completes.clone()
         };
-        let mut result_sinks: Vec<String> = Vec::new();
-        if !is_tool {
-            for complete in &rule.metadata.terminal_completes {
-                let roots = rule.metadata.terminal_complete_reads.get(complete);
-                let fully_redacted = roots.is_some_and(|roots| {
-                    !roots.is_empty()
-                        && roots.iter().all(|root| redacted_projection(root).is_some())
-                });
-                if fully_redacted {
-                    // The egress carries only the projections — its required clearance
-                    // is the join of the kept fields' labels.
-                    let projected: BTreeSet<String> = roots
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|root| redacted_projection(root))
-                        .flatten()
-                        .collect();
-                    if !envelope.dominates(&envelope.reader_set(complete), &projected) {
-                        diagnostics.push(Diagnostic {
-                            span: rule
-                                .metadata
-                                .effects
-                                .first()
-                                .map(|effect| effect.span)
-                                .unwrap_or(whipplescript_parser::SourceSpan { start: 0, end: 0 }),
-                            message: format!(
-                                "information-flow violation in rule `{rule}`: the redacted result \
-                                 `{complete}` still carries fields readable by {proj}, but the \
-                                 invoker `{complete}` is readable by {sink}",
-                                rule = rule.name,
-                                proj = label_text(&projected),
-                                sink = envelope.reader_label(complete),
-                            ),
-                            suggestion: Some(format!(
-                                "keep fewer / less-sensitive fields in the redaction, or clear the \
-                                 invoker with `grant … -> {complete} readable by <role>`"
-                            )),
-                            related: Vec::new(),
-                        });
-                    }
-                } else {
-                    // Not provably narrowed — governed conservatively (whole read set).
-                    result_sinks.push(complete.clone());
-                }
-            }
-        }
+        let result_sinks = partition_redacted_egresses(
+            &result_candidates,
+            rule,
+            envelope,
+            redact_span,
+            &mut diagnostics,
+        );
+        let record_sinks = partition_redacted_egresses(
+            &record_candidates,
+            rule,
+            envelope,
+            redact_span,
+            &mut diagnostics,
+        );
         // DR-0030 X2 (cross-package): a `tell <agent>` turn whose agent may call an
         // imported `@tool` (DR-0025 `tools [...]`) can pull that tool's result into the
         // turn — and the tool may read confidential/low-integrity data the consumer
@@ -2227,7 +2251,7 @@ rule r
             check_with_envelope(&ir, &VerifiedEnvelope::for_test(leak_env))
                 .iter()
                 .any(
-                    |d| d.message.contains("redacted result") && d.message.contains("confidential")
+                    |d| d.message.contains("redacted egress") && d.message.contains("confidential")
                 ),
             "keeping a confidential field must leak to a public invoker"
         );
@@ -2242,8 +2266,58 @@ rule r
         assert!(
             !check_with_envelope(&ir, &VerifiedEnvelope::for_test(cleared))
                 .iter()
-                .any(|d| d.message.contains("redacted result")),
+                .any(|d| d.message.contains("redacted egress")),
             "clearing the invoker for the kept fields' label removes the leak"
+        );
+    }
+
+    #[test]
+    fn redacted_record_egress_is_governed_by_the_projection() {
+        // The same refinement applies to a `record` egress: a recorded fact built
+        // only from a redacted projection is governed by the kept fields' label.
+        let program = r#"@service
+workflow RedactRecord
+
+input customer Customer
+output result PublicView
+
+class Customer { id string  ssn string }
+class PublicView { ok bool }
+class SafeFact { who string }
+
+rule r
+  when Customer as c
+=> {
+  redact c keep [KEEP] as safe
+  record SafeFact {
+    who FIELD
+  }
+  complete result { ok true }
+}
+"#;
+        let envelope = r#"{ "resources": { "Customer.ssn": { "reader": "confidential" } } }"#;
+        // Keeping only public `id`: the recorded fact is public — no leak.
+        let safe = program.replace("KEEP", "id").replace("FIELD", "safe.id");
+        let ir = compile_program(&safe).ir.expect("compiles");
+        let env = Envelope::from_json(envelope).expect("valid");
+        assert!(
+            !check_with_envelope(&ir, &VerifiedEnvelope::for_test(env))
+                .iter()
+                .any(|d| d.message.contains("SafeFact")),
+            "a fact built only from a public projection must not leak"
+        );
+        // Keeping `ssn`: the recorded fact carries confidential — flagged.
+        let leak = program
+            .replace("KEEP", "id, ssn")
+            .replace("FIELD", "safe.ssn");
+        let ir = compile_program(&leak).ir.expect("compiles");
+        let env = Envelope::from_json(envelope).expect("valid");
+        assert!(
+            check_with_envelope(&ir, &VerifiedEnvelope::for_test(env))
+                .iter()
+                .any(|d| d.message.contains("redacted egress")
+                    && d.message.contains("fact:SafeFact")),
+            "a fact built from a confidential projection must be flagged"
         );
     }
 

@@ -1172,13 +1172,15 @@ pub struct IrRuleMetadata {
     /// models/lean/Whipple/Redaction.lean). IFC-only — NOT rendered in the `.ir`
     /// snapshot, so it adds no golden/hash churn.
     pub redactions: Vec<IrRedaction>,
-    /// Per `complete <binding>` egress, the set of binding roots its payload
-    /// references (union across branches). IFC-only (NOT in the `.ir` snapshot). The
-    /// information-flow engine uses this to recognize a FULLY-REDACTED egress — a
-    /// `complete` whose payload references only redaction outputs — and govern it by
-    /// the projection's per-field label rather than the rule's whole read set
-    /// (DR-0027 redact, the static refinement).
-    pub terminal_complete_reads: BTreeMap<String, BTreeSet<String>>,
+    /// Per egress sink, the set of binding roots its payload references (union
+    /// across branches), keyed by the sink string the IFC engine uses: a `complete
+    /// <binding>` is keyed by its binding, a `record <Schema>` by `fact:<Schema>`.
+    /// IFC-only (NOT in the `.ir` snapshot). The engine uses this to recognize a
+    /// FULLY-REDACTED egress — one whose payload references only redaction outputs —
+    /// and govern it by the projection's per-field label rather than the rule's
+    /// whole read set (DR-0027 redact, the static refinement). `send` egresses are a
+    /// follow-on (their payload is construct-use source text, not yet surfaced here).
+    pub egress_payload_reads: BTreeMap<String, BTreeSet<String>>,
     /// Maximum nesting depth of `after` blocks in the rule body (0 = no `after`,
     /// 1 = a top-level `after`, 2 = an `after` inside an `after`, …). Surfaced for the
     /// `lint.deep_after_nesting` maintainability check.
@@ -7192,12 +7194,12 @@ fn analyze_rule(
         &binding_types,
         &mut metadata.redactions,
     );
-    let mut complete_reads = Vec::new();
-    collect_terminal_complete_reads(&body_ast.statements, &mut complete_reads);
-    for (binding, roots) in complete_reads {
+    let mut egress_reads = Vec::new();
+    collect_egress_payload_reads(&body_ast.statements, &mut egress_reads);
+    for (sink, roots) in egress_reads {
         metadata
-            .terminal_complete_reads
-            .entry(binding)
+            .egress_payload_reads
+            .entry(sink)
             .or_default()
             .extend(roots);
     }
@@ -7331,13 +7333,15 @@ fn collect_payload_field_roots(
     }
 }
 
-/// For each `complete <binding> { … }` in a rule body (recursing into nested
-/// blocks), the set of binding roots its payload references. Surfaced so the IFC
-/// engine can recognize a FULLY-REDACTED egress — a `complete` whose payload
-/// references only redaction outputs (and constants) — and govern it by the
-/// projection's per-field label instead of the rule's whole read set. A `complete`
-/// with no recorded entry references nothing resolvable (treated as public-only).
-fn collect_terminal_complete_reads(
+/// For each egress sink in a rule body (recursing into nested blocks), the set of
+/// binding roots its payload references, keyed by the sink string the IFC engine
+/// uses: a `complete <binding>` by its binding, a `record <Schema>` by
+/// `fact:<Schema>`. Surfaced so the engine can recognize a FULLY-REDACTED egress —
+/// one whose payload references only redaction outputs (and constants) — and
+/// govern it by the projection's per-field label instead of the rule's whole read
+/// set. A `record <Schema> from <binding>` references that `from` binding too (its
+/// fields are copied). A sink with no recorded entry references nothing resolvable.
+fn collect_egress_payload_reads(
     statements: &[body::BodyStmt],
     out: &mut Vec<(String, BTreeSet<String>)>,
 ) {
@@ -7348,22 +7352,40 @@ fn collect_terminal_complete_reads(
                 collect_payload_field_roots(&terminal.fields, None, &mut roots);
                 out.push((terminal.name.clone(), roots));
             }
-            body::BodyStmt::After(after) => collect_terminal_complete_reads(&after.body, out),
+            body::BodyStmt::Record(record) => out.push(record_payload_reads(record)),
+            // `done <b> -> record <Schema> { … }` is also a record egress.
+            body::BodyStmt::Done {
+                replacement: Some(record),
+                ..
+            } => out.push(record_payload_reads(record)),
+            body::BodyStmt::After(after) => collect_egress_payload_reads(&after.body, out),
             body::BodyStmt::Case(case) => {
                 for branch in &case.branches {
-                    collect_terminal_complete_reads(&branch.body, out);
+                    collect_egress_payload_reads(&branch.body, out);
                 }
             }
             body::BodyStmt::Branch(branch) => {
-                collect_terminal_complete_reads(&branch.then_body, out);
+                collect_egress_payload_reads(&branch.then_body, out);
                 if let Some(else_body) = &branch.else_body {
-                    collect_terminal_complete_reads(else_body, out);
+                    collect_egress_payload_reads(else_body, out);
                 }
             }
-            body::BodyStmt::Handler(handler) => collect_terminal_complete_reads(&handler.body, out),
+            body::BodyStmt::Handler(handler) => collect_egress_payload_reads(&handler.body, out),
             _ => {}
         }
     }
+}
+
+/// The `fact:<Schema>` sink key and the binding roots a `record` payload
+/// references — its explicit field values plus, for `record <S> from <b>`, the
+/// copied-from binding `b`.
+fn record_payload_reads(record: &body::RecordStmt) -> (String, BTreeSet<String>) {
+    let mut roots = BTreeSet::new();
+    if let Some(from) = &record.from {
+        roots.insert(from.clone());
+    }
+    collect_payload_field_roots(&record.fields, record.from.as_deref(), &mut roots);
+    (format!("fact:{}", record.schema), roots)
 }
 
 #[derive(Clone, Debug, Default)]
