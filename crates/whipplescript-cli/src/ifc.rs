@@ -1039,23 +1039,25 @@ fn result_dependency_reads(tool: &IrProgram) -> Vec<String> {
     reads.into_iter().collect()
 }
 
-/// Partition egress sinks (`complete` bindings or `fact:<Schema>` record sinks)
-/// into those handled by the redact static refinement and the conservative
-/// remainder. A sink whose payload references ONLY redaction outputs (each with a
-/// resolvable source schema) is FULLY-REDACTED: its required clearance is the JOIN
-/// of those projections' kept-field labels (`projected_reader_set`), checked here
-/// against the sink's own label — a leak is flagged, and the sink is dropped from
-/// the returned conservative list (the runtime physically projects, so the egress
-/// provably carries only the kept fields; DR-0027, proven in
-/// `models/lean/Whipple/Redaction.lean`). A mixed egress (references a non-redacted
-/// binding) or one whose redaction has no resolved source schema stays conservative.
-fn partition_redacted_egresses(
+/// The set of egress sinks (`complete` bindings, `fact:<Schema>` record sinks, or
+/// `send` channels) whose CONFIDENTIALITY (leak) check is governed by the redact
+/// static refinement rather than the conservative whole-read join. A sink whose
+/// payload references ONLY redaction outputs (each with a resolvable source schema)
+/// is FULLY-REDACTED: its required clearance is the JOIN of those projections'
+/// kept-field labels (`projected_reader_set`), checked here against the sink's own
+/// label (a leak is flagged); the runtime physically projects, so the egress
+/// provably carries only the kept fields (DR-0027, proven in
+/// `models/lean/Whipple/Redaction.lean`). The returned sinks are exempted from the
+/// conservative LEAK check ONLY — the integrity/injection check still applies in
+/// full, since redaction projects confidentiality, not trust. A mixed egress, or
+/// one whose redaction has no resolved source schema, is absent (stays conservative).
+fn redacted_leak_exempt_egresses(
     candidates: &[String],
     rule: &IrRule,
     envelope: &Envelope,
     span: whipplescript_parser::SourceSpan,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Vec<String> {
+) -> BTreeSet<String> {
     let projected_for = |binding: &str| -> Option<BTreeSet<String>> {
         let redaction = rule
             .metadata
@@ -1065,16 +1067,16 @@ fn partition_redacted_egresses(
         let schema = redaction.source_schema.as_deref()?;
         Some(envelope.projected_reader_set(schema, &redaction.keep))
     };
-    let mut conservative = Vec::new();
+    let mut exempt = BTreeSet::new();
     for sink in candidates {
         let roots = rule.metadata.egress_payload_reads.get(sink);
         let fully_redacted = roots.is_some_and(|roots| {
             !roots.is_empty() && roots.iter().all(|r| projected_for(r).is_some())
         });
         if !fully_redacted {
-            conservative.push(sink.clone());
             continue;
         }
+        exempt.insert(sink.clone());
         let projected: BTreeSet<String> = roots
             .into_iter()
             .flatten()
@@ -1099,7 +1101,7 @@ fn partition_redacted_egresses(
             });
         }
     }
-    conservative
+    exempt
 }
 
 pub fn check_with_envelope_imports(
@@ -1257,20 +1259,23 @@ pub fn check_with_envelope_imports(
         // egress is governed by its projected label here and EXCLUDED from the
         // conservative read×sink loop; a mixed or unresolved egress stays conservative.
         let redact_span = span.unwrap_or(whipplescript_parser::SourceSpan { start: 0, end: 0 });
-        let result_candidates: Vec<String> = if is_tool {
+        let result_sinks: Vec<String> = if is_tool {
             Vec::new()
         } else {
             rule.metadata.terminal_completes.clone()
         };
-        let result_sinks = partition_redacted_egresses(
-            &result_candidates,
-            rule,
-            envelope,
-            redact_span,
-            &mut diagnostics,
-        );
-        let record_sinks = partition_redacted_egresses(
-            &record_candidates,
+        let record_sinks = record_candidates;
+        // Sinks whose CONFIDENTIALITY check is governed by the redact refinement (a
+        // fully-redacted `complete`/`record`/`send`). They remain in the conservative
+        // loop for the integrity/injection axis; only their leak check is skipped.
+        let redact_candidates: Vec<String> = result_sinks
+            .iter()
+            .cloned()
+            .chain(record_sinks.iter().cloned())
+            .chain(writes.iter().map(|sink| (*sink).to_owned()))
+            .collect();
+        let leak_exempt = redacted_leak_exempt_egresses(
+            &redact_candidates,
             rule,
             envelope,
             redact_span,
@@ -1367,7 +1372,10 @@ pub fn check_with_envelope_imports(
                 .chain(record_sinks.iter().map(String::as_str))
                 .chain(result_sinks.iter().map(String::as_str))
             {
-                if leak.is_none() && envelope.leaks(src, sink) {
+                // A fully-redacted egress's leak is governed by its projected label
+                // (above); skip the conservative whole-read leak for it. Its
+                // integrity/injection check below still runs.
+                if leak.is_none() && !leak_exempt.contains(sink) && envelope.leaks(src, sink) {
                     leak = Some((src.to_owned(), sink.to_owned()));
                 }
                 if inject.is_none() {
@@ -2318,6 +2326,55 @@ rule r
                 .any(|d| d.message.contains("redacted egress")
                     && d.message.contains("fact:SafeFact")),
             "a fact built from a confidential projection must be flagged"
+        );
+    }
+
+    #[test]
+    fn redacted_send_egress_is_governed_by_the_projection() {
+        // The refinement also covers a `send via <channel>` egress: a message built
+        // only from a redacted projection is governed by the kept fields' label.
+        let program = r##"@service
+workflow RedactSend
+
+input customer Customer
+output result PublicView
+
+class Customer { id string  ssn string }
+class PublicView { ok bool }
+
+channel reply {
+  provider slack
+  destination "#ops"
+}
+
+rule r
+  when Customer as c
+=> {
+  redact c keep [KEEP] as safe
+  send via reply { text FIELD } as sent
+  complete result { ok true }
+}
+"##;
+        let envelope = r#"{ "resources": { "Customer.ssn": { "reader": "confidential" } } }"#;
+        let safe = program.replace("KEEP", "id").replace("FIELD", "safe.id");
+        let ir = compile_program(&safe).ir.expect("compiles");
+        let env = Envelope::from_json(envelope).expect("valid");
+        assert!(
+            !check_with_envelope(&ir, &VerifiedEnvelope::for_test(env))
+                .iter()
+                .any(|d| d.message.contains("reply")),
+            "a message built only from a public projection must not leak"
+        );
+        let leak = program
+            .replace("KEEP", "id, ssn")
+            .replace("FIELD", "safe.ssn");
+        let ir = compile_program(&leak).ir.expect("compiles");
+        let env = Envelope::from_json(envelope).expect("valid");
+        assert!(
+            check_with_envelope(&ir, &VerifiedEnvelope::for_test(env))
+                .iter()
+                .any(|d| d.message.contains("redacted egress") && d.message.contains("reply")),
+            "a message built from a confidential projection must be flagged"
         );
     }
 

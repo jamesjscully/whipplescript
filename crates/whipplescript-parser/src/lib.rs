@@ -1174,12 +1174,12 @@ pub struct IrRuleMetadata {
     pub redactions: Vec<IrRedaction>,
     /// Per egress sink, the set of binding roots its payload references (union
     /// across branches), keyed by the sink string the IFC engine uses: a `complete
-    /// <binding>` is keyed by its binding, a `record <Schema>` by `fact:<Schema>`.
-    /// IFC-only (NOT in the `.ir` snapshot). The engine uses this to recognize a
-    /// FULLY-REDACTED egress — one whose payload references only redaction outputs —
-    /// and govern it by the projection's per-field label rather than the rule's
-    /// whole read set (DR-0027 redact, the static refinement). `send` egresses are a
-    /// follow-on (their payload is construct-use source text, not yet surfaced here).
+    /// <binding>` by its binding, a `record <Schema>` by `fact:<Schema>`, a `send via
+    /// <channel>` by the channel. IFC-only (NOT in the `.ir` snapshot). The engine
+    /// uses this to recognize a FULLY-REDACTED egress — one whose payload references
+    /// only redaction outputs — and govern its leak check by the projection's
+    /// per-field label rather than the rule's whole read set (DR-0027 redact, the
+    /// static refinement).
     pub egress_payload_reads: BTreeMap<String, BTreeSet<String>>,
     /// Maximum nesting depth of `after` blocks in the rule body (0 = no `after`,
     /// 1 = a top-level `after`, 2 = an `after` inside an `after`, …). Surfaced for the
@@ -7358,6 +7358,21 @@ fn collect_egress_payload_reads(
                 replacement: Some(record),
                 ..
             } => out.push(record_payload_reads(record)),
+            // `send via <channel> { text … }` egresses to the channel; its payload
+            // fields (text/markdown/thread_id) are construct-use source text. Keyed by
+            // the channel (the engine's send sink, per `resource_for_body`).
+            body::BodyStmt::Effect(effect) => {
+                if let body::BodyEffectKind::ConstructCapabilityCall {
+                    keyword, fields, ..
+                } = &effect.kind
+                {
+                    if keyword == "send" {
+                        if let Some(reads) = send_payload_reads(fields) {
+                            out.push(reads);
+                        }
+                    }
+                }
+            }
             body::BodyStmt::After(after) => collect_egress_payload_reads(&after.body, out),
             body::BodyStmt::Case(case) => {
                 for branch in &case.branches {
@@ -7374,6 +7389,27 @@ fn collect_egress_payload_reads(
             _ => {}
         }
     }
+}
+
+/// The channel sink key and the binding roots a `send` payload references. The
+/// payload fields (`text`/`markdown`/`thread_id`) carry expression SOURCE TEXT, so
+/// each is parsed and walked (a string literal's `{{ … }}` interpolations count);
+/// the `channel` field names the sink. `None` if no channel is present.
+fn send_payload_reads(fields: &[body::ConstructUseField]) -> Option<(String, BTreeSet<String>)> {
+    let channel = fields
+        .iter()
+        .find(|field| field.name == "channel")
+        .map(|field| field.source.clone())?;
+    let mut roots = BTreeSet::new();
+    for field in fields.iter().filter(|field| field.name != "channel") {
+        if let Ok(expr) = parse_expression(&field.source) {
+            collect_expr_binding_roots(&expr, &mut roots);
+        } else {
+            // Unparseable source: scan its interpolations conservatively.
+            collect_template_binding_roots(&field.source, &mut roots);
+        }
+    }
+    Some((channel, roots))
 }
 
 /// The `fact:<Schema>` sink key and the binding roots a `record` payload

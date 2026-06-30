@@ -193,13 +193,14 @@ These are real gaps observed while building the examples, not hypotheticals.
    they can reach any sink), and **in the flow checker**. Per-field labels are
    envelope resources keyed `<Schema>.<field>` (e.g.
    `grant field cust_ssn -> Customer.ssn readable by Operator`); a field with no
-   label is public. A `complete result` or `record <Schema>` egress that references
-   **only** redacted projections is governed by the kept fields' label join — so
-   keeping only public fields needs no clearance, while keeping a confidential field
-   is flagged. The non-interference of the dropped fields is proven in
-   `models/lean/Whipple/Redaction.lean` (`canRead_redact`). **Still deferred:** the
-   same refinement on `send` egresses (their payload is construct-use source text,
-   not yet surfaced), and field-level precision *within* a non-redacted binding.
+   label is public. Any egress that references **only** redacted projections —
+   `complete result`, `record <Schema>`, or `send via <channel>` — is governed by
+   the kept fields' label join, so keeping only public fields needs no clearance
+   while keeping a confidential field is flagged. (Redaction projects
+   *confidentiality* only — the integrity/injection check still applies in full.)
+   The non-interference of the dropped fields is proven in
+   `models/lean/Whipple/Redaction.lean` (`canRead_redact`). **Still deferred:**
+   field-level precision *within* a non-redacted binding.
 
 5. ~~**Inbound message triggers are not integrity sources.**~~ *Fixed (H3):* a rule
    triggered by `when message from <channel>` now treats the channel as a

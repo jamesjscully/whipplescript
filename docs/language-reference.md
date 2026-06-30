@@ -369,11 +369,13 @@ Semantics:
   from the value bound to `out`, so they can never leave through any sink — the
   runtime teeth behind the static drop (proven in
   `models/lean/Whipple/Redaction.lean`: the dropped fields are non-interfering).
-- **Information-flow refinement.** Under a governance envelope, a `complete result`
-  or `record <Schema>` egress that references only redacted projections is governed
-  by the kept fields' per-field label join (envelope resources keyed
-  `<Schema>.<field>`), not the whole record — so a redaction releasing only public
-  fields needs no clearance, while keeping a confidential field is flagged.
+- **Information-flow refinement.** Under a governance envelope, any egress that
+  references only redacted projections — `complete result`, `record <Schema>`, or
+  `send via <channel>` — is governed by the kept fields' per-field label join
+  (envelope resources keyed `<Schema>.<field>`), not the whole record: a redaction
+  releasing only public fields needs no clearance, while keeping a confidential
+  field is flagged. (The projection narrows confidentiality only; the integrity
+  check is unaffected.)
 - **Source kinds.** The source may be a matched class (`when Class as c`), a
   coerce/decide/exec result, or the alias of an `after … succeeds as <alias>`
   branch (the read-then-redact flow). Redactions may chain: a redaction's output
