@@ -1083,7 +1083,40 @@ fn redacted_leak_exempt_egresses(
             .filter_map(|root| projected_for(root))
             .flatten()
             .collect();
-        if !envelope.dominates(&envelope.reader_set(sink), &projected) {
+        let sink_readers = envelope.reader_set(sink);
+        if !envelope.dominates(&sink_readers, &projected) {
+            // Name exactly which kept fields the sink cannot read, and suggest the
+            // safe keep-set — the sound "auto-suggest" form of auto-redaction, which
+            // keeps the crossing explicit (the author still narrows the `keep` list).
+            let mut offending: BTreeSet<String> = BTreeSet::new();
+            let mut safe: Vec<String> = Vec::new();
+            for root in roots.into_iter().flatten() {
+                let Some(redaction) = rule.metadata.redactions.iter().find(|r| &r.binding == root)
+                else {
+                    continue;
+                };
+                let Some(schema) = redaction.source_schema.as_deref() else {
+                    continue;
+                };
+                for field in &redaction.keep {
+                    let field_label = envelope.reader_set(&format!("{schema}.{field}"));
+                    if envelope.dominates(&sink_readers, &field_label) {
+                        safe.push(field.clone());
+                    } else {
+                        offending.insert(field.clone());
+                    }
+                }
+            }
+            let suggestion = if offending.is_empty() {
+                format!("clear the sink with `grant … -> {sink} readable by <role>`")
+            } else {
+                let dropped = offending.iter().cloned().collect::<Vec<_>>().join(", ");
+                let keep = safe.join(", ");
+                format!(
+                    "drop the field(s) `{dropped}` the sink cannot read (keep only [{keep}]), or \
+                     clear the sink with `grant … -> {sink} readable by <role>`"
+                )
+            };
             diagnostics.push(Diagnostic {
                 span,
                 message: format!(
@@ -1093,10 +1126,7 @@ fn redacted_leak_exempt_egresses(
                     proj = label_text(&projected),
                     have = envelope.reader_label(sink),
                 ),
-                suggestion: Some(format!(
-                    "keep fewer / less-sensitive fields in the redaction, or clear the sink with \
-                     `grant … -> {sink} readable by <role>`"
-                )),
+                suggestion: Some(suggestion),
                 related: Vec::new(),
             });
         }
@@ -2255,13 +2285,16 @@ rule r
         let ir = compile_program(&program).ir.expect("compiles");
         let confidential = r#"{ "resources": { "Customer.ssn": { "reader": "confidential" } } }"#;
         let leak_env = Envelope::from_json(confidential).expect("valid");
+        let diags = check_with_envelope(&ir, &VerifiedEnvelope::for_test(leak_env));
+        let redact_leak = diags
+            .iter()
+            .find(|d| d.message.contains("redacted egress") && d.message.contains("confidential"))
+            .expect("keeping a confidential field must leak to a public invoker");
+        // The auto-suggest names the offending field and the safe keep-set.
+        let suggestion = redact_leak.suggestion.as_deref().unwrap_or_default();
         assert!(
-            check_with_envelope(&ir, &VerifiedEnvelope::for_test(leak_env))
-                .iter()
-                .any(
-                    |d| d.message.contains("redacted egress") && d.message.contains("confidential")
-                ),
-            "keeping a confidential field must leak to a public invoker"
+            suggestion.contains("`ssn`") && suggestion.contains("keep only [id]"),
+            "suggestion should name the offending field and the safe keep-set: {suggestion}"
         );
         // Clearing the invoker for `confidential` removes it.
         let cleared = Envelope::from_json(
