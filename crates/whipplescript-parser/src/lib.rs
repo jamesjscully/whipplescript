@@ -1181,10 +1181,31 @@ pub struct IrRuleMetadata {
     /// per-field label rather than the rule's whole read set (DR-0027 redact, the
     /// static refinement).
     pub egress_payload_reads: BTreeMap<String, BTreeSet<String>>,
+    /// Bounded-type projection egresses (`record <T> from <src>`): each is governed
+    /// by the kept fields' per-field label join, like an explicit `redact`. IFC-only
+    /// (NOT in the `.ir` snapshot). DR-0027 auto-redaction, the bounded-type reading.
+    pub bounded_egresses: Vec<IrBoundedEgress>,
     /// Maximum nesting depth of `after` blocks in the rule body (0 = no `after`,
     /// 1 = a top-level `after`, 2 = an `after` inside an `after`, …). Surfaced for the
     /// `lint.deep_after_nesting` maintainability check.
     pub max_after_depth: usize,
+}
+
+/// A bounded-type projection egress (`record <T> from <src>`): the recorded fact
+/// keeps exactly `T`'s fields, copied from `src`, so the egress carries only the
+/// kept fields' per-field labels — the "bounded-type" auto-redaction reading
+/// (DR-0027). The bound is the declared target type `T`; the labels are the
+/// SOURCE schema's (a target field mislabelled public is still caught against the
+/// source's label). The IFC engine governs it exactly like an explicit `redact`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrBoundedEgress {
+    /// The engine's sink string (`fact:<T>` for a record).
+    pub sink: String,
+    /// The schema of the `from` source binding, whose per-field labels bound the
+    /// projection.
+    pub source_schema: String,
+    /// The kept field names (the target type `T`'s fields).
+    pub keep: Vec<String>,
 }
 
 /// A `redact <source> keep [..] as <binding>` projection, surfaced for the
@@ -7194,6 +7215,11 @@ fn analyze_rule(
         &binding_types,
         &mut metadata.redactions,
     );
+    collect_bounded_egresses(
+        &body_ast.statements,
+        &binding_types,
+        &mut metadata.bounded_egresses,
+    );
     let mut egress_reads = Vec::new();
     collect_egress_payload_reads(&body_ast.statements, &mut egress_reads);
     for (sink, roots) in egress_reads {
@@ -7226,6 +7252,80 @@ fn collect_redaction_metadata(
             binding: binding.to_owned(),
             source_schema: binding_types.get(source).cloned(),
         });
+    }
+}
+
+/// Collect the bounded-type projection egresses (`record <T> from <src>`) of a rule
+/// body (recursing into nested blocks). A `record T from src` keeps exactly `T`'s
+/// declared fields, copied from `src`, so the IFC engine can govern it by the kept
+/// fields' per-field labels (sourced from `src`'s schema) — the "bounded-type"
+/// auto-redaction reading. Only recorded when the source schema resolves and the
+/// target type is declared; otherwise the egress stays conservative.
+fn push_bounded_record(
+    record: &body::RecordStmt,
+    binding_types: &BTreeMap<String, String>,
+    out: &mut Vec<IrBoundedEgress>,
+) {
+    let Some(src) = &record.from else {
+        return;
+    };
+    let Some(source_schema) = binding_types.get(src) else {
+        return;
+    };
+    // Bounded-type applies only to a PURE `from` projection — every field a
+    // shorthand copy of `src.<name>`. The runtime records exactly these fields, so
+    // the kept set is their names. A record mixing explicit value expressions is not
+    // a clean projection; it stays conservative (handled by the whole-read join).
+    if record.fields.is_empty()
+        || !record
+            .fields
+            .iter()
+            .all(|field| matches!(field.value, body::FieldValue::Shorthand))
+    {
+        return;
+    }
+    out.push(IrBoundedEgress {
+        sink: format!("fact:{}", record.schema),
+        source_schema: source_schema.clone(),
+        keep: record
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect(),
+    });
+}
+
+fn collect_bounded_egresses(
+    statements: &[body::BodyStmt],
+    binding_types: &BTreeMap<String, String>,
+    out: &mut Vec<IrBoundedEgress>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Record(record) => push_bounded_record(record, binding_types, out),
+            body::BodyStmt::Done {
+                replacement: Some(record),
+                ..
+            } => push_bounded_record(record, binding_types, out),
+            body::BodyStmt::After(after) => {
+                collect_bounded_egresses(&after.body, binding_types, out)
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_bounded_egresses(&branch.body, binding_types, out);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                collect_bounded_egresses(&branch.then_body, binding_types, out);
+                if let Some(else_body) = &branch.else_body {
+                    collect_bounded_egresses(else_body, binding_types, out);
+                }
+            }
+            body::BodyStmt::Handler(handler) => {
+                collect_bounded_egresses(&handler.body, binding_types, out)
+            }
+            _ => {}
+        }
     }
 }
 

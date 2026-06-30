@@ -199,8 +199,11 @@ These are real gaps observed while building the examples, not hypotheticals.
    while keeping a confidential field is flagged. (Redaction projects
    *confidentiality* only — the integrity/injection check still applies in full.)
    The non-interference of the dropped fields is proven in
-   `models/lean/Whipple/Redaction.lean` (`canRead_redact`). **Still deferred:**
-   field-level precision *within* a non-redacted binding.
+   `models/lean/Whipple/Redaction.lean` (`canRead_redact`). A pure `from`
+   projection (`record T from src { … }`, all shorthand) is auto-governed the same
+   way without an explicit `redact` — the bounded-type reading of auto-redaction,
+   with the target type as the explicit bound. **Still deferred:** field-level
+   precision *within* a non-redacted binding.
 
 5. ~~**Inbound message triggers are not integrity sources.**~~ *Fixed (H3):* a rule
    triggered by `when message from <channel>` now treats the channel as a

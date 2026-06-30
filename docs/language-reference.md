@@ -380,6 +380,14 @@ Semantics:
   coerce/decide/exec result, or the alias of an `after … succeeds as <alias>`
   branch (the read-then-redact flow). Redactions may chain: a redaction's output
   can be the source of a later one.
+- **Bounded-type projection (no explicit `redact`).** A pure `from` projection —
+  `record <T> from <src> { f1  f2 }` whose fields are all shorthand copies — is
+  auto-governed as a redaction keeping `[f1, f2]`: the recorded fact is checked
+  against those fields' per-field labels, so projecting only public fields needs no
+  clearance and including a confidential one is flagged (naming the field). The
+  target type `T` is the explicit, reviewable bound; the labels are the source's. A
+  record mixing explicit value expressions is not a pure projection and stays
+  conservative.
 
 ### `include` and `use`
 

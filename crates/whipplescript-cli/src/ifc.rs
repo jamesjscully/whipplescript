@@ -1304,13 +1304,55 @@ pub fn check_with_envelope_imports(
             .chain(record_sinks.iter().cloned())
             .chain(writes.iter().map(|sink| (*sink).to_owned()))
             .collect();
-        let leak_exempt = redacted_leak_exempt_egresses(
+        let mut leak_exempt = redacted_leak_exempt_egresses(
             &redact_candidates,
             rule,
             envelope,
             redact_span,
             &mut diagnostics,
         );
+        // Bounded-type egresses (`record <T> from <src>`, DR-0027 auto-redaction): the
+        // recorded fact keeps exactly `T`'s fields, so it is governed by those fields'
+        // per-field label join (sourced from `src`'s schema) — like an explicit
+        // `redact`. Leak-exempt (the projected label is checked here); integrity still
+        // applies in the loop below.
+        for bounded in &rule.metadata.bounded_egresses {
+            leak_exempt.insert(bounded.sink.clone());
+            let projected = envelope.projected_reader_set(&bounded.source_schema, &bounded.keep);
+            let sink_readers = envelope.reader_set(&bounded.sink);
+            if envelope.dominates(&sink_readers, &projected) {
+                continue;
+            }
+            let offending: Vec<String> = bounded
+                .keep
+                .iter()
+                .filter(|field| {
+                    !envelope.dominates(
+                        &sink_readers,
+                        &envelope.reader_set(&format!("{}.{}", bounded.source_schema, field)),
+                    )
+                })
+                .cloned()
+                .collect();
+            diagnostics.push(Diagnostic {
+                span: redact_span,
+                message: format!(
+                    "information-flow violation in rule `{rule}`: the bounded-type egress \
+                     `{sink}` carries fields readable by {proj}, but `{sink}` is readable by {have}",
+                    rule = rule.name,
+                    sink = bounded.sink,
+                    proj = label_text(&projected),
+                    have = envelope.reader_label(&bounded.sink),
+                ),
+                suggestion: Some(format!(
+                    "remove the field(s) `{dropped}` from the target type, or clear the sink with \
+                     `grant … -> {sink} readable by <role>`",
+                    dropped = offending.join(", "),
+                    sink = bounded.sink,
+                )),
+                related: Vec::new(),
+            });
+        }
         // DR-0030 X2 (cross-package): a `tell <agent>` turn whose agent may call an
         // imported `@tool` (DR-0025 `tools [...]`) can pull that tool's result into the
         // turn — and the tool may read confidential/low-integrity data the consumer
@@ -2359,6 +2401,60 @@ rule r
                 .any(|d| d.message.contains("redacted egress")
                     && d.message.contains("fact:SafeFact")),
             "a fact built from a confidential projection must be flagged"
+        );
+    }
+
+    #[test]
+    fn bounded_type_record_projection_is_governed_by_kept_fields() {
+        // DR-0027 auto-redaction (bounded-type): `record T from <src>` keeps exactly
+        // the listed shorthand fields, so it is governed by those fields' per-field
+        // labels — no explicit `redact` needed. Keeping only public `id` is safe;
+        // also keeping confidential `ssn` is flagged, naming the offending field.
+        let program = r#"@service
+workflow BoundedRecord
+
+input customer Customer
+output result PublicView
+
+class Customer { id string  ssn string }
+class PublicView { ok bool }
+class SafeFact { FIELDS }
+
+rule r
+  when Customer as cust
+=> {
+  record SafeFact from cust { KEEP }
+  complete result { ok true }
+}
+"#;
+        let envelope = r#"{ "resources": { "Customer.ssn": { "reader": "confidential" } } }"#;
+        let safe = program.replace("FIELDS", "id string").replace("KEEP", "id");
+        let ir = compile_program(&safe).ir.expect("compiles");
+        let env = Envelope::from_json(envelope).expect("valid");
+        assert!(
+            !check_with_envelope(&ir, &VerifiedEnvelope::for_test(env))
+                .iter()
+                .any(|d| d.message.contains("SafeFact")),
+            "a pure projection keeping only public fields must not leak"
+        );
+        let leak = program
+            .replace("FIELDS", "id string  ssn string")
+            .replace("KEEP", "id\n    ssn");
+        let ir = compile_program(&leak).ir.expect("compiles");
+        let env = Envelope::from_json(envelope).expect("valid");
+        let diags = check_with_envelope(&ir, &VerifiedEnvelope::for_test(env));
+        let leak_diag = diags
+            .iter()
+            .find(|d| d.message.contains("bounded-type egress") && d.message.contains("SafeFact"))
+            .expect("keeping a confidential field in a bounded projection must leak");
+        assert!(
+            leak_diag
+                .suggestion
+                .as_deref()
+                .unwrap_or_default()
+                .contains("`ssn`"),
+            "the suggestion should name the offending field: {:?}",
+            leak_diag.suggestion
         );
     }
 
