@@ -1164,10 +1164,28 @@ pub struct IrRuleMetadata {
     /// IFC-only — deliberately NOT rendered in the `.ir` snapshot, so it adds no
     /// golden/hash churn.
     pub terminal_completes: Vec<String>,
+    /// The `redact <source> keep [..] as <out>` projections in this rule body
+    /// (recursing into after/case/branch/handler blocks). Surfaced for the
+    /// information-flow value-flow engine: a redaction is the explicit crossing at
+    /// which the rule-level opaque join box is refined — the projected binding
+    /// carries only the kept fields' labels (DR-0027, proven in
+    /// models/lean/Whipple/Redaction.lean). IFC-only — NOT rendered in the `.ir`
+    /// snapshot, so it adds no golden/hash churn.
+    pub redactions: Vec<IrRedaction>,
     /// Maximum nesting depth of `after` blocks in the rule body (0 = no `after`,
     /// 1 = a top-level `after`, 2 = an `after` inside an `after`, …). Surfaced for the
     /// `lint.deep_after_nesting` maintainability check.
     pub max_after_depth: usize,
+}
+
+/// A `redact <source> keep [..] as <binding>` projection, surfaced for the
+/// information-flow value-flow engine (DR-0027). `source` is the binding being
+/// projected, `keep` the kept field names, `binding` the projected output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrRedaction {
+    pub source: String,
+    pub keep: Vec<String>,
+    pub binding: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3504,6 +3522,12 @@ fn lower_program(
     // named `coerce -> Schema`. Done before the rule loop so `analyze_rule` sees
     // the class in the semantic index when type-checking field/`case` access.
     collect_inline_decide_schemas(&program.items, &mut semantic, &mut ir);
+
+    // `redact <source> keep [..] as <out>` synthesizes a hygienic
+    // `redact.<rule>.<out>` class holding only the kept fields of the source
+    // schema, so the projection cannot expose a dropped field. Run after the
+    // decide synthesis so a redact whose source is a decide result resolves.
+    collect_redact_schemas(&program.items, &mut semantic, &mut ir);
 
     for item in program.items {
         match item {
@@ -6800,6 +6824,14 @@ fn analyze_rule(
         &rule.name.name,
         &mut effect_payload_types,
     );
+    // `redact … as <binding>` result carries the synthesized `redact.<rule>.<binding>`
+    // projected class (see `collect_redact_schemas`), so access through it resolves
+    // against the kept-only fields.
+    collect_redact_payload_types(
+        &body_ast.statements,
+        &rule.name.name,
+        &mut effect_payload_types,
+    );
     for (binding, payload_type) in &effect_payload_types {
         if let IrType::Ref(schema) = payload_type {
             binding_types.insert(binding.clone(), schema.clone());
@@ -6927,6 +6959,15 @@ fn analyze_rule(
         diagnostics,
     );
     validate_coordination_discipline(rule, &body_ast.statements, diagnostics);
+    // `redact <source> keep [..] as <out>`: the source must resolve to a known
+    // schema and every kept field must exist on it (fail-closed).
+    validate_redactions(
+        rule,
+        &body_ast.statements,
+        semantic,
+        &binding_types,
+        diagnostics,
+    );
     // Family B read-narrowing: a presence-conditioned field is readable only inside a
     // matching `case <root>.<disc>` arm (starts with nothing allowed at the rule top).
     validate_conditioned_field_reads(
@@ -7131,7 +7172,23 @@ fn analyze_rule(
     collect_terminal_complete_bindings(&body_ast.statements, &mut metadata.terminal_completes);
     metadata.terminal_completes.sort();
     metadata.terminal_completes.dedup();
+    collect_redaction_metadata(&body_ast.statements, &mut metadata.redactions);
     metadata
+}
+
+/// Collects the `redact <source> keep [..] as <out>` projections of a rule body
+/// (recursing into nested blocks) as IFC value-flow metadata, preserving body
+/// order so a chained redaction's source resolves against the earlier projection.
+fn collect_redaction_metadata(statements: &[body::BodyStmt], out: &mut Vec<IrRedaction>) {
+    let mut redacts = Vec::new();
+    collect_redact_effects(statements, &mut redacts);
+    for (source, keep, binding, _span) in redacts {
+        out.push(IrRedaction {
+            source: source.to_owned(),
+            keep: keep.to_vec(),
+            binding: binding.to_owned(),
+        });
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -11080,6 +11137,241 @@ fn collect_inline_decide_schemas(
     }
 }
 
+/// The hygienic synthetic class name for a `redact … as <binding>` projection:
+/// `redact.<rule>.<binding>`, holding only the kept fields of the source schema.
+pub fn redact_schema_name(rule: &str, binding: &str) -> String {
+    format!("redact.{rule}.{binding}")
+}
+
+/// Collects every `redact <source> keep [..] as <binding>` in a rule body —
+/// recursing through nested after/case/branch/handler blocks — for projected-type
+/// synthesis, type registration, and IFC value-flow.
+#[allow(clippy::type_complexity)]
+fn collect_redact_effects<'a>(
+    statements: &'a [body::BodyStmt],
+    out: &mut Vec<(&'a str, &'a [String], &'a str, SourceSpan)>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Redact {
+                source,
+                keep,
+                binding,
+                span,
+            } => out.push((source.as_str(), keep.as_slice(), binding.as_str(), *span)),
+            body::BodyStmt::After(after) => collect_redact_effects(&after.body, out),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_redact_effects(&branch.body, out);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                collect_redact_effects(&branch.then_body, out);
+                if let Some(else_body) = &branch.else_body {
+                    collect_redact_effects(else_body, out);
+                }
+            }
+            body::BodyStmt::Handler(handler) => collect_redact_effects(&handler.body, out),
+            _ => {}
+        }
+    }
+}
+
+/// Resolves binding -> schema name for a rule's redact SOURCES: `when Class as x`
+/// matches, plus coerce/decide/exec result bindings. Used only to find the schema
+/// a `redact` projects from, so the synthetic projected class copies the kept
+/// fields' types. (`after`-alias sources are a documented follow-up; an
+/// unresolved source surfaces as an empty projection + a `validate_redactions`
+/// diagnostic.) Diagnostics from the reused collector are discarded — the real
+/// pass re-emits them.
+fn rule_binding_schemas(rule: &RuleDecl, semantic: &SemanticContext) -> BTreeMap<String, String> {
+    let mut schemas = binding_types_for_rule(rule);
+    let (body_ast, _) =
+        body::parse_rule_body(&rule.body.text, rule.body.span.start, body::BodyMode::Rule);
+    let mut payloads = collect_effect_payload_types(rule, semantic, &mut Vec::new());
+    collect_exec_payload_types(&body_ast.statements, semantic, &mut payloads);
+    collect_decide_payload_types(&body_ast.statements, &rule.name.name, &mut payloads);
+    collect_redact_payload_types(&body_ast.statements, &rule.name.name, &mut payloads);
+    // `after <binding> <predicate> as <alias>` aliases the effect's completed
+    // payload schema, so a `coerce … as c` then `after c succeeds as cust` then
+    // `redact cust …` resolves (the primary read-then-redact flow). Only
+    // payload-carrying predicates are mapped here; terminal predicates
+    // (`times out`/`fails`) bind synthetic terminal schemas not usefully redacted.
+    for line in rule.body.text.lines() {
+        let Some(rest) = line.trim().strip_prefix("after ") else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        let Some(binding) = words.next() else {
+            continue;
+        };
+        let Some(predicate) = words.next() else {
+            continue;
+        };
+        if predicate == "times" && words.next() != Some("out") {
+            continue;
+        }
+        let (Some("as"), Some(alias)) = (words.next(), words.next()) else {
+            continue;
+        };
+        let alias = alias.trim_end_matches('{').trim();
+        if alias.is_empty() {
+            continue;
+        }
+        if let Some(IrType::Ref(schema)) = payloads.get(binding) {
+            schemas.insert(alias.to_owned(), schema.clone());
+        }
+    }
+    for (binding, ty) in payloads {
+        if let IrType::Ref(schema) = ty {
+            schemas.insert(binding, schema);
+        }
+    }
+    schemas
+}
+
+/// Synthesizes a hygienic `redact.<rule>.<binding>` class for every
+/// `redact <source> keep [..] as <binding>`, holding ONLY the kept fields of the
+/// source schema (with their source types). This is what makes a redaction sound:
+/// the projected binding cannot expose a dropped field (accessing one is a
+/// type error, since it is absent from the synthetic class), so the lowered IFC
+/// label the checker assigns the projection is honoured by the type system too.
+/// Mirrors [`collect_inline_decide_schemas`]; run before the rule loop so
+/// `analyze_rule` sees the class. A redact chained off an earlier redact's output
+/// resolves via the local map built as the pass proceeds.
+fn collect_redact_schemas(items: &[Item], semantic: &mut SemanticContext, ir: &mut IrProgram) {
+    for item in items {
+        let Item::Rule(rule) = item else {
+            continue;
+        };
+        let (body_ast, _) =
+            body::parse_rule_body(&rule.body.text, rule.body.span.start, body::BodyMode::Rule);
+        let mut redacts = Vec::new();
+        collect_redact_effects(&body_ast.statements, &mut redacts);
+        if redacts.is_empty() {
+            continue;
+        }
+        let binding_schemas = rule_binding_schemas(rule, semantic);
+        let mut local: BTreeMap<String, String> = BTreeMap::new();
+        for (source, keep, binding, span) in redacts {
+            let name = redact_schema_name(&rule.name.name, binding);
+            let source_schema = binding_schemas
+                .get(source)
+                .cloned()
+                .or_else(|| local.get(source).cloned());
+            // Clone the kept fields' types out of the source schema first, so the
+            // immutable borrow ends before we insert the new class.
+            let projected: Vec<(String, TypeSyntax)> = source_schema
+                .as_ref()
+                .and_then(|schema| semantic.schemas.classes.get(schema))
+                .map(|src_fields| {
+                    keep.iter()
+                        .filter_map(|field| {
+                            src_fields.get(field).map(|ty| (field.clone(), ty.clone()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut syntax_fields: BTreeMap<String, TypeSyntax> = BTreeMap::new();
+            let mut ir_fields = Vec::new();
+            for (field_name, ty) in &projected {
+                syntax_fields.insert(field_name.clone(), ty.clone());
+                ir_fields.push(IrClassField {
+                    name: field_name.clone(),
+                    ty: lower_type(ty.clone()),
+                    is_key: false,
+                    presence_condition: None,
+                    span,
+                });
+            }
+            semantic.schemas.classes.insert(name.clone(), syntax_fields);
+            ir.schemas.push(IrSchema::Class(IrClass {
+                name: name.clone(),
+                fields: ir_fields,
+                span,
+            }));
+            local.insert(binding.to_owned(), name);
+        }
+    }
+}
+
+/// Registers each `redact … as <binding>` result as `Ref(redact.<rule>.<binding>)`
+/// so field access / `case` through the projection resolves against the kept-only
+/// synthetic class (a dropped field is an unknown-field error). Mirrors
+/// [`collect_decide_payload_types`].
+fn collect_redact_payload_types(
+    statements: &[body::BodyStmt],
+    rule_name: &str,
+    payloads: &mut BTreeMap<String, IrType>,
+) {
+    let mut redacts = Vec::new();
+    collect_redact_effects(statements, &mut redacts);
+    for (_source, _keep, binding, _span) in redacts {
+        payloads.insert(
+            binding.to_owned(),
+            IrType::Ref(redact_schema_name(rule_name, binding)),
+        );
+    }
+}
+
+/// Validates each `redact <source> keep [..] as <out>`: the source must resolve to
+/// a known schema, and every kept field must exist on it. Fail-closed — an
+/// unresolvable source or unknown kept field is a hard error, so a redaction can
+/// never silently project nothing (which would carry no data and mask a mistake).
+fn validate_redactions(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    binding_schemas: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut redacts = Vec::new();
+    collect_redact_effects(statements, &mut redacts);
+    let mut local: BTreeMap<String, String> = BTreeMap::new();
+    for (source, keep, binding, span) in redacts {
+        let source_schema = binding_schemas
+            .get(source)
+            .cloned()
+            .or_else(|| local.get(source).cloned());
+        local.insert(
+            binding.to_owned(),
+            redact_schema_name(&rule.name.name, binding),
+        );
+        let Some(schema) = source_schema else {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span,
+                message: format!(
+                    "rule `{}` redacts `{source}`, which has no known schema",
+                    rule.name.name
+                ),
+                suggestion: Some(
+                    "redact a binding with a known record type — a matched `when Class as x`, or a \
+                     coerce/decide/exec result"
+                        .to_owned(),
+                ),
+            });
+            continue;
+        };
+        let Some(src_fields) = semantic.schemas.classes.get(&schema) else {
+            continue;
+        };
+        for field in keep {
+            if !src_fields.contains_key(field) {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span,
+                    message: format!(
+                        "rule `{}` redacts `{source}` keeping unknown field `{field}` of `{schema}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some(format!("keep a field declared on `{schema}`")),
+                });
+            }
+        }
+    }
+}
+
 /// Registers the typed result of the single `exec "..." -> Schema as binding`
 /// form so `after <binding> succeeds as r` resolves `r`'s fields — the same
 /// after-binding type flow a named `coerce -> Schema` already gets. The
@@ -11546,6 +11838,7 @@ fn validate_conditioned_field_reads(
             ),
             body::BodyStmt::Done { .. }
             | body::BodyStmt::Cancel { .. }
+            | body::BodyStmt::Redact { .. }
             | body::BodyStmt::Effect(_) => {}
             body::BodyStmt::After(after) => validate_conditioned_field_reads(
                 rule,
@@ -12179,6 +12472,10 @@ fn collect_all_binding_names(statements: &[body::BodyStmt], out: &mut BTreeSet<S
             }
             body::BodyStmt::Handler(handler) => {
                 collect_all_binding_names(&handler.body, out);
+            }
+            // `redact … as <out>` introduces the projected binding `out`.
+            body::BodyStmt::Redact { binding, .. } => {
+                out.insert(binding.clone());
             }
             body::BodyStmt::Record(_)
             | body::BodyStmt::Done { .. }
@@ -22173,6 +22470,100 @@ rule j
             compiled.diagnostics
         );
         assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
+    }
+
+    #[test]
+    fn redact_projection_keeps_only_kept_fields() {
+        // `redact c keep [id, status] as safe` synthesizes a projected class
+        // holding only the kept fields, so `safe.id` resolves but `safe.ssn`
+        // (dropped) is an unknown field — the type-system half of redaction
+        // soundness (a dropped field cannot be reached through the projection).
+        let kept = r#"
+@service
+workflow RedactKept
+
+class Customer { id string  ssn string  status string }
+class Result { tag string }
+output result Result
+
+signal go.now { x string }
+
+coerce read_customer(x string) -> Customer { prompt "x" }
+
+rule r
+  when go.now as g
+=> {
+  coerce read_customer(g.x) as c
+  after c succeeds as cust {
+    redact cust keep [id, status] as safe
+    complete result {
+      tag safe.id
+    }
+  }
+}
+"#;
+        let compiled = compile_program(kept);
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown field") || d.message.contains("not a typed")),
+            "kept field `safe.id` should resolve: {:?}",
+            compiled.diagnostics
+        );
+
+        assert!(
+            compiled.ir.is_some(),
+            "kept program should compile: {compiled:?}"
+        );
+
+        let dropped = kept.replace("tag safe.id", "tag safe.ssn");
+        let compiled = compile_program(&dropped);
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("safe.ssn") || d.message.contains("`ssn`")),
+            "dropped field `safe.ssn` should be rejected: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn redact_unknown_kept_field_is_rejected() {
+        let source = r#"
+@service
+workflow RedactBadKeep
+
+class Customer { id string  status string }
+class Result { tag string }
+output result Result
+
+signal go.now { x string }
+
+coerce read_customer(x string) -> Customer { prompt "x" }
+
+rule r
+  when go.now as g
+=> {
+  coerce read_customer(g.x) as c
+  after c succeeds as cust {
+    redact cust keep [id, nonexistent] as safe
+    complete result {
+      tag safe.id
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("keeping unknown field `nonexistent`")),
+            "expected unknown-kept-field rejection: {:?}",
+            compiled.diagnostics
+        );
     }
 
     #[test]

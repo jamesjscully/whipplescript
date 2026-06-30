@@ -969,6 +969,23 @@ pub(crate) fn print_statement_rn(
                 push_stmt_line(out, indent, "}");
             }
         }
+        BodyStmt::Redact {
+            source,
+            keep,
+            binding,
+            ..
+        } => {
+            push_stmt_line(
+                out,
+                indent,
+                &format!(
+                    "redact {} keep [{}] as {}",
+                    rn(source),
+                    keep.join(", "),
+                    rn(binding)
+                ),
+            );
+        }
     }
 }
 

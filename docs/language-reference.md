@@ -336,6 +336,44 @@ Semantics:
 
 Like patterns, actions have no runtime identity; they are reuse, not subroutines.
 
+### `redact`
+
+Projects a record-typed binding onto a chosen subset of its fields, producing a
+new binding that carries **only** the kept fields:
+
+```whip
+rule triage
+  when Customer as c
+=> {
+  redact c keep [id, status] as safe
+
+  complete result {
+    who   safe.id
+    state safe.status
+  }
+}
+```
+
+`redact <source> keep [<field>, …] as <out>` is a synchronous, pure restructure —
+not an effect. It is the explicit information-flow crossing at which the
+rule-level analysis is refined: the projection is the deliberate, auditable point
+where a record is narrowed before it flows onward (a focused complement to the
+audited `declassify` hatch documented in the `examples/infoflow` README).
+
+Semantics:
+
+- **Kept-only type.** `out` has a synthesized type holding just the kept fields,
+  so `safe.id` resolves but accessing a dropped field (`safe.ssn`) is a compile
+  error. The source schema must be known and every kept field must exist on it.
+- **Runtime projection.** At runtime the dropped fields are physically removed
+  from the value bound to `out`, so they can never leave through any sink — the
+  runtime teeth behind the static drop (proven in
+  `models/lean/Whipple/Redaction.lean`: the dropped fields are non-interfering).
+- **Source kinds.** The source may be a matched class (`when Class as c`), a
+  coerce/decide/exec result, or the alias of an `after … succeeds as <alias>`
+  branch (the read-then-redact flow). Redactions may chain: a redaction's output
+  can be the source of a later one.
+
 ### `include` and `use`
 
 ```whip

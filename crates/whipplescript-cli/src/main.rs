@@ -52,7 +52,7 @@ use whipplescript_parser::{
     DependencyPredicate as IrDependencyPredicate, Diagnostic, EffectStatus as TestEffectStatus,
     ExpectTarget, Expr, ExprLiteral, ExprObjectField, FormatOutput, GivenClause, IrConstructUse,
     IrEffectDependency, IrEffectKind, IrEffectNode, IrInclude, IrPrimitiveType, IrProgram,
-    IrProjectionRead, IrRule, IrSchema, IrSource, IrTest, IrType, IrWorkflowContract,
+    IrProjectionRead, IrRedaction, IrRule, IrSchema, IrSource, IrTest, IrType, IrWorkflowContract,
     IrWorkflowContractKind, Item, MissedPolicy, ProjQueryKind, QueryKind, Recurrence, RuleStatus,
     RunKind, SourceSpan, SourceValue, StubPayload, TestClause, TestField, TimeOfDay, UnaryOp,
     Weekday,
@@ -30664,7 +30664,10 @@ fn lower_rule(
     effects: &[EffectView],
     source_path: Option<&Path>,
 ) -> OwnedLowering {
-    let (body, context, branch_reports) = selected_rule_body(&rule.body, context);
+    let (body, mut context, branch_reports) = selected_rule_body(&rule.body, context);
+    // Materialize top-level `redact … as <out>` projections (sources are when /
+    // effect bindings already in scope); after-block redacts materialize below.
+    materialize_redactions(&mut context, &rule.metadata.redactions);
     let existing_fact_ids = facts
         .iter()
         .map(|fact| fact.fact_id.as_str())
@@ -30912,8 +30915,11 @@ fn lower_rule(
                 push_effect_binding(&mut after_context, binding, effect_id, value);
             }
         }
-        let (selected_after_body, after_context, branch_reports) =
+        let (selected_after_body, mut after_context, branch_reports) =
             selected_rule_body(&after.body, &after_context);
+        // Materialize `redact … as <out>` projections inside this fired `after`
+        // block — its alias (the redaction's source) is now bound.
+        materialize_redactions(&mut after_context, &rule.metadata.redactions);
         lowering.branch_reports.extend(branch_reports);
         append_consumed_fact_ids(&mut lowering, &selected_after_body, &after_context, facts);
         append_workflow_terminal(
@@ -31115,6 +31121,47 @@ fn push_effect_binding(context: &mut RuleContext, binding: &str, effect_id: &str
             source_span_json: None,
         },
     ));
+}
+
+/// Projects a record value to a kept field subset (the runtime half of `redact`).
+/// A non-object value has no fields to drop and passes through unchanged. This is
+/// the concrete twin of `redact (keep)` in models/lean/Whipple/Redaction.lean: the
+/// dropped fields are physically removed, so they cannot leave through any sink —
+/// the runtime teeth behind the projected type's static drop.
+fn project_record_value(value: &Value, keep: &[String]) -> Value {
+    let Value::Object(map) = value else {
+        return value.clone();
+    };
+    let mut projected = serde_json::Map::new();
+    for field in keep {
+        if let Some(field_value) = map.get(field) {
+            projected.insert(field.clone(), field_value.clone());
+        }
+    }
+    Value::Object(projected)
+}
+
+/// Materializes each `redact <source> keep [..] as <out>` of a rule into the
+/// evaluation context, so the projected binding `out` resolves like any other
+/// binding when payloads render. `redact` is a synchronous pure restructure (not
+/// an effect), so it is computed here at lowering time once its source is bound;
+/// a redaction whose source is not yet in scope is skipped (it materializes in the
+/// scope that does bind it — e.g. inside the `after` block that aliases it).
+/// Redactions are visited in body order, so a redaction chained off an earlier
+/// one's output resolves.
+fn materialize_redactions(context: &mut RuleContext, redactions: &[IrRedaction]) {
+    for redaction in redactions {
+        let Some(source) = context
+            .bindings
+            .iter()
+            .find(|(binding, _)| binding == &redaction.source)
+            .map(|(_, fact)| fact.clone())
+        else {
+            continue;
+        };
+        let projected = project_record_value(&json_from_str(&source.value_json), &redaction.keep);
+        push_effect_binding(context, &redaction.binding, &source.fact_id, projected);
+    }
 }
 
 fn append_consumed_fact_ids(
@@ -41089,6 +41136,63 @@ workflow EchoText {
             &no_status,
             "succeeds"
         ));
+    }
+
+    #[test]
+    fn redact_projects_to_kept_fields_at_runtime() {
+        let value = json!({"id": "c1", "ssn": "secret", "status": "active"});
+        let projected = project_record_value(&value, &["id".to_owned(), "status".to_owned()]);
+        assert_eq!(projected, json!({"id": "c1", "status": "active"}));
+        // The dropped field is physically gone — it cannot leave through any sink.
+        assert!(projected.get("ssn").is_none());
+        // A non-object value has no fields to drop.
+        assert_eq!(
+            project_record_value(&json!("x"), &["id".to_owned()]),
+            json!("x")
+        );
+    }
+
+    #[test]
+    fn materialize_redactions_binds_the_projection() {
+        let mut context = RuleContext {
+            trigger_event_id: None,
+            identity: None,
+            bindings: vec![(
+                "cust".to_owned(),
+                FactView {
+                    fact_id: "f1".to_owned(),
+                    program_version_id: None,
+                    revision_epoch: 0,
+                    name: "cust".to_owned(),
+                    key: "f1".to_owned(),
+                    value_json: json!({"id": "c1", "ssn": "secret", "status": "active"})
+                        .to_string(),
+                    provenance_class: "effect".to_owned(),
+                    source_span_json: None,
+                },
+            )],
+        };
+        let redactions = vec![IrRedaction {
+            source: "cust".to_owned(),
+            keep: vec!["id".to_owned(), "status".to_owned()],
+            binding: "safe".to_owned(),
+        }];
+        materialize_redactions(&mut context, &redactions);
+        let safe = context
+            .bindings
+            .iter()
+            .find(|(binding, _)| binding == "safe")
+            .map(|(_, fact)| json_from_str(&fact.value_json))
+            .expect("redact output `safe` should be bound");
+        assert_eq!(safe, json!({"id": "c1", "status": "active"}));
+        // A redaction whose source is absent is skipped (it materializes where bound).
+        let mut empty = RuleContext {
+            trigger_event_id: None,
+            identity: None,
+            bindings: Vec::new(),
+        };
+        materialize_redactions(&mut empty, &redactions);
+        assert!(empty.bindings.is_empty());
     }
 
     #[test]

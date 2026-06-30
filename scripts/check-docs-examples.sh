@@ -29,6 +29,7 @@ check_example examples/incident-router.whip
 check_example examples/scheduled-escalation.whip
 check_example examples/exec-json-ingest.whip
 check_example examples/deterministic-validation.whip
+check_example examples/redact-projection.whip
 check_example examples/event-bridge.whip
 check_example examples/messaging-demo.whip
 check_example examples/file-store-demo.whip

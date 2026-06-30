@@ -186,7 +186,15 @@ These are real gaps observed while building the examples, not hypotheticals.
 4. **Per-resource labels, not per-field/path.** You cannot say "the order-status
    field of the CRM is public but the SSN is confidential" — a label attaches to a
    whole `file store` / `channel`, not a path within it. Mixed-sensitivity stores
-   must be physically split.
+   must be physically split. *Partially addressed by `redact` (DR-0027):* the
+   `redact <r> keep [..] as <out>` construct projects a record to a kept subset,
+   enforced both statically (a dropped field is a type error on `out`) and at
+   runtime (dropped fields are physically removed before they can reach any sink).
+   The non-interference of the dropped fields is proven in
+   `models/lean/Whipple/Redaction.lean`. **Still deferred:** the *static label*
+   refinement — letting the checker grant a redacted egress a lower required
+   clearance (the kept fields' join) rather than the whole-record label — needs
+   per-field labels in the envelope, the open design choice for the next increment.
 
 5. ~~**Inbound message triggers are not integrity sources.**~~ *Fixed (H3):* a rule
    triggered by `when message from <channel>` now treats the channel as a

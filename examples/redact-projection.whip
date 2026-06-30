@@ -1,0 +1,44 @@
+# `redact` (DR-0027): project a record-typed binding onto a chosen subset of its
+# fields before it flows onward. The projection is enforced two ways:
+# - statically: `safe` has only the kept fields, so `safe.ssn` is a type error.
+# - at runtime: the dropped fields are physically removed, so they can never
+# leave through any sink (proven non-interfering in
+# models/lean/Whipple/Redaction.lean).
+# This is the explicit, auditable point where a record is narrowed — a focused
+# complement to the audited `declassify` hatch (see examples/infoflow).
+workflow RedactProjection
+
+input customer Customer
+
+output result PublicView
+
+class Customer {
+  id string
+  ssn string
+  status string
+}
+
+class PublicView {
+  who string
+  state string
+}
+
+rule publish
+  when Customer as c
+=> {
+  redact c keep [id, status] as safe
+
+  complete result {
+    who   safe.id
+    state safe.status
+  }
+}
+
+test "the projection keeps only the non-sensitive fields and completes" {
+  workflow RedactProjection
+  given input {
+    customer { id "c1" ssn "secret" status "active" }
+  }
+  run until idle
+  expect workflow completed
+}

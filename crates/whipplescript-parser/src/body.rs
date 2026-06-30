@@ -123,6 +123,23 @@ pub enum BodyStmt {
         fields: Vec<FieldAssign>,
         span: SourceSpan,
     },
+    /// `redact <source> keep [<field>, …] as <out>` (DR-0027 redact): an explicit,
+    /// audited PROJECTION of the record bound to `source` onto the kept field set,
+    /// producing a new binding `out`. It is the information-flow crossing the
+    /// rule-level opaque join box is refined at — the projection carries only the
+    /// labels of the KEPT fields (the dropped fields are non-interfering, proven in
+    /// models/lean/Whipple/Redaction.lean: `canRead_redact`). It is NOT an async
+    /// effect: it is a synchronous, pure restructure (like a record projection), so
+    /// it never becomes an `IrEffectKind` — it is rule metadata the IFC checker and
+    /// the runtime projection both read. `out`'s type is the source schema projected
+    /// to the kept fields (`redact.<rule>.<out>`); accessing a dropped field on `out`
+    /// is a type error.
+    Redact {
+        source: String,
+        keep: Vec<String>,
+        binding: String,
+        span: SourceSpan,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1050,6 +1067,7 @@ impl<'a> BodyParser<'a> {
             "acquire" => self.parse_lease_acquire(),
             "append" => self.parse_ledger_append(),
             "emit" => self.parse_emit_signal(),
+            "redact" => self.parse_redact(),
             "when" if self.mode == BodyMode::Flow => self.parse_branch(),
             "on" if self.mode == BodyMode::Flow => self.parse_handler(),
             "when" | "on" => {
@@ -2423,6 +2441,85 @@ impl<'a> BodyParser<'a> {
         })
     }
 
+    /// `redact <source> keep [<field>, …] as <out>` (DR-0027): an explicit
+    /// information-flow projection. Parses the source binding, the bracketed
+    /// comma-separated kept-field list, and the `as` output binding. A redaction
+    /// must keep at least one field (keeping nothing releases nothing).
+    fn parse_redact(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // redact
+        let source = self.ident_text("binding to redact after `redact`")?;
+        if !self.consume_ident("keep") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `keep [<field>, …]` after the binding".to_owned(),
+                Some("write `redact customer keep [id, status] as safe`".to_owned()),
+            );
+            return None;
+        }
+        if !self.consume_sym('[') {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `[` to open the kept-field list".to_owned(),
+                Some("write `keep [id, status]`".to_owned()),
+            );
+            return None;
+        }
+        let mut keep = Vec::new();
+        loop {
+            if self.consume_sym(']') {
+                break;
+            }
+            if self.peek().is_none() {
+                let span = self.span_here();
+                self.error(
+                    span,
+                    "unclosed kept-field list".to_owned(),
+                    Some("add `]`".to_owned()),
+                );
+                return None;
+            }
+            let field = self.ident_text("kept field name")?;
+            keep.push(field);
+            if !self.consume_sym(',') && !self.at_sym(']') {
+                let span = self.span_here();
+                self.error(
+                    span,
+                    "expected `,` or `]` in the kept-field list".to_owned(),
+                    None,
+                );
+                return None;
+            }
+        }
+        if !self.consume_ident("as") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "`redact` requires an `as <binding>`".to_owned(),
+                Some("write `redact customer keep [id] as safe`".to_owned()),
+            );
+            return None;
+        }
+        let binding = self.ident_text("output binding after `as`")?;
+        if keep.is_empty() {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "`redact` must keep at least one field".to_owned(),
+                Some("a redaction that keeps nothing has no value to release".to_owned()),
+            );
+            return None;
+        }
+        Some(BodyStmt::Redact {
+            source,
+            keep,
+            binding,
+            span: self.span_from(start),
+        })
+    }
+
     /// `acquire <lease> for <key-expr> [until ttl] as <slot>`: one atomic
     /// attempt with branchable `held`/`contended` outcomes
     /// (spec/coordination.md).
@@ -3218,7 +3315,7 @@ const STATEMENT_KEYWORDS: &[&str] = &[
     "record", "done", "consume", "tell", "coerce", "askHuman", "claim", "release", "finish",
     "file", "call", "recall", "send", "invoke", "read", "write", "import", "export", "after",
     "case", "complete", "fail", "flowfail", "timer", "cancel", "decide", "exec", "when", "on",
-    "else",
+    "else", "redact",
 ];
 
 #[cfg(test)]
@@ -3229,6 +3326,35 @@ mod tests {
         let (ast, diagnostics) = parse_rule_body(source, 0, BodyMode::Rule);
         assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:?}");
         ast
+    }
+
+    #[test]
+    fn parses_redact_projection() {
+        let ast = parse_ok("redact customer keep [id, status] as safe");
+        let BodyStmt::Redact {
+            source,
+            keep,
+            binding,
+            ..
+        } = &ast.statements[0]
+        else {
+            panic!("expected redact, got {:?}", ast.statements[0]);
+        };
+        assert_eq!(source, "customer");
+        assert_eq!(keep, &["id".to_owned(), "status".to_owned()]);
+        assert_eq!(binding, "safe");
+    }
+
+    #[test]
+    fn rejects_redact_keeping_nothing() {
+        let (_, diagnostics) =
+            parse_rule_body("redact customer keep [] as safe", 0, BodyMode::Rule);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("keep at least one field")),
+            "expected empty-keep rejection, got {diagnostics:?}"
+        );
     }
 
     #[test]
