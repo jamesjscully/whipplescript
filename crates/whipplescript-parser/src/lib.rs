@@ -7801,6 +7801,10 @@ fn resource_for_body(kind: &body::BodyEffectKind) -> Option<String> {
             .iter()
             .find(|field| field.name == "channel")
             .map(|field| field.source.clone()),
+        // `emit signal <name> to <peer>` touches the signal port `signal:<name>` (the
+        // emit-port door, DR-0027 E6/H8); surfaced so the IFC checker can carry the
+        // emitter's label to the receiver and enumerate the port in the surface.
+        body::BodyEffectKind::Notify { event, .. } => Some(format!("signal:{event}")),
         _ => None,
     }
 }
@@ -11419,7 +11423,6 @@ fn check_conditioned_reads_in_text(
 fn check_conditioned_reads_in_fields(
     rule: &RuleDecl,
     fields: &[body::FieldAssign],
-    span: SourceSpan,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
     allowed: &BTreeSet<(String, String)>,
@@ -11439,7 +11442,6 @@ fn check_conditioned_reads_in_fields(
             body::FieldValue::Nested { fields, .. } => check_conditioned_reads_in_fields(
                 rule,
                 fields,
-                span,
                 semantic,
                 binding_types,
                 allowed,
@@ -11469,7 +11471,6 @@ fn validate_conditioned_field_reads(
             body::BodyStmt::Record(record) => check_conditioned_reads_in_fields(
                 rule,
                 &record.fields,
-                record.span,
                 semantic,
                 binding_types,
                 allowed,
@@ -11478,7 +11479,6 @@ fn validate_conditioned_field_reads(
             body::BodyStmt::Terminal(terminal) => check_conditioned_reads_in_fields(
                 rule,
                 &terminal.fields,
-                terminal.span,
                 semantic,
                 binding_types,
                 allowed,
@@ -11490,16 +11490,14 @@ fn validate_conditioned_field_reads(
             } => check_conditioned_reads_in_fields(
                 rule,
                 &record.fields,
-                record.span,
                 semantic,
                 binding_types,
                 allowed,
                 diagnostics,
             ),
-            body::BodyStmt::Milestone { fields, span, .. } => check_conditioned_reads_in_fields(
+            body::BodyStmt::Milestone { fields, .. } => check_conditioned_reads_in_fields(
                 rule,
                 fields,
-                *span,
                 semantic,
                 binding_types,
                 allowed,

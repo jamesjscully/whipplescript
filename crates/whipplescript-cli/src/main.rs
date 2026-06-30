@@ -2663,7 +2663,12 @@ fn check(options: &CliOptions) -> ExitCode {
                         eprint!("{report}");
                     }
                 }
-                let mut ifc_diagnostics = ifc::check_ifc_program(&ir);
+                // Imported @tool IRs (DR-0029 cross-package signal carriage, H8 stage
+                // b): the consumer recompiles the pinned tool sources so an imported
+                // `emit signal X` contributes its carried integrity to the consumer's
+                // `signal:X`.
+                let imported_irs = imported_tool_irs(package_lock.as_ref());
+                let mut ifc_diagnostics = ifc::check_ifc_program_with_imports(&ir, &imported_irs);
                 // Consumer-side cross-package check (DR-0029): each imported @tool's
                 // IFC surface must be governed by the consumer envelope.
                 ifc_diagnostics.extend(ifc::check_imported_tool_surfaces(&imported_tool_surfaces(
@@ -3612,6 +3617,28 @@ fn package_contract_json_from_manifests(
 /// acyclicity check. A consumer reads this to check a grant without the source.
 /// Each imported `@tool`'s name + computed IFC surface, for the consumer-side
 /// cross-package check (DR-0029). Recomputed from the tool source the lock pins.
+/// The imported `@tool` programs, recompiled from the sources the lock pins, for the
+/// consumer-side cross-package signal carriage (DR-0029 / H8 stage b). Best effort —
+/// a tool that cannot be compiled standalone is skipped (its surface is then governed
+/// fail-closed by `check_imported_tool_surfaces`).
+fn imported_tool_irs(
+    package_lock: Option<&LoadedPackageLock>,
+) -> Vec<whipplescript_parser::IrProgram> {
+    let mut out = Vec::new();
+    if let Some(lock) = package_lock {
+        for manifest in &lock.manifests {
+            for tool in &manifest.workflow_tools {
+                if let Ok(source) = std::fs::read_to_string(&tool.source) {
+                    if let Some(tool_ir) = whipplescript_parser::compile_program(&source).ir {
+                        out.push(tool_ir);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 fn imported_tool_surfaces(package_lock: Option<&LoadedPackageLock>) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
     if let Some(lock) = package_lock {
@@ -35423,6 +35450,23 @@ fn signal(options: &CliOptions) -> ExitCode {
         );
         return ExitCode::from(2);
     };
+    // No laundering (H8 stage b): a signal governance marks INTERNAL is an internal
+    // channel whose integrity is carried from its emitter, so it may not be sourced
+    // by an external `whip signal` injection — otherwise an attacker could smuggle
+    // untrusted data in under a trusted signal name. Ungoverned/dev mode imposes
+    // nothing.
+    if ifc::signal_is_internal(&event_name) {
+        eprintln!(
+            "signal `{event_name}` is governed as an INTERNAL channel (DR-0027 H8); external \
+             injection is refused — an internal signal carries its emitter's integrity and may \
+             not be sourced from outside"
+        );
+        eprintln!(
+            "to allow external delivery, remove the `internal` mark on `signal:{event_name}` in \
+             the governance envelope (it then becomes an external-entry source, default low)"
+        );
+        return ExitCode::from(1);
+    }
     let payload: Value = match serde_json::from_str(&data) {
         Ok(payload) => payload,
         Err(error) => {

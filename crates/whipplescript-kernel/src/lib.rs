@@ -1849,9 +1849,12 @@ impl RuntimeKernel {
         let value_field = if succeeded {
             result_value_payload(true, result.value_json.as_deref())
         } else {
+            // DR-0032 + redaction (D4): loft is provider-backed, so the raw
+            // `error_json` is confidential. The base `reason` is the already-redacted
+            // summary, not the raw-error-derived text (which would leak into the fact).
             Some(effect_failure_base(
                 execution.request.action.effect_kind(),
-                &failure_reason_of(result.error_json.as_deref(), &summary),
+                &summary,
                 &summary,
                 execution.effect_id,
                 execution.run_id,
@@ -1962,9 +1965,13 @@ impl RuntimeKernel {
         let value_field = if succeeded {
             result_value_payload(true, result.value_json.as_deref())
         } else {
+            // DR-0032 + redaction (D4): coerce is provider-backed, so the raw
+            // `error_json` is confidential model output. The base `reason` must be
+            // the already-redacted summary, NOT the raw-error-derived text — echoing
+            // the provider error here would leak it into the persisted fact value.
             Some(effect_failure_base(
                 "coerce",
-                &failure_reason_of(result.error_json.as_deref(), &summary),
+                &summary,
                 &summary,
                 execution.effect_id,
                 execution.run_id,
@@ -3029,22 +3036,6 @@ fn effect_failure_base(
         "run_id": run_id,
         "kind": kind,
     })
-}
-
-/// The human-facing failure text for the base `reason`, pulled from an effect's
-/// error blob (`reason` or `message`, whichever it uses), falling back to the
-/// run summary when the blob carries neither.
-fn failure_reason_of(error_json: Option<&str>, fallback: &str) -> String {
-    error_json
-        .map(json_from_str)
-        .and_then(|value| {
-            value
-                .get("reason")
-                .or_else(|| value.get("message"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| fallback.to_owned())
 }
 
 fn sanitized_provider_artifact_metadata(

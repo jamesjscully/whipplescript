@@ -87,6 +87,32 @@ ProjectionEventuallyCatchesUp
 RecoveryEventuallyFinishes
 ```
 
+## Information-flow models (temporal layer)
+
+Two models carry the information-flow properties that are about a *sequence* of
+steps over time, complementing the single-step Maude bites and the timeless Lean
+algebra:
+
+```text
+InfoflowReleaseBudget.tla
+InfoflowLabelCarriage.tla
+```
+
+`InfoflowReleaseBudget.tla` (DR-0030 Direction C) checks, over all traces, that the
+checked declassifier never exceeds the public release budget and that no committed
+privileged release ever carries a tainted (adaptively-derived) selector — the
+no-adaptive-oracle safety surrogate.
+
+`InfoflowLabelCarriage.tla` (I-IFC7, audit-findings W6) checks that a datum's label
+is carried across every transport hop — persist, reload, cross-instance handoff,
+replay — without being **stripped** (`NoStrip`, confidentiality silently lowered) or
+**forged/laundered** (`NoForge`, integrity silently raised). It is the inductive,
+all-interleavings complement to `infoflow-carriage.maude`'s single hop. *Bite
+(verified to fail):* adding a `LaunderHandoff` transport that rewrites integ to 1
+produces an Apalache counterexample at the `NoForge`/`CarriagePreserved` invariant.
+Label *crossings* (declassify/endorse) are authorized exceptions modeled in the
+crossing models, not here.
+
 The default script typechecks these formulas with Apalache and runs a bounded
 safety check over `SafetyInvariants` using `ConstInit`, a small finite harness.
 It does not treat full temporal liveness proof as a v0 release gate; the

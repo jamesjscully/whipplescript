@@ -17,6 +17,24 @@ channel   public_reply   readable by public,    from public     # reply back to 
 provider  fixture        readable by Operator,  from Operator   # in-house model, in trust domain
 ```
 
+A label is not limited to one role. `readable by` (and `from`) accept a **set of
+compartments**, comma- or space-separated, and a party may read the resource only
+if it is cleared for **every** one of them (the intersection — combining secrets
+*restricts*, it never widens):
+
+```
+file store mixed   readable by Bank, Email   # readable only by a party cleared for BOTH
+```
+
+A flow is safe when the sink's reader set **dominates** the source's — every
+compartment that gates the source is covered by some compartment of the sink, so
+no reader of the sink is un-cleared for the source. A single-compartment label is
+just the one-element set, behaving exactly as the role it names. The integrity
+axis (`from`) is the dual: a sink requiring `from Sec, Ops` accepts data only from
+a source that provides a voucher acting-for each. (DR-0027 E6; the set algebra is
+machine-proven in `models/lean/Whipple/ReaderSets.lean` and modeled in
+`models/maude/infoflow-reader-sets.maude`.)
+
 `whip check` discovers the policy via `WHIPPLESCRIPT_IFC_ENVELOPE`. With no
 envelope set, a whip is **ungoverned** (dev mode) and makes no IFC claim — the
 checker imposes nothing.
@@ -110,6 +128,26 @@ are now explicitly, auditably accepted rather than silently present.
 This is the point: the system permits the maximally-permissive *safe* structure —
 it is not just blocking everything.
 
+## The guarantee report (`whip check` under an envelope)
+
+Running `whip check` under a governed envelope prints an IT-legible **guarantee
+report** (DR-0028). It states, in order:
+
+- **guaranteed invariants** — one line *per governed resource* with the exact
+  property proven on every rule, e.g. `crm: may not flow to a sink not cleared for
+  Operator (unless an audited declassify clears it)`. Not a generic blanket line.
+- **violations caught** — how many dangerous flows the envelope rejects in this whip.
+- **flagged risks** — resources the whip touches that governance has *not* labelled;
+  each defaults to public + low-integrity (fail-closed), so the operator must confirm
+  it holds nothing confidential and feeds no trusted sink, or add a `grant`.
+- **trusted surface** — every audited `declassify` / `endorse` crossing to review.
+- **cleared principals** and the full **information-flow surface** (every door).
+
+Each violation diagnostic names **two routes to fix**: a **self-serve** route the
+whip author can take alone (separate the contexts / gate the sink on trusted data)
+and an **escalate** route that needs a governance grant (`grant declassify …` /
+`grant endorse …`) — mirroring the two-agent privilege split.
+
 ---
 
 ## Limitations found hands-on
@@ -159,3 +197,26 @@ These are real gaps observed while building the examples, not hypotheticals.
    writing these examples:* the report now verifies a signed envelope first and
    prints `REFUSED: ...` for a tampered policy instead of rendering a guarantee
    computed from tampered labels.
+
+9. ~~**Signal triggers are invisible sources (fail-OPEN).**~~ *Fixed (H8):* a rule
+   triggered by `when <Signal> as e` now reads the governed resource
+   `signal:<name>` — integrity envelope-declared, default `public`/low (fail-closed)
+   — so an externally-injected signal driving a more-trusted sink is caught as an
+   injection, just like an inbound channel message. Vouch a trusted signal with
+   `grant signal <name> -> signal:<name> from <Role>`. Source recognition is now
+   *uniform* (channels, human answers, and signals all governed alike); the signal
+   also appears in the workflow's information-flow surface.
+
+10. ~~**Internal signals must be hand-vouched.**~~ *Fixed (H8 stage b — emitter-carried
+    integrity):* mark a signal an internal channel with
+    `grant signal <name> -> signal:<name> internal`, and its integrity is **derived
+    from its emitters** instead of defaulting low — an `emit signal X` carries the
+    intersection of its emitting rule's read-source vouchers, and `when X` reads that.
+    So you only hand-classify the *external entry points*; internal flows propagate
+    the emitter's trust automatically (the labeling burden stays `O(external entry)`).
+    Carriage spans packages: an imported `@tool`'s `emit signal X` contributes its
+    carried integrity to a consumer's `signal:X`, computed under the consumer's own
+    envelope from the pinned source. Soundness is preserved two ways — carriage never
+    *fabricates* trust (an untrusted emitter yields an untrusted receiver), and
+    `whip signal` **refuses** to externally inject an internal signal (no laundering
+    untrusted data in under a trusted signal name).

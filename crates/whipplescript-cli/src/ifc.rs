@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use whipplescript_parser::{Diagnostic, IrEffectKind, IrProgram};
+use whipplescript_parser::{Diagnostic, IrEffectKind, IrProgram, IrRule};
 
 /// The bottom reader-authority: data readable by `public` is readable by anyone,
 /// and `public` itself holds no authority above itself.
@@ -29,21 +29,33 @@ const PUBLIC: &str = "public";
 /// the secret is readable by any party that acts-for that role. The delegation
 /// context is the acts-for edge set, closed reflexive-transitively by `can_act`.
 pub struct Envelope {
-    /// resource handle -> reader-authority role (absent = `public`, the bottom).
-    readers: BTreeMap<String, String>,
+    /// resource handle -> reader-authority SET (a set of compartments; absent or
+    /// empty = `public`, the bottom). A party may read the resource iff it acts-for
+    /// EVERY compartment — the intersection of up-sets (DR-0027 E6, the set form
+    /// proven in `models/lean/Whipple/ReaderSets.lean`). A single-compartment label
+    /// is the leaf case, behaving exactly as the role it replaces.
+    readers: BTreeMap<String, BTreeSet<String>>,
     governed: BTreeSet<String>,
     /// acts-for edges `(p, q)`: `p` acts-for `q` (has at least `q`'s authority).
     deleg: Vec<(String, String)>,
     /// declassify grants `(resource, role)`: `resource` may be released to any
     /// party that acts-for `role`. These are the audited trusted-surface holes.
     declassify: Vec<(String, String)>,
-    /// integrity (writer/vouching) authority per resource (absent = `public`, the
-    /// untrusted bottom). A control sink requiring integrity `r` accepts data only
-    /// from a source whose integrity acts-for `r` (DR-0027 I-IFC1, integrity axis).
-    integrity: BTreeMap<String, String>,
+    /// integrity (writer/vouching) authority SET per resource (absent or empty =
+    /// `public`, the untrusted bottom). A control sink requiring integrity set `ws`
+    /// accepts data only from a source whose integrity set DOMINATES `ws` — provides
+    /// some voucher acting-for each required one (DR-0027 I-IFC1/E6, the dual of the
+    /// reader axis).
+    integrity: BTreeMap<String, BTreeSet<String>>,
     /// endorse grants `(resource, role)`: `resource`'s data may be raised to `role`
     /// integrity — the audited integrity-axis crossing.
     endorse: Vec<(String, String)>,
+    /// signal resources (`signal:<name>`) governance marks INTERNAL (H8 stage b): an
+    /// internal signal is an internal channel, NOT an external entry point, so its
+    /// integrity at a receiver is DERIVED from its emitters (carriage) rather than
+    /// defaulting low, and an external `whip signal` injection of it is refused (no
+    /// laundering). A signal absent here is an external-entry point (stage a).
+    internal_signals: BTreeSet<String>,
     /// handles that name a PRINCIPAL (a provider/model endpoint, a human) rather
     /// than protected data. A principal carries a clearance (so it may be a sink
     /// target), but it is not itself a secret — so it must not be listed as a
@@ -102,6 +114,7 @@ impl Envelope {
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
+        let mut internal_signals = BTreeSet::new();
         let mut address_of = BTreeMap::new();
         let mut party_of = BTreeMap::new();
         // a signed/canonical envelope carries the handle -> address bindings; a
@@ -131,21 +144,33 @@ impl Envelope {
                 {
                     principals.insert(name.clone());
                 }
-                if let Some(reader) = label.get("reader").and_then(serde_json::Value::as_str) {
-                    if reader != PUBLIC {
-                        readers.insert(name.clone(), reader.to_owned());
-                    }
-                } else if label
-                    .get("confidential")
+                let mut reader_set = parse_role_set(label, "reader");
+                // back-compat: `confidential: true` is the single-compartment label
+                // `{confidential}` (the original binary form).
+                if reader_set.is_empty()
+                    && label
+                        .get("confidential")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    reader_set.insert("confidential".to_owned());
+                }
+                if !reader_set.is_empty() {
+                    readers.insert(name.clone(), reader_set);
+                }
+                let writer_set = parse_role_set(label, "writer");
+                if !writer_set.is_empty() {
+                    integrity.insert(name.clone(), writer_set);
+                }
+                // a signal resource marked `internal` derives its integrity from its
+                // emitters (H8 stage b) rather than defaulting to the external-entry
+                // low.
+                if label
+                    .get("internal")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false)
                 {
-                    readers.insert(name.clone(), "confidential".to_owned());
-                }
-                if let Some(writer) = label.get("writer").and_then(serde_json::Value::as_str) {
-                    if writer != PUBLIC {
-                        integrity.insert(name.clone(), writer.to_owned());
-                    }
+                    internal_signals.insert(name.clone());
                 }
             }
         }
@@ -193,6 +218,7 @@ impl Envelope {
             integrity,
             endorse,
             principals,
+            internal_signals,
             address_of,
             party_of,
         })
@@ -211,6 +237,7 @@ impl Envelope {
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
+        let mut internal_signals = BTreeSet::new();
         let mut address_of: BTreeMap<String, String> = BTreeMap::new();
         let mut party_of: BTreeMap<String, String> = BTreeMap::new();
         for (index, raw) in text.lines().enumerate() {
@@ -297,20 +324,31 @@ impl Envelope {
                 principals.insert(address.clone());
             }
             let label = &tokens[arrow + 2..];
-            // `readable by <Role>` sets a non-public reader authority.
+            // `readable by <Role>[, <Role>...]` sets the reader-authority SET (E6):
+            // every compartment listed after `by`, up to the `from` keyword or the
+            // end. Roles may be comma- or space-separated; `public` is dropped.
             if let Some(by) = label.iter().position(|tok| *tok == "by") {
-                if let Some(role) = label.get(by + 1) {
-                    if *role != PUBLIC {
-                        readers.insert(address.clone(), (*role).to_owned());
-                    }
+                let until = label
+                    .iter()
+                    .skip(by + 1)
+                    .position(|tok| *tok == "from")
+                    .map_or(label.len(), |rel| by + 1 + rel);
+                let roles = collect_role_set(&label[by + 1..until]);
+                if !roles.is_empty() {
+                    readers.insert(address.clone(), roles);
                 }
             }
-            // `from <Role>` sets the integrity (vouching) authority.
+            // `internal` marks a signal an internal channel (H8 stage b): its
+            // integrity is derived from its emitters, not the external-entry low.
+            if label.contains(&"internal") {
+                internal_signals.insert(address.clone());
+            }
+            // `from <Role>[, <Role>...]` sets the integrity (vouching) SET: the
+            // compartments after `from` to the end.
             if let Some(from) = label.iter().position(|tok| *tok == "from") {
-                if let Some(role) = label.get(from + 1) {
-                    if *role != PUBLIC {
-                        integrity.insert(address, (*role).to_owned());
-                    }
+                let roles = collect_role_set(&label[from + 1..]);
+                if !roles.is_empty() {
+                    integrity.insert(address, roles);
                 }
             }
         }
@@ -322,6 +360,7 @@ impl Envelope {
             integrity,
             endorse,
             principals,
+            internal_signals,
             address_of,
             party_of,
         })
@@ -332,12 +371,18 @@ impl Envelope {
     pub fn to_canonical_json(&self) -> String {
         let mut resources = serde_json::Map::new();
         for name in &self.governed {
+            // reader/writer are emitted as sorted compartment ARRAYS (E6); a public
+            // label is the empty array. The BTreeSet iterates in sorted order, so the
+            // canonical form is deterministic (stable signing hash).
             let mut entry = serde_json::json!({
-                "reader": self.reader_authority(name),
-                "writer": self.integrity_authority(name),
+                "reader": self.reader_set(name).into_iter().collect::<Vec<_>>(),
+                "writer": self.integrity_set(name).into_iter().collect::<Vec<_>>(),
             });
             if self.principals.contains(name) {
                 entry["principal"] = serde_json::Value::Bool(true);
+            }
+            if self.internal_signals.contains(name) {
+                entry["internal"] = serde_json::Value::Bool(true);
             }
             resources.insert(name.clone(), entry);
         }
@@ -382,12 +427,30 @@ impl Envelope {
         .to_string()
     }
 
-    /// The reader authority of a resource; `public` (the bottom) if unlabeled.
-    fn reader_authority(&self, resource: &str) -> &str {
+    /// The reader-authority SET of a resource; the empty set (`public`, the bottom)
+    /// if unlabeled. A party may read iff it acts-for every compartment.
+    fn reader_set(&self, resource: &str) -> BTreeSet<String> {
         self.readers
             .get(self.resolve(resource))
-            .map(String::as_str)
-            .unwrap_or(PUBLIC)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// A reader label rendered for diagnostics: `public` for the empty set, else the
+    /// compartments joined by `, `.
+    fn reader_label(&self, resource: &str) -> String {
+        label_text(&self.reader_set(resource))
+    }
+
+    /// `provider` DOMINATES `required` iff every required compartment is covered by
+    /// some provider compartment (via acts-for) — the leak/inject decision, proven
+    /// sound in `ReaderSets.lean` (`leak_safe`). An empty `required` is vacuously
+    /// dominated (a public source never leaks); an empty `provider` dominates only
+    /// the empty set (a public sink cannot carry a confidential source).
+    fn dominates(&self, provider: &BTreeSet<String>, required: &BTreeSet<String>) -> bool {
+        required
+            .iter()
+            .all(|req| provider.iter().any(|prov| self.can_act(prov, req)))
     }
 
     /// `p` acts-for `q`: reflexive-transitive over the delegation edges, with
@@ -425,25 +488,43 @@ impl Envelope {
     /// Otherwise some reader of `sink` is not cleared for `source`, and it leaks
     /// (the fail-closed sticky boundary, DR-0027 I-IFC6).
     fn leaks(&self, source: &str, sink: &str) -> bool {
-        let sink_reader = self.reader_authority(sink);
-        if self.can_act(sink_reader, self.reader_authority(source)) {
+        let sink_readers = self.reader_set(sink);
+        if self.dominates(&sink_readers, &self.reader_set(source)) {
             return false;
         }
+        // a declassify releases the WHOLE source to `role`: its effective reader
+        // requirement drops to the single compartment `{role}`, cleared iff the sink
+        // dominates that (the audited escape hatch, DR-0027 I-IFC3).
         for (resource, role) in &self.declassify {
-            if self.resolve(resource) == self.resolve(source) && self.can_act(sink_reader, role) {
+            if self.resolve(resource) == self.resolve(source)
+                && self.dominates(&sink_readers, &BTreeSet::from([role.clone()]))
+            {
                 return false;
             }
         }
         true
     }
 
-    /// The integrity (vouching) authority of a resource; `public` (the untrusted
-    /// bottom) if unlabeled.
-    fn integrity_authority(&self, resource: &str) -> &str {
+    /// The integrity (vouching) authority SET of a resource; the empty set
+    /// (`public`, the untrusted bottom) if unlabeled.
+    fn integrity_set(&self, resource: &str) -> BTreeSet<String> {
         self.integrity
             .get(self.resolve(resource))
-            .map(String::as_str)
-            .unwrap_or(PUBLIC)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether governance marks `resource` (a `signal:<name>`) an INTERNAL channel
+    /// (H8 stage b): its integrity is derived from its emitters, and it may not be
+    /// externally injected.
+    pub fn is_internal_signal(&self, resource: &str) -> bool {
+        self.internal_signals.contains(self.resolve(resource))
+    }
+
+    /// An integrity label rendered for diagnostics: `public` for the empty set, else
+    /// the compartments joined by `, `.
+    fn integrity_label(&self, resource: &str) -> String {
+        label_text(&self.integrity_set(resource))
     }
 
     /// Does reading `read` and writing `write` inject? Untrusted data pollutes a
@@ -451,17 +532,212 @@ impl Envelope {
     /// dual of `leaks`), OR an endorse grant raises `read` to a role that meets the
     /// requirement (the audited integrity crossing, DR-0027 I-IFC3).
     fn injects(&self, read: &str, write: &str) -> bool {
-        let requirement = self.integrity_authority(write);
-        if self.can_act(self.integrity_authority(read), requirement) {
+        let requirement = self.integrity_set(write);
+        let read_integrity = self.integrity_set(read);
+        if self.dominates(&read_integrity, &requirement) {
             return false;
         }
+        // an endorse raises `read` to vouch `role`: add it to the provided set and
+        // re-check whether the requirement is now met (the audited integrity
+        // crossing, DR-0027 I-IFC3).
         for (resource, role) in &self.endorse {
-            if self.resolve(resource) == self.resolve(read) && self.can_act(role, requirement) {
-                return false;
+            if self.resolve(resource) == self.resolve(read) {
+                let mut raised = read_integrity.clone();
+                raised.insert(role.clone());
+                if self.dominates(&raised, &requirement) {
+                    return false;
+                }
             }
         }
         true
     }
+}
+
+/// Render a compartment set for diagnostics: `public` (the bottom) when empty, else
+/// the sorted compartments joined by `, `.
+fn label_text(set: &BTreeSet<String>) -> String {
+    if set.is_empty() {
+        PUBLIC.to_owned()
+    } else {
+        set.iter().cloned().collect::<Vec<_>>().join(", ")
+    }
+}
+
+/// Parse a reader/writer label field into a compartment SET: a JSON string is the
+/// single-compartment leaf, a JSON array is the general set. `public` is dropped (it
+/// is the bottom, represented by absence/emptiness), so a `["public"]` or `"public"`
+/// label is the empty set.
+fn parse_role_set(label: &serde_json::Value, key: &str) -> BTreeSet<String> {
+    match label.get(key) {
+        Some(serde_json::Value::String(role)) if role != PUBLIC => BTreeSet::from([role.clone()]),
+        Some(serde_json::Value::Array(roles)) => roles
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter(|role| *role != PUBLIC)
+            .map(str::to_owned)
+            .collect(),
+        _ => BTreeSet::new(),
+    }
+}
+
+/// Collect a set of authority roles from DSL tokens, splitting each token on commas
+/// (so `Operator,Auditor` and `Operator Auditor` both yield two compartments) and
+/// dropping `public` (the bottom).
+fn collect_role_set(tokens: &[&str]) -> BTreeSet<String> {
+    let mut roles = BTreeSet::new();
+    for token in tokens {
+        for role in token.split(',') {
+            let role = role.trim();
+            if !role.is_empty() && role != PUBLIC {
+                roles.insert(role.to_owned());
+            }
+        }
+    }
+    roles
+}
+
+/// Integrity carried by a signal, as a voucher SET; `None` is TOP — fully trusted,
+/// the identity for the meet (a signal emitted only by rules that read nothing
+/// external). `Some(set)` is the concrete voucher set; `Some(∅)` is the untrusted
+/// bottom. The meet (combine) of two integrities is the INTERSECTION of vouchers
+/// (data is trusted only as much as its least-trusted input — the E6 integrity dual).
+type CarriedIntegrity = Option<BTreeSet<String>>;
+
+/// Render a carried integrity for diagnostics: `trusted (derived)` for TOP, else the
+/// voucher set (`public` for the empty/bottom set).
+fn carried_label(integrity: &CarriedIntegrity) -> String {
+    match integrity {
+        None => "trusted (derived)".to_owned(),
+        Some(set) => label_text(set),
+    }
+}
+
+/// The meet of two carried integrities: intersection of voucher sets, with `None`
+/// (top) as the identity.
+fn meet_integrity(a: CarriedIntegrity, b: CarriedIntegrity) -> CarriedIntegrity {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(a), Some(b)) => Some(a.intersection(&b).cloned().collect()),
+    }
+}
+
+/// The read sources of a rule (for computing the integrity its `emit`s carry): file
+/// reads, turn-grant reads, inbound message channels, signal triggers, and human
+/// answers — the same source recognition the rule-level join box uses.
+fn rule_read_resources(rule: &IrRule, signal_names: &BTreeSet<&str>) -> Vec<String> {
+    let mut reads: Vec<String> = Vec::new();
+    for effect in &rule.metadata.effects {
+        if let Some(resource) = &effect.resource {
+            if matches!(
+                effect.kind,
+                IrEffectKind::FileRead | IrEffectKind::FileImport
+            ) {
+                reads.push(resource.clone());
+            }
+        }
+        for grant in &effect.access_grants {
+            if grant.operations.iter().any(|op| is_read_op(&op.operation)) {
+                reads.push(grant.resource.clone());
+            }
+        }
+    }
+    for when in &rule.whens {
+        let pattern = when.pattern.trim_start();
+        if let Some(rest) = pattern.strip_prefix("message from ") {
+            if let Some(channel) = rest.split_whitespace().next() {
+                reads.push(channel.to_owned());
+            }
+        }
+        if pattern.starts_with("human answered") {
+            reads.push("human".to_owned());
+        }
+        if let Some(name) = pattern.split_whitespace().next() {
+            if signal_names.contains(name) {
+                reads.push(format!("signal:{name}"));
+            }
+        }
+    }
+    reads
+}
+
+/// The integrity an `emit` in `rule` carries: the meet (intersection) of the
+/// integrity of every source the rule reads. A rule that reads nothing external is
+/// TOP (`None`); a rule that reads any untrusted source drops to its meet.
+fn carried_integrity_of_rule(
+    envelope: &Envelope,
+    rule: &IrRule,
+    signal_names: &BTreeSet<&str>,
+) -> CarriedIntegrity {
+    let mut acc: CarriedIntegrity = None;
+    for src in rule_read_resources(rule, signal_names) {
+        acc = meet_integrity(acc, Some(envelope.integrity_set(&src)));
+    }
+    acc
+}
+
+/// The signal ports a rule emits (`emit signal <name> [to <peer>]` → resource
+/// `signal:<name>`). The directed form lowers to `EventNotify`, the broadcast form to
+/// `EventEmit`; both carry the emitter's payload across the boundary.
+fn emitted_signal_ports(rule: &IrRule) -> Vec<String> {
+    rule.metadata
+        .effects
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect.kind,
+                IrEffectKind::EventEmit | IrEffectKind::EventNotify
+            )
+        })
+        .filter_map(|effect| effect.resource.clone())
+        .filter(|resource| resource.starts_with("signal:"))
+        .collect()
+}
+
+/// The DERIVED integrity of each signal that some rule emits (H8 stage b carriage):
+/// `signal:<name>` → the meet, over its emitting rules, of the integrity each emit
+/// carries. The receiver's `when <name>` reads this instead of the external-entry
+/// default — so an internal signal inherits its emitters' trust automatically.
+///
+/// Spans MULTIPLE programs: the consumer plus every imported `@tool` (DR-0029
+/// cross-package carriage). The label is always computed under the CONSUMER's
+/// envelope from the pinned source, so it is the consumer's own governance reasoning
+/// about the imported emitter — no producer label attestation needed; the producer
+/// need only attest the surface (which names the emit port). Signals with no emitter
+/// in any program are absent (the caller falls back to the envelope label).
+fn derived_signal_integrity(
+    programs: &[&IrProgram],
+    envelope: &Envelope,
+) -> BTreeMap<String, CarriedIntegrity> {
+    let mut derived: BTreeMap<String, CarriedIntegrity> = BTreeMap::new();
+    for ir in programs {
+        let signal_names: BTreeSet<&str> = ir.events.iter().map(|e| e.name.as_str()).collect();
+        for rule in &ir.rules {
+            let ports = emitted_signal_ports(rule);
+            if ports.is_empty() {
+                continue;
+            }
+            let carried = carried_integrity_of_rule(envelope, rule, &signal_names);
+            for port in ports {
+                let merged = match derived.remove(&port) {
+                    None => carried.clone(),
+                    Some(prev) => meet_integrity(prev, carried.clone()),
+                };
+                derived.insert(port, merged);
+            }
+        }
+    }
+    derived
+}
+
+/// The binding name introduced by `… as <binding>` in a `when` pattern, if any.
+fn binding_after_as(pattern: &str) -> Option<&str> {
+    let mut tokens = pattern.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "as" {
+            return tokens.next();
+        }
+    }
+    None
 }
 
 fn is_read_op(operation: &str) -> bool {
@@ -495,8 +771,9 @@ pub struct VerifiedEnvelope {
 pub enum EnvelopeStatus {
     /// No envelope configured: ungoverned dev mode (the gradual model).
     Ungoverned,
-    /// Present and authentic — an unsigned dev policy, or signed + verified.
-    Verified(VerifiedEnvelope),
+    /// Present and authentic — an unsigned dev policy, or signed + verified. Boxed:
+    /// the verified envelope is much larger than the other variants.
+    Verified(Box<VerifiedEnvelope>),
     /// Present but its attestation failed: a tampered or re-edited signed policy.
     Rejected(String),
 }
@@ -530,7 +807,7 @@ impl VerifiedEnvelope {
             Envelope::from_dsl(text)
         };
         match parsed {
-            Ok(envelope) => EnvelopeStatus::Verified(VerifiedEnvelope { envelope }),
+            Ok(envelope) => EnvelopeStatus::Verified(Box::new(VerifiedEnvelope { envelope })),
             // A malformed envelope is the governance compiler's error to report, not
             // the checker's; treat as ungoverned (the prior behavior).
             Err(_) => EnvelopeStatus::Ungoverned,
@@ -571,6 +848,13 @@ pub fn report_for_check(ir: &IrProgram) -> Option<String> {
 /// trust boundary: a signed policy is verified first, and the whip agent refuses to
 /// enforce a tampered one.
 pub fn check_ifc_program(ir: &IrProgram) -> Vec<Diagnostic> {
+    check_ifc_program_with_imports(ir, &[])
+}
+
+/// `check_ifc_program` aware of imported `@tool` programs, so cross-package signal
+/// carriage (DR-0029 / H8 stage b) folds imported emit ports into the consumer's
+/// derived signal integrity.
+pub fn check_ifc_program_with_imports(ir: &IrProgram, imports: &[IrProgram]) -> Vec<Diagnostic> {
     match VerifiedEnvelope::load_from_env() {
         EnvelopeStatus::Ungoverned => Vec::new(),
         EnvelopeStatus::Rejected(message) => vec![Diagnostic {
@@ -582,7 +866,7 @@ pub fn check_ifc_program(ir: &IrProgram) -> Vec<Diagnostic> {
             related: Vec::new(),
         }],
         EnvelopeStatus::Verified(verified) => {
-            let mut diagnostics = check_with_envelope(ir, &verified);
+            let mut diagnostics = check_with_envelope_imports(ir, &verified, imports);
             // Principal ceiling (DR-0031 / D3): if governance declared parties, the
             // agent acts-for the role of the principal the environment asserts, and
             // may not read beyond that clearance. An unknown principal is the public
@@ -600,6 +884,20 @@ pub fn check_ifc_program(ir: &IrProgram) -> Vec<Diagnostic> {
             }
             diagnostics
         }
+    }
+}
+
+/// Whether the env-configured governed envelope marks signal `<name>` an INTERNAL
+/// channel (H8 stage b). `whip signal` uses this to refuse an external injection of
+/// an internal signal: an internal channel carries its emitter's integrity and must
+/// not be sourced from outside (the W6 no-laundering principle). Ungoverned/absent or
+/// a rejected envelope → `false` (the gradual model imposes nothing in dev mode).
+pub fn signal_is_internal(signal_name: &str) -> bool {
+    match VerifiedEnvelope::load_from_env() {
+        EnvelopeStatus::Verified(verified) => verified
+            .envelope()
+            .is_internal_signal(&format!("signal:{signal_name}")),
+        _ => false,
     }
 }
 
@@ -656,7 +954,32 @@ fn imported_surface_gaps<'a>(
 /// resource `sink`, flag the pair when data from `src` may leak to a reader of
 /// `sink` not cleared for `src` (party-relative, via the acts-for closure).
 pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<Diagnostic> {
+    check_with_envelope_imports(ir, verified, &[])
+}
+
+/// `check_with_envelope` aware of imported `@tool` programs (DR-0029): an imported
+/// tool's `emit signal X` contributes its carried integrity to the consumer's
+/// `signal:X`, so a cross-package internal signal propagates the emitter's trust just
+/// as an in-program one does. `imports` are the pinned tool IRs, compiled by the
+/// consumer; labels are computed under the consumer's envelope.
+pub fn check_with_envelope_imports(
+    ir: &IrProgram,
+    verified: &VerifiedEnvelope,
+    imports: &[IrProgram],
+) -> Vec<Diagnostic> {
     let envelope = verified.envelope();
+    // The declared signal names, so a `when <Signal> as e` trigger is recognized as
+    // an inbound read source (H8). Source recognition is uniform: a signal is a
+    // tracked read of `signal:<name>`, integrity envelope-declared, default public
+    // (the untrusted/fail-closed bottom) — exactly as channels work — so an
+    // unrecognized signal can no longer fail OPEN past a governed envelope.
+    let signal_names: BTreeSet<&str> = ir.events.iter().map(|e| e.name.as_str()).collect();
+    // H8 stage b: the integrity each emitted signal carries to its receivers (the
+    // meet over its emitters, across the consumer AND every imported tool). An
+    // `internal`-marked signal reads this instead of the external-entry default, so
+    // internal flows propagate the emitter's trust automatically.
+    let programs: Vec<&IrProgram> = std::iter::once(ir).chain(imports.iter()).collect();
+    let derived = derived_signal_integrity(&programs, envelope);
     let mut diagnostics = Vec::new();
     for rule in &ir.rules {
         // Collect reads and writes across the whole rule (the rule-level join box):
@@ -740,8 +1063,8 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
                                      (clearance {pr}) is not cleared, so the turn's context egresses \
                                      to an uncleared model",
                                     rule = rule.name,
-                                    rr = envelope.reader_authority(resource),
-                                    pr = envelope.reader_authority(provider),
+                                    rr = envelope.reader_label(resource),
+                                    pr = envelope.reader_label(provider),
                                 ),
                                 suggestion: Some(format!(
                                     "bind the agent to a provider cleared for `{resource}`, or \
@@ -773,6 +1096,11 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
         // confidentiality), so untrusted inbound data driving a more-trusted sink is
         // caught as an injection (H3). The IR pattern is `message from <channel>`.
         let mut message_reads: Vec<&str> = Vec::new();
+        // `when <Signal> as e` triggers: a signal is injected from outside the
+        // instance (an operator/peer `whip signal`, a directed `emit signal X to`),
+        // so it is an inbound read source `signal:<name>` (H8). Owned because the id
+        // is the prefixed name, not a borrow of the pattern.
+        let mut signal_reads: Vec<String> = Vec::new();
         for when in &rule.whens {
             let pattern = when.pattern.trim_start();
             if let Some(rest) = pattern.strip_prefix("message from ") {
@@ -785,21 +1113,66 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
             if pattern.starts_with("human answered") {
                 message_reads.push("human");
             }
+            // a trigger whose head is a declared signal name reads that signal.
+            if let Some(name) = pattern.split_whitespace().next() {
+                if signal_names.contains(name) {
+                    signal_reads.push(format!("signal:{name}"));
+                }
+            }
         }
         let report_span = span.unwrap_or(whipplescript_parser::SourceSpan { start: 0, end: 0 });
-        let mut leak: Option<(&str, &str)> = None;
-        let mut inject: Option<(&str, &str)> = None;
-        for src in reads.iter().copied().chain(message_reads.iter().copied()) {
+        // An internal signal reads its DERIVED integrity (carriage); every other
+        // source reads the envelope label. `None` integrity is TOP (never injects).
+        let internal_signal: BTreeSet<&str> = signal_reads
+            .iter()
+            .map(String::as_str)
+            .filter(|sig| envelope.is_internal_signal(sig))
+            .collect();
+        let source_integrity = |src: &str| -> CarriedIntegrity {
+            if internal_signal.contains(src) {
+                derived
+                    .get(src)
+                    .cloned()
+                    .unwrap_or_else(|| Some(envelope.integrity_set(src)))
+            } else {
+                Some(envelope.integrity_set(src))
+            }
+        };
+        let mut leak: Option<(String, String)> = None;
+        let mut inject: Option<(String, String, String)> = None;
+        for src in reads
+            .iter()
+            .copied()
+            .chain(message_reads.iter().copied())
+            .chain(signal_reads.iter().map(String::as_str))
+        {
+            let src_integrity = source_integrity(src);
             for sink in writes
                 .iter()
                 .copied()
                 .chain(record_sinks.iter().map(String::as_str))
             {
                 if leak.is_none() && envelope.leaks(src, sink) {
-                    leak = Some((src, sink));
+                    leak = Some((src.to_owned(), sink.to_owned()));
                 }
-                if inject.is_none() && envelope.injects(src, sink) {
-                    inject = Some((src, sink));
+                if inject.is_none() {
+                    // an internal signal carries its derived integrity (no endorse
+                    // hatch); every other source uses the envelope label + endorse.
+                    let injects = if internal_signal.contains(src) {
+                        match &src_integrity {
+                            None => false,
+                            Some(set) => !envelope.dominates(set, &envelope.integrity_set(sink)),
+                        }
+                    } else {
+                        envelope.injects(src, sink)
+                    };
+                    if injects {
+                        inject = Some((
+                            src.to_owned(),
+                            sink.to_owned(),
+                            carried_label(&src_integrity),
+                        ));
+                    }
                 }
             }
         }
@@ -811,17 +1184,18 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
                      {src_reader}) and write `{sink}` (readable by {sink_reader}), so data from \
                      `{src}` could reach a party not cleared for it",
                     rule = rule.name,
-                    src_reader = envelope.reader_authority(src),
-                    sink_reader = envelope.reader_authority(sink),
+                    src_reader = envelope.reader_label(&src),
+                    sink_reader = envelope.reader_label(&sink),
                 ),
                 suggestion: Some(format!(
-                    "separate the contexts — read `{src}` in a distinct turn and pass only a \
-                     bounded result; or declassify the value before writing `{sink}`"
+                    "self-serve (no grant needed): separate the contexts — read `{src}` in a \
+                     distinct turn and pass only a bounded result. escalate (needs governance): \
+                     request `grant declassify {src} to <role cleared for {sink}>`"
                 )),
                 related: Vec::new(),
             });
         }
-        if let Some((src, sink)) = inject {
+        if let Some((src, sink, src_int)) = inject {
             diagnostics.push(Diagnostic {
                 span: report_span,
                 message: format!(
@@ -829,12 +1203,12 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
                      {src_int}) influence `{sink}` (requires integrity {sink_int}), an injection \
                      into a more-trusted sink",
                     rule = rule.name,
-                    src_int = envelope.integrity_authority(src),
-                    sink_int = envelope.integrity_authority(sink),
+                    sink_int = envelope.integrity_label(&sink),
                 ),
                 suggestion: Some(format!(
-                    "endorse `{src}` to the required integrity (a `grant endorse {src} to …`), or \
-                     do not let `{src}` influence `{sink}`"
+                    "self-serve (no grant needed): do not let `{src}` influence `{sink}` — gate \
+                     the sink on trusted data. escalate (needs governance): request `grant endorse \
+                     {src} to <role>` to vouch the source"
                 )),
                 related: Vec::new(),
             });
@@ -844,20 +1218,24 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
         // inside a `case <disc> { … }` arm whose discriminant is low-integrity is
         // rejected — the attacker must not steer which declassify/endorse runs. The
         // discriminant is low-integrity when its root binding comes from a
-        // low-integrity `when` source (an inbound message / a human answer).
+        // low-integrity `when` source: an inbound message / a human answer, or (H8) a
+        // signal trigger the envelope does not vouch (a Family-B signal discriminant
+        // gating a crossing — the §5.6 channel-2 case the uniform recognition makes
+        // live). A signal vouched by governance (`signal:<name> from <Role>`) is
+        // high-integrity and may steer a crossing.
         let low_integrity_bindings: Vec<&str> = rule
             .whens
             .iter()
             .filter_map(|when| {
                 let pattern = when.pattern.trim_start();
-                if !(pattern.starts_with("message from ") || pattern.starts_with("human answered"))
-                {
-                    return None;
+                if pattern.starts_with("message from ") || pattern.starts_with("human answered") {
+                    return binding_after_as(pattern);
                 }
-                let mut tokens = pattern.split_whitespace();
-                while let Some(token) = tokens.next() {
-                    if token == "as" {
-                        return tokens.next();
+                if let Some(name) = pattern.split_whitespace().next() {
+                    if signal_names.contains(name)
+                        && envelope.integrity_set(&format!("signal:{name}")).is_empty()
+                    {
+                        return binding_after_as(pattern);
                     }
                 }
                 None
@@ -909,37 +1287,49 @@ pub fn check_principal_ceiling(
     principal_role: &str,
 ) -> Vec<Diagnostic> {
     let envelope = verified.envelope();
+    let signal_names: BTreeSet<&str> = ir.events.iter().map(|e| e.name.as_str()).collect();
     let mut diagnostics = Vec::new();
     let mut flagged: BTreeSet<String> = BTreeSet::new();
     for rule in &ir.rules {
-        let mut reads: Vec<(&str, whipplescript_parser::SourceSpan)> = Vec::new();
+        let mut reads: Vec<(String, whipplescript_parser::SourceSpan)> = Vec::new();
         for effect in &rule.metadata.effects {
             if let Some(resource) = &effect.resource {
                 if matches!(
                     effect.kind,
                     IrEffectKind::FileRead | IrEffectKind::FileImport
                 ) {
-                    reads.push((resource.as_str(), effect.span));
+                    reads.push((resource.clone(), effect.span));
                 }
             }
             for grant in &effect.access_grants {
                 if grant.operations.iter().any(|op| is_read_op(&op.operation)) {
-                    reads.push((grant.resource.as_str(), effect.span));
+                    reads.push((grant.resource.clone(), effect.span));
                 }
             }
         }
         for when in &rule.whens {
-            if let Some(rest) = when.pattern.trim_start().strip_prefix("message from ") {
+            let pattern = when.pattern.trim_start();
+            if let Some(rest) = pattern.strip_prefix("message from ") {
                 if let Some(channel) = rest.split_whitespace().next() {
-                    reads.push((channel, when.span));
+                    reads.push((channel.to_owned(), when.span));
+                }
+            }
+            // a `when <Signal>` trigger reads `signal:<name>` (H8); the principal
+            // must be cleared for the signal's reader set too.
+            if let Some(name) = pattern.split_whitespace().next() {
+                if signal_names.contains(name) {
+                    reads.push((format!("signal:{name}"), when.span));
                 }
             }
         }
         for (src, span) in reads {
-            let required = envelope.reader_authority(src);
-            if !envelope.can_act(principal_role, required)
-                && flagged.insert(format!("{}:{src}", rule.name))
-            {
+            let src = src.as_str();
+            let required = envelope.reader_set(src);
+            // the principal must be cleared for EVERY compartment of the source (it
+            // can read iff it acts-for the whole reader set — `canRead`).
+            let cleared = required.iter().all(|r| envelope.can_act(principal_role, r));
+            if !cleared && flagged.insert(format!("{}:{src}", rule.name)) {
+                let required = envelope.reader_label(src);
                 diagnostics.push(Diagnostic {
                     span,
                     message: format!(
@@ -967,6 +1357,7 @@ pub fn check_principal_ceiling(
 /// Mirrors the resource collection of `check_with_envelope`, so the surface is
 /// exactly the set of handles the checker would treat as a source or sink.
 pub fn ifc_surface(ir: &IrProgram) -> Vec<String> {
+    let signal_names: BTreeSet<&str> = ir.events.iter().map(|e| e.name.as_str()).collect();
     let mut surface: BTreeSet<String> = BTreeSet::new();
     for rule in &ir.rules {
         for effect in &rule.metadata.effects {
@@ -1012,19 +1403,33 @@ pub fn ifc_surface(ir: &IrProgram) -> Vec<String> {
             if pattern.starts_with("human answered") {
                 surface.insert("human".to_owned());
             }
+            // a `when <Signal>` trigger opens the `signal:<name>` door (H8).
+            if let Some(name) = pattern.split_whitespace().next() {
+                if signal_names.contains(name) {
+                    surface.insert(format!("signal:{name}"));
+                }
+            }
         }
     }
     surface.into_iter().collect()
 }
 
 /// The IT-facing guarantee report (`gov compile`, DR-0028): what a governance
-/// config protects and the risks it leaves. v0 surfaces the protected resources,
-/// the count of IFC violations the config catches in the program, and coverage
-/// gaps (resources the program touches that governance does not label).
+/// config guarantees and the risks it leaves. Surfaces per-resource guaranteed
+/// invariants (the exact confidentiality/integrity proven on every rule), the count
+/// of IFC violations the config catches, flagged risks (touched-but-ungoverned
+/// resources, fail-closed to public/low), the audited trusted surface (declassify /
+/// endorse crossings to review), cleared principals (H5), and the full door surface.
 pub struct GovernanceReport {
-    pub protected: Vec<String>,
+    /// Per-resource guaranteed invariants (DR-0028): for each governed resource, the
+    /// exact confidentiality/integrity the checker guarantees on every rule — not a
+    /// generic line. The "guaranteed invariants" half of the guarantee report.
+    pub invariants: Vec<String>,
+    /// Flagged risks (DR-0028): coverage gaps reframed as risks the operator must
+    /// confirm (each defaults to public + low-integrity, fail-closed). Audited
+    /// crossings — the other risk class — are surfaced in `trusted_surface`.
+    pub flagged_risks: Vec<String>,
     pub violations: usize,
-    pub coverage_gaps: Vec<String>,
     /// The audited trusted surface: each crossing, tagged by axis —
     /// `declassify <resource> -> <role>` and `endorse <resource> -> <role>`.
     pub trusted_surface: Vec<String>,
@@ -1037,21 +1442,12 @@ pub struct GovernanceReport {
 
 pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> GovernanceReport {
     let envelope = verified.envelope();
-    // protected = governed resources whose reader authority is not public, EXCLUDING
-    // principals (a provider/human is a cleared reader, not protected data) (H5).
-    let mut protected: Vec<String> = envelope
-        .readers
-        .keys()
-        .filter(|name| !envelope.principals.contains(*name))
-        .cloned()
-        .collect();
-    protected.sort();
     // Principals (providers/humans) cleared for non-public data, listed separately.
     let mut cleared_principals: Vec<String> = envelope
         .principals
         .iter()
         .filter(|name| envelope.readers.contains_key(*name))
-        .map(|name| format!("{name} (cleared for {})", envelope.reader_authority(name)))
+        .map(|name| format!("{name} (cleared for {})", envelope.reader_label(name)))
         .collect();
     cleared_principals.sort();
     // The audited trusted surface is BOTH axes' crossings: declassify (lowers
@@ -1101,10 +1497,55 @@ pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> Governa
         .into_iter()
         .filter(|resource| !envelope.governed.contains(envelope.resolve(resource)))
         .collect();
+    // Per-resource guaranteed invariants: every governed resource (on either axis,
+    // excluding principals) gets its exact guarantee, so the report states what is
+    // proven, not a generic blanket line. A confidentiality-labelled resource may not
+    // flow to a sink not cleared for its reader set; an integrity-labelled one may not
+    // be influenced by data below its writer set. Both axes shown when both are set.
+    let mut invariant_names: BTreeSet<&String> = envelope.readers.keys().collect();
+    invariant_names.extend(envelope.integrity.keys());
+    let invariants: Vec<String> = invariant_names
+        .into_iter()
+        .filter(|name| !envelope.principals.contains(*name))
+        .filter_map(|name| {
+            let mut clauses: Vec<String> = Vec::new();
+            if !envelope.reader_set(name).is_empty() {
+                clauses.push(format!(
+                    "may not flow to a sink not cleared for {} (unless an audited declassify clears it)",
+                    envelope.reader_label(name)
+                ));
+            }
+            if !envelope.integrity_set(name).is_empty() {
+                clauses.push(format!(
+                    "may not be influenced by data below {} (unless an audited endorse vouches it)",
+                    envelope.integrity_label(name)
+                ));
+            }
+            if clauses.is_empty() {
+                None
+            } else {
+                Some(format!("{name}: {}", clauses.join("; ")))
+            }
+        })
+        .collect();
+    // Flagged risks: a touched-but-ungoverned resource is a risk the operator must
+    // confirm — it defaults to public + low-integrity (fail-closed), so the checker
+    // proves nothing about it. (Audited crossings are the other risk class, shown in
+    // their own trusted-surface section so each downgrade is reviewable.)
+    let flagged_risks: Vec<String> = coverage_gaps
+        .iter()
+        .map(|resource| {
+            format!(
+                "{resource}: touched but not labelled by governance — treated as public + \
+                 low-integrity (fail-closed). Confirm it holds nothing confidential and feeds no \
+                 trusted sink, or add a `grant` for it."
+            )
+        })
+        .collect();
     GovernanceReport {
-        protected,
+        invariants,
+        flagged_risks,
         violations,
-        coverage_gaps,
         trusted_surface,
         cleared_principals,
         surface: ifc_surface(ir),
@@ -1116,28 +1557,24 @@ impl GovernanceReport {
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str("information-flow guarantee report\n");
-        if self.protected.is_empty() {
-            out.push_str("  protected resources: none (no confidentiality declared)\n");
+        if self.invariants.is_empty() {
+            out.push_str("  guaranteed invariants: none (no resource labelled)\n");
         } else {
-            out.push_str("  protected resources (confidential):\n");
-            for resource in &self.protected {
-                out.push_str(&format!(
-                    "    - {resource}: may not flow to an un-cleared sink without a declassify\n"
-                ));
+            out.push_str("  guaranteed invariants (proven by the checker on every rule):\n");
+            for invariant in &self.invariants {
+                out.push_str(&format!("    - {invariant}\n"));
             }
         }
         out.push_str(&format!(
             "  violations caught in this program: {}\n",
             self.violations
         ));
-        if self.coverage_gaps.is_empty() {
-            out.push_str("  coverage gaps: none\n");
+        if self.flagged_risks.is_empty() {
+            out.push_str("  flagged risks: none (every touched resource is governed)\n");
         } else {
-            out.push_str(
-                "  coverage gaps (resources the program touches but governance does not label):\n",
-            );
-            for resource in &self.coverage_gaps {
-                out.push_str(&format!("    - {resource}\n"));
+            out.push_str("  flagged risks (the operator must confirm or govern these):\n");
+            for risk in &self.flagged_risks {
+                out.push_str(&format!("    - {risk}\n"));
             }
         }
         if self.trusted_surface.is_empty() {
@@ -1288,8 +1725,8 @@ party bob@acme.com : Requester\n";
     fn dsl_parses_to_the_same_labels_as_json() {
         let from_dsl = Envelope::from_dsl(DSL).expect("valid DSL");
         // ledger has reader authority Operator; outbox is public.
-        assert_eq!(from_dsl.reader_authority("ledger"), "Operator");
-        assert_eq!(from_dsl.reader_authority("outbox"), "public");
+        assert_eq!(from_dsl.reader_label("ledger"), "Operator");
+        assert_eq!(from_dsl.reader_label("outbox"), "public");
         // ledger (Operator) -> outbox (public) leaks; the reverse does not.
         assert!(from_dsl.leaks("ledger", "outbox"));
         assert!(!from_dsl.leaks("outbox", "ledger"));
@@ -1347,6 +1784,56 @@ rule work
             "rule-body read->write should be flagged, got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn reader_set_requires_clearance_for_every_compartment() {
+        // E6: a resource whose label is the SET {Bank, Email} is readable only by a
+        // party cleared for BOTH. operator acts-for both; an email-only sink does not.
+        let env = Envelope::from_dsl(
+            "grant file_store mixed -> file:/srv/mixed readable by Bank,Email\n\
+             grant file_store bankbox -> file:/srv/bank readable by Bank\n\
+             grant file_store opbox -> file:/srv/op readable by Operator\n\
+             grant channel pub -> smtp:pub public\n\
+             delegate Operator acts-for Bank\n\
+             delegate Operator acts-for Email\n",
+        )
+        .expect("valid");
+        assert_eq!(env.reader_label("mixed"), "Bank, Email");
+        // mixed {Bank,Email} -> a Bank-only sink leaks: Email is uncovered.
+        assert!(
+            env.leaks("mixed", "bankbox"),
+            "a Bank-only sink does not dominate a {{Bank,Email}} source"
+        );
+        // mixed {Bank,Email} -> a public sink leaks (covers nothing).
+        assert!(env.leaks("mixed", "pub"));
+        // mixed {Bank,Email} -> an Operator sink is SAFE: operator acts-for both, so
+        // the singleton {Operator} dominates the whole source set.
+        assert!(
+            !env.leaks("mixed", "opbox"),
+            "Operator acts-for every compartment, so it dominates the set"
+        );
+        // a Bank-only source -> the {Bank,Email} sink is SAFE: the richer sink set
+        // still covers Bank (dominates is monotone in the provider).
+        assert!(!env.leaks("bankbox", "mixed"));
+    }
+
+    #[test]
+    fn integrity_set_requires_every_required_voucher() {
+        // E6 dual: a sink requiring the writer SET {Sec, Ops} accepts data only from
+        // a source providing a voucher acting-for each. A source vouched only by Sec
+        // is rejected; endorsing it to Ops clears it.
+        let base = "\
+grant file_store sink -> file:/srv/sink from Sec,Ops\n\
+grant channel secsrc -> imap:sec from Sec\n";
+        let env = Envelope::from_dsl(base).expect("valid");
+        assert_eq!(env.integrity_label("sink"), "Ops, Sec");
+        // secsrc provides only {Sec}; the sink requires {Sec,Ops} -> Ops unmet -> inject.
+        assert!(env.injects("secsrc", "sink"));
+        // endorsing secsrc to Ops adds the missing voucher -> no injection.
+        let with =
+            Envelope::from_dsl(&format!("{base}grant endorse secsrc to Ops\n")).expect("valid");
+        assert!(!with.injects("secsrc", "sink"));
     }
 
     #[test]
@@ -1451,22 +1938,64 @@ grant channel reply -> smtp:out readable by Requester\n";
     }
 
     #[test]
-    fn report_surfaces_protections_violations_and_coverage_gaps() {
+    fn leak_and_inject_diagnostics_carry_self_serve_and_escalate_routes() {
+        // a leak (read confidential ledger -> write public outbox) and an inject (an
+        // unvouched source -> a high-integrity sink) each carry BOTH a self-serve route
+        // (no grant) and an escalate route (a governance grant), so the whip author
+        // knows what they can fix alone vs what needs the governance root agent.
+        let envelope = Envelope::from_dsl(
+            "grant file_store ledger -> file:/srv/ledger.db readable by Operator\n",
+        )
+        .expect("valid");
+        let ir = ir_with_grants(&format!("{READ_LEDGER}{WRITE_OUTBOX}"));
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        let leak = diagnostics
+            .iter()
+            .find(|d| d.message.contains("information-flow violation"))
+            .expect("a leak should be flagged");
+        let suggestion = leak.suggestion.as_deref().unwrap_or_default();
+        assert!(
+            suggestion.contains("self-serve") && suggestion.contains("escalate"),
+            "leak fix should name both routes: {suggestion}"
+        );
+        assert!(
+            suggestion.contains("grant declassify"),
+            "the escalate route should name the declassify grant: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn report_surfaces_invariants_violations_and_risks() {
         // envelope governs ledger (confidential) but NOT outbox, which the whip writes.
         let envelope =
             Envelope::from_json(r#"{ "resources": { "ledger": { "confidential": true } } }"#)
                 .expect("valid envelope");
         let ir = ir_with_grants(&format!("{READ_LEDGER}{WRITE_OUTBOX}"));
         let report = governance_report(&ir, &VerifiedEnvelope::for_test(envelope));
-        assert_eq!(report.protected, vec!["ledger".to_owned()]);
+        // ledger gets a per-resource guaranteed invariant, not a generic line.
+        assert!(
+            report
+                .invariants
+                .iter()
+                .any(|inv| inv.starts_with("ledger:")),
+            "ledger should have a per-resource invariant: {:?}",
+            report.invariants
+        );
         // ledger (confidential) flows to outbox (not confidential) -> caught by the
         // fail-closed sticky boundary even though outbox is ungoverned.
         assert!(report.violations >= 1);
-        // outbox is touched (written) but ungoverned -> also a coverage gap.
-        assert!(report.coverage_gaps.contains(&"outbox".to_owned()));
+        // outbox is touched (written) but ungoverned -> flagged as a risk to confirm.
+        assert!(
+            report
+                .flagged_risks
+                .iter()
+                .any(|risk| risk.starts_with("outbox:")),
+            "outbox should be a flagged risk: {:?}",
+            report.flagged_risks
+        );
         let text = report.render();
-        assert!(text.contains("protected resources"));
-        assert!(text.contains("coverage gaps"));
+        assert!(text.contains("guaranteed invariants"));
+        assert!(text.contains("flagged risks"));
     }
 
     #[test]
@@ -1596,6 +2125,307 @@ rule ingest
                     && d.message.contains("ledger")),
             "inbound message driving a trusted sink should be an injection, got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A whip whose rule is triggered by a signal and writes the signal's payload
+    /// into `ledger`. The signal `deploy.finished` carries a `status` field.
+    fn signal_triggered_write_ir() -> IrProgram {
+        let program = r##"@service
+workflow IfcSignal
+
+output result R
+class R { ok bool }
+
+signal deploy.finished { status string }
+file store ledger { root "./ledger"  allow write ["**"] }
+
+rule ingest
+  when deploy.finished as deployed
+=> {
+  write text to ledger at "notes.txt" {
+    body "{{ deployed.status }}"
+    mode append
+  } as noted
+  after noted succeeds {
+    complete result { ok true }
+  }
+}
+"##;
+        compile_program(program).ir.expect("compiles")
+    }
+
+    #[test]
+    fn signal_trigger_is_a_low_integrity_source() {
+        // H8: a rule triggered by `when <Signal> as e` reads an externally-injected
+        // signal (an operator/peer `whip signal`). It defaults to public integrity
+        // (fail-closed), so driving an Operator-integrity store is an injection —
+        // exactly as an inbound channel message is. Before H8 the signal was
+        // recognized as NO source, so this flow slipped past a governed envelope.
+        let ir = signal_triggered_write_ir();
+        let envelope =
+            Envelope::from_dsl("grant file_store ledger -> file:/srv/ledger.db from Operator\n")
+                .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("integrity violation")
+                    && d.message.contains("signal:deploy.finished")
+                    && d.message.contains("ledger")),
+            "an untrusted signal driving a trusted sink should be an injection, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn vouched_signal_does_not_inject() {
+        // a signal the envelope vouches (`signal:<name> from Operator`) carries
+        // Operator integrity, so it meets the sink's requirement — no injection. The
+        // integrity is envelope-declared, not kind-hardcoded (the H8 premise).
+        let ir = signal_triggered_write_ir();
+        let envelope = Envelope::from_dsl(
+            "grant file_store ledger -> file:/srv/ledger.db from Operator\n\
+             grant signal deploy.finished -> signal:deploy.finished from Operator\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("integrity violation")),
+            "a vouched signal should not inject, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn confidential_signal_leaks_to_public_sink() {
+        // the confidentiality axis is symmetric: a signal the envelope labels
+        // readable-by Operator, written into a public store, leaks (the signal is a
+        // read source on both axes).
+        let ir = signal_triggered_write_ir();
+        let envelope = Envelope::from_dsl(
+            "grant signal deploy.finished -> signal:deploy.finished readable by Operator\n\
+             grant file_store ledger -> file:/srv/ledger.db public\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("information-flow violation")
+                    && d.message.contains("signal:deploy.finished")),
+            "a confidential signal written to a public sink should leak, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn signal_trigger_is_in_the_ifc_surface() {
+        // H8: the workflow's surface (X1) enumerates `signal:<name>` so a consumer's
+        // governance must cover it (no ungoverned door).
+        let ir = signal_triggered_write_ir();
+        let surface = ifc_surface(&ir);
+        assert!(
+            surface.iter().any(|d| d == "signal:deploy.finished"),
+            "surface should include the signal door, got: {surface:?}"
+        );
+    }
+
+    /// A producer rule reads `source` and emits `work.done`; a consumer rule reacts
+    /// `when work.done` and writes the payload into `ledger`. The carried integrity
+    /// of `work.done` is the producer's read-source integrity.
+    fn signal_carriage_ir() -> IrProgram {
+        let program = r##"@service
+workflow Carriage
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+
+signal work.done { detail string }
+file store source { root "./source"  allow read ["**"] }
+file store ledger { root "./ledger"  allow write ["**"] }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule produce
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from source at "in.txt" as loaded
+  after loaded succeeds as file {
+    emit signal work.done to ticket.id {
+      detail file.content
+    } as sent
+  }
+}
+
+rule consume
+  when work.done as evt
+=> {
+  write text to ledger at "out.txt" {
+    body "{{ evt.detail }}"
+    mode append
+  } as noted
+  after noted succeeds {
+    complete result { ok true }
+  }
+}
+"##;
+        compile_program(program).ir.expect("compiles")
+    }
+
+    #[test]
+    fn internal_signal_carries_emitter_integrity() {
+        // H8 stage b (THE win): `work.done` is marked internal and emitted by a rule
+        // whose only read source (`source`) has Operator integrity. So the signal
+        // CARRIES Operator integrity to its receiver, which writes the Operator
+        // `ledger` — no injection, with no hand-vouching of the signal itself.
+        let ir = signal_carriage_ir();
+        let envelope = Envelope::from_dsl(
+            "grant file_store source -> file:/srv/source from Operator\n\
+             grant file_store ledger -> file:/srv/ledger from Operator\n\
+             grant signal work.done -> signal:work.done internal\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("integrity violation")),
+            "an internal signal from a trusted emitter should carry that trust, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn signal_without_internal_mark_stays_low_and_injects() {
+        // the contrast: the SAME flow without the `internal` mark — `work.done` is an
+        // external-entry signal (stage a), defaults low, and injects into the Operator
+        // ledger. This is exactly what the `internal` mark + carriage clears above.
+        let ir = signal_carriage_ir();
+        let envelope = Envelope::from_dsl(
+            "grant file_store source -> file:/srv/source from Operator\n\
+             grant file_store ledger -> file:/srv/ledger from Operator\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("integrity violation")
+                    && d.message.contains("signal:work.done")
+                    && d.message.contains("ledger")),
+            "an unmarked signal should default low and inject, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn internal_signal_does_not_fabricate_trust() {
+        // carriage does NOT launder trust up: when the emitter's read source is
+        // untrusted (no `from` → public integrity), the internal signal carries
+        // `public` to the receiver, which still injects into the Operator ledger.
+        let ir = signal_carriage_ir();
+        let envelope = Envelope::from_dsl(
+            "grant file_store source -> file:/srv/source readable by Anyone\n\
+             grant file_store ledger -> file:/srv/ledger from Operator\n\
+             grant signal work.done -> signal:work.done internal\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("integrity violation")
+                    && d.message.contains("signal:work.done")),
+            "an internal signal from an untrusted emitter must still inject, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cross_package_signal_carries_imported_emitter_integrity() {
+        // DR-0029 / H8 stage b: a consumer reacts `when work.done` and writes the
+        // Operator `ledger`; the signal is emitted by an IMPORTED tool whose emit
+        // reads an Operator-integrity store. The consumer derives the imported emit's
+        // carried integrity UNDER ITS OWN ENVELOPE, so `work.done` carries Operator
+        // across the package boundary — no injection, no producer label attestation.
+        let consumer = compile_program(
+            r##"@service
+workflow Consumer
+
+output result R
+class R { ok bool }
+
+signal work.done { detail string }
+file store ledger { root "./ledger"  allow write ["**"] }
+
+rule consume
+  when work.done as evt
+=> {
+  write text to ledger at "out.txt" {
+    body "{{ evt.detail }}"
+    mode append
+  } as noted
+  after noted succeeds {
+    complete result { ok true }
+  }
+}
+"##,
+        )
+        .ir
+        .expect("consumer compiles");
+        let imported = compile_program(
+            r##"@service
+workflow Producer
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+
+signal work.done { detail string }
+file store source { root "./source"  allow read ["**"] }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule produce
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from source at "in.txt" as loaded
+  after loaded succeeds as file {
+    emit signal work.done to ticket.id {
+      detail file.content
+    } as sent
+  }
+}
+"##,
+        )
+        .ir
+        .expect("producer compiles");
+        let envelope = Envelope::from_dsl(
+            "grant file_store source -> file:/srv/source from Operator\n\
+             grant file_store ledger -> file:/srv/ledger from Operator\n\
+             grant signal work.done -> signal:work.done internal\n",
+        )
+        .expect("valid");
+        let verified = VerifiedEnvelope::for_test(envelope);
+        // WITHOUT the import, the consumer sees no emitter -> falls back to the
+        // external-entry low -> injects into the Operator ledger.
+        assert!(
+            check_with_envelope(&consumer, &verified)
+                .iter()
+                .any(|d| d.message.contains("integrity violation")),
+            "with no imported emitter the internal signal defaults low and injects"
+        );
+        // WITH the imported tool, the consumer derives `work.done`'s integrity from
+        // the imported Operator-trusted emit -> no injection (cross-package carriage).
+        assert!(
+            !check_with_envelope_imports(&consumer, &verified, &[imported])
+                .iter()
+                .any(|d| d.message.contains("integrity violation")),
+            "the imported tool's Operator-trusted emit should carry across the package boundary"
         );
     }
 
@@ -1800,8 +2630,8 @@ rule triage
              grant channel out -> smtp:out public\n",
         )
         .expect("valid");
-        assert_eq!(env.reader_authority("a"), "Operator");
-        assert_eq!(env.reader_authority("b"), "Operator");
+        assert_eq!(env.reader_label("a"), "Operator");
+        assert_eq!(env.reader_label("b"), "Operator");
         // both leak to the public channel — they are the same secret.
         assert!(env.leaks("a", "out"));
         assert!(env.leaks("b", "out"));
@@ -1823,7 +2653,7 @@ rule triage
     #[test]
     fn provider_principal_is_not_listed_as_protected_data() {
         // a provider cleared for Operator data is a principal (a reader), not a
-        // secret — it must not appear under "protected resources" (H5).
+        // secret — it must not appear among the guaranteed-invariant resources (H5).
         let envelope = Envelope::from_dsl(
             "grant file_store crm -> file:/srv/crm readable by Operator\n\
              grant provider fixture -> selfhost:llama readable by Operator\n",
@@ -1832,11 +2662,21 @@ rule triage
         let ir = ir_with_grants(READ_LEDGER);
         let report = governance_report(&ir, &VerifiedEnvelope::for_test(envelope));
         // the report names the canonical kind:address identity, not the handle (E5).
-        assert!(report.protected.contains(&"file:/srv/crm".to_owned()));
         assert!(
-            !report.protected.iter().any(|name| name == "selfhost:llama"),
+            report
+                .invariants
+                .iter()
+                .any(|inv| inv.starts_with("file:/srv/crm:")),
+            "crm should have a per-resource invariant under its address: {:?}",
+            report.invariants
+        );
+        assert!(
+            !report
+                .invariants
+                .iter()
+                .any(|inv| inv.starts_with("selfhost:llama:")),
             "a provider principal must not be listed as protected data: {:?}",
-            report.protected
+            report.invariants
         );
         assert!(
             report
@@ -1887,13 +2727,13 @@ rule triage
         match VerifiedEnvelope::from_text(&json) {
             EnvelopeStatus::Verified(verified) => {
                 let ok = governance_report(&ir, &verified).render();
-                assert!(ok.contains("protected resources"));
+                assert!(ok.contains("guaranteed invariants"));
             }
             _ => panic!("genuine signed envelope should verify"),
         }
         // ...but tampering with the labels makes the boundary REJECT it, so neither
         // the checker nor the report can vouch for content they cannot attest.
-        let tampered = json.replace("\"reader\":\"Operator\"", "\"reader\":\"public\"");
+        let tampered = json.replace("\"reader\":[\"Operator\"]", "\"reader\":[]");
         assert_ne!(tampered, json, "test should actually modify the content");
         match VerifiedEnvelope::from_text(&tampered) {
             EnvelopeStatus::Rejected(_) => {}

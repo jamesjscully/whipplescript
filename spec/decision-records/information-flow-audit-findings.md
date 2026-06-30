@@ -30,9 +30,13 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   non-interference, NMIF were comments, not proofs. **PARTIAL** — Lean now proves
   the acts-for preorder, `public` bottom, `canAct` sound+complete (`canAct_iff`,
   axioms `[propext, Quot.sound]`), the conf/integ duality, and the sticky boundary
-  (`models/lean/`). OPEN within M1: reader/writer **sets** → semilattice, NMIF,
-  non-interference-relative-to-policy as a theorem, and an **agreement** result
-  that our `canAct` instantiates the published asymmetric-delegation order.
+  (`models/lean/`). Reader/writer **sets** → semilattice + the **agreement**
+  (the set `dominates` check reduces to the single-authority `canRead`, so it is a
+  conservative refinement of the published acts-for order) landed with E6
+  (`ReaderSets.lean`: `dominates`/`leak_safe`/`dominates_singleton`/`dominates_split`/
+  `dominates_mono_provider`/`inject_safe`). OPEN within M1: NMIF as a theorem (have
+  the robust-declassification lemma in `NMIF.lean`; not yet the general statement)
+  and full non-interference-relative-to-policy.
 - **M2 — Maude models are single-consumer.** No model had multiple consumers of a
   trusted artifact; `subworkflow-attestation` modeled only the enforce path.
   **DONE (Wave 1)** — added a second consumer (`publish`, the report analogue) held
@@ -45,8 +49,14 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   `models/tla/InfoflowReleaseBudget.tla` (DR-0030 Direction C) checks the
   release-budget-over-all-traces invariant and the no-adaptive-oracle selector-
   provenance invariant (both bite-verified) under Apalache in `check-tla-models.sh`.
-  Still OPEN: I-IFC7 carriage temporal, D4 versioning/non-retroactivity, replay-
-  stability, and Veil (a planned stub, not yet a live gate).
+  **I-IFC7 durable label carriage now also has a temporal model (2026-06-30):**
+  `models/tla/InfoflowLabelCarriage.tla` — an Apalache-checked transition system over
+  persist / reload / cross-instance-handoff / replay hops, with `CarriagePreserved` /
+  `NoStrip` / `NoForge` (the W6 no-laundering principle as an all-interleavings trace
+  property), bite-verified (a `LaunderHandoff` hop that rewrites integrity produces a
+  counterexample) and wired into the gate. It is the inductive complement to the
+  single-hop `infoflow-carriage.maude`. Still OPEN: D4 versioning/non-retroactivity,
+  replay-stability *liveness*, and Veil (a planned stub, not yet a live gate).
 - **M4 — Cross-product test discipline.** Institute "negative bite per consumer per
   trusted artifact" as a standing rule. **OPEN (process).**
 
@@ -112,8 +122,22 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   full content, not just `resources`). **This is also the cross-package X4 binding
   model** — so X4 (resource parameterization) is unblocked by the same mechanism.
   *Not the "blocked" item I claimed:* it was an unmade design decision, now made.
-- **E6 — Reader/writer SETS.** A single role up-set per resource today; real labels
-  are sets of principals (a lattice). **OPEN** (paired with M1).
+- **E6 — Reader/writer SETS. DONE 2026-06-30.** The checker label is now a SET of
+  compartments per resource (`readers`/`integrity: BTreeMap<String, BTreeSet<String>>`),
+  read iff a party acts-for EVERY compartment (the intersection of up-sets). The
+  leak/inject decision is one `dominates(provider, required)` relation — every
+  required compartment covered by some provider compartment — with the
+  single-compartment case reproducing the legacy single-role check exactly.
+  Envelope JSON (`reader`/`writer` as string OR array; `confidential` bool retained),
+  the `readable by R1, R2` / `from R1, R2` DSL, the canonical signing form (sorted
+  arrays), declassify/endorse, the report and the principal ceiling all run over
+  sets. Model-first: `models/maude/infoflow-reader-sets.maude` (4 coverage / 4 bite,
+  incl. the load-bearing single-resource `{Bank,Email}` set label) + `ReaderSets.lean`
+  gained `dominates`, `leak_safe` (soundness: dominates ⟹ every sink reader can read
+  the source), `dominates_singleton` (the agreement/leaf), `dominates_split` (join),
+  `dominates_mono_provider`, and `inject_safe` (the integrity dual). Regenerated
+  `examples/infoflow/governance.signed.json`. Closes the M1 reader/writer-set +
+  agreement remainder below.
 - **E7 — Whip-agent acts-for-user binding (D3).** **DESIGN LOCKED — DR-0031 (the
   identity boundary).** Resolution: WhippleScript *consumes* an identity assertion
   and never authenticates one. Three layers — identity (enterprise: OS login/SSO),
@@ -155,7 +179,41 @@ Status key: `DONE` · `PARTIAL` · `OPEN` · `DEFERRED`.
   pinpointing is a possible future nicety, not a soundness gap.
 - **H7 — Per-field / per-path labels.** Mixed-sensitivity stores must be split;
   labels attach to whole resources. **DEFERRED (recorded).**
-- **H8 — Signal triggers are invisible sources (fail-OPEN).** **OPEN — DECISION
+- **H8 — Signal triggers are invisible sources (fail-OPEN).** **DONE 2026-06-30 —
+  BOTH stages.** Stage (b) — emitter-carried integrity — landed: a signal governance
+  marks `internal` (`grant signal X -> signal:X internal`) has its integrity DERIVED
+  from its emitters (`derived_signal_integrity`): each `emit signal X` carries the
+  intersection of its emitting rule's read-source vouchers, `when X` reads the meet
+  over emitters. Carriage is cross-package (DR-0029): an imported `@tool`'s emit
+  contributes to the consumer's `signal:X`, computed under the CONSUMER's envelope
+  from the pinned source (`check_with_envelope_imports` / `imported_tool_irs`) — no
+  producer label attestation or X2 flow-matrix needed (producer attests only the
+  surface, which names the port). Soundness: carriage never fabricates trust
+  (untrusted emitter → untrusted receiver), and `whip signal` refuses external
+  injection of an internal signal (no laundering — `ifc::signal_is_internal`).
+  Model `infoflow-signal-carriage.maude` (3 cov / 2 bite); 5 ifc + 1 soft_middle
+  tests. So the O(external-entry) labeling model is realized: only external entry
+  points are hand-classified; internal flows propagate automatically. Stage (a)
+  below.
+
+  **STAGE (a) DONE
+  2026-06-30; stage (b) → DR-0029 carriage.** A `when <Signal> as e` trigger is now
+  recognized in `ifc.rs` as a tracked read of the governed resource `signal:<name>`,
+  integrity envelope-declared, default `public`/low (fail-closed) — wired into
+  `check_with_envelope` (leak + inject over both axes), `ifc_surface` (the
+  `signal:<name>` door), `check_principal_ceiling`, and the NMIF-on-selector
+  `low_integrity_bindings` (a signal discriminant the envelope does not vouch makes
+  the §5.6 channel-2 selector check live; a vouched `signal:<name> from <Role>` is
+  high-integrity and may steer a crossing). Recognition is now uniform across
+  channels / human answers / signals. The injection *algebra* (untrusted source →
+  trusted sink) is the already-gated `infoflow-integrity.maude`; H8 is a checker
+  recognition slice (the W2 precedent: record/message/human recognitions extended the
+  checker + tests, not the algebra), covered by 4 ifc unit tests + a CLI run.
+  **Stage (b) — emitter-carried integrity** (a signal carries the emitting instance's
+  label so internal flows propagate without hand-labeling) remains owned by the W6
+  carriage / DR-0029 boundary-label track. Original decision below.
+
+  **OPEN — DECISION
   RECORDED 2026-06-29.** Source *recognition* is hardcoded by kind: only
   `when message from <channel>` (H3) and `when human answered` are tracked as
   inbound read-sources; a `when <Signal> as e` trigger is recognized as *nothing*,

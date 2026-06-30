@@ -2738,6 +2738,75 @@ fn signal_lands_typed_fact_and_rule_fires() {
     let _ = fs::remove_file(source);
 }
 
+/// No laundering (H8 stage b): under a governed envelope that marks the signal an
+/// INTERNAL channel, an external `whip signal` injection is refused — an internal
+/// signal carries its emitter's integrity and may not be sourced from outside.
+/// Ungoverned (no envelope) still delivers (the gradual model).
+#[test]
+fn whip_signal_refuses_external_injection_of_an_internal_signal() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let source = temp_path("signal-internal", "whip");
+    let policy = temp_path("signal-internal", "policy");
+    fs::write(&source, EVENT_SOURCE).expect("write source");
+    fs::write(
+        &policy,
+        "grant signal deploy.finished -> signal:deploy.finished internal\n",
+    )
+    .expect("write policy");
+    let source_str = source.to_str().expect("utf-8");
+
+    // Governed + internal: the external injection is refused.
+    let refused = Command::new(bin)
+        .args([
+            "signal",
+            "inst-x",
+            "--name",
+            "deploy.finished",
+            "--data",
+            r#"{"service":"api","status":"ok"}"#,
+            "--program",
+            source_str,
+        ])
+        .env(
+            "WHIPPLESCRIPT_IFC_ENVELOPE",
+            policy.to_str().expect("utf-8"),
+        )
+        .output()
+        .expect("command runs");
+    assert!(
+        !refused.status.success(),
+        "external injection of an internal signal must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("INTERNAL channel"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // Ungoverned (no envelope): the same delivery is NOT refused for being internal.
+    let dev = Command::new(bin)
+        .args([
+            "signal",
+            "inst-x",
+            "--name",
+            "deploy.finished",
+            "--data",
+            r#"{"service":"api","status":"ok"}"#,
+            "--program",
+            source_str,
+        ])
+        .output()
+        .expect("command runs");
+    assert!(
+        !String::from_utf8_lossy(&dev.stderr).contains("INTERNAL channel"),
+        "dev mode must not refuse for internal: {}",
+        String::from_utf8_lossy(&dev.stderr)
+    );
+
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(policy);
+}
+
 /// A malformed payload or undeclared signal is rejected at the CLI boundary;
 /// no ill-typed fact can land.
 #[test]
@@ -3705,7 +3774,7 @@ fn ifc_check_enforces_and_rejects_tampered_signed_envelope() {
     );
 
     // tamper the signed envelope: flip ledger's reader to public without re-signing
-    let tampered = signed_json.replace("\"reader\":\"Operator\"", "\"reader\":\"public\"");
+    let tampered = signed_json.replace("\"reader\":[\"Operator\"]", "\"reader\":[]");
     assert_ne!(tampered, signed_json, "tamper must change the content");
     fs::write(&signed_file, &tampered).expect("write tampered");
     let rejected = Command::new(bin)
