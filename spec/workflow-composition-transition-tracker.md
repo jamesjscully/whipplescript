@@ -189,8 +189,17 @@ The target behavior is specified in [language.md](language.md),
   unauthorized target, and unsupported recursive invocation.
 - [ ] Generate Maude fixtures from compiled IR for workflow terminal and
   invocation invariants.
-- [ ] Add expected-failure fixtures for broken terminal validation, post-terminal
+- [x] Add expected-failure fixtures for broken terminal validation, post-terminal
   mutation, and direct parent completion without child terminal state.
+  Broken terminal validation → check-time fixture
+  `examples/invalid/bad-terminal-payload.whip` (+`.diagnostics`, in
+  `invalid_fixtures_have_actionable_diagnostics`). The other two are *runtime*
+  invariants (no check-time fixture applies) and are guarded by store/e2e tests:
+  post-terminal mutation → `terminal_instance_statuses_are_absorbing` /
+  `duplicate_terminal_completion_rolls_back_event` (store/lib.rs:9806/9264);
+  direct parent completion without child terminal → parent only completes via
+  child-terminal projection, `failed_child_invocation_drives_parent_failure_branch`
+  (control_plane.rs:5759) + the three `dev_projects_*_child_workflow_invocation`.
 
 ## Phase 7: Runtime, Store, And CLI
 
@@ -232,10 +241,10 @@ The target behavior is specified in [language.md](language.md),
   runs to completion.)
 - [x] Add deterministic fixture-provider e2e for pattern application provenance.
   (`dev_runs_rule_generated_by_pattern_application` control_plane.rs:11134.)
-- [~] Add deterministic fixture-provider e2e for workflow complete/fail.
-  (`complete` covered: `dev_complete_terminal_action_marks_instance_completed`
-  control_plane.rs:10811; direct workflow-`fail` terminal e2e still missing —
-  only child-driven fail exists.)
+- [x] Add deterministic fixture-provider e2e for workflow complete/fail.
+  (`complete`: `dev_complete_terminal_action_marks_instance_completed`
+  control_plane.rs:10811; direct `fail`: `dev_fail_terminal_action_marks_instance_failed`
+  control_plane.rs:12753 — asserts failed status + `workflow.failed` event.)
 - [x] Add deterministic fixture-provider e2e for parent-child invocation.
   (`dev_creates_workflow_invoke_effect` control_plane.rs:11212; projection tests;
   `worker_resumes_running_workflow_invocation` control_plane.rs:11496.)

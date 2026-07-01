@@ -23502,6 +23502,10 @@ rule branch
                 include_str!("../../../examples/invalid/bad-record.whip"),
             ),
             (
+                "bad-terminal-payload",
+                include_str!("../../../examples/invalid/bad-terminal-payload.whip"),
+            ),
+            (
                 "bad-effect-graph",
                 include_str!("../../../examples/invalid/bad-effect-graph.whip"),
             ),

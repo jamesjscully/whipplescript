@@ -1,0 +1,18 @@
+# Broken terminal validation: `complete` names an output the workflow contract
+# never declared. The terminal action is validated against the `output`/`failure`
+# contract, so an undeclared terminal name is a compile-time error.
+workflow BadTerminalPayload
+
+output result Done
+
+class Done {
+  id string
+}
+
+rule finish
+  when started
+=> {
+  complete summary {
+    id "x-1"
+  }
+}
