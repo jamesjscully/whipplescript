@@ -73,15 +73,31 @@ The target behavior is specified in [language.md](language.md),
   `dev_projects_{failed,timed_out,cancelled}_child_workflow_invocation`.)
 - [x] Provider and harness failures remain effect/run events and evidence; they
   do not automatically fail a workflow unless source rules choose to `fail`. (Done: 503 auto-fail is scoped to UNHANDLED effect failures in self-terminating flows — main.rs ~20105; see [project-503-autofail].)
-- [ ] The generated Maude/check path can represent pattern provenance,
-  workflow terminal actions, and invocation edges from compiled IR.
-- [ ] Examples and docs use one canonical spelling for each concept.
+- [~] The generated Maude/check path can represent pattern provenance,
+  workflow terminal actions, and invocation edges from compiled IR. **Deferred —
+  model-first piece, de-risked.** The kernel model *already* has every rule needed
+  (`elaborate-pattern` → `ruleProvenance`; `complete-workflow`/`fail-workflow` →
+  `workflowCompletedEvt`/`workflowFailedEvt`; `start-workflow-invocation` +
+  `complete/fail/cancel-workflow-invocation` → `invocationOutput/Failure/Cancellation`,
+  kernel.maude:585/698/703/757-774). What remains is emitting those searches from
+  `generate_maude_model_search` (main.rs:38686) over `ir.pattern_applications`,
+  `rule.metadata.terminal_outputs`/`terminal_completes`, and `WorkflowInvoke`
+  effects — synthesizing the InstanceId/WorkflowId/OutputId/FactId ops and initial
+  configs. Held for a focused model-first pass (getting the generated Maude wrong
+  would break the formal-models gate), not a correctness gap.
+- [~] Examples and docs use one canonical spelling for each concept. **Partial:**
+  examples are canonical (37/37 explicit `workflow`; new include/pattern/parent-child
+  examples use the canonical spellings); the cross-doc canonicalization sweep is the
+  outstanding half (see Phase 8 docs items). Deferred with that sweep.
 
 ## Phase 1: Source Bundles And Imports
 
 - [x] Define concrete grammar for `include "path.whip"` and allowed path forms.
 - [ ] Decide whether coerce imports use `include "types.coerce"`, a separate coerce
-  declaration, or generated source bundle members.
+  declaration, or generated source bundle members. **Open decision** (duplicated in
+  Open Decisions below — that is the canonical entry). `include` currently accepts
+  only `.whip`; coerce definitions live inline in `.whip` today, so no coerce-import
+  mechanism is forced yet.
 - [x] Implement include resolution with cycle detection and stable ordering.
   (`SourceBundleResolver` main.rs:37432 — active-stack cycle detection, visited
   dedup, deterministic pre-order concat.)
@@ -105,8 +121,13 @@ The target behavior is specified in [language.md](language.md),
 ## Phase 2: Explicit Workflows
 
 - [x] Add AST/IR nodes for top-level `workflow` declarations.
-- [ ] Move current file-level declarations into an implicit compatibility root
+- [~] Move current file-level declarations into an implicit compatibility root
   only as a migration bridge, with diagnostics nudging explicit syntax.
+  **Gated on a decision.** The compatibility path exists (`program.workflow` when
+  `workflows` is empty, `select_root_workflow` lib.rs:2381) but emits **no**
+  nudge/deprecation diagnostic — deliberately, because whether to keep the implicit
+  root at all is the open "how much implicit compatibility syntax remains" decision.
+  Resolve that first (Open Decisions), then either add the nudge or remove the path.
 - [~] Define allowed top-level declarations inside and outside a workflow.
   **Partial/decision:** the `Item` enum admits every decl kind anywhere
   (lib.rs:126); no in-workflow vs out-of-workflow restriction is enforced. Tied
@@ -117,9 +138,20 @@ The target behavior is specified in [language.md](language.md),
 - [x] Add workflow input binding syntax and runtime start payload validation.
 - [x] Add workflow `output` and `failure` contract declarations.
   (`WorkflowContractKind::{Output,Failure}` parsed lib.rs:16548.)
-- [ ] Ensure workflow-local names do not leak into sibling workflows.
-- [ ] Ensure shared schemas, coerces, patterns, agents, and capabilities have
-  explicit local/global scoping rules.
+- [~] Ensure workflow-local names do not leak into sibling workflows. **Gated on
+  the scoping decision.** Today `select_root_workflow` (lib.rs:2449) *discards*
+  non-selected workflows and flattens the selected one, so only one workflow ever
+  compiles into an instance — there is no active cross-workflow name-collision check
+  because siblings never coexist in a compiled program. A real leak/collision check
+  only has meaning under a scoping model where siblings share a program; define that
+  model first (next item).
+- [~] Ensure shared schemas, coerces, patterns, agents, and capabilities have
+  explicit local/global scoping rules. **This is the core open scoping decision.**
+  Everything is effectively global after flattening. The design question — which
+  declarations are workflow-local vs program-global, and how sharing is spelled — is
+  the keystone that gates name-leak checks, in/out-of-workflow decl restrictions,
+  scoped name resolution (Phase 6), the bundle store schema (Phase 7), and
+  diagnostics grouping. Needs a design call before implementation. See Open Decisions.
 
 ## Phase 3: Patterns And Apply
 
@@ -224,10 +256,16 @@ The target behavior is specified in [language.md](language.md),
 
 ## Phase 6: Static Analysis And Verification
 
-- [ ] Extend name resolution to model source bundles, workflow-local scopes,
-  pattern-local scopes, and generated scopes.
-- [ ] Extend cycle analysis so compile-time pattern recursion and runtime
-  workflow invocation cycles are checked separately.
+- [~] Extend name resolution to model source bundles, workflow-local scopes,
+  pattern-local scopes, and generated scopes. **Gated on the scoping decision.**
+  Only flat/global resolution exists today (post-flatten). A scoped resolver is
+  the implementation of that decision (see Phase 2 "local/global scoping rules").
+- [~] Extend cycle analysis so compile-time pattern recursion and runtime
+  workflow invocation cycles are checked separately. **Partial + gated.**
+  Compile-time pattern recursion is fully checked (`detect_pattern_recursion`);
+  the *runtime* invocation-cycle half is only a per-rule direct-self-recursion
+  reject (lib.rs:8771) — transitive invoke-cycle analysis is gated on the
+  "recursive workflow invocation" policy decision (Open Decisions).
 - [x] Add termination/boundedness diagnostics for pattern expansion. v0 target:
   emit `graph.unbounded_pattern_recursion` (severity `error`) for any recursive
   `apply`; bounded-recursion analysis is deferred. **Done 2026-06-18** via
@@ -240,8 +278,10 @@ The target behavior is specified in [language.md](language.md),
   + direct-recursive (lib.rs:8771/8786) are diagnosed; *unauthorized* and
   *transitive* recursive invocation are not (both gated on the recursive-invocation
   + authorization decisions). Deferred to those decisions.
-- [ ] Generate Maude fixtures from compiled IR for workflow terminal and
-  invocation invariants.
+- [~] Generate Maude fixtures from compiled IR for workflow terminal and
+  invocation invariants. **Deferred — same model-first piece as the "generated
+  Maude/check path" acceptance gate above** (kernel rules exist; emit searches
+  from `generate_maude_model_search`). Held for a focused pass.
 - [x] Add expected-failure fixtures for broken terminal validation, post-terminal
   mutation, and direct parent completion without child terminal state.
   Broken terminal validation → check-time fixture
@@ -311,11 +351,21 @@ The target behavior is specified in [language.md](language.md),
   declared failure, timeout, and cancellation. (`examples/parent-child-outcomes.whip`
   — one parent rule with `after child succeeds/fails/times out/cancelled` branches;
   in the docs-examples gate with `--root Parent`.)
-- [ ] Update quickstart, language sketch, examples spec, companion skill, and
-  troubleshooting docs to use the canonical model.
-- [ ] Document the canonical explicit-workflow shape in examples and quickstart.
-- [ ] Remove or downgrade examples that imply lifecycle patterns are built into
-  the language.
+- [~] Update quickstart, language sketch, examples spec, companion skill, and
+  troubleshooting docs to use the canonical model. **Partial:** the explicit
+  `workflow` keyword is canonical in docs/quickstart.md, tutorial.md, and
+  language-reference.md; a full sweep for the `include`/`pattern`/`invoke`
+  canonical spellings across the companion skill + troubleshooting is outstanding.
+  Deferred — doc-polish, best done as one sweep once the scoping decision settles
+  the surface.
+- [~] Document the canonical explicit-workflow shape in examples and quickstart.
+  **Partial:** the explicit `workflow` shape is present in quickstart; the new
+  `include`/`pattern`/parent-child examples (above) document those shapes. Full
+  cross-doc canonical-shape section deferred with the sweep above.
+- [~] Remove or downgrade examples that imply lifecycle patterns are built into
+  the language. **Deferred — needs a judgment call** on which examples over-promise
+  built-in lifecycle (vs demonstrating composition). A per-example audit for Jack's
+  review, not a mechanical change. See Open Decisions.
 
 ## Phase 9: E2E And validation
 
@@ -332,36 +382,82 @@ The target behavior is specified in [language.md](language.md),
 - [x] Add deterministic fixture-provider e2e for parent-child invocation.
   (`dev_creates_workflow_invoke_effect` control_plane.rs:11212; projection tests;
   `worker_resumes_running_workflow_invocation` control_plane.rs:11496.)
-- [ ] Add validation workflow that reviews each phase of this tracker using a child
-  workflow invocation per phase.
-- [ ] Add opt-in real-provider validation that invokes Codex, Claude, and Pi review
-  workflows and validates outputs through `coerce`.
+- [~] Add validation workflow that reviews each phase of this tracker using a child
+  workflow invocation per phase. **Deferred — meta/aspirational.** This is a
+  self-hosting demo (a whip workflow that invokes a child per tracker phase), not a
+  correctness gate; the invocation machinery it would exercise is already covered by
+  the deterministic parent-child e2e above. Build as a showcase once the surface is
+  frozen. (Belongs with the gaugewright dogfood engine, per open-core notes.)
+- [~] Add opt-in real-provider validation that invokes Codex, Claude, and Pi review
+  workflows and validates outputs through `coerce`. **Deferred — external/opt-in.**
+  Requires live provider credentials and network; it is the real-provider tier
+  tracked canonically in `native-provider-implementation-tracker.md` (NP live
+  validation), not deterministic CI. Cross-referenced there.
 - [x] Verify failed provider runs appear in the event stream without directly
   failing workflow instances unless source rules say so.
   (`dev_fixture_failure_reaches_event_stream` control_plane.rs:4965.)
 
 ## Open Decisions
 
-- [ ] Exact syntax for workflow contracts:
-  `input Name { ... }`, `output Name { ... }`, `failure Name { ... }`, or a
-  compact signature form.
-- [ ] Whether coerce files are included directly or referenced through a generated
-  source-bundle member.
+Each open item carries a recommendation to make it decision-ready. These are the
+true remaining gate to "finished" — the implementation items above are done or are
+justified deferrals; the calls below unblock the last cluster.
+
+- [ ] **Exact syntax for workflow contracts.** `input Name Type` / `output Name
+  Type` / `failure Name Type` is implemented and working (lib.rs:16547). Open only:
+  whether to *also* add a compact single-line signature form.
+  **Recommendation:** keep the current keyword form as canonical, defer the compact
+  form (no user demand; it is pure sugar). Low stakes.
+- [ ] **Coerce file imports.** Whether coerce definitions can be imported (and how:
+  `include "types.coerce"` vs a coerce declaration vs a generated bundle member).
+  **Recommendation:** defer — coerce definitions live inline in `.whip` today and
+  nothing forces cross-file coerce reuse yet; revisit when a real multi-file coerce
+  need appears. If/when needed, `include` of a `.coerce` member is the smallest step.
+- [ ] **Scalar terminal payloads.** Whether `complete result 0.9` (a bare scalar)
+  is allowed, or terminal payloads must always be class-shaped (`complete result {
+  score 0.9 }`). Only class-shaped is implemented. **Recommendation:** make
+  class-only the deliberate v0 rule (one payload shape, uniform with `record`;
+  scalars can always be a one-field class) and close this as a non-goal rather than
+  leave it a lingering "remains."
+- [ ] **Recursive workflow invocation policy.** Whether runtime `invoke` cycles
+  (distinct from compile-time `apply`) are rejected in v0 or allowed with explicit
+  policy limits. Today only *direct* self-invocation is rejected; transitive cycles
+  are unanalyzed. **Recommendation:** reject transitive `invoke` cycles in v0
+  (symmetry with the pattern-recursion rule; a runtime invoke cycle with no external
+  boundary is the effectful-cycle hazard Design Commitment 7 forbids), with a
+  documented escape only when a cycle provably crosses an external event/clock.
+  Resolving this unblocks the transitive cycle-analysis + invoke-authorization items.
+- [ ] **How much implicit compatibility syntax remains.** Whether the implicit
+  compatibility root (a file with top-level decls and no explicit `workflow`) is
+  kept as a bridge or removed now. **Recommendation (keystone):** since the corpus
+  is fully migrated (37/37 explicit `workflow`) and the project is pre-release with
+  no back-compat obligation, **remove the implicit root** and require an explicit
+  `workflow`. That collapses the flatten-and-discard model into a clean
+  one-program-many-workflows model, which is the precondition for the scoping work
+  (workflow-local names, scoped resolution, bundle store schema). This is the single
+  decision that unblocks the largest remaining cluster.
+
 - [x] Whether pattern bodies may contain terminal actions: resolved. v0 forbids
   `complete`/`fail` in pattern bodies entirely (compile-time `error`); no pattern
   capability/contract escape hatch in v0.
 - [x] Whether recursive *pattern application* is allowed: resolved. v0 is
   non-recursive-only (`graph.unbounded_pattern_recursion`); bounded recursion is
   deferred pending a statically-decreasing structural measure.
-- [ ] Whether recursive *workflow invocation* (runtime `invoke` cycles, distinct
-  from compile-time `apply`) is rejected in v0 or allowed only with explicit
-  policy limits.
-- [ ] How much implicit compatibility syntax remains after examples migrate.
 
-## Next Implementation Slice
+## Remaining Work (after the 2026-07-01 reconcile + delivery pass)
 
-1. Implement source bundle parsing and explicit root workflow selection.
-2. Add explicit `workflow` AST/IR while preserving current examples through a
-   temporary compatibility root.
-3. Add terminal `complete`/`fail` syntax and runtime store support before
-   implementing `pattern`/`apply`, because invocation needs terminal contracts.
+The transition is substantially shipped. What remains, grouped:
+
+1. **Decision-gated (the real blockers).** The Open Decisions above — chiefly the
+   implicit-compatibility-root / scoping keystone and the recursive-invocation
+   policy. These gate: workflow-local name scoping + leak checks, scoped name
+   resolution, in/out-of-workflow decl restrictions, the bundle store schema,
+   transitive invoke-cycle analysis, invoke authorization, and diagnostics grouping.
+2. **Model-first pieces.** Generate Maude searches from compiled IR for pattern
+   provenance / terminal actions / invocation edges (kernel rules already exist;
+   emit from `generate_maude_model_search`).
+3. **Polish / observability (deferred-with-cause).** Recursive status-tree, JSON
+   trace enrichment, source-span provenance back-links, workflow-fail-vs-provider-fail
+   status field, per-file span preservation, docs canonicalization sweep.
+4. **Showcase / external.** Self-hosting validation workflow; opt-in real-provider
+   validation (tracked in the native-provider tracker).
