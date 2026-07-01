@@ -1181,6 +1181,15 @@ pub struct IrRuleMetadata {
     /// per-field label rather than the rule's whole read set (DR-0027 redact, the
     /// static refinement).
     pub egress_payload_reads: BTreeMap<String, BTreeSet<String>>,
+    /// Per `complete <binding>` egress, the binding roots each RESULT FIELD
+    /// references — a two-level map `binding -> field -> {roots}`. Where
+    /// `egress_payload_reads` joins all of a sink's fields into one set (enough for the
+    /// fully-redacted recognizer), this keeps them SEPARATE so the IFC engine can
+    /// compute a PER-FIELD flow signature (DR-0030 X2 v2): the reads reaching each
+    /// result field, refined at fact granularity. IFC-only (NOT in the `.ir`
+    /// snapshot). Union across branches; a `Shorthand` field resolves to the
+    /// terminal's `from` binding.
+    pub complete_field_reads: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     /// Bounded-type projection egresses (`record <T> from <src>`): each is governed
     /// by the kept fields' per-field label join, like an explicit `redact`. IFC-only
     /// (NOT in the `.ir` snapshot). DR-0027 auto-redaction, the bounded-type reading.
@@ -7236,7 +7245,64 @@ fn analyze_rule(
             .or_default()
             .extend(roots);
     }
+    collect_complete_field_reads(&body_ast.statements, &mut metadata.complete_field_reads);
     metadata
+}
+
+/// For each `complete <binding> { field: <expr>, … }` egress in a rule body
+/// (recursing into nested blocks), the binding roots EACH result field references,
+/// as `binding -> field -> {roots}`. A `Shorthand` field (`complete result from src
+/// { f }`) resolves to the terminal's `from` binding. Unlike
+/// `collect_egress_payload_reads` (which joins a sink's fields), this keeps fields
+/// separate so the IFC engine can compute a per-field flow signature (DR-0030 X2
+/// v2). Union across branches (a field completed in two arms references the union).
+fn collect_complete_field_reads(
+    statements: &[body::BodyStmt],
+    out: &mut BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Terminal(terminal) if terminal.kind == body::TerminalKind::Complete => {
+                let per_field = out.entry(terminal.name.clone()).or_default();
+                for field in &terminal.fields {
+                    let mut roots = BTreeSet::new();
+                    match &field.value {
+                        body::FieldValue::Shorthand => {
+                            if let Some(root) = &terminal.from {
+                                roots.insert(root.clone());
+                            }
+                        }
+                        body::FieldValue::Expr { expr, .. } => {
+                            collect_expr_binding_roots(expr, &mut roots)
+                        }
+                        body::FieldValue::Nested { fields, .. } => collect_payload_field_roots(
+                            fields,
+                            terminal.from.as_deref(),
+                            &mut roots,
+                        ),
+                    }
+                    per_field
+                        .entry(field.name.clone())
+                        .or_default()
+                        .extend(roots);
+                }
+            }
+            body::BodyStmt::After(after) => collect_complete_field_reads(&after.body, out),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_complete_field_reads(&branch.body, out);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                collect_complete_field_reads(&branch.then_body, out);
+                if let Some(else_body) = &branch.else_body {
+                    collect_complete_field_reads(else_body, out);
+                }
+            }
+            body::BodyStmt::Handler(handler) => collect_complete_field_reads(&handler.body, out),
+            _ => {}
+        }
+    }
 }
 
 /// Collects the `redact <source> keep [..] as <out>` projections of a rule body
@@ -25203,5 +25269,55 @@ source webhook as deploys {
         assert_eq!(decl.provider, "webhook");
         assert!(decl.recurrence.is_none());
         assert_eq!(decl.emit_signal, "deploy.finished");
+    }
+
+    #[test]
+    fn complete_field_reads_are_collected_per_field() {
+        // The per-field flow-signature metadata (DR-0030 X2 v2) keeps each result
+        // field's referenced roots SEPARATE (where `egress_payload_reads` joins them):
+        // `id` references only `a`, `note` references only `b`.
+        let source = r#"
+@tool
+workflow Producer {
+  input request Req
+  output result R
+  class Req { id string }
+  class A { x string }
+  class B { y string }
+  class R { id string  note string }
+
+  rule combine
+    when A as a
+    when B as b
+  => {
+    complete result {
+      id a.x
+      note b.y
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        let ir = compiled.ir.expect("program compiles");
+        let rule = ir
+            .rules
+            .iter()
+            .find(|r| r.name == "combine")
+            .expect("combine rule");
+        let per_field = rule
+            .metadata
+            .complete_field_reads
+            .get("result")
+            .expect("result has per-field reads");
+        assert_eq!(
+            per_field.get("id"),
+            Some(&BTreeSet::from(["a".to_owned()])),
+            "id references only a: {per_field:?}"
+        );
+        assert_eq!(
+            per_field.get("note"),
+            Some(&BTreeSet::from(["b".to_owned()])),
+            "note references only b: {per_field:?}"
+        );
     }
 }

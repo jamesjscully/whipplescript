@@ -170,8 +170,20 @@ These are real gaps observed while building the examples, not hypotheticals.
    consumer never touched, whose result then egresses, is caught. The **Direction A
    reach refinement** keeps only the tool reads that reach a completing rule (inputs the
    result is `independent_of` are dropped); it is computed consumer-side from the pinned
-   tool source. **Still deferred:** per-field value-flow (v2) — at whole-result v1 a
-   tool that reads confidential data anywhere taints its whole result.
+   tool source. *The **per-field flow signature** (DR-0030 X2 v2) refines this further,
+   producer-side:* the guarantee report surfaces, for each `complete <binding>` result
+   field, the reads reaching that field — at **fact granularity** (a field root that is a
+   direct `when <Fact> as b` binding carries only that fact's producer reach; the
+   completing rule's own reads reach every field, preserving the rule-level opaque box;
+   any within-rule *derived* root falls back to the whole-result reach, so a field reach
+   is always a subset of the whole reach and never under-reports — proven in
+   `models/maude/infoflow-field-signature.maude`). This is producer-side **audit
+   transparency**: a consumer of `result.<field>` inherits only that field's reads.
+   **Consumer-side per-field *enforcement* remains a documented boundary:** the only
+   cross-package consumer path — an agent turn that may call the tool — folds the result
+   into an *opaque* turn, so the turn still conservatively inherits the whole-result
+   reach. Relaxing it needs a non-opaque consumer (turn field-access grants, or
+   IFC-tracked `invoke` result-field access), not yet built.
 
 2. **Coarse, rule-level join box (no value tracking).** Any read in a rule is
    assumed to potentially reach any sink in the same rule. The safe refactor must

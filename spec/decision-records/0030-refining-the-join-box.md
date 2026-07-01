@@ -90,8 +90,13 @@ refinement only ever *removes* edges, and every removed edge is a proof obligati
   tracking**. The integrity win stands alone ("does this decision depend on the
   low-integrity inbound note, or only on the high-integrity policy?"); the
   confidentiality win is rarer at whole-result but real.
-- **v2 = per-output-field**: needs Direction B's value-flow tracking to attribute
-  fields; the full matrix.
+- **v2 = per-output-field**: the *full* matrix (per-field attribution *within* a
+  single model output) needs Direction B's value-flow tracking. But a **fact-granular
+  producer-side v2 shipped without B** (see the 2026-06-30 note under Consequences):
+  it refines per field using *between-rule* fact provenance while keeping the
+  completing rule's own reads on every field, so it needs no value-flow engine and
+  does not touch B's non-goal. Consumer-side enforcement of it is a documented
+  opacity boundary.
 
 The contract is **keyed per-output-port from day one** (a map; v1 uses a single
 `result` key) so v2 is non-breaking.
@@ -327,7 +332,39 @@ trust-free (no attestation to verify), and consistent with carriage. The `flow_s
 contract field stays reserved for the case where a consumer does *not* have the source
 (a binary/attested-only package); it is not needed while pinned-source recompilation is
 the model. The top-level `@service` `complete result` is governed as an egress sink in
-the same pass. Per-field v2 (value-flow attribution) remains deferred.
+the same pass.
+
+### Implementation note (2026-06-30) — per-field flow signature (v2), producer-side
+
+Per-field v2 shipped **producer-side** in `ifc.rs` (`result_field_dependency_reads`,
+surfaced in the guarantee report's `flow_signature`). It refines the whole-result reach
+per `complete <binding>` result field, but **at FACT granularity, without a full
+value-flow engine** — so it does *not* violate the rule-level opaque box (I-IFC2, the
+"per-field labels within a single output are unsound" non-goal below stands):
+
+- The completing rule's **own reads reach every field** (the opaque box is preserved
+  within the rule).
+- Only the **between-rule fact provenance** is refined: a field root that is a *direct*
+  `when <Fact> as b` binding contributes only that fact's producer reach (reverse-
+  reachability seeded by the fact's producers, reusing the v1 reach primitive
+  `reach_reads_from`). Metadata: parser `complete_field_reads` (`binding → field →
+  {roots}`, IFC-only).
+- Any **derived** within-rule root (or a `when` binding of an inbound/external fact with
+  no internal producer) has opaque provenance and **falls back to the whole-result
+  reach** — the fail-closed core, so a field reach is always ⊆ whole reach and never
+  under-reports.
+- Soundness proven in `models/maude/infoflow-field-signature.maude` (3 coverage / 2 bite).
+
+This is producer-side **audit transparency**. **Consumer-side per-field enforcement is a
+documented boundary, not a deferral-by-difficulty:** the only cross-package consumer path
+(an agent turn via `tell <agent> with tools […]`) folds the tool result into an *opaque*
+turn — the checker cannot see which result fields the turn reads — so the turn
+conservatively inherits the whole-result reach. Relaxing it requires a *non-opaque*
+consumer that does not exist yet: turn field-access grants, or IFC-tracked `invoke`
+result-field access. Until one lands, the per-field signature informs audit while the
+whole-result join still governs enforcement. This is the value-flow-vs-opaque-box tension
+of Direction B: full per-field precision *within* a single output stays the B non-goal;
+this v2 lives strictly *between* rules where reach is structural, not value-dependent.
 
 ## Non-goals
 

@@ -1013,9 +1013,17 @@ fn result_dependency_reads(tool: &IrProgram) -> Vec<String> {
     if completing.is_empty() {
         return program_read_resources(tool);
     }
-    // Reverse-reachability over the fact-dependency graph (producer -> consumer): the
-    // set of rules that transitively feed a completing rule.
-    let mut contributing = completing;
+    reach_reads_from(tool, completing).into_iter().collect()
+}
+
+/// The reads feeding a `seed` set of rules: the seed plus every rule that
+/// transitively feeds one via a recorded fact (reverse-reachability over the
+/// producer→consumer fact-dependency graph), unioned over their read resources.
+/// This is the reach primitive behind both the whole-result signature
+/// (`result_dependency_reads`, seeded by the completing rules) and the per-field
+/// signature (`result_field_dependency_reads`, seeded by a single fact's producers).
+fn reach_reads_from(tool: &IrProgram, seed: BTreeSet<&str>) -> BTreeSet<String> {
+    let mut contributing = seed;
     loop {
         let mut added = false;
         for dep in &tool.rule_dependencies {
@@ -1036,7 +1044,115 @@ fn result_dependency_reads(tool: &IrProgram) -> Vec<String> {
             reads.extend(rule_read_resources(rule, &signal_names));
         }
     }
-    reads.into_iter().collect()
+    reads
+}
+
+/// A result field's flow signature: the binding, the field name, and the reads
+/// reaching that field — the PER-FIELD refinement of `result_dependency_reads`
+/// (DR-0030 X2 v2). The refinement is at FACT granularity and preserves the
+/// rule-level opaque box (I-IFC2): the completing rule's OWN reads reach every
+/// field, and only the BETWEEN-rule fact provenance is refined per field. A field
+/// root that is a DIRECT `when <Fact> as root` binding contributes only that fact's
+/// producer reach; any other root (a within-rule derived binding, or a `when`
+/// binding of an inbound/external fact with no internal producer) has opaque
+/// provenance and FALLS BACK to the whole-result reach — the fail-closed core, so
+/// a field reach is always a subset of the whole-result reach and never
+/// under-reports. Proven in `models/maude/infoflow-field-signature.maude`.
+///
+/// CONSUMER-SIDE NOTE (documented boundary, not a gap): the per-field signature is
+/// producer-side audit transparency. It cannot yet RELAX a cross-package consumer
+/// check, because the only consumer path — an agent turn that may call an imported
+/// tool (`tell <agent> with tools […]`) — folds the tool result into an OPAQUE turn
+/// (we can't see which result fields it reads), so the turn conservatively inherits
+/// the whole-result reach. Per-field ENFORCEMENT needs a non-opaque consumer (turn
+/// field-access grants, or IFC-tracked `invoke` result-field access); until then
+/// the field signature is exposed for audit, and the whole-result join still governs.
+fn result_field_dependency_reads(tool: &IrProgram) -> Vec<(String, String, Vec<String>)> {
+    let whole: BTreeSet<String> = result_dependency_reads(tool).into_iter().collect();
+    let signal_names: BTreeSet<&str> = tool.events.iter().map(|e| e.name.as_str()).collect();
+    // binding -> field -> reads, unioned across every completing rule.
+    let mut per_field: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for rule in &tool.rules {
+        if rule.metadata.complete_field_reads.is_empty() {
+            continue;
+        }
+        let own: BTreeSet<String> = rule_read_resources(rule, &signal_names)
+            .into_iter()
+            .collect();
+        let when_facts = when_binding_facts(rule);
+        for (binding, fields) in &rule.metadata.complete_field_reads {
+            for (field, roots) in fields {
+                let mut reads = own.clone();
+                for root in roots {
+                    match when_facts.get(root.as_str()) {
+                        // A direct `when <Fact> as root` binding: precise. The reads
+                        // feeding this field are the producers of that fact and their
+                        // upstreams. An inbound/external fact with no internal producer
+                        // yields an empty seed-reach → falls back to the whole reach.
+                        Some(fact) => {
+                            let producers: BTreeSet<&str> = tool
+                                .rules
+                                .iter()
+                                .filter(|r| r.metadata.fact_writes.iter().any(|w| w == fact))
+                                .map(|r| r.name.as_str())
+                                .collect();
+                            if producers.is_empty() {
+                                reads.clone_from(&whole);
+                            } else {
+                                reads.extend(reach_reads_from(tool, producers));
+                            }
+                        }
+                        // A within-rule derived binding: opaque provenance, fall back
+                        // to the whole-result reach (fail-closed).
+                        None => reads.clone_from(&whole),
+                    }
+                }
+                per_field
+                    .entry((binding.clone(), field.clone()))
+                    .or_default()
+                    .extend(reads);
+            }
+        }
+    }
+    per_field
+        .into_iter()
+        .map(|((binding, field), reads)| (binding, field, reads.into_iter().collect()))
+        .collect()
+}
+
+/// A rule's `when <Fact> as <binding>` bindings, mapped `binding -> schema:<Fact>`
+/// (the fact string the rule-dependency graph uses). Only patterns that bind a
+/// name and whose head is a schema fact are captured; message/signal/human and
+/// bindingless triggers are omitted, so their roots take the conservative
+/// whole-result fallback in `result_field_dependency_reads`.
+fn when_binding_facts(rule: &IrRule) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for when in &rule.whens {
+        let pattern = when.pattern.trim();
+        // The binding is the tail `… as <binding>`.
+        let Some((head, binding)) = pattern.rsplit_once(" as ") else {
+            continue;
+        };
+        let binding = binding.trim();
+        if binding.is_empty() || binding.contains(char::is_whitespace) {
+            continue;
+        }
+        // The fact is the head schema name — the first token, before any `{ … }`
+        // field pattern. Inbound sources (`message from …`, `human …`) are not
+        // schema facts, so their bindings are left to the fallback.
+        let head = head.trim();
+        if head.starts_with("message from") || head.starts_with("human") {
+            continue;
+        }
+        let Some(schema) = head.split([' ', '{']).next() else {
+            continue;
+        };
+        if schema.is_empty() || !schema.chars().next().is_some_and(|c| c.is_uppercase()) {
+            continue;
+        }
+        out.insert(binding.to_owned(), format!("schema:{schema}"));
+    }
+    out
 }
 
 /// Flags the redact static refinement's CONFIDENTIALITY check on fully-redacted
@@ -1731,6 +1847,11 @@ pub struct GovernanceReport {
     pub cleared_principals: Vec<String>,
     /// The workflow's full IFC surface (DR-0029 X1): every door it opens.
     pub surface: Vec<String>,
+    /// The per-field flow signature (DR-0030 X2 v2): for each `complete <binding>`
+    /// result field, the reads reaching it, refined at fact granularity. Producer-
+    /// side audit transparency — a consumer of `result.<field>` inherits only these
+    /// reads. Empty when the workflow completes no result fields.
+    pub flow_signature: Vec<String>,
 }
 
 pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> GovernanceReport {
@@ -1835,6 +1956,19 @@ pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> Governa
             )
         })
         .collect();
+    // The per-field flow signature: for each result field, the reads reaching it
+    // (fact-granular). A field with no reaching reads is stated as `independent` —
+    // an audited non-interference claim the invoker can rely on.
+    let flow_signature: Vec<String> = result_field_dependency_reads(ir)
+        .into_iter()
+        .map(|(binding, field, reads)| {
+            if reads.is_empty() {
+                format!("{binding}.{field}: independent of every governed read")
+            } else {
+                format!("{binding}.{field} carries reads: {}", reads.join(", "))
+            }
+        })
+        .collect();
     GovernanceReport {
         invariants,
         flagged_risks,
@@ -1842,6 +1976,7 @@ pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> Governa
         trusted_surface,
         cleared_principals,
         surface: ifc_surface(ir),
+        flow_signature,
     }
 }
 
@@ -1890,6 +2025,15 @@ impl GovernanceReport {
             out.push_str("  information-flow surface (every door this workflow opens):\n");
             for door in &self.surface {
                 out.push_str(&format!("    - {door}\n"));
+            }
+        }
+        if !self.flow_signature.is_empty() {
+            out.push_str(
+                "  result flow signature (per field, the reads a consumer inherits, \
+                 fact-granular):\n",
+            );
+            for field in &self.flow_signature {
+                out.push_str(&format!("    - {field}\n"));
             }
         }
         out
@@ -2773,6 +2917,139 @@ workflow Refiner {
     }
 
     #[test]
+    fn result_field_dependency_reads_splits_reads_per_field() {
+        // DR-0030 X2 v2 (per-field signature): the completing rule `combine` consumes
+        // two facts via `when`, one produced from a confidential read (`secret`) and
+        // one from a public read (`pub_in`). It has NO own reads. Each result field
+        // references exactly one fact binding directly, so per-field reach attributes
+        // `secret` to `hot` only and `pub_in` to `cold` only — a real refinement over
+        // the whole-result reach (which carries both to every field).
+        let tool = compile_program(
+            r#"@tool
+workflow Splitter {
+  input request Req
+  output result R
+  class Req { id string }
+  class Secret { s string }
+  class Pub { p string }
+  class R { hot string  cold string }
+  file store secret { root "./sec"  allow read ["**"] }
+  file store pub_in { root "./pin"  allow read ["**"] }
+
+  rule load_secret
+    when Req as request
+  => {
+    read text from secret at "s.txt" as s
+    after s succeeds as sv {
+      record Secret { s sv.content }
+    }
+  }
+
+  rule load_pub
+    when Req as request
+  => {
+    read text from pub_in at "p.txt" as p
+    after p succeeds as pv {
+      record Pub { p pv.content }
+    }
+  }
+
+  rule combine
+    when Secret as sec
+    when Pub as pb
+  => {
+    complete result {
+      hot sec.s
+      cold pb.p
+    }
+  }
+}
+"#,
+        )
+        .ir
+        .expect("tool compiles");
+        let sig = result_field_dependency_reads(&tool);
+        let field = |name: &str| -> Vec<String> {
+            sig.iter()
+                .find(|(binding, field, _)| binding == "result" && field == name)
+                .map(|(_, _, reads)| reads.clone())
+                .unwrap_or_else(|| panic!("no signature for result.{name}: {sig:?}"))
+        };
+        let hot = field("hot");
+        let cold = field("cold");
+        assert!(
+            hot.contains(&"secret".to_owned()) && !hot.contains(&"pub_in".to_owned()),
+            "hot depends on the confidential fact only: {hot:?}"
+        );
+        assert!(
+            cold.contains(&"pub_in".to_owned()) && !cold.contains(&"secret".to_owned()),
+            "cold depends on the public fact only: {cold:?}"
+        );
+    }
+
+    #[test]
+    fn result_field_dependency_reads_keeps_own_reads_on_every_field() {
+        // The rule-level opaque box (I-IFC2) is preserved: the completing rule reads
+        // `secret` DIRECTLY, so `secret` reaches EVERY result field — even `cold`,
+        // whose only referenced binding is a public fact. And `hot` references a
+        // within-rule DERIVED binding (`after … as sv`), whose opaque provenance falls
+        // back to the whole-result reach. Neither field ever under-reports.
+        let tool = compile_program(
+            r#"@tool
+workflow Mixer {
+  input request Req
+  output result R
+  class Req { id string }
+  class Pub { p string }
+  class R { hot string  cold string }
+  file store secret { root "./sec"  allow read ["**"] }
+  file store pub_in { root "./pin"  allow read ["**"] }
+
+  rule load_pub
+    when Req as request
+  => {
+    read text from pub_in at "p.txt" as p
+    after p succeeds as pv {
+      record Pub { p pv.content }
+    }
+  }
+
+  rule combine
+    when Pub as pb
+  => {
+    read text from secret at "s.txt" as s
+    after s succeeds as sv {
+      complete result {
+        cold pb.p
+        hot sv.content
+      }
+    }
+  }
+}
+"#,
+        )
+        .ir
+        .expect("tool compiles");
+        let sig = result_field_dependency_reads(&tool);
+        let field = |name: &str| -> Vec<String> {
+            sig.iter()
+                .find(|(binding, field, _)| binding == "result" && field == name)
+                .map(|(_, _, reads)| reads.clone())
+                .unwrap_or_else(|| panic!("no signature for result.{name}: {sig:?}"))
+        };
+        assert!(
+            field("cold").contains(&"secret".to_owned()),
+            "the completing rule's own read reaches every field (opaque box): {:?}",
+            field("cold")
+        );
+        let hot = field("hot");
+        assert!(
+            hot.contains(&"secret".to_owned()) && hot.contains(&"pub_in".to_owned()),
+            "a derived-binding field falls back to the whole-result reach: {hot:?}"
+        );
+    }
+
+    #[test]
     fn leak_and_inject_diagnostics_carry_self_serve_and_escalate_routes() {
         // a leak (read confidential ledger -> write public outbox) and an inject (an
         // unvouched source -> a high-integrity sink) each carry BOTH a self-serve route
@@ -2831,6 +3108,76 @@ workflow Refiner {
         let text = report.render();
         assert!(text.contains("guaranteed invariants"));
         assert!(text.contains("flagged risks"));
+    }
+
+    #[test]
+    fn report_exposes_the_per_field_flow_signature() {
+        // DR-0030 X2 v2: a producer's guarantee report surfaces the per-field flow
+        // signature — the reads a consumer of each result field inherits. `hot`
+        // depends on the confidential store, `cold` on the public one.
+        let ir = compile_program(
+            r#"@tool
+workflow Splitter {
+  input request Req
+  output result R
+  class Req { id string }
+  class Secret { s string }
+  class Pub { p string }
+  class R { hot string  cold string }
+  file store secret { root "./sec"  allow read ["**"] }
+  file store pub_in { root "./pin"  allow read ["**"] }
+
+  rule load_secret
+    when Req as request
+  => {
+    read text from secret at "s.txt" as s
+    after s succeeds as sv {
+      record Secret { s sv.content }
+    }
+  }
+
+  rule load_pub
+    when Req as request
+  => {
+    read text from pub_in at "p.txt" as p
+    after p succeeds as pv {
+      record Pub { p pv.content }
+    }
+  }
+
+  rule combine
+    when Secret as sec
+    when Pub as pb
+  => {
+    complete result {
+      hot sec.s
+      cold pb.p
+    }
+  }
+}
+"#,
+        )
+        .ir
+        .expect("tool compiles");
+        let envelope = Envelope::from_json(r#"{ "resources": {} }"#).expect("valid envelope");
+        let report = governance_report(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            report
+                .flow_signature
+                .iter()
+                .any(|line| line.contains("result.hot") && line.contains("secret")),
+            "flow signature should attribute secret to hot: {:?}",
+            report.flow_signature
+        );
+        assert!(
+            report
+                .flow_signature
+                .iter()
+                .any(|line| line.contains("result.cold") && line.contains("pub_in")),
+            "flow signature should attribute pub_in to cold: {:?}",
+            report.flow_signature
+        );
+        assert!(report.render().contains("result flow signature"));
     }
 
     #[test]
