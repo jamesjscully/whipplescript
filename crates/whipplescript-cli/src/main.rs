@@ -296,7 +296,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "counters" => "usage: whip counters [<counter>]",
         "items" => "usage: whip items [list [--queue Q] [--status S]|add --queue Q --title T [--body B] [--label L]...|show <id>]",
         "evidence" => "usage: whip evidence <instance>",
-        "diagnostics" => "usage: whip diagnostics <instance>",
+        "diagnostics" => "usage: whip diagnostics [--grouped] <instance>",
         "trace" => "usage: whip trace <instance> [--check]",
         "pause" => "usage: whip pause <instance>",
         "resume" => "usage: whip resume <instance>",
@@ -34826,9 +34826,18 @@ fn status(options: &CliOptions) -> ExitCode {
             Ok(runs) => runs,
             Err(error) => return report_store_error("failed to load runs", error),
         };
-        emit_json(status_to_json_with_effects_and_runs(
-            &status, &effects, &runs,
-        ))
+        let mut value = status_to_json_with_effects_and_runs(&status, &effects, &runs);
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "invocation_tree".to_owned(),
+                Value::Array(build_invocation_tree(
+                    &store,
+                    instance_id,
+                    INVOCATION_TREE_DEPTH,
+                )),
+            );
+        }
+        emit_json(value)
     } else {
         println!(
             "instance {} {}",
@@ -34935,8 +34944,12 @@ fn log(options: &CliOptions) -> ExitCode {
     };
 
     if options.json {
+        let provenance = event_provenance_for_instance(&store, instance_id);
         emit_json(Value::Array(
-            events.iter().map(event_to_json).collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|event| event_to_json_with_provenance(event, &provenance))
+                .collect::<Vec<_>>(),
         ))
     } else {
         for event in events {
@@ -36314,9 +36327,17 @@ fn evidence(options: &CliOptions) -> ExitCode {
 }
 
 fn diagnostics(options: &CliOptions) -> ExitCode {
-    let Some(instance_id) = single_arg(options, "usage: whip diagnostics <instance>") else {
+    let grouped = options.args.iter().any(|arg| arg == "--grouped");
+    let positional: Vec<&String> = options
+        .args
+        .iter()
+        .filter(|arg| arg.as_str() != "--grouped")
+        .collect();
+    let [instance_id] = positional.as_slice() else {
+        eprintln!("usage: whip diagnostics [--grouped] <instance>");
         return ExitCode::from(2);
     };
+    let instance_id = instance_id.as_str();
     let store = match open_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
@@ -36327,12 +36348,16 @@ fn diagnostics(options: &CliOptions) -> ExitCode {
     };
 
     if options.json {
-        emit_json(Value::Array(
-            diagnostics
-                .iter()
-                .map(diagnostic_to_json)
-                .collect::<Vec<_>>(),
-        ))
+        if grouped {
+            emit_json(grouped_diagnostics_to_json(&diagnostics))
+        } else {
+            emit_json(Value::Array(
+                diagnostics
+                    .iter()
+                    .map(diagnostic_to_json)
+                    .collect::<Vec<_>>(),
+            ))
+        }
     } else {
         for diagnostic in diagnostics {
             println!(
@@ -40466,6 +40491,70 @@ fn event_to_json(event: &EventView) -> Value {
     })
 }
 
+/// Instance-level provenance stamped onto every runtime event trace line so a
+/// trace can be tied back to its workflow and (when the instance was spawned by
+/// a parent `invoke`) the invocation that produced it.
+struct EventProvenance {
+    instance_id: String,
+    workflow_id: Option<String>,
+    workflow_version_id: Option<String>,
+    invocation_id: Option<String>,
+}
+
+fn event_provenance_for_instance(store: &SqliteStore, instance_id: &str) -> EventProvenance {
+    let instance = store.get_instance(instance_id).ok().flatten();
+    let invocation_id = store
+        .get_parent_workflow_invocation(instance_id)
+        .ok()
+        .flatten()
+        .map(|invocation| invocation.invocation_id);
+    EventProvenance {
+        instance_id: instance_id.to_owned(),
+        workflow_id: instance
+            .as_ref()
+            .map(|instance| instance.program_id.clone()),
+        workflow_version_id: instance
+            .as_ref()
+            .map(|instance| instance.version_id.clone()),
+        invocation_id,
+    }
+}
+
+fn event_to_json_with_provenance(event: &EventView, provenance: &EventProvenance) -> Value {
+    let mut value = event_to_json(event);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "instance_id".to_owned(),
+            Value::String(provenance.instance_id.clone()),
+        );
+        object.insert(
+            "workflow_id".to_owned(),
+            provenance
+                .workflow_id
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "workflow_version_id".to_owned(),
+            provenance
+                .workflow_version_id
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "invocation_id".to_owned(),
+            provenance
+                .invocation_id
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+    }
+    value
+}
+
 fn trace_record_to_json(record: &TraceRecord) -> Value {
     json!({
         "sequence": record.sequence,
@@ -40779,6 +40868,41 @@ fn native_lifecycle_event_to_json(event: &EventView) -> Option<Value> {
         "provider_turn_id": payload.get("provider_turn_id").cloned().unwrap_or(Value::Null),
         "evidence_id": payload.get("evidence_id").cloned().unwrap_or(Value::Null),
     }))
+}
+
+/// Maximum depth of the recursive `whip status` invocation tree. Transitive
+/// invocation cycles are rejected at compile time, so this only guards against
+/// unexpected data corruption producing an unbounded walk.
+const INVOCATION_TREE_DEPTH: usize = 64;
+
+/// Recursively assembles the multi-level child-invocation tree rooted at
+/// `parent_instance_id`. Each node is the flat invocation JSON plus a
+/// `children` array of the invocations its child instance itself issued, so a
+/// parent -> child -> grandchild bundle surfaces as nested `children`.
+fn build_invocation_tree(
+    store: &SqliteStore,
+    parent_instance_id: &str,
+    depth_budget: usize,
+) -> Vec<Value> {
+    let children = match store.list_child_workflow_invocations(parent_instance_id) {
+        Ok(children) => children,
+        Err(_) => return Vec::new(),
+    };
+    children
+        .iter()
+        .map(|invocation| {
+            let mut node = workflow_invocation_to_json(invocation);
+            let descendants = if depth_budget == 0 {
+                Vec::new()
+            } else {
+                build_invocation_tree(store, &invocation.child_instance_id, depth_budget - 1)
+            };
+            if let Some(object) = node.as_object_mut() {
+                object.insert("children".to_owned(), Value::Array(descendants));
+            }
+            node
+        })
+        .collect()
 }
 
 fn workflow_invocation_to_json(invocation: &WorkflowInvocationView) -> Value {
@@ -41274,6 +41398,57 @@ fn tool_check_to_json(tool: &ToolCheck) -> Value {
     })
 }
 
+/// Groups a flat diagnostics list along the provenance dimensions an operator
+/// triages by: the source file/bundle, the workflow instance (workflow-local
+/// scoping), and the subject type (which carries `pattern_application` and
+/// generated-declaration provenance alongside `rule`/`effect`/`assertion`).
+fn grouped_diagnostics_to_json(diagnostics: &[DiagnosticView]) -> Value {
+    let mut by_file: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let mut by_workflow: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let mut by_subject: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for diagnostic in diagnostics {
+        let json = diagnostic_to_json(diagnostic);
+        let file_key = diagnostic
+            .program_id
+            .clone()
+            .or_else(|| diagnostic.program_version_id.clone())
+            .unwrap_or_else(|| "unattributed".to_owned());
+        let workflow_key = diagnostic
+            .instance_id
+            .clone()
+            .unwrap_or_else(|| "unattributed".to_owned());
+        let subject_key = diagnostic
+            .subject_type
+            .clone()
+            .unwrap_or_else(|| "unspecified".to_owned());
+        by_file.entry(file_key).or_default().push(json.clone());
+        by_workflow
+            .entry(workflow_key)
+            .or_default()
+            .push(json.clone());
+        by_subject.entry(subject_key).or_default().push(json);
+    }
+    json!({
+        "schema": "whipplescript.diagnostics_grouped.v0",
+        "total": diagnostics.len(),
+        "diagnostics": diagnostics.iter().map(diagnostic_to_json).collect::<Vec<_>>(),
+        "groups": {
+            "by_file": diagnostic_group_to_json(by_file),
+            "by_workflow": diagnostic_group_to_json(by_workflow),
+            "by_subject_type": diagnostic_group_to_json(by_subject),
+        },
+    })
+}
+
+fn diagnostic_group_to_json(groups: BTreeMap<String, Vec<Value>>) -> Value {
+    Value::Object(
+        groups
+            .into_iter()
+            .map(|(key, entries)| (key, Value::Array(entries)))
+            .collect(),
+    )
+}
+
 fn status_to_json(status: &StatusView) -> Value {
     json!({
         "instance": instance_to_json(&status.instance),
@@ -41283,6 +41458,7 @@ fn status_to_json(status: &StatusView) -> Value {
         "blocked_effect_count": status.blocked_effect_count,
         "active_run_count": status.active_run_count,
         "failure_count": status.failure_count,
+        "failure_surface": failure_surface_to_json(status),
         "cancellation_request_count": status.cancellation_request_count,
         "revisions": status.revisions.iter().map(workflow_revision_to_json).collect::<Vec<_>>(),
         "workflow_invocations": {
@@ -41311,6 +41487,46 @@ fn status_to_json_with_effects_and_runs(
         );
     }
     value
+}
+
+/// Distinguishes the two failure categories side by side on the status surface:
+/// a workflow-level failure (an author-declared `fail` terminal, or the
+/// generated `flowfail` auto-fail) versus provider/effect failure *evidence*
+/// (failed runs recorded against the instance). The two are independent: a
+/// workflow can fail on an author path with zero provider failures, and a
+/// provider failure can be recorded as evidence on a workflow that has not (yet)
+/// failed.
+fn failure_surface_to_json(status: &StatusView) -> Value {
+    let terminal = status
+        .recent_events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "workflow.failed");
+    let (fail_kind, fail_terminal) = match terminal {
+        Some(event) => {
+            let payload = json_from_str(&event.payload_json);
+            let terminal_name = payload
+                .get("terminal_name")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            // The generated auto-fail terminal reserves the `flowfail` name; an
+            // author-declared `fail` carries the class name the author wrote.
+            let kind = match terminal_name.as_deref() {
+                Some("flowfail") | None => "internal",
+                Some(_) => "author",
+            };
+            (Some(kind), terminal_name)
+        }
+        None => (None, None),
+    };
+    let workflow_failed = status.instance.status == "failed" || terminal.is_some();
+    json!({
+        "workflow_failed": workflow_failed,
+        "workflow_fail_kind": if workflow_failed { fail_kind } else { None },
+        "workflow_fail_terminal": fail_terminal,
+        "provider_failure_present": status.failure_count > 0,
+        "provider_failure_count": status.failure_count,
+    })
 }
 
 fn workflow_terminal_summary(events: &[EventView]) -> Option<Value> {

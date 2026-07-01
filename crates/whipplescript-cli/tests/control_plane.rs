@@ -16890,3 +16890,555 @@ fn temp_workflow_path(label: &str) -> PathBuf {
         std::process::id()
     ))
 }
+
+// --- Observability / UX polish (Phase 7 + Phase 4) ---------------------------
+
+#[test]
+fn status_assembles_multi_level_invocation_tree() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let workflow_path = temp_workflow_path("observability-invocation-tree");
+    fs::write(
+        &workflow_path,
+        r#"
+workflow Parent {
+  input task Task
+
+  class Task {
+    title string
+  }
+
+  class ParentDone {
+    title string
+  }
+
+  rule dispatch
+    when Task as task
+  => {
+    invoke Child { task { title task.title } } as child
+
+    after child succeeds as result {
+      record ParentDone {
+        title result.title
+      }
+    }
+  }
+}
+
+workflow Child {
+  input task Task
+  output result ChildResult
+
+  class Task {
+    title string
+  }
+
+  class ChildResult {
+    title string
+  }
+
+  rule dispatch_grandchild
+    when Task as task
+  => {
+    invoke GrandChild { task { title task.title } } as grandchild
+
+    after grandchild succeeds as result {
+      complete result {
+        title result.title
+      }
+    }
+  }
+}
+
+workflow GrandChild {
+  input task Task
+  output result GrandResult
+
+  class Task {
+    title string
+  }
+
+  class GrandResult {
+    title string
+  }
+
+  rule finish
+    when Task as task
+  => {
+    complete result {
+      title task.title
+    }
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--input",
+            r#"{"task":{"title":"deep"}}"#,
+            "--json",
+            "dev",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--root",
+            "Parent",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let status = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "status",
+            instance_id,
+        ],
+    );
+
+    // Level 1: parent -> child.
+    let child = status
+        .pointer("/invocation_tree/0")
+        .expect("child invocation node");
+    assert_eq!(
+        child.get("target_workflow").and_then(Value::as_str),
+        Some("Child")
+    );
+    let child_instance_id = child
+        .get("child_instance_id")
+        .and_then(Value::as_str)
+        .expect("child instance id");
+
+    // Level 2: child -> grandchild, nested under the child node's `children`.
+    let grandchild = status
+        .pointer("/invocation_tree/0/children/0")
+        .expect("grandchild invocation node");
+    assert_eq!(
+        grandchild.get("target_workflow").and_then(Value::as_str),
+        Some("GrandChild")
+    );
+    // The grandchild invocation's parent is the child instance (proving the
+    // tree is genuinely multi-level, not a flattened sibling list).
+    assert_eq!(
+        grandchild.get("parent_instance_id").and_then(Value::as_str),
+        Some(child_instance_id)
+    );
+    // The grandchild is a leaf: its own `children` array is present and empty.
+    assert_eq!(
+        grandchild
+            .get("children")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
+#[test]
+fn log_json_stamps_invocation_and_workflow_provenance() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let workflow_path = temp_workflow_path("observability-log-provenance");
+    fs::write(
+        &workflow_path,
+        r#"
+workflow Parent {
+  input task Task
+
+  class Task {
+    title string
+  }
+
+  class ParentDone {
+    title string
+  }
+
+  rule dispatch
+    when Task as task
+  => {
+    invoke Child { task { title task.title } } as child
+
+    after child succeeds as result {
+      record ParentDone {
+        title result.title
+      }
+    }
+  }
+}
+
+workflow Child {
+  input task Task
+  output result ChildResult
+
+  class Task {
+    title string
+  }
+
+  class ChildResult {
+    title string
+  }
+
+  rule complete_child
+    when Task as task
+  => {
+    complete result {
+      title task.title
+    }
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--input",
+            r#"{"task":{"title":"trace me"}}"#,
+            "--json",
+            "dev",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--root",
+            "Parent",
+            "--until",
+            "idle",
+        ],
+    );
+    let parent_instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    // Every parent event line is stamped with the workflow id + its own
+    // instance id; a root workflow has no spawning invocation.
+    let parent_log = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "log",
+            parent_instance_id,
+        ],
+    );
+    let parent_events = parent_log.as_array().expect("parent events array");
+    assert!(!parent_events.is_empty());
+    for event in parent_events {
+        assert_eq!(
+            event.get("instance_id").and_then(Value::as_str),
+            Some(parent_instance_id)
+        );
+        assert!(event.get("workflow_id").and_then(Value::as_str).is_some());
+        assert!(event.get("invocation_id").is_some());
+        assert!(event.get("invocation_id").expect("key present").is_null());
+    }
+
+    // Discover the child instance and read the child invocation id from the
+    // parent status invocation tree.
+    let status = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "status",
+            parent_instance_id,
+        ],
+    );
+    let child_instance_id = status
+        .pointer("/invocation_tree/0/child_instance_id")
+        .and_then(Value::as_str)
+        .expect("child instance id");
+    let expected_invocation_id = status
+        .pointer("/invocation_tree/0/invocation_id")
+        .and_then(Value::as_str)
+        .expect("child invocation id");
+
+    // Every child event line is tied back to the invocation that spawned it.
+    let child_log = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "log",
+            child_instance_id,
+        ],
+    );
+    let child_events = child_log.as_array().expect("child events array");
+    assert!(!child_events.is_empty());
+    for event in child_events {
+        assert_eq!(
+            event.get("instance_id").and_then(Value::as_str),
+            Some(child_instance_id)
+        );
+        assert_eq!(
+            event.get("invocation_id").and_then(Value::as_str),
+            Some(expected_invocation_id)
+        );
+        assert!(event.get("workflow_id").and_then(Value::as_str).is_some());
+    }
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
+#[test]
+fn diagnostics_grouped_buckets_findings_by_provenance() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("observability-diagnostics-v1");
+    let v2 = temp_workflow_path("observability-diagnostics-v2");
+    fs::write(
+        &v1,
+        r#"
+workflow StepRevision
+
+class Marker {
+  version string
+}
+
+rule seed_v1
+  when started
+=> {
+  record Marker {
+    version "v1"
+  }
+}
+"#,
+    )
+    .expect("write v1 workflow");
+    fs::write(
+        &v2,
+        r#"
+workflow StepRevision
+
+class Marker {
+  version string
+}
+
+rule seed_v2
+  when started
+=> {
+  record Marker {
+    version "v2"
+  }
+}
+"#,
+    )
+    .expect("write v2 workflow");
+
+    let started = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "run",
+            v1.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "revise",
+            instance_id,
+            v2.to_str().expect("utf-8 workflow path"),
+            "--json",
+        ],
+    );
+
+    // A stale step against the pre-revision program path records a diagnostic.
+    let stale_step = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "step",
+            instance_id,
+            "--program",
+            v1.to_str().expect("utf-8 workflow path"),
+        ])
+        .output()
+        .expect("command runs");
+    assert!(!stale_step.status.success());
+
+    // Default output stays a flat array (backwards compatible).
+    let flat = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "diagnostics",
+            instance_id,
+        ],
+    );
+    assert!(flat.is_array());
+
+    // Grouped output buckets findings along file / workflow / subject-type.
+    let grouped = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "diagnostics",
+            instance_id,
+            "--grouped",
+        ],
+    );
+    assert_eq!(
+        grouped.get("schema").and_then(Value::as_str),
+        Some("whipplescript.diagnostics_grouped.v0")
+    );
+    assert!(grouped.get("total").and_then(Value::as_u64).unwrap_or(0) >= 1);
+    assert!(grouped
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .is_some());
+    let groups = grouped.get("groups").expect("groups object");
+    // The stale-step diagnostic is subject_type `program_path`; it must appear
+    // in that subject bucket and in the workflow (instance) bucket.
+    let subject_bucket = groups
+        .pointer("/by_subject_type/program_path")
+        .and_then(Value::as_array)
+        .expect("program_path subject bucket");
+    assert!(subject_bucket.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(Value::as_str) == Some("revision.stale_program_path")
+    }));
+    let workflow_bucket = groups
+        .pointer(&format!("/by_workflow/{instance_id}"))
+        .and_then(Value::as_array)
+        .expect("workflow bucket keyed by instance id");
+    assert!(!workflow_bucket.is_empty());
+    assert!(groups
+        .get("by_file")
+        .and_then(Value::as_object)
+        .map(|files| !files.is_empty())
+        .unwrap_or(false));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(v1);
+    let _ = fs::remove_file(v2);
+}
+
+#[test]
+fn status_failure_surface_separates_workflow_fail_from_provider_evidence() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let workflow_path = temp_workflow_path("observability-failure-surface");
+    fs::write(
+        &workflow_path,
+        r#"
+workflow Solo {
+  input task Task
+
+  class Task {
+    title string
+  }
+
+  failure error SoloFailure
+
+  class SoloFailure {
+    reason string
+  }
+
+  rule fail_now
+    when Task as task
+  => {
+    fail error {
+      reason task.title
+    }
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--input",
+            r#"{"task":{"title":"boom"}}"#,
+            "--json",
+            "dev",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--root",
+            "Solo",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let status = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "status",
+            instance_id,
+        ],
+    );
+    let surface = status
+        .get("failure_surface")
+        .expect("failure_surface field");
+    // The workflow failed on an author-declared `fail` terminal ...
+    assert_eq!(
+        surface.get("workflow_failed").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        surface.get("workflow_fail_kind").and_then(Value::as_str),
+        Some("author")
+    );
+    assert_eq!(
+        surface
+            .get("workflow_fail_terminal")
+            .and_then(Value::as_str),
+        Some("error")
+    );
+    // ... with no provider/effect failure evidence recorded.
+    assert_eq!(
+        surface
+            .get("provider_failure_present")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        surface
+            .get("provider_failure_count")
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(workflow_path);
+}
