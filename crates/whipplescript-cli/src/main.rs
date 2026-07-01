@@ -38730,6 +38730,16 @@ fn generate_maude_model_search(
     let mut fact_symbols = std::collections::BTreeMap::<String, String>::new();
     let mut graph_symbols = std::collections::BTreeMap::<String, String>::new();
     let mut assertion_symbols = std::collections::BTreeMap::<usize, String>::new();
+    // Composition symbols (workflow/pattern/invoke kernel rules). These are
+    // synthesized concrete ops for otherwise-abstract kernel sorts so the
+    // generated module can search the elaborate-pattern, complete/fail-workflow
+    // and workflow-invocation rules against real compiled IR.
+    let mut pattern_symbols = std::collections::BTreeMap::<String, String>::new();
+    let mut application_symbols = std::collections::BTreeMap::<String, String>::new();
+    let mut workflow_symbols = std::collections::BTreeMap::<String, String>::new();
+    let mut instance_symbols = std::collections::BTreeMap::<String, String>::new();
+    let mut output_symbols = std::collections::BTreeMap::<String, String>::new();
+    let mut failure_symbols = std::collections::BTreeMap::<String, String>::new();
     let mut expr_context = MaudeExprContext::default();
     for rule in &ir.rules {
         rule_symbols
@@ -38772,6 +38782,18 @@ fn generate_maude_model_search(
             .or_insert_with(|| maude_symbol("assertion", &assertion_key(index, assertion)));
         let _ = maude_bool_cases(&assertion.expr.expr, &mut expr_context);
     }
+    collect_composition_symbols(
+        ir,
+        &mut rule_symbols,
+        &mut fact_symbols,
+        &mut graph_symbols,
+        &mut pattern_symbols,
+        &mut application_symbols,
+        &mut workflow_symbols,
+        &mut instance_symbols,
+        &mut output_symbols,
+        &mut failure_symbols,
+    );
 
     let mut output = String::new();
     let mut expected = Vec::new();
@@ -38785,6 +38807,12 @@ fn generate_maude_model_search(
     append_maude_ops(&mut output, assertion_symbols.values(), "AssertionId");
     append_maude_ops(&mut output, expr_context.scalar_symbols.values(), "Scalar");
     append_maude_ops(&mut output, expr_context.query_symbols.values(), "QueryId");
+    append_maude_ops(&mut output, pattern_symbols.values(), "PatternId");
+    append_maude_ops(&mut output, application_symbols.values(), "ApplicationId");
+    append_maude_ops(&mut output, workflow_symbols.values(), "WorkflowId");
+    append_maude_ops(&mut output, instance_symbols.values(), "InstanceId");
+    append_maude_ops(&mut output, output_symbols.values(), "OutputId");
+    append_maude_ops(&mut output, failure_symbols.values(), "FailureId");
     output.push_str("endm\n\n");
 
     for rule in &ir.rules {
@@ -39101,7 +39129,448 @@ fn generate_maude_model_search(
         }
     }
 
+    append_composition_model_searches(
+        ir,
+        &mut output,
+        &mut expected,
+        &rule_symbols,
+        &fact_symbols,
+        &graph_symbols,
+        &effect_symbols,
+        &pattern_symbols,
+        &application_symbols,
+        &workflow_symbols,
+        &instance_symbols,
+        &output_symbols,
+        &failure_symbols,
+    );
+
     (output, expected)
+}
+
+fn pattern_app_rule_key(alias: &str) -> String {
+    format!("pattern:{alias}:rule")
+}
+
+fn pattern_app_fact_key(alias: &str) -> String {
+    format!("pattern:{alias}:fact")
+}
+
+fn pattern_app_graph_key(alias: &str) -> String {
+    format!("pattern:{alias}:graph")
+}
+
+fn workflow_instance_key(workflow: &str) -> String {
+    format!("workflow:{workflow}:instance")
+}
+
+fn complete_fact_key(workflow: &str, output: &str) -> String {
+    format!("complete:{workflow}:{output}")
+}
+
+fn fail_fact_key(workflow: &str, failure: &str) -> String {
+    format!("fail:{workflow}:{failure}")
+}
+
+fn invoke_child_instance_key(rule: &str, effect_id: &str) -> String {
+    format!("invoke:{rule}:{effect_id}:child")
+}
+
+fn invoke_target_workflow_key(rule: &str, effect_id: &str) -> String {
+    format!("invoke:{rule}:{effect_id}:workflow")
+}
+
+fn invoke_payload_fact_key(rule: &str, effect_id: &str) -> String {
+    format!("invoke:{rule}:{effect_id}:payload")
+}
+
+/// Register the synthetic concrete ops needed to exercise the workflow
+/// composition kernel rules (pattern elaboration, workflow completion/failure
+/// and workflow invocation) against real compiled IR.
+#[allow(clippy::too_many_arguments)]
+fn collect_composition_symbols(
+    ir: &IrProgram,
+    rule_symbols: &mut BTreeMap<String, String>,
+    fact_symbols: &mut BTreeMap<String, String>,
+    graph_symbols: &mut BTreeMap<String, String>,
+    pattern_symbols: &mut BTreeMap<String, String>,
+    application_symbols: &mut BTreeMap<String, String>,
+    workflow_symbols: &mut BTreeMap<String, String>,
+    instance_symbols: &mut BTreeMap<String, String>,
+    output_symbols: &mut BTreeMap<String, String>,
+    failure_symbols: &mut BTreeMap<String, String>,
+) {
+    for application in &ir.pattern_applications {
+        pattern_symbols
+            .entry(application.pattern.clone())
+            .or_insert_with(|| maude_symbol("pat", &application.pattern));
+        application_symbols
+            .entry(application.alias.clone())
+            .or_insert_with(|| maude_symbol("app", &application.alias));
+        let rule_key = pattern_app_rule_key(&application.alias);
+        rule_symbols
+            .entry(rule_key.clone())
+            .or_insert_with(|| maude_symbol("rule", &rule_key));
+        let fact_key = pattern_app_fact_key(&application.alias);
+        fact_symbols
+            .entry(fact_key.clone())
+            .or_insert_with(|| maude_symbol("fact", &fact_key));
+        let graph_key = pattern_app_graph_key(&application.alias);
+        graph_symbols
+            .entry(graph_key.clone())
+            .or_insert_with(|| maude_symbol("graph", &graph_key));
+    }
+
+    let has_workflow_terminal = ir.workflow_contracts.iter().any(|contract| {
+        matches!(
+            contract.kind,
+            IrWorkflowContractKind::Output | IrWorkflowContractKind::Failure
+        )
+    });
+    let has_invoke = ir.rules.iter().any(|rule| {
+        rule.metadata
+            .effects
+            .iter()
+            .any(|effect| effect.kind == IrEffectKind::WorkflowInvoke)
+    });
+    if has_workflow_terminal || has_invoke {
+        workflow_symbols
+            .entry(ir.workflow.clone())
+            .or_insert_with(|| maude_symbol("wf", &ir.workflow));
+        let instance_key = workflow_instance_key(&ir.workflow);
+        instance_symbols
+            .entry(instance_key.clone())
+            .or_insert_with(|| maude_symbol("inst", &instance_key));
+    }
+
+    for contract in &ir.workflow_contracts {
+        match contract.kind {
+            IrWorkflowContractKind::Output => {
+                output_symbols
+                    .entry(contract.name.clone())
+                    .or_insert_with(|| {
+                        maude_symbol("out", &format!("{}:{}", ir.workflow, contract.name))
+                    });
+                let fact_key = complete_fact_key(&ir.workflow, &contract.name);
+                fact_symbols
+                    .entry(fact_key.clone())
+                    .or_insert_with(|| maude_symbol("fact", &fact_key));
+            }
+            IrWorkflowContractKind::Failure => {
+                failure_symbols
+                    .entry(contract.name.clone())
+                    .or_insert_with(|| {
+                        maude_symbol("fail", &format!("{}:{}", ir.workflow, contract.name))
+                    });
+                let fact_key = fail_fact_key(&ir.workflow, &contract.name);
+                fact_symbols
+                    .entry(fact_key.clone())
+                    .or_insert_with(|| maude_symbol("fact", &fact_key));
+            }
+            IrWorkflowContractKind::Input => {}
+        }
+    }
+
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            if effect.kind != IrEffectKind::WorkflowInvoke {
+                continue;
+            }
+            let child_key = invoke_child_instance_key(&rule.name, &effect.id);
+            instance_symbols
+                .entry(child_key.clone())
+                .or_insert_with(|| maude_symbol("inst", &child_key));
+            let workflow_key = invoke_target_workflow_key(&rule.name, &effect.id);
+            workflow_symbols
+                .entry(workflow_key.clone())
+                .or_insert_with(|| maude_symbol("wf", &workflow_key));
+            let payload_key = invoke_payload_fact_key(&rule.name, &effect.id);
+            fact_symbols
+                .entry(payload_key.clone())
+                .or_insert_with(|| maude_symbol("fact", &payload_key));
+        }
+    }
+}
+
+/// Emit generated searches for the workflow composition kernel rules against
+/// real compiled IR: pattern elaboration provenance, explicit workflow
+/// completion/failure, and workflow invocation resolution.
+#[allow(clippy::too_many_arguments)]
+fn append_composition_model_searches(
+    ir: &IrProgram,
+    output: &mut String,
+    expected: &mut Vec<ExpectedSearch>,
+    rule_symbols: &BTreeMap<String, String>,
+    fact_symbols: &BTreeMap<String, String>,
+    graph_symbols: &BTreeMap<String, String>,
+    effect_symbols: &BTreeMap<String, String>,
+    pattern_symbols: &BTreeMap<String, String>,
+    application_symbols: &BTreeMap<String, String>,
+    workflow_symbols: &BTreeMap<String, String>,
+    instance_symbols: &BTreeMap<String, String>,
+    output_symbols: &BTreeMap<String, String>,
+    failure_symbols: &BTreeMap<String, String>,
+) {
+    // Pattern applications elaborate into a provenance-tracked rule.
+    for application in &ir.pattern_applications {
+        let Some(pattern) = pattern_symbols.get(&application.pattern) else {
+            continue;
+        };
+        let Some(app) = application_symbols.get(&application.alias) else {
+            continue;
+        };
+        let Some(rule) = rule_symbols.get(&pattern_app_rule_key(&application.alias)) else {
+            continue;
+        };
+        let Some(fact) = fact_symbols.get(&pattern_app_fact_key(&application.alias)) else {
+            continue;
+        };
+        let Some(graph) = graph_symbols.get(&pattern_app_graph_key(&application.alias)) else {
+            continue;
+        };
+
+        output.push_str(&format!(
+            "--- pattern {}: applying `{}` elaborates into a provenance-tracked rule.\n",
+            application.alias, application.pattern
+        ));
+        output.push_str(&format!(
+            "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  patternApp({pattern}, {app}, {rule}, {fact}, {graph})\n  =>*\n  patternElaborated({pattern}, {app}, {rule}, {fact}, {graph}) rule({rule}, {fact}, {graph}) ruleProvenance({rule}, {pattern}, {app}) .\n\n"
+        ));
+        expected.push(ExpectedSearch {
+            outcome: ExpectedSearchResult::Solution,
+            span: SourceSpan { start: 0, end: 0 },
+            description: format!("{} pattern application elaborates", application.alias),
+            upstream: application.pattern.clone(),
+            predicate: "pattern-elaborates",
+            downstream: "ruleProvenance".to_owned(),
+        });
+
+        output.push_str(&format!(
+            "--- pattern {}: rule provenance cannot appear without pattern elaboration.\n",
+            application.alias
+        ));
+        output.push_str(&format!(
+            "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  rule({rule}, {fact}, {graph})\n  =>*\n  ruleProvenance({rule}, {pattern}, {app}) RESIDUAL:Cfg .\n\n"
+        ));
+        expected.push(ExpectedSearch {
+            outcome: ExpectedSearchResult::NoSolution,
+            span: SourceSpan { start: 0, end: 0 },
+            description: format!(
+                "{} provenance requires pattern elaboration",
+                application.alias
+            ),
+            upstream: application.pattern.clone(),
+            predicate: "pattern-provenance-requires-elaboration",
+            downstream: "ruleProvenance".to_owned(),
+        });
+    }
+
+    // Explicit workflow completion and failure are terminal.
+    let workflow = workflow_symbols.get(&ir.workflow);
+    let instance = instance_symbols.get(&workflow_instance_key(&ir.workflow));
+    if let (Some(workflow_symbol), Some(instance_symbol)) = (workflow, instance) {
+        for contract in &ir.workflow_contracts {
+            match contract.kind {
+                IrWorkflowContractKind::Output => {
+                    let Some(output_symbol) = output_symbols.get(&contract.name) else {
+                        continue;
+                    };
+                    let Some(fact) =
+                        fact_symbols.get(&complete_fact_key(&ir.workflow, &contract.name))
+                    else {
+                        continue;
+                    };
+                    output.push_str(&format!(
+                        "--- {}: `complete {}` drives the instance to a completed terminal.\n",
+                        ir.workflow, contract.name
+                    ));
+                    output.push_str(&format!(
+                        "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  instance({instance_symbol}, {workflow_symbol}, instRunning) workflowOutput({workflow_symbol}, {output_symbol}) completeWorkflow({instance_symbol}, {output_symbol}, {fact}) fact({fact})\n  =>*\n  instance({instance_symbol}, {workflow_symbol}, instCompleted) workflowOutput({workflow_symbol}, {output_symbol}) terminalPayload({instance_symbol}, {fact}) fact({fact}) event(workflowCompletedEvt) .\n\n"
+                    ));
+                    expected.push(ExpectedSearch {
+                        outcome: ExpectedSearchResult::Solution,
+                        span: contract.span,
+                        description: format!(
+                            "{} complete {} reaches terminal",
+                            ir.workflow, contract.name
+                        ),
+                        upstream: ir.workflow.clone(),
+                        predicate: "workflow-complete",
+                        downstream: "workflowCompletedEvt".to_owned(),
+                    });
+
+                    output.push_str(&format!(
+                        "--- {}: completion event requires an explicit `complete {}` action.\n",
+                        ir.workflow, contract.name
+                    ));
+                    output.push_str(&format!(
+                        "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  instance({instance_symbol}, {workflow_symbol}, instRunning) workflowOutput({workflow_symbol}, {output_symbol}) fact({fact})\n  =>*\n  event(workflowCompletedEvt) RESIDUAL:Cfg .\n\n"
+                    ));
+                    expected.push(ExpectedSearch {
+                        outcome: ExpectedSearchResult::NoSolution,
+                        span: contract.span,
+                        description: format!(
+                            "{} completion requires explicit complete {}",
+                            ir.workflow, contract.name
+                        ),
+                        upstream: ir.workflow.clone(),
+                        predicate: "workflow-complete-requires-action",
+                        downstream: "workflowCompletedEvt".to_owned(),
+                    });
+                }
+                IrWorkflowContractKind::Failure => {
+                    let Some(failure_symbol) = failure_symbols.get(&contract.name) else {
+                        continue;
+                    };
+                    let Some(fact) = fact_symbols.get(&fail_fact_key(&ir.workflow, &contract.name))
+                    else {
+                        continue;
+                    };
+                    output.push_str(&format!(
+                        "--- {}: `fail {}` drives the instance to a failed terminal.\n",
+                        ir.workflow, contract.name
+                    ));
+                    output.push_str(&format!(
+                        "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  instance({instance_symbol}, {workflow_symbol}, instRunning) workflowFailure({workflow_symbol}, {failure_symbol}) failWorkflow({instance_symbol}, {failure_symbol}, {fact}) fact({fact})\n  =>*\n  instance({instance_symbol}, {workflow_symbol}, instFailed) workflowFailure({workflow_symbol}, {failure_symbol}) terminalPayload({instance_symbol}, {fact}) fact({fact}) event(workflowFailedEvt) .\n\n"
+                    ));
+                    expected.push(ExpectedSearch {
+                        outcome: ExpectedSearchResult::Solution,
+                        span: contract.span,
+                        description: format!(
+                            "{} fail {} reaches terminal",
+                            ir.workflow, contract.name
+                        ),
+                        upstream: ir.workflow.clone(),
+                        predicate: "workflow-fail",
+                        downstream: "workflowFailedEvt".to_owned(),
+                    });
+
+                    output.push_str(&format!(
+                        "--- {}: failure event requires an explicit `fail {}` action.\n",
+                        ir.workflow, contract.name
+                    ));
+                    output.push_str(&format!(
+                        "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  instance({instance_symbol}, {workflow_symbol}, instRunning) workflowFailure({workflow_symbol}, {failure_symbol}) fact({fact})\n  =>*\n  event(workflowFailedEvt) RESIDUAL:Cfg .\n\n"
+                    ));
+                    expected.push(ExpectedSearch {
+                        outcome: ExpectedSearchResult::NoSolution,
+                        span: contract.span,
+                        description: format!(
+                            "{} failure requires explicit fail {}",
+                            ir.workflow, contract.name
+                        ),
+                        upstream: ir.workflow.clone(),
+                        predicate: "workflow-fail-requires-action",
+                        downstream: "workflowFailedEvt".to_owned(),
+                    });
+                }
+                IrWorkflowContractKind::Input => {}
+            }
+        }
+    }
+
+    // Workflow invocation is runtime composition behind an invocation effect.
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            if effect.kind != IrEffectKind::WorkflowInvoke {
+                continue;
+            }
+            let Some(effect_symbol) = effect_symbols.get(&effect_key(&rule.name, &effect.id))
+            else {
+                continue;
+            };
+            let Some(parent) = instance_symbols.get(&workflow_instance_key(&ir.workflow)) else {
+                continue;
+            };
+            let Some(child) =
+                instance_symbols.get(&invoke_child_instance_key(&rule.name, &effect.id))
+            else {
+                continue;
+            };
+            let Some(target) =
+                workflow_symbols.get(&invoke_target_workflow_key(&rule.name, &effect.id))
+            else {
+                continue;
+            };
+            let Some(payload) = fact_symbols.get(&invoke_payload_fact_key(&rule.name, &effect.id))
+            else {
+                continue;
+            };
+
+            output.push_str(&format!(
+                "--- {}: invoke `{}` starts a child instance behind the invocation effect.\n",
+                rule.name, effect.id
+            ));
+            output.push_str(&format!(
+                "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  effect({effect_symbol}, running) invokeWorkflow({effect_symbol}, {parent}, {target}, {child})\n  =>*\n  effect({effect_symbol}, running) instance({child}, {target}, instRunning) childOf({child}, {effect_symbol}) .\n\n"
+            ));
+            expected.push(ExpectedSearch {
+                outcome: ExpectedSearchResult::Solution,
+                span: effect.span,
+                description: format!("{} invoke {} starts child instance", rule.name, effect.id),
+                upstream: rule.name.clone(),
+                predicate: "invoke-starts-child",
+                downstream: "childOf".to_owned(),
+            });
+
+            output.push_str(&format!(
+                "--- {}: invocation resolves to output only when the child completes.\n",
+                rule.name
+            ));
+            output.push_str(&format!(
+                "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  effect({effect_symbol}, running) childOf({child}, {effect_symbol}) instance({child}, {target}, instCompleted) terminalPayload({child}, {payload})\n  =>*\n  effect({effect_symbol}, completed) childOf({child}, {effect_symbol}) instance({child}, {target}, instCompleted) terminalPayload({child}, {payload}) invocationOutput({effect_symbol}, {payload}) .\n\n"
+            ));
+            expected.push(ExpectedSearch {
+                outcome: ExpectedSearchResult::Solution,
+                span: effect.span,
+                description: format!(
+                    "{} invoke {} resolves on child completion",
+                    rule.name, effect.id
+                ),
+                upstream: rule.name.clone(),
+                predicate: "invoke-completes",
+                downstream: "invocationOutput".to_owned(),
+            });
+
+            output.push_str(&format!(
+                "--- {}: invocation resolves to failure when the child fails.\n",
+                rule.name
+            ));
+            output.push_str(&format!(
+                "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  effect({effect_symbol}, running) childOf({child}, {effect_symbol}) instance({child}, {target}, instFailed) terminalPayload({child}, {payload})\n  =>*\n  effect({effect_symbol}, failed) childOf({child}, {effect_symbol}) instance({child}, {target}, instFailed) terminalPayload({child}, {payload}) invocationFailure({effect_symbol}, {payload}) .\n\n"
+            ));
+            expected.push(ExpectedSearch {
+                outcome: ExpectedSearchResult::Solution,
+                span: effect.span,
+                description: format!(
+                    "{} invoke {} resolves on child failure",
+                    rule.name, effect.id
+                ),
+                upstream: rule.name.clone(),
+                predicate: "invoke-fails",
+                downstream: "invocationFailure".to_owned(),
+            });
+
+            output.push_str(&format!(
+                "--- {}: invocation cannot resolve while the child is still running.\n",
+                rule.name
+            ));
+            output.push_str(&format!(
+                "search [1] in WHIPPLESCRIPT-GENERATED-CHECK :\n  effect({effect_symbol}, running) childOf({child}, {effect_symbol}) instance({child}, {target}, instRunning)\n  =>*\n  invocationOutput({effect_symbol}, {payload}) RESIDUAL:Cfg .\n\n"
+            ));
+            expected.push(ExpectedSearch {
+                outcome: ExpectedSearchResult::NoSolution,
+                span: effect.span,
+                description: format!(
+                    "{} invoke {} does not resolve before child terminal",
+                    rule.name, effect.id
+                ),
+                upstream: rule.name.clone(),
+                predicate: "invoke-blocks-until-terminal",
+                downstream: "invocationOutput".to_owned(),
+            });
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -50033,6 +50502,298 @@ rule accept
 
         let output =
             run_maude_source("generated-revision-check-fixture", &maude).expect("runs Maude");
+        let actual = extract_maude_search_results(&output.stdout);
+        assert_eq!(
+            actual,
+            expected
+                .iter()
+                .map(|expected| expected.outcome)
+                .collect::<Vec<_>>(),
+            "{}",
+            output.stdout
+        );
+    }
+
+    fn composition_invoke_source() -> &'static str {
+        // Block-form parent/child: exercises workflow completion + failure
+        // (declared output/failure contracts) and workflow invocation. Patterns
+        // cannot appear in block-form workflow bodies, so pattern elaboration is
+        // covered by `composition_pattern_source` instead.
+        r#"
+workflow CompositionModelCheck {
+  input request ReviewRequest
+  output result ReviewSummary
+  failure error ReviewFailure
+
+  class ReviewRequest {
+    id string
+    title string
+  }
+
+  class ReviewSummary {
+    reviewed int
+  }
+
+  class ReviewFailure {
+    reason string
+  }
+
+  class ChildTask {
+    title string
+  }
+
+  rule dispatch
+    when ReviewRequest as request
+  => {
+    invoke ChildReviewWorkflow { task { title request.title } } as child
+
+    after child succeeds as childResult {
+      done request
+
+      complete result {
+        reviewed 1
+      }
+    }
+
+    after child fails as childFailure {
+      done request
+
+      fail error {
+        reason childFailure.reason
+      }
+    }
+  }
+}
+
+workflow ChildReviewWorkflow {
+  input task ChildTask
+  output result ChildResult
+
+  class ChildTask {
+    title string
+  }
+
+  class ChildResult {
+    summary string
+  }
+
+  rule do_work
+    when ChildTask as task
+  => {
+    complete result {
+      summary task.title
+    }
+  }
+}
+"#
+    }
+
+    fn composition_pattern_source() -> &'static str {
+        // Flat-form program: exercises pattern elaboration (`apply`) alongside a
+        // declared output contract (`complete result`).
+        r#"
+workflow CompositionPatternCheck
+
+output result ReviewSummary
+
+class ReviewRequest {
+  id string
+  title string
+  status "queued"
+}
+
+class ReviewedItem {
+  id string
+  summary string
+  status "reviewed"
+}
+
+class ReviewSummary {
+  reviewed int
+}
+
+agent reviewer {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+table requests as ReviewRequest [
+  {
+    id "R-1"
+    title "Tune retries"
+    status "queued"
+  }
+]
+
+pattern AgentReview<Input, Output> {
+  rule review
+    when Input as item
+    when reviewer is available
+  => {
+    tell reviewer as turn """markdown
+    Review {{ item.title }}.
+    """
+
+    after turn succeeds as reviewed {
+      done item -> record Output {
+        id item.id
+        summary reviewed.summary
+        status "reviewed"
+      }
+    }
+  }
+}
+
+apply AgentReview<ReviewRequest, ReviewedItem> as itemReview {
+}
+
+rule finish_batch
+  when ReviewedItem as reviewed where reviewed.status == "reviewed"
+=> {
+  complete result {
+    reviewed 1
+  }
+}
+"#
+    }
+
+    #[test]
+    fn generates_composition_model_searches_from_ir() {
+        let source = composition_invoke_source();
+        let compiled =
+            whipplescript_parser::compile_program_with_root(source, Some("CompositionModelCheck"));
+        let ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("source compiles: {:?}", compiled.diagnostics));
+        let (maude, expected) =
+            generate_maude_model_search(source, &ir, Path::new("/tmp/kernel.maude"));
+
+        // Workflow completion + failure kernel rules are driven by the declared
+        // output/failure contracts.
+        assert!(maude.contains("completeWorkflow("));
+        assert!(maude.contains("event(workflowCompletedEvt)"));
+        assert!(maude.contains("failWorkflow("));
+        assert!(maude.contains("event(workflowFailedEvt)"));
+        // Workflow invocation kernel rules are driven by the `workflow.invoke`
+        // effect.
+        assert!(maude.contains("invokeWorkflow("));
+        assert!(maude.contains("invocationOutput("));
+        assert!(maude.contains("invocationFailure("));
+
+        for predicate in [
+            "workflow-complete",
+            "workflow-fail",
+            "invoke-starts-child",
+            "invoke-completes",
+            "invoke-fails",
+        ] {
+            assert!(
+                expected.iter().any(|search| {
+                    search.predicate == predicate
+                        && search.outcome == ExpectedSearchResult::Solution
+                }),
+                "missing solution search for {predicate}"
+            );
+        }
+        for predicate in [
+            "workflow-complete-requires-action",
+            "workflow-fail-requires-action",
+            "invoke-blocks-until-terminal",
+        ] {
+            assert!(
+                expected.iter().any(|search| {
+                    search.predicate == predicate
+                        && search.outcome == ExpectedSearchResult::NoSolution
+                }),
+                "missing no-solution search for {predicate}"
+            );
+        }
+    }
+
+    #[test]
+    fn generates_pattern_elaboration_model_searches_from_ir() {
+        let source = composition_pattern_source();
+        let compiled = whipplescript_parser::compile_program(source);
+        let ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("source compiles: {:?}", compiled.diagnostics));
+        let (maude, expected) =
+            generate_maude_model_search(source, &ir, Path::new("/tmp/kernel.maude"));
+
+        assert!(maude.contains("patternApp("));
+        assert!(maude.contains("ruleProvenance("));
+        assert!(expected.iter().any(|search| {
+            search.predicate == "pattern-elaborates"
+                && search.outcome == ExpectedSearchResult::Solution
+        }));
+        assert!(expected.iter().any(|search| {
+            search.predicate == "pattern-provenance-requires-elaboration"
+                && search.outcome == ExpectedSearchResult::NoSolution
+        }));
+    }
+
+    #[test]
+    fn generated_composition_model_search_runs_clean_in_maude() {
+        if find_executable_in_path(&["maude"], &path_value()).is_none() {
+            return;
+        }
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let kernel_path =
+            fs::canonicalize(root.join("models/maude/kernel.maude")).expect("kernel path resolves");
+        let source = composition_invoke_source();
+        let compiled =
+            whipplescript_parser::compile_program_with_root(source, Some("CompositionModelCheck"));
+        let ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("source compiles: {:?}", compiled.diagnostics));
+        let (maude, expected) = generate_maude_model_search(source, &ir, &kernel_path);
+        assert!(!expected.is_empty());
+
+        let output = run_maude_source("generated-composition-check-fixture", &maude)
+            .expect("generated composition Maude fixture runs");
+        assert!(
+            output.stderr.is_empty(),
+            "generated composition Maude emitted warnings:\n{}",
+            output.stderr
+        );
+        let actual = extract_maude_search_results(&output.stdout);
+        assert_eq!(
+            actual,
+            expected
+                .iter()
+                .map(|expected| expected.outcome)
+                .collect::<Vec<_>>(),
+            "{}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn generated_pattern_model_search_runs_clean_in_maude() {
+        if find_executable_in_path(&["maude"], &path_value()).is_none() {
+            return;
+        }
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let kernel_path =
+            fs::canonicalize(root.join("models/maude/kernel.maude")).expect("kernel path resolves");
+        let source = composition_pattern_source();
+        let compiled = whipplescript_parser::compile_program(source);
+        let ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("source compiles: {:?}", compiled.diagnostics));
+        let (maude, expected) = generate_maude_model_search(source, &ir, &kernel_path);
+        assert!(!expected.is_empty());
+
+        let output = run_maude_source("generated-pattern-check-fixture", &maude)
+            .expect("generated pattern Maude fixture runs");
+        assert!(
+            output.stderr.is_empty(),
+            "generated pattern Maude emitted warnings:\n{}",
+            output.stderr
+        );
         let actual = extract_maude_search_results(&output.stdout);
         assert_eq!(
             actual,
