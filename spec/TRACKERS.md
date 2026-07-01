@@ -61,10 +61,10 @@ radio-style choice lists are excluded from checkbox counting.
 | `spec/expression-kernel-tracker.md` | active | The expression/evaluation kernel implementation | 2026-06-30 |
 | `spec/native-provider-implementation-tracker.md` | active | Building usable native Codex/Claude/Pi providers (prose tracker) | 2026-06-30 |
 | `spec/workflow-composition-transition-tracker.md` | active | Migrating to the workflow-composition model (invoke/subworkflows) | 2026-06-30 |
-| `spec/decision-records/language-ergonomics-tracker.md` | active | v2 language-surface ergonomics decisions and their build-out | 2026-06-30 |
+| `spec/decision-records/language-ergonomics-tracker.md` | active | v2 language-surface ergonomics decisions + build-out; **canonical home** for the small-language-follow-ups (see dedup) — Part B reconciled 2026-07-01, only B1a-refactor / B1g fuzz / `consume`-removal remain | 2026-07-01 |
 | `spec/decision-records/standard-package-design-tracker.md` | active | Open design todos for the standard packages | 2026-06-30 |
-| `spec/decision-records/discriminated-families-design.md` | active | Discriminated-families design — whole tracker shipped; open questions remain | 2026-06-30 |
-| `spec/review-change-plan.md` | active | Follow-ups from the 2026-06-09 review pass | 2026-06-30 |
+| `spec/decision-records/discriminated-families-design.md` | closed | Discriminated-families design — whole tracker shipped (Stages 1a/1b/2/3/4 + capstone); §9 open questions are design Qs, not unbuilt work | 2026-07-01 |
+| `spec/review-change-plan.md` | closed | 2026-06-09 review pass — shipped; remaining follow-ups folded into language-ergonomics (dedup) | 2026-07-01 |
 | `spec/final-audit.md` | active | Running v0 audit log for release readiness | 2026-06-30 |
 | `spec/real-provider-validation-tracker.md` | closed | Real (live) provider validation — all v0 items shipped | 2026-06-30 |
 | `spec/workflow-revision-transition-tracker.md` | closed | Workflow-revision transition — post-audit hardening complete | 2026-06-30 |
@@ -79,7 +79,25 @@ radio-style choice lists are excluded from checkbox counting.
 | `spec/language-ergonomics-tracker.md` | archived | Redirect stub → `decision-records/language-ergonomics-tracker.md` | 2026-06-30 |
 | `spec/archive/harness-language-topology-tracker.md` | archived | Superseded harness/language topology vocabulary | 2026-06-30 |
 
-### Not trackers (design/spec docs that merely match the name pattern)
+## Known overlaps (dedup — audited 2026-07-01)
+
+Same concern tracked in more than one place. Registry rule: work it in the
+**canonical home**; the others carry a pointer, not a live checkbox.
+
+| Concern | Canonical home | Also appears in |
+|---------|----------------|-----------------|
+| Move rule-body lowering out of the CLI crate | language-ergonomics B1a | review-change-plan §4.11 (folded) |
+| Remove `consume` after deprecation | language-ergonomics B3 | review-change-plan (folded) |
+| Dynamic rule-coverage CI (per-run committed rules) | language-ergonomics B3 | review-change-plan (folded); static lint already shipped |
+| Agent-turn enrichment / drop `AgentTurn.issue`+`changedFiles` | language-ergonomics A3e/B2 | review-change-plan (folded) |
+| Full expression-kernel guard typing | expression-kernel-tracker | final-audit G-002/G-010 (points here) |
+| Native-provider live validation | native-provider-implementation-tracker | final-audit G-006/G-008 (points here) |
+| Provider failure ≠ auto-fail workflow | workflow-composition-transition (done) | final-audit distributed-systems / G-009 |
+| C6/C7/C8/C9 capabilities (coord/messaging/telemetry/script/time/ingress) | shipped in core (language-ergonomics) | standard-package-design treats as future *packages* — that tracker is now a packaging/namespacing design question, not feature work |
+| `case`/sum-types/coerce→enum narrowing | discriminated-families-design (closed, shipped) | language-ergonomics C1; expression-kernel tagged-terminal rows |
+| vNext epic (retarget / fact migration / cancellation depth / destructive confirms) | final-audit (deferred log) = archived `workflow-revision-followups` | native-provider NP-060 builds only the cancellation request/ack model, not out-of-band depth |
+
+## Not trackers (design/spec docs that merely match the name pattern)
 
 - `spec/control-plane.md` — control-plane specification (draft spec, not a work tracker).
 - `spec/decision-records/0002-work-tracker-package.md` — ADR for the *work-tracker

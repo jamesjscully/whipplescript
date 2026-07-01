@@ -328,8 +328,8 @@ Cheapest/most-certain → most speculative. Each stage gets review + verify + do
 
 **Recosted honestly (resolves major, lens 3):** ~500–600 LOC compiler (collapse `case_branch_payload_binding` + `terminal_payload_schema_for_tag`, `finite_case_domain` + `terminal_case_tags` and its duplicates, and the ~225-line `validate_case_blocks` into one pass; add `binding`+`guard` to `IrCasePattern`; delete the textual scanner) + ~150–200 LOC Maude/Lean + full example migration + tooling. We split it:
 
-- [ ] **Stage 1a — narrowing-rule unification, no syntax break.** One unified pass `validate_and_lower_cases` running *after* `effect_payload_types` is populated; `Family::payload`/`Family::tags`; single `branch_scope` site; `after`-desugar to `case` (§5.1); delete textual scanner; add `duplicate_binding_in_scope` (§5.5) and observer-only construction check (§5.4); exhaustiveness lifted to **error** with the conditional-coverage diagnostic; redundancy check. The space-form terminal syntax still parses (adapter into the unified IR) so safe work lands first.
-- [ ] **Stage 1b — syntax break to `Tag as binding`.** Ship `whip fmt --upgrade-as-bindings`; migrate the corpus; delete the space-form parser path; update spec/sum-types.md §2.1 and language.md §B.2.2. Deferrable/reconsiderable independently of 1a.
+- [x] **Stage 1a — narrowing-rule unification, no syntax break.** One unified pass `validate_and_lower_cases` running *after* `effect_payload_types` is populated; `Family::payload`/`Family::tags`; single `branch_scope` site; `after`-desugar to `case` (§5.1); delete textual scanner; add `duplicate_binding_in_scope` (§5.5) and observer-only construction check (§5.4); exhaustiveness lifted to **error** with the conditional-coverage diagnostic; redundancy check. The space-form terminal syntax still parses (adapter into the unified IR) so safe work lands first.
+- [x] **Stage 1b — syntax break to `Tag as binding`.** Ship `whip fmt --upgrade-as-bindings`; migrate the corpus; delete the space-form parser path; update spec/sum-types.md §2.1 and language.md §B.2.2. Deferrable/reconsiderable independently of 1a.
 
 **Tooling:** `fmt` — one case-block formatter; **add a `case_nesting_depth` lint and confirm idempotency on nested `case`-in-`after`-in-`case` first** (memory flags nested-block non-idempotency). `lsp` — hover/completion/rename on case bindings (now in IR). `lint` — `mixed_case_binding_style` becomes obsolete.
 
@@ -396,10 +396,10 @@ Discriminated families and the deferred IFC items (`information-flow-audit-findi
 
 Recommended phase order (full rationale in the chat thread; durable IFC side tracked in `information-flow-audit-findings.md`):
 
-- [ ] **Phase 1 — Foundation.** Stage 1a (unify, no syntax break) → Stage 2 (Family A) → selector-doctrine capstone (wire the `case` discriminant as the NMIF selector for an in-arm `endorsed`/`declassified` crossing — E4 already landed — + Maude bite).
-- [ ] **Phase 2 — Discriminated heavies.** Stage 1b (syntax break + migration) → Stage 3 (Family B) → Stage 4 (Family C, milestone-as-boundary at resource grain).
-- [ ] **Phase 3 — IFC substrate.** E5 (typed `kind:address` ids + port-level reach) + E6 (reader/writer SETS in the checker) — brings the checker up to the Wave-4-proven algebra; prerequisite for all finer governance.
-- [ ] **Phase 4 — Join-box refinement.** DR-0030 Direction A v1 (flow_signature schema → producer reach-vector → consumer derive/gate; folds in X3/X4 hardening) → Direction B (then sync point 3). v2/conditional-discount and Direction C stay demand-gated.
+- [x] **Phase 1 — Foundation.** Stage 1a (unify, no syntax break) → Stage 2 (Family A) → selector-doctrine capstone (wire the `case` discriminant as the NMIF selector for an in-arm `endorsed`/`declassified` crossing — E4 already landed — + Maude bite).
+- [x] **Phase 2 — Discriminated heavies.** Stage 1b (syntax break + migration) → Stage 3 (Family B) → Stage 4 (Family C, milestone-as-boundary at resource grain).
+- [x] **Phase 3 — IFC substrate.** E5 (typed `kind:address` ids + port-level reach) + E6 (reader/writer SETS in the checker) — brings the checker up to the Wave-4-proven algebra; prerequisite for all finer governance.
+- [x] **Phase 4 — Join-box refinement.** DR-0030 Direction A v1 (flow_signature schema → producer reach-vector → consumer derive/gate; folds in X3/X4 hardening) → Direction B (then sync point 3). v2/conditional-discount and Direction C stay demand-gated.
 
 **Priority flip signal:** if the *read-secret/emit-benign* false positive (DR-0030's canonical pain case) is actively blocking real whips, pull Phase 3 → Phase 4 **ahead of** Phase 2 — it's the only deferred IFC item with user-facing bite. **Demand-gated / operational** (independent of both tracks): E7 (account binding), D4 (envelope versioning). **Free now:** adopt M4 ("negative bite per consumer per trusted artifact") as a standing review rule.
 

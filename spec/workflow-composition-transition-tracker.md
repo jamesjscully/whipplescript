@@ -28,7 +28,7 @@ The target behavior is specified in [language.md](language.md),
 | Maude model | [x] | Pattern elaboration, workflow terminal actions, child invocation resolution, and cancellation are modeled. |
 | `use` cleanup | [x] | Source now uses `use memory` for package/library imports; removed `use plugin` and `use skill` forms are rejected. |
 | Parser/runtime implementation | [~] | `include` parsing, CLI source-bundle resolution, duplicate-include diagnostics, explicit multi-workflow root selection, workflow contract IR, class-shaped terminal payload validation, keyed workflow input validation/seeding, pattern expansion with type and simple value arguments, static workflow invocation target/input/direct-recursion validation, resumable dev-worker child workflow invocation with source-span records and success/failure/timeout/cancellation projection, status JSON parent/child invocation links, non-class terminal contract rejection, and basic `complete`/`fail` runtime terminal actions are implemented; scalar terminal payload syntax remains. |
-| Examples migration | [ ] | Existing examples still use the current implicit one-workflow file shape. |
+| Examples migration | [x] | Done: all 37 `examples/*.whip` begin with an explicit `workflow` declaration (2026-07-01 reconcile). |
 | E2E coverage | [~] | Parser/runtime e2e now covers `include`, explicit root selection, keyed workflow inputs, `pattern`/`apply` with simple value arguments, static workflow invocation target/input validation, `workflow.invoke` child success/failure/timeout/cancellation projection, resumable running invocation completion, status JSON invocation links, and `complete`/`fail`. |
 
 ## Acceptance Gates
@@ -55,8 +55,8 @@ The target behavior is specified in [language.md](language.md),
   invocation, not an inline expansion.
 - [~] Parent workflows observe child terminal state through typed invocation
   completion/failure/timeout/cancellation outputs.
-- [ ] Provider and harness failures remain effect/run events and evidence; they
-  do not automatically fail a workflow unless source rules choose to `fail`.
+- [x] Provider and harness failures remain effect/run events and evidence; they
+  do not automatically fail a workflow unless source rules choose to `fail`. (Done: 503 auto-fail is scoped to UNHANDLED effect failures in self-terminating flows — main.rs ~20105; see [project-503-autofail].)
 - [ ] The generated Maude/check path can represent pattern provenance,
   workflow terminal actions, and invocation edges from compiled IR.
 - [ ] Examples and docs use one canonical spelling for each concept.
@@ -191,7 +191,7 @@ The target behavior is specified in [language.md](language.md),
 
 ## Phase 8: Examples And Docs
 
-- [ ] Rewrite core examples with explicit `workflow` declarations.
+- [x] Rewrite core examples with explicit `workflow` declarations. (Done: 37/37 examples workflow-prefixed.)
 - [ ] Add at least one library file included by multiple workflows.
 - [ ] Add at least one reusable `pattern` used in multiple workflows.
 - [ ] Add a parent workflow that invokes a child workflow and handles success,

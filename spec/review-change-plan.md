@@ -49,9 +49,11 @@ during review triage; each decision item includes its agreed direction.
 
 - [x] Add an index on `facts(instance_id, name)` — `fact_exists` queries are
   unindexed linear scans.
-- [ ] Move rule-body lowering and fact-ID derivation out of the CLI crate
-  (~17k-line `main.rs`) into the parser/kernel crates. Three near-identical
-  ID-derivation sites in one file is what allowed the collision bug.
+- [~] Move rule-body lowering and fact-ID derivation out of the CLI crate into
+  the parser/kernel crates. **Why still open:** the fact-ID/effect-ID collision
+  was fixed in place; the structural move remains (`main.rs` is now ~50k lines).
+  **When:** carried forward — now tracked canonically in
+  `decision-records/language-ergonomics-tracker.md` B1a (dedup 2026-07-01).
 
 ## 5. Docs
 
@@ -137,16 +139,15 @@ All items above are implemented, with these scope notes:
   Fixed with agent-name filtering and no-binding pattern support; covered by
   `completed_turn_pattern_fires_dependent_rule`.
 
-## Remaining follow-ups
+## Remaining follow-ups — FOLDED (dedup 2026-07-01)
 
-- [ ] **Dynamic rule-coverage CI (5.18 full version):** a script asserting every
-  rule in every shipped example commits at least once in some fixture run. The
-  static dead-rule lint covers the bug class that motivated it; the dynamic
-  check still needs runner support for reporting committed-rule names per dev run.
-- [ ] **Agent turn enrichment:** richer turn summaries and artifact lists are
-  still useful for review workflows. The curated queue examples avoid fields
-  the runtime does not currently populate.
-- [ ] **Move rule lowering out of the CLI crate (4.11):** deferred — the
-  fact-ID/effect-ID derivations were fixed in place; the structural move of
-  lowering into the parser/kernel crates remains open.
-- [ ] **Remove `consume`** after one release of deprecation warnings.
+This plan's remaining follow-ups are all duplicated in, and now tracked
+canonically by, `decision-records/language-ergonomics-tracker.md`. This tracker
+is `closed`; work these there:
+
+- **Dynamic rule-coverage CI (5.18 full version)** → language-ergonomics B3.
+  `scripts/check-rule-coverage.sh` exists (static dead-rule lint shipped); the
+  dynamic per-run committed-rule reporting is the open remainder.
+- **Agent turn enrichment** → language-ergonomics A3e / B2 (loft turn enrichment).
+- **Move rule lowering out of the CLI crate (4.11)** → language-ergonomics B1a.
+- **Remove `consume`** after its deprecation window → language-ergonomics B3.

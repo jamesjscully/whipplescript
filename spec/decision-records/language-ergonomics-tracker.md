@@ -261,6 +261,21 @@ flow triage
 
 ## Part B — Approved engineering work (no design input needed)
 
+> **RECONCILED 2026-07-01.** The [status board](#status-board) (rows 1–18) and
+> the codebase are authoritative — the Part B features below **shipped** (body
+> AST + unified evaluator in `parser/src/body.rs`+`flow_expand.rs`; single-line
+> record fix; `{{ }}` interpolation; timers/`cancel`; general `when fact` matcher
+> + `manual review requested` removed; work queues + `whip items`; `exec` +
+> `WHIPPLESCRIPT_EXEC_ALLOW`; rule-coverage lint; `--exec-profile`/C9). The
+> checklist below is retained as historical decomposition; its `[ ]` marks are
+> **not** live work except the three genuinely-open carry-overs, which are the
+> only remaining items in this whole tracker:
+> - **B1a (partial):** the body AST shipped, but *moving lowering out of the CLI
+>   crate* is still open (`main.rs` ~50k lines) — folds in review-change-plan §4.11.
+> - **B1g:** the fuzz/property "no silent no-op" sweep.
+> - **B3:** remove `consume` after its deprecation window (it still parses); and
+>   the dynamic per-run committed-rule reporting half of rule-coverage CI.
+
 ### B1. Harden the soft middle (priority 1)
 
 The root cause is shared: rule bodies are raw strings re-scanned line by
