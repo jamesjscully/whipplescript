@@ -1028,7 +1028,16 @@ fn print_terminal(
         body::TerminalKind::Fail => "fail",
         body::TerminalKind::FailInternal => unreachable!("handled above"),
     };
-    push_stmt_line(out, indent, &format!("{keyword} {} {{", terminal.name));
+    let from = terminal
+        .from
+        .as_ref()
+        .map(|binding| format!(" from {}", rn(binding)))
+        .unwrap_or_default();
+    push_stmt_line(
+        out,
+        indent,
+        &format!("{keyword} {}{from} {{", terminal.name),
+    );
     print_fields(&terminal.fields, indent + 1, rn, out);
     push_stmt_line(out, indent, "}");
 }

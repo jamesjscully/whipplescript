@@ -6599,10 +6599,17 @@ fn validate_workflow_terminal_actions(
         let Some((action, rest, declared)) = terminal else {
             continue;
         };
+        // Header is `<name>` or (for `complete`) `<name> from <binding>` — the
+        // bounded-type projection form (DR-0027), whose payload copies the binding.
         let Some(name) = rest.split('{').next().and_then(|header| {
             let mut parts = header.split_whitespace();
-            match (parts.next(), parts.next()) {
-                (Some(name), None) => Some(name),
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(name), None, _) => Some(name),
+                (Some(name), Some("from"), Some(binding))
+                    if action == "complete" && is_identifier(binding) =>
+                {
+                    Some(name)
+                }
                 _ => None,
             }
         }) else {
@@ -7261,38 +7268,49 @@ fn collect_redaction_metadata(
 /// fields' per-field labels (sourced from `src`'s schema) — the "bounded-type"
 /// auto-redaction reading. Only recorded when the source schema resolves and the
 /// target type is declared; otherwise the egress stays conservative.
-fn push_bounded_record(
-    record: &body::RecordStmt,
+/// Records a bounded-type projection egress for a PURE `from` projection — a
+/// `from <src>` egress every field of which is a shorthand copy of `src.<name>`.
+/// The runtime materializes exactly these fields, so the kept set is their names,
+/// governed by `src`'s schema per-field labels. `None` source schema, no `from`, or
+/// any explicit value field → not a clean projection, so it stays conservative
+/// (handled by the whole-read join). `sink` is the engine sink string
+/// (`fact:<Schema>` for a record, the completed binding for a `complete`).
+fn push_bounded_projection(
+    from: Option<&str>,
+    fields: &[body::FieldAssign],
+    sink: String,
     binding_types: &BTreeMap<String, String>,
     out: &mut Vec<IrBoundedEgress>,
 ) {
-    let Some(src) = &record.from else {
+    let Some(source_schema) = from.and_then(|src| binding_types.get(src)) else {
         return;
     };
-    let Some(source_schema) = binding_types.get(src) else {
-        return;
-    };
-    // Bounded-type applies only to a PURE `from` projection — every field a
-    // shorthand copy of `src.<name>`. The runtime records exactly these fields, so
-    // the kept set is their names. A record mixing explicit value expressions is not
-    // a clean projection; it stays conservative (handled by the whole-read join).
-    if record.fields.is_empty()
-        || !record
-            .fields
+    if fields.is_empty()
+        || !fields
             .iter()
             .all(|field| matches!(field.value, body::FieldValue::Shorthand))
     {
         return;
     }
     out.push(IrBoundedEgress {
-        sink: format!("fact:{}", record.schema),
+        sink,
         source_schema: source_schema.clone(),
-        keep: record
-            .fields
-            .iter()
-            .map(|field| field.name.clone())
-            .collect(),
+        keep: fields.iter().map(|field| field.name.clone()).collect(),
     });
+}
+
+fn push_bounded_record(
+    record: &body::RecordStmt,
+    binding_types: &BTreeMap<String, String>,
+    out: &mut Vec<IrBoundedEgress>,
+) {
+    push_bounded_projection(
+        record.from.as_deref(),
+        &record.fields,
+        format!("fact:{}", record.schema),
+        binding_types,
+        out,
+    );
 }
 
 fn collect_bounded_egresses(
@@ -7307,6 +7325,19 @@ fn collect_bounded_egresses(
                 replacement: Some(record),
                 ..
             } => push_bounded_record(record, binding_types, out),
+            // `complete <T> from <src> { … }`: bounded-type projection to the invoker.
+            // The engine sink for a complete is the completed binding (its name).
+            body::BodyStmt::Terminal(terminal)
+                if terminal.kind == body::TerminalKind::Complete && terminal.from.is_some() =>
+            {
+                push_bounded_projection(
+                    terminal.from.as_deref(),
+                    &terminal.fields,
+                    terminal.name.clone(),
+                    binding_types,
+                    out,
+                );
+            }
             body::BodyStmt::After(after) => {
                 collect_bounded_egresses(&after.body, binding_types, out)
             }

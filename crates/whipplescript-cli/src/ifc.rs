@@ -2451,6 +2451,48 @@ rule r
     }
 
     #[test]
+    fn bounded_type_complete_from_is_governed_by_kept_fields() {
+        // Bounded-type parity for the invoker egress: `complete T from <src>` keeps
+        // exactly the listed shorthand fields, governed by their per-field labels.
+        let program = r#"@service
+workflow BoundedComplete
+
+input customer Customer
+output result PublicView
+
+class Customer { id string  ssn string }
+class PublicView { FIELDS }
+
+rule r
+  when Customer as cust
+=> {
+  complete result from cust { KEEP }
+}
+"#;
+        let envelope = r#"{ "resources": { "Customer.ssn": { "reader": "confidential" } } }"#;
+        let safe = program.replace("FIELDS", "id string").replace("KEEP", "id");
+        let ir = compile_program(&safe).ir.expect("compiles");
+        let env = Envelope::from_json(envelope).expect("valid");
+        assert!(
+            !check_with_envelope(&ir, &VerifiedEnvelope::for_test(env))
+                .iter()
+                .any(|d| d.message.contains("result")),
+            "a `complete from` keeping only public fields must not leak"
+        );
+        let leak = program
+            .replace("FIELDS", "id string  ssn string")
+            .replace("KEEP", "id\n    ssn");
+        let ir = compile_program(&leak).ir.expect("compiles");
+        let env = Envelope::from_json(envelope).expect("valid");
+        assert!(
+            check_with_envelope(&ir, &VerifiedEnvelope::for_test(env))
+                .iter()
+                .any(|d| d.message.contains("bounded-type egress") && d.message.contains("result")),
+            "a `complete from` keeping a confidential field must be flagged"
+        );
+    }
+
+    #[test]
     fn bounded_type_record_projection_is_governed_by_kept_fields() {
         // DR-0027 auto-redaction (bounded-type): `record T from <src>` keeps exactly
         // the listed shorthand fields, so it is governed by those fields' per-field

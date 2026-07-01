@@ -31639,7 +31639,7 @@ fn append_workflow_terminal(
     let payload = Value::Object(parse_record_fields(
         &terminal.body,
         context,
-        None,
+        terminal.from.as_deref(),
         &mut lowering.errors,
     ));
     let payload_json = payload.to_string();
@@ -31684,6 +31684,9 @@ struct RecordBlock {
 struct TerminalBlock {
     kind: WorkflowTerminalKind,
     name: String,
+    /// `complete <T> from <binding>`: bounded-type projection source. The payload
+    /// shorthand fields copy this binding's same-named fields. `None` otherwise.
+    from: Option<String>,
     body: String,
 }
 
@@ -33722,18 +33725,31 @@ fn top_level_terminal_blocks(body: &str) -> Vec<TerminalBlock> {
             index += 1;
             continue;
         };
-        let Some(name) = rest.split('{').next().and_then(|header| {
-            let mut parts = header.split_whitespace();
-            match (parts.next(), parts.next()) {
-                (Some(name), None) if is_identifier(name) => Some(name.to_owned()),
-                _ => None,
-            }
-        }) else {
+        // Header is `<name>` or (for `complete`) `<name> from <binding>` — the
+        // bounded-type projection form, whose shorthand payload copies the binding.
+        let header = rest.split('{').next().unwrap_or("");
+        let mut parts = header.split_whitespace();
+        let Some(name) = parts.next().filter(|n| is_identifier(n)).map(str::to_owned) else {
             index += 1;
             continue;
         };
+        let from = match (parts.next(), parts.next(), parts.next()) {
+            (None, _, _) => None,
+            (Some("from"), Some(binding), None) if is_identifier(binding) => {
+                Some(binding.to_owned())
+            }
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
         if let Some(body) = inline_block_body(trimmed) {
-            blocks.push(TerminalBlock { kind, name, body });
+            blocks.push(TerminalBlock {
+                kind,
+                name,
+                from,
+                body,
+            });
             index += 1;
             continue;
         }
@@ -33752,6 +33768,7 @@ fn top_level_terminal_blocks(body: &str) -> Vec<TerminalBlock> {
         blocks.push(TerminalBlock {
             kind,
             name,
+            from,
             body: block_lines.join("\n"),
         });
     }

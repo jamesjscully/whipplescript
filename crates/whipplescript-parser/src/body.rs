@@ -468,6 +468,11 @@ pub enum HandlerKind {
 pub struct TerminalStmt {
     pub kind: TerminalKind,
     pub name: String,
+    /// `complete <T> from <binding>`: a bounded-type projection egress — the payload
+    /// is the source binding projected to `T`'s fields (the shorthand copies), the
+    /// dual of `record <T> from <binding>`. `None` for the ordinary explicit-field
+    /// form. Only meaningful for `Complete`.
+    pub from: Option<String>,
     pub fields: Vec<FieldAssign>,
     pub span: SourceSpan,
 }
@@ -3288,10 +3293,19 @@ impl<'a> BodyParser<'a> {
             TerminalKind::Fail
         };
         let name = self.ident_text("terminal contract name")?;
-        let fields = self.parse_field_block(false)?;
+        // `complete <T> from <binding> { … }`: bounded-type projection. Only valid on
+        // `complete` (a failure carries an explicit payload). Shorthand fields in the
+        // block copy the source binding's same-named fields, as in `record … from`.
+        let from = if kind == TerminalKind::Complete && self.consume_ident("from") {
+            Some(self.ident_text("binding name after `from`")?)
+        } else {
+            None
+        };
+        let fields = self.parse_field_block(from.is_some())?;
         Some(BodyStmt::Terminal(TerminalStmt {
             kind,
             name,
+            from,
             fields,
             span: self.span_from(start),
         }))
@@ -3305,6 +3319,7 @@ impl<'a> BodyParser<'a> {
         Some(BodyStmt::Terminal(TerminalStmt {
             kind: TerminalKind::FailInternal,
             name: String::new(),
+            from: None,
             fields: Vec::new(),
             span: self.span_from(start),
         }))
@@ -3343,6 +3358,22 @@ mod tests {
         assert_eq!(source, "customer");
         assert_eq!(keep, &["id".to_owned(), "status".to_owned()]);
         assert_eq!(binding, "safe");
+    }
+
+    #[test]
+    fn parses_complete_from_projection() {
+        let ast = parse_ok("complete result from cust {\n  id\n  status\n}");
+        let BodyStmt::Terminal(terminal) = &ast.statements[0] else {
+            panic!("expected terminal, got {:?}", ast.statements[0]);
+        };
+        assert_eq!(terminal.kind, TerminalKind::Complete);
+        assert_eq!(terminal.name, "result");
+        assert_eq!(terminal.from.as_deref(), Some("cust"));
+        assert_eq!(terminal.fields.len(), 2);
+        assert!(terminal
+            .fields
+            .iter()
+            .all(|f| matches!(f.value, FieldValue::Shorthand)));
     }
 
     #[test]
