@@ -73,18 +73,18 @@ The target behavior is specified in [language.md](language.md),
   `dev_projects_{failed,timed_out,cancelled}_child_workflow_invocation`.)
 - [x] Provider and harness failures remain effect/run events and evidence; they
   do not automatically fail a workflow unless source rules choose to `fail`. (Done: 503 auto-fail is scoped to UNHANDLED effect failures in self-terminating flows — main.rs ~20105; see [project-503-autofail].)
-- [~] The generated Maude/check path can represent pattern provenance,
-  workflow terminal actions, and invocation edges from compiled IR. **Deferred —
-  model-first piece, de-risked.** The kernel model *already* has every rule needed
-  (`elaborate-pattern` → `ruleProvenance`; `complete-workflow`/`fail-workflow` →
-  `workflowCompletedEvt`/`workflowFailedEvt`; `start-workflow-invocation` +
-  `complete/fail/cancel-workflow-invocation` → `invocationOutput/Failure/Cancellation`,
-  kernel.maude:585/698/703/757-774). What remains is emitting those searches from
-  `generate_maude_model_search` (main.rs:38686) over `ir.pattern_applications`,
-  `rule.metadata.terminal_outputs`/`terminal_completes`, and `WorkflowInvoke`
-  effects — synthesizing the InstanceId/WorkflowId/OutputId/FactId ops and initial
-  configs. Held for a focused model-first pass (getting the generated Maude wrong
-  would break the formal-models gate), not a correctness gap.
+- [x] The generated Maude/check path can represent pattern provenance,
+  workflow terminal actions, and invocation edges from compiled IR. **Shipped
+  2026-07-01 (commit 5d233c8).** `generate_maude_model_search` now emits searches
+  over `ir.pattern_applications` (elaborate-pattern), Output/Failure
+  `workflow_contracts` (complete/fail-workflow), and `WorkflowInvoke` effects
+  (start/complete/fail-workflow-invocation) against the existing kernel rules —
+  `collect_composition_symbols` synthesizes the PatternId/WorkflowId/InstanceId/
+  OutputId/FailureId ops and `append_composition_model_searches` emits paired
+  coverage + bite (RESIDUAL soup) searches. Tests
+  `generates_composition_model_searches_from_ir` +
+  `generated_composition_model_search_runs_clean_in_maude` (assert warning-free +
+  expected outcomes); verified against real examples.
 - [~] Examples and docs use one canonical spelling for each concept. **Partial:**
   examples are canonical (37/37 explicit `workflow`; new include/pattern/parent-child
   examples use the canonical spellings); the cross-doc canonicalization sweep is the
@@ -101,11 +101,15 @@ The target behavior is specified in [language.md](language.md),
 - [x] Implement include resolution with cycle detection and stable ordering.
   (`SourceBundleResolver` main.rs:37432 — active-stack cycle detection, visited
   dedup, deterministic pre-order concat.)
-- [~] Preserve per-file source spans through parse, typecheck, diagnostics, and
-  formatted output. **Partial:** the bundle is concatenated into one `source`
-  string (main.rs:37549) and spans are re-derived over the combined text, so a
-  span's originating *file* is not distinctly preserved. Deferred — no diagnostic
-  currently needs per-file attribution; revisit if cross-file diagnostics land.
+- [x] Preserve per-file source spans through parse, typecheck, diagnostics, and
+  formatted output. **Shipped 2026-07-01 (commit 7785aec).** The include-bundle
+  resolver builds a sorted per-file `SourceSegment{start,path}` table during
+  concatenation; `resolve_span_file` maps any combined-source offset back to its
+  originating file + in-file offset, and `render_bundle_diagnostic` renders against
+  the real file with the file's own line numbering (wired into report_compile_failure,
+  check, compile warnings, parse/include-error paths). Tests
+  `resolve_span_file_maps_offset_to_originating_file` +
+  `included_file_diagnostic_names_the_included_file`.
 - [x] Record include closure and content hashes in typed IR / program metadata.
   (`IrInclude{path,source_hash}` main.rs:37531; whole-closure `bundle_hash`
   kernel/lib.rs:2571; surfaced in `include_closure`.)
@@ -176,21 +180,28 @@ The target behavior is specified in [language.md](language.md),
 
 - [x] Add AST/IR nodes for `pattern` declarations with typed parameters.
   (`PatternDecl{type_params}` lib.rs:186; `IrPatternApplication` lib.rs:857.)
-- [~] Specify and implement the allowed pattern body surface. **Partial:** bodies
-  expand via `expand_pattern_item` (lib.rs:4162) and terminal actions are rejected
-  in pattern bodies; there is no explicit *allow-list* of permitted body constructs
-  beyond that. Deferred — the deny (terminals) is the load-bearing rule.
+- [x] Specify and implement the allowed pattern body surface. **Shipped 2026-07-01
+  (commit 7785aec).** `pattern_body_admission` is the explicit allow-list gate: a
+  pattern body may contain rules/effects/records/local schemas/tables/agents/
+  coordination resources, but NOT workflow contracts, nested pattern declarations,
+  nested applications, or a rule that reaches a workflow terminal (`complete`/`fail`)
+  — each rejected with a clear diagnostic. Modeled in
+  `models/maude/pattern-body-surface.maude` (6 coverage / 2 bite); tests
+  `rejects_terminal_statement_in_pattern_body` +
+  `rejects_workflow_contract_in_pattern_body`. (Recursive nested `apply` stays
+  rejected per the pattern-recursion decision — line 198.)
 - [x] Implement `apply Pattern { ... }` with typed argument validation. (Type +
   simple value args; `expand_pattern_applications` lib.rs:3961, test
   `expands_pattern_applications_with_hygienic_names`.)
 - [x] Generate hygienic names for expanded rules/effects/facts.
   (`IrPatternApplication.generated`; hygiene tests lib.rs:19789.)
-- [~] Attach provenance for every generated declaration back to both the pattern
-  definition and application site. **Partial:** name-level provenance is recorded
-  (`pattern`+`alias`+`generated`, lib.rs:857, surfaced in the `.ir` snapshot and
-  `pattern_applications` report); **source-span** back-links to the definition and
-  application site are not yet attached. Deferred — names suffice for the current
-  provenance report; spans are an LSP-grade enhancement.
+- [x] Attach provenance for every generated declaration back to both the pattern
+  definition and application site. **Shipped 2026-07-01 (commit 7785aec).**
+  `IrPatternApplication` now carries `definition_span` (the `pattern` decl) and
+  `application_span` (the `apply` site), both surfaced in the `.ir` snapshot as
+  `defined-at`/`applied-at` (in addition to the name-level `pattern`+`alias`+
+  `generated`). Golden `examples/reusable-review-pattern.ir` regenerated; test
+  `pattern_application_records_definition_and_application_spans`.
 - [x] Reject recursive pattern application. v0 decision: pattern expansion is
   **non-recursive only**; any `apply` that reaches another `apply` of a pattern
   already on the expansion stack is the compile-time error
@@ -205,11 +216,11 @@ The target behavior is specified in [language.md](language.md),
   expansion (transitive elaboration) remains a separate deferred slice (line 159).
 - [x] Add formatter support that preserves author-written `pattern` and `apply`
   syntax rather than formatting expanded output.
-- [~] Add golden IR snapshots that show generated declarations plus provenance.
-  **Partial:** `examples/reusable-review-pattern.ir` carries a
-  `pattern_applications` section (emitter lib.rs:2593); provenance is name-level
-  only (see the provenance item above) and only one golden covers it. Deferred
-  with that provenance enhancement.
+- [x] Add golden IR snapshots that show generated declarations plus provenance.
+  **Shipped 2026-07-01 (commit 7785aec + a3f09ac).** `examples/reusable-review-pattern.ir`
+  now shows the generated declarations AND source-span provenance
+  (`defined-at`/`applied-at`), regenerated against the current compiler; asserted by
+  `example_ir_snapshots_are_stable`.
 
 ## Phase 4: Terminal Workflow Actions
 
@@ -241,13 +252,15 @@ The target behavior is specified in [language.md](language.md),
   [language.md](language.md#workflow-contracts-and-invocation).
   (Absorbing-status + `duplicate_terminal_completion_rolls_back_event`
   store/lib.rs:9264.)
-- [~] Add status/diagnostics output that clearly distinguishes workflow failure
-  from provider/effect failure. **Partial:** `flowfail` (503 auto-fail) is
-  separated from typed `fail` (lib.rs:6322, `validate_flowfail_generated_only`
-  lib.rs:6422) and provider failure surfaces as evidence in the event stream
-  (`dev_fixture_failure_reaches_event_stream`); there is no dedicated status-surface
-  *field* that labels the two categories side by side. Deferred — a status-UX polish
-  item, not a correctness gap.
+- [x] Add status/diagnostics output that clearly distinguishes workflow failure
+  from provider/effect failure. **Shipped 2026-07-01 (commit f878df4).**
+  `whip status --json` now carries a `failure_surface` field distinguishing
+  workflow-level failure (author `fail` vs generated `flowfail`, via
+  `workflow_fail_kind`) from provider/effect failure evidence
+  (`provider_failure_count`/present). Test
+  `status_failure_surface_separates_workflow_fail_from_provider_evidence`. (The
+  author-fail category is fully tested; the `flowfail`/internal branch is
+  logic-complete.)
 
 ## Phase 5: Durable Workflow Invocation
 
@@ -284,6 +297,17 @@ The target behavior is specified in [language.md](language.md),
   `_accepts_a_valid_child_output_field`; example `typed-invoke-result.whip`.
   Deferred: scalar child outputs (bind `r` to a scalar *value*, not a schema — a
   different mechanism; low value, runtime already exposes it).
+- [x] **Typed invoke results (FAILURE side) — SHIPPED 2026-07-01 (commit 91453d9).**
+  `after child fails as f` now binds `f` to the child's declared FAILURE contract
+  class when it is a sole, shared, parent-scope-resolvable class (via
+  `invoke_failure_class` + `WorkflowInputSurface.failures`), so `f.<field>`
+  type-checks against the child's failure shape; a non-invoke fails binding
+  (coerce/exec) or an unresolvable/child-local/multiple failure falls back to the
+  DR-0032 `TerminalFailed` base (the `failed_child_invocation_drives_parent_failure_branch`
+  regression with a child-local `CFail` still resolves `f.reason` via the base).
+  Model `invoke-result-typing.maude` extended to 7/3; tests
+  `typed_invoke_failure_checks_field_access_against_child_failure` +
+  `_accepts_a_valid_child_failure_field`.
 - [x] Ensure child provider failures do not bypass child workflow rules or
   directly complete the parent invocation.
   (`failed_child_invocation_drives_parent_failure_branch` control_plane.rs:5759.)
@@ -321,10 +345,12 @@ The target behavior is specified in [language.md](language.md),
   + direct-recursive (lib.rs:8771/8786), and **transitive** recursive invocation
   (`detect_workflow_invoke_recursion`) are diagnosed; only *unauthorized* target
   remains (gated on the scoping/authorization decision). Deferred to that decision.
-- [~] Generate Maude fixtures from compiled IR for workflow terminal and
-  invocation invariants. **Deferred — same model-first piece as the "generated
-  Maude/check path" acceptance gate above** (kernel rules exist; emit searches
-  from `generate_maude_model_search`). Held for a focused pass.
+- [x] Generate Maude fixtures from compiled IR for workflow terminal and
+  invocation invariants. **Shipped 2026-07-01 (commit 5d233c8)** — same piece as
+  the "generated Maude/check path" acceptance gate above; `generate_maude_model_search`
+  emits terminal (complete/fail-workflow) + invocation (start/complete/fail-workflow-
+  invocation) + pattern-elaboration searches from compiled IR, verified running
+  clean in Maude by test.
 - [x] Add expected-failure fixtures for broken terminal validation, post-terminal
   mutation, and direct parent completion without child terminal state.
   Broken terminal validation → check-time fixture
@@ -364,21 +390,25 @@ The target behavior is specified in [language.md](language.md),
   `rule_commit_with_workflow_terminal_updates_instance_atomically` store/lib.rs:8959.)
 - [x] Update worker/stepper scheduling to run child workflow instances.
   (`worker_resumes_running_workflow_invocation` control_plane.rs:11496.)
-- [~] Update `whip status` to show parent/child invocation trees. **Partial:**
-  one level of `parent` + `children` invocation links is emitted (main.rs:40783);
-  a recursive multi-level tree is not yet assembled. Deferred — status-UX polish.
-- [~] Update JSON traces to include source bundle, workflow id, pattern
-  provenance, invocation id, and terminal payload references. **Partial:** the
-  compiled-IR JSON carries `include_closure`/`bundle_hash`/`pattern_applications`
-  and status JSON carries invocation links; runtime *event* traces
-  (kernel/trace.rs) do not yet uniformly stamp workflow-id/pattern-provenance/
-  invocation-id. Deferred — observability enrichment, not a transition blocker.
-- [~] Update `whip diagnostics` to group errors by file, workflow, pattern
-  application, and generated declaration. **Deferred.** The `diagnostics` command
-  exists (main.rs:178) but emits a flat list; grouping by file/workflow/
-  pattern-application/generated-decl is a diagnostics-UX enhancement. Workflow-local
-  scoping has now landed (2026-07-01), so the `workflow` grouping key is meaningful
-  and this is un-gated — a scoped follow-on, not decision-blocked.
+- [x] Update `whip status` to show parent/child invocation trees. **Shipped
+  2026-07-01 (commit f878df4).** `whip status --json` emits a recursive
+  `invocation_tree` — each child invocation node carries a nested `children` array
+  (walks `list_child_workflow_invocations` from each child, depth-guarded at 64);
+  test `status_assembles_multi_level_invocation_tree` (3-level Parent→Child→GrandChild).
+- [x] Update JSON traces to include source bundle, workflow id, pattern
+  provenance, invocation id, and terminal payload references. **Shipped 2026-07-01
+  (commit f878df4).** `whip log --json` now stamps each event with `instance_id`,
+  `workflow_id`, `workflow_version_id`, and `invocation_id` (spawning invocation for
+  child instances, null for roots); compiled-IR JSON already carried
+  `include_closure`/`bundle_hash`/`pattern_applications`. Test
+  `log_json_stamps_invocation_and_workflow_provenance`.
+- [x] Update `whip diagnostics` to group errors by file, workflow, pattern
+  application, and generated declaration. **Shipped 2026-07-01 (commit f878df4).**
+  `whip diagnostics --grouped --json` returns a `whipplescript.diagnostics_grouped.v0`
+  object grouping findings by file / workflow instance / `subject_type` (the latter
+  carries pattern-application + generated-declaration provenance); default output
+  stays a flat array for back-compat. Test
+  `diagnostics_grouped_buckets_findings_by_provenance`.
 
 ## Phase 8: Examples And Docs
 
@@ -396,20 +426,30 @@ The target behavior is specified in [language.md](language.md),
   — one parent rule with `after child succeeds/fails/times out/cancelled` branches;
   in the docs-examples gate with `--root Parent`.)
 - [~] Update quickstart, language sketch, examples spec, companion skill, and
-  troubleshooting docs to use the canonical model. **Partial:** the explicit
-  `workflow` keyword is canonical in docs/quickstart.md, tutorial.md, and
-  language-reference.md; a full sweep for the `include`/`pattern`/`invoke`
-  canonical spellings across the companion skill + troubleshooting is outstanding.
-  Deferred — doc-polish, best done as one sweep once the scoping decision settles
-  the surface.
+  troubleshooting docs to use the canonical model. **Mostly done (2026-07-01 sweep,
+  Work Item 5).** The `include`/`pattern`/`invoke`/`complete`/`fail`/`workflow`
+  spellings were swept across the companion skill (`skills/whipplescript-author/SKILL.md`)
+  and both troubleshooting docs and found ALREADY canonical; the one obsolete
+  phrasing (BAML terminology) was corrected in SKILL.md. **Remaining as its own
+  work item:** a `docs/*.md` BAML→coerce sweep (stale `baml.coerce` effect-kind
+  prose in language-reference.md/api-reference.md/manual.md/providers.md/troubleshooting.md
+  — caution: confirm whether the runtime provider registration name is still
+  literally `baml` before rewriting env examples).
 - [~] Document the canonical explicit-workflow shape in examples and quickstart.
   **Partial:** the explicit `workflow` shape is present in quickstart; the new
   `include`/`pattern`/parent-child examples (above) document those shapes. Full
   cross-doc canonical-shape section deferred with the sweep above.
 - [~] Remove or downgrade examples that imply lifecycle patterns are built into
-  the language. **Deferred — needs a judgment call** on which examples over-promise
-  built-in lifecycle (vs demonstrating composition). A per-example audit for Jack's
-  review, not a mechanical change. See Open Decisions.
+  the language. **Audited 2026-07-01 (Work Item 5) — corpus is already
+  Phase-8-compliant; no rewrite needed.** Nearly every pattern-heavy example carries
+  an explicit "this is composition, not a primitive" framing comment (circuit-breaker,
+  autoresearch-lite, reusable-review-pattern, scheduled-escalation, gastown-lite,
+  openclaw-lite, human-review, queue-worker-with-review, the revision examples). One
+  marginal nit left for Jack's judgment (NOT changed): `ralph.whip` lacks the
+  framing comment its siblings have and its `@service` + re-tell-on-completion rules
+  could read as a built-in "loop"; `docs/examples.md:39` already frames it correctly.
+  Suggested optional one-liner: "# Recurrence is composition: `when ralph completed
+  turn` re-triggers; there is no loop construct."
 
 ## Phase 9: E2E And validation
 
