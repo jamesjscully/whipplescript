@@ -63,7 +63,7 @@ radio-style choice lists are excluded from checkbox counting.
 | `spec/workflow-composition-transition-tracker.md` | active | Migrating to the workflow-composition model (invoke/subworkflows) | 2026-06-30 |
 | `spec/decision-records/language-ergonomics-tracker.md` | active | v2 language-surface ergonomics decisions + build-out; **canonical home** for the small-language-follow-ups (see dedup) — Part B reconciled 2026-07-01, only B1a-refactor / B1g fuzz / `consume`-removal remain | 2026-07-01 |
 | `spec/decision-records/standard-package-design-tracker.md` | active | Open design todos for the standard packages | 2026-06-30 |
-| `spec/decision-records/discriminated-families-design.md` | closed | Discriminated-families design — whole tracker shipped (Stages 1a/1b/2/3/4 + capstone); §9 open questions are design Qs, not unbuilt work | 2026-07-01 |
+| `spec/decision-records/discriminated-families-design.md` | active | Discriminated-families — all four families + selector capstone SHIPPED & gated; §5.4 observer-only construction gap (forgeable `record TerminalFailed {…}`) FIXED 2026-07-01 (`is_observer_only_schema` + 2 tests). Remaining: Stage 1a `[~]` records only that the internal pass-collapse refactor was dropped (Rev 2026-06-28e, no capability loss); §9 = design Qs. Effectively done — closeable once the `[~]` framing settles. | 2026-07-01 |
 | `spec/review-change-plan.md` | closed | 2026-06-09 review pass — shipped; remaining follow-ups folded into language-ergonomics (dedup) | 2026-07-01 |
 | `spec/final-audit.md` | active | Running v0 audit log for release readiness | 2026-06-30 |
 | `spec/real-provider-validation-tracker.md` | closed | Real (live) provider validation — all v0 items shipped | 2026-06-30 |

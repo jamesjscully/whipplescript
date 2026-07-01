@@ -6198,6 +6198,19 @@ fn is_builtin_schema_ref(name: &str) -> bool {
     )
 }
 
+/// The terminal-family schemas are `origin = observer` (discriminated-families
+/// design §5.4): the kernel projects them when it observes an effect or child
+/// terminal, and user rules may only *eliminate* them (`after … fails/times
+/// out/cancels as f`), never *construct* them. A rule that `record`s one would
+/// forge a terminal outcome the kernel never produced, misleading the
+/// `after`/terminal-case reaction machinery. Rejected at check time.
+fn is_observer_only_schema(name: &str) -> bool {
+    matches!(
+        name,
+        "TerminalFailed" | "TerminalTimedOut" | "TerminalCancelled"
+    )
+}
+
 fn lower_rule(
     rule: RuleDecl,
     semantic: &SemanticContext,
@@ -7141,7 +7154,20 @@ fn analyze_rule(
         }
 
         if let Some((schema, _)) = parse_record_start(line) {
-            if !semantic.schemas.class_exists(&schema) {
+            if is_observer_only_schema(&schema) {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` cannot record kernel-owned terminal schema `{schema}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some(
+                        "the terminal family (`TerminalFailed`/`TerminalTimedOut`/`TerminalCancelled`) is produced only by the kernel; to fail this workflow use `fail <failure> { ... }`, and to react to an effect terminal use `after <effect> fails/times out/cancels as f`"
+                            .to_owned(),
+                    ),
+                });
+            } else if !semantic.schemas.class_exists(&schema) {
                 diagnostics.push(Diagnostic {
                     related: Vec::new(),
                     span: rule.body.span,
@@ -22757,6 +22783,75 @@ rule r
                 .iter()
                 .any(|d| d.message.contains("reuses effect binding `v`")),
             "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_recording_observer_only_terminal_schema() {
+        // §5.4: the terminal family is `origin = observer` — the kernel projects
+        // it, user rules may only eliminate it. A rule that `record`s a terminal
+        // schema forges an outcome the kernel never produced, so it is rejected.
+        for schema in ["TerminalFailed", "TerminalTimedOut", "TerminalCancelled"] {
+            let source = format!(
+                r#"
+workflow Forge
+
+input item Job
+output result Done
+
+class Job {{ id string }}
+class Done {{ id string }}
+
+rule sneak
+  when Job as q
+=> {{
+  record {schema} {{ reason "x" summary "y" }}
+  complete result {{ id q.id }}
+}}
+"#
+            );
+            let compiled = compile_program(&source);
+            assert!(
+                compiled
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.contains(&format!(
+                        "cannot record kernel-owned terminal schema `{schema}`"
+                    ))),
+                "expected rejection for {schema}, got {:?}",
+                compiled.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn allows_recording_user_writable_builtin_schema() {
+        // Regression guard for the fix above: `WorkItem` is a builtin schema ref
+        // but user-writable (work-tracking state), so recording it must NOT be
+        // rejected as observer-only.
+        let source = r#"
+workflow WriteWork
+
+input item Job
+output result Done
+
+class Job { id string }
+class Done { id string }
+
+rule track
+  when Job as q
+=> {
+  record WorkItem { title "t" status "reviewed" }
+  complete result { id q.id }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            !compiled.diagnostics.iter().any(|d| d
+                .message
+                .contains("cannot record kernel-owned terminal schema")),
+            "WorkItem must remain user-writable, got {:?}",
             compiled.diagnostics
         );
     }
