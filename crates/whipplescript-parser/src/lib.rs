@@ -6890,6 +6890,51 @@ fn validate_workflow_terminal_actions(
         let Some((action, rest, declared)) = terminal else {
             continue;
         };
+        // Scalar terminal form: `complete result 0.9` / `fail error "msg"` — a bare
+        // value after the name, with no `{ }` block and no `from` projection.
+        // Validated against a scalar (primitive) contract; class contracts still
+        // require a field block (checked by the block path below).
+        if !rest.contains('{') {
+            let tokens: Vec<&str> = rest.split_whitespace().collect();
+            let is_from = matches!(tokens.as_slice(), [_, "from", ..]) && action == "complete";
+            if tokens.len() >= 2 && !is_from {
+                let name = tokens[0];
+                let value = rest.trim().get(name.len()..).unwrap_or("").trim();
+                if !declared.contains_key(name) {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: rule.body.span,
+                        message: format!(
+                            "rule `{}` {action}s unknown workflow terminal `{name}`",
+                            rule.name.name
+                        ),
+                        suggestion: Some(format!(
+                            "declare `{kind} {name} Type` on the workflow first",
+                            kind = if action == "complete" {
+                                "output"
+                            } else {
+                                "failure"
+                            }
+                        )),
+                    });
+                    continue;
+                }
+                if let Some(contract_ty) = declared.get(name) {
+                    validate_scalar_terminal_payload(
+                        rule,
+                        action,
+                        name,
+                        value,
+                        contract_ty,
+                        semantic,
+                        binding_types,
+                        known_roots,
+                        diagnostics,
+                    );
+                }
+                continue;
+            }
+        }
         // Header is `<name>` or (for `complete`) `<name> from <binding>` — the
         // bounded-type projection form (DR-0027), whose payload copies the binding.
         let Some(name) = rest.split('{').next().and_then(|header| {
@@ -6969,14 +7014,31 @@ fn validate_workflow_terminal_payload(
     };
     let schema = match contract_ty {
         TypeSyntax::Ref { name } if semantic.schemas.class_exists(&name.name) => &name.name,
+        TypeSyntax::Primitive { .. }
+        | TypeSyntax::LiteralString { .. }
+        | TypeSyntax::Union { .. } => {
+            // A scalar (primitive/literal/union) contract takes a bare value, not
+            // a field block.
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: rule.body.span,
+                message: format!(
+                    "workflow terminal `{terminal_name}` has a scalar payload contract but is given a field block"
+                ),
+                suggestion: Some(format!(
+                    "write a bare scalar value: `{action} {terminal_name} <value>`"
+                )),
+            });
+            return;
+        }
         _ => {
             diagnostics.push(Diagnostic { related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
-                    "workflow terminal `{terminal_name}` uses a non-class payload contract"
+                    "workflow terminal `{terminal_name}` uses an unsupported payload contract type"
                 ),
                 suggestion: Some(
-                    "declare terminal payloads as a class until scalar terminal payload syntax is supported"
+                    "declare the terminal payload as a class (field block) or a scalar type (number/string/bool)"
                         .to_owned(),
                 ),
             });
@@ -7000,6 +7062,93 @@ fn validate_workflow_terminal_payload(
         );
     }
     validate_required_terminal_fields(rule, schema, terminal_name, &body, semantic, diagnostics);
+}
+
+/// Validates a bare-scalar terminal payload (`complete result 0.9` /
+/// `fail error "reason"`) against a scalar output/failure contract. A class
+/// contract is rejected (it needs a field block); a literal value is typechecked
+/// against the primitive/enum/union contract, and a binding-expression value has
+/// its roots and field path validated.
+#[allow(clippy::too_many_arguments)]
+fn validate_scalar_terminal_payload(
+    rule: &RuleDecl,
+    action: &str,
+    terminal_name: &str,
+    value: &str,
+    contract_ty: &TypeSyntax,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    known_roots: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if let TypeSyntax::Ref { name } = contract_ty {
+        if semantic.schemas.class_exists(&name.name) {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: rule.body.span,
+                message: format!(
+                    "workflow terminal `{terminal_name}` has a class payload contract `{}` but is given a bare scalar value",
+                    name.name
+                ),
+                suggestion: Some(format!("write a field block: `{action} {terminal_name} {{ … }}`")),
+            });
+            return;
+        }
+    }
+    if value.is_empty() {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: rule.body.span,
+            message: format!("workflow terminal `{terminal_name}` is missing its scalar value"),
+            suggestion: Some(format!("write `{action} {terminal_name} <value>`")),
+        });
+        return;
+    }
+    // A literal value is typechecked against the scalar contract; a binding
+    // expression has its roots (and any field path) validated.
+    validate_literal_assignment(
+        rule,
+        terminal_name,
+        "value",
+        contract_ty,
+        value,
+        semantic,
+        diagnostics,
+    );
+    if let Some(root) = dangling_value_root(value, known_roots) {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: rule.body.span,
+            message: format!(
+                "rule `{}` has unknown binding `{root}` in `{action} {terminal_name}` value",
+                rule.name.name
+            ),
+            suggestion: Some(
+                "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern"
+                    .to_owned(),
+            ),
+        });
+    } else if let Some((root, path)) = expression_path(value) {
+        if let Some(schema) = binding_types.get(&root) {
+            if semantic.schemas.class_exists(schema) {
+                if let Err(message) = semantic.schemas.resolve_field_path(schema, &path) {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: rule.body.span,
+                        message: format!(
+                            "rule `{}` has invalid field path `{root}.{}`: {message}",
+                            rule.name.name,
+                            path.join(".")
+                        ),
+                        suggestion: Some(
+                            "use a field declared on the bound schema or add it to the class declaration"
+                                .to_owned(),
+                        ),
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn validate_required_terminal_fields(
@@ -7842,6 +7991,12 @@ fn collect_egress_payload_reads(
             body::BodyStmt::Terminal(terminal) if terminal.kind == body::TerminalKind::Complete => {
                 let mut roots = BTreeSet::new();
                 collect_payload_field_roots(&terminal.fields, None, &mut roots);
+                // A bare scalar payload's value expression is the whole egress
+                // value; its binding roots must join the sink's label (fail-closed
+                // — otherwise `complete result secret.value` would under-report).
+                if let Some(body::FieldValue::Expr { expr, .. }) = &terminal.scalar {
+                    collect_expr_binding_roots(expr, &mut roots);
+                }
                 out.push((terminal.name.clone(), roots));
             }
             body::BodyStmt::Record(record) => out.push(record_payload_reads(record)),
@@ -12534,14 +12689,28 @@ fn validate_conditioned_field_reads(
                 allowed,
                 diagnostics,
             ),
-            body::BodyStmt::Terminal(terminal) => check_conditioned_reads_in_fields(
-                rule,
-                &terminal.fields,
-                semantic,
-                binding_types,
-                allowed,
-                diagnostics,
-            ),
+            body::BodyStmt::Terminal(terminal) => {
+                check_conditioned_reads_in_fields(
+                    rule,
+                    &terminal.fields,
+                    semantic,
+                    binding_types,
+                    allowed,
+                    diagnostics,
+                );
+                // A bare scalar payload value is also an egress read.
+                if let Some(body::FieldValue::Expr { source, .. }) = &terminal.scalar {
+                    check_conditioned_reads_in_text(
+                        rule,
+                        source,
+                        terminal.span,
+                        semantic,
+                        binding_types,
+                        allowed,
+                        diagnostics,
+                    );
+                }
+            }
             body::BodyStmt::Done {
                 replacement: Some(record),
                 ..
@@ -20679,25 +20848,106 @@ rule bad
     }
 
     #[test]
-    fn rejects_non_class_workflow_terminal_payload_contracts_for_now() {
+    fn scalar_terminal_contract_accepts_bare_value() {
+        // A scalar output contract takes a bare scalar terminal payload.
         let source = r#"
 workflow ScalarTerminal {
-  output result string
+  output result float
+  failure error string
+
+  rule good
+    when started
+  => {
+    complete result 0.9
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "scalar terminal payload rejected: {:?}",
+            compiled.diagnostics
+        );
+        assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn scalar_terminal_contract_rejects_a_field_block() {
+        // A scalar contract with a `{ ... }` block is a shape mismatch.
+        let source = r#"
+workflow ScalarTerminal {
+  output result float
 
   rule bad
     when started
   => {
     complete result {
-      value "ok"
+      value 0.9
     }
   }
 }
 "#;
         let compiled = compile_program(source);
         assert!(compiled.ir.is_none());
-        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
-            .message
-            .contains("workflow terminal `result` uses a non-class payload contract")));
+        assert!(
+            compiled.diagnostics.iter().any(|d| d
+                .message
+                .contains("has a scalar payload contract but is given a field block")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn class_terminal_contract_rejects_a_bare_scalar() {
+        // A class contract given a bare scalar value is a shape mismatch.
+        let source = r#"
+workflow ClassTerminal {
+  output result Score
+  class Score { value number }
+
+  rule bad
+    when started
+  => {
+    complete result 0.9
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled.diagnostics.iter().any(|d| d
+                .message
+                .contains("has a class payload contract `Score` but is given a bare scalar value")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn scalar_terminal_value_is_typechecked_against_the_contract() {
+        // A string literal against a `number` scalar contract is a type error.
+        let source = r#"
+workflow ScalarTerminal {
+  output result float
+
+  rule bad
+    when started
+  => {
+    complete result "not a number"
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("result.value") || d.message.contains("number")),
+            "{:?}",
+            compiled.diagnostics
+        );
     }
 
     #[test]

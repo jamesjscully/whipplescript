@@ -10927,6 +10927,75 @@ workflow WorkflowComplete {
 }
 
 #[test]
+fn dev_completes_a_scalar_terminal_payload() {
+    // A workflow with a SCALAR output contract completes with a bare scalar value,
+    // and the stored terminal payload is that scalar (not a field object).
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let workflow_path = temp_workflow_path("workflow-scalar-complete");
+    fs::write(
+        &workflow_path,
+        r#"
+workflow ScalarComplete {
+  output result float
+
+  rule complete_immediately
+    when started
+  => {
+    complete result 0.9
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let status = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "status",
+            instance_id,
+        ],
+    );
+    assert_eq!(
+        status
+            .get("instance")
+            .and_then(|instance| instance.get("status"))
+            .and_then(Value::as_str),
+        Some("completed")
+    );
+    let terminal = status.get("workflow_terminal").expect("terminal");
+    assert_eq!(terminal.get("name").and_then(Value::as_str), Some("result"));
+    // The persisted payload is the bare scalar value, not a `{ field: … }` object.
+    assert_eq!(
+        terminal.get("payload").and_then(Value::as_f64),
+        Some(0.9),
+        "scalar terminal payload not stored as a scalar: {terminal:?}"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
+#[test]
 fn dev_runs_included_bundle_with_explicit_root_selection() {
     // Phase 9 e2e: a source bundle that BOTH pulls in a library file via `include`
     // AND declares multiple workflows (so `--root` is required) runs deterministically

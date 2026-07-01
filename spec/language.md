@@ -443,6 +443,25 @@ compact form takes one or more `name: Type` inputs, an output type after `->`,
 and an optional failure type after `!`. Both forms are legal; `whip fmt`
 normalizes the compact signature to the keyword lines.
 
+A terminal payload contract is either a class (a `{ field ... }` block) or a
+scalar type (`int`/`float`/`string`/`bool`). A class contract takes a field
+block; a scalar contract takes a bare value:
+
+```whip
+workflow Score(ticket: Ticket) -> float ! string
+
+rule score
+  when Ticket as ticket
+=> {
+  complete result 0.9
+}
+```
+
+Giving a scalar contract a `{ … }` block, or a class contract a bare value, is a
+shape mismatch and is rejected. (A parent that `invoke`s such a child observes
+the child's projected terminal; typed field/value access on an invoke result is
+tracked separately from this contract shape.)
+
 Workflow inputs are initial durable facts/events, not in-memory function
 arguments. Workflow outputs are terminal payload contracts, not arbitrary facts
 to watch for. The only successful return path is `complete`; the only declared

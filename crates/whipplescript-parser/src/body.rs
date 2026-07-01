@@ -474,6 +474,12 @@ pub struct TerminalStmt {
     /// form. Only meaningful for `Complete`.
     pub from: Option<String>,
     pub fields: Vec<FieldAssign>,
+    /// A bare scalar payload: `complete result 0.9` / `fail error "reason"`. Set
+    /// when the terminal is written without a `{ … }` block; mutually exclusive
+    /// with `fields` (which is empty) and `from` (a projection needs a block).
+    /// Validated against a scalar (`number`/`string`/`bool`) output/failure
+    /// contract. `None` for the ordinary field-block form.
+    pub scalar: Option<FieldValue>,
     pub span: SourceSpan,
 }
 
@@ -3301,12 +3307,22 @@ impl<'a> BodyParser<'a> {
         } else {
             None
         };
-        let fields = self.parse_field_block(from.is_some())?;
+        // A field block (`complete result { … }`) is the class-shaped form; a bare
+        // value (`complete result 0.9`) is the scalar form. `from` always projects
+        // fields, so it requires a block.
+        let (fields, scalar) =
+            if from.is_none() && !matches!(self.peek().map(|t| &t.tok), Some(Tok::Sym('{'))) {
+                let (source, expr) = self.parse_value_expression()?;
+                (Vec::new(), Some(FieldValue::Expr { source, expr }))
+            } else {
+                (self.parse_field_block(from.is_some())?, None)
+            };
         Some(BodyStmt::Terminal(TerminalStmt {
             kind,
             name,
             from,
             fields,
+            scalar,
             span: self.span_from(start),
         }))
     }
@@ -3321,6 +3337,7 @@ impl<'a> BodyParser<'a> {
             name: String::new(),
             from: None,
             fields: Vec::new(),
+            scalar: None,
             span: self.span_from(start),
         }))
     }

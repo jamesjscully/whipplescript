@@ -87,6 +87,23 @@ The compact form takes one or more `name: Type` inputs, an output type after
 `error`). Both forms are legal to write; `whip fmt` normalizes the compact
 signature to the keyword lines.
 
+A terminal payload contract is either a class or a scalar type
+(`int`/`float`/`string`/`bool`). A class contract is completed with a field
+block; a scalar contract with a bare value:
+
+```whip
+workflow Score(ticket: Ticket) -> float
+
+rule score
+  when Ticket as ticket
+=> {
+  complete result 0.9
+}
+```
+
+Mixing shapes — a block against a scalar contract, or a bare value against a
+class contract — is a compile error.
+
 Every program must declare at least one `workflow`. A file that only declares
 shared types or patterns is a library — `include` it from a workflow rather than
 compiling it on its own; compiling it alone reports `program declares no

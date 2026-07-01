@@ -1028,6 +1028,15 @@ fn print_terminal(
         body::TerminalKind::Fail => "fail",
         body::TerminalKind::FailInternal => unreachable!("handled above"),
     };
+    // A bare scalar payload serializes as `complete <name> <value>` with no block.
+    if let Some(FieldValue::Expr { source, .. }) = &terminal.scalar {
+        push_stmt_line(
+            out,
+            indent,
+            &format!("{keyword} {} {}", terminal.name, rn(source)),
+        );
+        return;
+    }
     let from = terminal
         .from
         .as_ref()

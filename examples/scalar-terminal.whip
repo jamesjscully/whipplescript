@@ -1,0 +1,17 @@
+# Scalar terminal payloads: a workflow whose `output`/`failure` contract is a
+# scalar type (number/string/bool) completes or fails with a bare scalar value
+# instead of a field block. A scalar contract is the deliberate shorthand for a
+# single-value result; a class contract (a `{ field ... }` block) is used when
+# the result has named fields.
+workflow ScoreTicket(ticket: Ticket) -> float ! string
+
+class Ticket {
+  id string
+  title string
+}
+
+rule score
+  when Ticket as ticket
+=> {
+  complete result 0.9
+}

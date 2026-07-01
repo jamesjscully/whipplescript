@@ -137,6 +137,10 @@ workflow-scoping.maude           workflow-local name scoping: a reference resolv
                                  against globals + its own workflow's locals, a
                                  sibling-only local name leaks, and a headerless
                                  program (no explicit workflow) is rejected
+terminal-payload-shape.maude     workflow terminal payload shape: a class contract
+                                 takes a field block, a scalar contract takes a
+                                 matching scalar value; shape/type mismatches are
+                                 rejected, correct shapes never wrongly rejected
 ```
 
 The shell script runs every Maude test file and checks the expected number of

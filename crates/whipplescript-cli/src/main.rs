@@ -31636,12 +31636,18 @@ fn append_workflow_terminal(
     if !workflow_contract_exists(ir, terminal.kind, &terminal.name) {
         return;
     }
-    let payload = Value::Object(parse_record_fields(
-        &terminal.body,
-        context,
-        terminal.from.as_deref(),
-        &mut lowering.errors,
-    ));
+    let payload = if let Some(scalar_source) = &terminal.scalar {
+        // A bare scalar payload: evaluate the value expression to a JSON scalar
+        // (a literal, or a binding path resolved against the rule context).
+        parse_record_field_value("", scalar_source, context, None, &mut lowering.errors)
+    } else {
+        Value::Object(parse_record_fields(
+            &terminal.body,
+            context,
+            terminal.from.as_deref(),
+            &mut lowering.errors,
+        ))
+    };
     let payload_json = payload.to_string();
     let mut key_parts = vec![
         rule.name.as_str(),
@@ -31688,6 +31694,10 @@ struct TerminalBlock {
     /// shorthand fields copy this binding's same-named fields. `None` otherwise.
     from: Option<String>,
     body: String,
+    /// A bare scalar payload value source (`complete result 0.9` → `Some("0.9")`).
+    /// When set, `body` is empty and the payload is the evaluated scalar value
+    /// rather than a field object. `None` for the field-block form.
+    scalar: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33725,18 +33735,43 @@ fn top_level_terminal_blocks(body: &str) -> Vec<TerminalBlock> {
             index += 1;
             continue;
         };
-        // Header is `<name>` or (for `complete`) `<name> from <binding>` — the
-        // bounded-type projection form, whose shorthand payload copies the binding.
+        // Header is `<name>`, `<name> from <binding>` (bounded-type projection), or
+        // `<name> <scalar-value>` (bare scalar payload, no block).
         let header = rest.split('{').next().unwrap_or("");
-        let mut parts = header.split_whitespace();
-        let Some(name) = parts.next().filter(|n| is_identifier(n)).map(str::to_owned) else {
+        let tokens: Vec<&str> = header.split_whitespace().collect();
+        let Some(name) = tokens
+            .first()
+            .filter(|n| is_identifier(n))
+            .map(|n| (*n).to_owned())
+        else {
             index += 1;
             continue;
         };
-        let from = match (parts.next(), parts.next(), parts.next()) {
+        let has_brace = rest.contains('{');
+        let is_from =
+            matches!(tokens.as_slice(), [_, "from", ..]) && kind == WorkflowTerminalKind::Completed;
+        // Scalar terminal: a bare value after the name, no block, no `from`.
+        if !has_brace && tokens.len() >= 2 && !is_from {
+            let value = header
+                .trim()
+                .get(name.len()..)
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            blocks.push(TerminalBlock {
+                kind,
+                name,
+                from: None,
+                body: String::new(),
+                scalar: Some(value),
+            });
+            index += 1;
+            continue;
+        }
+        let from = match (tokens.get(1), tokens.get(2), tokens.get(3)) {
             (None, _, _) => None,
-            (Some("from"), Some(binding), None) if is_identifier(binding) => {
-                Some(binding.to_owned())
+            (Some(&"from"), Some(binding), None) if is_identifier(binding) => {
+                Some((*binding).to_owned())
             }
             _ => {
                 index += 1;
@@ -33749,6 +33784,7 @@ fn top_level_terminal_blocks(body: &str) -> Vec<TerminalBlock> {
                 name,
                 from,
                 body,
+                scalar: None,
             });
             index += 1;
             continue;
@@ -33770,6 +33806,7 @@ fn top_level_terminal_blocks(body: &str) -> Vec<TerminalBlock> {
             name,
             from,
             body: block_lines.join("\n"),
+            scalar: None,
         });
     }
     blocks

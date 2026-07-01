@@ -27,7 +27,7 @@ The target behavior is specified in [language.md](language.md),
 | Conceptual spec | [x] | `workflow`, `pattern`, `rule`, `include`, `use`, `apply`, `invoke`, `complete`, and `fail` are described. |
 | Maude model | [x] | Pattern elaboration, workflow terminal actions, child invocation resolution, and cancellation are modeled. |
 | `use` cleanup | [x] | Source now uses `use memory` for package/library imports; removed `use plugin` and `use skill` forms are rejected. |
-| Parser/runtime implementation | [~] | `include` parsing, CLI source-bundle resolution, duplicate-include diagnostics, explicit multi-workflow root selection, workflow contract IR, class-shaped terminal payload validation, keyed workflow input validation/seeding, pattern expansion with type and simple value arguments, static workflow invocation target/input/direct-recursion validation, resumable dev-worker child workflow invocation with source-span records and success/failure/timeout/cancellation projection, status JSON parent/child invocation links, non-class terminal contract rejection, and basic `complete`/`fail` runtime terminal actions are implemented; scalar terminal payload syntax remains. |
+| Parser/runtime implementation | [x] | `include` parsing, CLI source-bundle resolution, duplicate-include diagnostics, explicit multi-workflow root selection, workflow contract IR, class-shaped terminal payload validation, keyed workflow input validation/seeding, pattern expansion with type and simple value arguments, static workflow invocation target/input/direct-recursion validation, resumable dev-worker child workflow invocation with source-span records and success/failure/timeout/cancellation projection, status JSON parent/child invocation links, both class-shaped AND scalar terminal payloads (`complete result 0.9` against a scalar contract), and basic `complete`/`fail` runtime terminal actions are implemented. |
 | Examples migration | [x] | Done: all 37 `examples/*.whip` begin with an explicit `workflow` declaration (2026-07-01 reconcile). |
 | E2E coverage | [~] | Parser/runtime e2e now covers `include`, explicit root selection, keyed workflow inputs, `pattern`/`apply` with simple value arguments, static workflow invocation target/input validation, `workflow.invoke` child success/failure/timeout/cancellation projection, resumable running invocation completion, status JSON invocation links, and `complete`/`fail`. |
 
@@ -445,12 +445,26 @@ justified deferrals; the calls below unblock the last cluster.
   multi-file coerce need appears; `include` of a `.coerce` member is the smallest
   step then. Closed as deferred (not a transition blocker).
 - [x] **Scalar terminal payloads — RESOLVED 2026-07-01 (Jack): allow bare
-  scalars.** In addition to class-shaped payloads, allow a scalar output/failure
-  contract (`output result number`) with a bare-scalar terminal action
-  (`complete result 0.9`). A scalar binding (`after child succeeds as r`) resolves
-  to the whole value; class bindings keep field access. Whole-value redaction/IFC
-  label for scalar payloads. **Building now** as its own model-first piece
-  (`models/maude/…` for the class-vs-scalar terminal payload shape).
+  scalars — PRODUCER SIDE SHIPPED 2026-07-01.** A scalar output/failure contract
+  (`output result float`, note the primitives are `int`/`float`/`string`/`bool` —
+  not `number`) is completed with a bare value (`complete result 0.9`); a class
+  contract still takes a field block. Shape mismatches (block↔scalar) are rejected.
+  End-to-end: parse (`body.rs` `TerminalStmt.scalar`), typecheck
+  (`validate_scalar_terminal_payload`), lower (contract `ty` already general),
+  runtime store (`append_workflow_terminal` evaluates the scalar to a JSON scalar,
+  not an object), IFC whole-value label (`collect_egress_payload_reads` +
+  conditioned-reads now fold the scalar's read-roots — fail-closed), flow-expand
+  re-print. Model `models/maude/terminal-payload-shape.maude` (6 cov / 2 bite).
+  Tests: 4 parser (accept value / reject block / reject class-vs-scalar / value
+  typecheck) + `dev_completes_a_scalar_terminal_payload` e2e (scalar stored as a
+  scalar). Examples `scalar-terminal.whip`. **CONSUMER SIDE DEFERRED (with cause):**
+  making a parent's `after child succeeds as r` bind `r` to the child's typed
+  scalar value depends on typed invoke-result resolution that does not exist even
+  for CLASS outputs today (`WorkflowInvoke` yields an opaque object
+  `terminal_unknown_payload_type`; `r.field` on an invoke result is currently
+  unchecked). That is an orthogonal feature (typed invoke results), not scalar-
+  specific; the scalar producer side is independently useful (the value is in the
+  run outcome/status). Tracked as its own follow-on.
 - [x] **Recursive workflow invocation policy — RESOLVED 2026-07-01 (Jack): "as
   permissive as provable convergence at compile time allows."** Interpretation:
   whipplescript cannot prove runtime-`invoke` termination at compile time (it is
