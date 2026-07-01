@@ -260,12 +260,17 @@ The target behavior is specified in [language.md](language.md),
   pattern-local scopes, and generated scopes. **Gated on the scoping decision.**
   Only flat/global resolution exists today (post-flatten). A scoped resolver is
   the implementation of that decision (see Phase 2 "local/global scoping rules").
-- [~] Extend cycle analysis so compile-time pattern recursion and runtime
-  workflow invocation cycles are checked separately. **Partial + gated.**
-  Compile-time pattern recursion is fully checked (`detect_pattern_recursion`);
-  the *runtime* invocation-cycle half is only a per-rule direct-self-recursion
-  reject (lib.rs:8771) — transitive invoke-cycle analysis is gated on the
-  "recursive workflow invocation" policy decision (Open Decisions).
+- [x] Extend cycle analysis so compile-time pattern recursion and runtime
+  workflow invocation cycles are checked separately. Compile-time pattern
+  recursion: `detect_pattern_recursion`. Runtime invocation cycles: direct
+  self-invocation rejected per-rule (lib.rs:8766) **and** transitive cycles
+  rejected program-wide by `detect_workflow_invoke_recursion` (built over all
+  workflows' invoke edges before root selection) —
+  `graph.unbounded_workflow_invocation_recursion`, per the 2026-07-01 convergence
+  decision. Tests `rejects_transitive_workflow_invocation_cycle` +
+  `accepts_acyclic_workflow_invocation_chain`; fixture
+  `examples/invalid/recursive-workflow-invocation.whip`; modeled as invoke-graph
+  non-convergence in `subworkflow-convergence.maude`.
 - [x] Add termination/boundedness diagnostics for pattern expansion. v0 target:
   emit `graph.unbounded_pattern_recursion` (severity `error`) for any recursive
   `apply`; bounded-recursion analysis is deferred. **Done 2026-06-18** via
@@ -274,10 +279,10 @@ The target behavior is specified in [language.md](language.md),
   invocation-cycle analysis is separate, line 169).
 - [~] Add invocation graph diagnostics for missing root, ambiguous target,
   unauthorized target, and unsupported recursive invocation. **Partial:**
-  missing-root + ambiguous (`select_root_workflow` lib.rs:2438) and unknown-target
-  + direct-recursive (lib.rs:8771/8786) are diagnosed; *unauthorized* and
-  *transitive* recursive invocation are not (both gated on the recursive-invocation
-  + authorization decisions). Deferred to those decisions.
+  missing-root + ambiguous (`select_root_workflow` lib.rs:2438), unknown-target
+  + direct-recursive (lib.rs:8771/8786), and **transitive** recursive invocation
+  (`detect_workflow_invoke_recursion`) are diagnosed; only *unauthorized* target
+  remains (gated on the scoping/authorization decision). Deferred to that decision.
 - [~] Generate Maude fixtures from compiled IR for workflow terminal and
   invocation invariants. **Deferred — same model-first piece as the "generated
   Maude/check path" acceptance gate above** (kernel rules exist; emit searches
@@ -419,23 +424,27 @@ justified deferrals; the calls below unblock the last cluster.
   class-only the deliberate v0 rule (one payload shape, uniform with `record`;
   scalars can always be a one-field class) and close this as a non-goal rather than
   leave it a lingering "remains."
-- [ ] **Recursive workflow invocation policy.** Whether runtime `invoke` cycles
-  (distinct from compile-time `apply`) are rejected in v0 or allowed with explicit
-  policy limits. Today only *direct* self-invocation is rejected; transitive cycles
-  are unanalyzed. **Recommendation:** reject transitive `invoke` cycles in v0
-  (symmetry with the pattern-recursion rule; a runtime invoke cycle with no external
-  boundary is the effectful-cycle hazard Design Commitment 7 forbids), with a
-  documented escape only when a cycle provably crosses an external event/clock.
-  Resolving this unblocks the transitive cycle-analysis + invoke-authorization items.
-- [ ] **How much implicit compatibility syntax remains.** Whether the implicit
-  compatibility root (a file with top-level decls and no explicit `workflow`) is
-  kept as a bridge or removed now. **Recommendation (keystone):** since the corpus
-  is fully migrated (37/37 explicit `workflow`) and the project is pre-release with
-  no back-compat obligation, **remove the implicit root** and require an explicit
-  `workflow`. That collapses the flatten-and-discard model into a clean
-  one-program-many-workflows model, which is the precondition for the scoping work
-  (workflow-local names, scoped resolution, bundle store schema). This is the single
-  decision that unblocks the largest remaining cluster.
+- [x] **Recursive workflow invocation policy — RESOLVED 2026-07-01 (Jack): "as
+  permissive as provable convergence at compile time allows."** Interpretation:
+  whipplescript cannot prove runtime-`invoke` termination at compile time (it is
+  data-dependent), and no decreasing-measure mechanism for runtime invoke exists
+  yet — so the most permissive rule that still carries a compile-time convergence
+  guarantee is to **reject transitive `invoke` cycles** (no convergence proof admits
+  any today), exactly parallel to the bounded-pattern-recursion deferral. A future
+  bounded form may admit a cycle that carries a statically-decreasing structural
+  measure (or provably crosses an external event/clock boundary, Design Commitment
+  7). Direct self-invocation is already rejected (lib.rs:8766); transitive is the
+  new work (`graph.unbounded_workflow_invocation_recursion`). Unblocks the
+  transitive cycle-analysis item.
+- [x] **Implicit compatibility root / scoping keystone — RESOLVED 2026-07-01
+  (Jack): remove the implicit root, require explicit `workflow`.** Move from the
+  current flatten-and-discard model (only `--root` compiles) to
+  one-program-many-workflows with workflow-local scoping. Corpus is fully migrated
+  (37/37) and the project is pre-release, so no back-compat bridge is kept. This is
+  the keystone: it unblocks workflow-local name scoping + leak checks, scoped name
+  resolution, in/out-of-workflow decl restrictions, the bundle store schema, and
+  diagnostics grouping. **Large rearchitecture — its own model-first slice** (name
+  resolution rework touches lowering + many tests); sequenced next.
 
 - [x] Whether pattern bodies may contain terminal actions: resolved. v0 forbids
   `complete`/`fail` in pattern bodies entirely (compile-time `error`); no pattern

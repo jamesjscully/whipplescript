@@ -1711,6 +1711,20 @@ pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOut
         };
     }
 
+    // Program-level static check over ALL workflows (before root selection):
+    // transitive runtime invocation cycles have no compile-time convergence proof
+    // and are rejected (RESOLVED 2026-07-01). Direct self-invocation is caught
+    // per-rule during lowering.
+    let mut invoke_recursion_diagnostics = Vec::new();
+    detect_workflow_invoke_recursion(&parsed.program, &mut invoke_recursion_diagnostics);
+    if !invoke_recursion_diagnostics.is_empty() {
+        return CompileOutput {
+            ir: None,
+            diagnostics: invoke_recursion_diagnostics,
+            warnings: Vec::new(),
+        };
+    }
+
     let workflow_inputs = collect_workflow_input_surfaces(&parsed.program);
     match select_root_workflow(parsed.program, root) {
         Ok(program) => lower_program(program, workflow_inputs),
@@ -3956,6 +3970,113 @@ fn detect_pattern_recursion(
         }
     }
     recursive
+}
+
+/// Reject a *transitive* runtime workflow-invocation cycle (A invokes B invokes A,
+/// or longer). RESOLVED 2026-07-01: the invoke-recursion policy is "as permissive
+/// as provable convergence at compile time allows"; whipplescript has no
+/// convergence proof for runtime `invoke` recursion (termination is data-dependent
+/// and there is no decreasing-measure mechanism yet), so — exactly parallel to
+/// `detect_pattern_recursion` — any cycle is rejected as
+/// `graph.unbounded_workflow_invocation_recursion`. Direct self-invocation (a cycle
+/// of length 1) is already rejected per-rule in `validate_workflow_invocations`, so
+/// self-edges are excluded here and this catches only length >= 2 cycles. Modeled
+/// as invoke-graph non-convergence in `models/maude/subworkflow-convergence.maude`.
+fn detect_workflow_invoke_recursion(program: &Program, diagnostics: &mut Vec<Diagnostic>) {
+    // Invoke edges: workflow name -> the workflows its rules invoke, with the span
+    // of the invoking rule body. Built over the raw AST (all workflows), so it is
+    // independent of root selection. Self-edges are excluded (owned by the direct
+    // per-rule recursion check).
+    let mut edges: BTreeMap<String, Vec<(String, SourceSpan)>> = BTreeMap::new();
+    let record_invokes =
+        |name: &str, items: &[Item], edges: &mut BTreeMap<String, Vec<(String, SourceSpan)>>| {
+            let entry = edges.entry(name.to_owned()).or_default();
+            for item in items {
+                let Item::Rule(rule) = item else {
+                    continue;
+                };
+                for statement in workflow_invoke_statements(&rule.body.text) {
+                    if let Some((target, _)) = invoke_statement_parts(&statement) {
+                        if target != name {
+                            entry.push((target.to_owned(), rule.body.span));
+                        }
+                    }
+                }
+            }
+        };
+    if let Some(root) = &program.workflow {
+        record_invokes(&root.name, &program.items, &mut edges);
+    }
+    for workflow in &program.workflows {
+        record_invokes(&workflow.name.name, &workflow.items, &mut edges);
+    }
+
+    // A workflow is in a cycle iff it can reach itself over invoke edges. BFS for a
+    // shortest path back to `start` (mirrors `detect_pattern_recursion`).
+    let find_cycle = |start: &str| -> Option<(Vec<String>, SourceSpan)> {
+        let mut queue: VecDeque<&str> = VecDeque::new();
+        let mut predecessor: BTreeMap<&str, (&str, SourceSpan)> = BTreeMap::new();
+        for (target, span) in edges.get(start).into_iter().flatten() {
+            if predecessor
+                .insert(target.as_str(), (start, *span))
+                .is_none()
+            {
+                queue.push_back(target.as_str());
+            }
+        }
+        while let Some(node) = queue.pop_front() {
+            for (target, span) in edges.get(node).into_iter().flatten() {
+                if target == start {
+                    let mut path = vec![node.to_owned()];
+                    let mut cursor = node;
+                    while cursor != start {
+                        let (from, _) = predecessor[cursor];
+                        path.push(from.to_owned());
+                        cursor = from;
+                    }
+                    path.reverse();
+                    path.push(start.to_owned());
+                    let first = &path[1];
+                    let entry_span = edges
+                        .get(start)
+                        .into_iter()
+                        .flatten()
+                        .find(|(target, _)| target == first)
+                        .map(|(_, span)| *span)
+                        .unwrap_or(*span);
+                    return Some((path, entry_span));
+                }
+                if predecessor.insert(target.as_str(), (node, *span)).is_none() {
+                    queue.push_back(target.as_str());
+                }
+            }
+        }
+        None
+    };
+
+    let mut flagged: BTreeSet<String> = BTreeSet::new();
+    for name in edges.keys() {
+        if flagged.contains(name) {
+            continue;
+        }
+        if let Some((cycle, span)) = find_cycle(name) {
+            for member in &cycle {
+                flagged.insert(member.clone());
+            }
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span,
+                message: format!(
+                    "recursive workflow invocation is not allowed (graph.unbounded_workflow_invocation_recursion): invocation cycle {}",
+                    cycle.join(" -> ")
+                ),
+                suggestion: Some(
+                    "break the cycle: a runtime `invoke` cycle has no compile-time convergence proof; route the recurrence through an external event, clock, or durable boundary instead"
+                        .to_owned(),
+                ),
+            });
+        }
+    }
 }
 
 fn expand_pattern_applications(
@@ -22788,6 +22909,102 @@ rule r
     }
 
     #[test]
+    fn rejects_transitive_workflow_invocation_cycle() {
+        // A invokes B invokes A — a runtime invoke cycle with no compile-time
+        // convergence proof (RESOLVED 2026-07-01). Rejected before root selection.
+        let source = r#"
+workflow A {
+  input task TA
+  output result RA
+  class TA { id string }
+  class RA { id string }
+  rule go
+    when TA as t
+  => {
+    invoke B { task { id t.id } } as b
+    after b succeeds as r { complete result { id r.id } }
+  }
+}
+
+workflow B {
+  input task TB
+  output result RB
+  class TB { id string }
+  class RB { id string }
+  rule go
+    when TB as t
+  => {
+    invoke A { task { id t.id } } as a
+    after a succeeds as r { complete result { id r.id } }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("A"));
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled.diagnostics.iter().any(|d| d
+                .message
+                .contains("graph.unbounded_workflow_invocation_recursion")
+                && d.message.contains("A -> B -> A")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn accepts_acyclic_workflow_invocation_chain() {
+        // A invokes B invokes C — a finite chain, never flagged (bite: the cycle
+        // detector must not over-reject non-recursive nesting).
+        let source = r#"
+workflow A {
+  input task TA
+  output result RA
+  class TA { id string }
+  class RA { id string }
+  rule go
+    when TA as t
+  => {
+    invoke B { task { id t.id } } as b
+    after b succeeds as r { complete result { id r.id } }
+  }
+}
+
+workflow B {
+  input task TB
+  output result RB
+  class TB { id string }
+  class RB { id string }
+  rule go
+    when TB as t
+  => {
+    invoke C { task { id t.id } } as c
+    after c succeeds as r { complete result { id r.id } }
+  }
+}
+
+workflow C {
+  input task TC
+  output result RC
+  class TC { id string }
+  class RC { id string }
+  rule go
+    when TC as t
+  => {
+    complete result { id t.id }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("A"));
+        assert!(
+            !compiled.diagnostics.iter().any(|d| d
+                .message
+                .contains("graph.unbounded_workflow_invocation_recursion")),
+            "acyclic chain wrongly flagged: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
     fn rejects_recording_observer_only_terminal_schema() {
         // §5.4: the terminal family is `origin = observer` — the kernel projects
         // it, user rules may only eliminate it. A rule that `record`s a terminal
@@ -23504,6 +23721,10 @@ rule branch
             (
                 "bad-terminal-payload",
                 include_str!("../../../examples/invalid/bad-terminal-payload.whip"),
+            ),
+            (
+                "recursive-workflow-invocation",
+                include_str!("../../../examples/invalid/recursive-workflow-invocation.whip"),
             ),
             (
                 "bad-effect-graph",
