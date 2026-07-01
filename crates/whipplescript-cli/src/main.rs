@@ -42184,7 +42184,7 @@ workflow EchoText {
 
         // A span inside the included file resolves to lib.whip with its own
         // in-file line/column.
-        let lib_seven = combined.find("profile 7").unwrap() + "profile ".len();
+        let lib_seven = combined.find("profile 7").expect("profile 7 present") + "profile ".len();
         let lib_diag = Diagnostic {
             span: SourceSpan {
                 start: lib_seven,
@@ -42200,7 +42200,8 @@ workflow EchoText {
 
         // A span inside the root file resolves to root.whip using the ROOT's
         // own line numbering (line 3), not the inflated combined-text line.
-        let root_forty_two = combined.find("profile 42").unwrap() + "profile ".len();
+        let root_forty_two =
+            combined.find("profile 42").expect("profile 42 present") + "profile ".len();
         let root_diag = Diagnostic {
             span: SourceSpan {
                 start: root_forty_two,
@@ -42230,9 +42231,10 @@ workflow EchoText {
         fs::write(&root_path, root).expect("write root");
 
         let root_str = root_path.to_str().expect("utf8 path");
-        let error = compile_source_path_with_root(root_str, None)
-            .err()
-            .expect("compilation fails");
+        let error = match compile_source_path_with_root(root_str, None) {
+            Ok(_) => panic!("compilation should fail"),
+            Err(error) => error,
+        };
         let CompileFailure::Diagnostics {
             source,
             segments,

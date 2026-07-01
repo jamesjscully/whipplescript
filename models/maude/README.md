@@ -144,7 +144,12 @@ terminal-payload-shape.maude     workflow terminal payload shape: a class contra
 invoke-result-typing.maude       typed invoke results: `after child succeeds as r`
                                  binds r to the child's OUTPUT contract (field
                                  access checked against it), `after child fails as
-                                 f` to the failure base — predicate discrimination
+                                 f` to the child's FAILURE contract when resolvable
+                                 else the base — predicate discrimination
+pattern-body-surface.maude       pattern-body allow-list: a pattern body may hold
+                                 rules/effects/records/local schemas etc. but not
+                                 workflow contracts, nested pattern/apply, or a rule
+                                 reaching a workflow terminal; allowed never rejected
 ```
 
 The shell script runs every Maude test file and checks the expected number of
