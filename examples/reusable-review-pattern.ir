@@ -1,6 +1,8 @@
 workflow ReusableReviewPattern
 pattern_applications
   AgentReview as changeReview<ref<ChangeRequest>, ref<ReviewedChange>>
+    defined-at 589..947
+    applied-at 949..1017
     generated rule:changeReview_review
 workflow_contracts
   output result ref<ReviewBatch>

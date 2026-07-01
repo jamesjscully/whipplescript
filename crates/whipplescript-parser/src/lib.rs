@@ -860,6 +860,11 @@ pub struct IrPatternApplication {
     pub type_args: Vec<IrType>,
     pub value_args: Vec<IrPatternArgument>,
     pub generated: Vec<String>,
+    /// Source span of the `pattern <Name> { ... }` DEFINITION this application
+    /// expanded, so provenance can point back at where the reused shape lives.
+    pub definition_span: SourceSpan,
+    /// Source span of the `apply <Name> as <alias> { ... }` APPLICATION site.
+    pub application_span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2780,6 +2785,20 @@ impl IrProgram {
                         application.pattern, application.alias, type_args
                     ),
                 );
+                push_line(
+                    &mut snapshot,
+                    format!(
+                        "    defined-at {}..{}",
+                        application.definition_span.start, application.definition_span.end
+                    ),
+                );
+                push_line(
+                    &mut snapshot,
+                    format!(
+                        "    applied-at {}..{}",
+                        application.application_span.start, application.application_span.end
+                    ),
+                );
                 for argument in &application.value_args {
                     push_line(
                         &mut snapshot,
@@ -4304,16 +4323,23 @@ fn expand_pattern_applications(
             .collect::<BTreeMap<_, _>>();
         let value_substitutions = parse_pattern_value_arguments(&apply, diagnostics);
         let local_names = pattern_local_names(pattern, &apply.alias.name);
+        let definition_span = pattern.span;
+        let application_span = apply.span;
         let mut generated = Vec::new();
         for pattern_item in pattern.items.iter().cloned() {
+            // Enforce the pattern-body allow-list before expanding: a pattern
+            // is a compile-time reuse fragment, not a workflow, so forbidden
+            // constructs are rejected with a clear diagnostic and dropped.
+            if let Some(diagnostic) = pattern_body_admission(&pattern_item, &recursive_patterns) {
+                diagnostics.push(diagnostic);
+                continue;
+            }
             if let Some((generated_name, item)) = expand_pattern_item(
                 pattern_item,
                 &apply.alias.name,
                 &type_substitutions,
                 &value_substitutions,
                 &local_names,
-                &recursive_patterns,
-                diagnostics,
             ) {
                 generated.push(generated_name);
                 expanded_items.push(item);
@@ -4328,6 +4354,8 @@ fn expand_pattern_applications(
                 .map(|(name, value)| IrPatternArgument { name, value })
                 .collect(),
             generated,
+            definition_span,
+            application_span,
         });
     }
     program.items = expanded_items;
@@ -4440,14 +4468,105 @@ fn parse_pattern_value_arguments(
     args
 }
 
+/// The explicit allow-list gate for a `pattern { ... }` body.
+///
+/// A pattern is a compile-time reuse fragment, not a workflow. Its body MAY
+/// declare the building blocks of a workflow -- rules, effects (`coerce`),
+/// records (via a rule's `record`), local schemas (`class`/`enum`), tables,
+/// agents/harnesses, and coordination resources -- but it MUST NOT contain:
+///   * workflow contracts (`input`/`output`/`failure`) -- workflow-level shape,
+///   * nested `pattern` declarations,
+///   * nested `apply` (pattern applications inside pattern bodies), or
+///   * rules that reach a workflow terminal (`complete`/`fail`): a reusable
+///     fragment must not hard-code the enclosing workflow's terminal outcome.
+///
+/// Returns `Some(diagnostic)` for a forbidden construct; `None` when the item is
+/// on the allow-list.
+fn pattern_body_admission(
+    item: &Item,
+    recursive_patterns: &BTreeSet<String>,
+) -> Option<Diagnostic> {
+    match item {
+        Item::WorkflowContract(contract) => Some(Diagnostic {
+            related: Vec::new(),
+            span: contract.span,
+            message: "workflow contracts are not allowed in pattern bodies".to_owned(),
+            suggestion: Some(
+                "declare workflow inputs, outputs, and failures on the workflow".to_owned(),
+            ),
+        }),
+        Item::Pattern(pattern) => Some(Diagnostic {
+            related: Vec::new(),
+            span: pattern.span,
+            message: "nested pattern declarations are not supported in pattern bodies".to_owned(),
+            suggestion: Some("declare reusable patterns at source top level".to_owned()),
+        }),
+        // A recursive nested apply was already rejected with the precise
+        // graph.unbounded_pattern_recursion diagnostic by detect_pattern_recursion;
+        // don't also emit the generic "not supported yet" message for it.
+        Item::Apply(apply) if !recursive_patterns.contains(&apply.pattern.name) => Some(Diagnostic {
+            related: Vec::new(),
+            span: apply.span,
+            message: "pattern applications inside pattern bodies are not supported yet".to_owned(),
+            suggestion: Some(
+                "apply patterns from workflow bodies only in this implementation slice".to_owned(),
+            ),
+        }),
+        Item::Rule(rule) => pattern_rule_terminal_span(rule).map(|span| Diagnostic {
+            related: Vec::new(),
+            span,
+            message: format!(
+                "rule `{}` in a pattern body cannot reach a workflow terminal (`complete`/`fail`)",
+                rule.name.name
+            ),
+            suggestion: Some(
+                "record a fact in the pattern rule and let a workflow rule decide the terminal outcome"
+                    .to_owned(),
+            ),
+        }),
+        _ => None,
+    }
+}
+
+/// Locate the first workflow-terminal statement (`complete`/`fail`) in a
+/// pattern rule body, returning its source span for diagnostics.
+fn pattern_rule_terminal_span(rule: &RuleDecl) -> Option<SourceSpan> {
+    let mut offset = 0usize;
+    for line in rule.body.text.split_inclusive('\n') {
+        let trimmed_start = line.trim_start();
+        let leading = line.len() - trimmed_start.len();
+        let statement = trimmed_start.trim_end();
+        if is_pattern_terminal_statement(statement) {
+            let start = rule.body.span.start + offset + leading;
+            return Some(SourceSpan {
+                start,
+                end: start + statement.len(),
+            });
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// A trimmed body line begins a workflow terminal iff it starts with the
+/// `complete` or `fail` keyword followed by whitespace, `{`, or end of line.
+fn is_pattern_terminal_statement(line: &str) -> bool {
+    for keyword in ["complete", "fail"] {
+        if let Some(rest) = line.strip_prefix(keyword) {
+            if rest.is_empty() || rest.starts_with('{') || rest.starts_with(char::is_whitespace) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn expand_pattern_item(
     item: Item,
     alias: &str,
     type_substitutions: &BTreeMap<String, TypeSyntax>,
     value_substitutions: &BTreeMap<String, String>,
     local_names: &BTreeMap<String, String>,
-    recursive_patterns: &BTreeSet<String>,
-    diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<(String, Item)> {
     match item {
         Item::Include(include) => Some((
@@ -4487,44 +4606,10 @@ fn expand_pattern_item(
             harness.name = name;
             Some((generated, Item::Harness(harness)))
         }
-        Item::WorkflowContract(contract) => {
-            diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: contract.span,
-                message: "workflow contracts are not allowed in pattern bodies".to_owned(),
-                suggestion: Some(
-                    "declare workflow inputs, outputs, and failures on the workflow".to_owned(),
-                ),
-            });
-            None
-        }
-        Item::Pattern(pattern) => {
-            diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: pattern.span,
-                message: "nested pattern declarations are not supported".to_owned(),
-                suggestion: Some("declare reusable patterns at source top level".to_owned()),
-            });
-            None
-        }
-        Item::Apply(apply) => {
-            // A recursive nested apply was already rejected with the precise
-            // graph.unbounded_pattern_recursion diagnostic by detect_pattern_recursion;
-            // don't also emit the generic "not supported yet" message for it.
-            if !recursive_patterns.contains(&apply.pattern.name) {
-                diagnostics.push(Diagnostic {
-                    related: Vec::new(),
-                    span: apply.span,
-                    message: "pattern applications inside pattern bodies are not supported yet"
-                        .to_owned(),
-                    suggestion: Some(
-                        "apply patterns from workflow bodies only in this implementation slice"
-                            .to_owned(),
-                    ),
-                });
-            }
-            None
-        }
+        // Forbidden constructs are rejected up front by `pattern_body_admission`
+        // (the explicit allow-list gate), so these arms are unreachable in
+        // practice; they stay defensive and simply drop the item.
+        Item::WorkflowContract(_) | Item::Pattern(_) | Item::Apply(_) => None,
         Item::Agent(mut agent) => {
             let name = rename_ident(agent.name, alias, local_names);
             let generated = format!("agent:{}", name.name);
@@ -20444,6 +20529,118 @@ workflow Root {
         assert!(snapshot.contains("    item ref<Task>"));
         assert!(snapshot.contains("rule taskReview_dispatch"));
         assert!(snapshot.contains("    when Task as item"));
+    }
+
+    #[test]
+    fn pattern_application_records_definition_and_application_spans() {
+        let source = r#"
+pattern Review<Input> {
+  rule dispatch
+    when Input as item
+  => {
+  }
+}
+
+workflow Root {
+  class Task {
+    title string
+  }
+
+  apply Review<Task> as taskReview {
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("source compiles");
+        let application = ir
+            .pattern_applications
+            .first()
+            .expect("one pattern application");
+
+        // The recorded definition span must cover the `pattern Review<...> { ... }`
+        // declaration, and the application span the `apply ... as ... { ... }` site.
+        let definition =
+            &source[application.definition_span.start..application.definition_span.end];
+        assert!(definition.starts_with("pattern Review"));
+        assert!(definition.ends_with('}'));
+        let application_site =
+            &source[application.application_span.start..application.application_span.end];
+        assert!(application_site.starts_with("apply Review<Task> as taskReview"));
+        assert!(application_site.ends_with('}'));
+
+        let snapshot = ir.to_snapshot();
+        assert!(snapshot.contains(&format!(
+            "    defined-at {}..{}",
+            application.definition_span.start, application.definition_span.end
+        )));
+        assert!(snapshot.contains(&format!(
+            "    applied-at {}..{}",
+            application.application_span.start, application.application_span.end
+        )));
+    }
+
+    #[test]
+    fn rejects_terminal_statement_in_pattern_body() {
+        let source = r#"
+pattern Finisher<Input> {
+  rule wrap_up
+    when Input as item
+  => {
+    complete result {
+      done 1
+    }
+  }
+}
+
+workflow Root {
+  output result Summary
+
+  class Summary {
+    done int
+  }
+
+  class Task {
+    title string
+  }
+
+  apply Finisher<Task> as finish {
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("cannot reach a workflow terminal")));
+    }
+
+    #[test]
+    fn rejects_workflow_contract_in_pattern_body() {
+        let source = r#"
+pattern Contracted<Input> {
+  output result Input
+
+  rule dispatch
+    when Input as item
+  => {
+  }
+}
+
+workflow Root {
+  class Task {
+    title string
+  }
+
+  apply Contracted<Task> as contracted {
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("workflow contracts are not allowed in pattern bodies")));
     }
 
     #[test]

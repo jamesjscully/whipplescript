@@ -2856,6 +2856,7 @@ fn check(options: &CliOptions) -> ExitCode {
             }
             Err(CompileFailure::Diagnostics {
                 source,
+                segments,
                 diagnostics,
             }) => {
                 failed = true;
@@ -2874,7 +2875,16 @@ fn check(options: &CliOptions) -> ExitCode {
                     }));
                 } else {
                     for diagnostic in diagnostics {
-                        eprint!("{}", render_diagnostic(&path, &source, &diagnostic));
+                        eprint!(
+                            "{}",
+                            render_bundle_diagnostic(
+                                &path,
+                                &source,
+                                &segments,
+                                &diagnostic,
+                                "error"
+                            )
+                        );
                     }
                 }
             }
@@ -15447,6 +15457,7 @@ fn compile_failure_json_report(path: &str, error: CompileFailure) -> Value {
         CompileFailure::Diagnostics {
             source: _,
             diagnostics,
+            ..
         } => compile_json_error_report(
             Some(path),
             "diagnostics",
@@ -37002,6 +37013,10 @@ enum CompileFailure {
     Io(std::io::Error),
     Diagnostics {
         source: String,
+        /// Per-file segments of `source` (sorted by start offset) so a
+        /// diagnostic span can be attributed back to its originating file.
+        /// Empty when the failure is not produced over an include bundle.
+        segments: Vec<SourceSegment>,
         diagnostics: Vec<Diagnostic>,
     },
 }
@@ -37015,7 +37030,7 @@ fn compile_source_path_with_root(
     for warning in &compiled.warnings {
         eprint!(
             "{}",
-            render_diagnostic_with_severity(path, &bundle.source, warning, "warning")
+            render_bundle_diagnostic(path, &bundle.source, &bundle.segments, warning, "warning")
         );
     }
     if let Some(ir) = compiled.ir {
@@ -37025,6 +37040,7 @@ fn compile_source_path_with_root(
     } else {
         Err(CompileFailure::Diagnostics {
             source: bundle.source,
+            segments: bundle.segments,
             diagnostics: compiled.diagnostics,
         })
     }
@@ -37039,8 +37055,11 @@ fn compile_source_path_for_validation(
     let (source, ir) = compile_source_path_with_root(path, root)?;
     let liveness = lint_workflow_liveness(&ir);
     if !liveness.is_empty() {
+        // Liveness lints are workflow-level (span 0), not attributable to a
+        // single include, so they render against the root path.
         return Err(CompileFailure::Diagnostics {
             source,
+            segments: Vec::new(),
             diagnostics: liveness,
         });
     }
@@ -37489,14 +37508,36 @@ fn resolve_package_tool_grant(
 struct SourceBundle {
     source: String,
     includes: Vec<IrInclude>,
+    /// Per-file segments of `source`, sorted ascending by start offset. Each
+    /// segment marks where one file's OWN text begins in the concatenated
+    /// bundle, so a byte offset can be resolved back to (file, in-file offset).
+    segments: Vec<SourceSegment>,
+}
+
+/// One file's contribution to a concatenated include bundle: `path` names the
+/// originating file and `start` is the byte offset in the combined source where
+/// that file's own text begins (its region runs to the next segment's start).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceSegment {
+    start: usize,
+    path: String,
+}
+
+/// The concatenated text of a single file plus the per-file segment table
+/// (offsets relative to the start of `text`).
+struct ResolvedSource {
+    text: String,
+    segments: Vec<SourceSegment>,
 }
 
 fn resolve_source_bundle(path: &Path) -> Result<SourceBundle, CompileFailure> {
     let mut resolver = SourceBundleResolver::default();
-    let root = resolver.resolve_root(path)?;
+    let display = path.display().to_string();
+    let resolved = resolver.resolve_root(path, display)?;
     Ok(SourceBundle {
-        source: root,
+        source: resolved.text,
         includes: resolver.includes,
+        segments: resolved.segments,
     })
 }
 
@@ -37508,15 +37549,25 @@ struct SourceBundleResolver {
 }
 
 impl SourceBundleResolver {
-    fn resolve_root(&mut self, path: &Path) -> Result<String, CompileFailure> {
+    fn resolve_root(
+        &mut self,
+        path: &Path,
+        display: String,
+    ) -> Result<ResolvedSource, CompileFailure> {
         let path = canonical_or_original(path)?;
-        self.resolve_file(&path, true)
+        self.resolve_file(&path, &display, true)
     }
 
-    fn resolve_file(&mut self, path: &Path, is_root: bool) -> Result<String, CompileFailure> {
+    fn resolve_file(
+        &mut self,
+        path: &Path,
+        display: &str,
+        is_root: bool,
+    ) -> Result<ResolvedSource, CompileFailure> {
         if self.active.iter().any(|active| active == path) {
             return Err(CompileFailure::Diagnostics {
                 source: String::new(),
+                segments: Vec::new(),
                 diagnostics: vec![Diagnostic {
                     related: Vec::new(),
                     span: SourceSpan { start: 0, end: 0 },
@@ -37526,13 +37577,22 @@ impl SourceBundleResolver {
             });
         }
         if !is_root && self.visited.iter().any(|visited| visited == path) {
-            return Ok(String::new());
+            return Ok(ResolvedSource {
+                text: String::new(),
+                segments: Vec::new(),
+            });
         }
 
         let source = fs::read_to_string(path).map_err(CompileFailure::Io)?;
         let parsed = whipplescript_parser::parse_program(&source);
         if !parsed.diagnostics.is_empty() {
+            // A parse error is confined to this single file; hand back a
+            // one-entry segment table so the diagnostic names the real file.
             return Err(CompileFailure::Diagnostics {
+                segments: vec![SourceSegment {
+                    start: 0,
+                    path: display.to_owned(),
+                }],
                 source,
                 diagnostics: parsed.diagnostics,
             });
@@ -37540,6 +37600,7 @@ impl SourceBundleResolver {
 
         self.active.push(path.to_path_buf());
         let mut combined = String::new();
+        let mut segments = Vec::new();
         let mut seen_includes = BTreeSet::new();
         for item in &parsed.program.items {
             let Item::Include(include) = item else {
@@ -37548,6 +37609,10 @@ impl SourceBundleResolver {
             if !seen_includes.insert(include.path.value.clone()) {
                 self.active.pop();
                 return Err(CompileFailure::Diagnostics {
+                    segments: vec![SourceSegment {
+                        start: 0,
+                        path: display.to_owned(),
+                    }],
                     source,
                     diagnostics: vec![Diagnostic {
                         related: Vec::new(),
@@ -37561,6 +37626,10 @@ impl SourceBundleResolver {
             if include_path.is_absolute() {
                 self.active.pop();
                 return Err(CompileFailure::Diagnostics {
+                    segments: vec![SourceSegment {
+                        start: 0,
+                        path: display.to_owned(),
+                    }],
                     source,
                     diagnostics: vec![Diagnostic {
                         related: Vec::new(),
@@ -37575,6 +37644,10 @@ impl SourceBundleResolver {
             if include_path.extension().and_then(|ext| ext.to_str()) != Some("whip") {
                 self.active.pop();
                 return Err(CompileFailure::Diagnostics {
+                    segments: vec![SourceSegment {
+                        start: 0,
+                        path: display.to_owned(),
+                    }],
                     source,
                     diagnostics: vec![Diagnostic {
                         related: Vec::new(),
@@ -37594,9 +37667,16 @@ impl SourceBundleResolver {
                 path: include.path.value.clone(),
                 source_hash: Some(stable_hash_hex(&include_source)),
             });
-            let included = self.resolve_file(&resolved, false)?;
-            if !included.trim().is_empty() {
-                combined.push_str(&included);
+            let included = self.resolve_file(&resolved, &include.path.value, false)?;
+            if !included.text.trim().is_empty() {
+                let base = combined.len();
+                for segment in included.segments {
+                    segments.push(SourceSegment {
+                        start: segment.start + base,
+                        path: segment.path,
+                    });
+                }
+                combined.push_str(&included.text);
                 if !combined.ends_with('\n') {
                     combined.push('\n');
                 }
@@ -37608,9 +37688,70 @@ impl SourceBundleResolver {
             self.visited.push(path.to_path_buf());
         }
 
+        // This file's OWN source is appended after its expanded includes.
+        segments.push(SourceSegment {
+            start: combined.len(),
+            path: display.to_owned(),
+        });
         combined.push_str(&source);
-        Ok(combined)
+        Ok(ResolvedSource {
+            text: combined,
+            segments,
+        })
     }
+}
+
+/// Resolve a span's start offset to the originating file. Returns the file's
+/// display path plus the `[start, end)` byte bounds of that file's own text in
+/// `source`, so callers can render an in-file location. Falls back to the root
+/// path spanning the whole source when the table is empty.
+fn resolve_span_file<'a>(
+    root_path: &'a str,
+    source: &'a str,
+    segments: &'a [SourceSegment],
+    span: SourceSpan,
+) -> (&'a str, usize, usize) {
+    let mut chosen: Option<(&'a str, usize, usize)> = None;
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.start > span.start {
+            break;
+        }
+        let end = segments
+            .get(index + 1)
+            .map(|next| next.start)
+            .unwrap_or(source.len());
+        chosen = Some((segment.path.as_str(), segment.start, end));
+    }
+    chosen.unwrap_or((root_path, 0, source.len()))
+}
+
+/// Render a diagnostic, attributing it to its originating file via the bundle
+/// segment table and reporting an in-file location. When `segments` is empty
+/// this degrades to `render_diagnostic_with_severity` over the whole source.
+fn render_bundle_diagnostic(
+    root_path: &str,
+    source: &str,
+    segments: &[SourceSegment],
+    diagnostic: &Diagnostic,
+    severity: &str,
+) -> String {
+    let (origin, file_start, file_end) =
+        resolve_span_file(root_path, source, segments, diagnostic.span);
+    let file_text = &source[file_start..file_end.min(source.len())];
+    let local = Diagnostic {
+        span: SourceSpan {
+            start: diagnostic.span.start.saturating_sub(file_start),
+            end: diagnostic
+                .span
+                .end
+                .saturating_sub(file_start)
+                .min(file_text.len()),
+        },
+        message: diagnostic.message.clone(),
+        suggestion: diagnostic.suggestion.clone(),
+        related: diagnostic.related.clone(),
+    };
+    render_diagnostic_with_severity(origin, file_text, &local, severity)
 }
 
 fn canonical_or_original(path: &Path) -> Result<PathBuf, CompileFailure> {
@@ -40336,10 +40477,14 @@ fn report_compile_failure(path: &str, error: CompileFailure) -> ExitCode {
         }
         CompileFailure::Diagnostics {
             source,
+            segments,
             diagnostics,
         } => {
             for diagnostic in diagnostics {
-                eprint!("{}", render_diagnostic(path, &source, &diagnostic));
+                eprint!(
+                    "{}",
+                    render_bundle_diagnostic(path, &source, &segments, &diagnostic, "error")
+                );
             }
         }
     }
@@ -42015,6 +42160,99 @@ workflow EchoText {
         assert_eq!(
             render_diagnostic("example.whip", source, &diagnostic),
             expected
+        );
+    }
+
+    #[test]
+    fn resolve_span_file_maps_offset_to_originating_file() {
+        // Mirror the concatenation order used by the resolver: the included
+        // file's text comes first, then a separator newline, then the root.
+        let lib = "agent helper {\n  profile 7\n}\n";
+        let root = "workflow Root\nagent worker {\n  profile 42\n}\n";
+        let combined = format!("{lib}\n{root}");
+        let root_base = lib.len() + 1;
+        let segments = vec![
+            SourceSegment {
+                start: 0,
+                path: "lib.whip".to_owned(),
+            },
+            SourceSegment {
+                start: root_base,
+                path: "root.whip".to_owned(),
+            },
+        ];
+
+        // A span inside the included file resolves to lib.whip with its own
+        // in-file line/column.
+        let lib_seven = combined.find("profile 7").unwrap() + "profile ".len();
+        let lib_diag = Diagnostic {
+            span: SourceSpan {
+                start: lib_seven,
+                end: lib_seven + 1,
+            },
+            message: "expected profile string, found number literal".to_owned(),
+            suggestion: None,
+            related: Vec::new(),
+        };
+        let rendered =
+            render_bundle_diagnostic("root.whip", &combined, &segments, &lib_diag, "error");
+        assert!(rendered.contains("--> lib.whip:2:11"), "{rendered}");
+
+        // A span inside the root file resolves to root.whip using the ROOT's
+        // own line numbering (line 3), not the inflated combined-text line.
+        let root_forty_two = combined.find("profile 42").unwrap() + "profile ".len();
+        let root_diag = Diagnostic {
+            span: SourceSpan {
+                start: root_forty_two,
+                end: root_forty_two + 2,
+            },
+            message: "expected profile string, found number literal".to_owned(),
+            suggestion: None,
+            related: Vec::new(),
+        };
+        let rendered =
+            render_bundle_diagnostic("root.whip", &combined, &segments, &root_diag, "error");
+        assert!(rendered.contains("--> root.whip:3:11"), "{rendered}");
+    }
+
+    #[test]
+    fn included_file_diagnostic_names_the_included_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "whipplescript-bundle-span-included-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let lib = "class Widget {\n  id string\n}\n\nrule lib_rule\n  when Ghost as g\n=> {\n  record Widget { id \"x\" }\n}\n";
+        let root = "include \"lib.whip\"\n\nworkflow Root\n\noutput result Done\n\nclass Done {\n  ok int\n}\n\nrule finish\n  when Widget as w\n=> {\n  complete result { ok 1 }\n}\n";
+        fs::write(dir.join("lib.whip"), lib).expect("write lib");
+        let root_path = dir.join("root.whip");
+        fs::write(&root_path, root).expect("write root");
+
+        let root_str = root_path.to_str().expect("utf8 path");
+        let error = compile_source_path_with_root(root_str, None)
+            .err()
+            .expect("compilation fails");
+        let CompileFailure::Diagnostics {
+            source,
+            segments,
+            diagnostics,
+        } = error
+        else {
+            panic!("expected diagnostics failure");
+        };
+        let rendered: String = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                render_bundle_diagnostic(root_str, &source, &segments, diagnostic, "error")
+            })
+            .collect();
+        let _ = fs::remove_dir_all(&dir);
+
+        // The rule error originates in the INCLUDED file and must name it.
+        assert!(
+            rendered.contains("--> lib.whip:6:8"),
+            "cross-file diagnostic should name the included file:\n{rendered}"
         );
     }
 

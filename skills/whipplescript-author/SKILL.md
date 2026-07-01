@@ -388,8 +388,8 @@ rule dispatch_review
 ```
 
 Use `AgentRef<...>` when workflow data selects a logical agent. The value is
-source metadata, not a model decision. BAML/model output may review observed
-provider evidence, but must not choose the provider or route.
+source metadata, not a model decision. A `coerce` call or model output may
+review observed provider evidence, but must not choose the provider or route.
 
 ## Revision Guidance
 
