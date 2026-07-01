@@ -193,11 +193,18 @@ These are real gaps observed while building the examples, not hypotheticals.
    they can reach any sink), and **in the flow checker**. Per-field labels are
    envelope resources keyed `<Schema>.<field>` (e.g.
    `grant field cust_ssn -> Customer.ssn readable by Operator`); a field with no
-   label is public. Any egress that references **only** redacted projections —
-   `complete result`, `record <Schema>`, or `send via <channel>` — is governed by
-   the kept fields' label join, so keeping only public fields needs no clearance
-   while keeping a confidential field is flagged. (Redaction projects
-   *confidentiality* only — the integrity/injection check still applies in full.)
+   label is public. A fully-redacted egress (`complete result`, `record <Schema>`,
+   or `send via <channel>` referencing only redacted projections) is *additionally*
+   checked against the kept fields' label join — keeping a field the sink cannot
+   read is flagged. This is **additive**: it does not exempt the egress from the
+   ordinary read→sink checks, so releasing data derived from a confidential
+   *resource read* at a lower label still needs a `grant declassify` (dropping a
+   field narrows the per-field schema label, not a confidential source's
+   provenance). Redaction projects confidentiality only — integrity still applies.
+   *(A prior version wrongly exempted redacted egresses from the read checks, an
+   under-taint; fixed. Full per-field provenance — so a kept field derived from a
+   public source needs no grant while one derived from a secret does — is the
+   value-flow engine, in progress.)*
    The non-interference of the dropped fields is proven in
    `models/lean/Whipple/Redaction.lean` (`canRead_redact`). A pure `from`
    projection (`record T from src { … }`, all shorthand) is auto-governed the same

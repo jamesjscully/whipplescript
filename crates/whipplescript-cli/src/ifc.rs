@@ -1039,25 +1039,29 @@ fn result_dependency_reads(tool: &IrProgram) -> Vec<String> {
     reads.into_iter().collect()
 }
 
-/// The set of egress sinks (`complete` bindings, `fact:<Schema>` record sinks, or
-/// `send` channels) whose CONFIDENTIALITY (leak) check is governed by the redact
-/// static refinement rather than the conservative whole-read join. A sink whose
-/// payload references ONLY redaction outputs (each with a resolvable source schema)
-/// is FULLY-REDACTED: its required clearance is the JOIN of those projections'
-/// kept-field labels (`projected_reader_set`), checked here against the sink's own
-/// label (a leak is flagged); the runtime physically projects, so the egress
-/// provably carries only the kept fields (DR-0027, proven in
-/// `models/lean/Whipple/Redaction.lean`). The returned sinks are exempted from the
-/// conservative LEAK check ONLY — the integrity/injection check still applies in
-/// full, since redaction projects confidentiality, not trust. A mixed egress, or
-/// one whose redaction has no resolved source schema, is absent (stays conservative).
-fn redacted_leak_exempt_egresses(
+/// Flags the redact static refinement's CONFIDENTIALITY check on fully-redacted
+/// egresses (`complete` bindings, `fact:<Schema>` record sinks, or `send`
+/// channels): a sink whose payload references ONLY redaction outputs (each with a
+/// resolvable source schema) must have its own label dominate the JOIN of those
+/// projections' kept-field labels (`projected_reader_set`) — else keeping a
+/// too-sensitive field is flagged (naming it). This is PURELY ADDITIVE: it does
+/// NOT exempt the egress from the conservative read×sink leak check. The kept
+/// fields carry data derived from the rule's READS, whose provenance the schema
+/// field labels do not capture, so exempting the egress from those reads was
+/// unsound (a confirmed under-taint: a redacted egress of confidential-resource
+/// data released with no grant). Releasing resource-read-derived data at a lower
+/// label is a declassification and still requires a `grant declassify` (honoured by
+/// the conservative loop). The proven model (`Redaction.lean`) covers the
+/// projection algebra given per-field labels; it does not cover read provenance —
+/// which is exactly why the exemption slipped past it. (The value-flow engine that
+/// tracks per-field provenance is the real refinement; this keeps the tree sound.)
+fn flag_redacted_egress_projections(
     candidates: &[String],
     rule: &IrRule,
     envelope: &Envelope,
     span: whipplescript_parser::SourceSpan,
     diagnostics: &mut Vec<Diagnostic>,
-) -> BTreeSet<String> {
+) {
     let projected_for = |binding: &str| -> Option<BTreeSet<String>> {
         let redaction = rule
             .metadata
@@ -1067,7 +1071,6 @@ fn redacted_leak_exempt_egresses(
         let schema = redaction.source_schema.as_deref()?;
         Some(envelope.projected_reader_set(schema, &redaction.keep))
     };
-    let mut exempt = BTreeSet::new();
     for sink in candidates {
         let roots = rule.metadata.egress_payload_reads.get(sink);
         let fully_redacted = roots.is_some_and(|roots| {
@@ -1076,7 +1079,6 @@ fn redacted_leak_exempt_egresses(
         if !fully_redacted {
             continue;
         }
-        exempt.insert(sink.clone());
         let projected: BTreeSet<String> = roots
             .into_iter()
             .flatten()
@@ -1131,7 +1133,6 @@ fn redacted_leak_exempt_egresses(
             });
         }
     }
-    exempt
 }
 
 pub fn check_with_envelope_imports(
@@ -1295,16 +1296,19 @@ pub fn check_with_envelope_imports(
             rule.metadata.terminal_completes.clone()
         };
         let record_sinks = record_candidates;
-        // Sinks whose CONFIDENTIALITY check is governed by the redact refinement (a
-        // fully-redacted `complete`/`record`/`send`). They remain in the conservative
-        // loop for the integrity/injection axis; only their leak check is skipped.
+        // Redact refinement (PURELY ADDITIVE — DR-0027): a fully-redacted egress must
+        // have its sink dominate the kept fields' per-field label join. This does NOT
+        // exempt the egress from the conservative read×sink leak below — the kept
+        // fields carry read-derived data whose provenance the schema labels don't
+        // capture, so exempting was an under-taint; releasing read-derived data at a
+        // lower label needs a `grant declassify` (honoured by the conservative loop).
         let redact_candidates: Vec<String> = result_sinks
             .iter()
             .cloned()
             .chain(record_sinks.iter().cloned())
             .chain(writes.iter().map(|sink| (*sink).to_owned()))
             .collect();
-        let mut leak_exempt = redacted_leak_exempt_egresses(
+        flag_redacted_egress_projections(
             &redact_candidates,
             rule,
             envelope,
@@ -1312,12 +1316,9 @@ pub fn check_with_envelope_imports(
             &mut diagnostics,
         );
         // Bounded-type egresses (`record <T> from <src>`, DR-0027 auto-redaction): the
-        // recorded fact keeps exactly `T`'s fields, so it is governed by those fields'
-        // per-field label join (sourced from `src`'s schema) — like an explicit
-        // `redact`. Leak-exempt (the projected label is checked here); integrity still
-        // applies in the loop below.
+        // recorded fact keeps exactly `T`'s fields, checked against those fields'
+        // per-field label join. Also purely additive (no read exemption).
         for bounded in &rule.metadata.bounded_egresses {
-            leak_exempt.insert(bounded.sink.clone());
             let projected = envelope.projected_reader_set(&bounded.source_schema, &bounded.keep);
             let sink_readers = envelope.reader_set(&bounded.sink);
             if envelope.dominates(&sink_readers, &projected) {
@@ -1444,10 +1445,7 @@ pub fn check_with_envelope_imports(
                 .chain(record_sinks.iter().map(String::as_str))
                 .chain(result_sinks.iter().map(String::as_str))
             {
-                // A fully-redacted egress's leak is governed by its projected label
-                // (above); skip the conservative whole-read leak for it. Its
-                // integrity/injection check below still runs.
-                if leak.is_none() && !leak_exempt.contains(sink) && envelope.leaks(src, sink) {
+                if leak.is_none() && envelope.leaks(src, sink) {
                     leak = Some((src.to_owned(), sink.to_owned()));
                 }
                 if inject.is_none() {
@@ -2292,6 +2290,54 @@ rule r
   }
 }
 "#;
+
+    #[test]
+    fn redact_does_not_launder_a_confidential_resource_read() {
+        // Regression (confirmed under-taint): a redacted egress must NOT be exempted
+        // from the rule's confidential resource READS. Reading confidential `crm`,
+        // deriving a typed value, redacting to an unlabelled field, and releasing to a
+        // public sink is a declassification of crm-derived data — it must still flag
+        // (releasing it needs a `grant declassify`), even though the projected schema
+        // label is public. The redact refinement is purely additive, not a read hatch.
+        let program = r#"@service
+workflow Launder
+
+input trigger Trigger
+output result PublicView
+
+class Trigger { k string }
+class Customer { id string  ssn string }
+class PublicView { x string }
+
+file store crm { root "./crm"  allow read ["**"] }
+
+coerce parse(raw string) -> Customer { prompt "x" }
+
+rule r
+  when Trigger as t
+=> {
+  read text from crm at "customerfile" as raw
+  after raw succeeds as loaded {
+    coerce parse(loaded.text) as c
+    after c succeeds as cust {
+      redact cust keep [id] as safe
+      complete result { x safe.id }
+    }
+  }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope =
+            Envelope::from_json(r#"{ "resources": { "crm": { "confidential": true } } }"#)
+                .expect("valid");
+        assert!(
+            check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+                .iter()
+                .any(|d| d.message.contains("information-flow violation")
+                    && d.message.contains("crm")),
+            "a redacted egress of confidential-read-derived data must still leak (no read hatch)"
+        );
+    }
 
     #[test]
     fn redacted_egress_keeping_only_public_fields_does_not_leak() {
