@@ -1448,6 +1448,13 @@ struct WorkflowInputSurface {
     /// `r.<field>` type-checks against the child's declared output (the runtime
     /// already carries the child's terminal payload into that binding).
     outputs: BTreeMap<String, TypeSyntax>,
+    /// The workflow's `failure` contract types by name. A parent's
+    /// `after <invoke-binding> fails as f` binds `f` to this contract (when it is
+    /// a shared top-level class) so `f.<field>` type-checks against the child's
+    /// declared failure shape, instead of the generic DR-0032 `TerminalFailed`
+    /// base. Falls back to the base when the failure class is child-local or the
+    /// child declares zero/several failures.
+    failures: BTreeMap<String, TypeSyntax>,
     schemas: SchemaIndex,
     /// Milestones the workflow may project (Family C): name -> payload class
     /// (empty string for a bare, payload-less milestone). Derived by scanning the
@@ -5021,6 +5028,7 @@ fn collect_workflow_input_surfaces(program: &Program) -> BTreeMap<String, Workfl
             WorkflowInputSurface {
                 inputs,
                 outputs: workflow_outputs_for_items(&program.items),
+                failures: workflow_failures_for_items(&program.items),
                 schemas: top_level_schemas.clone(),
                 milestones: collect_milestone_declarations(&program.items),
             },
@@ -5035,6 +5043,7 @@ fn collect_workflow_input_surfaces(program: &Program) -> BTreeMap<String, Workfl
             WorkflowInputSurface {
                 inputs: workflow_inputs_for_items(&workflow.items),
                 outputs: workflow_outputs_for_items(&workflow.items),
+                failures: workflow_failures_for_items(&workflow.items),
                 schemas,
                 milestones: collect_milestone_declarations(&workflow.items),
             },
@@ -5229,6 +5238,34 @@ fn invoke_output_class(
     }
 }
 
+/// Resolves the FAILURE-contract class of the child workflow a `fails` invoke
+/// binding observes, so `after <binding> fails as f` can type `f` to the child's
+/// declared failure shape (and check `f.<field>`) instead of the generic DR-0032
+/// `TerminalFailed` base. `None` (fall back to the base) when: the binding is not
+/// an invoke; the child declares zero or several failures (which failure the child
+/// raised is not statically known); the sole failure is a scalar (no fields); or
+/// the failure class is not resolvable in THIS workflow's scope. That last guard
+/// preserves workflow-local scoping — a child's private failure class is not
+/// visible to the parent, so only a shared top-level class is typed here; anything
+/// else keeps the base, which every failure structurally satisfies.
+fn invoke_failure_class(
+    rule: &RuleDecl,
+    binding: &str,
+    semantic: &SemanticContext,
+) -> Option<String> {
+    let workflow = invoke_binding_workflow(rule, binding)?;
+    let surface = semantic.workflow_inputs.get(&workflow)?;
+    if surface.failures.len() != 1 {
+        return None;
+    }
+    match surface.failures.values().next()? {
+        TypeSyntax::Ref { name } if semantic.schemas.class_exists(&name.name) => {
+            Some(name.name.clone())
+        }
+        _ => None,
+    }
+}
+
 /// Parses `emit milestone "<name>" [of <Class>]` headers out of a rule body's
 /// text, returning (name, class) pairs (class is empty for a bare milestone).
 /// Text-based to mirror the other body scanners (`workflow_invoke_statements`)
@@ -5291,6 +5328,18 @@ fn workflow_outputs_for_items(items: &[Item]) -> BTreeMap<String, TypeSyntax> {
         .iter()
         .filter_map(|item| match item {
             Item::WorkflowContract(contract) if contract.kind == WorkflowContractKind::Output => {
+                Some((contract.name.name.clone(), contract.ty.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn workflow_failures_for_items(items: &[Item]) -> BTreeMap<String, TypeSyntax> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::WorkflowContract(contract) if contract.kind == WorkflowContractKind::Failure => {
                 Some((contract.name.name.clone(), contract.ty.clone()))
             }
             _ => None,
@@ -7436,8 +7485,19 @@ fn analyze_rule(
             // failure extras (exec `exit_code`, …) are deferred behind static
             // effect-kind narrowing (a future variant), so the base is what is
             // typed today. This replaces the prior untyped no-op.
+            //
+            // Exception (typed invoke failure): when this is an invoke binding
+            // whose child declares a SOLE, shared top-level FAILURE contract class,
+            // bind the alias to THAT class so `f.<field>` type-checks against the
+            // child's declared failure shape. Non-invoke fails bindings
+            // (coerce/exec/…) and invoke bindings with a child-local/unresolvable
+            // failure class keep the `TerminalFailed` base.
             "fails" => {
-                binding_types.insert(alias.to_owned(), "TerminalFailed".to_owned());
+                if let Some(class) = invoke_failure_class(rule, binding, semantic) {
+                    binding_types.insert(alias.to_owned(), class);
+                } else {
+                    binding_types.insert(alias.to_owned(), "TerminalFailed".to_owned());
+                }
             }
             _ => {
                 if let Some(IrType::Ref(schema)) = effect_payload_types.get(binding) {
@@ -23611,6 +23671,109 @@ workflow Child {
         assert!(
             compiled.diagnostics.is_empty(),
             "valid invoke-result field access wrongly rejected: {:?}",
+            compiled.diagnostics
+        );
+        assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn typed_invoke_failure_checks_field_access_against_child_failure() {
+        // The child's failure is a shared top-level class `ChildError`. The
+        // parent's `after child fails as f` binds f to ChildError, so
+        // `f.nonexistent` (not a field of ChildError) is rejected — the failure
+        // binding is the child's declared failure shape, not the opaque base.
+        let source = r#"
+class Report { id string }
+class Job { id string }
+class ChildError { reason string }
+class ParentError { detail string }
+
+workflow Parent {
+  input task Job
+  output result Report
+  failure err ParentError
+  rule go
+    when Job as t
+  => {
+    invoke Child { task { id t.id } } as child
+    after child succeeds as r {
+      complete result { id r.id }
+    }
+    after child fails as f {
+      fail err { detail f.nonexistent }
+    }
+  }
+}
+
+workflow Child {
+  input task Job
+  output result Report
+  failure err ChildError
+  rule work
+    when Job as t
+  => {
+    fail err { reason t.id }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Parent"));
+        assert!(
+            compiled.ir.is_none(),
+            "unknown field on invoke failure must not compile"
+        );
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("f.nonexistent") || d.message.contains("nonexistent")),
+            "typed invoke failure did not reject f.nonexistent: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn typed_invoke_failure_accepts_a_valid_child_failure_field() {
+        // Bite: a field that IS on the child's shared failure contract resolves
+        // and the program compiles — the `fails` binding is no longer the opaque
+        // `TerminalFailed` base when the child declares a shared failure class.
+        let source = r#"
+class Report { id string }
+class Job { id string }
+class ChildError { reason string }
+class ParentError { detail string }
+
+workflow Parent {
+  input task Job
+  output result Report
+  failure err ParentError
+  rule go
+    when Job as t
+  => {
+    invoke Child { task { id t.id } } as child
+    after child succeeds as r {
+      complete result { id r.id }
+    }
+    after child fails as f {
+      fail err { detail f.reason }
+    }
+  }
+}
+
+workflow Child {
+  input task Job
+  output result Report
+  failure err ChildError
+  rule work
+    when Job as t
+  => {
+    fail err { reason t.id }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Parent"));
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "valid invoke-failure field access wrongly rejected: {:?}",
             compiled.diagnostics
         );
         assert!(compiled.ir.is_some());

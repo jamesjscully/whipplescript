@@ -33,3 +33,29 @@ search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
 search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
   accessFails(fBoth) outputFields((fOut , fBoth)) failureFields((fFail , fBoth))
   =>* rejected RESIDUAL:Cfg .
+
+--- Part (b) coverage: a field SPECIFIC to the child's declared failure class,
+--- accessed via the fails alias when the class is resolvable, is accepted. Under
+--- the old base-only binding this child-specific field would not have resolved;
+--- binding the child's failure class is what makes it check.
+search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
+  accessFails(fChild) failureFields((fChild , fReason))
+  =>* C:Cfg accepted .
+
+--- Part (b) coverage: fallback to the base — a child-class-specific field on the
+--- BASE-bound fails alias is rejected (the base has no such field).
+search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
+  accessFailsBase(fChild) baseFields((fReason , fBase))
+  =>* C:Cfg rejected .
+
+--- Part (b) coverage: the base's `reason` still resolves under the fallback — the
+--- control_plane regression (`after child fails as f { fail error { reason
+--- f.reason } }` with a child-local failure class) depends on this.
+search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
+  accessFailsBase(fReason) baseFields((fReason , fBase))
+  =>* C:Cfg accepted .
+
+--- Part (b) bite: the base's `reason` is NEVER rejected under the fallback.
+search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
+  accessFailsBase(fReason) baseFields((fReason , fBase))
+  =>* rejected RESIDUAL:Cfg .
