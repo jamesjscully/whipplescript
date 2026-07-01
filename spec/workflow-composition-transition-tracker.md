@@ -303,9 +303,14 @@ The target behavior is specified in [language.md](language.md),
   (`examples/includes/support-lib.whip` included by both
   `examples/include-triage.whip` and `examples/include-audit.whip`; both in the
   docs-examples gate.)
-- [ ] Add at least one reusable `pattern` used in multiple workflows.
-- [ ] Add a parent workflow that invokes a child workflow and handles success,
-  declared failure, timeout, and cancellation.
+- [x] Add at least one reusable `pattern` used in multiple workflows. The shared
+  `TagReviewed` pattern in `examples/includes/review-pattern-lib.whip` is applied
+  by both `examples/pattern-consumer-triage.whip` and
+  `examples/pattern-consumer-audit.whip`; both in the docs-examples gate.
+- [x] Add a parent workflow that invokes a child workflow and handles success,
+  declared failure, timeout, and cancellation. (`examples/parent-child-outcomes.whip`
+  — one parent rule with `after child succeeds/fails/times out/cancelled` branches;
+  in the docs-examples gate with `--root Parent`.)
 - [ ] Update quickstart, language sketch, examples spec, companion skill, and
   troubleshooting docs to use the canonical model.
 - [ ] Document the canonical explicit-workflow shape in examples and quickstart.

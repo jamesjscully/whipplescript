@@ -1,0 +1,18 @@
+# A reusable `pattern` shared across workflows via `include`. `TagReviewed`
+# generates a "mark reviewed" rule for whatever `Input` schema a workflow applies
+# it to, recording a shared `ReviewLog` fact. Patterns are compile-time reuse, so
+# each applying workflow gets its own hygienic copy of the rule. Terminal actions
+# are not allowed in a pattern body, so the applying workflow owns the `complete`.
+pattern TagReviewed<Input> {
+  rule mark_reviewed
+    when Input as item
+  => {
+    record ReviewLog {
+      id item.id
+    }
+  }
+}
+
+class ReviewLog {
+  id string
+}

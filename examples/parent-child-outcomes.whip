@@ -1,0 +1,80 @@
+# A parent workflow that `invoke`s a child workflow and handles every child
+# outcome the runtime can project: success, declared failure, timeout, and
+# cancellation. Each terminal outcome is a distinct `after child <outcome>`
+# branch — the parent never inspects child internals, only its projected
+# terminal. The four `after child <outcome>` branches — succeeds / fails /
+# times out / cancelled — cover every outcome the runtime projects onto a child
+# invocation. Check with `--root Parent`.
+workflow Parent {
+  input task Task
+  output result ParentDone
+  failure error ParentFailed
+
+  class Task {
+    title string
+  }
+
+  class ParentDone {
+    note string
+  }
+
+  class ParentFailed {
+    reason string
+  }
+
+  rule dispatch
+    when Task as task
+  => {
+    invoke Child { task { title task.title } } as child
+
+    after child succeeds as ok {
+      complete result {
+        note ok.summary
+      }
+    }
+
+    after child fails as bad {
+      fail error {
+        reason bad.reason
+      }
+    }
+
+    after child times out {
+      fail error {
+        reason "child workflow timed out"
+      }
+    }
+
+    after child cancelled {
+      fail error {
+        reason "child workflow was cancelled"
+      }
+    }
+  }
+}
+
+workflow Child {
+  input task ChildTask
+  output result ChildResult
+  failure error ChildFailed
+
+  class ChildTask {
+    title string
+  }
+
+  class ChildResult {
+    summary string
+  }
+
+  class ChildFailed {
+    reason string
+  }
+
+  rule work
+    when ChildTask as t
+  => {
+    complete result {
+      summary t.title
+    }
+  }
+}

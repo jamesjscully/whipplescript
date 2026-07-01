@@ -1,0 +1,28 @@
+# Consumer B of the SAME shared `TagReviewed` pattern (from review-pattern-lib.whip).
+# A different workflow applying the identical pattern to its own `TicketB` input
+# demonstrates one pattern reused across multiple workflows.
+include "includes/review-pattern-lib.whip"
+
+workflow ReviewTicketsB
+
+input ticket TicketB
+output result DoneB
+
+class TicketB {
+  id string
+}
+
+class DoneB {
+  id string
+}
+
+apply TagReviewed<TicketB> as auditTag {
+}
+
+rule finish
+  when ReviewLog as log
+=> {
+  complete result {
+    id log.id
+  }
+}
