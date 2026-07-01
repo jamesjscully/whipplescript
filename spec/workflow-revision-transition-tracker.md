@@ -789,10 +789,7 @@ experimental.
   - [x] `scripts/check-e2e.sh`
   - [x] revision-specific deterministic e2e
   - [x] trace conformance on revised instances
-- [x] Decide release status:
-  - [x] stable
-  - [ ] experimental behind feature flag
-  - [ ] deferred
+- [x] Decide release status: **stable** (not: experimental behind a feature flag; not: deferred)
 - [x] Record final audit summary in [final-audit.md](final-audit.md) or a
   linked release note.
 

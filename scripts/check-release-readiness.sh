@@ -60,6 +60,7 @@ CHECK_STATUSES=()
 CHECK_LOGS=()
 
 run_check required "shell syntax" "cd '$ROOT' && bash -n scripts/*.sh"
+run_check required "tracker discipline" "cd '$ROOT' && scripts/check-trackers.sh"
 run_check required "docs snippets" "cd '$ROOT' && scripts/check-docs-snippets.sh"
 run_check required "IR goldens" "cd '$ROOT' && scripts/regen-ir-goldens.sh --check"
 run_check required "docs site" "cd '$ROOT' && scripts/check-docs-site.sh"

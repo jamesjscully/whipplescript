@@ -1,6 +1,13 @@
 # Workflow Revision Follow-Ups Tracker
 
-Status: active vNext planning tracker; docs/spec-only.
+> **ARCHIVED (2026-06-30) — declared tracker bankruptcy.** This was a large
+> untriaged backlog of non-blocking vNext follow-ups. Rather than let ~100 open
+> items read as live work forever, it is parked. Nothing is lost: any item here
+> is re-surfaced on demand — when you next touch the relevant area, pull the
+> item into an `active` tracker (see `spec/TRACKERS.md`) and work it there.
+> Kept in place (not moved to `spec/archive/`) because other docs link to it.
+
+Status: archived (see banner above). Historical: active vNext planning tracker; docs/spec-only.
 
 This tracker covers non-blocking follow-ups from
 [final-audit.md](final-audit.md) after the v0 workflow revision implementation

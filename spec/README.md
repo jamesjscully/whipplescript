@@ -11,6 +11,13 @@ The `docs/` directory is authoritative for stable user-facing behavior. The
 specs remain design records, acceptance criteria, rationale, and implementation
 trackers.
 
+**For trackers, [`TRACKERS.md`](TRACKERS.md) is the single source of truth** —
+which trackers exist, their scope, and whether each is active / closed /
+archived. It is gate-enforced (`scripts/check-trackers.sh`): an unregistered
+tracker fails the build. Register there before starting a new one, and check for
+an existing scope first. The per-file links below are convenience pointers; the
+registry is authoritative.
+
 ## Status Legend
 
 | Status | Meaning |
