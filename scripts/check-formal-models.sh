@@ -121,6 +121,7 @@ declare -A EXPECTED_NO_SOLUTION=(
   ["workflow-revision.maude"]=5
   ["workflow-scoping.maude"]=3
   ["terminal-payload-shape.maude"]=2
+  ["invoke-result-typing.maude"]=2
 )
 
 declare -A EXPECTED_SOLUTION=(
@@ -180,6 +181,7 @@ declare -A EXPECTED_SOLUTION=(
   ["workflow-revision.maude"]=4
   ["workflow-scoping.maude"]=6
   ["terminal-payload-shape.maude"]=6
+  ["invoke-result-typing.maude"]=4
 )
 
 declare -A SEEN_TEST=()

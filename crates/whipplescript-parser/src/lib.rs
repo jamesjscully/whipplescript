@@ -1443,6 +1443,11 @@ struct SemanticContext {
 #[derive(Clone, Debug, Default)]
 struct WorkflowInputSurface {
     inputs: BTreeMap<String, TypeSyntax>,
+    /// The workflow's `output` contract types by name. A parent's
+    /// `after <invoke-binding> succeeds as r` binds `r` to this contract so
+    /// `r.<field>` type-checks against the child's declared output (the runtime
+    /// already carries the child's terminal payload into that binding).
+    outputs: BTreeMap<String, TypeSyntax>,
     schemas: SchemaIndex,
     /// Milestones the workflow may project (Family C): name -> payload class
     /// (empty string for a bare, payload-less milestone). Derived by scanning the
@@ -5015,6 +5020,7 @@ fn collect_workflow_input_surfaces(program: &Program) -> BTreeMap<String, Workfl
             workflow.name.clone(),
             WorkflowInputSurface {
                 inputs,
+                outputs: workflow_outputs_for_items(&program.items),
                 schemas: top_level_schemas.clone(),
                 milestones: collect_milestone_declarations(&program.items),
             },
@@ -5028,6 +5034,7 @@ fn collect_workflow_input_surfaces(program: &Program) -> BTreeMap<String, Workfl
             workflow.name.name.clone(),
             WorkflowInputSurface {
                 inputs: workflow_inputs_for_items(&workflow.items),
+                outputs: workflow_outputs_for_items(&workflow.items),
                 schemas,
                 milestones: collect_milestone_declarations(&workflow.items),
             },
@@ -5196,6 +5203,32 @@ fn milestone_payload_class(
     surface.milestones.get(milestone).cloned()
 }
 
+/// Resolves the OUTPUT-contract class of the child workflow a `succeeds`/`completes`
+/// invoke binding observes, so `after <binding> succeeds as r` can type `r` and
+/// check `r.<field>`. `None` (leave the binding opaque, unchanged) when: the binding
+/// is not an invoke; the child declares zero or several outputs (which output the
+/// child completes is not statically known); the sole output is a scalar (no
+/// fields); or the output class is not resolvable in THIS workflow's scope. That
+/// last guard preserves workflow-local scoping — a child's private output class is
+/// not visible to the parent, so only a shared top-level class is typed here.
+fn invoke_output_class(
+    rule: &RuleDecl,
+    binding: &str,
+    semantic: &SemanticContext,
+) -> Option<String> {
+    let workflow = invoke_binding_workflow(rule, binding)?;
+    let surface = semantic.workflow_inputs.get(&workflow)?;
+    if surface.outputs.len() != 1 {
+        return None;
+    }
+    match surface.outputs.values().next()? {
+        TypeSyntax::Ref { name } if semantic.schemas.class_exists(&name.name) => {
+            Some(name.name.clone())
+        }
+        _ => None,
+    }
+}
+
 /// Parses `emit milestone "<name>" [of <Class>]` headers out of a rule body's
 /// text, returning (name, class) pairs (class is empty for a bare milestone).
 /// Text-based to mirror the other body scanners (`workflow_invoke_statements`)
@@ -5246,6 +5279,18 @@ fn workflow_inputs_for_items(items: &[Item]) -> BTreeMap<String, TypeSyntax> {
         .iter()
         .filter_map(|item| match item {
             Item::WorkflowContract(contract) if contract.kind == WorkflowContractKind::Input => {
+                Some((contract.name.name.clone(), contract.ty.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn workflow_outputs_for_items(items: &[Item]) -> BTreeMap<String, TypeSyntax> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::WorkflowContract(contract) if contract.kind == WorkflowContractKind::Output => {
                 Some((contract.name.name.clone(), contract.ty.clone()))
             }
             _ => None,
@@ -7397,6 +7442,13 @@ fn analyze_rule(
             _ => {
                 if let Some(IrType::Ref(schema)) = effect_payload_types.get(binding) {
                     binding_types.insert(alias.to_owned(), schema.clone());
+                } else if let Some(class) = invoke_output_class(rule, binding, semantic) {
+                    // Typed invoke result: `after <child> succeeds/completes as r`
+                    // binds r to the child workflow's OUTPUT contract class, so
+                    // `r.<field>` type-checks. (The runtime already carries the
+                    // child's terminal payload into this binding.) The `fails` arm
+                    // above keeps the DR-0032 failure base.
+                    binding_types.insert(alias.to_owned(), class);
                 }
             }
         }
@@ -23475,6 +23527,93 @@ workflow C {
             "acyclic chain wrongly flagged: {:?}",
             compiled.diagnostics
         );
+    }
+
+    #[test]
+    fn typed_invoke_result_checks_field_access_against_child_output() {
+        // The child's output is a shared top-level class `Report`. The parent's
+        // `after child succeeds as r` binds r to Report, so `r.missing` (not a
+        // field of Report) is rejected — invoke results are no longer opaque.
+        let source = r#"
+class Report { id string }
+class Job { id string }
+
+workflow Parent {
+  input task Job
+  output result Report
+  rule go
+    when Job as t
+  => {
+    invoke Child { task { id t.id } } as child
+    after child succeeds as r {
+      complete result { id r.missing }
+    }
+  }
+}
+
+workflow Child {
+  input task Job
+  output result Report
+  rule work
+    when Job as t
+  => {
+    complete result { id t.id }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Parent"));
+        assert!(
+            compiled.ir.is_none(),
+            "unknown field on invoke result must not compile"
+        );
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("r.missing") || d.message.contains("missing")),
+            "typed invoke result did not reject r.missing: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn typed_invoke_result_accepts_a_valid_child_output_field() {
+        // Bite: a field that IS on the child's output contract resolves and the
+        // program compiles.
+        let source = r#"
+class Report { id string }
+class Job { id string }
+
+workflow Parent {
+  input task Job
+  output result Report
+  rule go
+    when Job as t
+  => {
+    invoke Child { task { id t.id } } as child
+    after child succeeds as r {
+      complete result { id r.id }
+    }
+  }
+}
+
+workflow Child {
+  input task Job
+  output result Report
+  rule work
+    when Job as t
+  => {
+    complete result { id t.id }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Parent"));
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "valid invoke-result field access wrongly rejected: {:?}",
+            compiled.diagnostics
+        );
+        assert!(compiled.ir.is_some());
     }
 
     #[test]

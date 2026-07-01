@@ -38,6 +38,7 @@ check_example examples/include-audit.whip
 check_example examples/parent-child-outcomes.whip --root Parent
 check_example examples/compact-contract.whip
 check_example examples/scalar-terminal.whip
+check_example examples/typed-invoke-result.whip --root Router
 check_example examples/pattern-consumer-triage.whip
 check_example examples/pattern-consumer-audit.whip
 check_example examples/reusable-review-pattern.whip

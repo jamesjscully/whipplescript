@@ -586,7 +586,12 @@ from the same source bundle, records a parent/child invocation link, and can
 either run the child to a terminal state within a bounded local loop or leave
 the parent effect running for a later worker pass to resume. Child
 `complete`/`fail` payloads are projected back into parent `after review
-succeeds`/`after review fails` blocks. If the child does not reach a workflow
+succeeds`/`after review fails` blocks. In `after <child> succeeds as r`, `r` is
+statically typed to the child's `output` contract, so `r.<field>` is checked at
+compile time — provided that output type is a **shared top-level class** (a
+class declared privately inside the child workflow is not visible to the parent,
+per workflow-local scoping, so the binding stays opaque there). If the child does
+not reach a workflow
 terminal state within the bounded loop, the parent invocation effect is marked
 `timed_out` and projected as the `TimedOut` terminal, matched by `after review
 times out` (or the `TimedOut` arm of `after review completes`). If the child

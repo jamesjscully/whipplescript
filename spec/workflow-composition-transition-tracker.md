@@ -269,6 +269,21 @@ The target behavior is specified in [language.md](language.md),
 - [x] Support `after invocation succeeds`, `after invocation fails`, and
   `after invocation completes` using the existing tagged terminal matching
   model. (Predicate parse body.rs:3036; `invoke_binding_workflow` lib.rs:4903.)
+- [x] **Typed invoke results (success side) — SHIPPED 2026-07-01.** `after child
+  succeeds as r` now binds `r` to the child workflow's `output` contract *class*
+  so `r.<field>` is statically checked (was opaque `terminal_unknown_payload_type`).
+  Static-only: the runtime already carries the child's terminal payload into the
+  binding (verified by the pre-existing e2e `result.title == "Invoke smoke"`),
+  so this only closed the compile-time typing gap. Resolved in `analyze_rule`'s
+  succeeds/completes arm via `invoke_output_class` (`invoke_binding_workflow` →
+  the target's sole `output` contract), guarded on `semantic.schemas.class_exists`
+  so a child-*local* output class stays opaque (workflow-local scoping preserved);
+  the `fails` arm keeps the DR-0032 `TerminalFailed` base (predicate discrimination).
+  `WorkflowInputSurface.outputs` added. Model `invoke-result-typing.maude` (4/2);
+  tests `typed_invoke_result_checks_field_access_against_child_output` +
+  `_accepts_a_valid_child_output_field`; example `typed-invoke-result.whip`.
+  Deferred: scalar child outputs (bind `r` to a scalar *value*, not a schema — a
+  different mechanism; low value, runtime already exposes it).
 - [x] Ensure child provider failures do not bypass child workflow rules or
   directly complete the parent invocation.
   (`failed_child_invocation_drives_parent_failure_branch` control_plane.rs:5759.)
@@ -457,14 +472,14 @@ justified deferrals; the calls below unblock the last cluster.
   re-print. Model `models/maude/terminal-payload-shape.maude` (6 cov / 2 bite).
   Tests: 4 parser (accept value / reject block / reject class-vs-scalar / value
   typecheck) + `dev_completes_a_scalar_terminal_payload` e2e (scalar stored as a
-  scalar). Examples `scalar-terminal.whip`. **CONSUMER SIDE DEFERRED (with cause):**
-  making a parent's `after child succeeds as r` bind `r` to the child's typed
-  scalar value depends on typed invoke-result resolution that does not exist even
-  for CLASS outputs today (`WorkflowInvoke` yields an opaque object
-  `terminal_unknown_payload_type`; `r.field` on an invoke result is currently
-  unchecked). That is an orthogonal feature (typed invoke results), not scalar-
-  specific; the scalar producer side is independently useful (the value is in the
-  run outcome/status). Tracked as its own follow-on.
+  scalar). Examples `scalar-terminal.whip`. **CONSUMER SIDE — CLASS outputs now typed (2026-07-01); scalar
+  outputs still deferred.** The orthogonal "typed invoke results" follow-on
+  shipped for CLASS outputs (see Phase 5): `after child succeeds as r` now binds
+  `r` to the child's output contract *class* (shared top-level), so `r.field` is
+  statically checked. A SCALAR child output stays opaque — binding `r` directly to
+  a scalar *value* (not a schema) is a different mechanism than the schema-map used
+  for class typing, and the runtime already exposes the value regardless, so it is
+  a low-value remaining slice deferred with cause.
 - [x] **Recursive workflow invocation policy — RESOLVED 2026-07-01 (Jack): "as
   permissive as provable convergence at compile time allows."** Interpretation:
   whipplescript cannot prove runtime-`invoke` termination at compile time (it is

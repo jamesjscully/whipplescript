@@ -1,0 +1,61 @@
+--- Typed workflow invoke results, per spec/language.md "Workflow Contracts And
+--- Invocation". A parent that `invoke`s a child and observes its terminal binds
+--- the observing alias to a type that depends on the OUTCOME PREDICATE:
+---   * `after child succeeds as r` -> r carries the child's OUTPUT contract, so
+---     `r.<field>` is checked against the output's fields;
+---   * `after child fails as f`     -> f carries the failure base (TerminalFailed),
+---     NOT the output, so an output-only field on f is rejected.
+--- This model abstracts each contract to its field set and checks by search that
+--- a field access resolves against the predicate-selected contract only. Companion
+--- to the succeeds-arm resolution in analyze_rule (the fails arm already binds the
+--- DR-0032 failure base). The runtime already carries the child payload; this is
+--- the static typing that makes `r.<field>` checked instead of opaque.
+mod WHIPPLESCRIPT-INVOKE-RESULT-TYPING is
+  protecting BOOL .
+
+  sorts Field FieldSet Cfg .
+  subsort Field < FieldSet .
+
+  ops fOut fFail fBoth : -> Field [ctor] .   --- output-only, failure-only, shared
+
+  op mtFields : -> FieldSet [ctor] .
+  op _,_ : FieldSet FieldSet -> FieldSet [ctor assoc comm id: mtFields] .
+  eq [field-idem] : F:Field , F:Field = F:Field .
+
+  op memberField : Field FieldSet -> Bool .
+  eq memberField(F:Field, (F:Field , FS:FieldSet)) = true .
+  eq memberField(F:Field, FS:FieldSet) = false [owise] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- The child's two contracts, each a field set.
+  op outputFields : FieldSet -> Cfg [ctor] .
+  op failureFields : FieldSet -> Cfg [ctor] .
+
+  --- A pending field access through the succeeds- or fails-bound alias.
+  op accessSucceeds : Field -> Cfg [ctor] .
+  op accessFails : Field -> Cfg [ctor] .
+
+  ops accepted rejected : -> Cfg [ctor] .
+
+  var F : Field .
+  vars OS FS : FieldSet .
+
+  --- A succeeds-alias access resolves against the OUTPUT contract only.
+  crl [succeeds-ok] : accessSucceeds(F) outputFields(OS)
+      => accepted outputFields(OS)
+      if memberField(F, OS) .
+  crl [succeeds-bad] : accessSucceeds(F) outputFields(OS)
+      => rejected outputFields(OS)
+      if memberField(F, OS) = false .
+
+  --- A fails-alias access resolves against the FAILURE contract only, so an
+  --- output-only field on the fails binding is rejected (predicate discrimination).
+  crl [fails-ok] : accessFails(F) failureFields(FS)
+      => accepted failureFields(FS)
+      if memberField(F, FS) .
+  crl [fails-bad] : accessFails(F) failureFields(FS)
+      => rejected failureFields(FS)
+      if memberField(F, FS) = false .
+endm

@@ -141,6 +141,10 @@ terminal-payload-shape.maude     workflow terminal payload shape: a class contra
                                  takes a field block, a scalar contract takes a
                                  matching scalar value; shape/type mismatches are
                                  rejected, correct shapes never wrongly rejected
+invoke-result-typing.maude       typed invoke results: `after child succeeds as r`
+                                 binds r to the child's OUTPUT contract (field
+                                 access checked against it), `after child fails as
+                                 f` to the failure base — predicate discrimination
 ```
 
 The shell script runs every Maude test file and checks the expected number of
