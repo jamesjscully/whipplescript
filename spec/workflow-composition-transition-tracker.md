@@ -33,28 +33,39 @@ The target behavior is specified in [language.md](language.md),
 
 ## Acceptance Gates
 
-- [~] A source bundle with includes compiles deterministically and records the
-  include closure, bundle hash, root workflow, and diagnostics.
+- [x] A source bundle with includes compiles deterministically and records the
+  include closure, bundle hash, root workflow, and diagnostics. Include closure +
+  per-include `source_hash` (kernel/lib.rs:2571), cycle/dup/root diagnostics, and
+  the whole-closure `bundle_hash` (kernel/lib.rs:2571, test
+  `analysis_summary_reports_a_stable_whole_closure_bundle_hash`) all recorded in
+  `program_analysis_summary_json`.
 - [x] A file may contain multiple explicit `workflow` declarations; commands
   require `--root` or equivalent selection when ambiguous.
 - [~] `pattern` declarations elaborate into first-order declarations before
   runtime with hygienic generated names and source provenance.
 - [~] `apply` cannot create runtime recursion, hidden effects, or declarations
   outside its allowed expansion scope.
-- [~] `workflow` declarations have typed `input`, `output`, and `failure`
-  contracts.
-- [~] `complete <output> <payload>` atomically validates output, appends a
+- [x] `workflow` declarations have typed `input`, `output`, and `failure`
+  contracts. (`WorkflowContractDecl`/`WorkflowContractKind`, parser lib.rs:208;
+  `lower_workflow_contract` lib.rs:5280.)
+- [x] `complete <output> <payload>` atomically validates output, appends a
   terminal workflow event, stores terminal payload, and marks the instance
-  completed.
-- [~] `fail <failure> <payload>` atomically validates failure payload, appends a
+  completed. (Typecheck `validate_workflow_terminal_payload` lib.rs:6684; atomic
+  commit `rule_commit_with_workflow_terminal_updates_instance_atomically`
+  store/lib.rs:8959; payload persist `workflow_terminal_payload` store/lib.rs:7585.)
+- [x] `fail <failure> <payload>` atomically validates failure payload, appends a
   terminal workflow event, stores terminal payload, and marks the instance
-  failed.
-- [~] Terminal instances cannot commit additional rule effects or user-fact
+  failed. (Same paths, `WorkflowTerminalKind::Failed`.)
+- [x] Terminal instances cannot commit additional rule effects or user-fact
   mutations after completion/failure/cancellation.
-- [~] `invoke Workflow { ... } as name` creates a durable child workflow
-  invocation, not an inline expansion.
-- [~] Parent workflows observe child terminal state through typed invocation
-  completion/failure/timeout/cancellation outputs.
+  (`terminal_instance_statuses_are_absorbing` store/lib.rs:9806;
+  `duplicate_terminal_completion_rolls_back_event` store/lib.rs:9264.)
+- [x] `invoke Workflow { ... } as name` creates a durable child workflow
+  invocation, not an inline expansion. (`run_workflow_invoke_effect` main.rs:25478;
+  `workflow_invocations` table, migration 0001:154.)
+- [x] Parent workflows observe child terminal state through typed invocation
+  completion/failure/timeout/cancellation outputs. (Projection tests
+  `dev_projects_{failed,timed_out,cancelled}_child_workflow_invocation`.)
 - [x] Provider and harness failures remain effect/run events and evidence; they
   do not automatically fail a workflow unless source rules choose to `fail`. (Done: 503 auto-fail is scoped to UNHANDLED effect failures in self-terminating flows — main.rs ~20105; see [project-503-autofail].)
 - [ ] The generated Maude/check path can represent pattern provenance,
@@ -128,8 +139,9 @@ The target behavior is specified in [language.md](language.md),
   dropped for v0.)
 - [x] Make terminal action commits atomic with the rule commit.
 - [x] Persist workflow terminal events and terminal payloads in the store.
-- [~] Block further effectful rule commits after terminal state.
-- [~] Terminal tie-break: under the deterministic fixpoint (rule declaration
+- [x] Block further effectful rule commits after terminal state.
+  (`terminal_instance_statuses_are_absorbing` store/lib.rs:9806.)
+- [x] Terminal tie-break: under the deterministic fixpoint (rule declaration
   order, then earliest triggering fact sequence; see
   [semantics.md](semantics.md)), the **first committed terminal wins**. Once a
   `complete`/`fail` commits, the instance is terminal: no further effectful rule
@@ -137,6 +149,8 @@ The target behavior is specified in [language.md](language.md),
   reached a terminal does not fire (its matched state was consumed by the
   terminal commit, and the post-terminal guard rejects it). See
   [language.md](language.md#workflow-contracts-and-invocation).
+  (Absorbing-status + `duplicate_terminal_completion_rolls_back_event`
+  store/lib.rs:9264.)
 - [~] Add status/diagnostics output that clearly distinguishes workflow failure
   from provider/effect failure.
 
@@ -145,17 +159,19 @@ The target behavior is specified in [language.md](language.md),
 - [x] Add parser support for `invoke Workflow { ... } as binding`.
 - [x] Typecheck invocation input against the target workflow input contract.
 - [~] Validate target workflow visibility and authorization.
-- [~] Persist invocation records with parent instance, child instance, target
-  workflow, input payload, and source span.
+- [x] Persist invocation records with parent instance, child instance, target
+  workflow, input payload, and source span. (`record_workflow_invocation`
+  store/lib.rs:1663; `workflow_invocations` incl. `source_span_json`, 0001:154.)
 - [x] Start child instances through the same durable runtime path as root
   instances.
 - [x] Project child `complete`, `fail`, timeout, and cancellation into typed
   parent invocation terminal outputs.
-- [~] Support `after invocation succeeds`, `after invocation fails`, and
+- [x] Support `after invocation succeeds`, `after invocation fails`, and
   `after invocation completes` using the existing tagged terminal matching
-  model.
-- [~] Ensure child provider failures do not bypass child workflow rules or
+  model. (Predicate parse body.rs:3036; `invoke_binding_workflow` lib.rs:4903.)
+- [x] Ensure child provider failures do not bypass child workflow rules or
   directly complete the parent invocation.
+  (`failed_child_invocation_drives_parent_failure_branch` control_plane.rs:5759.)
 
 ## Phase 6: Static Analysis And Verification
 
@@ -181,8 +197,11 @@ The target behavior is specified in [language.md](language.md),
 - [ ] Add store schema for programs with source bundles and multiple workflows.
 - [ ] Add store schema for workflow terminal payloads and invocation records.
 - [ ] Add migration strategy for existing SQLite stores used by tests.
-- [ ] Update the kernel transaction boundary for terminal workflow commits.
-- [~] Update worker/stepper scheduling to run child workflow instances.
+- [x] Update the kernel transaction boundary for terminal workflow commits.
+  (Terminal commit is atomic with the rule commit —
+  `rule_commit_with_workflow_terminal_updates_instance_atomically` store/lib.rs:8959.)
+- [x] Update worker/stepper scheduling to run child workflow instances.
+  (`worker_resumes_running_workflow_invocation` control_plane.rs:11496.)
 - [~] Update `whip status` to show parent/child invocation trees.
 - [ ] Update JSON traces to include source bundle, workflow id, pattern
   provenance, invocation id, and terminal payload references.
@@ -192,7 +211,10 @@ The target behavior is specified in [language.md](language.md),
 ## Phase 8: Examples And Docs
 
 - [x] Rewrite core examples with explicit `workflow` declarations. (Done: 37/37 examples workflow-prefixed.)
-- [ ] Add at least one library file included by multiple workflows.
+- [x] Add at least one library file included by multiple workflows.
+  (`examples/includes/support-lib.whip` included by both
+  `examples/include-triage.whip` and `examples/include-audit.whip`; both in the
+  docs-examples gate.)
 - [ ] Add at least one reusable `pattern` used in multiple workflows.
 - [ ] Add a parent workflow that invokes a child workflow and handles success,
   declared failure, timeout, and cancellation.
@@ -204,17 +226,26 @@ The target behavior is specified in [language.md](language.md),
 
 ## Phase 9: E2E And validation
 
-- [ ] Add deterministic fixture-provider e2e for include plus explicit root
-  selection.
-- [~] Add deterministic fixture-provider e2e for pattern application provenance.
-- [ ] Add deterministic fixture-provider e2e for workflow complete/fail.
-- [~] Add deterministic fixture-provider e2e for parent-child invocation.
+- [x] Add deterministic fixture-provider e2e for include plus explicit root
+  selection. (`dev_runs_included_bundle_with_explicit_root_selection`
+  control_plane.rs — `dev --root Selected` on an include+multi-workflow bundle
+  runs to completion.)
+- [x] Add deterministic fixture-provider e2e for pattern application provenance.
+  (`dev_runs_rule_generated_by_pattern_application` control_plane.rs:11134.)
+- [~] Add deterministic fixture-provider e2e for workflow complete/fail.
+  (`complete` covered: `dev_complete_terminal_action_marks_instance_completed`
+  control_plane.rs:10811; direct workflow-`fail` terminal e2e still missing —
+  only child-driven fail exists.)
+- [x] Add deterministic fixture-provider e2e for parent-child invocation.
+  (`dev_creates_workflow_invoke_effect` control_plane.rs:11212; projection tests;
+  `worker_resumes_running_workflow_invocation` control_plane.rs:11496.)
 - [ ] Add validation workflow that reviews each phase of this tracker using a child
   workflow invocation per phase.
 - [ ] Add opt-in real-provider validation that invokes Codex, Claude, and Pi review
   workflows and validates outputs through `coerce`.
-- [ ] Verify failed provider runs appear in the event stream without directly
+- [x] Verify failed provider runs appear in the event stream without directly
   failing workflow instances unless source rules say so.
+  (`dev_fixture_failure_reaches_event_stream` control_plane.rs:4965.)
 
 ## Open Decisions
 

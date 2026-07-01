@@ -2578,6 +2578,26 @@ pub fn program_analysis_summary_json(program: &IrProgram) -> String {
             })
         })
         .collect::<Vec<_>>();
+    // A single stable fingerprint of the whole include closure: the ordered
+    // (path, source_hash) pairs. Changes iff any included file's path or content
+    // changes, so it identifies the bundle as a unit (the per-file `source_hash`
+    // values above identify each member individually). Deterministic and stable
+    // for an include-free program (hashes the empty closure).
+    let bundle_hash = {
+        let canonical = program
+            .includes
+            .iter()
+            .map(|include| {
+                format!(
+                    "{}\u{0}{}",
+                    include.path,
+                    include.source_hash.as_deref().unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        stable_hash_hex(&canonical)
+    };
     let pattern_applications = program
         .pattern_applications
         .iter()
@@ -2631,6 +2651,7 @@ pub fn program_analysis_summary_json(program: &IrProgram) -> String {
         "workflow": program.workflow,
         "workflow_contracts": workflow_contracts,
         "include_closure": include_closure,
+        "bundle_hash": bundle_hash,
         "pattern_applications": pattern_applications,
         "generated_declarations": generated_declarations,
         "generated_declaration_hashes": generated_declaration_hashes,
@@ -3832,6 +3853,66 @@ workflow Root {
             assert!(hash.chars().all(|ch| ch.is_ascii_hexdigit()));
             assert_ne!(entry.get("missing").and_then(Value::as_bool), Some(true));
         }
+    }
+
+    #[test]
+    fn analysis_summary_reports_a_stable_whole_closure_bundle_hash() {
+        // The compiled-IR report carries a single `bundle_hash` fingerprinting the
+        // whole include closure (in addition to per-include `source_hash`). It is
+        // deterministic, present for an include-free program, and changes iff the
+        // closure changes (a member added, or a member's content changed).
+        let compiled = compile_program(
+            r#"
+workflow Root {
+  output result Done
+  class Done { note string }
+
+  rule finish
+    when Done as d
+  => {
+    complete result { note d.note }
+  }
+}
+"#,
+        );
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let base = compiled.ir.expect("program compiles");
+
+        let bundle_hash = |program: &IrProgram| {
+            serde_json::from_str::<Value>(&program_analysis_summary_json(program))
+                .expect("valid JSON")
+                .get("bundle_hash")
+                .and_then(Value::as_str)
+                .expect("bundle_hash present")
+                .to_owned()
+        };
+
+        // Include-free closure: deterministic 16-hex fingerprint.
+        let empty = bundle_hash(&base);
+        assert_eq!(empty.len(), 16);
+        assert!(empty.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(empty, bundle_hash(&base), "same closure -> same hash");
+
+        // Adding a closure member changes the bundle hash.
+        let mut with_one = base.clone();
+        with_one.includes.push(whipplescript_parser::IrInclude {
+            path: "lib.whip".to_owned(),
+            source_hash: Some("aaaa".to_owned()),
+        });
+        let one = bundle_hash(&with_one);
+        assert_ne!(one, empty, "adding an include changes the bundle hash");
+
+        // Changing a member's content changes the bundle hash.
+        let mut changed = base.clone();
+        changed.includes.push(whipplescript_parser::IrInclude {
+            path: "lib.whip".to_owned(),
+            source_hash: Some("bbbb".to_owned()),
+        });
+        assert_ne!(
+            bundle_hash(&changed),
+            one,
+            "changed include content changes the bundle hash"
+        );
     }
 
     #[test]

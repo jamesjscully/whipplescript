@@ -33,6 +33,8 @@ check_example examples/redact-projection.whip
 check_example examples/event-bridge.whip
 check_example examples/messaging-demo.whip
 check_example examples/file-store-demo.whip
+check_example examples/include-triage.whip
+check_example examples/include-audit.whip
 check_example examples/reusable-review-pattern.whip
 check_example examples/reusable-action-chain.whip
 check_example examples/queue-worker-with-review.whip

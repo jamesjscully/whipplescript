@@ -10910,6 +10910,115 @@ workflow WorkflowComplete {
 }
 
 #[test]
+fn dev_runs_included_bundle_with_explicit_root_selection() {
+    // Phase 9 e2e: a source bundle that BOTH pulls in a library file via `include`
+    // AND declares multiple workflows (so `--root` is required) runs deterministically
+    // to completion. Exercises include resolution + root selection together in one dev run.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let root = temp_workflow_path("include-root-dev");
+    let lib = root.with_file_name(format!(
+        "{}.lib.whip",
+        root.file_stem()
+            .expect("temp path has stem")
+            .to_string_lossy()
+    ));
+    fs::write(
+        &lib,
+        r#"class SharedTicket {
+  id string
+}
+"#,
+    )
+    .expect("write include lib");
+    fs::write(
+        &root,
+        format!(
+            r#"include "{}"
+
+workflow Selected {{
+  output result Out
+
+  class Out {{
+    id string
+  }}
+
+  rule go
+    when started
+  => {{
+    record SharedTicket {{
+      id "t-1"
+    }}
+    complete result {{
+      id "t-1"
+    }}
+  }}
+}}
+
+workflow Other {{
+  output result OtherOut
+
+  class OtherOut {{
+    note "other"
+  }}
+
+  rule go
+    when started
+  => {{
+    complete result {{
+      note "other"
+    }}
+  }}
+}}
+"#,
+            lib.file_name().expect("lib file name").to_string_lossy()
+        ),
+    )
+    .expect("write root bundle");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            root.to_str().expect("utf-8 workflow path"),
+            "--root",
+            "Selected",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let status = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "status",
+            instance_id,
+        ],
+    );
+    assert_eq!(
+        status
+            .get("instance")
+            .and_then(|instance| instance.get("status"))
+            .and_then(Value::as_str),
+        Some("completed"),
+        "included+root bundle should run to completion: {status}"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(root);
+    let _ = fs::remove_file(lib);
+}
+
+#[test]
 fn status_surfaces_pending_human_asks_with_answer_command() {
     // An instance idle on an `askHuman` shows the pending ask and the exact command
     // (with available choices) to unblock it.
