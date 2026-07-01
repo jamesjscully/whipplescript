@@ -432,22 +432,25 @@ Each open item carries a recommendation to make it decision-ready. These are the
 true remaining gate to "finished" — the implementation items above are done or are
 justified deferrals; the calls below unblock the last cluster.
 
-- [ ] **Exact syntax for workflow contracts.** `input Name Type` / `output Name
-  Type` / `failure Name Type` is implemented and working (lib.rs:16547). Open only:
-  whether to *also* add a compact single-line signature form.
-  **Recommendation:** keep the current keyword form as canonical, defer the compact
-  form (no user demand; it is pure sugar). Low stakes.
-- [ ] **Coerce file imports.** Whether coerce definitions can be imported (and how:
-  `include "types.coerce"` vs a coerce declaration vs a generated bundle member).
-  **Recommendation:** defer — coerce definitions live inline in `.whip` today and
-  nothing forces cross-file coerce reuse yet; revisit when a real multi-file coerce
-  need appears. If/when needed, `include` of a `.coerce` member is the smallest step.
-- [ ] **Scalar terminal payloads.** Whether `complete result 0.9` (a bare scalar)
-  is allowed, or terminal payloads must always be class-shaped (`complete result {
-  score 0.9 }`). Only class-shaped is implemented. **Recommendation:** make
-  class-only the deliberate v0 rule (one payload shape, uniform with `record`;
-  scalars can always be a one-field class) and close this as a non-goal rather than
-  leave it a lingering "remains."
+- [x] **Exact syntax for workflow contracts — RESOLVED 2026-07-01 (Jack): add the
+  compact single-line signature form.** The keyword form (`input Name Type` /
+  `output Name Type` / `failure Name Type`) stays legal; ADD a compact form
+  `workflow Name(input: Type[, ...]) -> Output [! Failure]` that desugars to the
+  same contract decls (output name defaults to `result`, failure to `error`). Both
+  forms are legal to write; `whip fmt` canonicalizes the compact form to keyword
+  lines (single stored form, no data loss). **Building now** as its own piece.
+- [x] **Coerce file imports — RESOLVED 2026-07-01 (Jack): defer.** Coerce
+  definitions live inline in `.whip` today; share them by `include`ing the whole
+  `.whip` library file. No dedicated `.coerce` import is built. Revisit when a real
+  multi-file coerce need appears; `include` of a `.coerce` member is the smallest
+  step then. Closed as deferred (not a transition blocker).
+- [x] **Scalar terminal payloads — RESOLVED 2026-07-01 (Jack): allow bare
+  scalars.** In addition to class-shaped payloads, allow a scalar output/failure
+  contract (`output result number`) with a bare-scalar terminal action
+  (`complete result 0.9`). A scalar binding (`after child succeeds as r`) resolves
+  to the whole value; class bindings keep field access. Whole-value redaction/IFC
+  label for scalar payloads. **Building now** as its own model-first piece
+  (`models/maude/…` for the class-vs-scalar terminal payload shape).
 - [x] **Recursive workflow invocation policy — RESOLVED 2026-07-01 (Jack): "as
   permissive as provable convergence at compile time allows."** Interpretation:
   whipplescript cannot prove runtime-`invoke` termination at compile time (it is

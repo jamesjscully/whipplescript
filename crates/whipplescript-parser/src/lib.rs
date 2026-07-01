@@ -16332,6 +16332,10 @@ impl Parser<'_> {
                         }
                         workflow_tags = parsed_workflow.decl.tags;
                         workflow_description = parsed_workflow.decl.description;
+                        // A header-form workflow carries no block, so its only
+                        // items are the compact-signature contracts (if any);
+                        // those are top-level for a single-workflow program.
+                        items.extend(parsed_workflow.decl.items);
                         workflow = Some(parsed_workflow.decl.name);
                         explicit_workflow_body = false;
                     }
@@ -16380,6 +16384,17 @@ impl Parser<'_> {
         let mut explicit_body = false;
         let mut items = Vec::new();
         let mut end = name.span.end;
+        // Optional compact contract signature: `Name(in: T, ...) -> Out [! Fail]`.
+        // Desugars to the same `input`/`output`/`failure` contract decls as the
+        // keyword form, with the output named `result` and the failure `error`
+        // (the conventional names). Both forms are legal; `whip fmt` re-emits the
+        // keyword lines (one canonical stored shape).
+        if self.at_symbol('(') {
+            if let Some((contracts, signature_end)) = self.parse_compact_contract_signature() {
+                end = signature_end;
+                items.extend(contracts.into_iter().map(Item::WorkflowContract));
+            }
+        }
         if self.at_symbol('{') {
             explicit_body = true;
             self.expect_symbol('{')?;
@@ -16441,6 +16456,66 @@ impl Parser<'_> {
             },
             explicit_body,
         })
+    }
+
+    /// Parses a compact contract signature `(name: Type, ...) -> Output [! Failure]`
+    /// into the same contract decls the keyword form produces. The output binding
+    /// is named `result` and the failure `error` — the conventional names used by
+    /// `complete result` / `fail error`. Returns the contracts and the signature's
+    /// end offset (so the workflow span covers it).
+    fn parse_compact_contract_signature(&mut self) -> Option<(Vec<WorkflowContractDecl>, usize)> {
+        self.expect_symbol('(')?;
+        let mut contracts = Vec::new();
+        while !self.is_at_end() && !self.at_symbol(')') {
+            let name = self.expect_ident("workflow input name")?;
+            self.expect_symbol(':')?;
+            let ty = self.parse_type()?;
+            let span = name.span.join(ty.span());
+            contracts.push(WorkflowContractDecl {
+                kind: WorkflowContractKind::Input,
+                name,
+                ty,
+                span,
+            });
+            if self.at_symbol(',') {
+                self.advance();
+            } else if !self.at_symbol(')') {
+                self.unexpected("`,` or `)`");
+                while !self.is_at_end() && !self.at_symbol(')') && !self.at_symbol(',') {
+                    self.advance();
+                }
+            }
+        }
+        self.expect_symbol(')')?;
+        self.expect_thin_arrow()?;
+        let output_ty = self.parse_type()?;
+        let output_span = output_ty.span();
+        let mut end = output_span.end;
+        contracts.push(WorkflowContractDecl {
+            kind: WorkflowContractKind::Output,
+            name: Ident {
+                name: "result".to_owned(),
+                span: output_span,
+            },
+            ty: output_ty,
+            span: output_span,
+        });
+        if self.at_symbol('!') {
+            self.advance();
+            let failure_ty = self.parse_type()?;
+            let failure_span = failure_ty.span();
+            end = failure_span.end;
+            contracts.push(WorkflowContractDecl {
+                kind: WorkflowContractKind::Failure,
+                name: Ident {
+                    name: "error".to_owned(),
+                    span: failure_span,
+                },
+                ty: failure_ty,
+                span: failure_span,
+            });
+        }
+        Some((contracts, end))
     }
 
     fn parse_tag(&mut self) -> Option<TagDecl> {
@@ -23326,6 +23401,116 @@ workflow Beta {
             compiled.diagnostics
         );
         assert!(compiled.ir.is_some(), "selected root failed to compile");
+    }
+
+    #[test]
+    fn compact_workflow_signature_desugars_to_keyword_contracts() {
+        // `Name(in: T) -> Out ! Fail` must produce exactly the contracts the
+        // keyword form produces, with output named `result` and failure `error`.
+        let compact = r#"
+workflow Triage(ticket: Ticket) -> Resolution ! TriageFailed
+
+class Ticket { id string }
+class Resolution { id string }
+class TriageFailed { reason string }
+
+rule go
+  when Ticket as t
+=> {
+  complete result { id t.id }
+}
+"#;
+        let keyword = r#"
+workflow Triage
+
+input ticket Ticket
+output result Resolution
+failure error TriageFailed
+
+class Ticket { id string }
+class Resolution { id string }
+class TriageFailed { reason string }
+
+rule go
+  when Ticket as t
+=> {
+  complete result { id t.id }
+}
+"#;
+        let compact_ir = compile_program_with_root(compact, None);
+        let keyword_ir = compile_program_with_root(keyword, None);
+        assert!(
+            compact_ir.diagnostics.is_empty(),
+            "compact form did not compile: {:?}",
+            compact_ir.diagnostics
+        );
+        assert!(
+            keyword_ir.diagnostics.is_empty(),
+            "keyword form did not compile: {:?}",
+            keyword_ir.diagnostics
+        );
+        // Compare the semantic triple (kind, name, type) — spans naturally differ
+        // between the two source layouts.
+        let project = |ir: &IrProgram| {
+            ir.workflow_contracts
+                .iter()
+                .map(|c| {
+                    (
+                        format!("{:?}", c.kind),
+                        c.name.clone(),
+                        format!("{:?}", c.ty),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            project(&compact_ir.ir.expect("compact ir")),
+            project(&keyword_ir.ir.expect("keyword ir")),
+            "compact signature did not desugar to the same contracts"
+        );
+    }
+
+    #[test]
+    fn compact_signature_supports_multiple_inputs_and_optional_failure() {
+        // Multiple comma-separated inputs; failure clause omitted.
+        let source = r#"
+workflow Merge(left: LeftIn, right: RightIn) -> Merged
+
+class LeftIn { id string }
+class RightIn { id string }
+class Merged { id string }
+
+rule go
+  when {
+    LeftIn as l
+    RightIn as r
+  }
+=> {
+  complete result { id l.id }
+}
+"#;
+        let compiled = compile_program_with_root(source, None);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "multi-input compact form did not compile: {:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("ir");
+        let inputs = ir
+            .workflow_contracts
+            .iter()
+            .filter(|c| matches!(c.kind, IrWorkflowContractKind::Input))
+            .count();
+        let failures = ir
+            .workflow_contracts
+            .iter()
+            .filter(|c| matches!(c.kind, IrWorkflowContractKind::Failure))
+            .count();
+        assert_eq!(inputs, 2, "expected two inputs");
+        assert_eq!(
+            failures, 0,
+            "omitted failure clause must add no failure contract"
+        );
     }
 
     #[test]

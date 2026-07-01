@@ -66,6 +66,27 @@ Both forms support the full language, including contracts and terminal
 actions. Library workflows in the same bundle are invokable by name with
 `invoke`.
 
+Contracts may be written as a compact signature on the workflow line instead of
+separate `input`/`output`/`failure` lines:
+
+```whip
+workflow Triage(ticket: Ticket) -> Resolution ! TriageFailed
+```
+
+is exactly equivalent to:
+
+```whip
+workflow Triage
+  input ticket Ticket
+  output result Resolution
+  failure error TriageFailed
+```
+
+The compact form takes one or more `name: Type` inputs, an output type after
+`->` (bound as `result`), and an optional failure type after `!` (bound as
+`error`). Both forms are legal to write; `whip fmt` normalizes the compact
+signature to the keyword lines.
+
 Every program must declare at least one `workflow`. A file that only declares
 shared types or patterns is a library — `include` it from a workflow rather than
 compiling it on its own; compiling it alone reports `program declares no

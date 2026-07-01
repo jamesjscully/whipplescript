@@ -435,6 +435,14 @@ workflow ReviewPhase {
 }
 ```
 
+The contract may also be written as a compact signature on the workflow line —
+`workflow ReviewPhase(phase: PhaseReviewRequest) -> PhaseReviewResult !
+ReviewPhaseFailure` — which desugars to the same `input`/`output`/`failure`
+contracts, binding the output as `result` and the failure as `error`. The
+compact form takes one or more `name: Type` inputs, an output type after `->`,
+and an optional failure type after `!`. Both forms are legal; `whip fmt`
+normalizes the compact signature to the keyword lines.
+
 Workflow inputs are initial durable facts/events, not in-memory function
 arguments. Workflow outputs are terminal payload contracts, not arbitrary facts
 to watch for. The only successful return path is `complete`; the only declared
