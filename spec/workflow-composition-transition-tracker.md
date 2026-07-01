@@ -146,12 +146,16 @@ The target behavior is specified in [language.md](language.md),
   only has meaning under a scoping model where siblings share a program; define that
   model first (next item).
 - [~] Ensure shared schemas, coerces, patterns, agents, and capabilities have
-  explicit local/global scoping rules. **This is the core open scoping decision.**
-  Everything is effectively global after flattening. The design question — which
-  declarations are workflow-local vs program-global, and how sharing is spelled — is
-  the keystone that gates name-leak checks, in/out-of-workflow decl restrictions,
-  scoped name resolution (Phase 6), the bundle store schema (Phase 7), and
-  diagnostics grouping. Needs a design call before implementation. See Open Decisions.
+  explicit local/global scoping rules. **DECIDED 2026-07-01 (remove implicit root,
+  one-program-many-workflows with workflow-local scoping) — implementation queued as
+  the next model-first slice.** Two parts: (1) reject truly-headerless programs
+  (no `workflow` at all) — small, bounded by `select_root_workflow` lib.rs:2381;
+  (2) compile all workflows together instead of flatten-and-discard, with a
+  workflow-local vs program-global scoping model + scoped name resolution — a
+  compiler-wide rearchitecture (name resolution, lowering, many tests) that is its
+  own model-first slice, not a tail addition. This keystone unblocks the name-leak
+  checks, in/out-of-workflow decl restrictions, scoped resolution (Phase 6), bundle
+  store schema (Phase 7), and diagnostics grouping listed as deferred above.
 
 ## Phase 3: Patterns And Apply
 
