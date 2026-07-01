@@ -247,11 +247,21 @@ library file      = included declarations not selected as the root
 invokable workflow = top-level `workflow` declaration imported for `invoke`
 ```
 
-Trying to deploy a bundle with zero workflows is a diagnostic. If the entrypoint
-or include closure contains multiple workflow declarations, the deploy command
-must select the root by name. For v0, prefer one workflow declaration per file;
-multiple workflows in one file should require an explicit root selection and
-clear duplicate-name diagnostics.
+A bundle that declares no `workflow` at all is rejected at compile time
+(`program declares no `workflow``): a source with only shared types or patterns
+is a library fragment meant to be `include`d, not a runnable program. There is no
+implicit compatibility root. If the entrypoint or include closure contains
+multiple workflow declarations, the running commands (`dev`, `deploy`) select the
+root by name (`--root <name>`); a single-workflow file needs no selection.
+
+Compilation validates **every** workflow in the bundle, not only the selected
+root. Each workflow is checked against its own scope — the top-level globals in
+the include closure plus that workflow's own local declarations — so a mistake in
+any workflow is reported in one compile regardless of which root is chosen, and a
+name declared privately inside one workflow cannot satisfy a reference in a
+sibling (the reference is an unknown-name error, annotated with where the name
+actually lives). Root selection then produces the single entry instance for
+`dev`/`deploy`; it never narrows what is validated.
 
 Top-level declarations in the include closure are visible by name. The source
 bundle compiles into one versioned program bundle, and a selected root workflow

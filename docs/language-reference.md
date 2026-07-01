@@ -66,6 +66,16 @@ Both forms support the full language, including contracts and terminal
 actions. Library workflows in the same bundle are invokable by name with
 `invoke`.
 
+Every program must declare at least one `workflow`. A file that only declares
+shared types or patterns is a library — `include` it from a workflow rather than
+compiling it on its own; compiling it alone reports `program declares no
+`workflow``. Compilation validates **all** workflows in the bundle, not just the
+`--root` you select to run, so an error in any workflow is caught in one pass.
+Scope is lexical: a top-level declaration (outside every `workflow { ... }`
+block) is shared across the whole bundle, while a declaration written inside a
+workflow block is private to that workflow. Referencing another workflow's
+private name is an error — move the declaration to the top level to share it.
+
 ## Lexical Structure
 
 WhippleScript is line-oriented but not indentation-sensitive. Newlines

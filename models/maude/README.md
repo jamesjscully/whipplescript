@@ -133,6 +133,10 @@ action-expansion.maude           action-call inlining (DR-0023): hygienic
                                  inlining runs no provider work
 workflow-revision.maude          active revision, old-effect attribution, and
                                  cancellation policy behavior
+workflow-scoping.maude           workflow-local name scoping: a reference resolves
+                                 against globals + its own workflow's locals, a
+                                 sibling-only local name leaks, and a headerless
+                                 program (no explicit workflow) is rejected
 ```
 
 The shell script runs every Maude test file and checks the expected number of

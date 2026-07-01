@@ -121,41 +121,56 @@ The target behavior is specified in [language.md](language.md),
 ## Phase 2: Explicit Workflows
 
 - [x] Add AST/IR nodes for top-level `workflow` declarations.
-- [~] Move current file-level declarations into an implicit compatibility root
+- [x] Move current file-level declarations into an implicit compatibility root
   only as a migration bridge, with diagnostics nudging explicit syntax.
-  **Gated on a decision.** The compatibility path exists (`program.workflow` when
-  `workflows` is empty, `select_root_workflow` lib.rs:2381) but emits **no**
-  nudge/deprecation diagnostic — deliberately, because whether to keep the implicit
-  root at all is the open "how much implicit compatibility syntax remains" decision.
-  Resolve that first (Open Decisions), then either add the nudge or remove the path.
+  **Resolved by removal (2026-07-01).** No implicit/compatibility root is kept: a
+  bundle that declares no `workflow` at all is rejected at compile time
+  (`select_root_workflow` lib.rs, `program declares no `workflow``), so no nudge
+  is needed — the header form (`workflow Name`) and the block form
+  (`workflow Name { ... }`) are the only entry shapes, both explicit. Tests
+  `rejects_headerless_program_with_no_workflow` / `accepts_single_workflow_header_program`;
+  fixture `examples/invalid/headerless-library.whip`. See
+  `models/maude/workflow-scoping.maude` (headerless reject) and the RESOLVED Open
+  Decision below.
 - [~] Define allowed top-level declarations inside and outside a workflow.
-  **Partial/decision:** the `Item` enum admits every decl kind anywhere
-  (lib.rs:126); no in-workflow vs out-of-workflow restriction is enforced. Tied
-  to the scoping decision (see "workflow-local names" below + Open Decisions).
+  **Partial (un-gated 2026-07-01).** Name *scoping* by position now ships
+  (top-level = global, workflow-block = private; whole-program validation), but the
+  `Item` enum still admits every decl *kind* anywhere (lib.rs:126) — there is no
+  "this kind may only appear at top level / only inside a workflow" restriction.
+  No longer decision-blocked; a scoped follow-on if a real must-be-here rule
+  emerges (e.g. terminals only inside a workflow, already enforced separately).
 - [x] Implement root selection for `check`, `dev`, `deploy`, and generated IR
   snapshots. (`select_root_workflow` lib.rs:2377, invoked in the compile path
   lib.rs:1715; `--root` plumbed through the CLI.)
 - [x] Add workflow input binding syntax and runtime start payload validation.
 - [x] Add workflow `output` and `failure` contract declarations.
   (`WorkflowContractKind::{Output,Failure}` parsed lib.rs:16548.)
-- [~] Ensure workflow-local names do not leak into sibling workflows. **Gated on
-  the scoping decision.** Today `select_root_workflow` (lib.rs:2449) *discards*
-  non-selected workflows and flattens the selected one, so only one workflow ever
-  compiles into an instance — there is no active cross-workflow name-collision check
-  because siblings never coexist in a compiled program. A real leak/collision check
-  only has meaning under a scoping model where siblings share a program; define that
-  model first (next item).
-- [~] Ensure shared schemas, coerces, patterns, agents, and capabilities have
-  explicit local/global scoping rules. **DECIDED 2026-07-01 (remove implicit root,
-  one-program-many-workflows with workflow-local scoping) — implementation queued as
-  the next model-first slice.** Two parts: (1) reject truly-headerless programs
-  (no `workflow` at all) — small, bounded by `select_root_workflow` lib.rs:2381;
-  (2) compile all workflows together instead of flatten-and-discard, with a
-  workflow-local vs program-global scoping model + scoped name resolution — a
-  compiler-wide rearchitecture (name resolution, lowering, many tests) that is its
-  own model-first slice, not a tail addition. This keystone unblocks the name-leak
-  checks, in/out-of-workflow decl restrictions, scoped resolution (Phase 6), bundle
-  store schema (Phase 7), and diagnostics grouping listed as deferred above.
+- [x] Ensure workflow-local names do not leak into sibling workflows. **Shipped
+  2026-07-01.** The whole-program validation pass (`compile_program_with_root`
+  lib.rs) lowers **every** workflow against its own scope — top-level globals +
+  that workflow's own block-local declarations — so a name declared privately
+  inside one workflow cannot satisfy a reference in a sibling; the reference is an
+  unknown-name error, and `annotate_cross_workflow_leak` (lib.rs) attaches a
+  related note pointing at the sibling's declaration ("`X` is declared inside
+  workflow `B`… move it to a top-level declaration to share it"). Tests
+  `cross_workflow_reference_to_sibling_local_is_annotated` +
+  `shared_top_level_name_is_not_annotated_as_a_leak`. Modeled as the leak/isolation
+  property in `models/maude/workflow-scoping.maude`.
+- [x] Ensure shared schemas, coerces, patterns, agents, and capabilities have
+  explicit local/global scoping rules. **Shipped 2026-07-01 (RESOLVED Open
+  Decision below: remove implicit root, one-program-many-workflows with
+  workflow-local scoping).** Scope is lexical by position (spec/language.md "Scope
+  And Visibility"): a top-level declaration is global across the include closure;
+  a declaration nested in a `workflow { ... }` block is private to that workflow.
+  Both parts landed: (1) truly-headerless programs are rejected
+  (`select_root_workflow` lib.rs); (2) all workflows compile+validate together
+  (whole-program pass) instead of flatten-and-discard, each against globals + its
+  own locals. This unblocked the name-leak check (above) and Phase 6 scoped
+  resolution. Deferred-with-cause below: in/out-of-workflow decl-*kind* restrictions
+  (the `Item` enum still admits every kind anywhere; scoping is enforced but no
+  "this kind may only appear at top level" rule), bundle store schema (Phase 7),
+  diagnostics grouping. Model: `models/maude/workflow-scoping.maude` (coverage 6 /
+  bite 3).
 
 ## Phase 3: Patterns And Apply
 
@@ -260,10 +275,14 @@ The target behavior is specified in [language.md](language.md),
 
 ## Phase 6: Static Analysis And Verification
 
-- [~] Extend name resolution to model source bundles, workflow-local scopes,
-  pattern-local scopes, and generated scopes. **Gated on the scoping decision.**
-  Only flat/global resolution exists today (post-flatten). A scoped resolver is
-  the implementation of that decision (see Phase 2 "local/global scoping rules").
+- [x] Extend name resolution to model source bundles, workflow-local scopes,
+  pattern-local scopes, and generated scopes. **Shipped 2026-07-01 for the
+  load-bearing scopes.** Source bundles: the include closure's top-level names are
+  global. Workflow-local scopes: each workflow now resolves against globals + its
+  own block-local names (whole-program validation pass), and sibling-local names
+  do not resolve (leak check above). Pattern-local + generated scopes: hygienic
+  qualification (`expand_pattern_applications` lib.rs, `IrPatternApplication.generated`).
+  Modeled in `models/maude/workflow-scoping.maude`.
 - [x] Extend cycle analysis so compile-time pattern recursion and runtime
   workflow invocation cycles are checked separately. Compile-time pattern
   recursion: `detect_pattern_recursion`. Runtime invocation cycles: direct
@@ -306,13 +325,14 @@ The target behavior is specified in [language.md](language.md),
 ## Phase 7: Runtime, Store, And CLI
 
 - [~] Add store schema for programs with source bundles and multiple workflows.
-  **Deferred — architectural decision.** Today the bundle is resolved and
-  *flattened* into one source string before storage (`resolve_source_bundle`
+  **Deferred (un-gated 2026-07-01) — not yet needed.** Today the bundle is resolved
+  and *flattened* into one source string before storage (`resolve_source_bundle`
   main.rs:37432), so `programs`/`program_versions` store one source + its
   `bundle_hash`/`include_closure` in the compiled IR; there is no per-member
-  bundle schema. Adding one only matters if we want to store the *unflattened*
-  bundle — a model change gated on the "how much implicit compatibility remains"
-  decision. See Open Decisions.
+  bundle schema. The scoping keystone shipped without needing one (whole-program
+  validation works over the parsed AST, not a stored per-member schema). A
+  per-member schema only matters if we later want to store the *unflattened*
+  bundle; author it then. No longer decision-blocked.
 - [x] Add store schema for workflow terminal payloads and invocation records.
   Invocation records: `workflow_invocations` table (migration 0001:154, incl.
   parent/child/target/input/`source_span_json`). Terminal payloads: persisted as
@@ -341,9 +361,9 @@ The target behavior is specified in [language.md](language.md),
 - [~] Update `whip diagnostics` to group errors by file, workflow, pattern
   application, and generated declaration. **Deferred.** The `diagnostics` command
   exists (main.rs:178) but emits a flat list; grouping by file/workflow/
-  pattern-application/generated-decl is a diagnostics-UX enhancement, most useful
-  once workflow-local scoping lands (so grouping keys are meaningful). Sequenced
-  after the scoping decision.
+  pattern-application/generated-decl is a diagnostics-UX enhancement. Workflow-local
+  scoping has now landed (2026-07-01), so the `workflow` grouping key is meaningful
+  and this is un-gated — a scoped follow-on, not decision-blocked.
 
 ## Phase 8: Examples And Docs
 
@@ -441,14 +461,26 @@ justified deferrals; the calls below unblock the last cluster.
   new work (`graph.unbounded_workflow_invocation_recursion`). Unblocks the
   transitive cycle-analysis item.
 - [x] **Implicit compatibility root / scoping keystone — RESOLVED 2026-07-01
-  (Jack): remove the implicit root, require explicit `workflow`.** Move from the
-  current flatten-and-discard model (only `--root` compiles) to
-  one-program-many-workflows with workflow-local scoping. Corpus is fully migrated
-  (37/37) and the project is pre-release, so no back-compat bridge is kept. This is
-  the keystone: it unblocks workflow-local name scoping + leak checks, scoped name
-  resolution, in/out-of-workflow decl restrictions, the bundle store schema, and
-  diagnostics grouping. **Large rearchitecture — its own model-first slice** (name
-  resolution rework touches lowering + many tests); sequenced next.
+  (Jack) + SHIPPED 2026-07-01.** Decision: remove the implicit root, require
+  explicit `workflow`; move from flatten-and-discard (only `--root` compiles) to
+  one-program-many-workflows with workflow-local scoping. Corpus fully migrated
+  (37/37), pre-release, so no back-compat bridge. **Implemented in three pieces,
+  all gated (parser 233, CLI 156, kernel/store/parser green, docs-examples green,
+  `models/maude/workflow-scoping.maude` 6/3):** (1) headerless reject
+  (`select_root_workflow`, `program declares no `workflow``); (2) whole-program
+  validation — `compile_program_with_root` lowers every workflow against globals +
+  its own locals, aggregating diagnostics, so a broken sibling is caught under any
+  `--root` (this surfaced + fixed a latent broken example,
+  `examples/revision-parent-child.whip`, whose child agent lacked a provider); (3)
+  sibling-local leak note (`annotate_cross_workflow_leak`). Note the blast radius
+  was far smaller than feared: because block workflows already segregate their
+  items in `WorkflowDecl.items`, scoping was already lexical in the AST — this was
+  "loop lowering per workflow with the right scope," not a name-resolution-engine
+  rewrite. Root selection still produces the single entry IR for `dev`/`deploy`;
+  the pass only widens validation coverage. Unblocked: workflow-local name scoping
+  + leak checks (Phase 2), scoped name resolution (Phase 6). Still deferred-with-
+  cause: in/out-of-workflow decl-*kind* restrictions, bundle store schema (Phase
+  7), diagnostics grouping (Phase 7) — all now un-gated but not yet built.
 
 - [x] Whether pattern bodies may contain terminal actions: resolved. v0 forbids
   `complete`/`fail` in pattern bodies entirely (compile-time `error`); no pattern
@@ -461,11 +493,16 @@ justified deferrals; the calls below unblock the last cluster.
 
 The transition is substantially shipped. What remains, grouped:
 
-1. **Decision-gated (the real blockers).** The Open Decisions above — chiefly the
-   implicit-compatibility-root / scoping keystone and the recursive-invocation
-   policy. These gate: workflow-local name scoping + leak checks, scoped name
-   resolution, in/out-of-workflow decl restrictions, the bundle store schema,
-   transitive invoke-cycle analysis, invoke authorization, and diagnostics grouping.
+1. **Decision-gated (the real blockers) — CLEARED 2026-07-01.** Both keystone
+   decisions are now made *and shipped*: the recursive-invocation policy
+   (transitive `invoke` cycles rejected) and the implicit-root / scoping keystone
+   (headerless reject + whole-program validation + workflow-local scoping +
+   sibling-leak notes; `models/maude/workflow-scoping.maude`). That un-gated the
+   downstream cluster; what is left of it is now plain deferred-with-cause work,
+   not decision-blocked: in/out-of-workflow decl-*kind* restrictions, the
+   unflattened bundle store schema (Phase 7), invoke authorization (needs a policy,
+   ties to the invoke Open Decision), and diagnostics grouping (Phase 7). None
+   block the transition; each is a scoped follow-on.
 2. **Model-first pieces.** Generate Maude searches from compiled IR for pattern
    provenance / terminal actions / invocation edges (kernel rules already exist;
    emit from `generate_maude_model_search`).

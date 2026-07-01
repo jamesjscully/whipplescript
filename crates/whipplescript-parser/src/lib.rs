@@ -1726,6 +1726,74 @@ pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOut
     }
 
     let workflow_inputs = collect_workflow_input_surfaces(&parsed.program);
+
+    // Whole-program validation (RESOLVED 2026-07-01): when a program declares
+    // more than one explicit `workflow`, validate EVERY workflow — not only the
+    // selected root — so a broken sibling is caught in a single compile
+    // regardless of which `--root` is chosen. Each workflow is lowered against
+    // its own scope (top-level globals + that workflow's local block items),
+    // which is exactly the scoped program `select_root_workflow` builds for that
+    // name. Root selection below still produces the single entry IR for
+    // `dev`/`deploy`; this pass only adds validation coverage and never changes
+    // the emitted IR (when it finds no errors it returns nothing, so the root is
+    // lowered once more, cleanly, below). See models/maude/workflow-scoping.maude.
+    if parsed.program.workflows.len() > 1 {
+        // Names declared at the top level are global (shared across every
+        // workflow); names declared inside a `workflow { ... }` block are private
+        // to it. Map each workflow-local name to its owning workflow(s) so that
+        // when a workflow references a name that is really a sibling's local, the
+        // resulting unknown-name error can point the author at where it lives —
+        // the "names do not leak into sibling workflows" guarantee, surfaced.
+        let global_names: BTreeSet<String> = parsed
+            .program
+            .items
+            .iter()
+            .filter_map(|item| referenced_decl_name(item).map(|(name, _)| name))
+            .collect();
+        let mut sibling_locals: BTreeMap<String, Vec<(String, SourceSpan)>> = BTreeMap::new();
+        for workflow in &parsed.program.workflows {
+            for item in &workflow.items {
+                if let Some((name, span)) = referenced_decl_name(item) {
+                    sibling_locals
+                        .entry(name)
+                        .or_default()
+                        .push((workflow.name.name.clone(), span));
+                }
+            }
+        }
+
+        let mut aggregated = Vec::new();
+        for workflow in &parsed.program.workflows {
+            let name = workflow.name.name.clone();
+            let own_locals: BTreeSet<String> = workflow
+                .items
+                .iter()
+                .filter_map(|item| referenced_decl_name(item).map(|(name, _)| name))
+                .collect();
+            let mut diagnostics = match select_root_workflow(parsed.program.clone(), Some(&name)) {
+                Ok(scoped) => lower_program(scoped, workflow_inputs.clone()).diagnostics,
+                Err(diagnostics) => diagnostics,
+            };
+            for diagnostic in &mut diagnostics {
+                annotate_cross_workflow_leak(
+                    diagnostic,
+                    &name,
+                    &own_locals,
+                    &global_names,
+                    &sibling_locals,
+                );
+            }
+            aggregated.extend(diagnostics);
+        }
+        if !aggregated.is_empty() {
+            return CompileOutput {
+                ir: None,
+                diagnostics: aggregated,
+                warnings: Vec::new(),
+            };
+        }
+    }
+
     match select_root_workflow(parsed.program, root) {
         Ok(program) => lower_program(program, workflow_inputs),
         Err(diagnostics) => CompileOutput {
@@ -2388,10 +2456,90 @@ fn try_format_enum_with_comments(
     true
 }
 
+/// The name a top-level named declaration introduces, paired with its span, when
+/// it is a kind that another workflow can reference by name (schemas, agents,
+/// coordination resources, signals). Rules/tests/asserts/apply/contracts/patterns
+/// introduce no such cross-referenced name here. Mirrors `document_symbols`'
+/// named-decl set. Used to attach a "declared in workflow B" note when a
+/// workflow references a name that is really private to a sibling.
+fn referenced_decl_name(item: &Item) -> Option<(String, SourceSpan)> {
+    match item {
+        Item::Class(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::Enum(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::Agent(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::Coerce(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::Lease(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::Ledger(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::Counter(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::Queue(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::Channel(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::FileStore(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::Event(decl) => Some((decl.name.clone(), decl.span)),
+        Item::Table(decl) => Some((decl.name.name.clone(), decl.span)),
+        _ => None,
+    }
+}
+
+/// If `diagnostic` (produced while validating workflow `current`) reports an
+/// unknown name that is actually declared *private to a sibling workflow*, attach
+/// a related note pointing at that sibling's declaration. This turns a bare
+/// "unknown class `X`" into an actionable "…and `X` lives in workflow `B`; move
+/// it to the top level to share it." A name that is global or one of `current`'s
+/// own locals is legitimately in scope and never annotated.
+fn annotate_cross_workflow_leak(
+    diagnostic: &mut Diagnostic,
+    current: &str,
+    own_locals: &BTreeSet<String>,
+    global_names: &BTreeSet<String>,
+    sibling_locals: &BTreeMap<String, Vec<(String, SourceSpan)>>,
+) {
+    for (name, owners) in sibling_locals {
+        if global_names.contains(name) || own_locals.contains(name) {
+            continue;
+        }
+        // Only names actually referenced (as `` `name` ``) in this diagnostic, and
+        // owned by some workflow other than the one being validated.
+        if !diagnostic.message.contains(&format!("`{name}`")) {
+            continue;
+        }
+        let Some((owner, span)) = owners.iter().find(|(owner, _)| owner != current) else {
+            continue;
+        };
+        diagnostic.related.push(RelatedInfo {
+            span: *span,
+            message: format!(
+                "`{name}` is declared inside workflow `{owner}`, which makes it \
+                 private to that workflow; move it to a top-level declaration to \
+                 share it across workflows"
+            ),
+        });
+        return;
+    }
+}
+
 fn select_root_workflow(
     mut program: Program,
     root: Option<&str>,
 ) -> Result<Program, Vec<Diagnostic>> {
+    // A runnable program requires at least one explicit `workflow`. The implicit
+    // compatibility root is removed (RESOLVED 2026-07-01): a source that declares
+    // no `workflow` at all (neither the header form nor a `workflow Name { ... }`
+    // block) is a library fragment, not a program, and is rejected here rather
+    // than silently compiled as an anonymous root.
+    if program.workflow.is_none() && program.workflows.is_empty() {
+        return Err(vec![Diagnostic {
+            related: Vec::new(),
+            span: SourceSpan { start: 0, end: 0 },
+            message: "program declares no `workflow`".to_owned(),
+            suggestion: Some(
+                "add an explicit `workflow Name { ... }` declaration; a runnable \
+                 program requires at least one workflow (files that only declare \
+                 shared types or patterns are libraries, meant to be `include`d)"
+                    .to_owned(),
+            ),
+        }]);
+    }
+
     if program.workflows.is_empty() {
         if let Some(root) = root {
             match program.workflow.as_ref() {
@@ -23005,6 +23153,242 @@ workflow C {
     }
 
     #[test]
+    fn whole_program_validation_catches_a_broken_sibling_under_any_root() {
+        // Two workflows; `Good` is well-formed, `Broken` references an undeclared
+        // schema in its own scope. Compiling with `--root Good` must still catch
+        // `Broken`'s error — the pre-pass validates EVERY workflow, not just the
+        // selected root (RESOLVED 2026-07-01). Before this, a broken sibling was
+        // silently discarded by root selection and never validated.
+        let source = r#"
+workflow Good {
+  input task TG
+  output result RG
+  class TG { id string }
+  class RG { id string }
+  rule go
+    when TG as t
+  => {
+    complete result { id t.id }
+  }
+}
+
+workflow Broken {
+  input task TB
+  output result RB
+  class TB { id string }
+  class RB { id string }
+  rule go
+    when Nonexistent as t
+  => {
+    complete result { id t.id }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Good"));
+        assert!(
+            compiled.ir.is_none(),
+            "a program with a broken sibling must not compile"
+        );
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("Nonexistent")),
+            "the broken sibling's error was not surfaced: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn cross_workflow_reference_to_sibling_local_is_annotated() {
+        // `Consumer` references class `Secret`, which is declared *inside* sibling
+        // workflow `Owner` (private to it). The reference is an error (isolation),
+        // and it carries a related note pointing at Owner's declaration so the
+        // author knows the name exists but is out of scope.
+        let source = r#"
+workflow Owner {
+  input task TO
+  output result RO
+  class TO { id string }
+  class RO { id string }
+  class Secret { id string }
+  rule go
+    when TO as t
+  => {
+    complete result { id t.id }
+  }
+}
+
+workflow Consumer {
+  input task TC
+  output result RC
+  class TC { id string }
+  class RC { id string }
+  rule go
+    when Secret as s
+  => {
+    complete result { id s.id }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Consumer"));
+        assert!(
+            compiled.ir.is_none(),
+            "sibling-local reference must not compile"
+        );
+        let leak = compiled
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains("`Secret`"))
+            .expect("an unknown-name diagnostic for Secret");
+        assert!(
+            leak.related
+                .iter()
+                .any(|r| r.message.contains("workflow `Owner`")
+                    && r.message.contains("private to that workflow")),
+            "missing sibling-local leak note: {:?}",
+            leak.related
+        );
+    }
+
+    #[test]
+    fn shared_top_level_name_is_not_annotated_as_a_leak() {
+        // Bite: a class declared at the TOP LEVEL is global — both workflows may
+        // reference it, and no leak note is attached. (Also confirms the program
+        // compiles: the shared global resolves in each workflow.)
+        let source = r#"
+class Shared { id string }
+
+workflow Alpha {
+  input task Shared
+  output result RA
+  class RA { id string }
+  rule go
+    when Shared as s
+  => {
+    complete result { id s.id }
+  }
+}
+
+workflow Beta {
+  input task Shared
+  output result RB
+  class RB { id string }
+  rule go
+    when Shared as s
+  => {
+    complete result { id s.id }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Alpha"));
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "shared top-level global wrongly rejected: {:?}",
+            compiled.diagnostics
+        );
+        assert!(compiled.ir.is_some());
+    }
+
+    #[test]
+    fn whole_program_validation_accepts_all_well_formed_workflows() {
+        // Bite: when every workflow is well-formed, the pre-pass adds no spurious
+        // diagnostics and the selected root still compiles to IR.
+        let source = r#"
+workflow Alpha {
+  input task TA
+  output result RA
+  class TA { id string }
+  class RA { id string }
+  rule go
+    when TA as t
+  => {
+    complete result { id t.id }
+  }
+}
+
+workflow Beta {
+  input task TB
+  output result RB
+  class TB { id string }
+  class RB { id string }
+  rule go
+    when TB as t
+  => {
+    complete result { id t.id }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Alpha"));
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "well-formed multi-workflow program emitted diagnostics: {:?}",
+            compiled.diagnostics
+        );
+        assert!(compiled.ir.is_some(), "selected root failed to compile");
+    }
+
+    #[test]
+    fn rejects_headerless_program_with_no_workflow() {
+        // The implicit compatibility root is removed (RESOLVED 2026-07-01): a
+        // source with no explicit `workflow` (only shared types/patterns) is a
+        // library fragment, not a runnable program, and is rejected.
+        let source = r#"
+class SharedTicket {
+  id string
+}
+
+pattern TagReviewed<Input> {
+  rule tag
+    when Input as item
+  => {
+    record SharedTicket { id item.id }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, None);
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("program declares no `workflow`")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn accepts_single_workflow_header_program() {
+        // Bite: the headerless reject must not fire on a program that declares a
+        // workflow via the header form (the common single-workflow shape).
+        let source = r#"
+workflow OnlyOne
+
+input item Job
+output result Done
+
+class Job { id string }
+class Done { id string }
+
+rule go
+  when Job as j
+=> {
+  complete result { id j.id }
+}
+"#;
+        let compiled = compile_program_with_root(source, None);
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("program declares no `workflow`")),
+            "header-form program wrongly rejected as headerless: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
     fn rejects_recording_observer_only_terminal_schema() {
         // §5.4: the terminal family is `origin = observer` — the kernel projects
         // it, user rules may only eliminate it. A rule that `record`s a terminal
@@ -23769,6 +24153,10 @@ rule branch
             (
                 "unknown-schema",
                 include_str!("../../../examples/invalid/unknown-schema.whip"),
+            ),
+            (
+                "headerless-library",
+                include_str!("../../../examples/invalid/headerless-library.whip"),
             ),
         ];
 

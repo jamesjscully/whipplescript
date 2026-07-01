@@ -119,6 +119,7 @@ declare -A EXPECTED_NO_SOLUTION=(
   ["external-event-loop.maude"]=1
   ["workflow-composition.maude"]=5
   ["workflow-revision.maude"]=5
+  ["workflow-scoping.maude"]=3
 )
 
 declare -A EXPECTED_SOLUTION=(
@@ -176,6 +177,7 @@ declare -A EXPECTED_SOLUTION=(
   ["external-event-loop.maude"]=2
   ["workflow-composition.maude"]=7
   ["workflow-revision.maude"]=4
+  ["workflow-scoping.maude"]=6
 )
 
 declare -A SEEN_TEST=()

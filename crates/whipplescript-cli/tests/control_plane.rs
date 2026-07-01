@@ -10247,6 +10247,23 @@ fn fmt_is_non_destructive_across_every_example() {
         lines.sort();
         Some(lines)
     };
+    // Examples that `include` a shared library resolve the include relative to the
+    // formatted file's own directory, so the scratch dir must mirror the shared
+    // `includes/` subtree — otherwise the formatted copy cannot compile bare and
+    // `compile_structure` returns `None` against a `Some(...)` original, a false
+    // "corruption" signal that has nothing to do with formatting.
+    let includes_src = format!("{examples_dir}/includes");
+    if let Ok(entries) = fs::read_dir(&includes_src) {
+        let includes_dst = dir.join("includes");
+        fs::create_dir_all(&includes_dst).expect("create scratch includes dir");
+        for entry in entries.flatten() {
+            let include_path = entry.path();
+            if include_path.extension().and_then(|e| e.to_str()) == Some("whip") {
+                let name = include_path.file_name().expect("include file name");
+                fs::copy(&include_path, includes_dst.join(name)).expect("copy include library");
+            }
+        }
+    }
     let mut checked = 0usize;
     for entry in fs::read_dir(&examples_dir).expect("read examples dir") {
         let path = entry.expect("dir entry").path();
