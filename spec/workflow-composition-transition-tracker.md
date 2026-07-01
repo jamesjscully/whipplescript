@@ -42,9 +42,14 @@ The target behavior is specified in [language.md](language.md),
 - [x] A file may contain multiple explicit `workflow` declarations; commands
   require `--root` or equivalent selection when ambiguous.
 - [~] `pattern` declarations elaborate into first-order declarations before
-  runtime with hygienic generated names and source provenance.
+  runtime with hygienic generated names and source provenance. **Partial:**
+  elaboration + hygienic names shipped (`expand_pattern_applications` lib.rs:3961);
+  provenance is name-level, source-span back-links deferred (see Phase 3).
 - [~] `apply` cannot create runtime recursion, hidden effects, or declarations
-  outside its allowed expansion scope.
+  outside its allowed expansion scope. **Partial:** recursion is fully blocked
+  (`detect_pattern_recursion` lib.rs:3871); hidden-effect / out-of-expansion-scope
+  containment is not separately enforced (relies on the terminal-in-pattern reject
+  + expansion emitting only first-order decls). Deferred — no known escape today.
 - [x] `workflow` declarations have typed `input`, `output`, and `failure`
   contracts. (`WorkflowContractDecl`/`WorkflowContractKind`, parser lib.rs:208;
   `lower_workflow_contract` lib.rs:5280.)
@@ -77,14 +82,25 @@ The target behavior is specified in [language.md](language.md),
 - [x] Define concrete grammar for `include "path.whip"` and allowed path forms.
 - [ ] Decide whether coerce imports use `include "types.coerce"`, a separate coerce
   declaration, or generated source bundle members.
-- [~] Implement include resolution with cycle detection and stable ordering.
+- [x] Implement include resolution with cycle detection and stable ordering.
+  (`SourceBundleResolver` main.rs:37432 — active-stack cycle detection, visited
+  dedup, deterministic pre-order concat.)
 - [~] Preserve per-file source spans through parse, typecheck, diagnostics, and
-  formatted output.
-- [~] Record include closure and content hashes in typed IR / program metadata.
-- [~] Add diagnostics for missing include, duplicate include, include cycle,
-  non-file include target, and unsupported extension.
-- [~] Add CLI tests for single file, included library file, ambiguous roots, and
-  explicit root selection.
+  formatted output. **Partial:** the bundle is concatenated into one `source`
+  string (main.rs:37549) and spans are re-derived over the combined text, so a
+  span's originating *file* is not distinctly preserved. Deferred — no diagnostic
+  currently needs per-file attribution; revisit if cross-file diagnostics land.
+- [x] Record include closure and content hashes in typed IR / program metadata.
+  (`IrInclude{path,source_hash}` main.rs:37531; whole-closure `bundle_hash`
+  kernel/lib.rs:2571; surfaced in `include_closure`.)
+- [x] Add diagnostics for missing include, duplicate include, include cycle,
+  non-file include target, and unsupported extension. (main.rs:37461 cycle,
+  :37493 duplicate, :37506 absolute-path, :37520 non-`.whip`, :37530 missing.)
+- [x] Add CLI tests for single file, included library file, ambiguous roots, and
+  explicit root selection. (`check_resolves_relative_whip_includes`,
+  `check_rejects_duplicate_includes_in_one_file`,
+  `check_selects_root_from_multiple_explicit_workflows`,
+  `check_root_option_validates_current_workflow_name`.)
 
 ## Phase 2: Explicit Workflows
 
@@ -92,22 +108,38 @@ The target behavior is specified in [language.md](language.md),
 - [ ] Move current file-level declarations into an implicit compatibility root
   only as a migration bridge, with diagnostics nudging explicit syntax.
 - [~] Define allowed top-level declarations inside and outside a workflow.
-- [~] Implement root selection for `check`, `dev`, `deploy`, and generated IR
-  snapshots.
+  **Partial/decision:** the `Item` enum admits every decl kind anywhere
+  (lib.rs:126); no in-workflow vs out-of-workflow restriction is enforced. Tied
+  to the scoping decision (see "workflow-local names" below + Open Decisions).
+- [x] Implement root selection for `check`, `dev`, `deploy`, and generated IR
+  snapshots. (`select_root_workflow` lib.rs:2377, invoked in the compile path
+  lib.rs:1715; `--root` plumbed through the CLI.)
 - [x] Add workflow input binding syntax and runtime start payload validation.
-- [~] Add workflow `output` and `failure` contract declarations.
+- [x] Add workflow `output` and `failure` contract declarations.
+  (`WorkflowContractKind::{Output,Failure}` parsed lib.rs:16548.)
 - [ ] Ensure workflow-local names do not leak into sibling workflows.
 - [ ] Ensure shared schemas, coerces, patterns, agents, and capabilities have
   explicit local/global scoping rules.
 
 ## Phase 3: Patterns And Apply
 
-- [~] Add AST/IR nodes for `pattern` declarations with typed parameters.
-- [~] Specify and implement the allowed pattern body surface.
-- [~] Implement `apply Pattern { ... }` with typed argument validation.
-- [~] Generate hygienic names for expanded rules/effects/facts.
+- [x] Add AST/IR nodes for `pattern` declarations with typed parameters.
+  (`PatternDecl{type_params}` lib.rs:186; `IrPatternApplication` lib.rs:857.)
+- [~] Specify and implement the allowed pattern body surface. **Partial:** bodies
+  expand via `expand_pattern_item` (lib.rs:4162) and terminal actions are rejected
+  in pattern bodies; there is no explicit *allow-list* of permitted body constructs
+  beyond that. Deferred — the deny (terminals) is the load-bearing rule.
+- [x] Implement `apply Pattern { ... }` with typed argument validation. (Type +
+  simple value args; `expand_pattern_applications` lib.rs:3961, test
+  `expands_pattern_applications_with_hygienic_names`.)
+- [x] Generate hygienic names for expanded rules/effects/facts.
+  (`IrPatternApplication.generated`; hygiene tests lib.rs:19789.)
 - [~] Attach provenance for every generated declaration back to both the pattern
-  definition and application site.
+  definition and application site. **Partial:** name-level provenance is recorded
+  (`pattern`+`alias`+`generated`, lib.rs:857, surfaced in the `.ir` snapshot and
+  `pattern_applications` report); **source-span** back-links to the definition and
+  application site are not yet attached. Deferred — names suffice for the current
+  provenance report; spans are an LSP-grade enhancement.
 - [x] Reject recursive pattern application. v0 decision: pattern expansion is
   **non-recursive only**; any `apply` that reaches another `apply` of a pattern
   already on the expansion stack is the compile-time error
@@ -123,14 +155,21 @@ The target behavior is specified in [language.md](language.md),
 - [x] Add formatter support that preserves author-written `pattern` and `apply`
   syntax rather than formatting expanded output.
 - [~] Add golden IR snapshots that show generated declarations plus provenance.
+  **Partial:** `examples/reusable-review-pattern.ir` carries a
+  `pattern_applications` section (emitter lib.rs:2593); provenance is name-level
+  only (see the provenance item above) and only one golden covers it. Deferred
+  with that provenance enhancement.
 
 ## Phase 4: Terminal Workflow Actions
 
 - [x] Add parser support for `complete <output-name> <payload>` and
   `fail <failure-name> <payload>` in rule bodies.
-- [~] Typecheck terminal payloads against the current workflow contract.
+- [x] Typecheck terminal payloads against the current workflow contract.
+  (`validate_workflow_terminal_actions`/`_payload` lib.rs:6605-6716: unknown-terminal
+  + non-class-contract + field typecheck. Scalar terminal payloads are a separate
+  open item; class-shaped payloads — the v0 contract shape — are fully checked.)
 - [x] Reject `complete`/`fail` outside workflow rule bodies.
-- [~] Reject terminal actions in pattern bodies. v0 decision: `complete`/`fail`
+- [x] Reject terminal actions in pattern bodies. v0 decision: `complete`/`fail`
   inside a `pattern` body is always a compile-time error (severity `error`);
   patterns elaborate into rules, and workflow terminals belong to the owning
   workflow contract. A reusable body reaches a terminal by recording a result
@@ -152,13 +191,23 @@ The target behavior is specified in [language.md](language.md),
   (Absorbing-status + `duplicate_terminal_completion_rolls_back_event`
   store/lib.rs:9264.)
 - [~] Add status/diagnostics output that clearly distinguishes workflow failure
-  from provider/effect failure.
+  from provider/effect failure. **Partial:** `flowfail` (503 auto-fail) is
+  separated from typed `fail` (lib.rs:6322, `validate_flowfail_generated_only`
+  lib.rs:6422) and provider failure surfaces as evidence in the event stream
+  (`dev_fixture_failure_reaches_event_stream`); there is no dedicated status-surface
+  *field* that labels the two categories side by side. Deferred — a status-UX polish
+  item, not a correctness gap.
 
 ## Phase 5: Durable Workflow Invocation
 
 - [x] Add parser support for `invoke Workflow { ... } as binding`.
 - [x] Typecheck invocation input against the target workflow input contract.
-- [~] Validate target workflow visibility and authorization.
+- [~] Validate target workflow visibility and authorization. **Partial:** target
+  existence + direct self-recursion are validated (`invokes unknown workflow`
+  lib.rs:8786, `recursively invokes` lib.rs:8771). No *visibility/authorization
+  policy* gate exists — that requires deciding what the policy is (which workflows
+  may invoke which; ties to the recursive-invocation Open Decision). Deferred to
+  that decision.
 - [x] Persist invocation records with parent instance, child instance, target
   workflow, input payload, and source span. (`record_workflow_invocation`
   store/lib.rs:1663; `workflow_invocations` incl. `source_span_json`, 0001:154.)
@@ -186,7 +235,11 @@ The target behavior is specified in [language.md](language.md),
   the compile-time pattern-recursion half of the cycle-analysis line above (runtime
   invocation-cycle analysis is separate, line 169).
 - [~] Add invocation graph diagnostics for missing root, ambiguous target,
-  unauthorized target, and unsupported recursive invocation.
+  unauthorized target, and unsupported recursive invocation. **Partial:**
+  missing-root + ambiguous (`select_root_workflow` lib.rs:2438) and unknown-target
+  + direct-recursive (lib.rs:8771/8786) are diagnosed; *unauthorized* and
+  *transitive* recursive invocation are not (both gated on the recursive-invocation
+  + authorization decisions). Deferred to those decisions.
 - [ ] Generate Maude fixtures from compiled IR for workflow terminal and
   invocation invariants.
 - [x] Add expected-failure fixtures for broken terminal validation, post-terminal
@@ -203,19 +256,45 @@ The target behavior is specified in [language.md](language.md),
 
 ## Phase 7: Runtime, Store, And CLI
 
-- [ ] Add store schema for programs with source bundles and multiple workflows.
-- [ ] Add store schema for workflow terminal payloads and invocation records.
-- [ ] Add migration strategy for existing SQLite stores used by tests.
+- [~] Add store schema for programs with source bundles and multiple workflows.
+  **Deferred — architectural decision.** Today the bundle is resolved and
+  *flattened* into one source string before storage (`resolve_source_bundle`
+  main.rs:37432), so `programs`/`program_versions` store one source + its
+  `bundle_hash`/`include_closure` in the compiled IR; there is no per-member
+  bundle schema. Adding one only matters if we want to store the *unflattened*
+  bundle — a model change gated on the "how much implicit compatibility remains"
+  decision. See Open Decisions.
+- [x] Add store schema for workflow terminal payloads and invocation records.
+  Invocation records: `workflow_invocations` table (migration 0001:154, incl.
+  parent/child/target/input/`source_span_json`). Terminal payloads: persisted as
+  the terminal event `payload_json` referenced by `terminal_event_id`
+  (`workflow_terminal_payload` store/lib.rs:7585) — no dedicated table needed.
+- [~] Add migration strategy for existing SQLite stores used by tests.
+  **Deferred.** Migration infra exists (`apply_migrations`, `schema_migrations`,
+  `MIGRATIONS` store/lib.rs:874) but everything sits in a single baseline `0001`
+  and tests use fresh stores; no incremental migration has been authored because
+  there is no pre-baseline store in the wild yet (pre-release). Author the first
+  incremental migration when a schema change must preserve an existing store.
 - [x] Update the kernel transaction boundary for terminal workflow commits.
   (Terminal commit is atomic with the rule commit —
   `rule_commit_with_workflow_terminal_updates_instance_atomically` store/lib.rs:8959.)
 - [x] Update worker/stepper scheduling to run child workflow instances.
   (`worker_resumes_running_workflow_invocation` control_plane.rs:11496.)
-- [~] Update `whip status` to show parent/child invocation trees.
-- [ ] Update JSON traces to include source bundle, workflow id, pattern
-  provenance, invocation id, and terminal payload references.
-- [ ] Update `whip diagnostics` to group errors by file, workflow, pattern
-  application, and generated declaration.
+- [~] Update `whip status` to show parent/child invocation trees. **Partial:**
+  one level of `parent` + `children` invocation links is emitted (main.rs:40783);
+  a recursive multi-level tree is not yet assembled. Deferred — status-UX polish.
+- [~] Update JSON traces to include source bundle, workflow id, pattern
+  provenance, invocation id, and terminal payload references. **Partial:** the
+  compiled-IR JSON carries `include_closure`/`bundle_hash`/`pattern_applications`
+  and status JSON carries invocation links; runtime *event* traces
+  (kernel/trace.rs) do not yet uniformly stamp workflow-id/pattern-provenance/
+  invocation-id. Deferred — observability enrichment, not a transition blocker.
+- [~] Update `whip diagnostics` to group errors by file, workflow, pattern
+  application, and generated declaration. **Deferred.** The `diagnostics` command
+  exists (main.rs:178) but emits a flat list; grouping by file/workflow/
+  pattern-application/generated-decl is a diagnostics-UX enhancement, most useful
+  once workflow-local scoping lands (so grouping keys are meaningful). Sequenced
+  after the scoping decision.
 
 ## Phase 8: Examples And Docs
 
