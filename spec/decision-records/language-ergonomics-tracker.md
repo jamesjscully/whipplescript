@@ -650,3 +650,16 @@ file-writing workers).
       (documented as a convenience gate); hosted rejects raw `exec` at check
       and at the worker. Deferred: argv schemas beyond stdin, signed
       manifests (multi-host), network script fetch.
+
+## Proposed — v1 surface-hardening design pass (2026-07-01)
+
+- [ ] **P1. `prompt` — bare model prompt → text.** DECIDED (Jack). The most
+      basic model pattern is missing: `coerce`/`decide` are structured and `tell`
+      needs an `agent` decl + full turn lifecycle, so there is no lightweight
+      `prompt "…" → text`. Add a `prompt "<text>" [using <provider>] as r`
+      effect — a **free-text-output sibling of `decide`**, reusing the same
+      provider backend (no `agent` decl, no turn lifecycle). IFC treatment is
+      identical to `coerce` (the prompt is an egress; the result is a low-integrity
+      model output). Result type is a plain string reachable via `after r
+      succeeds`. Small: parse + lower (reuse the Coerce backend path) + IFC
+      (reuse coerce's) + test. No new model needed (coerce-shaped invariant).

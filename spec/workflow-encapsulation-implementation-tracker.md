@@ -95,6 +95,47 @@ Each clause is a re-parameterization/extension of an already-proven or bitten pr
   payloads carry the same DR-0030 X2 per-field reader-set signature as `complete
   result`; egress gated by `leak_safe`; expose in `flow_signature`.
 
+## Phase 4b — Owned-harness runtime authority enforcement + agent-surface decisions
+
+From the 2026-07-01 v1 surface-hardening design pass. The `with access to` /
+capability model is enforced only STATICALLY today; the owned-harness runtime
+does not bind tool calls to declared authority (`with_policy`/`with_bash_allow`
+are `#[allow(dead_code)]`, test-only — `harness_tools.rs:302-331`; the live
+`run_owned_agent_turn` reads bash/file policy from process env, not the decl).
+
+- [ ] **Finish runtime enforcement of declared authority in the owned harness.**
+  The owned-harness tool executor's per-tool-call policy = the **governance
+  envelope** (IT-set, `gov.rs`) ∩ the agent's declared authority (`with access
+  to` / `capabilities`), replacing the env-only path. This makes `with access to`
+  actually bind runtime behavior and yields **per-tool-call, argument-sensitive**
+  governance (a static grant says "may run bash"; only a runtime gate says "may
+  run *this* bash command"). Author boilerplate stays minimal — concrete policy
+  (allow-lists, path globs, provider access) lives in the **governance layer
+  (IT)**; the author's whole surface is `with access to` (scope a subagent) +
+  the agent decl's `capabilities`/`profile`. Enumerate any additional concrete
+  author-facing per-turn case before adding surface; none known beyond `with
+  access to` today.
+- [x] **No PreToolUse-style hooks — DECIDED (Jack): keep the whip model.** Per-tool
+  events stay evidence, not rule-matchable facts (turn-is-leaf / I2,
+  `harness_loop.rs:14-18`); a rule reacts to the turn terminal, never gates a tool
+  mid-loop. Governance is declared-policy (above) + post-turn reactive rules —
+  stronger than Claude-Code hooks and deliberately not that shape.
+- [x] **No blocking interactive "ask" — DECIDED (Jack): REJECTED.** Human-in-the-loop
+  is the **async decision-issue** model (`human.ask` → inbox → a rule reacts when
+  the answer lands, `main.rs:23013`); the agent NEVER blocks mid-turn waiting on a
+  person — the software adjudicates the decision issue on its own schedule.
+
+## Related capability — web search tool (item ①, gated on the network-tool discussion)
+
+- [ ] **Web search as an owned-harness tool.** A new `ToolSpec` alongside
+  `file_tool_specs()` (`harness_tools.rs:99`) with a `ToolExecutor`, kernel-brokered.
+  **Owned-harness only** (command-backed Claude/Codex use their native web search).
+  IFC: the query is an **egress** (flow-checked like `send`), the result is a
+  **low-integrity ingress** (taint source, like an inbound message). Made a
+  **capability grantable via `with access to`** — the first real customer of the
+  authority model (a subagent gets web search only if delegated it). Settled in
+  shape; **gated on the broader network-tool policy discussion** (open, per Jack).
+
 ## Phase 5 — Docs, examples, gate
 
 - [ ] Language-reference + spec/language.md sections for the membrane, `private`,
