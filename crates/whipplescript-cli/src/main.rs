@@ -20884,8 +20884,8 @@ fn package_from_workflow_principal(principal: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn workflow_identity_for_instance(
-    store: &SqliteStore,
+fn workflow_identity_for_instance<S: RuntimeStore>(
+    store: &S,
     instance_id: &str,
 ) -> Result<WorkflowRuntimeIdentity, StoreError> {
     let instance = store
@@ -20913,14 +20913,13 @@ fn invoke_resources_for_identity(identity: &WorkflowRuntimeIdentity) -> Vec<Stri
     ]
 }
 
-fn internal_workflow_delivery_violation(
-    store_path: &Path,
+fn internal_workflow_delivery_violation<S: RuntimeStore>(
+    store: &S,
     sender_instance_id: &str,
     target_instance_id: &str,
 ) -> Result<Option<String>, StoreError> {
-    let store = SqliteStore::open(store_path)?;
-    let sender = workflow_identity_for_instance(&store, sender_instance_id)?;
-    let target = workflow_identity_for_instance(&store, target_instance_id)?;
+    let sender = workflow_identity_for_instance(store, sender_instance_id)?;
+    let target = workflow_identity_for_instance(store, target_instance_id)?;
     if sender.package == target.package {
         return Ok(None);
     }
@@ -23873,6 +23872,17 @@ fn run_notify_effect(
     instance_id: &str,
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
+    run_notify_effect_generic(&mut kernel, instance_id, effect)
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): validate + inject a durable event into a
+/// peer instance over a held `RuntimeKernel<S>` (runtime-store-only).
+fn run_notify_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input = json_from_str(&effect.input_json);
     let target = input
         .get("target_instance")
@@ -23889,8 +23899,6 @@ fn run_notify_effect(
 
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "notify-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "notify-lease"]);
-    let store = SqliteStore::open(store_path)?;
-    let mut kernel = RuntimeKernel::new(store);
     kernel.start_run(RunStart {
         instance_id,
         effect_id: &effect.effect_id,
@@ -23904,13 +23912,11 @@ fn run_notify_effect(
 
     let mut errors = Vec::new();
     validate_ingest_value(&payload, &shape, "$", &mut errors);
-    let target_exists = SqliteStore::open(store_path)?
-        .get_instance(&target)?
-        .is_some();
+    let target_exists = kernel.store().get_instance(&target)?.is_some();
     if !target_exists {
         errors.push(format!("target instance `{target}` not found"));
     } else if let Some(reason) =
-        internal_workflow_delivery_violation(store_path, instance_id, &target)?
+        internal_workflow_delivery_violation(kernel.store(), instance_id, &target)?
     {
         errors.push(reason);
     }
