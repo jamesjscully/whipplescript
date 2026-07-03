@@ -68,6 +68,151 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         Self { sql }
     }
 
+    /// Records an effect-cancellation request (idempotent replay + open-request
+    /// guard), its `effect.cancellation_requested` event, and the evidence with its
+    /// link fan-out (event / effect / revision / active runs). Shared by
+    /// `request_effect_cancellation` and `activate_revision`. Mirrors
+    /// `insert_effect_cancellation_request_on`.
+    fn insert_effect_cancellation_request(
+        &self,
+        request: EffectCancellationRequest<'_>,
+    ) -> StoreResult<EffectCancellationRequestView> {
+        if let Some(idempotency_key) = request.idempotency_key {
+            let existing = self
+                .sql
+                .query(
+                    "SELECT request_id, instance_id, effect_id, revision_id, reason, requested_by, \
+                     causation_event_id, status, idempotency_key, created_at, updated_at, \
+                     resolved_by_event_id FROM effect_cancellation_requests \
+                     WHERE instance_id = ?1 AND idempotency_key = ?2",
+                    &[text(request.instance_id), text(idempotency_key)],
+                )
+                .map_err(sql_err)?;
+            if let Some(row) = existing.first() {
+                return Ok(effect_cancellation_request_from_row(row));
+            }
+        }
+        if self.effect_has_open_cancellation_request(request.instance_id, request.effect_id)? {
+            return Err(StoreError::Conflict(
+                "effect already has an open cancellation request".to_owned(),
+            ));
+        }
+        // Mint a request id (SQLite-side, same shape as random_id_on).
+        let id_rows = self
+            .sql
+            .query(
+                "SELECT ?1 || '_' || lower(hex(randomblob(16)))",
+                &[text("ecr")],
+            )
+            .map_err(sql_err)?;
+        let request_id = id_rows
+            .first()
+            .map(|r| as_text(&r[0]))
+            .ok_or_else(|| sql_err("failed to mint request id".to_string()))?;
+        let payload = serde_json::json!({
+            "request_id": &request_id,
+            "effect_id": request.effect_id,
+            "revision_id": request.revision_id,
+            "reason": request.reason,
+            "requested_by": request.requested_by,
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: request.instance_id,
+                event_type: "effect.cancellation_requested",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: request.causation_event_id.or(Some(request.effect_id)),
+                correlation_id: request.revision_id,
+                idempotency_key: request.idempotency_key,
+            },
+        )?;
+        self.sql
+            .execute(
+                "INSERT INTO effect_cancellation_requests (request_id, instance_id, effect_id, \
+                 revision_id, reason, requested_by, causation_event_id, status, idempotency_key) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'requested', ?8)",
+                &[
+                    text(&request_id),
+                    text(request.instance_id),
+                    text(request.effect_id),
+                    opt_text(request.revision_id),
+                    opt_text(request.reason),
+                    text(request.requested_by),
+                    opt_text(request.causation_event_id),
+                    opt_text(request.idempotency_key),
+                ],
+            )
+            .map_err(sql_err)?;
+        let active_run_rows = self
+            .sql
+            .query(
+                "SELECT run_id FROM runs WHERE instance_id = ?1 AND effect_id = ?2 \
+                 AND status = 'running' ORDER BY started_at, run_id",
+                &[text(request.instance_id), text(request.effect_id)],
+            )
+            .map_err(sql_err)?;
+        let active_run_ids: Vec<String> = active_run_rows.iter().map(|r| as_text(&r[0])).collect();
+        let evidence_metadata = serde_json::json!({
+            "request_id": &request_id,
+            "effect_id": request.effect_id,
+            "revision_id": request.revision_id,
+            "reason": request.reason,
+            "requested_by": request.requested_by,
+            "event_id": event.event_id,
+            "active_run_ids": &active_run_ids,
+        })
+        .to_string();
+        let evidence_id = do_insert_evidence(
+            &self.sql,
+            EvidenceRecord {
+                instance_id: request.instance_id,
+                kind: "effect.cancellation.requested",
+                subject_type: "effect_cancellation_request",
+                subject_id: &request_id,
+                causation_id: Some(&event.event_id),
+                correlation_id: request.revision_id,
+                summary: Some("effect cancellation requested"),
+                metadata_json: &evidence_metadata,
+            },
+        )?;
+        let link = |target_type: &str, target_id: &str, relation: &str| {
+            do_insert_evidence_link(
+                &self.sql,
+                EvidenceLink {
+                    evidence_id: &evidence_id,
+                    instance_id: request.instance_id,
+                    target_type,
+                    target_id,
+                    relation,
+                },
+            )
+        };
+        link("event", &event.event_id, "requested")?;
+        link("effect", request.effect_id, "requested_cancellation")?;
+        if let Some(revision_id) = request.revision_id {
+            link("workflow_revision", revision_id, "requested_by")?;
+        }
+        for run_id in &active_run_ids {
+            link("run", run_id, "active_run")?;
+        }
+        let recorded = self
+            .sql
+            .query(
+                "SELECT request_id, instance_id, effect_id, revision_id, reason, requested_by, \
+                 causation_event_id, status, idempotency_key, created_at, updated_at, \
+                 resolved_by_event_id FROM effect_cancellation_requests WHERE request_id = ?1",
+                &[text(&request_id)],
+            )
+            .map_err(sql_err)?;
+        recorded
+            .first()
+            .map(|r| effect_cancellation_request_from_row(r))
+            .ok_or_else(|| StoreError::Conflict("cancellation request was not recorded".to_owned()))
+    }
+
     /// Shared rule-commit path for `commit_rule` /
     /// `commit_rule_with_revision_guard`: record `rule.committed`, insert derived
     /// facts, consume triggering facts, insert queued effects + dependency edges,
@@ -537,6 +682,64 @@ fn run_view_from_row(row: &[SqlValue]) -> RunView {
         metadata_json: as_text(&row[7]),
         cancel_requested: as_i64(&row[8]) != 0,
     }
+}
+
+/// The 12-column instance-revision projection, used by the by-id / by-idempotency
+/// revision lookups.
+const REVISION_SELECT: &str = "SELECT revision_id, instance_id, epoch, from_version_id, \
+     to_version_id, activated_by_event_id, activation_policy_json, cancellation_policy, status, \
+     idempotency_key, created_at, activated_at FROM instance_revisions ";
+
+/// A revision by its id, mirroring `revision_by_id_on`.
+fn do_revision_by_id<Sql: DoSql>(
+    sql: &Sql,
+    revision_id: &str,
+) -> StoreResult<Option<WorkflowRevisionView>> {
+    let rows = sql
+        .query(
+            &format!("{REVISION_SELECT}WHERE revision_id = ?1"),
+            &[text(revision_id)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows.first().map(|r| workflow_revision_from_row(r)))
+}
+
+/// A revision by its instance + idempotency key, mirroring
+/// `revision_by_idempotency_on`.
+fn do_revision_by_idempotency<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    idempotency_key: &str,
+) -> StoreResult<Option<WorkflowRevisionView>> {
+    let rows = sql
+        .query(
+            &format!("{REVISION_SELECT}WHERE instance_id = ?1 AND idempotency_key = ?2"),
+            &[text(instance_id), text(idempotency_key)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows.first().map(|r| workflow_revision_from_row(r)))
+}
+
+/// Guards that a reused revision idempotency key carries identical activation
+/// input, mirroring `ensure_revision_idempotency_matches`.
+fn ensure_revision_idempotency_matches(
+    existing: &WorkflowRevisionView,
+    activation: &RevisionActivation<'_>,
+    activation_policy: &Value,
+    cancellation_policy: &str,
+) -> StoreResult<()> {
+    let existing_activation_policy: Value = serde_json::from_str(&existing.activation_policy_json)?;
+    if existing.instance_id.as_str() == activation.instance_id
+        && existing.from_version_id.as_str() == activation.from_version_id
+        && existing.to_version_id.as_str() == activation.to_version_id
+        && existing.cancellation_policy.as_str() == cancellation_policy
+        && &existing_activation_policy == activation_policy
+    {
+        return Ok(());
+    }
+    Err(StoreError::Conflict(
+        "revision idempotency key was reused with different activation input".to_owned(),
+    ))
 }
 
 /// Normalizes a revision cancellation-policy token, mirroring
@@ -2858,7 +3061,296 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         &mut self,
         activation: RevisionActivation<'_>,
     ) -> StoreResult<WorkflowRevisionView> {
-        todo!("Phase 5b: port `activate_revision` SQL to DoSql + verify against a live DO")
+        let cancellation_policy = normalize_cancellation_policy(activation.cancellation_policy)?;
+        let activation_policy: Value = serde_json::from_str(activation.activation_policy_json)?;
+
+        // Idempotent replay: an existing revision with the same key + input is returned.
+        if let Some(idempotency_key) = activation.idempotency_key {
+            if let Some(existing) =
+                do_revision_by_idempotency(&self.sql, activation.instance_id, idempotency_key)?
+            {
+                ensure_revision_idempotency_matches(
+                    &existing,
+                    &activation,
+                    &activation_policy,
+                    cancellation_policy,
+                )?;
+                return Ok(existing);
+            }
+        }
+
+        let instance_rows = self
+            .sql
+            .query(
+                "SELECT instances.program_id, programs.name, instances.version_id, \
+                 instances.revision_epoch, instances.status FROM instances \
+                 JOIN programs ON programs.program_id = instances.program_id \
+                 WHERE instances.instance_id = ?1",
+                &[text(activation.instance_id)],
+            )
+            .map_err(sql_err)?;
+        let row = instance_rows
+            .first()
+            .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))?;
+        let program_id = as_text(&row[0]);
+        let program_name = as_text(&row[1]);
+        let current_version_id = as_text(&row[2]);
+        let current_epoch = as_i64(&row[3]);
+        let status = as_text(&row[4]);
+        if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+            return Err(StoreError::Conflict(format!(
+                "instance is {status}; revisions require a non-terminal instance"
+            )));
+        }
+        if current_version_id != activation.from_version_id {
+            return Err(StoreError::Conflict(format!(
+                "active version is {current_version_id}; expected {}",
+                activation.from_version_id
+            )));
+        }
+        let to_rows = self
+            .sql
+            .query(
+                "SELECT program_id FROM program_versions WHERE version_id = ?1",
+                &[text(activation.to_version_id)],
+            )
+            .map_err(sql_err)?;
+        let to_program_id = to_rows.first().map(|r| as_text(&r[0])).ok_or_else(|| {
+            StoreError::Conflict("target program version does not exist".to_owned())
+        })?;
+        if to_program_id != program_id {
+            return Err(StoreError::Conflict(
+                "target version belongs to a different program".to_owned(),
+            ));
+        }
+        // Compatibility gate.
+        let (_active_program_id, active_summary) =
+            do_program_version_analysis(&self.sql, &current_version_id)?;
+        let (_candidate_program_id, candidate_summary) =
+            do_program_version_analysis(&self.sql, activation.to_version_id)?;
+        let mut compatibility_diagnostics = Vec::new();
+        let context = RevisionInstanceContext {
+            program_id: program_id.clone(),
+            program_name,
+            active_version_id: current_version_id.clone(),
+            status: status.clone(),
+        };
+        add_instance_revision_diagnostics(&context, &mut compatibility_diagnostics);
+        compare_revision_summaries(
+            &active_summary,
+            &candidate_summary,
+            &mut compatibility_diagnostics,
+        );
+        do_add_active_fact_schema_diagnostics(
+            &self.sql,
+            activation.instance_id,
+            &active_summary,
+            &candidate_summary,
+            &mut compatibility_diagnostics,
+        )?;
+        if !compatibility_diagnostics.is_empty() {
+            let codes = compatibility_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(StoreError::Conflict(format!(
+                "revision candidate is incompatible: {codes}"
+            )));
+        }
+
+        let next_epoch = current_epoch + 1;
+        let id_rows = self
+            .sql
+            .query(
+                "SELECT ?1 || '_' || lower(hex(randomblob(16)))",
+                &[text("rev")],
+            )
+            .map_err(sql_err)?;
+        let revision_id = id_rows
+            .first()
+            .map(|r| as_text(&r[0]))
+            .ok_or_else(|| sql_err("failed to mint revision id".to_string()))?;
+        let queued_effects = do_revision_policy_effects(&self.sql, activation.instance_id, false)?;
+        let running_effects = do_revision_policy_effects(&self.sql, activation.instance_id, true)?;
+        let queued_effects_for_policy = if cancellation_policy == "keep" {
+            Vec::new()
+        } else {
+            queued_effects
+        };
+        let running_effects_for_policy = if cancellation_policy == "request_running" {
+            running_effects
+        } else {
+            Vec::new()
+        };
+        let payload = serde_json::json!({
+            "revision_id": &revision_id,
+            "instance_id": activation.instance_id,
+            "from_version_id": activation.from_version_id,
+            "to_version_id": activation.to_version_id,
+            "from_epoch": current_epoch,
+            "to_epoch": next_epoch,
+            "activation_policy": activation_policy,
+            "cancellation_policy": cancellation_policy,
+            "terminal_cancel_effects": &queued_effects_for_policy,
+            "request_cancel_effects": &running_effects_for_policy,
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: activation.instance_id,
+                event_type: "workflow.revision_activated",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: None,
+                correlation_id: Some(&revision_id),
+                idempotency_key: activation.idempotency_key,
+            },
+        )?;
+        self.sql
+            .execute(
+                "INSERT INTO instance_revisions (revision_id, instance_id, epoch, from_version_id, \
+                 to_version_id, activated_by_event_id, activation_policy_json, cancellation_policy, \
+                 status, idempotency_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9)",
+                &[
+                    text(&revision_id),
+                    text(activation.instance_id),
+                    int(next_epoch),
+                    text(activation.from_version_id),
+                    text(activation.to_version_id),
+                    text(&event.event_id),
+                    text(activation.activation_policy_json),
+                    text(cancellation_policy),
+                    opt_text(activation.idempotency_key),
+                ],
+            )
+            .map_err(sql_err)?;
+        self.sql
+            .execute(
+                "UPDATE instances SET version_id = ?1, revision_epoch = ?2, last_event_id = ?3, \
+                 updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?4",
+                &[
+                    text(activation.to_version_id),
+                    int(next_epoch),
+                    text(&event.event_id),
+                    text(activation.instance_id),
+                ],
+            )
+            .map_err(sql_err)?;
+
+        for effect_id in &queued_effects_for_policy {
+            let cancel_payload = serde_json::json!({
+                "effect_id": effect_id,
+                "status": "cancelled",
+                "revision_id": &revision_id,
+                "reason": "workflow revision",
+            })
+            .to_string();
+            let cancel_idempotency_key = format!("revision-cancel:{revision_id}:{effect_id}");
+            let cancel_event = do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: activation.instance_id,
+                    event_type: "effect.terminal",
+                    payload_json: &cancel_payload,
+                    source: "kernel",
+                    causation_id: Some(&event.event_id),
+                    correlation_id: Some(&revision_id),
+                    idempotency_key: Some(&cancel_idempotency_key),
+                },
+            )?;
+            self.sql
+                .execute(
+                    "UPDATE effects SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP \
+                     WHERE instance_id = ?1 AND effect_id = ?2 AND status IN ('queued', 'blocked', \
+                     'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', \
+                     'blocked_by_profile')",
+                    &[text(activation.instance_id), text(effect_id)],
+                )
+                .map_err(sql_err)?;
+            do_mark_cancellation_requests_terminal(
+                &self.sql,
+                activation.instance_id,
+                effect_id,
+                &cancel_event.event_id,
+            )?;
+        }
+        if !queued_effects_for_policy.is_empty() {
+            self.satisfy_dependencies(activation.instance_id)?;
+        }
+        let mut cancellation_request_ids = Vec::new();
+        for effect_id in &running_effects_for_policy {
+            let request_idempotency_key =
+                format!("revision-request-cancel:{revision_id}:{effect_id}");
+            let request = self.insert_effect_cancellation_request(EffectCancellationRequest {
+                instance_id: activation.instance_id,
+                effect_id,
+                revision_id: Some(&revision_id),
+                reason: Some("workflow revision"),
+                requested_by: "workflow.revision",
+                causation_event_id: Some(&event.event_id),
+                idempotency_key: Some(&request_idempotency_key),
+            })?;
+            cancellation_request_ids.push((effect_id.clone(), request.request_id));
+        }
+        let revision_evidence_metadata = serde_json::json!({
+            "revision_id": &revision_id,
+            "event_id": event.event_id,
+            "from_version_id": activation.from_version_id,
+            "to_version_id": activation.to_version_id,
+            "from_epoch": current_epoch,
+            "to_epoch": next_epoch,
+            "cancellation_policy": cancellation_policy,
+            "terminal_cancel_effects": &queued_effects_for_policy,
+            "request_cancel_effects": &running_effects_for_policy,
+            "cancellation_request_ids": cancellation_request_ids
+                .iter()
+                .map(|(_, request_id)| request_id.as_str())
+                .collect::<Vec<_>>(),
+        })
+        .to_string();
+        let revision_evidence_id = do_insert_evidence(
+            &self.sql,
+            EvidenceRecord {
+                instance_id: activation.instance_id,
+                kind: "workflow.revision.activated",
+                subject_type: "workflow_revision",
+                subject_id: &revision_id,
+                causation_id: Some(&event.event_id),
+                correlation_id: Some(&revision_id),
+                summary: Some("workflow revision activated"),
+                metadata_json: &revision_evidence_metadata,
+            },
+        )?;
+        let link = |target_type: &str, target_id: &str, relation: &str| {
+            do_insert_evidence_link(
+                &self.sql,
+                EvidenceLink {
+                    evidence_id: &revision_evidence_id,
+                    instance_id: activation.instance_id,
+                    target_type,
+                    target_id,
+                    relation,
+                },
+            )
+        };
+        link("event", &event.event_id, "activated")?;
+        link(
+            "program_version",
+            activation.from_version_id,
+            "from_version",
+        )?;
+        link("program_version", activation.to_version_id, "to_version")?;
+        for effect_id in &queued_effects_for_policy {
+            link("effect", effect_id, "terminal_cancelled")?;
+        }
+        for (effect_id, request_id) in &cancellation_request_ids {
+            link("effect", effect_id, "cancellation_requested")?;
+            link("effect_cancellation_request", request_id, "created")?;
+        }
+        do_revision_by_id(&self.sql, &revision_id)?
+            .ok_or_else(|| StoreError::Conflict("revision was not recorded".to_owned()))
     }
 
     fn request_effect_cancellation(
@@ -2881,141 +3373,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 "effect is {status}; cancellation requests require running work"
             )));
         }
-        // Idempotent replay: an existing request with the same key is returned.
-        if let Some(idempotency_key) = request.idempotency_key {
-            let existing = self
-                .sql
-                .query(
-                    "SELECT request_id, instance_id, effect_id, revision_id, reason, requested_by, \
-                     causation_event_id, status, idempotency_key, created_at, updated_at, \
-                     resolved_by_event_id FROM effect_cancellation_requests \
-                     WHERE instance_id = ?1 AND idempotency_key = ?2",
-                    &[text(request.instance_id), text(idempotency_key)],
-                )
-                .map_err(sql_err)?;
-            if let Some(row) = existing.first() {
-                return Ok(effect_cancellation_request_from_row(row));
-            }
-        }
-        if self.effect_has_open_cancellation_request(request.instance_id, request.effect_id)? {
-            return Err(StoreError::Conflict(
-                "effect already has an open cancellation request".to_owned(),
-            ));
-        }
-        // Mint a request id (SQLite-side, same shape as random_id_on).
-        let id_rows = self
-            .sql
-            .query(
-                "SELECT ?1 || '_' || lower(hex(randomblob(16)))",
-                &[text("ecr")],
-            )
-            .map_err(sql_err)?;
-        let request_id = id_rows
-            .first()
-            .map(|r| as_text(&r[0]))
-            .ok_or_else(|| sql_err("failed to mint request id".to_string()))?;
-        let payload = serde_json::json!({
-            "request_id": &request_id,
-            "effect_id": request.effect_id,
-            "revision_id": request.revision_id,
-            "reason": request.reason,
-            "requested_by": request.requested_by,
-        })
-        .to_string();
-        let event = do_append_event(
-            &self.sql,
-            NewEvent {
-                instance_id: request.instance_id,
-                event_type: "effect.cancellation_requested",
-                payload_json: &payload,
-                source: "kernel",
-                causation_id: request.causation_event_id.or(Some(request.effect_id)),
-                correlation_id: request.revision_id,
-                idempotency_key: request.idempotency_key,
-            },
-        )?;
-        self.sql
-            .execute(
-                "INSERT INTO effect_cancellation_requests (request_id, instance_id, effect_id, \
-                 revision_id, reason, requested_by, causation_event_id, status, idempotency_key) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'requested', ?8)",
-                &[
-                    text(&request_id),
-                    text(request.instance_id),
-                    text(request.effect_id),
-                    opt_text(request.revision_id),
-                    opt_text(request.reason),
-                    text(request.requested_by),
-                    opt_text(request.causation_event_id),
-                    opt_text(request.idempotency_key),
-                ],
-            )
-            .map_err(sql_err)?;
-        let active_run_rows = self
-            .sql
-            .query(
-                "SELECT run_id FROM runs WHERE instance_id = ?1 AND effect_id = ?2 \
-                 AND status = 'running' ORDER BY started_at, run_id",
-                &[text(request.instance_id), text(request.effect_id)],
-            )
-            .map_err(sql_err)?;
-        let active_run_ids: Vec<String> = active_run_rows.iter().map(|r| as_text(&r[0])).collect();
-        let evidence_metadata = serde_json::json!({
-            "request_id": &request_id,
-            "effect_id": request.effect_id,
-            "revision_id": request.revision_id,
-            "reason": request.reason,
-            "requested_by": request.requested_by,
-            "event_id": event.event_id,
-            "active_run_ids": &active_run_ids,
-        })
-        .to_string();
-        let evidence_id = do_insert_evidence(
-            &self.sql,
-            EvidenceRecord {
-                instance_id: request.instance_id,
-                kind: "effect.cancellation.requested",
-                subject_type: "effect_cancellation_request",
-                subject_id: &request_id,
-                causation_id: Some(&event.event_id),
-                correlation_id: request.revision_id,
-                summary: Some("effect cancellation requested"),
-                metadata_json: &evidence_metadata,
-            },
-        )?;
-        let link = |target_type: &str, target_id: &str, relation: &str| {
-            do_insert_evidence_link(
-                &self.sql,
-                EvidenceLink {
-                    evidence_id: &evidence_id,
-                    instance_id: request.instance_id,
-                    target_type,
-                    target_id,
-                    relation,
-                },
-            )
-        };
-        link("event", &event.event_id, "requested")?;
-        link("effect", request.effect_id, "requested_cancellation")?;
-        if let Some(revision_id) = request.revision_id {
-            link("workflow_revision", revision_id, "requested_by")?;
-        }
-        for run_id in &active_run_ids {
-            link("run", run_id, "active_run")?;
-        }
-        let recorded = self
-            .sql
-            .query(
-                "SELECT request_id, instance_id, effect_id, revision_id, reason, requested_by, \
-                 causation_event_id, status, idempotency_key, created_at, updated_at, \
-                 resolved_by_event_id FROM effect_cancellation_requests WHERE request_id = ?1",
-                &[text(&request_id)],
-            )
-            .map_err(sql_err)?;
-        recorded
-            .first()
-            .map(|r| effect_cancellation_request_from_row(r))
-            .ok_or_else(|| StoreError::Conflict("cancellation request was not recorded".to_owned()))
+        self.insert_effect_cancellation_request(request)
     }
 
     fn effect_has_open_cancellation_request(
@@ -5308,7 +5666,8 @@ mod tests {
                 from_version_id TEXT NOT NULL, to_version_id TEXT NOT NULL,
                 activated_by_event_id TEXT NOT NULL, activation_policy_json TEXT NOT NULL DEFAULT '{}',
                 cancellation_policy TEXT NOT NULL, status TEXT NOT NULL, idempotency_key TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, activated_at TEXT NOT NULL
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                activated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE workflow_invocations (
                 invocation_id TEXT PRIMARY KEY, parent_instance_id TEXT NOT NULL,
@@ -7588,5 +7947,94 @@ mod tests {
             )
             .expect("candidate");
         assert!(!cand.compatible);
+    }
+
+    /// activate_revision bumps the epoch, records the revision + event, cancels
+    /// queued effects per policy, and is idempotent on its key. Real SQL.
+    #[test]
+    fn do_store_activate_revision_runs_real_sql() {
+        let mut store = store();
+        let summary = r#"{"workflow":"main","workflow_contracts":[],"schemas":[]}"#;
+        for (sql, params) in [
+            (
+                "INSERT INTO programs (program_id, name) VALUES (?1, ?2)",
+                vec![text("prog_1"), text("orders")],
+            ),
+            (
+                "INSERT INTO program_versions (version_id, program_id, source_hash, analysis_summary) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                vec![text("ver_a"), text("prog_1"), text("sh_a"), text(summary)],
+            ),
+            (
+                "INSERT INTO program_versions (version_id, program_id, source_hash, analysis_summary) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                vec![text("ver_b"), text("prog_1"), text("sh_b"), text(summary)],
+            ),
+            (
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                vec![text("i1"), text("prog_1"), text("ver_a"), int(0), text("root"), text("{}"), text("running"), text("{}")],
+            ),
+            (
+                "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![text("eff_q"), text("i1"), text("coerce"), text("queued"), text("{}")],
+            ),
+        ] {
+            store.sql.execute(sql, &params).expect("seed");
+        }
+
+        let activation = RevisionActivation {
+            instance_id: "i1",
+            from_version_id: "ver_a",
+            to_version_id: "ver_b",
+            activation_policy_json: "{}",
+            cancellation_policy: "cancel_queued",
+            idempotency_key: Some("act-1"),
+        };
+        let view = store.activate_revision(activation).expect("activate");
+        assert!(view.revision_id.starts_with("rev_"));
+        assert_eq!(view.epoch, 1);
+        assert_eq!(view.to_version_id, "ver_b");
+        // Instance advanced to ver_b epoch 1; the queued effect was cancelled.
+        let inst = store.get_instance("i1").expect("get").expect("some");
+        assert_eq!(inst.version_id, "ver_b");
+        assert_eq!(inst.revision_epoch, 1);
+        let eff = store
+            .sql
+            .query(
+                "SELECT status FROM effects WHERE effect_id = ?1",
+                &[text("eff_q")],
+            )
+            .expect("read");
+        assert_eq!(as_text(&eff[0][0]), "cancelled");
+        assert_eq!(store.list_instance_revisions("i1").expect("revs").len(), 1);
+
+        // Idempotent replay returns the same revision without a second row.
+        let view2 = store
+            .activate_revision(RevisionActivation {
+                instance_id: "i1",
+                from_version_id: "ver_a",
+                to_version_id: "ver_b",
+                activation_policy_json: "{}",
+                cancellation_policy: "cancel_queued",
+                idempotency_key: Some("act-1"),
+            })
+            .expect("replay");
+        assert_eq!(view.revision_id, view2.revision_id);
+        assert_eq!(store.list_instance_revisions("i1").expect("revs").len(), 1);
+
+        // A stale from_version is rejected (already advanced to ver_b).
+        assert!(store
+            .activate_revision(RevisionActivation {
+                instance_id: "i1",
+                from_version_id: "ver_a",
+                to_version_id: "ver_b",
+                activation_policy_json: "{}",
+                cancellation_policy: "keep",
+                idempotency_key: Some("act-2"),
+            })
+            .is_err());
     }
 }
