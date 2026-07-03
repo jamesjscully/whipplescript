@@ -559,6 +559,68 @@ fn do_append_event<Sql: DoSql>(sql: &Sql, event: NewEvent<'_>) -> StoreResult<St
     })
 }
 
+/// The execution fingerprint for a run: `H(input_json | sorted upstream ids)`,
+/// mirroring `execution_fingerprint_on`.
+fn do_execution_fingerprint<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    effect_id: &str,
+) -> StoreResult<String> {
+    let input_rows = sql
+        .query(
+            "SELECT input_json FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
+            &[text(instance_id), text(effect_id)],
+        )
+        .map_err(sql_err)?;
+    let input_json = input_rows
+        .first()
+        .map(|r| as_text(&r[0]))
+        .unwrap_or_else(|| "{}".to_owned());
+    let upstream_rows = sql
+        .query(
+            "SELECT upstream_effect_id FROM effect_dependencies \
+             WHERE instance_id = ?1 AND downstream_effect_id = ?2",
+            &[text(instance_id), text(effect_id)],
+        )
+        .map_err(sql_err)?;
+    let mut upstream: Vec<String> = upstream_rows.iter().map(|r| as_text(&r[0])).collect();
+    upstream.sort();
+    Ok(stable_hash_hex(&format!(
+        "{input_json}|{}",
+        upstream.join(",")
+    )))
+}
+
+/// The `effect.run_started` event payload, mirroring `run_start_payload`.
+fn run_start_payload(run: &RunStart<'_>, metadata_json: &str) -> String {
+    serde_json::json!({
+        "effect_id": run.effect_id,
+        "run_id": run.run_id,
+        "provider": run.provider,
+        "worker_id": run.worker_id,
+        "lease_id": run.lease_id,
+        "lease_expires_at": run.lease_expires_at,
+        "metadata": serde_json::from_str::<Value>(metadata_json).unwrap_or(Value::Null),
+    })
+    .to_string()
+}
+
+/// Merge the execution fingerprint into a run's metadata object, mirroring
+/// `inject_execution_fingerprint`.
+fn inject_execution_fingerprint(metadata_json: &str, fingerprint: &str) -> String {
+    let mut value: Value = serde_json::from_str(metadata_json).unwrap_or(Value::Null);
+    if !value.is_object() {
+        value = serde_json::json!({});
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "execution_fingerprint".to_owned(),
+            Value::String(fingerprint.to_owned()),
+        );
+    }
+    value.to_string()
+}
+
 /// The active `(program_version_id, revision_epoch)` for an instance, or
 /// `(None, 0)` when the instance row is absent. Mirrors `active_revision_on`.
 fn do_active_revision<Sql: DoSql>(
@@ -801,10 +863,8 @@ struct PolicyEffect {
     declared_profiles_json: String,
 }
 
-/// A scheduling block: the `blocked_by_*` status the effect should take and why.
-/// `claimable_effects` only checks presence; `start_run` (a later chunk) reads
-/// `status`/`reason` to record the block, hence the allow until then.
-#[allow(dead_code)]
+/// A scheduling block: the `blocked_by_*` status the effect should take and why
+/// (`start_run` records both; `claimable_effects` only checks presence).
 struct PolicyBlock {
     status: &'static str,
     reason: String,
@@ -2972,7 +3032,194 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
-        todo!("Phase 5b: port `start_run` SQL to DoSql + verify against a live DO")
+        let status_rows = self
+            .sql
+            .query(
+                "SELECT status FROM instances WHERE instance_id = ?1",
+                &[text(run.instance_id)],
+            )
+            .map_err(sql_err)?;
+        if let Some(row) = status_rows.first() {
+            let status = as_text(&row[0]);
+            if status != "running" {
+                return Err(StoreError::Conflict(format!(
+                    "instance is {status}; provider runs require a running instance"
+                )));
+            }
+        }
+        if let Some(block) = do_policy_block(&self.sql, run.instance_id, run.effect_id)? {
+            let payload = serde_json::json!({
+                "effect_id": run.effect_id,
+                "status": block.status,
+                "reason": block.reason,
+            })
+            .to_string();
+            do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: run.instance_id,
+                    event_type: "effect.blocked",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(run.effect_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&format!(
+                        "policy-block:{}:{}",
+                        run.effect_id, run.run_id
+                    )),
+                },
+            )?;
+            self.sql
+                .execute(
+                    "UPDATE effects SET status = ?1, policy_block_reason = ?2, \
+                     updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?3 AND effect_id = ?4 \
+                     AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')",
+                    &[
+                        text(block.status),
+                        text(&block.reason),
+                        text(run.instance_id),
+                        text(run.effect_id),
+                    ],
+                )
+                .map_err(sql_err)?;
+            return Err(StoreError::PolicyBlocked {
+                effect_id: run.effect_id.to_owned(),
+                reason: block.reason,
+            });
+        }
+        // Dependency gate: NOT EXISTS an unsatisfied dependency.
+        let claimable_rows = self
+            .sql
+            .query(
+                "SELECT NOT EXISTS (SELECT 1 FROM effect_dependencies AS dependency \
+                 JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
+                  AND upstream.instance_id = dependency.instance_id \
+                 WHERE dependency.instance_id = ?1 AND dependency.downstream_effect_id = ?2 \
+                 AND NOT ( \
+                   (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
+                   OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
+                   OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
+                   OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
+                   OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
+                 ))",
+                &[text(run.instance_id), text(run.effect_id)],
+            )
+            .map_err(sql_err)?;
+        let claimable = claimable_rows
+            .first()
+            .map(|r| as_i64(&r[0]) != 0)
+            .unwrap_or(true);
+        if !claimable {
+            self.sql
+                .execute(
+                    "UPDATE effects SET status = 'blocked_by_dependency', \
+                     updated_at = CURRENT_TIMESTAMP \
+                     WHERE instance_id = ?1 AND effect_id = ?2 AND status = 'queued'",
+                    &[text(run.instance_id), text(run.effect_id)],
+                )
+                .map_err(sql_err)?;
+            return Err(StoreError::Conflict(
+                "effect dependencies are not satisfied".to_owned(),
+            ));
+        }
+        if self.effect_has_open_cancellation_request(run.instance_id, run.effect_id)? {
+            return Err(StoreError::Conflict(
+                "effect cancellation has been requested".to_owned(),
+            ));
+        }
+        if let Some(reason) = do_capacity_block(&self.sql, run.instance_id, run.effect_id)? {
+            let payload = serde_json::json!({
+                "effect_id": run.effect_id,
+                "status": "blocked_by_capacity",
+                "reason": reason,
+            })
+            .to_string();
+            do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: run.instance_id,
+                    event_type: "effect.blocked",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(run.effect_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&format!(
+                        "capacity-block:{}:{}",
+                        run.effect_id, run.run_id
+                    )),
+                },
+            )?;
+            self.sql
+                .execute(
+                    "UPDATE effects SET status = 'blocked_by_capacity', policy_block_reason = ?1, \
+                     updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?2 AND effect_id = ?3 \
+                     AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')",
+                    &[text(&reason), text(run.instance_id), text(run.effect_id)],
+                )
+                .map_err(sql_err)?;
+            return Err(StoreError::CapacityBlocked {
+                effect_id: run.effect_id.to_owned(),
+                reason,
+            });
+        }
+
+        let fingerprint = do_execution_fingerprint(&self.sql, run.instance_id, run.effect_id)?;
+        let run_metadata = inject_execution_fingerprint(run.metadata_json, &fingerprint);
+        let payload = run_start_payload(&run, &run_metadata);
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: run.instance_id,
+                event_type: "effect.run_started",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(run.effect_id),
+                correlation_id: None,
+                idempotency_key: Some(run.run_id),
+            },
+        )?;
+        let changed = self
+            .sql
+            .execute(
+                "UPDATE effects SET status = 'running', policy_block_reason = NULL, \
+                 policy_block_category = NULL, updated_at = CURRENT_TIMESTAMP \
+                 WHERE instance_id = ?1 AND effect_id = ?2 \
+                 AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')",
+                &[text(run.instance_id), text(run.effect_id)],
+            )
+            .map_err(sql_err)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict("effect is not claimable".to_owned()));
+        }
+        self.sql
+            .execute(
+                "INSERT INTO runs (run_id, effect_id, instance_id, provider, worker_id, status, \
+                 metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6)",
+                &[
+                    text(run.run_id),
+                    text(run.effect_id),
+                    text(run.instance_id),
+                    text(run.provider),
+                    text(run.worker_id),
+                    text(&run_metadata),
+                ],
+            )
+            .map_err(sql_err)?;
+        self.sql
+            .execute(
+                "INSERT INTO leases (lease_id, run_id, effect_id, instance_id, worker_id, status, \
+                 expires_at) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
+                &[
+                    text(run.lease_id),
+                    text(run.run_id),
+                    text(run.effect_id),
+                    text(run.instance_id),
+                    text(run.worker_id),
+                    text(run.lease_expires_at),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(event)
     }
 
     fn block_effect_binding(
@@ -3574,13 +3821,14 @@ mod tests {
             );
             CREATE TABLE leases (
                 lease_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, run_id TEXT NOT NULL,
-                effect_id TEXT NOT NULL, status TEXT NOT NULL, expires_at TEXT NOT NULL,
-                released_at TEXT
+                effect_id TEXT NOT NULL, worker_id TEXT, status TEXT NOT NULL,
+                expires_at TEXT NOT NULL, released_at TEXT
             );
             CREATE TABLE runs (
                 run_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, effect_id TEXT NOT NULL,
                 provider TEXT NOT NULL, worker_id TEXT NOT NULL, status TEXT NOT NULL,
-                started_at TEXT NOT NULL, completed_at TEXT, metadata_json TEXT NOT NULL DEFAULT '{}'
+                started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE effect_cancellation_requests (
                 request_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, effect_id TEXT NOT NULL,
@@ -5203,5 +5451,150 @@ mod tests {
             )
             .expect("pause");
         assert!(store.claimable_effects("i1").expect("none").is_empty());
+    }
+
+    /// start_run claims a queued effect: it records effect.run_started, flips the
+    /// effect to running, and creates the run + lease rows. Guards (policy block,
+    /// unmet dependency) are enforced. Real SQL.
+    #[test]
+    fn do_store_start_run_runs_real_sql() {
+        let mut store = store();
+        let seed = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
+        seed(
+            "INSERT INTO programs (program_id, name) VALUES (?1, ?2)",
+            &[text("prog_1"), text("orders")],
+        );
+        seed(
+            "INSERT INTO program_versions (version_id, program_id, declared_profiles) \
+             VALUES (?1, ?2, ?3)",
+            &[text("ver_1"), text("prog_1"), text("[]")],
+        );
+        seed(
+            "INSERT INTO instances (instance_id, program_id, version_id, workflow_principal, \
+             effective_authority, status, input_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                text("i1"),
+                text("prog_1"),
+                text("ver_1"),
+                text("root"),
+                text("{}"),
+                text("running"),
+                text("{}"),
+            ],
+        );
+        // A runtime-resolved coordination effect (no policy applies) — claimable.
+        seed(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                text("eff_1"),
+                text("i1"),
+                text("queue.push"),
+                text("queued"),
+                text("{\"a\":1}"),
+            ],
+        );
+        // A provider effect with no registered provider (policy-blocked later).
+        seed(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json, \
+             required_capabilities) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                text("eff_p"),
+                text("i1"),
+                text("coerce"),
+                text("queued"),
+                text("{}"),
+                text("[]"),
+            ],
+        );
+        // An effect with an unmet dependency (dependency-gated later).
+        seed(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                text("eff_up"),
+                text("i1"),
+                text("queue.push"),
+                text("queued"),
+                text("{}"),
+            ],
+        );
+        seed(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                text("eff_dn"),
+                text("i1"),
+                text("queue.push"),
+                text("queued"),
+                text("{}"),
+            ],
+        );
+        seed(
+            "INSERT INTO effect_dependencies (instance_id, downstream_effect_id, \
+             upstream_effect_id, predicate) VALUES (?1, ?2, ?3, ?4)",
+            &[text("i1"), text("eff_dn"), text("eff_up"), text("succeeds")],
+        );
+
+        let run = RunStart {
+            instance_id: "i1",
+            effect_id: "eff_1",
+            run_id: "run_1",
+            provider: "builtin",
+            worker_id: "w1",
+            lease_id: "lse_1",
+            lease_expires_at: "2026-01-01T01:00:00Z",
+            metadata_json: "{}",
+        };
+        let ev = store.start_run(run).expect("start_run");
+        assert!(ev.event_id.starts_with("evt_"));
+        // Effect running, run + lease created, fingerprint injected into metadata.
+        let eff = store
+            .sql
+            .query(
+                "SELECT status FROM effects WHERE effect_id = ?1",
+                &[text("eff_1")],
+            )
+            .expect("read effect");
+        assert_eq!(as_text(&eff[0][0]), "running");
+        let runs = store.list_runs("i1").expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].provider, "builtin");
+        assert!(runs[0].metadata_json.contains("execution_fingerprint"));
+        let leases = store
+            .sql
+            .query(
+                "SELECT status FROM leases WHERE lease_id = ?1",
+                &[text("lse_1")],
+            )
+            .expect("read lease");
+        assert_eq!(as_text(&leases[0][0]), "active");
+
+        // The provider effect with no registered provider is policy-blocked.
+        let blocked = store.start_run(RunStart {
+            instance_id: "i1",
+            effect_id: "eff_p",
+            run_id: "run_p",
+            provider: "x",
+            worker_id: "w1",
+            lease_id: "lse_p",
+            lease_expires_at: "2026-01-01T01:00:00Z",
+            metadata_json: "{}",
+        });
+        assert!(matches!(blocked, Err(StoreError::PolicyBlocked { .. })));
+
+        // The effect with an unmet dependency is conflict-gated.
+        assert!(store
+            .start_run(RunStart {
+                instance_id: "i1",
+                effect_id: "eff_dn",
+                run_id: "run_dn",
+                provider: "builtin",
+                worker_id: "w1",
+                lease_id: "lse_dn",
+                lease_expires_at: "2026-01-01T01:00:00Z",
+                metadata_json: "{}",
+            })
+            .is_err());
     }
 }
