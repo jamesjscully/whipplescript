@@ -268,13 +268,23 @@ flow triage
 > + `manual review requested` removed; work queues + `whip items`; `exec` +
 > `WHIPPLESCRIPT_EXEC_ALLOW`; rule-coverage lint; `--exec-profile`/C9). The
 > checklist below is retained as historical decomposition; its `[ ]` marks are
-> **not** live work except the three genuinely-open carry-overs, which are the
+> **not** live work except the two genuinely-open carry-overs, which are the
 > only remaining items in this whole tracker:
 > - **B1a (partial):** the body AST shipped, but *moving lowering out of the CLI
 >   crate* is still open (`main.rs` ~50k lines) — folds in review-change-plan §4.11.
-> - **B1g:** the fuzz/property "no silent no-op" sweep.
+>   *Ordering note 2026-07-01:* the durable-object sans-IO refactor
+>   (`../durable-object-runtime-tracker.md` Phases 1–4) will restructure the
+>   executor half of the same file; do the lowering-move first or jointly, not
+>   after — avoid refactoring the same ~50k-line file twice.
 > - **B3:** remove `consume` after its deprecation window (it still parses); and
 >   the dynamic per-run committed-rule reporting half of rule-coverage CI.
+>
+> **B1g closed 2026-07-02:** the pull-forward was kept: the no-silent-no-op
+> sweep now has a deterministic accepted-body matrix in
+> `accepted_rule_body_matrix_has_no_silent_noops`, plus runtime scanner coverage
+> in `parse_effect_statements_covers_accepted_body_surface`. The CLI scanner also
+> no longer double-advances adjacent single-line effects, which was the concrete
+> silent-skip risk the sweep exposed.
 
 ### B1. Harden the soft middle (priority 1)
 
@@ -302,9 +312,10 @@ line at lowering time, and guards/assertions use two different evaluators.
 - [ ] **B1f.** Reject unknown effect modifiers with a spanned diagnostic
       (`tell w as turn timeout 10m "..."` must say "unknown token
       `timeout`", not mis-parse downstream).
-- [ ] **B1g.** Sweep: fuzz/property tests that any body accepted by `check`
+- [x] **B1g.** Sweep: fuzz/property tests that any body accepted by `check`
       either executes faithfully or produces a runtime diagnostic — no
-      silent no-ops.
+      silent no-ops. Closed 2026-07-02 with deterministic parser/CLI accepted-body
+      matrices and the adjacent single-line effect scanner fix.
 
 ### B2. Implementation work derived from Part A decisions
 
@@ -653,7 +664,7 @@ file-writing workers).
 
 ## Proposed — v1 surface-hardening design pass (2026-07-01)
 
-- [ ] **P1. `prompt` — bare model prompt → text.** DECIDED (Jack). The most
+- [x] **P1. `prompt` — bare model prompt → text.** DECIDED (Jack). The most
       basic model pattern is missing: `coerce`/`decide` are structured and `tell`
       needs an `agent` decl + full turn lifecycle, so there is no lightweight
       `prompt "…" → text`. Add a `prompt "<text>" [using <provider>] as r`
@@ -663,3 +674,12 @@ file-writing workers).
       model output). Result type is a plain string reachable via `after r
       succeeds`. Small: parse + lower (reuse the Coerce backend path) + IFC
       (reuse coerce's) + test. No new model needed (coerce-shaped invariant).
+      Shipped 2026-07-02: parser/IR/runtime scanner/native/fixture coerce path
+      support `prompt`, including provider override, string payload binding, and
+      matrix/input-shape coverage. Course-correction same day: the new `prompt`
+      keyword made the runtime effect scanner misparse record-field lines named
+      `prompt` (fixture-table rows) as effects, colliding effect idempotency
+      keys; fixed by skipping record blocks in `parse_effect_statements` and
+      requiring the `as` binding on the prompt branch
+      (`parse_effect_statements_skips_record_block_fields` +
+      `dev_provider_language_*` regressions).

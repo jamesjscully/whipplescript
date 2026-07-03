@@ -164,6 +164,8 @@ Each is the owner's to decide; recommendation given.
 
 **Not closed by any fix:** `is_delegating_edge` and the E1 boundary predicate assume `package_of` is well-defined for every workflow (holds today). If the open one-program-many-workflows scoping keystone blurs package identity, the boundary predicate must be re-derived. Door discipline is per-seam: any FUTURE runtime op that delivers to / mutates a target instance by id must route through the E2-DYN marker check (the cancel-cleanup terminal-path audit lesson). Under dev/ungoverned envelope the `internal_workflows` loader returns false, so encapsulation is enforced only under a verified envelope — consistent with all IFC.
 
+**Not closed by admission alone (claim-vs-enforcement):** the per-instance authority slot + invoke-seam admission bind `with access to` at the governed-effect seams, but they do NOT bind the owned-harness agent loop's in-turn tool calls — today the live tool executor reads policy from process env, not the declared authority (build tracker Phase 4b closes this). Until that piece lands, a "runtime least-privilege subagent" claim for owned-harness turns would be a report-vs-check gap: the grant governs admission and effect gating, not which tool call runs mid-turn. Docs and the guarantee report must scope the claim accordingly (tracker § Sequencing).
+
 ---
 
 *Anchors cite the subsystem surveys, the shipped H8 signal precedent, DR-0028/0029/0030, and code/model locations. Nothing here proposes a new abstraction; every clause — including the four v2 hole closures — is an instantiation or small extension of a Lean-proven or Maude-bitten primitive, and the mechanism is gated so it fires only where a principal boundary is crossed.*

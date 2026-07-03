@@ -44,6 +44,21 @@ repo/commit/branch), and dedup-efficient (store a touched file once by hash,
 reference across checkpoints — not full-tree copies), and uniform with the rest
 of whip (files become "just another event-sourced resource").
 
+## Consistency requirement (added 2026-07-01)
+
+A checkpoint is a **consistent cut across all three planes**, not three
+independent bookmarks. The checkpoint must bind together, captured at the same
+quiescent point (no effect in flight straddling the cut): (1) the agent
+transcript position, (2) the instance event-log index, and (3) the file-store
+manifest hash. **Restore is atomic across all three.** Reverting files without
+rewinding the transcript (or vice versa) yields an incoherent state the agent
+would then act on — e.g. a transcript that remembers writing a file the storage
+plane no longer contains, or restored files the instance's facts already
+supersede. A partial restore is refused, not best-effort. The checkpoint event
+in the instance log is the natural carrier of the cut: it inherently has an
+event index, and it records the transcript checkpoint id plus the manifest
+hash alongside it.
+
 ## Cost accepted
 
 File content in the log is a **storage** concern. Accepted with the direction to
