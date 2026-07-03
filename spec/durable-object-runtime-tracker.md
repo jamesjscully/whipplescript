@@ -266,7 +266,17 @@ linear undo chain). No phase work now.
       (Decision 4) layers on later (Phase 7) behind this same seam; the
       small-file-inline path is the native default.
 
-### Phase 5 — DO host crate + TS shell (the wasm target)
+### Phase 5 — DO host crate + TS shell (the wasm target) — in-repo scope COMPLETE 2026-07-03; only the Cloudflare `wrangler deploy` (5d) remains
+> **Status (2026-07-03):** every in-repo chunk is built and live-validated —
+> 5a store traits on `DoSqliteStore`, 5b all effect families (10 store-only +
+> coerce suspend/resume + eviction-safe agent turn), 5c `DoInstanceDriver` +
+> `DurableInstance` + the `#[wasm_bindgen]` `WasmDurableInstance` surface, and
+> 5d the worker shell + end-to-end validation of the real wasm module over real
+> SQLite (commit 56ae999). The ONLY remainder is provisioning: `wrangler deploy`
+> against a live edge DO + `wrangler secret put`, plus the follow-on DO
+> messages-API agent `HttpModelClient` for live agent turns. Details per chunk
+> below.
+>
 > **Concrete entry point (found 2026-07-03, Phases 0–4 done).** The sans-IO
 > seams (`sansio.rs`, `HttpModelClient`/`BrokeredTurnMachine`) and the store
 > traits (`RuntimeStore`/`Coordination`/`WorkItems`/`FileStore`) all exist, but
@@ -298,8 +308,9 @@ linear undo chain). No phase work now.
       (kernel + `sansio` + `harness_loop`/`harness_model` + `coerce_native`) runs
       on wasm. Native unchanged (kernel 204+17, CLI green, clippy `-D warnings`).
       This proves the DR-0033 architecture end-to-end.
-- [~] `whipplescript-host-do` crate started — the DO binding's building blocks,
-      built for wasm against the wasm-clean core:
+- [x] `whipplescript-host-do` crate — the DO binding, built for wasm against the
+      wasm-clean core, native tests green + wasm32 build green + live-validated
+      through the wasm-bindgen boundary (56ae999). Building blocks:
       - [x] `FetchClient` (the DO's `fetch`) + `FetchHost` — the sans-IO
             `HostDriver` that fulfills a `NeedsIo(Http)` through the isolate's
             fetch. Any effect step machine (`coerce`, an agent turn) runs on the
@@ -309,13 +320,21 @@ linear undo chain). No phase work now.
             space). Tested (`do_file_store_round_trips_through_the_file_seam`).
       - Crate builds native (2 tests green, clippy `-D warnings` clean) **and**
         `--no-default-features --target wasm32-unknown-unknown`.
-      - [~] TS/Worker shell landed (`worker/`): `src/index.ts` (the
-            `WhippleInstance` DO class running the sans-IO drive loop — step the
-            synchronous Rust machine, await `fetch` on `NeedsIo(Http)`, re-enter),
-            `wrangler.toml` (DO SQLite class + R2 large-object bucket + secrets),
-            `package.json`/`tsconfig.json`, and a README mapping each Rust host
-            trait to its DO primitive. Deployment scaffold — real code, not built
-            here.
+      - [x] TS/Worker shell landed (`worker/`): `src/index.ts` (the DO class
+            running the sans-IO drive loop — step the synchronous Rust machine,
+            await `fetch` on `NeedsIo(Http)`, re-enter), `wrangler.toml`
+            (`new_sqlite_classes` DO SQLite + secrets), `package.json`/`tsconfig.json`,
+            a README mapping each Rust host trait to its DO primitive, and
+            `do_schema.sql` (the 33-table DO schema, coordination tables prefixed
+            `coord_*`). **No longer just scaffold: live-validated in-repo** —
+            `validate.cjs` (commit 56ae999) backs the JS `DoSqlBridge` with Node 24's
+            `node:sqlite` (`DatabaseSync`, in-memory) and drives the REAL wasm-bindgen
+            module through the REAL step protocol: `node validate.cjs` reports
+            `PASS effect-free workflow -> completed` and `PASS coerce workflow ->
+            needs_http -> (fetch) -> terminal`. `pkg/` (the wasm-bindgen output) is
+            gitignored — `npm run validate` regenerates it. This exercises the exact
+            deployed path minus only Cloudflare's `state.storage.sql` (swapped for
+            `node:sqlite`, contract-identical) and `wrangler deploy`.
       - [x] `RuntimeStore` over `DoSql` (`do_store.rs`): the `DoSql` seam (the DO's
             synchronous SQLite as `execute`/`query`) + `DoSqliteStore<Sql: DoSql>`
             implementing the full 87-method `RuntimeStore` trait — **builds for
@@ -337,7 +356,11 @@ linear undo chain). No phase work now.
             *live-DO validation only*: a `DoSql` impl over the real
             `state.storage.sql` in the `worker` crate, exercised end-to-end against
             an actual Durable Object.
-      - [~] **Instance-level sans-IO scheduler (full lift).** The native top-level
+      - [~] **Instance-level sans-IO scheduler (full lift).** **STATUS 2026-07-03:
+            in-repo COMPLETE — chunks 0–5 all built + validated; cause-deferred
+            remainders only** (the optional native-default-executor swap in chunk 4,
+            and the live `wrangler deploy` in chunk 5). The narrative below is the
+            chunk-by-chunk record. The native top-level
             driver is the `dev` fixpoint (`main.rs`): alternate `step_instance`
             (pure rule pass — reads facts/effects, commits ready rules, may spawn
             effects / reach a workflow terminal) and `run_worker_once` (the effect
@@ -498,11 +521,27 @@ linear undo chain). No phase work now.
                 behavior-neutral swap of a working path, whose real payoff is the DO,
                 not native) — deferred as low-value;
             (5) wire the DO host (`RuntimeKernel<DoSqliteStore>` + `FetchHost`) to
-                the wasm-bindgen surface below.
-      - [ ] The `wasm-bindgen` surface the shell imports (`createInstance`/`step`/
-            `snapshot`) wiring `RuntimeKernel<DoSqliteStore>` + `FetchHost` to the
-            drive loop; routing every new delivery/re-entry seam through the E2-DYN
-            marker door. **Needs a live Cloudflare DO runtime.**
+                the wasm-bindgen surface below — **DONE.** `DoInstanceDriver`
+                (commit e0b68bc) is the DO's `InstanceDriver`; `DurableInstance`
+                (9aabc96) holds it across `step()` calls; `WasmDurableInstance`
+                (b4724ae) is the `#[wasm_bindgen]` boundary; the whole path is
+                live-validated over `node:sqlite` (56ae999). Only `wrangler deploy`
+                against a live edge DO remains.
+      - [x] The `wasm-bindgen` surface the shell imports — **BUILT + live-validated
+            in-repo** (commits 9aabc96 `DurableInstance` create/step/status handle,
+            b4724ae `WasmDurableInstance` `#[wasm_bindgen]` create/step/status,
+            56ae999 the end-to-end validation). `do_wasm.rs` (`#[cfg(target_arch =
+            "wasm32")]`) is the JS↔Rust boundary: `WasmDurableInstance` wraps
+            `DurableInstance<JsDoSql>`, `JsDoSql` implements `DoSql` over the JS
+            `DoSqlBridge` (`state.storage.sql`), and the step protocol marshals the
+            `fetch` request out / response in as JSON. This drives
+            `RuntimeKernel<DoSqliteStore>` through the `InstanceStepMachine`, coerce
+            creds flowing in via `create`'s `coerce_config_json` (DO secrets). What
+            is NOT yet wired: the messages-API agent `HttpModelClient` on the DO
+            (the follow-on seam — coerce runs live, agent needs a DO model client +
+            tool executor) and routing the delivery/re-entry seams through the
+            E2-DYN marker door on the deployed surface. **The only truly infra-gated
+            remainder is `wrangler deploy` against a real edge DO** (5d below).
             **Concrete chunk-5 map (found 2026-07-03):** the kernel's
             `InstanceStepMachine` + `InstanceDriver` seam (built + validated in
             chunk 4) is exactly what the DO plugs into. Four concrete pieces, three
@@ -530,12 +569,25 @@ linear undo chain). No phase work now.
             (minimal-noop, `when started`→complete) to `completed` through the
             `InstanceStepMachine`, verified against the rusqlite mock** (host-do 30).
             So the DO runs the instance scheduler over its store for effect-free
-            workflows. REMAINING in 5c: the **wasm-bindgen `createInstance`/`step`/
-            `snapshot`** surface (the JS↔Rust boundary the TS shell imports — needs
-            the `wasm-bindgen` crate + JS DoSql/fetch callbacks, so it can only be
-            exercised on a live DO); and once 5b lands, run_effect executes effects;
-            (5d) **live validation** on a real Cloudflare DO (the only truly
-            infra-gated part — Jack's "plug into infra at the end").
+            workflows. **5c COMPLETE** — the wasm-bindgen `create`/`step`/`status`
+            surface is BUILT (`do_wasm.rs`, commits 9aabc96 + b4724ae) and, contrary
+            to the earlier "only on a live DO" note, was exercised in-repo by wiring
+            the JS `DoSqlBridge`/`fetch` callbacks to `node:sqlite` + a canned
+            provider response (commit 56ae999) — the wasm module drives real
+            workflows (store-only AND coerce suspend/resume) through the real
+            boundary. 5b's effects execute through `run_effect`;
+            (5d) **live validation.** In-repo end-to-end validation is **DONE**
+            (commits 92fb4bf worker+DO shell + coerce-creds wiring, 56ae999 the
+            validation harness): the real wasm-bindgen module runs real workflows —
+            effect-free → `completed` in one step, and coerce → `needs_http` →
+            (fetch) → terminal across two steps — over real SQLite (`node:sqlite`
+            standing in for `state.storage.sql`) in a real JS runtime (Node 24),
+            driven by `worker/validate.cjs`. The DR-0033 sans-IO suspend/resume crux
+            executes through the deployed code path. **The sole remaining part is
+            the literal Cloudflare deployment** — `wrangler deploy` against a real
+            edge Durable Object + `wrangler secret put` for provider creds — which is
+            provisioning, not code (Jack's "plug into infra at the end"); it deploys
+            already-live-validated code with no remaining in-repo engineering.
 
 ### Phase 6 — Scheduling + config on the DO
 - [~] Seams landed in `whipplescript-host-do` (real, tested, native + wasm):
@@ -568,8 +620,8 @@ also trigger exec/agent compute that cannot live in the isolate (Decision 7:
 subprocess effects are HTTP to a container sidecar). This phase registers
 that compute plane as open intent — cloud deployment is only partially
 solved without it. A design pass is required before any box is checked;
-shared design with `versioned-workspace-research-note.md` §9–§10 (the
-materialization boundary must be **evidence-grade**: atomic, recorded,
+shared design with `versioned-workspace-research-note.md` (the
+materialization + evidence-grade boundary sections: atomic, recorded,
 complete imports).
 
 - [ ] Sidecar lifecycle: container-per-DO controller model (Cloudflare
@@ -581,8 +633,9 @@ complete imports).
       manifest, execs, pushes the diff back keyed by effect id — idempotent
       by Decisions 3/4; just another step-machine effect.
 - [ ] **Image digest = environment hash**: the container image digest slots
-      into generator-hash ambient config (experimentation note §7) — a
-      toolchain bump becomes a visible warm-start, never silent.
+      into generator-hash ambient config (experimentation note, "Evidence
+      identity — the slice hash") — a toolchain bump becomes a visible
+      warm-start, never silent.
 - [ ] Economics: cold starts (seconds) + billed-while-running → exec
       batching, warm-pool policy, DO↔sidecar placement affinity.
 - [ ] IFC span: egress doors must be enforced where whip cannot see
