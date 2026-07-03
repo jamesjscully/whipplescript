@@ -479,11 +479,18 @@ linear undo chain). No phase work now.
                 `InstanceSchedulerLifecycle.tla`; 3 mock-driver tests
                 (store-only→terminal, HTTP suspend+resume, park) — kernel 207,
                 native+wasm, clippy -D. The rule pass + effect execution sit behind
-                an `InstanceDriver` seam. REMAINING for (4): wire the NATIVE
-                `InstanceDriver` impl (advance_rules→`step_instance_generic`,
-                next_ready_effect→`claimable_effects`, run_effect→the handler cores)
-                so native `dev`/`worker`/`step` can drive an instance through the
-                machine, proven to match the dev loop; the DO impl comes in (5);
+                an `InstanceDriver` seam. **Native `InstanceDriver` binding BUILT
+                (commit 8e07bd5):** `NativeInstanceDriver` (main.rs) wires
+                advance_rules→`step_instance_generic`+status,
+                next_ready_effect→`claimable_effects`, run_effect→the 11 store-only
+                handler cores (dispatched by kind, all settle `Done`; HTTP/subproc/
+                recursion tail errors clearly). Compiles + clippy -D clean; the
+                native handlers run HTTP to completion internally so it never
+                suspends (only the DO binding does). REMAINING for (4): swap it into
+                `dev`/`worker`/`step` (behavior-neutral for store-only workflows) +
+                a subprocess integration test proving parity with the dev loop —
+                needs the full instance-run harness. It has no production call site
+                yet (dead-code allow);
             (5) wire the DO host (`RuntimeKernel<DoSqliteStore>` + `FetchHost`) to
                 the wasm-bindgen surface below.
       - [ ] The `wasm-bindgen` surface the shell imports (`createInstance`/`step`/
