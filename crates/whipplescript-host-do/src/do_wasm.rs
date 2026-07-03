@@ -11,14 +11,17 @@
 //! The TS shell drives it: `WasmDurableInstance.create(bridge, program, input,
 //! principal)`, then loop `step(responseJson)` — on `{"kind":"needs_http", …}` do the
 //! `fetch` and pass the result back, on `{"kind":"terminal"|"parked"|"failed"}` stop.
-//! Effect creds (coerce/agent secrets) are a follow-on injection; this surface runs
-//! the store-only + effect-free + creds-provided paths.
+//! Coerce provider creds flow in via `create`'s `coerce_config_json` (from DO
+//! secrets), so the store-only, effect-free, AND coerce paths run on the deployed
+//! surface; the messages-API agent model client is the remaining follow-on seam.
 
 use wasm_bindgen::prelude::*;
 
 use crate::do_store::SqlValue;
+use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::sansio::{HttpResponse, TransportError};
 
+use crate::do_instance::CoerceProviderConfig;
 use crate::do_store::DoSql;
 use crate::do_worker::{DurableEffectPorts, DurableInstance, DurableStepOutcome};
 
@@ -149,6 +152,33 @@ fn outcome_to_json(outcome: &DurableStepOutcome) -> String {
     value.to_string()
 }
 
+/// Parse the DO-secret coerce config JSON into a `CoerceProviderConfig`.
+fn parse_coerce_config(json: &str) -> Result<CoerceProviderConfig, String> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let provider = match value.get("provider").and_then(serde_json::Value::as_str) {
+        Some("anthropic") => CoerceProvider::Anthropic,
+        Some("openai") => CoerceProvider::OpenAi,
+        other => return Err(format!("unknown coerce provider: {other:?}")),
+    };
+    let field = |name: &str| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    Ok(CoerceProviderConfig {
+        provider,
+        provider_name: field("provider").unwrap_or_else(|| "coerce".to_owned()),
+        base_url: field("base_url").ok_or("coerce config needs base_url")?,
+        api_key: field("api_key").ok_or("coerce config needs api_key")?,
+        model: field("model").ok_or("coerce config needs model")?,
+        max_tokens: value
+            .get("max_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1024) as u32,
+    })
+}
+
 /// The durable-object instance as the Worker shell sees it.
 #[wasm_bindgen]
 pub struct WasmDurableInstance {
@@ -158,19 +188,30 @@ pub struct WasmDurableInstance {
 #[wasm_bindgen]
 impl WasmDurableInstance {
     /// Compile `program` and create + start a fresh instance over the JS-backed DO
-    /// SQLite. Called once when the object is first addressed.
+    /// SQLite. Called once when the object is first addressed. `coerce_config_json`
+    /// (optional) carries the provider creds a `coerce` effect needs, from DO
+    /// secrets: `{"provider":"anthropic"|"openai","base_url","api_key","model",
+    /// "max_tokens"}`. The messages-API agent model client is a follow-on seam.
     pub fn create(
         bridge: DoSqlBridge,
         program: &str,
         input: &str,
         principal: &str,
+        coerce_config_json: Option<String>,
     ) -> Result<WasmDurableInstance, JsValue> {
+        let coerce = match coerce_config_json {
+            Some(json) => Some(parse_coerce_config(&json).map_err(|e| JsValue::from_str(&e))?),
+            None => None,
+        };
         let inner = DurableInstance::create(
             JsDoSql { bridge },
             program,
             input,
             principal,
-            DurableEffectPorts::default(),
+            DurableEffectPorts {
+                coerce,
+                ..DurableEffectPorts::default()
+            },
         )
         .map_err(|error| JsValue::from_str(&error))?;
         Ok(Self { inner })
