@@ -19,10 +19,10 @@
 
 use whipplescript_kernel::effect_config::EffectConfig;
 use whipplescript_kernel::effect_handlers::{
-    run_coordination_effect_generic, run_event_effect_generic, run_file_effect_generic,
-    run_file_import_effect_generic, run_file_write_effect_generic, run_human_effect_generic,
-    run_loft_effect_generic, run_notify_effect_generic, run_queue_effect_generic,
-    DeliveryGovernance,
+    run_capability_effect_generic, run_coordination_effect_generic, run_event_effect_generic,
+    run_file_effect_generic, run_file_import_effect_generic, run_file_write_effect_generic,
+    run_human_effect_generic, run_loft_effect_generic, run_notify_effect_generic,
+    run_queue_effect_generic, CapabilityContract, DeliveryGovernance,
 };
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_pass::step_instance_generic;
@@ -54,6 +54,21 @@ struct DoDeliveryGovernance;
 impl DeliveryGovernance for DoDeliveryGovernance {
     fn any_internal_workflow(&self, _resources: &[String]) -> Result<bool, String> {
         Ok(false)
+    }
+}
+
+/// Durable-object capability contract. The mock DO carries no package-lock, so no
+/// output-validation constraint applies; a live DO validates against the contract
+/// in its program metadata (plugged in with the infra; mirrors the native
+/// `PackageLockCapabilityContract`).
+struct DoCapabilityContract;
+impl CapabilityContract for DoCapabilityContract {
+    fn validate_output(
+        &self,
+        _effect: &ClaimableEffect,
+        _value: &serde_json::Value,
+    ) -> Option<String> {
+        None
     }
 }
 
@@ -106,6 +121,13 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 self.instance_id,
                 effect,
                 &DoDeliveryGovernance,
+            )?,
+            "capability.call" => run_capability_effect_generic(
+                &mut self.kernel,
+                self.instance_id,
+                effect,
+                &config,
+                &DoCapabilityContract,
             )?,
             "queue.file" | "queue.claim" | "queue.release" | "queue.finish" => {
                 run_queue_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?

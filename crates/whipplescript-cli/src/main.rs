@@ -20094,9 +20094,13 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
             "event.emit" => run_event_effect_generic(kernel, id, effect, &config)?,
             "loft.claim" => run_loft_effect_generic(kernel, id, effect, &config)?,
             "human.ask" => run_human_effect_generic(kernel, id, effect, &config)?,
-            "capability.call" => {
-                run_capability_effect_generic(kernel, id, effect, &config, package_lock)?
-            }
+            "capability.call" => run_capability_effect_generic(
+                kernel,
+                id,
+                effect,
+                &config,
+                &PackageLockCapabilityContract(package_lock),
+            )?,
             "queue.file" | "queue.claim" | "queue.release" | "queue.finish" => {
                 run_queue_effect_generic(kernel, id, effect, &config)?
             }
@@ -22878,197 +22882,19 @@ fn run_capability_effect(
         instance_id,
         effect,
         &options.effect_config(),
-        package_lock,
+        &PackageLockCapabilityContract(package_lock),
     )
 }
 
-/// Host-agnostic core (DR-0033 chunk 3): run the capability call + its terminal
-/// over a held `RuntimeKernel<S>` (only kernel methods, so `S: RuntimeStore`).
-fn run_capability_effect_generic<S: RuntimeStore>(
-    kernel: &mut RuntimeKernel<S>,
-    instance_id: &str,
-    effect: &ClaimableEffect,
-    config: &EffectConfig,
-    package_lock: Option<&LoadedPackageLock>,
-) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    let input = json_from_str(&effect.input_json);
-    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "capability-run"]);
-    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "capability-lease"]);
-    kernel.start_run(RunStart {
-        instance_id,
-        effect_id: &effect.effect_id,
-        run_id: &run_id,
-        provider: &config.provider,
-        worker_id: "whip-worker",
-        lease_id: &lease_id,
-        lease_expires_at: "2030-01-01T00:00:00Z",
-        metadata_json: &json!({
-            "target": effect.target,
-            "input": input,
-        })
-        .to_string(),
-    })?;
-
-    let terminal = if config.outcome_failed {
-        let metadata_json = json!({
-            "failure": {
-                "phase": "provider.capability.failed",
-                "error_kind": "fixture_failure",
-                "message": "fixture capability failure"
-            },
-            "target": effect.target,
-            "input": input,
-        })
-        .to_string();
-        let terminal = kernel.fail_run(EffectCompletion {
-            instance_id,
-            effect_id: &effect.effect_id,
-            run_id: &run_id,
-            provider: &config.provider,
-            worker_id: "whip-worker",
-            status: "failed",
-            exit_code: Some(1),
-            summary: Some("fixture capability failure"),
-            metadata_json: &metadata_json,
-            idempotency_key: Some(&idempotency_key(&[
-                instance_id,
-                &effect.effect_id,
-                "terminal",
-            ])),
-        })?;
-        let value_json = json!({
-            "effect_id": effect.effect_id,
-            "run_id": run_id,
-            "target": effect.target,
-            "status": "failed",
-            "value": effect_failure_base("capability.call", "fixture capability failure", "fixture capability failure", &effect.effect_id, &run_id),
-            "error": {
-                "kind": "fixture_failure",
-                "message": "fixture capability failure"
-            },
-            "summary": "fixture capability failure"
-        })
-        .to_string();
-        kernel.derive_fact(
-            instance_id,
-            "capability.call.failed",
-            &effect.effect_id,
-            &value_json,
-            Some(&terminal.event_id),
-            Some(&idempotency_key(&[
-                instance_id,
-                &effect.effect_id,
-                "capability.call.failed",
-            ])),
-        )?;
-        terminal
-    } else {
-        let value = json!({
-            "summary": "Fixture capability context",
-            "target": effect.target,
-        });
-        if let Some(error) = validate_package_capability_output(package_lock, effect, &value) {
-            let metadata_json = json!({
-                "failure": {
-                    "phase": "provider.capability.output_validation",
-                    "error_kind": "provider_output_validation",
-                    "message": error,
-                },
-                "target": effect.target,
-                "input": input,
-                "value": value,
-            })
-            .to_string();
-            let terminal = kernel.fail_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: &config.provider,
-                worker_id: "whip-worker",
-                status: "failed",
-                exit_code: Some(1),
-                summary: Some("fixture capability output validation failed"),
-                metadata_json: &metadata_json,
-                idempotency_key: Some(&idempotency_key(&[
-                    instance_id,
-                    &effect.effect_id,
-                    "terminal",
-                ])),
-            })?;
-            let value_json = json!({
-                "effect_id": effect.effect_id,
-                "run_id": run_id,
-                "target": effect.target,
-                "status": "failed",
-                "value": effect_failure_base("capability.call", &error, "fixture capability output validation failed", &effect.effect_id, &run_id),
-                "error": {
-                    "kind": "provider_output_validation",
-                    "message": error,
-                },
-                "summary": "fixture capability output validation failed"
-            })
-            .to_string();
-            kernel.derive_fact(
-                instance_id,
-                "capability.call.failed",
-                &effect.effect_id,
-                &value_json,
-                Some(&terminal.event_id),
-                Some(&idempotency_key(&[
-                    instance_id,
-                    &effect.effect_id,
-                    "capability.call.failed",
-                ])),
-            )?;
-            return Ok(terminal);
-        }
-        let metadata_json = json!({
-            "target": effect.target,
-            "input": input,
-            "value": value,
-        })
-        .to_string();
-        let terminal = kernel.complete_run(EffectCompletion {
-            instance_id,
-            effect_id: &effect.effect_id,
-            run_id: &run_id,
-            provider: &config.provider,
-            worker_id: "whip-worker",
-            status: "completed",
-            exit_code: Some(0),
-            summary: Some("fixture capability completed"),
-            metadata_json: &metadata_json,
-            idempotency_key: Some(&idempotency_key(&[
-                instance_id,
-                &effect.effect_id,
-                "terminal",
-            ])),
-        })?;
-        let value_json = json!({
-            "effect_id": effect.effect_id,
-            "run_id": run_id,
-            "target": effect.target,
-            "status": "completed",
-            "value": value,
-            "error": null,
-            "summary": "fixture capability completed"
-        })
-        .to_string();
-        kernel.derive_fact(
-            instance_id,
-            "capability.call.succeeded",
-            &effect.effect_id,
-            &value_json,
-            Some(&terminal.event_id),
-            Some(&idempotency_key(&[
-                instance_id,
-                &effect.effect_id,
-                "capability.call.succeeded",
-            ])),
-        )?;
-        terminal
-    };
-    Ok(terminal)
+/// Native capability contract: validate against the workspace package-lock's
+/// declared capability contracts.
+struct PackageLockCapabilityContract<'a>(Option<&'a LoadedPackageLock>);
+impl whipplescript_kernel::effect_handlers::CapabilityContract
+    for PackageLockCapabilityContract<'_>
+{
+    fn validate_output(&self, effect: &ClaimableEffect, value: &Value) -> Option<String> {
+        validate_package_capability_output(self.0, effect, value)
+    }
 }
 
 fn validate_package_capability_output(
