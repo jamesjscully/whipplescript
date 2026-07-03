@@ -519,10 +519,16 @@ linear undo chain). No phase work now.
             the runtime store's effect `leases` (separate files natively, one store on
             the DO) → coordination tables prefixed `coord_*` on the DO; the live
             migration must adopt that;
-            (5b) **DO-reachable effect handler cores** — the store-only cores live
-            in `main.rs`; the DO's `InstanceDriver::run_effect` needs them in a lib
-            (relocate to kernel, or a host-do effect module) + the two HTTP effects
-            wired to `FetchHost` (the `NeedsHttp` path the machine already supports);
+            (5b) **DO-reachable effect handler cores — STARTED (commit 9124f67).**
+            Pattern established: lift each store-only core into
+            `kernel::effect_handlers` (host-neutral, `EffectConfig`-only) so both
+            `InstanceDriver` bindings dispatch it. `event.emit` DONE — lifted to the
+            kernel, native wrapper imports it, the DO's `run_effect` executes it over
+            `RuntimeKernel<DoSqliteStore>` (its first executable effect). REMAINING:
+            lift the other ~10 store-only cores the same way (loft/human/queue/
+            coordination/notify/file×4 — a few pull small helper closures per the
+            curation notes) + wire the two HTTP effects (coerce/agent) to
+            `FetchHost`'s `NeedsHttp` path; then the DO runs effectful workflows;
             (5c) **`DoInstanceDriver` DONE (commit e0b68bc):** the DO counterpart to
             `NativeInstanceDriver` over `RuntimeKernel<DoSqliteStore>` — implements the
             `InstanceDriver` seam (advance_rules→`step_instance_generic`,
