@@ -420,7 +420,11 @@ linear undo chain). No phase work now.
                 file handlers `run_file_effect`/`_write`/`_import`/`_export` via the
                 `FileStore` seam (`*_generic<S>(kernel, files: &dyn FileStore, …)`,
                 native `NativeFileStore` / DO `DoFileStore`) (3c, 2a1b2f9).
-                REMAINING (a deeper grind): `run_notify_effect` nests
+                `run_queue_effect` via `WorkItems` + the facade wrapper
+                (`RuntimeKernel<NativeStores>`) (3d, e3b31a5), and
+                `run_coordination_effect` via `Coordination` + facade (+ its helper
+                `coordination_owner_for_instance` generic over `&S`) (3e, aa016ab).
+                **10/~15 handlers generic.** REMAINING: `run_notify_effect` nests
                 `internal_workflow_delivery_violation`(store_path); the
                 `file*` handlers need `FileStore`, `coordination`/`queue` need
                 `Coordination`/`WorkItems` (audit for inherent-vs-trait methods —
