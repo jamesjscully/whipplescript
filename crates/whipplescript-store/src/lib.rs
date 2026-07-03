@@ -4,15 +4,18 @@ pub mod coordination;
 pub mod files;
 pub mod items;
 
+use std::result;
+#[cfg(feature = "native")]
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
-    result,
 };
 use whipplescript_core::Severity;
 
+#[cfg(feature = "native")]
 use rusqlite::{params, Connection, OptionalExtension};
+#[cfg(feature = "native")]
 use serde_json::{json, Value};
 
 pub type StoreResult<T> = result::Result<T, StoreError>;
@@ -20,11 +23,18 @@ pub type StoreResult<T> = result::Result<T, StoreError>;
 #[derive(Debug)]
 pub enum StoreError {
     Io(std::io::Error),
+    #[cfg(feature = "native")]
     Sqlite(rusqlite::Error),
     Json(serde_json::Error),
     Conflict(String),
-    PolicyBlocked { effect_id: String, reason: String },
-    CapacityBlocked { effect_id: String, reason: String },
+    PolicyBlocked {
+        effect_id: String,
+        reason: String,
+    },
+    CapacityBlocked {
+        effect_id: String,
+        reason: String,
+    },
 }
 
 impl From<std::io::Error> for StoreError {
@@ -33,6 +43,7 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
+#[cfg(feature = "native")]
 impl From<rusqlite::Error> for StoreError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Sqlite(error)
@@ -45,6 +56,7 @@ impl From<serde_json::Error> for StoreError {
     }
 }
 
+#[cfg(feature = "native")]
 pub struct SqliteStore {
     connection: Connection,
 }
@@ -889,12 +901,14 @@ pub struct RetryEffect<'a> {
     pub idempotency_key: Option<&'a str>,
 }
 
+#[cfg(feature = "native")]
 struct Migration {
     version: i64,
     name: &'static str,
     sql: &'static str,
 }
 
+#[cfg(feature = "native")]
 const MIGRATIONS: &[Migration] = &[Migration {
     version: 1,
     name: "runtime-store-schema",
@@ -906,6 +920,7 @@ pub fn store_stage() -> &'static str {
     whipplescript_core::IMPLEMENTATION_STAGE
 }
 
+#[cfg(feature = "native")]
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         let path = path.as_ref();
@@ -5401,6 +5416,7 @@ pub trait RuntimeStore {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "native")]
 impl RuntimeStore for SqliteStore {
     fn schema_version(&self) -> StoreResult<i64> {
         self.schema_version()
@@ -5772,6 +5788,7 @@ impl RuntimeStore for SqliteStore {
     }
 }
 
+#[cfg(feature = "native")]
 #[cfg(unix)]
 fn harden_store_file_permissions(path: &Path) -> StoreResult<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -5784,11 +5801,13 @@ fn harden_store_file_permissions(path: &Path) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 #[cfg(not(unix))]
 fn harden_store_file_permissions(_path: &Path) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
     connection
         .query_row(
@@ -5801,6 +5820,7 @@ fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn validate_workspace_policy(policy: &str) -> StoreResult<()> {
     match policy {
         "shared"
@@ -5814,6 +5834,7 @@ fn validate_workspace_policy(policy: &str) -> StoreResult<()> {
     }
 }
 
+#[cfg(feature = "native")]
 fn validate_workspace_status(status: &str) -> StoreResult<()> {
     match status {
         "prepared" | "active" | "released" | "failed" => Ok(()),
@@ -5823,6 +5844,7 @@ fn validate_workspace_status(status: &str) -> StoreResult<()> {
     }
 }
 
+#[cfg(feature = "native")]
 fn workspace_select_sql(predicate: &str) -> String {
     format!(
         r#"
@@ -5844,6 +5866,7 @@ fn workspace_select_sql(predicate: &str) -> String {
     )
 }
 
+#[cfg(feature = "native")]
 fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceView> {
     Ok(WorkspaceView {
         workspace_id: row.get(0)?,
@@ -5860,6 +5883,7 @@ fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceView
     })
 }
 
+#[cfg(feature = "native")]
 fn append_event_on(connection: &Connection, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
     connection
         .query_row(
@@ -5909,6 +5933,7 @@ fn append_event_on(connection: &Connection, event: NewEvent<'_>) -> StoreResult<
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn insert_fact(
     connection: &Connection,
     instance_id: &str,
@@ -5959,6 +5984,7 @@ fn insert_fact(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn consume_facts(connection: &Connection, instance_id: &str, fact_ids: &[&str]) -> StoreResult<()> {
     for fact_id in fact_ids {
         let changed = connection.execute(
@@ -5981,6 +6007,7 @@ fn consume_facts(connection: &Connection, instance_id: &str, fact_ids: &[&str]) 
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn insert_effect(
     connection: &Connection,
     instance_id: &str,
@@ -6032,6 +6059,7 @@ fn insert_effect(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn insert_effect_dependency(
     connection: &Connection,
     instance_id: &str,
@@ -6062,6 +6090,7 @@ fn insert_effect_dependency(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn insert_evidence_on(
     connection: &Connection,
     evidence: EvidenceRecord<'_>,
@@ -6142,6 +6171,7 @@ fn insert_evidence_on(
     Ok(evidence_id)
 }
 
+#[cfg(feature = "native")]
 fn insert_evidence_link_on(connection: &Connection, link: EvidenceLink<'_>) -> StoreResult<()> {
     connection.execute(
         r#"
@@ -6174,6 +6204,7 @@ fn insert_evidence_link_on(connection: &Connection, link: EvidenceLink<'_>) -> S
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn insert_diagnostic_on(
     connection: &Connection,
     diagnostic: DiagnosticRecord<'_>,
@@ -6260,10 +6291,12 @@ fn insert_diagnostic_on(
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn optional_string(value: Option<&Value>) -> Option<String> {
     value.and_then(Value::as_str).map(str::to_owned)
 }
 
+#[cfg(feature = "native")]
 fn existing_diagnostic_id_on(
     connection: &Connection,
     diagnostic: &DiagnosticRecord<'_>,
@@ -6320,6 +6353,7 @@ fn existing_diagnostic_id_on(
     Ok(None)
 }
 
+#[cfg(feature = "native")]
 fn parse_json_array(json: &str) -> StoreResult<()> {
     let value = serde_json::from_str::<Value>(json)?;
     if value.is_array() {
@@ -6329,6 +6363,7 @@ fn parse_json_array(json: &str) -> StoreResult<()> {
     }
 }
 
+#[cfg(feature = "native")]
 fn satisfy_dependencies_on(connection: &Connection, instance_id: &str) -> StoreResult<usize> {
     connection
         .execute(
@@ -6365,11 +6400,13 @@ fn satisfy_dependencies_on(connection: &Connection, instance_id: &str) -> StoreR
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 struct PolicyBlock {
     status: &'static str,
     reason: String,
 }
 
+#[cfg(feature = "native")]
 struct PolicyEffect {
     kind: String,
     target: Option<String>,
@@ -6380,6 +6417,7 @@ struct PolicyEffect {
     declared_profiles_json: String,
 }
 
+#[cfg(feature = "native")]
 fn policy_block_on(
     connection: &Connection,
     instance_id: &str,
@@ -6481,6 +6519,7 @@ fn policy_block_on(
     policy_block_for_capabilities(connection, &effect, &capabilities)
 }
 
+#[cfg(feature = "native")]
 fn policy_block_for_capabilities(
     connection: &Connection,
     effect: &PolicyEffect,
@@ -6529,6 +6568,7 @@ fn policy_block_for_capabilities(
     Ok(None)
 }
 
+#[cfg(feature = "native")]
 fn agent_target_policy_block(effect: &PolicyEffect) -> StoreResult<Option<PolicyBlock>> {
     if effect.kind != "agent.tell" {
         return Ok(None);
@@ -6576,6 +6616,7 @@ fn agent_target_policy_block(effect: &PolicyEffect) -> StoreResult<Option<Policy
     }
 }
 
+#[cfg(feature = "native")]
 fn capacity_block_on(
     connection: &Connection,
     instance_id: &str,
@@ -6639,6 +6680,7 @@ fn capacity_block_on(
     }
 }
 
+#[cfg(feature = "native")]
 fn declared_agent_profile(
     declared_profiles_json: &str,
     agent: &str,
@@ -6647,6 +6689,7 @@ fn declared_agent_profile(
     Ok(agent_profile_in_value(&parsed, agent))
 }
 
+#[cfg(feature = "native")]
 fn declared_agents_present(declared_profiles_json: &str) -> StoreResult<bool> {
     let parsed = serde_json::from_str::<Value>(declared_profiles_json)?;
     Ok(match &parsed {
@@ -6673,6 +6716,7 @@ fn declared_agents_present(declared_profiles_json: &str) -> StoreResult<bool> {
     })
 }
 
+#[cfg(feature = "native")]
 fn agent_profile_in_value(value: &Value, agent: &str) -> Option<Option<String>> {
     match value {
         Value::Array(items) => items
@@ -6714,11 +6758,13 @@ fn agent_profile_in_value(value: &Value, agent: &str) -> Option<Option<String>> 
     }
 }
 
+#[cfg(feature = "native")]
 fn declared_agent_capacity(declared_profiles_json: &str, agent: &str) -> StoreResult<Option<i64>> {
     let parsed = serde_json::from_str::<Value>(declared_profiles_json)?;
     Ok(agent_capacity_in_value(&parsed, agent))
 }
 
+#[cfg(feature = "native")]
 fn declared_agent_capabilities(
     declared_profiles_json: &str,
     agent: &str,
@@ -6727,6 +6773,7 @@ fn declared_agent_capabilities(
     Ok(agent_capabilities_in_value(&parsed, agent).unwrap_or_default())
 }
 
+#[cfg(feature = "native")]
 fn agent_capabilities_in_value(value: &Value, agent: &str) -> Option<BTreeSet<String>> {
     match value {
         Value::Array(items) => items
@@ -6758,6 +6805,7 @@ fn agent_capabilities_in_value(value: &Value, agent: &str) -> Option<BTreeSet<St
     }
 }
 
+#[cfg(feature = "native")]
 fn capabilities_value(value: &Value) -> BTreeSet<String> {
     value
         .as_array()
@@ -6771,6 +6819,7 @@ fn capabilities_value(value: &Value) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
+#[cfg(feature = "native")]
 fn agent_capacity_in_value(value: &Value, agent: &str) -> Option<i64> {
     match value {
         Value::Array(items) => items
@@ -6809,6 +6858,7 @@ fn agent_capacity_in_value(value: &Value, agent: &str) -> Option<i64> {
     }
 }
 
+#[cfg(feature = "native")]
 fn capacity_value(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| {
         value
@@ -6817,6 +6867,7 @@ fn capacity_value(value: &Value) -> Option<i64> {
     })
 }
 
+#[cfg(feature = "native")]
 fn required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
     let mut capabilities = explicit_required_capabilities(effect)?;
     if capabilities.is_empty() {
@@ -6827,6 +6878,7 @@ fn required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
     Ok(capabilities)
 }
 
+#[cfg(feature = "native")]
 fn explicit_required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
     let parsed = serde_json::from_str::<Value>(&effect.required_capabilities_json)?;
     let mut capabilities = parsed
@@ -6844,6 +6896,7 @@ fn explicit_required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<Stri
     Ok(capabilities)
 }
 
+#[cfg(feature = "native")]
 fn effect_provider_exists(connection: &Connection, effect_kind: &str) -> StoreResult<bool> {
     connection
         .query_row(
@@ -6856,6 +6909,7 @@ fn effect_provider_exists(connection: &Connection, effect_kind: &str) -> StoreRe
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn capability_schema_exists(connection: &Connection, capability: &str) -> StoreResult<bool> {
     connection
         .query_row(
@@ -6868,6 +6922,7 @@ fn capability_schema_exists(connection: &Connection, capability: &str) -> StoreR
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn capability_bound(
     connection: &Connection,
     program_id: &str,
@@ -6890,6 +6945,7 @@ fn capability_bound(
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn profile_policy(
     connection: &Connection,
     profile: &str,
@@ -6917,6 +6973,7 @@ fn profile_policy(
         .transpose()
 }
 
+#[cfg(feature = "native")]
 fn instance_status_on(connection: &Connection, instance_id: &str) -> StoreResult<Option<String>> {
     connection
         .query_row(
@@ -6928,6 +6985,7 @@ fn instance_status_on(connection: &Connection, instance_id: &str) -> StoreResult
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn active_revision_on(
     connection: &Connection,
     instance_id: &str,
@@ -6943,6 +7001,7 @@ fn active_revision_on(
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 struct RevisionInstanceContext {
     program_id: String,
     program_name: String,
@@ -6950,6 +7009,7 @@ struct RevisionInstanceContext {
     status: String,
 }
 
+#[cfg(feature = "native")]
 fn revision_instance_context_on(
     connection: &Connection,
     instance_id: &str,
@@ -6976,6 +7036,7 @@ fn revision_instance_context_on(
         .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))
 }
 
+#[cfg(feature = "native")]
 fn add_instance_revision_diagnostics(
     context: &RevisionInstanceContext,
     diagnostics: &mut Vec<RevisionCompatibilityDiagnostic>,
@@ -6995,6 +7056,7 @@ fn add_instance_revision_diagnostics(
     }
 }
 
+#[cfg(feature = "native")]
 fn program_version_analysis_on(
     connection: &Connection,
     version_id: &str,
@@ -7015,6 +7077,7 @@ fn program_version_analysis_on(
     Ok((program_id, analysis_summary))
 }
 
+#[cfg(feature = "native")]
 fn compare_revision_summaries(
     active: &Value,
     candidate: &Value,
@@ -7052,6 +7115,7 @@ fn compare_revision_summaries(
     compare_contracts("failure", false, active, candidate, diagnostics);
 }
 
+#[cfg(feature = "native")]
 fn compare_contracts(
     kind: &str,
     reject_candidate_additions: bool,
@@ -7098,12 +7162,14 @@ fn compare_contracts(
     }
 }
 
+#[cfg(feature = "native")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ContractSummary {
     ty: String,
     source_span_json: Option<String>,
 }
 
+#[cfg(feature = "native")]
 fn contracts_by_name(summary: &Value, kind: &str) -> BTreeMap<String, ContractSummary> {
     summary
         .get("workflow_contracts")
@@ -7123,6 +7189,7 @@ fn contracts_by_name(summary: &Value, kind: &str) -> BTreeMap<String, ContractSu
         .collect()
 }
 
+#[cfg(feature = "native")]
 fn add_active_fact_schema_diagnostics(
     connection: &Connection,
     instance_id: &str,
@@ -7204,6 +7271,7 @@ fn add_active_fact_schema_diagnostics(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn schemas_by_name(summary: &Value) -> BTreeMap<String, Value> {
     summary
         .get("schemas")
@@ -7214,10 +7282,12 @@ fn schemas_by_name(summary: &Value) -> BTreeMap<String, Value> {
         .collect()
 }
 
+#[cfg(feature = "native")]
 fn summary_source_span_json(summary: &Value) -> Option<String> {
     summary.get("source_span").map(Value::to_string)
 }
 
+#[cfg(feature = "native")]
 fn fact_schema_name<'a>(
     fact_name: &'a str,
     schema_id: Option<&'a str>,
@@ -7235,6 +7305,7 @@ fn fact_schema_name<'a>(
     None
 }
 
+#[cfg(feature = "native")]
 fn validate_fact_value_against_schema(
     value: &Value,
     schema: &Value,
@@ -7277,6 +7348,7 @@ fn validate_fact_value_against_schema(
     }
 }
 
+#[cfg(feature = "native")]
 fn validate_value_against_fields(
     value: &Value,
     fields: Option<&Vec<Value>>,
@@ -7318,6 +7390,7 @@ fn validate_value_against_fields(
     }
 }
 
+#[cfg(feature = "native")]
 fn validate_value_against_type_signature(
     value: &Value,
     signature: &str,
@@ -7458,6 +7531,7 @@ fn validate_value_against_type_signature(
     }
 }
 
+#[cfg(feature = "native")]
 fn validate_value_against_object_signature(
     value: &Value,
     inner: &str,
@@ -7483,10 +7557,12 @@ fn validate_value_against_object_signature(
     validate_value_against_fields(value, Some(&fields), schemas, path, errors, depth + 1);
 }
 
+#[cfg(feature = "native")]
 fn is_optional_signature(signature: &str) -> bool {
     signature_envelope(signature, "optional").is_some()
 }
 
+#[cfg(feature = "native")]
 fn signature_envelope<'a>(signature: &'a str, name: &str) -> Option<&'a str> {
     let prefix = format!("{name}<");
     signature
@@ -7494,6 +7570,7 @@ fn signature_envelope<'a>(signature: &'a str, name: &str) -> Option<&'a str> {
         .and_then(|rest| rest.strip_suffix('>'))
 }
 
+#[cfg(feature = "native")]
 fn split_top_level(input: &str, separator: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
@@ -7523,6 +7600,7 @@ fn split_top_level(input: &str, separator: &str) -> Vec<String> {
     parts
 }
 
+#[cfg(feature = "native")]
 fn revision_compatibility_diagnostic(
     code: &str,
     message: String,
@@ -7531,6 +7609,7 @@ fn revision_compatibility_diagnostic(
     revision_compatibility_diagnostic_with_span(code, message, subject, None)
 }
 
+#[cfg(feature = "native")]
 fn revision_compatibility_diagnostic_with_span(
     code: &str,
     message: String,
@@ -7545,6 +7624,7 @@ fn revision_compatibility_diagnostic_with_span(
     }
 }
 
+#[cfg(feature = "native")]
 fn normalize_cancellation_policy(policy: &str) -> StoreResult<&'static str> {
     match policy {
         "keep" => Ok("keep"),
@@ -7556,6 +7636,7 @@ fn normalize_cancellation_policy(policy: &str) -> StoreResult<&'static str> {
     }
 }
 
+#[cfg(feature = "native")]
 fn random_id_on(connection: &Connection, prefix: &str) -> StoreResult<String> {
     connection
         .query_row(
@@ -7566,6 +7647,7 @@ fn random_id_on(connection: &Connection, prefix: &str) -> StoreResult<String> {
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn workflow_revision_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRevisionView> {
     Ok(WorkflowRevisionView {
         revision_id: row.get(0)?,
@@ -7583,6 +7665,7 @@ fn workflow_revision_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workf
     })
 }
 
+#[cfg(feature = "native")]
 fn revision_by_id_on(
     connection: &Connection,
     revision_id: &str,
@@ -7613,6 +7696,7 @@ fn revision_by_id_on(
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn revision_by_idempotency_on(
     connection: &Connection,
     instance_id: &str,
@@ -7645,6 +7729,7 @@ fn revision_by_idempotency_on(
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn ensure_revision_idempotency_matches(
     existing: &WorkflowRevisionView,
     activation: &RevisionActivation<'_>,
@@ -7665,6 +7750,7 @@ fn ensure_revision_idempotency_matches(
     ))
 }
 
+#[cfg(feature = "native")]
 fn revision_policy_effects_on(
     connection: &Connection,
     instance_id: &str,
@@ -7690,6 +7776,7 @@ fn revision_policy_effects_on(
     Ok(rows)
 }
 
+#[cfg(feature = "native")]
 fn effect_has_open_cancellation_request_on(
     connection: &Connection,
     instance_id: &str,
@@ -7713,6 +7800,7 @@ fn effect_has_open_cancellation_request_on(
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn effect_cancellation_request_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<EffectCancellationRequestView> {
@@ -7732,6 +7820,7 @@ fn effect_cancellation_request_from_row(
     })
 }
 
+#[cfg(feature = "native")]
 fn cancellation_request_by_idempotency_on(
     connection: &Connection,
     instance_id: &str,
@@ -7764,6 +7853,7 @@ fn cancellation_request_by_idempotency_on(
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn cancellation_request_by_id_on(
     connection: &Connection,
     request_id: &str,
@@ -7794,6 +7884,7 @@ fn cancellation_request_by_id_on(
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn insert_effect_cancellation_request_on(
     connection: &Connection,
     request: EffectCancellationRequest<'_>,
@@ -7934,6 +8025,7 @@ fn insert_effect_cancellation_request_on(
         .ok_or_else(|| StoreError::Conflict("cancellation request was not recorded".to_owned()))
 }
 
+#[cfg(feature = "native")]
 fn running_run_ids_for_effect_on(
     connection: &Connection,
     instance_id: &str,
@@ -7956,6 +8048,7 @@ fn running_run_ids_for_effect_on(
     Ok(run_ids)
 }
 
+#[cfg(feature = "native")]
 fn mark_cancellation_requests_terminal_on(
     connection: &Connection,
     instance_id: &str,
@@ -7977,10 +8070,12 @@ fn mark_cancellation_requests_terminal_on(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn capability_allowed(allowed: &[String], capability: &str) -> bool {
     allowed.iter().any(|item| item == "*" || item == capability)
 }
 
+#[cfg(feature = "native")]
 fn required_string(value: &Value, field: &str) -> String {
     value
         .get(field)
@@ -7989,6 +8084,7 @@ fn required_string(value: &Value, field: &str) -> String {
         .to_owned()
 }
 
+#[cfg(feature = "native")]
 fn required_manifest_string(value: &Value, fields: &[&str]) -> StoreResult<String> {
     fields
         .iter()
@@ -8011,6 +8107,7 @@ fn required_manifest_string(value: &Value, fields: &[&str]) -> StoreResult<Strin
         })
 }
 
+#[cfg(feature = "native")]
 fn manifest_effect_kind(provider: &Value) -> String {
     provider
         .get("effect_kind")
@@ -8024,6 +8121,7 @@ fn manifest_effect_kind(provider: &Value) -> String {
         .to_owned()
 }
 
+#[cfg(feature = "native")]
 fn skill_view_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillView> {
     Ok(SkillView {
         skill_id: row.get(0)?,
@@ -8037,6 +8135,7 @@ fn skill_view_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillView> {
     })
 }
 
+#[cfg(feature = "native")]
 fn skill_to_json(skill: &SkillView) -> Value {
     json!({
         "skill_id": skill.skill_id,
@@ -8050,6 +8149,7 @@ fn skill_to_json(skill: &SkillView) -> Value {
     })
 }
 
+#[cfg(feature = "native")]
 fn stable_hash_hex(value: &str) -> String {
     format!("{:016x}", stable_hash(value))
 }
@@ -8062,6 +8162,7 @@ fn stable_hash_hex(value: &str) -> String {
 /// bake their upstream outputs into `input_json` at lowering, so the materialized
 /// input already carries the resolved dependency outputs; the sorted upstream
 /// effect ids record the dependency structure that fed the run.
+#[cfg(feature = "native")]
 fn execution_fingerprint_on(
     connection: &Connection,
     instance_id: &str,
@@ -8091,6 +8192,7 @@ fn execution_fingerprint_on(
     )))
 }
 
+#[cfg(feature = "native")]
 fn stable_hash(value: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in value.as_bytes() {
@@ -8100,6 +8202,7 @@ fn stable_hash(value: &str) -> u64 {
     hash
 }
 
+#[cfg(feature = "native")]
 fn count_where(
     connection: &Connection,
     table: &str,
@@ -8117,6 +8220,7 @@ fn count_where(
         .map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn workflow_invocation_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<WorkflowInvocationView> {
@@ -8143,6 +8247,7 @@ fn workflow_invocation_from_row(
     })
 }
 
+#[cfg(feature = "native")]
 fn rule_commit_payload(
     commit: RuleCommit<'_>,
     program_version_id: Option<&str>,
@@ -8233,6 +8338,7 @@ fn rule_commit_payload(
     serde_json::to_string(&payload).map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn workflow_terminal_payload(
     commit: RuleCommit<'_>,
     terminal: WorkflowTerminal<'_>,
@@ -8247,6 +8353,7 @@ fn workflow_terminal_payload(
     serde_json::to_string(&payload).map_err(Into::into)
 }
 
+#[cfg(feature = "native")]
 fn effect_completion_payload(
     completion: EffectCompletion<'_>,
     diagnostic: Option<&TerminalDiagnosticRecord>,
@@ -8265,6 +8372,7 @@ fn effect_completion_payload(
     .to_string()
 }
 
+#[cfg(feature = "native")]
 fn terminal_diagnostic_payload(diagnostic: &TerminalDiagnosticRecord) -> Value {
     json!({
         "program_id": diagnostic.program_id,
@@ -8288,6 +8396,7 @@ fn terminal_diagnostic_payload(diagnostic: &TerminalDiagnosticRecord) -> Value {
     })
 }
 
+#[cfg(feature = "native")]
 fn run_start_payload(run: RunStart<'_>, metadata_json: &str) -> String {
     json!({
         "effect_id": run.effect_id,
@@ -8301,6 +8410,7 @@ fn run_start_payload(run: RunStart<'_>, metadata_json: &str) -> String {
     .to_string()
 }
 
+#[cfg(feature = "native")]
 /// Merge the execution fingerprint into a run's metadata object so it is recorded
 /// with the run (in the `run_started` event payload and the projected `runs` row)
 /// and reconstructs on replay through the existing metadata flow.
@@ -8318,6 +8428,7 @@ fn inject_execution_fingerprint(metadata_json: &str, fingerprint: &str) -> Strin
     value.to_string()
 }
 
+#[cfg(feature = "native")]
 fn replay_rule_commit(
     connection: &Connection,
     instance_id: &str,
@@ -8482,6 +8593,7 @@ fn replay_rule_commit(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn replay_fact_derived(
     connection: &Connection,
     instance_id: &str,
@@ -8527,6 +8639,7 @@ fn replay_fact_derived(
     )
 }
 
+#[cfg(feature = "native")]
 fn replay_workflow_terminal(
     connection: &Connection,
     instance_id: &str,
@@ -8564,6 +8677,7 @@ fn replay_workflow_terminal(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn replay_instance_transition(
     connection: &Connection,
     instance_id: &str,
@@ -8598,6 +8712,7 @@ fn replay_instance_transition(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn replay_revision_activation(
     connection: &Connection,
     instance_id: &str,
@@ -8677,6 +8792,7 @@ fn replay_revision_activation(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn replay_run_started(
     connection: &Connection,
     instance_id: &str,
@@ -8789,6 +8905,7 @@ fn replay_run_started(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn replay_effect_terminal(
     connection: &Connection,
     instance_id: &str,
@@ -8887,6 +9004,7 @@ fn replay_effect_terminal(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn replay_effect_cancelled(
     connection: &Connection,
     instance_id: &str,
@@ -8917,6 +9035,7 @@ fn replay_effect_cancelled(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn replay_lease_expired(
     connection: &Connection,
     instance_id: &str,
@@ -8968,6 +9087,7 @@ fn replay_lease_expired(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn replay_cancellation_request(
     connection: &Connection,
     instance_id: &str,
@@ -9036,6 +9156,7 @@ fn replay_cancellation_request(
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
@@ -9081,6 +9202,7 @@ fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn ensure_effect_time_columns(connection: &Connection) -> StoreResult<()> {
     let effects_table_exists = connection
         .query_row(
@@ -9099,6 +9221,7 @@ fn ensure_effect_time_columns(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn ensure_lookup_indexes(connection: &Connection) -> StoreResult<()> {
     {
         let (table, statement) = (
@@ -9120,6 +9243,7 @@ fn ensure_lookup_indexes(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn ensure_instance_authority_schema(connection: &Connection) -> StoreResult<()> {
     if !table_exists(connection, "instances")? {
         return Ok(());
@@ -9139,6 +9263,7 @@ fn ensure_instance_authority_schema(connection: &Connection) -> StoreResult<()> 
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn ensure_workspace_schema(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
@@ -9161,6 +9286,7 @@ fn ensure_workspace_schema(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn ensure_revision_schema(connection: &Connection) -> StoreResult<()> {
     if table_exists(connection, "instances")?
         && !column_exists(connection, "instances", "revision_epoch")?
@@ -9243,6 +9369,7 @@ fn ensure_revision_schema(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn ensure_workflow_invocation_schema(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
@@ -9286,6 +9413,7 @@ fn ensure_workflow_invocation_schema(connection: &Connection) -> StoreResult<()>
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn ensure_fact_schema(connection: &Connection) -> StoreResult<()> {
     let facts_table_exists = connection
         .query_row(
@@ -9316,6 +9444,7 @@ fn ensure_fact_schema(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn ensure_diagnostics_schema(connection: &Connection) -> StoreResult<()> {
     for (column, definition) in [
         ("program_id", "TEXT"),
@@ -9361,6 +9490,7 @@ fn ensure_diagnostics_schema(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn column_exists(connection: &Connection, table: &str, column: &str) -> StoreResult<bool> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = statement

@@ -10,8 +10,17 @@ readme.workspace = true
 
 [dependencies]
 whipplescript-core = { version = "0.1.0", path = "../whipplescript-core" }
-rusqlite = { version = "0.32.1", features = ["bundled"] }
+rusqlite = { version = "0.32.1", features = ["bundled"], optional = true }
 serde_json = "1.0.145"
+
+[features]
+# `native` pulls in the rusqlite-backed store impls (SqliteStore /
+# CoordinationStore / WorkItemStore / NativeFileStore). Default-on, so every
+# native build compiles them unchanged; a wasm consumer builds with
+# `--no-default-features` to get only the backend-agnostic traits + data types
+# (DR-0033 Phase 5 — the durable-object host supplies its own store impls).
+default = ["native"]
+native = ["dep:rusqlite"]
 
 [lib]
 path = "src/lib.rs"

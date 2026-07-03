@@ -7,12 +7,18 @@
 //! builtin is just another tracker binding whose backend is a local file —
 //! run stores never hold source-of-truth items, only projections.
 
+#[cfg(feature = "native")]
 use std::path::Path;
 
+#[cfg(feature = "native")]
 use rusqlite::{params, Connection, OptionalExtension};
-use serde_json::{json, Value};
+#[cfg(feature = "native")]
+use serde_json::json;
+use serde_json::Value;
 
-use crate::{StoreError, StoreResult};
+#[cfg(feature = "native")]
+use crate::StoreError;
+use crate::StoreResult;
 
 /// Core status categories — the layer every surveyed tracker shares.
 /// `ready` is a derived predicate (open and unclaimed), never a status.
@@ -33,10 +39,12 @@ pub struct WorkItem {
     pub updated_at: String,
 }
 
+#[cfg(feature = "native")]
 pub struct WorkItemStore {
     connection: Connection,
 }
 
+#[cfg(feature = "native")]
 impl WorkItemStore {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -273,6 +281,7 @@ pub trait WorkItems {
     fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool>;
 }
 
+#[cfg(feature = "native")]
 impl WorkItems for WorkItemStore {
     // Forwards to the inherent methods of the same name; inherent methods win
     // `self.method()` resolution, so this delegates rather than recurses.
@@ -324,6 +333,7 @@ pub enum ClaimOutcome {
     NotFound,
 }
 
+#[cfg(feature = "native")]
 fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
     let labels_json: String = row.get(5)?;
     let metadata_json: String = row.get(6)?;

@@ -7,8 +7,10 @@
 //! bound every held lease (principle 3); the caller passes the current
 //! time/period so the clock stays at the worker boundary.
 
+#[cfg(feature = "native")]
 use std::path::Path;
 
+#[cfg(feature = "native")]
 use rusqlite::{params, Connection};
 use serde_json::Value;
 
@@ -62,10 +64,12 @@ pub struct CounterRow {
     pub period: String,
 }
 
+#[cfg(feature = "native")]
 pub struct CoordinationStore {
     connection: Connection,
 }
 
+#[cfg(feature = "native")]
 impl CoordinationStore {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -563,6 +567,7 @@ pub trait Coordination {
     }
 }
 
+#[cfg(feature = "native")]
 impl Coordination for CoordinationStore {
     // Each method forwards to the inherent method of the same name; inherent
     // methods win `self.method()` resolution, so this is delegation, not
@@ -654,6 +659,7 @@ impl Coordination for CoordinationStore {
     }
 }
 
+#[cfg(feature = "native")]
 fn normalized_owner(owner: &str) -> &str {
     if owner.trim().is_empty() {
         DEFAULT_COORDINATION_OWNER
@@ -662,6 +668,7 @@ fn normalized_owner(owner: &str) -> &str {
     }
 }
 
+#[cfg(feature = "native")]
 fn ensure_partitioned_schema(connection: &Connection) -> StoreResult<()> {
     if !table_exists(connection, "leases")? {
         create_leases_table(connection)?;
@@ -696,6 +703,7 @@ fn ensure_partitioned_schema(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn create_leases_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
@@ -713,6 +721,7 @@ fn create_leases_table(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn create_ledger_entries_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
@@ -731,6 +740,7 @@ fn create_ledger_entries_table(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn create_ledger_seq_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
@@ -745,6 +755,7 @@ fn create_ledger_seq_table(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn create_counters_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
@@ -761,6 +772,7 @@ fn create_counters_table(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn migrate_leases_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
@@ -781,6 +793,7 @@ fn migrate_leases_table(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn migrate_ledger_entries_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
@@ -810,6 +823,7 @@ fn migrate_ledger_entries_table(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn migrate_ledger_seq_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
@@ -830,6 +844,7 @@ fn migrate_ledger_seq_table(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn migrate_counters_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
@@ -850,6 +865,7 @@ fn migrate_counters_table(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "native")]
 fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
     let count: i64 = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -859,6 +875,7 @@ fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
     Ok(count > 0)
 }
 
+#[cfg(feature = "native")]
 fn column_exists(connection: &Connection, table: &str, column: &str) -> StoreResult<bool> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = statement.query([])?;
