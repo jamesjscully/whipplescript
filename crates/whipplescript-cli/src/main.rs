@@ -29,11 +29,10 @@ use whipplescript_kernel::codex_app_server::{
 use whipplescript_kernel::{
     coerce::{CoerceRequest, FakeCoerceClient},
     effect_config::EffectConfig,
-    effect_handlers::run_event_effect_generic,
+    effect_handlers::{run_event_effect_generic, run_loft_effect_generic},
     harness::{CommandAgentHarness, CommandLaunchPlan},
     idempotency_key,
     instance_machine::{EffectStep, InstanceDriver},
-    loft::{FakeLoftClient, LoftAction, LoftEffectRequest},
     lowering::{BranchReport, BranchStatus},
     pi_rpc::{PiRpcAdapter, PiRpcClient, StdioPiRpcTransport},
     program_analysis_summary_json,
@@ -58,7 +57,6 @@ use whipplescript_kernel::{
     AgentTurnExecution,
     CoerceExecution,
     HumanAskExecution,
-    LoftEffectExecution,
     ProgramVersionInput,
     RuntimeKernel,
 };
@@ -23074,75 +23072,6 @@ fn run_loft_effect(
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
     run_loft_effect_generic(&mut kernel, instance_id, effect, &options.effect_config())
-}
-
-/// Host-agnostic core (DR-0033 chunk 3): the loft claim + terminal over a held
-/// `RuntimeKernel<S>` (only kernel methods, so `S: RuntimeStore`).
-fn run_loft_effect_generic<S: RuntimeStore>(
-    kernel: &mut RuntimeKernel<S>,
-    instance_id: &str,
-    effect: &ClaimableEffect,
-    config: &EffectConfig,
-) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    let input = json_from_str(&effect.input_json);
-    let issue_id = input
-        .pointer("/issue/issue/id")
-        .and_then(Value::as_str)
-        .or_else(|| input.pointer("/issue/issue_id").and_then(Value::as_str))
-        .unwrap_or("issue-fixture")
-        .to_owned();
-    let request = LoftEffectRequest {
-        action: LoftAction::Claim,
-        issue_id: issue_id.clone(),
-        lease_id: None,
-        claim_ready: true,
-        issue_version: None,
-        actor: Some("whip-worker".to_owned()),
-        lease_duration_seconds: Some(3600),
-        command_id: idempotency_key(&[instance_id, &effect.effect_id, "loft-command"]),
-        note: None,
-        target_status: None,
-        evidence_json: None,
-        evidence_kind: None,
-        evidence_artifact: None,
-        evidence_data_path: None,
-        resource_intent_json: None,
-        release_after_failure: false,
-        expect_heads: Vec::new(),
-        metadata_json: effect.input_json.clone(),
-    };
-    let client = if config.outcome_failed {
-        FakeLoftClient::fails("fixture loft failure")
-    } else {
-        FakeLoftClient::succeeds(
-            json!({
-                "issue": {
-                    "id": issue_id,
-                    "title": "Fixture Loft issue",
-                    "body": "Fixture body"
-                },
-                "lease": {
-                    "id": idempotency_key(&[instance_id, &effect.effect_id, "loft-lease-value"])
-                }
-            })
-            .to_string(),
-        )
-    };
-    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "loft-run"]);
-    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "loft-lease"]);
-    kernel.run_loft_effect(
-        LoftEffectExecution {
-            instance_id,
-            effect_id: &effect.effect_id,
-            run_id: &run_id,
-            provider: &config.provider,
-            worker_id: "whip-worker",
-            lease_id: &lease_id,
-            lease_expires_at: "2030-01-01T00:00:00Z",
-            request: &request,
-        },
-        &client,
-    )
 }
 
 fn run_human_effect(

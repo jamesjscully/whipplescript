@@ -16,7 +16,9 @@ use whipplescript_store::{
 
 use crate::effect_config::EffectConfig;
 use crate::idempotency_key;
+use crate::loft::{FakeLoftClient, LoftAction, LoftEffectRequest};
 use crate::rule_lowering::json_from_str;
+use crate::LoftEffectExecution;
 use crate::RuntimeKernel;
 
 /// `event.emit`: ingest a durable event, settle the effect, and derive the
@@ -134,4 +136,72 @@ pub fn run_event_effect_generic<S: RuntimeStore>(
         ])),
     )?;
     Ok(terminal)
+}
+
+/// `loft.claim`: claim a Loft issue via the (fixture) loft client + settle.
+pub fn run_loft_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    config: &EffectConfig,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let input = json_from_str(&effect.input_json);
+    let issue_id = input
+        .pointer("/issue/issue/id")
+        .and_then(Value::as_str)
+        .or_else(|| input.pointer("/issue/issue_id").and_then(Value::as_str))
+        .unwrap_or("issue-fixture")
+        .to_owned();
+    let request = LoftEffectRequest {
+        action: LoftAction::Claim,
+        issue_id: issue_id.clone(),
+        lease_id: None,
+        claim_ready: true,
+        issue_version: None,
+        actor: Some("whip-worker".to_owned()),
+        lease_duration_seconds: Some(3600),
+        command_id: idempotency_key(&[instance_id, &effect.effect_id, "loft-command"]),
+        note: None,
+        target_status: None,
+        evidence_json: None,
+        evidence_kind: None,
+        evidence_artifact: None,
+        evidence_data_path: None,
+        resource_intent_json: None,
+        release_after_failure: false,
+        expect_heads: Vec::new(),
+        metadata_json: effect.input_json.clone(),
+    };
+    let client = if config.outcome_failed {
+        FakeLoftClient::fails("fixture loft failure")
+    } else {
+        FakeLoftClient::succeeds(
+            json!({
+                "issue": {
+                    "id": issue_id,
+                    "title": "Fixture Loft issue",
+                    "body": "Fixture body"
+                },
+                "lease": {
+                    "id": idempotency_key(&[instance_id, &effect.effect_id, "loft-lease-value"])
+                }
+            })
+            .to_string(),
+        )
+    };
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "loft-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "loft-lease"]);
+    kernel.run_loft_effect(
+        LoftEffectExecution {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &run_id,
+            provider: &config.provider,
+            worker_id: "whip-worker",
+            lease_id: &lease_id,
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            request: &request,
+        },
+        &client,
+    )
 }
