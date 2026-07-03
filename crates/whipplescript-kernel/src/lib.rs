@@ -11,6 +11,7 @@ pub mod effect_config;
 pub mod harness;
 pub mod harness_loop;
 pub mod harness_model;
+pub mod instance_machine;
 pub mod loft;
 pub mod lowering;
 pub mod native_lifecycle;
