@@ -271,8 +271,17 @@ in flight and expensive to retrofit:
 > generic over `S: RuntimeStore` (it calls 29 store methods, all already in the
 > trait) so the CLI uses `RuntimeKernel<SqliteStore>` and the DO host uses
 > `RuntimeKernel<DoSqliteStore>`. Only after that can the wasm host be built.
-- [ ] Store-API crate split + `RuntimeKernel<S: RuntimeStore>` (the wasm-clean
-      prerequisite above). Native-only, gate-green refactor; large but mechanical.
+- [x] `RuntimeKernel<S: RuntimeStore = SqliteStore>` — the kernel is now generic
+      over the store trait (commit fc6d14a); native uses `RuntimeKernel<SqliteStore>`
+      (inferred), decoupled from the concrete store. Gate-green.
+- [ ] Store wasm-cleanup so `rusqlite` drops out of the kernel's dep graph (crate
+      split, or feature-gate `rusqlite` + the SQL/`std::fs` impls behind a `native`
+      feature). **Proven the payoff is real (2026-07-03):** `whipplescript-core`
+      and `whipplescript-parser` build for `wasm32-unknown-unknown` today, and the
+      generic kernel's wasm build fails *only* on `libsqlite3-sys` (rusqlite's
+      bundled C — also needs `clang`, and is moot since the DO uses its own
+      SQLite). So this cleanup is the single remaining native blocker to a
+      wasm-buildable core. Native-only, gate-green refactor; large but mechanical.
 - [ ] `whipplescript-host-do` (wasm32) + Worker/DO shell: async `fetch` driver for
       `NeedsIo(Http)`, store traits over synchronous DO SQLite, consumes the
       sans-IO core. Subprocess effects unavailable / via HTTP sidecar. Every
