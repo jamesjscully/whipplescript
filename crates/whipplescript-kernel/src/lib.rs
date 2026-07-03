@@ -44,12 +44,16 @@ use whipplescript_store::{
     InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent, NewFact, NewInboxItem,
     NewInstance, NewInstanceAuthority, NewProgramVersion, NewWorkflowInvocation,
     ProgramVersionRecord, RetryEffect, RevisionActivation, RuleCommit, RuleCommitRevisionGuard,
-    RunStart, SkillEvidence, SqliteStore, StoreError, StoreResult, StoredEvent,
+    RunStart, RuntimeStore, SkillEvidence, SqliteStore, StoreError, StoreResult, StoredEvent,
     TerminalDiagnosticRecord, WorkflowInvocationView, WorkflowRevisionView,
 };
 
-pub struct RuntimeKernel {
-    store: SqliteStore,
+/// The runtime kernel over a [`RuntimeStore`] backend. Native uses
+/// `RuntimeKernel<SqliteStore>`; the durable-object host (Phase 5) will use
+/// `RuntimeKernel<DoSqliteStore>` — the kernel calls only trait methods, so it
+/// is decoupled from the concrete rusqlite store (DR-0033 Phase 5 prerequisite).
+pub struct RuntimeKernel<S: RuntimeStore = SqliteStore> {
+    store: S,
     trace: Vec<TraceRecord>,
 }
 
@@ -174,8 +178,8 @@ fn brokered_observation_evidence(
     }
 }
 
-impl RuntimeKernel {
-    pub fn new(store: SqliteStore) -> Self {
+impl<S: RuntimeStore> RuntimeKernel<S> {
+    pub fn new(store: S) -> Self {
         Self {
             store,
             trace: Vec::new(),
@@ -396,7 +400,7 @@ impl RuntimeKernel {
         }
     }
 
-    pub fn into_store(self) -> SqliteStore {
+    pub fn into_store(self) -> S {
         self.store
     }
 
