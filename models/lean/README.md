@@ -60,6 +60,14 @@ scripts/check-lean-models.sh   # builds + rejects any sorry/admit/axiom/native_d
   party reads the combination iff it reads both parts), `canRead_append_comm`,
   `canRead_mono` (higher clearance reads at least as much). The confidentiality
   label forms a join-semilattice; the single-authority `Label.reader` is the leaf.
+- `leak_safe`, `dominates_singleton`, `dominates_split`, `inject_safe` → the Rust
+  leak/inject checks lift from one reader/writer to set labels without changing the
+  underlying acts-for lattice.
+- `shared_cell_clearance_not_nmif` → two incomparable clearances can both dominate
+  a shared cell label; leak-safety for the cell does **not** create an authority
+  flow/NMIF relation among the clearances.
+- `same_principal_flow_trivial` → self-coordination is reflexive, justifying the
+  `|P(R)|≤1` skip for coordination gates.
 
 `Whipple/NMIF.lean` — robust declassification (nonmalleable information flow):
 - `untrusted_declassify_only_public` (the NMIF guarantee: attacker-controlled data

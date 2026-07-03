@@ -128,6 +128,28 @@ std-construct-authorization.maude  std-library construct lock exemption (1929 op
 turn-access-grant.maude          turn-access grant authority narrowing (Proposal A):
                                  effective authority = profile intersect grant; a
                                  grant never widens beyond the profile
+workflow-authority-attenuation.maude  workflow-encapsulation D1 invoke-seam
+                                 authority narrowing: child authority is bounded
+                                 by declared(child) intersect effective(parent),
+                                 and an explicit start grant can only narrow
+                                 that automatic cap
+workflow-runtime-marker-reresolution.maude  workflow-encapsulation E2-DYN
+                                 runtime delivery door: re-resolve instance
+                                 handle identity before consulting private
+                                 workflow markers; unresolved handles fail closed
+infoflow-field-signature.maude   DR-0030 X2 per-field result signatures plus
+                                 workflow-encapsulation D3' milestone payload
+                                 egress and milestone-reached occurrence
+                                 read-source checks
+infoflow-signal-carriage.maude   signal label carriage, no-laundering, and
+                                 workflow-encapsulation D2b invoke-selector NMIF:
+                                 invoke inbound payload integrity cannot select
+                                 a higher-integrity branch
+infoflow-coord-carriage.maude    workflow-encapsulation E-COORD partition fork:
+                                 coordination writes are integrity-gated,
+                                 outcomes are read sources, `shared` carries
+                                 remaining/holders across workflows, and
+                                 partition prevents that carriage
 action-expansion.maude           action-call inlining (DR-0023): hygienic
                                  binding per call site, acyclic gate, and that
                                  inlining runs no provider work

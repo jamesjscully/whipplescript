@@ -117,6 +117,50 @@ theorem dominates_mono_provider (d : List (P × P)) (pub : P) (p1 p2 required : 
   obtain ⟨s, hs_mem, hs_act⟩ := h r hr
   exact ⟨s, sub s hs_mem, hs_act⟩
 
+/-- A shared cell can be readable by two incomparable clearances without creating a
+    flow order between those clearances. Both `a` and `b` dominate the cell label
+    `[r]`, but neither dominates the other. This is the algebraic point behind the
+    coordination exception: `leak_safe` for the cell does not imply NMIF/authority
+    flow among distinct users of that cell. -/
+theorem shared_cell_clearance_not_nmif (d : List (P × P)) (pub a b r : P)
+    (har : ActsFor d pub a r) (hbr : ActsFor d pub b r)
+    (hab : ¬ ActsFor d pub a b) (hba : ¬ ActsFor d pub b a) :
+    dominates d pub [a] [r] ∧ dominates d pub [b] [r] ∧
+      ¬ dominates d pub [a] [b] ∧ ¬ dominates d pub [b] [a] := by
+  constructor
+  · intro x hx
+    have hx' : x = r := List.mem_singleton.mp hx
+    subst x
+    exact ⟨a, List.mem_singleton.mpr rfl, har⟩
+  constructor
+  · intro x hx
+    have hx' : x = r := List.mem_singleton.mp hx
+    subst x
+    exact ⟨b, List.mem_singleton.mpr rfl, hbr⟩
+  constructor
+  · intro h
+    have hb_mem : b ∈ [b] := List.mem_singleton.mpr rfl
+    obtain ⟨s, hs_mem, hs_act⟩ := h b hb_mem
+    have hs_eq : s = a := List.mem_singleton.mp hs_mem
+    subst s
+    exact hab hs_act
+  · intro h
+    have ha_mem : a ∈ [a] := List.mem_singleton.mpr rfl
+    obtain ⟨s, hs_mem, hs_act⟩ := h a ha_mem
+    have hs_eq : s = b := List.mem_singleton.mp hs_mem
+    subst s
+    exact hba hs_act
+
+/-- Self-coordination is label-trivial: a principal's singleton clearance dominates
+    itself by reflexivity of acts-for. This justifies skipping the coordination
+    NMIF gate when all contending users collapse to one workflow principal. -/
+theorem same_principal_flow_trivial (d : List (P × P)) (pub p : P) :
+    dominates d pub [p] [p] := by
+  intro r hr
+  have hr' : r = p := List.mem_singleton.mp hr
+  subst r
+  exact ⟨p, List.mem_singleton.mpr rfl, actsFor_refl d pub p⟩
+
 /-- The INTEGRITY dual (M1, writer sets). `dominates` is axis-agnostic — it is a
     relation on the acts-for order, not on a chosen axis. On the integrity axis the
     same relation runs with the READ's provided vouchers covering the WRITE's

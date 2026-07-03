@@ -15,17 +15,25 @@
 --- Soundness is preserved: carriage does not FABRICATE trust -- an untrusted emitter
 --- yields an untrusted receiver (the meet/intersection of what flowed into the emit).
 ---
+--- D2b extension: an `invoke:<B>` inbound payload is a signal-like entry into the
+--- child workflow. A selector rooted in that payload may not gate a branch whose
+--- required integrity is higher than the payload's carried label.
+---
 --- Grounding: emit(S, L) = an `emit signal S` whose payload carries integrity L (the
 --- intersection of the emitting rule's read-source vouchers). internalSig/externalSig
 --- = the governance classification. receiver(S) = a `when S` reads it. controlSink(R)
---- = the receiver drives a sink requiring integrity R. trusted/untrusted = a 2-point
---- integrity order (trusted geq untrusted); enough for the carriage property.
+--- = the receiver drives a sink requiring integrity R. invokePayload(T, L) = the
+--- inbound payload delivered to workflow target T with integrity L. selectorRequires(T, R)
+--- records that the selected branch for target T requires integrity R. trusted/untrusted
+--- = a 2-point integrity order (trusted geq untrusted); enough for the carriage and
+--- selector properties.
 mod WHIPPLESCRIPT-INFOFLOW-SIGNAL-CARRIAGE is
   protecting BOOL .
-  sorts Sig Label Cfg .
+  sorts Sig InvokeTarget Label Cfg .
 
   ops trusted untrusted : -> Label [ctor] .   --- 2-point integrity order
   ops sigA sigB : -> Sig [ctor] .
+  ops childB childC : -> InvokeTarget [ctor] .
 
   --- integrity dominance: does a carried label L meet a sink requirement R? trusted
   --- meets everything; untrusted meets only untrusted (the public/low requirement).
@@ -46,12 +54,18 @@ mod WHIPPLESCRIPT-INFOFLOW-SIGNAL-CARRIAGE is
   op carried : Sig Label -> Cfg [ctor] .       --- the integrity the receiver observes
   op injection : -> Cfg [ctor] .               --- untrusted carried label into a trusted sink
   op laundering : -> Cfg [ctor] .              --- an internal signal sourced externally
+  op invokePayload : InvokeTarget Label -> Cfg [ctor] .
+                                                --- inbound `invoke:<B>` payload label
+  op selectorRequires : InvokeTarget Label -> Cfg [ctor] .
+                                                --- branch selector integrity requirement
+  op invokeSelectorReject : -> Cfg [ctor] .     --- low selector gating a high branch
 
-  vars S : Sig .  vars L R : Label .
+  vars S : Sig .  vars L R : Label .  vars T : InvokeTarget .
 
   eq carried(S, L) carried(S, L) = carried(S, L) .
   eq injection injection = injection .
   eq laundering laundering = laundering .
+  eq invokeSelectorReject invokeSelectorReject = invokeSelectorReject .
 
   --- CARRIAGE: an internal signal's receiver observes the EMITTER's label. The emit
   --- crosses the instance boundary carrying L unchanged; the receiver reads it.
@@ -75,5 +89,12 @@ mod WHIPPLESCRIPT-INFOFLOW-SIGNAL-CARRIAGE is
   --- label, so trust is never fabricated.
   crl [inject] : carried(S, L) controlSink(R)
     => carried(S, L) controlSink(R) injection
+    if meets(L, R) =/= true .
+
+  --- D2b INVOKE SELECTOR: the invoke inbound payload is substituted for the signal
+  --- payload as the selector source. A low-integrity payload cannot select a branch
+  --- that requires a higher-integrity discriminator.
+  crl [invoke-selector] : invokePayload(T, L) selectorRequires(T, R)
+    => invokePayload(T, L) selectorRequires(T, R) invokeSelectorReject
     if meets(L, R) =/= true .
 endm

@@ -12,12 +12,17 @@
 --- so it FALLS BACK to the whole-result reach. This is the fail-closed core: an
 --- untraceable root never narrows anything.
 ---
+--- D3' extension: milestone payloads use the same projection rule as complete
+--- results. The milestone-reached occurrence itself is a separate read source:
+--- branching on a high occurrence to a public audience leaks even if the payload
+--- fields would be independently checked.
+---
 --- Soundness: a field reach never UNDER-reports. own-reads are in every field, a
 --- traceable root contributes its fact producer reach, a derived root contributes
 --- the whole reach. So a downstream leak check driven by the per-field reach still
---- catches every real leak, the coverage case, while a field genuinely independent of a
---- confidential read does NOT carry it -- bite, the real refinement. A field reach is
---- always a subset of the whole reach, so per-field never exceeds whole-result.
+--- catches every real leak, the coverage case, while a field genuinely independent of
+--- a confidential read does NOT carry it -- bite, the real refinement. A field reach
+--- is always a subset of the whole reach, so per-field never exceeds whole-result.
 mod WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE is
   protecting BOOL .
   sorts Fact Level Root RootList Cfg .
@@ -31,6 +36,11 @@ mod WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE is
   op join : Level Level -> Level [assoc comm] .
   eq join(lo, L:Level) = L:Level .
   eq join(hi, L:Level) = hi .
+
+  op dominates : Level Level -> Bool .
+  eq dominates(hi, L:Level) = true .
+  eq dominates(lo, lo) = true .
+  eq dominates(lo, hi) = false .
 
   --- a field references a list of roots. A tr root is a DIRECT when-binding of fact F,
   --- its provenance is F producer reach. dv is a DERIVED within-rule binding whose
@@ -47,11 +57,18 @@ mod WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE is
   op own : Level -> Cfg [ctor] .            --- completing rule own-reads level, the opaque box
   op factReach : Fact Level -> Cfg [ctor] . --- fact F producer-reach level
   op field : RootList -> Cfg [ctor] .       --- the result field under audit, its roots
+  op milestoneField : RootList -> Cfg [ctor] .
+                                             --- milestone payload field under audit, same roots
   op sink : Level -> Cfg [ctor] .           --- release audience level
+  op milestoneReached : Level -> Cfg [ctor] .
+                                             --- reached-fact occurrence read-source label
+  op branchSink : Level -> Cfg [ctor] .      --- branch audience/clearance for occurrence
   op leak : -> Cfg [ctor] .
+  op occurrenceLeak : -> Cfg [ctor] .
   eq leak leak = leak .
+  eq occurrenceLeak occurrenceLeak = occurrenceLeak .
 
-  vars L : Level .  var F : Fact .  var R : Root .  var RL : RootList .  var C : Cfg .
+  vars L A : Level .  var F : Fact .  var R : Root .  var RL : RootList .  var C : Cfg .
 
   --- the completing rule own-reads level, lo if unset
   op ownLevel : Cfg -> Level .
@@ -88,8 +105,20 @@ mod WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE is
   op fieldReach : RootList Cfg -> Level .
   eq fieldReach(RL, C) = join(ownLevel(C), listReach(RL, C)) .
 
-  --- A field release to a sink leaks iff the audience is public lo and the field
-  --- reach is hi. The whole config is threaded so ownLevel and factReach are summed.
+  --- A result field release leaks iff the audience does not dominate the field
+  --- reach. The whole config is threaded so ownLevel and factReach are summed.
   crl [leak] : field(RL) sink(L) C => field(RL) sink(L) C leak
-    if L == lo /\ fieldReach(RL, (field(RL) sink(L) C)) == hi .
+    if dominates(L, fieldReach(RL, (field(RL) sink(L) C))) =/= true .
+
+  --- D3' MILESTONE PAYLOAD: milestone projection is identical to complete-result
+  --- egress; the only difference is the projected fact kind.
+  crl [milestone-leak] : milestoneField(RL) sink(L) C
+    => milestoneField(RL) sink(L) C leak
+    if dominates(L, fieldReach(RL, (milestoneField(RL) sink(L) C))) =/= true .
+
+  --- D3' MILESTONE OCCURRENCE: `workflow.invoke.reached:<name>` is a read-source in
+  --- its own right. A public branch on a high occurrence leaks the occurrence bit.
+  crl [milestone-occurrence-leak] : milestoneReached(L) branchSink(A) C
+    => milestoneReached(L) branchSink(A) C occurrenceLeak
+    if dominates(A, L) =/= true .
 endm
