@@ -2745,5 +2745,5 @@ print(
 )
 PY
 
-echo "== tla models/tla/ControlPlaneLifecycle.tla"
+echo "== tla models/tla/*.tla (Apalache typecheck + bounded check)"
 "$ROOT/scripts/check-tla-models.sh"

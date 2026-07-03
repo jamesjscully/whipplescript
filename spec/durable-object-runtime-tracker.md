@@ -3,8 +3,10 @@
 **Purpose (open intent):** make whipplescript able to run inside a single-threaded
 wasm isolate (Cloudflare Durable Object) by lifting all blocking I/O out of the
 core, then building the DO host binding. This file holds only what is *not yet
-true in the repo*. Settled design lives in the "Decisions" section below and will
-graduate to **DR-0033** in Phase 0; reality lives in code + git + gates.
+true in the repo*. The settled design is now **DR-0033**
+(`spec/decision-records/0033-durable-object-runtime.md`, accepted 2026-07-03); the
+"Decisions" section below is retained as a summary and defers to the DR. Reality
+lives in code + git + gates.
 
 Registered in `spec/TRACKERS.md` (status: active).
 
@@ -32,7 +34,9 @@ existing gate green; the wasm host arrives only in Phase 5+.
 ## Decisions (settled — the constraints these phases must respect)
 
 These are locked. They constrain the earlier phases even though the later phases
-build on them. Formalize as DR-0033 in Phase 0.
+build on them. **Formalized as DR-0033**
+(`spec/decision-records/0033-durable-object-runtime.md`, 2026-07-03) — that record
+is the design SSOT; this list is the at-a-glance summary.
 
 1. **Sans-IO, Rust stays synchronous — even on wasm.** Each external-I/O effect
    is a pure resumable step machine `step(state, incoming) -> NeedsIo(HttpRequest,
@@ -104,17 +108,51 @@ workflow-encapsulation build (`workflow-encapsulation-implementation-tracker.md`
    encapsulation E2-DYN marker door (per-seam door discipline) — the membrane's
    doors must exist before this effort multiplies the seams they guard.
 
+**Downstream-customer note (2026-07-03, experimentation subsystem):** the
+checkpoint substrate this storage plane carries (per
+`decision-records/restorable-context.md`, the content-addressed, tiered,
+event-referenced file store *is* the checkpoint mechanism) has a second
+customer beyond "undo": the experimentation & evaluation subsystem
+(`spec/experimentation-subsystem-research-note.md`, pre-ADR) uses a checkpoint
+as the frozen prefix of a freeze-and-regenerate experiment. Neither
+requirement adds phase work now; both are cheap to preserve while this work is
+in flight and expensive to retrofit:
+
+1. The checkpoint's **consistent cut must pin coordination state**
+   (counters/leases/queues/ledgers) alongside transcript + event-log index +
+   file manifest. The coordination store is workspace-scoped and
+   cross-instance, so a cut that omits it makes replay-from-checkpoint
+   non-deterministic and hollows out the subsystem's checkpoint-conditional
+   evidence semantics (research note §7.2 Tier B, §15). Phase 3 (store behind
+   a trait) is the cheap moment to shape this: cut the coordination trait with
+   a snapshot/manifest capability in view.
+2. **Content-addressing stays canonical and stable** across tiers and hosts
+   (Decision 4): the subsystem keys evidence by content hash (kernel identity,
+   file manifests), so hash identity must not vary by storage tier, host
+   binding, or serialization quirk.
+
 ---
 
 ## Phase plan (open intent)
 
-### Phase 0 — Formal model + DR-0033
-- [ ] TLA+ (Apalache) model of the resumable-effect lifecycle: `claim →
-      [NeedsIo → io-pending → io-done]* → settle`. Prove: exactly-once **modulo
-      at-least-once-on-eviction** (Decision 3); no orphaned `io-pending`;
-      idempotency-key stability across suspend/resume; the native run-to-
-      completion path is a **refinement** of the general machine. Bite fixtures.
-- [ ] Write DR-0033 capturing Decisions 1–7 (supersede the scattered notes here).
+### Phase 0 — Formal model + DR-0033 — DONE 2026-07-03
+- [x] TLA+ (Apalache) model of the resumable-effect lifecycle: `claim →
+      [NeedsIo → io-pending → io-done]* → settle`.
+      `models/tla/ResumableEffectLifecycle.tla`, in the `check-tla-models.sh`
+      gate (Apalache 0.56.1, length 6, both host modes). Proves — coverage
+      (11-invariant `SafetyInvariants` holds) **and** bite (each key invariant
+      carries an inline `Bite:` mutation, all six verified to fail-closed):
+      exactly-once settle (`NoDuplicateSettle`/`SettledLedgerMatchesSet`);
+      at-least-once delivery deduplicated by a durable idempotency key
+      (`AtLeastOnceLowerBounds` + `ProviderExecBoundedByRounds` + `IdemKeyStable`,
+      Decision 3); no orphaned `io_pending`
+      (`NoOrphanedIoPending`/`InflightOnlyWhenIoPending`/`IoPendingHasRoundsLeft`);
+      native run-to-completion is a refinement (`NativeExactlyOnce`).
+- [x] DR-0033 capturing Decisions 1–7:
+      `spec/decision-records/0033-durable-object-runtime.md` (accepted
+      2026-07-03); the tracker's Decisions section now defers to it. No
+      user-facing surface in Phase 0, so no `docs/` change (formal model + design
+      record only).
 
 ### Phase 1 — Pilot: coerce sans-IO on native (no behavior change)
 - [ ] Introduce the shared types (`HttpRequest`/`IoResult`/`Outcome`) + host
@@ -174,3 +212,6 @@ workflow-encapsulation build (`workflow-encapsulation-implementation-tracker.md`
       optional size hint is worth exposing in v1 (Decision 4).
 - [ ] workflow-invoke is already cross-pass/store-only — confirm it needs no step-
       machine treatment (child observed across passes, no external I/O).
+- [ ] Checkpoint cut × coordination store: decide where coordination-state
+      snapshot/restore lives in the Phase 3 traits so the restorable-context
+      consistent cut can pin it (see Downstream-customer note above).
