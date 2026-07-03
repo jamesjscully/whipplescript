@@ -424,8 +424,18 @@ linear undo chain). No phase work now.
                 (`RuntimeKernel<NativeStores>`) (3d, e3b31a5), and
                 `run_coordination_effect` via `Coordination` + facade (+ its helper
                 `coordination_owner_for_instance` generic over `&S`) (3e, aa016ab).
-                **10/~15 handlers generic.** REMAINING: `run_notify_effect` nests
-                `internal_workflow_delivery_violation`(store_path); the
+                and `run_notify_effect` + its nested helpers
+                `internal_workflow_delivery_violation` /
+                `workflow_identity_for_instance` (now generic over `&S`) (3f,
+                dbbf9dc). **11/~15 generic — the store-only executor is fully
+                lifted.** REMAINING = the hard tail (best done WITH the chunk-4 step
+                machine so the NeedsIo suspension is wired, not just store access):
+                the two HTTP effects `run_agent_effect` /
+                `run_coerce_effect`(→`cancel_coerce_effect`/`run_native_coerce_effect`)
+                wire the sans-IO `BrokeredTurnMachine`/`CoerceStepMachine`;
+                `run_workflow_invoke_effect` (435 ln) recurses into
+                `step_instance`/`run_worker_once`; `run_exec_effect` stays
+                native-only (DR-0033 Decision 7, no DO port). Original note: the
                 `file*` handlers need `FileStore`, `coordination`/`queue` need
                 `Coordination`/`WorkItems` (audit for inherent-vs-trait methods —
                 e.g. `try_acquire_for_owner`); `workflow_invoke` (435 ln) recurses
