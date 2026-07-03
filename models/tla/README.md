@@ -87,6 +87,37 @@ ProjectionEventuallyCatchesUp
 RecoveryEventuallyFinishes
 ```
 
+## Durable-object runtime models (DR-0033)
+
+Two models cover the sans-IO durable-object runtime lifecycle, at two scales:
+
+```text
+ResumableEffectLifecycle.tla
+InstanceSchedulerLifecycle.tla
+```
+
+`ResumableEffectLifecycle.tla` (Phase 0) models ONE external-I/O effect as a
+resumable step machine — `claim → [NeedsIo → io_pending → io_done]* → settle` —
+and proves exactly-once settle, at-least-once network delivery deduplicated by a
+stable idempotency key (the DO host may be evicted mid-`fetch`), no orphaned
+`io_pending`, and that the native run-to-completion path is the eviction-free
+refinement.
+
+`InstanceSchedulerLifecycle.tla` sits one level up: it models the WHOLE instance
+as the native `dev` fixpoint re-expressed as a host-agnostic step machine —
+alternate a pure rule pass (commit ready rules; may spawn effects or reach a
+workflow terminal) with an effect pass (run each ready effect to a terminal that
+becomes a fact), abstracting each effect's fetch rounds to one `inflight/evicted`
+slot. It names the NEW instance-level obligations the full-lift refactor must
+preserve: a workflow terminal is recorded at most once and is **absorbing** (no
+rule commits or effect settles after it); the scheduler **parks only at a genuine
+fixpoint** (no ready rule, no ready effect, nothing mid-fetch); an effect is
+mid-fetch only while the instance is running; and eviction/resume of a suspended
+effect **never loses or double-counts instance progress**. Each safety invariant
+carries an inline `Bite:` mutation (five of them, each verified to produce an
+Apalache counterexample — e.g. letting `Quiesce` fire with a ready effect
+outstanding, or an `EffectResume` that re-settles).
+
 ## Information-flow models (temporal layer)
 
 Two models carry the information-flow properties that are about a *sequence* of

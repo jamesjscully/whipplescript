@@ -328,6 +328,53 @@ in flight and expensive to retrofit:
             *live-DO validation only*: a `DoSql` impl over the real
             `state.storage.sql` in the `worker` crate, exercised end-to-end against
             an actual Durable Object.
+      - [~] **Instance-level sans-IO scheduler (full lift).** The native top-level
+            driver is the `dev` fixpoint (`main.rs`): alternate `step_instance`
+            (pure rule pass — reads facts/effects, commits ready rules, may spawn
+            effects / reach a workflow terminal) and `run_worker_once` (the effect
+            executor, where all external I/O lives) until a full round makes no
+            progress (idle/park) or the instance terminates. The refactor
+            (scope B — full lift, chosen 2026-07-03) re-expresses this as a
+            host-agnostic instance step machine generic over `RuntimeStore`,
+            composing the already-sans-IO effect machines
+            (`CoerceStepMachine`/`BrokeredTurnMachine`) so a ready HTTP effect
+            suspends with `NeedsIo(Http)`; this is the object the wasm-bindgen
+            surface wires to. **Model-first landed:**
+            `models/tla/InstanceSchedulerLifecycle.tla` (in `check-tla-models.sh`)
+            proves the NEW instance-level obligations above the per-effect
+            `ResumableEffectLifecycle` — a workflow terminal is recorded at most
+            once and is absorbing; the scheduler parks only at a genuine fixpoint;
+            an effect is mid-fetch only while running; eviction/resume never loses
+            or double-counts instance progress — coverage (6-invariant
+            `SafetyInvariants`) **and** bite (5 inline mutations, each verified
+            fail-closed). Code lift proceeds in dependency-ordered chunks with
+            native gates green at each step.
+
+            **Lift target = `whipplescript-kernel`** (already wasm-clean, already
+            depends on `whipplescript-parser` for `IrProgram`/`IrRule` and on the
+            `whipplescript-store` traits, already holds
+            `RuntimeKernel<S: RuntimeStore>`) — no new crate. **Architectural crux
+            the lift must resolve:** natively the runtime store, the coordination
+            store, and the work-items store are *three separate SQLite files*, and
+            every runtime helper re-opens them by path
+            (`SqliteStore::open(store_path)`, `WorkItemStore::open(items_store_path())`).
+            On a DO they collapse to one held handle. So the lift's substance is
+            changing the store-access idiom from open-by-path to a threaded
+            `&mut S: RuntimeStore` (+ `&mut dyn Coordination`/`WorkItems`) handle,
+            generically, across the rule engine and all ~15 effect handlers.
+            Dependency-ordered chunk plan (each: move + re-import in `main.rs`,
+            native gate green, review, commit):
+            (0) model-first — **DONE** (`InstanceSchedulerLifecycle.tla`);
+            (1) lift the pure lowering closure (`lower_rule`/`ready_contexts` +
+                helpers — pure IR+data→`OwnedLowering`, no store) into the kernel;
+            (2) lift the rule pass (`step_instance`/`project_queue_items`) generic
+                over the held store handles;
+            (3) lift the effect executor + 13 store-only handlers, then the two
+                HTTP handlers as the already-built sans-IO effect machines;
+            (4) assemble the `InstanceStepMachine` (the fixpoint as a `StepMachine`
+                raising `NeedsIo(Http)`); native `dev`/`worker`/`step` call it;
+            (5) wire the DO host (`RuntimeKernel<DoSqliteStore>` + `FetchHost`) to
+                the wasm-bindgen surface below.
       - [ ] The `wasm-bindgen` surface the shell imports (`createInstance`/`step`/
             `snapshot`) wiring `RuntimeKernel<DoSqliteStore>` + `FetchHost` to the
             drive loop; routing every new delivery/re-entry seam through the E2-DYN
