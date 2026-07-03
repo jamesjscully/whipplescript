@@ -17,6 +17,7 @@
 //! derives a rule-matchable fact from them (I2, leaf-ness). Only the single
 //! terminal becomes a fact (layer 3).
 
+use crate::harness::{ProviderFailure, ProviderRunResult, ProviderRunStatus};
 use serde_json::{json, Value};
 
 use crate::sansio::{
@@ -214,6 +215,56 @@ pub struct BrokeredTurnOutcome {
     pub steps: usize,
     pub observations: Vec<LoopObservation>,
     pub usage: Value,
+}
+
+/// Project a finished [`BrokeredTurnOutcome`] onto the [`ProviderRunResult`] the
+/// kernel settles (via `settle_provider_run_result`). The durable-object agent
+/// dispatch drives a [`BrokeredTurnMachine`] over `fetch`, then converts its outcome
+/// here — the same terminal shape the native provider adapters produce.
+pub fn provider_result_from_brokered_turn(outcome: &BrokeredTurnOutcome) -> ProviderRunResult {
+    let (status, failure) = match outcome.status {
+        TurnStatus::Completed => (ProviderRunStatus::Completed, None),
+        TurnStatus::Failed | TurnStatus::TimedOut => {
+            let error_kind = if matches!(outcome.status, TurnStatus::TimedOut) {
+                "timeout"
+            } else {
+                "provider_error"
+            };
+            (
+                if matches!(outcome.status, TurnStatus::TimedOut) {
+                    ProviderRunStatus::TimedOut
+                } else {
+                    ProviderRunStatus::Failed
+                },
+                Some(ProviderFailure {
+                    provider: "brokered".to_owned(),
+                    adapter: "brokered-turn".to_owned(),
+                    phase: "provider.agent.turn".to_owned(),
+                    error_kind: error_kind.to_owned(),
+                    message: outcome.summary.clone(),
+                    recoverable: matches!(outcome.status, TurnStatus::TimedOut),
+                    retry_after: None,
+                    workspace_id: None,
+                    provider_session_id: None,
+                    provider_thread_id: None,
+                    missing_config_keys: Vec::new(),
+                    raw_json: None,
+                }),
+            )
+        }
+    };
+    ProviderRunResult {
+        status,
+        summary: outcome.summary.clone(),
+        stdout: outcome.summary.clone(),
+        stderr: String::new(),
+        transcript: serde_json::to_string(&outcome.observations)
+            .unwrap_or_else(|_| "[]".to_owned()),
+        exit_code: matches!(outcome.status, TurnStatus::Completed).then_some(0),
+        usage_json: outcome.usage.to_string(),
+        artifacts: Vec::new(),
+        failure,
+    }
 }
 
 /// The initial prompt for a brokered turn (slice 1 minimal projection: a system

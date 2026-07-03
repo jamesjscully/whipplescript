@@ -6995,6 +6995,9 @@ pub(crate) mod test_support {
                 binding_id TEXT PRIMARY KEY, program_id TEXT, capability TEXT NOT NULL,
                 provider TEXT NOT NULL, config_json TEXT NOT NULL
             );
+            CREATE TABLE agent_turn_snapshots (
+                effect_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL
+            );
             CREATE TABLE items (
                 item_id TEXT PRIMARY KEY, queue TEXT NOT NULL, title TEXT NOT NULL,
                 body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open',
@@ -7030,6 +7033,36 @@ pub(crate) mod test_support {
         .expect("schema");
         DoSqliteStore::new(RusqliteDoSql { conn })
     }
+}
+
+/// Persist an agent turn's `BrokeredTurnSnapshot` (as JSON) keyed by effect, so a
+/// multi-round turn survives DO eviction between provider rounds (DR-0033 chunk 5b).
+pub fn do_save_agent_snapshot<Sql: DoSql>(
+    sql: &Sql,
+    effect_id: &str,
+    snapshot_json: &str,
+) -> StoreResult<()> {
+    sql.execute(
+        "INSERT INTO agent_turn_snapshots (effect_id, snapshot_json) VALUES (?1, ?2) \
+         ON CONFLICT(effect_id) DO UPDATE SET snapshot_json = excluded.snapshot_json",
+        &[text(effect_id), text(snapshot_json)],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+/// Load a persisted agent-turn snapshot JSON, or `None` on the first round.
+pub fn do_load_agent_snapshot<Sql: DoSql>(
+    sql: &Sql,
+    effect_id: &str,
+) -> StoreResult<Option<String>> {
+    let rows = sql
+        .query(
+            "SELECT snapshot_json FROM agent_turn_snapshots WHERE effect_id = ?1",
+            &[text(effect_id)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows.first().map(|row| as_text(&row[0])))
 }
 
 #[cfg(test)]

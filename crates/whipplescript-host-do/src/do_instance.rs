@@ -28,10 +28,17 @@ use whipplescript_kernel::effect_handlers::{
     run_human_effect_generic, run_loft_effect_generic, run_notify_effect_generic,
     run_queue_effect_generic, CapabilityContract, DeliveryGovernance,
 };
+use whipplescript_kernel::harness_loop::{
+    provider_result_from_brokered_turn, BrokeredTurnInput, BrokeredTurnMachine,
+    BrokeredTurnSnapshot, ChatMessage, HttpModelClient, ToolExecutor,
+};
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_lowering::json_from_str;
 use whipplescript_kernel::rule_pass::step_instance_generic;
-use whipplescript_kernel::sansio::{HttpResponse, TransportError};
+use whipplescript_kernel::sansio::{
+    HttpResponse, IoRequest, IoResult, Outcome, StepMachine, TransportError,
+};
+use whipplescript_kernel::AgentTurnExecution;
 use whipplescript_kernel::{idempotency_key, CoerceExecution, RuntimeKernel};
 use whipplescript_parser::IrProgram;
 use whipplescript_store::files::FileStore;
@@ -52,7 +59,7 @@ pub struct CoerceProviderConfig {
     pub max_tokens: u32,
 }
 
-use crate::do_store::{DoSql, DoSqliteStore};
+use crate::do_store::{do_load_agent_snapshot, do_save_agent_snapshot, DoSql, DoSqliteStore};
 
 /// Drives a workflow instance's rule pass + effect discovery on the durable object.
 pub struct DoInstanceDriver<'a, Sql: DoSql> {
@@ -65,6 +72,13 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     /// Projected coerce provider credentials, or `None` if coerce is not configured
     /// on this DO (a `coerce.call` then errors rather than degrading silently).
     pub coerce: Option<&'a CoerceProviderConfig>,
+    /// The DO agent model client (builds the messages request + parses the reply);
+    /// `None` if agent turns are not configured. A live worker's impl reads creds
+    /// from its bindings; tests inject a fake.
+    pub agent_model: Option<&'a dyn HttpModelClient>,
+    /// Executes tool calls the model requests within a turn (nested effects). A live
+    /// DO brokers these as HTTP to a sidecar; tests inject a fake.
+    pub agent_tools: &'a dyn ToolExecutor,
     pub ir: &'a IrProgram,
     pub instance_id: &'a str,
 }
@@ -152,6 +166,90 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 &config,
                 &DoCapabilityContract,
             )?,
+            // The agent turn: multi-round sans-IO. Each round drives the
+            // BrokeredTurnMachine one provider call, persisting its snapshot so an
+            // eviction between fetches loses nothing (snapshot/restore); on the final
+            // reply the outcome settles through the shared kernel seam.
+            "agent.tell" => {
+                let model = self.agent_model.ok_or_else(|| {
+                    StoreError::Conflict(
+                        "no agent model is configured on this durable object".to_owned(),
+                    )
+                })?;
+                let input = json_from_str(&effect.input_json);
+                let prompt = input
+                    .get("prompt")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                let turn_input = BrokeredTurnInput {
+                    system: "You are a WhippleScript agent.".to_owned(),
+                    user: prompt,
+                    tools: Vec::new(),
+                    max_steps: 8,
+                    resume_from: Vec::new(),
+                };
+                let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "agent-run"]);
+                let lease_id =
+                    idempotency_key(&[self.instance_id, &effect.effect_id, "agent-lease"]);
+                let loaded = do_load_agent_snapshot(&self.kernel.store().sql, &effect.effect_id)?;
+                if loaded.is_none() {
+                    self.kernel.start_run(RunStart {
+                        instance_id: self.instance_id,
+                        effect_id: &effect.effect_id,
+                        run_id: &run_id,
+                        provider: "agent",
+                        worker_id: "whip-worker",
+                        lease_id: &lease_id,
+                        lease_expires_at: "2030-01-01T00:00:00Z",
+                        metadata_json: "{}",
+                    })?;
+                }
+                let mut discard = |_: &[ChatMessage]| {};
+                let mut machine = match loaded {
+                    None => {
+                        BrokeredTurnMachine::new(model, self.agent_tools, &turn_input, &mut discard)
+                    }
+                    Some(json) => {
+                        let snapshot: BrokeredTurnSnapshot = serde_json::from_str(&json)
+                            .map_err(|error| StoreError::Conflict(error.to_string()))?;
+                        BrokeredTurnMachine::restore(
+                            model,
+                            self.agent_tools,
+                            &turn_input,
+                            &mut discard,
+                            snapshot,
+                        )
+                    }
+                };
+                let step = machine.step(incoming.map(IoResult::Http));
+                match step {
+                    Outcome::NeedsIo(IoRequest::Http(request)) => {
+                        let json = serde_json::to_string(&machine.snapshot())
+                            .map_err(|error| StoreError::Conflict(error.to_string()))?;
+                        do_save_agent_snapshot(&self.kernel.store().sql, &effect.effect_id, &json)?;
+                        return Ok(EffectStep::NeedsHttp(request));
+                    }
+                    Outcome::Settle(outcome) => {
+                        let result = provider_result_from_brokered_turn(&outcome);
+                        let execution = AgentTurnExecution {
+                            instance_id: self.instance_id,
+                            effect_id: &effect.effect_id,
+                            run_id: &run_id,
+                            provider: "agent",
+                            worker_id: "whip-worker",
+                            lease_id: &lease_id,
+                            lease_expires_at: "2030-01-01T00:00:00Z",
+                            agent: "agent",
+                            profile: None,
+                            input_json: &effect.input_json,
+                            skill_names: &[],
+                        };
+                        self.kernel
+                            .settle_provider_run_result(execution, "{}", &result)?
+                    }
+                }
+            }
             // The coerce HTTP effect: the sans-IO suspend/resume DR-0033 exists for.
             // First pass builds the provider request (pure kernel: parts + request)
             // and yields `NeedsHttp`; the host awaits `fetch` and re-enters with the
@@ -303,6 +401,20 @@ mod tests {
         }
     }
 
+    /// A no-op `ToolExecutor` for turns that request no tools.
+    struct NoTools;
+    impl ToolExecutor for NoTools {
+        fn execute(
+            &self,
+            call: &whipplescript_kernel::harness_loop::ToolCall,
+        ) -> whipplescript_kernel::harness_loop::ToolOutcome {
+            whipplescript_kernel::harness_loop::ToolOutcome {
+                status: whipplescript_kernel::harness_loop::ToolStatus::Error,
+                content: format!("no tool executor on this test DO: {}", call.name),
+            }
+        }
+    }
+
     /// A `FileStore` stub for effect-free runs (no file effect touches it).
     struct NoFiles;
     impl FileStore for NoFiles {
@@ -372,6 +484,8 @@ mod tests {
             kernel,
             files: &NoFiles,
             coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
             ir: &ir,
             instance_id: &instance_id,
         };
@@ -475,6 +589,8 @@ mod tests {
             kernel,
             files: &NoFiles,
             coerce: Some(&cfg),
+            agent_model: None,
+            agent_tools: &NoTools,
             ir: &ir,
             instance_id: &instance_id,
         };
@@ -493,5 +609,125 @@ mod tests {
             .expect("status")
             .expect("instance row");
         assert_eq!(status.instance.status, "completed");
+    }
+
+    /// A fake HTTP agent model: one round, a final reply with no tool calls.
+    struct FinalReplyModel;
+    impl HttpModelClient for FinalReplyModel {
+        fn build_request(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[whipplescript_kernel::harness_loop::ToolSpec],
+        ) -> whipplescript_kernel::sansio::HttpRequest {
+            whipplescript_kernel::sansio::HttpRequest {
+                url: "https://provider/agent".to_owned(),
+                headers: Vec::new(),
+                body: serde_json::json!({}),
+            }
+        }
+        fn parse_response(
+            &self,
+            _response: Result<HttpResponse, TransportError>,
+        ) -> Result<
+            whipplescript_kernel::harness_loop::ModelReply,
+            whipplescript_kernel::harness_loop::HarnessModelError,
+        > {
+            Ok(whipplescript_kernel::harness_loop::ModelReply {
+                text: "done".to_owned(),
+                tool_calls: Vec::new(),
+                usage: serde_json::json!({ "input_tokens": 1, "output_tokens": 1 }),
+            })
+        }
+    }
+
+    // The DO agent turn end-to-end: a `when started -> tell agent -> complete`
+    // workflow drives the BrokeredTurnMachine over `fetch` (suspend on NeedsHttp,
+    // resume via the snapshot table) and settles the ProviderRunResult, reaching a
+    // terminal over the DO store.
+    #[test]
+    fn do_instance_driver_runs_an_agent_turn_over_fetch() {
+        let source = "workflow AgentDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             agent helper {\n  provider owned\n  profile \"repo-reader\"\n  capacity 1\n}\n\n\
+             rule go\n  when started\n=> {\n  tell helper as reply \"\"\"\n  Do the thing.\n  \"\"\"\n\n\
+             \x20 after reply succeeds {\n    complete result { ok 1 }\n  }\n\n\
+             \x20 after reply fails {\n    complete result { ok 0 }\n  }\n}\n";
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("agent program compiles");
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) \
+             VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed agent provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: "src",
+                    ir_hash: "ir",
+                    compiler_version: "test",
+                },
+                &ir,
+            )
+            .expect("program version");
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/AgentDemo",
+                    effective_authority_json: "{}",
+                },
+            )
+            .expect("instance");
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .expect("start event");
+
+        let model = FinalReplyModel;
+        let driver = DoInstanceDriver {
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: Some(&model),
+            agent_tools: &NoTools,
+            ir: &ir,
+            instance_id: &instance_id,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &OkHost);
+        assert!(
+            matches!(outcome, InstanceOutcome::Terminal),
+            "the DO drives the agent turn over fetch to a terminal: {outcome:?}"
+        );
+        let driver = machine.into_driver();
+        let status = driver
+            .kernel
+            .store()
+            .status(&instance_id)
+            .expect("status")
+            .expect("instance row");
+        assert_eq!(status.instance.status, "completed");
+    }
+
+    /// A host that answers any request with a 200 (the fake model ignores the body).
+    struct OkHost;
+    impl HostDriver for OkHost {
+        fn fulfill(&self, _request: &IoRequest) -> IoResult {
+            IoResult::Http(Ok(HttpResponse {
+                status: 200,
+                body: serde_json::json!({}),
+            }))
+        }
     }
 }
