@@ -416,8 +416,11 @@ linear undo chain). No phase work now.
                 `*_generic<S: RuntimeStore>` core): `run_event_effect`,
                 `run_capability_effect` (3a, 2b1b255), `run_loft_effect`,
                 `run_human_effect` + the shared read-only helper
-                `resolve_effect_input_after_bindings` (3b, 93ffefd). REMAINING (a
-                deeper grind): `run_notify_effect` nests
+                `resolve_effect_input_after_bindings` (3b, 93ffefd), and all four
+                file handlers `run_file_effect`/`_write`/`_import`/`_export` via the
+                `FileStore` seam (`*_generic<S>(kernel, files: &dyn FileStore, …)`,
+                native `NativeFileStore` / DO `DoFileStore`) (3c, 2a1b2f9).
+                REMAINING (a deeper grind): `run_notify_effect` nests
                 `internal_workflow_delivery_violation`(store_path); the
                 `file*` handlers need `FileStore`, `coordination`/`queue` need
                 `Coordination`/`WorkItems` (audit for inherent-vs-trait methods —
