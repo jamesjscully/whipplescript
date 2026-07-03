@@ -380,6 +380,17 @@ fn evidence_from_row(row: &[SqlValue]) -> EvidenceView {
     }
 }
 
+/// Maps a 4-column time-effect row (`effect_id, kind, status, timeout_seconds`)
+/// to a `DueTimeEffect`.
+fn due_time_effect_from_row(row: &[SqlValue]) -> DueTimeEffect {
+    DueTimeEffect {
+        effect_id: as_text(&row[0]),
+        kind: as_text(&row[1]),
+        status: as_text(&row[2]),
+        timeout_seconds: as_i64(&row[3]),
+    }
+}
+
 /// Maps a 5-column evidence-link row to an `EvidenceLinkView`.
 fn evidence_link_from_row(row: &[SqlValue]) -> EvidenceLinkView {
     EvidenceLinkView {
@@ -1935,7 +1946,31 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn satisfy_dependencies(&self, instance_id: &str) -> StoreResult<usize> {
-        todo!("Phase 5b: port `satisfy_dependencies` SQL to DoSql + verify against a live DO")
+        let updated = self
+            .sql
+            .execute(
+                "UPDATE effects SET status = 'queued', updated_at = CURRENT_TIMESTAMP \
+                 WHERE instance_id = ?1 AND status = 'blocked_by_dependency' \
+                 AND effect_id IN ( \
+                   SELECT candidate.effect_id FROM effects AS candidate \
+                   WHERE candidate.instance_id = ?1 AND NOT EXISTS ( \
+                     SELECT 1 FROM effect_dependencies AS dependency \
+                     JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
+                      AND upstream.instance_id = dependency.instance_id \
+                     WHERE dependency.instance_id = candidate.instance_id \
+                       AND dependency.downstream_effect_id = candidate.effect_id AND NOT ( \
+                         (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
+                         OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
+                         OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
+                         OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
+                         OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
+                       ) \
+                   ) \
+                 )",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(updated as usize)
     }
 
     fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
@@ -1960,7 +1995,40 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn due_time_effects(&self, instance_id: &str, now: &str) -> StoreResult<Vec<DueTimeEffect>> {
-        todo!("Phase 5b: port `due_time_effects` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT candidate.effect_id, candidate.kind, candidate.status, \
+                 COALESCE(candidate.timeout_seconds, 0) FROM effects AS candidate \
+                 WHERE candidate.instance_id = ?1 \
+                 AND candidate.status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
+                 AND ( \
+                   (candidate.timeout_seconds IS NOT NULL \
+                    AND (strftime('%s', ?2) - strftime('%s', candidate.created_at)) \
+                        >= candidate.timeout_seconds) \
+                   OR (json_extract(candidate.input_json, '$.deadline_at') IS NOT NULL \
+                       AND CAST(strftime('%s', ?2) AS INTEGER) \
+                           >= CAST(strftime('%s', json_extract(candidate.input_json, \
+                              '$.deadline_at')) AS INTEGER)) \
+                 ) AND ( \
+                   candidate.kind != 'timer.wait' OR NOT EXISTS ( \
+                     SELECT 1 FROM effect_dependencies AS dependency \
+                     JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
+                      AND upstream.instance_id = dependency.instance_id \
+                     WHERE dependency.instance_id = candidate.instance_id \
+                       AND dependency.downstream_effect_id = candidate.effect_id AND NOT ( \
+                         (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
+                         OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
+                         OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
+                         OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
+                         OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
+                       ) \
+                   ) \
+                 ) ORDER BY candidate.created_at, candidate.effect_id",
+                &[text(instance_id), text(now)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| due_time_effect_from_row(r)).collect())
     }
 
     fn due_interval_occurrences(
@@ -1969,11 +2037,34 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         interval_seconds: i64,
         now: &str,
     ) -> StoreResult<Vec<String>> {
-        todo!("Phase 5b: port `due_interval_occurrences` SQL to DoSql + verify against a live DO")
+        if interval_seconds <= 0 {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .sql
+            .query(
+                "WITH RECURSIVE occurrence(scheduled_epoch) AS ( \
+                   SELECT CAST(strftime('%s', ?1) AS INTEGER) + ?2 \
+                   UNION ALL SELECT scheduled_epoch + ?2 FROM occurrence \
+                   WHERE scheduled_epoch + ?2 <= CAST(strftime('%s', ?3) AS INTEGER) \
+                     AND scheduled_epoch < CAST(strftime('%s', ?1) AS INTEGER) + (?2 * 100000) \
+                 ) SELECT strftime('%Y-%m-%dT%H:%M:%SZ', scheduled_epoch, 'unixepoch') \
+                 FROM occurrence WHERE scheduled_epoch <= CAST(strftime('%s', ?3) AS INTEGER) \
+                 ORDER BY scheduled_epoch",
+                &[text(after_scheduled), int(interval_seconds), text(now)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| as_text(&r[0])).collect())
     }
 
     fn resolve_clock(&self, now: &str) -> StoreResult<String> {
-        todo!("Phase 5b: port `resolve_clock` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?1)", &[text(now)])
+            .map_err(sql_err)?;
+        rows.first()
+            .and_then(|r| as_opt_text(&r[0]))
+            .ok_or_else(|| StoreError::Conflict(format!("unparseable clock instant `{now}`")))
     }
 
     fn last_clock_occurrence(
@@ -1981,11 +2072,29 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         instance_id: &str,
         signal: &str,
     ) -> StoreResult<Option<String>> {
-        todo!("Phase 5b: port `last_clock_occurrence` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT MAX(json_extract(payload_json, '$.scheduled_at')) FROM events \
+                 WHERE instance_id = ?1 AND event_type = ?2",
+                &[text(instance_id), text(signal)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().and_then(|r| as_opt_text(&r[0])))
     }
 
     fn pending_time_effects(&self, instance_id: &str) -> StoreResult<Vec<DueTimeEffect>> {
-        todo!("Phase 5b: port `pending_time_effects` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT effect_id, kind, status, timeout_seconds FROM effects \
+                 WHERE instance_id = ?1 AND timeout_seconds IS NOT NULL \
+                 AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
+                 ORDER BY created_at, effect_id",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| due_time_effect_from_row(r)).collect())
     }
 
     fn expire_effect(
@@ -2172,8 +2281,13 @@ mod tests {
                 created_by_rule TEXT NOT NULL DEFAULT '', program_version_id TEXT,
                 revision_epoch INTEGER NOT NULL DEFAULT 0, profile TEXT,
                 required_capabilities TEXT NOT NULL DEFAULT '[]', policy_block_reason TEXT,
-                policy_block_category TEXT, created_by_event_id TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                policy_block_category TEXT, created_by_event_id TEXT, timeout_seconds INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE effect_dependencies (
+                instance_id TEXT NOT NULL, downstream_effect_id TEXT NOT NULL,
+                upstream_effect_id TEXT NOT NULL, predicate TEXT NOT NULL
             );
             CREATE TABLE runs (
                 run_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, effect_id TEXT NOT NULL,
@@ -3144,5 +3258,127 @@ mod tests {
         let mut bad = make();
         bad.evidence_ids_json = "{}";
         assert!(store.record_diagnostic(bad).is_err());
+    }
+
+    /// The clock/time-obligation and dependency-satisfaction queries run their real
+    /// (strftime / recursive-CTE / dependency-predicate) SQL.
+    #[test]
+    fn do_store_clock_time_and_dependencies_run_real_sql() {
+        let store = store();
+        let e = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
+
+        // resolve_clock normalizes an instant; a garbage token errors.
+        assert_eq!(
+            store.resolve_clock("2026-01-02T03:04:05Z").expect("clock"),
+            "2026-01-02T03:04:05Z"
+        );
+        assert!(store.resolve_clock("not-a-time").is_err());
+
+        // due_interval_occurrences is pure interval arithmetic.
+        let occ = store
+            .due_interval_occurrences("2026-01-01T00:00:00Z", 3600, "2026-01-01T02:00:00Z")
+            .expect("occurrences");
+        assert_eq!(
+            occ,
+            vec![
+                "2026-01-01T01:00:00Z".to_string(),
+                "2026-01-01T02:00:00Z".to_string()
+            ]
+        );
+        assert!(store
+            .due_interval_occurrences("2026-01-01T00:00:00Z", 0, "2026-01-01T02:00:00Z")
+            .expect("no interval")
+            .is_empty());
+
+        // An effect whose creation-anchored timeout has elapsed is due; pending lists it too.
+        e(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json, \
+             timeout_seconds, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                text("eff_timeout"),
+                text("i1"),
+                text("timer.wait"),
+                text("queued"),
+                text("{}"),
+                int(60),
+                text("2026-01-01T00:00:00Z"),
+            ],
+        );
+        let due = store
+            .due_time_effects("i1", "2026-01-01T00:05:00Z")
+            .expect("due");
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].effect_id, "eff_timeout");
+        assert_eq!(due[0].timeout_seconds, 60);
+        // Not yet due at t+30s.
+        assert!(store
+            .due_time_effects("i1", "2026-01-01T00:00:30Z")
+            .expect("not due")
+            .is_empty());
+        assert_eq!(store.pending_time_effects("i1").expect("pending").len(), 1);
+
+        // last_clock_occurrence reads MAX(scheduled_at) from matching events.
+        e(
+            "INSERT INTO events (event_id, instance_id, sequence, event_type, payload_json, \
+             occurred_at, source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                text("evt_c"),
+                text("i1"),
+                int(1),
+                text("clock.tick"),
+                text("{\"scheduled_at\":\"2026-01-01T01:00:00Z\"}"),
+                text("2026-01-01T01:00:00Z"),
+                text("kernel"),
+            ],
+        );
+        assert_eq!(
+            store
+                .last_clock_occurrence("i1", "clock.tick")
+                .expect("last")
+                .as_deref(),
+            Some("2026-01-01T01:00:00Z")
+        );
+        assert!(store
+            .last_clock_occurrence("i1", "absent")
+            .expect("none")
+            .is_none());
+
+        // satisfy_dependencies queues an effect once its upstream succeeds.
+        e(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                text("up"),
+                text("i1"),
+                text("coerce"),
+                text("completed"),
+                text("{}"),
+            ],
+        );
+        e(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                text("down"),
+                text("i1"),
+                text("coerce"),
+                text("blocked_by_dependency"),
+                text("{}"),
+            ],
+        );
+        e(
+            "INSERT INTO effect_dependencies (instance_id, downstream_effect_id, \
+             upstream_effect_id, predicate) VALUES (?1, ?2, ?3, ?4)",
+            &[text("i1"), text("down"), text("up"), text("succeeds")],
+        );
+        assert_eq!(store.satisfy_dependencies("i1").expect("satisfy"), 1);
+        let down_status = store
+            .sql
+            .query(
+                "SELECT status FROM effects WHERE effect_id = ?1",
+                &[text("down")],
+            )
+            .expect("read");
+        assert_eq!(as_text(&down_status[0][0]), "queued");
     }
 }
