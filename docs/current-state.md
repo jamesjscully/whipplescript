@@ -59,7 +59,8 @@ between releases.
   configurable per-turn step budget and a durable workspace lease), and a
   default-deny `bash` tool (allow-list of command prefixes, workspace cwd,
   timeout), and capability-gated tracker tools (`list/add/update_todo` over the
-  durable work tracker, refined-I3 shared-state participation), context
+  durable work tracker; mutating calls use `with access to tracker { ... }`),
+  context
   compaction on long turns (projection only; the durable stream is complete), and
   resume-from-crash (the turn transcript is persisted per step and a recovered
   turn resumes from that projection). The delegating Codex/Claude adapters are now

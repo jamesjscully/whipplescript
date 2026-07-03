@@ -973,6 +973,7 @@ This section is a compact index of source constructs.
 | `done binding` | Mark matched fact consumed. `consume binding` is a deprecated alias; the checker now emits a warning for it. |
 | `done binding -> record ...` | Consume and create replacement fact atomically. |
 | `tell agent ... [timeout <dur>] as turn` | `agent.tell` effect. |
+| `prompt "..." [using provider] as result` | Provider-backed free-text prompt effect returning a string-shaped result. |
 | `coerce fn(...) as result` | `coerce` effect. |
 | `decide "..." -> { ... } as result` | Inline typed `coerce` effect. |
 | `exec "<command>" as result` | Dev-profile `exec.command` effect (gated by `WHIPPLESCRIPT_EXEC_ALLOW`; exposes `exit_code`, `stdout`). |

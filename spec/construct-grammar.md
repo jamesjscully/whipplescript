@@ -286,7 +286,7 @@ Do not duplicate that catalog here.
 | effect operation | core-owned verb/preposition slots ending in `as <binding>` | `effect_operation` | `capability_call`, `typed_effect_call`, `resource_effect`, `core_effect`, `signal_emit` | `recall from project_memory for issue as context` |
 | signal emit | `emit signal <signal> to <target> { <fields> } as <binding>` | `effect_operation` | `signal_emit` | `emit signal deploy.finished to peer.id { ... } as sent` |
 | resource operation | core-shaped resource verbs such as `acquire`, `release`, `append`, `consume` | `effect_operation` | `resource_effect` | `claim issue as active_claim` |
-| turn-access grant | `with access to <resource> { <grant clauses> }` | (not a family) metadata on the `tell` effect | none — see below | `with access to project_memory { recall for issue }` |
+| turn-access grant | `with access to <resource> { <grant clauses> }` or `with access to { <resource> { <grant clauses> } ... }` | (not a family) metadata on the `tell`/`invoke` effect | none — see below | `with access to project_memory { recall for issue }` |
 | provider declaration | provider/profile/binding clauses or blocks | `declaration_block` | `metadata_only` | `provider github` |
 | rule | `rule <name> when ... => { ... }` | `rule` | `rule_template` | `rule triage when ... => { ... }` |
 | assertion | top-level `assert <predicate>` | `assertion` | `assertion_check` | `assert facts count Issue is 1` |
@@ -294,10 +294,11 @@ Do not duplicate that catalog here.
 | test scenario | `test <name> { given ... stub ... run ... expect ... }` | `test_scenario` (core-owned, non-runtime) | none; test-only validation | `test "failed CI gets triaged" { ... }` |
 
 Turn-access grants are not a lowering class. A `with access to <resource> { … }`
-clause is authority-narrowing metadata on the agent-turn effect: it is validated
-as required ports (`Resource`, per-granted `Operation`, `Capability`) on the
-`tell` node and lowered as bounded sub-authority fields on the `agent.tell`
-effect. In-turn tool invocations are recorded as evidence, not durable child
+clause, or grouped `with access to { <resource> { … } ... }` shorthand, is
+authority-narrowing metadata on the agent-turn or workflow-invoke effect: it is
+validated as required ports (`Resource`, per-granted `Operation`, `Capability`)
+on the effect node and lowered as bounded sub-authority fields on the effect.
+In-turn tool invocations are recorded as evidence, not durable child
 effects. Resource declarations are likewise not their own lowering class; they
 lower through `metadata_only` and the resource surface comes from the runtime
 provider registry.

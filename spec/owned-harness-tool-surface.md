@@ -114,11 +114,30 @@ Per-tool, enforced by the envelope (the point of brokering):
 ```text
 read / grep / find / ls   read sandbox (file store read globs); no extra gate
 write / edit              write sandbox (file store write globs); + counter
-bash                      exec capability + confinement; command classification
-                          (step 4); + counter
+bash                      `command.run` capability + `with access to command
+                          { run }` turn grant + operator allow-list
+                          (`WHIPPLESCRIPT_HARNESS_BASH_ALLOW`; empty =
+                          refuse all); single simple command only (control
+                          operators, pipes, command substitution, backticks,
+                          variable/glob/brace/tilde expansion refused);
+                          literal file redirections checked against
+                          file-store read/write globs (dynamic targets
+                          refused); path-shaped arguments confined to the
+                          workspace (absolute/`~`/`..` rejected); + counter.
+                          Command-specific argv classification is NOT part
+                          of this surface (see the command side-effect
+                          boundary open item below).
 list_todos                read; ungated
-add_todo / update_todo    tracker capability; per-capability gate (e.g. may file
-                          but not close); + counter
+add_todo                  tracker capability; `with access to tracker { file }`;
+                          profile `tracker.file` / `tracker.write`; + counter
+update_todo               tracker capability; status-specific
+                          `claim`/`finish`/`release` grants, or `update`/`write`;
+                          profile `tracker.claim`/`tracker.finish`/
+                          `tracker.release`/`tracker.update`/`tracker.write`;
+                          + counter
+@tool workflow            curated workflow.invoke facade; profile/required
+                          capability `workflow.invoke`; cross-package
+                          `invoke:<pkg>/<tool>` envelope door
 ```
 
 ## Open items (handed to step 3/4)
@@ -127,8 +146,35 @@ add_todo / update_todo    tracker capability; per-capability gate (e.g. may file
   possible per-model-family variant later.
 - **file store construct vs. turn-scoped workspace grant**: how the coding tools'
   file access is expressed — an engineering call on technical merits in step 4.
-- **unified writable boundary**: exec writable-roots == file-store write-globs.
+- **command side-effect boundary**: owned-harness bash requires explicit
+  `command.run` authority, the applicable profile/capability policy, and the
+  operator bash allow-list before execution. It rejects shell
+  control/substitution/expansion syntax, checks literal shell redirection
+  targets against file-store read/write globs, and refuses obvious
+  out-of-workspace path arguments. Command-specific argv classifiers are not part
+  of the active v1 owned-harness surface after the classifier rollback;
+  command-specific side-effect policy must be model-first and explicitly scoped
+  before it is reintroduced.
+
 - **tracker capability projection**: the general mechanism that marks a whip
   capability agent-callable and derives its tool schema from the capability's
   declared I/O types (the same projection serves `file store` and tracker
   facades). Specified in step 4 alongside the governance map.
+- **web search tool** (from the 2026-07-01 v1 surface-hardening pass; canonical
+  home for this item): a new `ToolSpec` alongside the profile-filtered file
+  tool specs, with a `ToolExecutor`, kernel-brokered. **Owned-harness only**
+  (command-backed Claude/Codex use their native web search). IFC: the query is
+  an **egress** (flow-checked like `send`), the result is a **low-integrity
+  ingress** (taint source, like an inbound message). A capability grantable via
+  `with access to` — the first real customer of the workflow authority model (a
+  subagent gets web search only if delegated it). Settled in shape; **gated on
+  the broader network-tool policy discussion** (open, per Jack).
+- **remaining runtime-governance policy extensions** (from encapsulation
+  Phase 4b; canonical home for this item): the live owned harness binds tool
+  exposure and execution to turn grants, profile/registry capabilities, known
+  `tell ... requires [...]` capabilities, and governance-envelope resource
+  coverage. Open: governance-envelope label/argument policy beyond resource
+  coverage, and future provider/tool capability mappings whose policy is not
+  yet specified. Author surface stays `with access to` plus the agent
+  declaration's `capabilities`/`profile`; concrete policy lives in the
+  governance layer.

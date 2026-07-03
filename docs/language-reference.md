@@ -64,7 +64,9 @@ workflow Child {
 
 Both forms support the full language, including contracts and terminal
 actions. Library workflows in the same bundle are invokable by name with
-`invoke`.
+`invoke` unless the target workflow is tagged `@private`. A private workflow is
+still validated and may be selected as `--root`, but sibling workflows cannot
+invoke it.
 
 Contracts may be written as a compact signature on the workflow line instead of
 separate `input`/`output`/`failure` lines:
@@ -113,6 +115,9 @@ Scope is lexical: a top-level declaration (outside every `workflow { ... }`
 block) is shared across the whole bundle, while a declaration written inside a
 workflow block is private to that workflow. Referencing another workflow's
 private name is an error — move the declaration to the top level to share it.
+For workflow declarations themselves, `@private` is an invocation membrane marker,
+not lexical scoping: it hides the workflow from sibling `invoke` targets while
+leaving root selection available for internal runs.
 
 ## Lexical Structure
 
@@ -161,7 +166,7 @@ program       ::= include* use* item*
 item          ::= workflow | contract | harness | agent | class | enum | event
                 | table | queue | lease | ledger | counter | coerce | rule
                 | flow | pattern | apply | action | assert
-workflow      ::= "workflow" Ident block?        # header form if block omitted
+workflow      ::= tag* "workflow" Ident block?   # header form if block omitted
 contract      ::= ("input" | "output" | "failure") Ident Type
 class         ::= "class" TypeName "{" field* "}"
 enum          ::= "enum" TypeName "{" variant* "}"
@@ -170,9 +175,9 @@ agent         ::= "agent" Ident ("using" Ident)? "{" agent_field* "}"
 harness       ::= "harness" Ident ":" Ident
 table         ::= "table" Ident "as" TypeName "[" row* "]"
 queue         ::= "queue" Ident "{" "tracker" Ident "}"
-lease         ::= "lease" Ident "{" "key" TypeName "slots" int "ttl" duration "}"
-ledger        ::= "ledger" Ident "{" "entry" TypeName "partition" "by" Ident "retain" duration "}"
-counter       ::= "counter" Ident "{" "key" TypeName "cap" int "reset" period "}"
+lease         ::= "lease" Ident "{" "shared"? "key" TypeName "slots" int "ttl" duration "}"
+ledger        ::= "ledger" Ident "{" "shared"? "entry" TypeName "partition" "by" Ident "retain" duration "}"
+counter       ::= "counter" Ident "{" "shared"? "key" TypeName "cap" int "reset" period "}"
 coerce        ::= "coerce" Ident "(" params? ")" "->" Type block
 rule          ::= "rule" Ident when* "=>" block
 flow          ::= "flow" Ident when* block
@@ -210,6 +215,20 @@ PhaseReviewRequest`, start the workflow with
 `PhaseReviewRequest` fact. `complete` and `fail` (below) are the only ways a
 rule produces the declared outputs; cancellation is an operator action with
 no source syntax.
+
+`@private` on a workflow prevents sibling workflow invocation:
+
+```whip
+@private
+workflow InternalAuditHarness {
+  input request AuditRequest
+  output result AuditReport
+}
+```
+
+The private workflow is still a valid root for an internal run. A public wrapper
+should expose its own workflow contract or shared pattern body rather than
+invoking the private workflow as a sibling.
 
 ### `class` and `enum`
 
@@ -460,16 +479,17 @@ package can also authorize constrained library-owned forms, such as memory
 Source metadata on workflows, tables, rules, and assertions:
 
 ```whip
+@private
 @acceptance
-description "Provider x language acceptance workflow"
-workflow ProviderLanguageE2E
+description "Internal provider x language acceptance workflow"
+workflow InternalProviderLanguageE2E
 ```
 
 Both are preserved in compiled IR for reports. `whip dev --include-tag` /
-`--exclude-tag` filter which assertions are evaluated. Two tags carry static
-meaning for the [liveness checks](#liveness-checks): `@service` and
-`@external`. No tag changes runtime behavior — readiness, routing, and
-effects are unaffected.
+`--exclude-tag` filter which assertions are evaluated. `@service` and
+`@external` carry static meaning for the [liveness checks](#liveness-checks).
+`@private` on a workflow is semantic and prevents sibling `invoke`; other tags
+do not change readiness, routing, effects, or runtime behavior.
 
 ### Signals and sources
 
@@ -682,7 +702,7 @@ becomes an effect, and a later rule branches on its completion.
 | `release <lease-binding>` | Release a lease acquired earlier in the rule progression. |
 | `append Type { ... } to <ledger> as x` | Append a typed entry to a partitioned ledger. |
 | `consume <counter> for <key> amount <expr> as x` | Consume from a bounded counter; branch on `ok` or `over`. |
-| `invoke Workflow { ... } as x` | Start a durable child workflow. |
+| `invoke Workflow { ... } [with access to <resource> { ... } \| with access to { <resource> { ... } ... }] as x` | Start a durable child workflow, optionally narrowing the child start authority. |
 | `after x succeeds as y { ... }` | Run when effect `x` completes successfully. |
 | `after x fails as y { ... }` | Run when effect `x` fails; `y` binds the failure base (see below). |
 | `after x completes { ... }` | Run on any terminal status of `x`. |
@@ -785,6 +805,23 @@ tell coder as turn
 "Work the issue."
 ```
 
+The equivalent grouped shorthand is also accepted and desugars to the same grant
+list:
+
+```whip
+tell coder as turn
+  with access to {
+    project_memory {
+      recall for issue
+      learn for issue
+    }
+    project_files {
+      read ["docs/**"]
+    }
+  }
+"Work the issue."
+```
+
 Each grant clause is an operation grant — an operation name with an optional
 `for <ref>` target and/or `["glob", …]` path patterns. The grant is
 authority-*narrowing* metadata on the `agent.tell` effect (Proposal A): the turn's
@@ -795,6 +832,52 @@ calls are recorded as evidence, not durable child effects.
 A grant must list at least one operation, must not name the same resource twice on
 one `tell`, and — for a declared `file store` resource — may only use the file
 operations `read`/`write`/`import`/`export`.
+
+For the owned harness, file tools are deny-by-default unless the turn input
+carries a file-store grant; ungranted file tools are not offered to the model.
+`read`/`import` authorize read-like file tools and `write`/`export` authorize
+write-like file tools, with each call checked against the granted globs. `edit`
+is offered only with both read and write grants and also requires both at
+execution because it reads existing content before rewriting it. Built-in
+profiles also narrow the owned harness tool surface: `repo-reader` and
+`human-review` are read-only,
+`repo-writer`/`permissive`/`release-operator` may mutate subject to grants, and
+`no-repo`/`internet-research` receive no filesystem/bash tools. Registered custom
+profiles are also consulted: the owned harness maps `repo.read`, `repo.write`,
+and `command.run` from `allowed_capabilities` to read, write, and bash tool
+authority before intersecting turn grants; tracker mutations use
+`tracker.file`, `tracker.claim`, `tracker.finish`, `tracker.release`,
+`tracker.update`, or `tracker.write`; curated `@tool` sub-workflow tools use
+`workflow.invoke`. If the `tell` uses `requires [...]`, the owned harness also
+intersects the tool surface with those known harness capabilities; the store
+blocks the turn before provider launch if the target agent did not declare them.
+When an IFC governance envelope is active, every
+file-store resource named by a turn grant must also be governed by that envelope
+before the owned turn is admitted. Bash is offered and executed only when ALL of
+the following hold: the profile/registry/required-capability set permits
+`command.run`; the turn carries `with access to command { run }`; the command
+matches the operator allow-list (`WHIPPLESCRIPT_HARNESS_BASH_ALLOW` — with no
+allow-list, every command is refused); the command is a single simple command
+(shell control operators, pipes, command substitution, backticks, and
+variable/glob/brace/tilde expansion are refused before execution); literal
+shell file redirection targets pass the same turn globs as file tools (`<` uses
+read globs, `>`/`>>` use write globs; dynamic redirection targets are refused);
+path-shaped arguments stay inside the workspace (absolute, `~`, and `..` paths
+are rejected); and, when an IFC governance envelope is active, the `command`
+resource is governed by that envelope. Command-specific side-effect
+classification (per-tool argv operand policies) is deliberately not part of
+this surface — the simple-command policy plus the operator allow-list is the
+whole enforcement boundary.
+Tracker `list_todos` is read-only;
+`add_todo` requires
+`with access to tracker { file }`, and `update_todo` requires the matching
+`claim`/`finish`/`release` grant (or `update`/`write`). When an IFC governance
+envelope is active, mutating tracker authority requires the `tracker` resource to
+be governed.
+Provider configs with `profile_ids` also act as endpoint allow-lists and block
+mismatched agent-turn profiles before provider launch. Broader
+governance-envelope label/argument policy and future provider/tool capability
+mappings remain open implementation work.
 
 ### Effect ordering and scope
 
@@ -1390,6 +1473,32 @@ after review fails as failure {
 A provider failure inside the child does not propagate; the parent's `fails`
 branch runs only when the child workflow itself executes `fail`.
 
+An invocation may also carry a resource-specific start grant:
+
+```whip
+invoke ReviewDocs {
+  task task
+}
+  with access to project_files {
+    read ["docs/**"]
+  }
+  as review
+```
+
+The child has its own workflow principal and per-instance effective-authority
+slot. Local children use `workflow:local/<name>`; package-exported `@tool`
+children invoked through the owned harness use the exporting manifest's package
+id. Under a governed envelope, an imported package tool also opens the membrane
+door `invoke:<package_id>/<tool>`; the consumer envelope must govern that door
+before the tool is accepted or offered to the model. Rule-issued `invoke` starts use the delegating start seam. The default
+authority is the child's declared authority narrowed by the parent's effective
+authority; a `with access to` clause narrows that cap further. The runtime
+rejects a grant that would widen authority beyond either side. The shipped
+grammar accepts both `with access to <resource> { ... }` and the grouped
+shorthand `with access to { <resource> { ... } ... }` on `invoke`; the grouped
+form desugars to the same resource-specific grant metadata before runtime
+admission.
+
 ### Provider failure vs. workflow failure
 
 A failed provider run is effect/run state plus events and evidence — the
@@ -1537,13 +1646,15 @@ records its `DeploymentNotice`.
 
 ### Coordination resources
 
-A closed family of workspace-scoped shared resources, each declared with a
+A closed family of workflow-scoped coordination resources, each declared with a
 typed key and mandatory bounds, mutated only by atomic branchable effects:
 
 ```whip
 lease deploy_slot { key Environment  slots 1  ttl 10m }
 ledger decisions  { entry Decision  partition by area  retain 90d }
 counter budget    { key Customer  cap 1000  reset daily }
+
+lease global_deploy_slot { shared  key Environment  slots 1  ttl 10m }
 
 acquire deploy_slot for r.env as slot     # after slot held / after slot contended
 release slot                              # or `acquire ... until ttl` (fire-and-forget)
@@ -1558,6 +1669,13 @@ auto-releases every lease the instance holds — a rule-driven `complete`/`fail`
 or an operator `whip cancel` — so holder lifetime bounds every lease, with TTL
 only as the crash net. Counter reset is lazy at the consume boundary. Inspect
 shared state with `whip leases`, `whip ledger`, and `whip counters`.
+
+By default, coordination rows are partitioned by workflow owner, so two
+workflows using the same source resource name do not contend or communicate
+through outcome bits. Adding the bare `shared` field opts the resource into the
+shared owner. Under `shared`, branchable outcomes are cross-principal
+information-flow read sources and mutations are governed sinks; resources used
+by only one workflow principal remain unlabeled self-coordination.
 
 ### Observability export
 

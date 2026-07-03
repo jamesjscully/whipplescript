@@ -77,13 +77,40 @@ Current scope is **experimental**:
 
 - Tools: `read`, `write`, `edit`, `grep`, `find`, `ls`, executed through the
   `file store` path policy (no absolute/`..` escape), plus `bash` — **default-deny**:
-  a command runs only if it matches an allow-list prefix in
-  `WHIPPLESCRIPT_HARNESS_BASH_ALLOW` (e.g. `git,cargo,ls`), runs with the
-  workspace as cwd, and is killed past a timeout. With no allow-list, every `bash`
-  command is refused.
+  file tools are offered only when the turn carries matching file-store grants
+  (`edit` needs both read and write). When an IFC governance envelope is active,
+  those granted file stores must also be governed by the envelope before the
+  turn is admitted. A `tell ... requires [...]` list further narrows the owned
+  tool surface for known harness capabilities (`repo.read`, `repo.write`,
+  `command.run`, `tracker.*`, and `workflow.invoke`); the scheduler already
+  requires those values to be declared by the target agent. `bash` is offered
+  only with `with access to command { run }`, and a command runs only if ALL of:
+  the profile and required-capability set permit `command.run`; it matches an
+  allow-list prefix in `WHIPPLESCRIPT_HARNESS_BASH_ALLOW` (e.g. `git,cargo,ls`
+  — with no allow-list, every `bash` command is refused); it is a single simple
+  command — shell control operators, pipes, command substitution, backticks,
+  and variable/glob/brace/tilde expansion are refused before execution; its
+  literal redirection targets pass the same turn globs as file tools (`<` uses
+  read globs, `>`/`>>` use write globs; dynamic redirection targets are
+  refused); and its path-shaped arguments stay inside the workspace (absolute,
+  `~`, and `..` paths are rejected). When an IFC governance envelope is active,
+  the `command` resource must also be governed. Commands run with the workspace
+  as cwd and are killed past a timeout. Command-specific side-effect
+  classification (per-tool argv operand policies) is deliberately **not** part
+  of this surface: the simple-command policy plus the operator allow-list is
+  the whole enforcement boundary, and anything subtler is the operator's
+  allow-list judgment.
 - Tracker tools (`list_todos`/`add_todo`/`update_todo`), offered only when
   `WHIPPLESCRIPT_HARNESS_TRACKER=<queue>` is set: the agent participates in the
   durable work tracker (files/updates items the workflow's rules observe).
+  `list_todos` remains read-only and ungated; mutating tools are surfaced and
+  executed only when the turn delegates tracker authority with
+  `with access to tracker { file }` for `add_todo`, or `claim`/`finish`/`release`
+  (or `update`) for the corresponding `update_todo` status transition. Registered
+  profiles may further narrow this with `tracker.file`, `tracker.claim`,
+  `tracker.finish`, `tracker.release`, `tracker.update`, or `tracker.write`.
+  When an IFC governance envelope is active, mutating tracker authority also
+  requires the envelope to govern the `tracker` resource.
   Per the refined I3, these write shared tracker *state*, never rule-matchable
   facts; `add_todo` items are attributed to the agent (`source: "agent"`).
 - Sub-workflow tools ([DR-0025](https://github.com/jamesjscully/whipplescript/blob/main/spec/decision-records/0025-workflows-as-agent-tools.md)):
@@ -103,10 +130,19 @@ Current scope is **experimental**:
   names resolve against the same program bundle or a `use`d package; the operator
   override `WHIPPLESCRIPT_HARNESS_TOOLS=<path>[,<path>…]` still lists out-of-tree
   `@tool` sources for a turn (merged with the grant, which wins on a name clash).
+  Registered profiles and `tell ... requires [...]` may further narrow the
+  model-facing workflow-tool surface with `workflow.invoke`; direct calls are
+  refused at dispatch if that capability is not present in the resolved
+  profile/required-capability policy. Cross-package `@tool` imports also require
+  the active IFC envelope to govern the package invoke door
+  `invoke:<package>/<tool>` before the tool is offered.
   A package exports a `@tool` workflow by shipping its source and listing it in
   the manifest (`"workflow_tools": [{ "name": …, "source": … }]`); the package
   contract then carries a convergence-eligibility **attestation** (the tool's
-  derived input/output schema), so a consumer's grant is checked against the
+  derived input/output schema) and an information-flow surface that includes the
+  package invoke membrane door `invoke:<package_id>/<tool>`. Under a governed
+  envelope, that invoke door must be governed before the imported tool can be
+  checked or offered to the model. A consumer's grant is checked against the
   contract and the tool is driven from the package's shipped source. See
   `examples/subworkflow-tool-consumer.whip` (grants the `toolkit` package's
   `EchoText`).
@@ -119,6 +155,9 @@ Current scope is **experimental**:
   Unset, a deterministic credential-free **fixture** client drives the loop so
   `dev`/CI need no credentials (`WHIPPLESCRIPT_OWNED_FIXTURE_TOOL=read:<path>`
   makes it exercise one tool call).
+- Provider configs may list `profile_ids`; a non-empty list is enforced as an
+  endpoint allow-list before provider launch. A mismatched agent profile leaves
+  the effect recoverably `blocked` with category `provider_config`.
 - Envelope: a per-turn model-step budget (`WHIPPLESCRIPT_HARNESS_MAX_STEPS`,
   default 16) bounds the loop, and the turn holds a durable workspace lease for
   the duration (a contended workspace blocks, recoverable, rather than racing).

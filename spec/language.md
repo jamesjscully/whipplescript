@@ -284,6 +284,14 @@ declarations are private to their enclosing workflow or pattern. Imported
 workflow internals do not pollute the parent namespace; callers see only the
 workflow name and its typed input/output/failure contract.
 
+Top-level workflows are invokable from other workflows in the same source bundle
+by default. A workflow tagged `@private` opts out of sibling invocation: the
+bundle still validates the workflow, and `dev`/`deploy` may select it as the root
+workflow directly, but another workflow cannot name it in `invoke`. Expose a
+public wrapper by putting the shared implementation in a pattern or public
+workflow contract; do not make another top-level workflow invoke the `@private`
+workflow.
+
 Pattern expansion is hygienic. Applying a pattern qualifies generated helper
 names under the application name so traces can still explain generated rules
 without exposing accidental unqualified names:
@@ -579,6 +587,43 @@ bundle and that the invocation payload uses the target workflow's declared
 `input` names and value types. This is a source-bundle contract check: it does
 not inline the child rules into the parent workflow.
 
+Invocation also carries authority. The child runs as its own workflow principal
+and has a per-instance effective-authority slot. The default slot for a
+delegating edge is the child's declared authority narrowed by the parent's
+effective authority. An explicit start grant narrows that cap further with the
+same resource-grant shape used by agent turns:
+
+```whip
+invoke ReviewDocs {
+  task task
+}
+  with access to project_files {
+    read ["docs/**"]
+  }
+  as review
+```
+
+The grouped shorthand is equivalent and lowers to the same start-grant metadata:
+
+```whip
+invoke ReviewDocs {
+  task task
+}
+  with access to {
+    project_files {
+      read ["docs/**"]
+    }
+  }
+  as review
+```
+
+The grant is additive only as source syntax and narrowing only as authority: it
+can name authority the caller delegates to the child, but it cannot create
+authority the parent lacks or the child did not declare. Such a never-widen
+violation is rejected at the runtime start seam. The current implementation
+accepts both the resource-specific form `with access to <resource> { ... }` and
+the grouped shorthand `with access to { <resource> { ... } ... }` on `invoke`.
+
 Current implementation status: `invoke Workflow { ... } as binding` lowers to a
 durable `workflow.invoke` effect with structured input and dependency metadata.
 In the local dev/fixture worker, that effect starts a child workflow instance
@@ -599,6 +644,21 @@ instance is cancelled, the parent invocation effect is marked `cancelled` and
 projected as the `Cancelled` terminal, matched by `after review cancelled` (or
 the `Cancelled` arm of `after review completes`). Invocation records include
 source-span metadata when the parent effect has it.
+
+Current authority status: local root and ordinary child instances are minted as
+`workflow:local/<name>` with an effective-authority slot. Package-exported
+`@tool` workflows invoked through the owned harness are minted as
+`workflow:<package_id>/<name>` using the exporting manifest's package id. Under
+a governed envelope, an imported package tool also opens the membrane door
+`invoke:<package_id>/<tool>`; the consumer envelope must govern that door before
+the tool is accepted or offered to the model.
+Resource-specific `with access to <resource> { ... }` start grants are
+serialized on `workflow.invoke`; grouped shorthand grants desugar to the same
+resource-specific metadata. Rule-issued child starts run through the
+delegating start seam: without a grant, the child persists
+`declared(child) ∩ effective(parent)`; a grant narrows that cap further, and the
+seam runs child IFC admission before instance creation. Future ordinary
+package-qualified `invoke` surfaces must reuse the same package membrane door.
 
 If the same logic should be usable inline and as a child workflow, define a
 pattern for the reusable body and wrap it in a workflow:
@@ -689,10 +749,107 @@ capability schemas, effect providers, optional profiles, and optional bindings.
 They extend the registry but do not receive mutable access to kernel state or
 control-flow semantics.
 
+Turn-scoped authority narrowing for an agent is expressed as metadata on the
+`tell` effect:
+
+```whip
+tell reviewer as turn
+  with access to project_files {
+    read ["docs/**"]
+    write ["reports/**"]
+  }
+"""markdown
+Review the docs and update the report.
+"""
+```
+
+The grant does not create a child effect. It is lowered onto `agent.tell`,
+serialized into the owned-turn input, and resolved by the harness as a narrowed
+tool policy. For the owned harness, file tools are deny-by-default when no
+file-store grant is present; ungranted file tools are not offered to the model.
+`read`/`import` grants authorize read-like file tools, and `write`/`export`
+grants authorize write-like tools, both checked against the granted globs at each
+tool call. `edit` is offered only with both read and write grants and also
+requires both at execution because it reads existing content before rewriting it.
+The built-in
+profiles also intersect the owned harness tool surface: `repo-reader` and
+`human-review` are read-only, `repo-writer`/`permissive`/`release-operator` may
+mutate subject to grants, and `no-repo`/
+`internet-research` receive no filesystem/bash tools. Registered custom profiles
+are also consulted: the owned harness maps `repo.read`, `repo.write`, and
+`command.run` from `allowed_capabilities` to read, write, and bash tool
+authority before intersecting turn grants; tracker mutations use
+`tracker.file`, `tracker.claim`, `tracker.finish`, `tracker.release`,
+`tracker.update`, or `tracker.write`; curated `@tool` sub-workflow tools use
+`workflow.invoke`. If `tell` uses `requires [...]`, the owned harness also
+intersects the tool surface with the known owned-harness capabilities named
+there; the store rejects the turn before provider launch if the target agent did
+not declare them. When an IFC governance envelope is active,
+every file-store resource named by a turn grant must also be governed by that
+envelope before the owned turn is admitted. Bash is offered and executed only
+when all gates pass: the profile/registry/required-capability set permits
+`command.run`; the turn input carries `with access to command { run }`; the
+command matches the operator allow-list (`WHIPPLESCRIPT_HARNESS_BASH_ALLOW` —
+with no allow-list, every command is refused); the command is a single simple
+command (shell control operators, pipes, command substitution, backticks, and
+variable/glob/brace/tilde expansion are refused before execution); literal
+shell file redirection targets pass the same turn globs as file tools (`<`
+uses read globs, `>`/`>>` use write globs; dynamic redirection targets are
+refused); path-shaped arguments stay inside the workspace (absolute, `~`, and
+`..` paths are rejected); and, when an IFC governance envelope is active, the
+`command` resource is governed by that envelope. Command-specific side-effect
+classification (per-tool argv operand policies) is deliberately not part of
+this surface: the simple-command policy plus the operator allow-list is the
+whole enforcement boundary, and any subtler judgment belongs to the operator's
+allow-list. A per-command classifier sweep was prototyped and removed — it is
+not accepted design; reintroducing command-specific policy requires a
+model-first design pass with an explicitly bounded surface.
+Tracker `list_todos` is read-only; `add_todo` requires
+`with access to tracker { file }`, and
+`update_todo` requires the matching `claim`/`finish`/`release` grant (or
+`update`/`write`). When an IFC governance envelope is active, mutating tracker
+authority requires the `tracker` resource to be governed. Provider configs with
+`profile_ids` also act as endpoint allow-lists and block mismatched agent-turn
+profiles before provider launch. Broader governance-envelope label/argument
+policy and future provider/tool capability mappings remain Phase 4b work.
+
 All fact payloads, effect payloads, and `coerce` signatures use the type system
 defined in [type-system.md](type-system.md). WhippleScript supports
 schema-coercion-compatible boundary types, but only a small pure expression kernel. It should not grow
 loops, collection pipelines, numeric libraries, or media manipulation.
+
+## Coordination Partitioning
+
+Coordination resources (`lease`, `ledger`, `counter`) are workflow-owned by
+default. A resource named `slot` used by workflow `A` and workflow `B` maps to
+separate runtime owners, so the two workflows do not communicate through
+Held/Contended, ledger entries, or counter remaining-capacity outcomes merely
+because they chose the same source name.
+
+```whip
+lease deploy_slot {
+  key Environment
+  slots 1
+  ttl 10m
+}
+```
+
+Cross-workflow coordination is an audited opt-in. Add the bare `shared` field to
+make the resource use the shared owner:
+
+```whip
+lease deploy_slot {
+  shared
+  key Environment
+  slots 1
+  ttl 10m
+}
+```
+
+Under `shared`, branchable coordination outcomes are treated as cross-principal
+information-flow read sources, and mutations are governed sinks. The checker
+labels only shared resources actually used by more than one distinct workflow
+principal; single-principal self-coordination remains unlabeled.
 
 ## Parser Strategy
 
@@ -1160,8 +1317,11 @@ logic.
 
 ## Tags
 
-Tags are non-semantic source metadata for filtering, documentation, reports, and
-future release gates:
+Tags are source metadata for filtering, documentation, reports, and release
+gates. Most tags are non-semantic; semantic tags are explicitly named by the
+language. Today, `@private` on a workflow is semantic and prevents sibling
+workflow invocation as described in
+[Workflow Contracts And Invocation](#workflow-contracts-and-invocation):
 
 ```whipplescript
 @fixture
@@ -1183,15 +1343,16 @@ assert count(LanguageTask where status == "queued") == 6
 
 The current implementation accepts tags on workflows, tables, assertions, and
 rules. A tag starts with `@` and uses a single non-whitespace name made from
-letters, digits, `_`, `-`, `.`, and `:`. Examples: `@fixture`,
+letters, digits, `_`, `-`, `.`, and `:`. Examples: `@private`, `@fixture`,
 `@release-gate`, `@provider:codex`.
 
-Tags are preserved in typed IR as source metadata. They do not change rule
-readiness, rule ordering, effect routing, capabilities, provider selection,
-table seeding, effects, or runtime state. `whip dev` may include or exclude
-assertion evaluation by tag for validation reports, but this filtering is not
-workflow execution semantics. Duplicate tags are preserved for now; reporting
-may choose to de-duplicate in a future slice.
+Tags are preserved in typed IR as source metadata. Except for explicitly
+semantic tags such as `@private`, they do not change rule readiness, rule
+ordering, effect routing, capabilities, provider selection, table seeding,
+effects, or runtime state. `whip dev` may include or exclude assertion
+evaluation by tag for validation reports, but this filtering is not workflow
+execution semantics. Duplicate tags are preserved for now; reporting may choose
+to de-duplicate in a future slice.
 
 ## Descriptions
 

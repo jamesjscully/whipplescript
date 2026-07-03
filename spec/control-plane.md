@@ -574,6 +574,10 @@ Concurrency exists at three layers:
 3. Provider workers may execute effects in parallel subject to capability and
    profile policy.
 
+Provider bindings may also restrict a provider endpoint with `profile_ids`. A
+non-empty list is enforced before launch; a mismatched effect is recoverably
+blocked as `provider_config`, with no provider run started.
+
 Rule commits inside one instance are serialized. This avoids exposing authors to
 distributed transaction bugs. Concurrency is expressed through durable facts and
 effects, not simultaneous mutation of workflow state.
