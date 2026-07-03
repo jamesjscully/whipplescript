@@ -17,10 +17,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 use whipplescript_kernel::coerce_native::{
-    output_schema_envelope, CoerceProvider, CoerceTransport, CoerceTransportError, HttpRequest,
-    HttpResponse,
+    CoerceProvider, CoerceTransport, CoerceTransportError, HttpRequest, HttpResponse,
 };
-use whipplescript_parser::{IrProgram, IrType};
 
 /// Resolved configuration for a real coerce call.
 pub struct NativeCoerceConfig {
@@ -238,119 +236,6 @@ fn codex_oauth_token() -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Build the prompt and output schema for a declared coerce function.
-///
-/// Returns `(rendered_prompt, output_schema, wrapped, schema_name)`.
-pub fn build_coerce_call_parts(
-    ir: &IrProgram,
-    function_name: &str,
-    arguments: &Value,
-) -> Result<(String, Value, bool, String), String> {
-    let coerce = ir
-        .coerces
-        .iter()
-        .find(|coerce| coerce.name == function_name)
-        .ok_or_else(|| {
-            format!("coerce function `{function_name}` is not declared in the program")
-        })?;
-    let (schema, wrapped) = output_schema_envelope(&coerce.output, &ir.schemas);
-    // Coerce-call arguments lower to positional keys (`arg0`, `arg1`, …); map
-    // them to the declared parameter names so the prompt's `{{ <param> }}`
-    // interpolations resolve. The positional keys are preserved too.
-    let named = name_positional_arguments(coerce, arguments);
-    // Render after building the schema so `{{ ctx.output_format }}` can embed it:
-    // this makes the prompt self-describing and lets endpoints without native
-    // structured output still return schema-shaped JSON (prompt-instructed mode).
-    let prompt = render_coerce_prompt(&coerce.body, &named, Some(&schema));
-    Ok((prompt, schema, wrapped, output_type_name(&coerce.output)))
-}
-
-/// Map positional argument keys (`arg0`, `arg1`, …) to the coerce function's
-/// declared parameter names, keeping the originals so either form resolves.
-fn name_positional_arguments(coerce: &whipplescript_parser::IrCoerce, arguments: &Value) -> Value {
-    let Some(object) = arguments.as_object() else {
-        return arguments.clone();
-    };
-    let mut named = object.clone();
-    for (index, param) in coerce.params.iter().enumerate() {
-        if let Some(value) = object.get(&format!("arg{index}")) {
-            named
-                .entry(param.name.clone())
-                .or_insert_with(|| value.clone());
-        }
-    }
-    Value::Object(named)
-}
-
-fn output_type_name(ty: &IrType) -> String {
-    match ty {
-        IrType::Ref(name) => name.clone(),
-        _ => "CoerceResult".to_owned(),
-    }
-}
-
-/// Render a coerce prompt template: substitute `{{ arg }}` from the arguments
-/// object, replace the `{{ ctx.output_format }}` token with a structured-output
-/// instruction (the API enforces the schema, so this is a textual reminder), and
-/// leave any unrecognized interpolation untouched.
-pub fn render_coerce_prompt(
-    template: &str,
-    arguments: &Value,
-    output_schema: Option<&Value>,
-) -> String {
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(open) = rest.find("{{") {
-        out.push_str(&rest[..open]);
-        let after = &rest[open + 2..];
-        let Some(close) = after.find("}}") else {
-            // No closing braces: emit the remainder verbatim.
-            out.push_str("{{");
-            rest = after;
-            continue;
-        };
-        let key = after[..close].trim();
-        match resolve_template_key(key, arguments, output_schema) {
-            Some(value) => out.push_str(&value),
-            None => {
-                // Preserve unknown interpolation so nothing is silently dropped.
-                out.push_str("{{ ");
-                out.push_str(key);
-                out.push_str(" }}");
-            }
-        }
-        rest = &after[close + 2..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn resolve_template_key(
-    key: &str,
-    arguments: &Value,
-    output_schema: Option<&Value>,
-) -> Option<String> {
-    if key == "ctx.output_format" {
-        return Some(match output_schema {
-            Some(schema) => {
-                format!("Respond with a single JSON value matching this JSON Schema:\n{schema}")
-            }
-            None => {
-                "Respond with a single value that matches the required output schema.".to_owned()
-            }
-        });
-    }
-    // Support dotted access into the arguments object (`{{ item.summary }}`).
-    let mut current = arguments;
-    for segment in key.split('.') {
-        current = current.get(segment)?;
-    }
-    Some(match current {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    })
-}
-
 /// The single network side effect, backed by `ureq` (synchronous — consistent
 /// with how the worker drains effects serially; concurrency comes from running
 /// effects on a worker thread pool, not async).
@@ -461,6 +346,7 @@ fn assemble_responses_sse(raw: &str) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+    use whipplescript_kernel::coerce_native::{build_coerce_call_parts, render_coerce_prompt};
 
     #[test]
     fn assemble_responses_sse_prefers_delta_text_and_keeps_usage() {

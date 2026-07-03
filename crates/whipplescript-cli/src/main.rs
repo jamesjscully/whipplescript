@@ -22734,8 +22734,12 @@ fn run_native_coerce_effect(
             "string".to_owned(),
         )
     } else {
-        coerce_runtime::build_coerce_call_parts(&ir, &request.function_name, &arguments)
-            .map_err(StoreError::Conflict)?
+        whipplescript_kernel::coerce_native::build_coerce_call_parts(
+            &ir,
+            &request.function_name,
+            &arguments,
+        )
+        .map_err(StoreError::Conflict)?
     };
     let transport = coerce_runtime::UreqCoerceTransport::new(config.timeout);
     // Codex backend needs a (account_id, session_id) pair; the session id is a
