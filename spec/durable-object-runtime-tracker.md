@@ -131,6 +131,14 @@ in flight and expensive to retrofit:
    file manifests), so hash identity must not vary by storage tier, host
    binding, or serialization quirk.
 
+*Third customer (2026-07-03):* the **versioned workspace**
+(`spec/versioned-workspace-research-note.md`, pre-ADR) — whip-native version
+control generalizing checkpoints into branches (manifest pointers with
+children, virtual working sets, certified merge). Same substrate; the
+additional cheap-to-preserve requirement is that the manifest/cut design
+leaves room for a cut to have **divergent children** (a parent pointer, not a
+linear undo chain). No phase work now.
+
 ---
 
 ## Phase plan (open intent)
@@ -379,27 +387,30 @@ in flight and expensive to retrofit:
                 pure lowering layer now lives in the kernel;
             (2) lift the rule-pass ORCHESTRATION (`step_instance`/
                 `project_queue_items`) generic over held store handles — the crux
-                (open-by-path → threaded `&mut S`). **OPEN DESIGN FORK (awaiting
-                Jack, asked 2026-07-03):** the rule pass touches all THREE stores
-                (rule commits → runtime; `project_queue_items` → work-items;
-                terminal cleanup → coordination), which are three separate native
-                SQLite structs (`SqliteStore`/`CoordinationStore`/`WorkItemStore`,
-                each with `&mut self` trait methods) but ONE `DoSqliteStore` on the
-                DO. How the lifted pass obtains them:
-                (A, RECOMMENDED) unified facade — generic over one handle
-                `S: RuntimeStore + Coordination + WorkItems`; native `NativeStores`
-                facade holds the 3 connections and delegates (~111 fwds),
-                `DoSqliteStore` already impls all three. Clean single handle for the
-                DO + the step machine; solves the `&mut` aliasing problem; chunks
-                2–4 hold one `S`. (B) three handles threaded separately — DO can't
-                alias one object as three `&mut` → RefCell/interior mutability;
-                messy where the DO lives. (C) lift runtime core only, keep
-                queue/coordination as native hooks — smallest, but the DO can't run
-                them through it, deferring the reconciliation the step machine
-                needs. Also settle here: the generic fn holds one `RuntimeKernel<S>`
-                across the pass (vs. today's per-commit `new`/`into_store`), and
-                `RuntimeKernel<S>` must expose its store for the raw reads +
-                work-items calls the pass interleaves;
+                (open-by-path → threaded `&mut S`). **Store-handle fork resolved:
+                Option A (unified facade).** (2a) **DONE (commit 97959b1):**
+                `NativeStores` (`whipplescript-store`, native feat) presents the 3
+                native connections (`SqliteStore`/`CoordinationStore`/
+                `WorkItemStore`) as one handle impl'ing
+                `RuntimeStore + Coordination + WorkItems` by delegation (104 fwds;
+                the 7 shared-owner Coordination defaults inherited) — the native
+                counterpart to the DO's one `DoSqliteStore` impl'ing all three;
+                tested through all 3 surfaces; store 91 tests green.
+                (2b) NEXT — rewrite `step_instance` + `project_queue_items` +
+                `release_holder_resources_on_terminal` (+ `apply_rule_cancels`)
+                generic over one `RuntimeKernel<S>` where
+                `S: RuntimeStore + Coordination + WorkItems`, and move them to the
+                kernel (most deps — `lower_rule`/`ready_contexts`/`OwnedLowering`/
+                `GuardReport`/`BranchReport`/`idempotency_key` — are already there).
+                Design settled: `fail_instance_internal`/`derive_fact` are
+                `RuntimeKernel` methods (so hold the kernel, not bare `S`); add
+                `RuntimeKernel::store()`/`store_mut()` so the pass reaches `S`'s
+                Coordination/WorkItems + raw reads. **Behavior-sensitive:** native
+                today RE-OPENS the store each loop iteration; the generic holds ONE
+                connection across the pass — equivalent under WAL (autocommit reads
+                see other connections' commits) but must be gate-verified. Updates 6
+                native callers (`step`/`dev`/sub-workflow paths) to build
+                `NativeStores` from the 3 paths and pass one `RuntimeKernel`;
             (3) lift the effect executor + 13 store-only handlers, then the two
                 HTTP handlers as the already-built sans-IO effect machines;
             (4) assemble the `InstanceStepMachine` (the fixpoint as a `StepMachine`
