@@ -1,6 +1,7 @@
 //! Durable SQLite store for event logs, facts, effects, and evidence.
 
 pub mod coordination;
+pub mod files;
 pub mod items;
 
 use std::{

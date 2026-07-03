@@ -69,6 +69,9 @@ use whipplescript_store::{
     SqliteStore, StatusView, StoreError, WorkflowInvocationView, WorkflowRevisionView,
     WorkflowTerminal, WorkflowTerminalKind,
 };
+// File-effect byte I/O routes through the FileStore seam (DR-0033 Phase 4); the
+// native backing is `std::fs`.
+use whipplescript_store::files::{FileStore, NativeFileStore};
 
 mod auth;
 mod coerce_runtime;
@@ -24194,7 +24197,8 @@ fn run_file_effect(
     let allow = effect_allow_globs(&input);
     let read_outcome = match file_path_policy_error(path, store_name, &allow, "read") {
         Some(reason) => Err(reason),
-        None => fs::read_to_string(&full)
+        None => NativeFileStore
+            .read_to_string(&full)
             .map_err(|error| format!("read of `{}` failed: {error}", full.display())),
     };
     match read_outcome {
@@ -24334,7 +24338,7 @@ fn run_file_write_effect(
         if let Some(reason) = file_path_policy_error(path, store_name, &allow, "write") {
             Err(reason)
         } else {
-            let exists = full.exists();
+            let exists = NativeFileStore.exists(&full);
             // Mode policy (spec/std-library/files.md): no silent overwrite.
             let mode_ok = match mode.as_str() {
                 "create" if exists => Err(format!(
@@ -24348,18 +24352,14 @@ fn run_file_write_effect(
             };
             mode_ok.and_then(|()| {
                 if let Some(parent) = full.parent() {
-                    fs::create_dir_all(parent)
+                    NativeFileStore
+                        .create_dir_all(parent)
                         .map_err(|error| format!("create parent of `{path}`: {error}"))?;
                 }
                 let result = if mode == "append" {
-                    use std::io::Write as _;
-                    fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&full)
-                        .and_then(|mut file| file.write_all(body.as_bytes()))
+                    NativeFileStore.append(&full, body.as_bytes())
                 } else {
-                    fs::write(&full, body.as_bytes())
+                    NativeFileStore.write(&full, body.as_bytes())
                 };
                 result.map_err(|error| format!("write of `{}` failed: {error}", full.display()))
             })
@@ -24590,7 +24590,8 @@ fn run_file_import_effect(
         if let Some(reason) = file_path_policy_error(path, store_name, &allow, "read") {
             return Err(reason);
         }
-        let content = fs::read_to_string(&full)
+        let content = NativeFileStore
+            .read_to_string(&full)
             .map_err(|error| format!("read of `{}` failed: {error}", full.display()))?;
         let rows = decode_import_rows(&format, &content)?;
         for (index, row) in rows.iter().enumerate() {
@@ -24882,7 +24883,7 @@ fn run_file_export_effect(
                 rows.push(value);
             }
         }
-        let exists = full.exists();
+        let exists = NativeFileStore.exists(&full);
         match mode.as_str() {
             "create" if exists => {
                 return Err(format!(
@@ -24899,19 +24900,17 @@ fn run_file_export_effect(
         }
         let serialized = encode_export_rows(&format, &rows, &fields)?;
         if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent)
+            NativeFileStore
+                .create_dir_all(parent)
                 .map_err(|error| format!("create parent of `{path}`: {error}"))?;
         }
         if mode == "append" {
-            use std::io::Write as _;
-            fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&full)
-                .and_then(|mut file| file.write_all(serialized.as_bytes()))
+            NativeFileStore
+                .append(&full, serialized.as_bytes())
                 .map_err(|error| format!("append to `{}` failed: {error}", full.display()))?;
         } else {
-            fs::write(&full, serialized.as_bytes())
+            NativeFileStore
+                .write(&full, serialized.as_bytes())
                 .map_err(|error| format!("write of `{}` failed: {error}", full.display()))?;
         }
         Ok((rows.len(), stable_hash_hex(&serialized)))

@@ -238,10 +238,24 @@ in flight and expensive to retrofit:
       it is designed against a real consumer (see the trait doc-comments). This is
       the only Phase-3 remnant, deferred-with-cause.
 
-### Phase 4 — Files route through the store trait (tiering seam)
-- [ ] Route `file.read/write/import/export` through the store trait so a second
-      physical tier can slot in without touching the language. Native backing =
-      `std::fs`. Small-file inline-in-store path defined; large-tier is Phase 7.
+### Phase 4 — Files route through the store trait (tiering seam) — DONE 2026-07-03
+- [x] `FileStore` trait + `NativeFileStore` in
+      `crates/whipplescript-store/src/files.rs`: the byte-I/O seam
+      (`read_to_string`/`exists`/`create_dir_all`/`write`/`append`) the file
+      effects perform, object-safe so a DO backend can be a `&dyn FileStore`
+      (small files inline in DO SQLite, large spilled to an object store —
+      Phase 7). Native backing = `std::fs`.
+      `native_file_store_round_trips_through_the_trait` drives it through the
+      trait.
+- [x] All four handlers (`file.read`/`file.write`/`file.import`/`file.export`,
+      main.rs) route their raw `fs::` I/O through `NativeFileStore` — path
+      resolution and the `file store` policy boundary stay in the handler, only
+      the bytes cross the seam. Behavior identical: the 15 CLI file-effect tests
+      (`dev_file_read/write/import/export/*`, mode enforcement, path-escape
+      refusal, policy scoping) pass; fmt + `clippy -D warnings` clean; full
+      store+kernel+CLI suite green. The content-hash-handle / tiering model
+      (Decision 4) layers on later (Phase 7) behind this same seam; the
+      small-file-inline path is the native default.
 
 ### Phase 5 — DO host crate + TS shell (the wasm target)
 - [ ] `whipplescript-host-do` (wasm32) + Worker/DO shell: async `fetch` driver for
