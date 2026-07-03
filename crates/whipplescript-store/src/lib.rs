@@ -3,6 +3,8 @@
 pub mod coordination;
 pub mod files;
 pub mod items;
+#[cfg(feature = "native")]
+pub mod native_stores;
 
 use std::result;
 #[cfg(feature = "native")]
