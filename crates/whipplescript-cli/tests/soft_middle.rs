@@ -2211,6 +2211,56 @@ rule ship
 }
 "#;
 
+const PARTITIONED_LEASE_SOURCE: &str = r#"
+workflow __WORKFLOW__
+
+output result Held
+failure error Failed
+
+class Held {
+  tag string
+}
+
+class Failed {
+  reason string
+}
+
+class Key {
+  id string
+}
+
+lease slot {
+  key Key
+  slots 1
+  ttl 1h
+}
+
+rule seed
+  when started
+=> {
+  record Key {
+    id "same"
+  }
+}
+
+rule grab
+  when Key as k
+=> {
+  acquire slot for k.id until ttl as lease
+
+  after lease held {
+    record Held {
+      tag k.id
+    }
+  }
+  after lease contended {
+    fail error {
+      reason "busy"
+    }
+  }
+}
+"#;
+
 fn dev_with_coordination(bin: &str, store: &str, source: &str, coordination: &str) -> Value {
     let mut command = Command::new(bin);
     command
@@ -2293,7 +2343,14 @@ fn lease_contention_routes_to_contended_arm() {
             .expect("open coordination store");
         assert_eq!(
             seeded
-                .try_acquire("deploy_slot", "prod", 1, 600, "ins_other")
+                .try_acquire_for_owner(
+                    "local/LeaseDemo",
+                    "deploy_slot",
+                    "prod",
+                    1,
+                    600,
+                    "ins_other"
+                )
                 .expect("seed holder"),
             whipplescript_store::coordination::AcquireOutcome::Held
         );
@@ -2314,6 +2371,157 @@ fn lease_contention_routes_to_contended_arm() {
 
     let _ = fs::remove_file(store);
     let _ = fs::remove_file(source);
+    let _ = fs::remove_file(coordination);
+}
+
+#[test]
+fn coordination_leases_are_partitioned_by_workflow_owner() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("lease-partition", "sqlite");
+    let source_a = temp_path("lease-partition-a", "whip");
+    let source_b = temp_path("lease-partition-b", "whip");
+    let coordination = temp_path("lease-partition-coord", "sqlite");
+    fs::write(
+        &source_a,
+        PARTITIONED_LEASE_SOURCE.replace("__WORKFLOW__", "PartitionAlpha"),
+    )
+    .expect("write source a");
+    fs::write(
+        &source_b,
+        PARTITIONED_LEASE_SOURCE.replace("__WORKFLOW__", "PartitionBeta"),
+    )
+    .expect("write source b");
+
+    let store_str = store.to_str().expect("utf-8");
+    let coordination_str = coordination.to_str().expect("utf-8");
+    let first = dev_with_coordination(
+        bin,
+        store_str,
+        source_a.to_str().expect("utf-8"),
+        coordination_str,
+    );
+    let first_instance = first
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("first instance");
+    assert_eq!(instance_status(bin, store_str, first_instance), "running");
+
+    let second = dev_with_coordination(
+        bin,
+        store_str,
+        source_b.to_str().expect("utf-8"),
+        coordination_str,
+    );
+    let second_instance = second
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("second instance");
+    assert_eq!(instance_status(bin, store_str, second_instance), "running");
+
+    let output = Command::new(bin)
+        .args(["--json", "leases"])
+        .env("WHIPPLESCRIPT_COORDINATION_STORE", coordination_str)
+        .output()
+        .expect("leases runs");
+    assert!(
+        output.status.success(),
+        "leases failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let leases: Value =
+        serde_json::from_str(&stdout[stdout.find('[').expect("json")..]).expect("leases json");
+    let owners: Vec<_> = leases
+        .as_array()
+        .expect("lease array")
+        .iter()
+        .filter_map(|lease| lease.get("owner").and_then(Value::as_str))
+        .collect();
+    assert_eq!(owners.len(), 2, "{leases}");
+    assert!(owners.contains(&"local/PartitionAlpha"), "{leases}");
+    assert!(owners.contains(&"local/PartitionBeta"), "{leases}");
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source_a);
+    let _ = fs::remove_file(source_b);
+    let _ = fs::remove_file(coordination);
+}
+
+#[test]
+fn shared_coordination_lease_opts_into_cross_workflow_contention() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("lease-shared", "sqlite");
+    let source_a = temp_path("lease-shared-a", "whip");
+    let source_b = temp_path("lease-shared-b", "whip");
+    let coordination = temp_path("lease-shared-coord", "sqlite");
+    let shared_source =
+        PARTITIONED_LEASE_SOURCE.replace("lease slot {\n  key", "lease slot {\n  shared\n  key");
+    fs::write(
+        &source_a,
+        shared_source.replace("__WORKFLOW__", "SharedAlpha"),
+    )
+    .expect("write source a");
+    fs::write(
+        &source_b,
+        shared_source.replace("__WORKFLOW__", "SharedBeta"),
+    )
+    .expect("write source b");
+
+    let store_str = store.to_str().expect("utf-8");
+    let coordination_str = coordination.to_str().expect("utf-8");
+    let first = dev_with_coordination(
+        bin,
+        store_str,
+        source_a.to_str().expect("utf-8"),
+        coordination_str,
+    );
+    let first_instance = first
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("first instance");
+    assert_eq!(instance_status(bin, store_str, first_instance), "running");
+
+    let second = dev_with_coordination(
+        bin,
+        store_str,
+        source_b.to_str().expect("utf-8"),
+        coordination_str,
+    );
+    let second_instance = second
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("second instance");
+    assert_eq!(instance_status(bin, store_str, second_instance), "failed");
+
+    let output = Command::new(bin)
+        .args(["--json", "leases"])
+        .env("WHIPPLESCRIPT_COORDINATION_STORE", coordination_str)
+        .output()
+        .expect("leases runs");
+    assert!(
+        output.status.success(),
+        "leases failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let leases: Value =
+        serde_json::from_str(&stdout[stdout.find('[').expect("json")..]).expect("leases json");
+    let rows = leases.as_array().expect("lease array");
+    assert_eq!(rows.len(), 1, "{leases}");
+    assert_eq!(
+        rows[0].get("owner").and_then(Value::as_str),
+        Some("shared"),
+        "{leases}"
+    );
+    assert_eq!(
+        rows[0].get("holder").and_then(Value::as_str),
+        Some(first_instance),
+        "{leases}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source_a);
+    let _ = fs::remove_file(source_b);
     let _ = fs::remove_file(coordination);
 }
 
@@ -3540,9 +3748,9 @@ fn ifc_runtime_admission_refuses_a_violating_whip() {
 }
 
 /// End-to-end cross-package IFC (DR-0029, Wave 3): a consuming whip imports a
-/// `@tool` whose surface opens a door (`secretz`) the consumer's governance does
-/// not cover, so `whip check` rejects the import fail-closed (X1/X8); governing the
-/// door clears it.
+/// `@tool` whose surface opens doors (`secretz` and the package invoke membrane)
+/// the consumer's governance does not cover, so `whip check` rejects the import
+/// fail-closed (X1/X8/E1); governing those doors clears it.
 #[test]
 fn ifc_cross_package_rejects_imported_tool_with_ungoverned_surface() {
     let bin = env!("CARGO_BIN_EXE_whip");
@@ -3600,17 +3808,44 @@ fn ifc_cross_package_rejects_imported_tool_with_ungoverned_surface() {
     assert!(
         !governed.status.success()
             && stderr.contains("cross-package information-flow violation")
-            && stderr.contains("secretz"),
-        "expected a cross-package violation naming secretz\nstderr:\n{stderr}"
+            && stderr.contains("secretz")
+            && stderr.contains("invoke:package-leaky/LeakyTool"),
+        "expected a cross-package violation naming secretz and the invoke door\nstderr:\n{stderr}"
     );
 
-    // govern `secretz` -> the import clears.
+    // govern `secretz` but not the cross-package invoke door -> E1 still fails.
     fs::write(
         &envelope,
         "grant file_store crm -> file:/srv/crm readable by Operator\n\
          grant file_store secretz -> file:/srv/s readable by Operator\n",
     )
     .expect("env2");
+    let missing_invoke = Command::new(bin)
+        .args([
+            "check",
+            consumer.to_str().expect("utf-8"),
+            "--package-lock",
+            lock.to_str().expect("utf-8"),
+        ])
+        .env("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope)
+        .output()
+        .expect("check runs");
+    let missing_invoke_stderr = String::from_utf8_lossy(&missing_invoke.stderr);
+    assert!(
+        !missing_invoke.status.success()
+            && missing_invoke_stderr.contains("cross-package information-flow violation")
+            && missing_invoke_stderr.contains("invoke:package-leaky/LeakyTool"),
+        "missing package invoke grant should still fail\nstderr:\n{missing_invoke_stderr}"
+    );
+
+    // Govern both the tool surface and the package invoke door -> the import clears.
+    fs::write(
+        &envelope,
+        "grant file_store crm -> file:/srv/crm readable by Operator\n\
+         grant file_store secretz -> file:/srv/s readable by Operator\n\
+         grant invoke LeakyTool -> invoke:package-leaky/LeakyTool public\n",
+    )
+    .expect("env3");
     let cleared = Command::new(bin)
         .args([
             "check",

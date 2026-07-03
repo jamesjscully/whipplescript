@@ -182,9 +182,10 @@ pub struct EffectStmt {
     pub span: SourceSpan,
 }
 
-/// A turn-access grant (`with access to <resource> { <grant clauses> }`) on a `tell`:
-/// authority-narrowing metadata per Proposal A (spec/agent-harness.md). The granted
-/// operations narrow the turn's effective authority on `resource`.
+/// Access grant metadata (`with access to <resource> { <grant clauses> }`) on an
+/// effect. On `tell`, it narrows the turn's effective authority per Proposal A
+/// (spec/agent-harness.md). On `invoke`, it is the explicit start-grant surface for
+/// narrowing the child workflow's authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccessGrant {
     pub resource: String,
@@ -225,6 +226,12 @@ pub enum BodyEffectKind {
     AskHuman {
         choices: Vec<String>,
     },
+    /// Bare free-text model prompt: `prompt "<text>" [using <provider>] as x`.
+    /// It lowers through the same model/backend path as `coerce`, but its
+    /// completed value is a plain string.
+    Prompt {
+        provider: Option<String>,
+    },
     /// Inline anonymous coercion: `decide "<prompt>" -> { field type, ... } as x`.
     Decide {
         result_fields: Vec<(String, String)>,
@@ -241,6 +248,7 @@ pub enum BodyEffectKind {
     Invoke {
         workflow: String,
         payload: Vec<FieldAssign>,
+        access_grants: Vec<AccessGrant>,
     },
     Timer {
         duration_seconds: u64,
@@ -1037,7 +1045,7 @@ impl<'a> BodyParser<'a> {
                     Some(
                         "statements start with record, done, tell, coerce, askHuman, claim, \
                          release, finish, file, call, recall, invoke, emit, after, case, complete, \
-                         fail, timer, cancel, decide, or exec"
+                         fail, timer, cancel, decide, prompt, or exec"
                             .to_owned(),
                     ),
                 );
@@ -1055,6 +1063,7 @@ impl<'a> BodyParser<'a> {
             "tell" => self.parse_tell(),
             "coerce" => self.parse_coerce_call(),
             "askHuman" => self.parse_ask_human(),
+            "prompt" => self.parse_prompt_effect(),
             "decide" => self.parse_decide(),
             "call" => self.parse_call(),
             "recall" => self.parse_recall(),
@@ -1100,7 +1109,7 @@ impl<'a> BodyParser<'a> {
                     Some(
                         "statements start with record, done, tell, coerce, askHuman, claim, \
                          release, finish, file, call, recall, invoke, emit, after, case, complete, \
-                         fail, timer, cancel, decide, or exec"
+                         fail, timer, cancel, decide, prompt, or exec"
                             .to_owned(),
                     ),
                 );
@@ -1458,8 +1467,8 @@ impl<'a> BodyParser<'a> {
         let mut timeout_seconds = None;
         let mut access_grants = Vec::new();
         // Pre-prompt modifiers may interleave the standard ones (`as`/`requires`/
-        // `timeout`) with `with access to` turn-access grants.
-        if !self.parse_tell_modifiers(
+        // `timeout`) with `with access to` grants.
+        if !self.parse_effect_modifiers_with_access(
             &mut binding,
             &mut requires,
             &mut timeout_seconds,
@@ -1468,7 +1477,7 @@ impl<'a> BodyParser<'a> {
             return None;
         }
         let prompt = self.parse_prompt()?;
-        if !self.parse_tell_modifiers(
+        if !self.parse_effect_modifiers_with_access(
             &mut binding,
             &mut requires,
             &mut timeout_seconds,
@@ -1489,9 +1498,9 @@ impl<'a> BodyParser<'a> {
         }))
     }
 
-    /// Parse `tell` modifiers, interleaving the shared effect modifiers with
-    /// `with access to` turn-access grants until neither matches.
-    fn parse_tell_modifiers(
+    /// Parse effect modifiers, interleaving the shared effect modifiers with
+    /// `with access to` grants until neither matches.
+    fn parse_effect_modifiers_with_access(
         &mut self,
         binding: &mut Option<String>,
         requires: &mut Vec<String>,
@@ -1512,10 +1521,11 @@ impl<'a> BodyParser<'a> {
         }
     }
 
-    /// Parse one `with access to <resource> { <op clauses> }` turn-access grant. Each
-    /// clause is an operation name with an optional `for <target>` ref and/or
-    /// `["glob", …]` paths. `with context`/`with skills` modifiers are not yet
-    /// supported and are reported as such.
+    /// Parse `with access to <resource> { <op clauses> }`, or the resource-less
+    /// shorthand `with access to { <resource> { <op clauses> } ... }`. Each clause is
+    /// an operation name with an optional `for <target>` ref and/or `["glob", …]`
+    /// paths. `with context`/`with skills` modifiers are not yet supported and are
+    /// reported as such.
     fn parse_access_grant(&mut self, grants: &mut Vec<AccessGrant>) -> bool {
         let start = self.pos;
         self.pos += 1; // with
@@ -1534,6 +1544,51 @@ impl<'a> BodyParser<'a> {
             self.error(span, "expected `to` after `with access`".to_owned(), None);
             return false;
         }
+        if self.consume_sym('{') {
+            let mut resources = 0usize;
+            loop {
+                if self.consume_sym('}') {
+                    break;
+                }
+                resources += 1;
+                let grant_start = self.pos;
+                let Some(resource) =
+                    self.ident_text("resource in the access-grant shorthand block")
+                else {
+                    return false;
+                };
+                if !self.consume_sym('{') {
+                    let span = self.span_here();
+                    self.error(
+                        span,
+                        "expected `{` to open the resource access-grant block".to_owned(),
+                        None,
+                    );
+                    return false;
+                }
+                let Some(operations) = self.parse_access_grant_operations() else {
+                    return false;
+                };
+                grants.push(AccessGrant {
+                    resource,
+                    operations,
+                    span: self.span_from(grant_start),
+                });
+            }
+            if resources == 0 {
+                let span = self.span_from(start);
+                self.error(
+                    span,
+                    "access-grant shorthand block grants no resources".to_owned(),
+                    Some(
+                        "write `with access to <resource> { ... }`, or add resource blocks inside the shorthand"
+                            .to_owned(),
+                    ),
+                );
+                return false;
+            }
+            return true;
+        }
         let Some(resource) = self.ident_text("resource after `with access to`") else {
             return false;
         };
@@ -1546,27 +1601,37 @@ impl<'a> BodyParser<'a> {
             );
             return false;
         }
+        let Some(operations) = self.parse_access_grant_operations() else {
+            return false;
+        };
+        grants.push(AccessGrant {
+            resource,
+            operations,
+            span: self.span_from(start),
+        });
+        true
+    }
+
+    fn parse_access_grant_operations(&mut self) -> Option<Vec<AccessGrantOp>> {
         let mut operations = Vec::new();
         loop {
             if self.consume_sym('}') {
-                break;
+                return Some(operations);
             }
             let op_start = self.pos;
-            let Some(operation) = self.ident_text("operation in the access-grant block") else {
-                return false;
-            };
+            let operation = self.ident_text("operation in the access-grant block")?;
             let mut target = None;
             if self.consume_ident("for") {
                 match self.ident_text("target after `for`") {
                     Some(name) => target = Some(name),
-                    None => return false,
+                    None => return None,
                 }
             }
             let mut globs = Vec::new();
             if self.at_sym('[') {
                 match self.parse_string_array() {
                     Some(values) => globs = values,
-                    None => return false,
+                    None => return None,
                 }
             }
             operations.push(AccessGrantOp {
@@ -1576,12 +1641,6 @@ impl<'a> BodyParser<'a> {
                 span: self.span_from(op_start),
             });
         }
-        grants.push(AccessGrant {
-            resource,
-            operations,
-            span: self.span_from(start),
-        });
-        true
     }
 
     fn parse_coerce_call(&mut self) -> Option<BodyStmt> {
@@ -1666,6 +1725,40 @@ impl<'a> BodyParser<'a> {
         }
         Some(BodyStmt::Effect(EffectStmt {
             kind: BodyEffectKind::AskHuman { choices },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: Some(prompt),
+            span: self.span_from(start),
+        }))
+    }
+
+    fn parse_prompt_effect(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // prompt
+        let prompt = self.parse_prompt()?;
+        let provider = if self.consume_ident("using") {
+            Some(self.ident_text("provider after `using`")?)
+        } else {
+            None
+        };
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+            return None;
+        }
+        if binding.is_none() {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "`prompt` requires an `as` binding".to_owned(),
+                Some("write `prompt \"Summarize this\" as summary`".to_owned()),
+            );
+            return None;
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::Prompt { provider },
             binding,
             requires,
             timeout_seconds,
@@ -2305,11 +2398,21 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        let mut access_grants = Vec::new();
+        if !self.parse_effect_modifiers_with_access(
+            &mut binding,
+            &mut requires,
+            &mut timeout_seconds,
+            &mut access_grants,
+        ) {
             return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::Invoke { workflow, payload },
+            kind: BodyEffectKind::Invoke {
+                workflow,
+                payload,
+                access_grants,
+            },
             binding,
             requires,
             timeout_seconds,
@@ -3344,10 +3447,10 @@ impl<'a> BodyParser<'a> {
 }
 
 const STATEMENT_KEYWORDS: &[&str] = &[
-    "record", "done", "consume", "tell", "coerce", "askHuman", "claim", "release", "finish",
-    "file", "call", "recall", "send", "invoke", "read", "write", "import", "export", "after",
-    "case", "complete", "fail", "flowfail", "timer", "cancel", "decide", "exec", "when", "on",
-    "else", "redact",
+    "record", "done", "consume", "tell", "coerce", "askHuman", "prompt", "claim", "release",
+    "finish", "file", "call", "recall", "send", "invoke", "read", "write", "import", "export",
+    "after", "case", "complete", "fail", "flowfail", "timer", "cancel", "decide", "exec", "when",
+    "on", "else", "redact",
 ];
 
 #[cfg(test)]
@@ -3475,6 +3578,26 @@ mod tests {
         let prompt = effect.prompt.as_ref().expect("prompt");
         assert_eq!(prompt.content_type.as_deref(), Some("markdown"));
         assert_eq!(prompt.text, "Do it.");
+    }
+
+    #[test]
+    fn parses_prompt_effect() {
+        let ast = parse_ok(
+            "prompt \"\"\"markdown\nSummarize this.\n\"\"\" using fixture requires [\"model.invoke\"] as answer timeout 10m",
+        );
+        let BodyStmt::Effect(effect) = &ast.statements[0] else {
+            panic!("expected effect");
+        };
+        let BodyEffectKind::Prompt { provider } = &effect.kind else {
+            panic!("expected prompt");
+        };
+        assert_eq!(provider.as_deref(), Some("fixture"));
+        assert_eq!(effect.binding.as_deref(), Some("answer"));
+        assert_eq!(effect.requires, vec!["model.invoke".to_owned()]);
+        assert_eq!(effect.timeout_seconds, Some(600));
+        let prompt = effect.prompt.as_ref().expect("prompt");
+        assert_eq!(prompt.content_type.as_deref(), Some("markdown"));
+        assert_eq!(prompt.text, "Summarize this.");
     }
 
     #[test]
@@ -3809,11 +3932,82 @@ mod tests {
         let BodyStmt::Effect(effect) = &ast.statements[0] else {
             panic!("expected effect");
         };
-        let BodyEffectKind::Invoke { workflow, payload } = &effect.kind else {
+        let BodyEffectKind::Invoke {
+            workflow, payload, ..
+        } = &effect.kind
+        else {
             panic!("expected invoke");
         };
         assert_eq!(workflow, "ReviewPhase");
         assert!(matches!(payload[0].value, FieldValue::Nested { .. }));
+    }
+
+    #[test]
+    fn parses_invoke_with_access_grants() {
+        let ast = parse_ok(
+            "invoke Child {\n  task Task { id ticket.id }\n}\n  with access to project_files {\n    read [\"docs/**\"]\n  }\n  as child",
+        );
+        let BodyStmt::Effect(effect) = &ast.statements[0] else {
+            panic!("expected effect");
+        };
+        let BodyEffectKind::Invoke {
+            workflow,
+            payload,
+            access_grants,
+        } = &effect.kind
+        else {
+            panic!("expected invoke");
+        };
+        assert_eq!(workflow, "Child");
+        assert_eq!(effect.binding.as_deref(), Some("child"));
+        assert!(matches!(payload[0].value, FieldValue::Nested { .. }));
+        assert_eq!(access_grants.len(), 1);
+        assert_eq!(access_grants[0].resource, "project_files");
+        assert_eq!(access_grants[0].operations[0].operation, "read");
+        assert_eq!(
+            access_grants[0].operations[0].globs,
+            vec!["docs/**".to_owned()]
+        );
+    }
+
+    #[test]
+    fn parses_invoke_with_resource_less_access_grant_shorthand() {
+        let ast = parse_ok(
+            "invoke Child {\n  task Task { id ticket.id }\n}\n  with access to {\n    project_memory {\n      recall for ticket\n    }\n    project_files {\n      read [\"docs/**\"]\n    }\n  }\n  as child",
+        );
+        let BodyStmt::Effect(effect) = &ast.statements[0] else {
+            panic!("expected effect");
+        };
+        let BodyEffectKind::Invoke { access_grants, .. } = &effect.kind else {
+            panic!("expected invoke");
+        };
+        assert_eq!(effect.binding.as_deref(), Some("child"));
+        assert_eq!(access_grants.len(), 2);
+
+        let memory = &access_grants[0];
+        assert_eq!(memory.resource, "project_memory");
+        assert_eq!(memory.operations[0].operation, "recall");
+        assert_eq!(memory.operations[0].target.as_deref(), Some("ticket"));
+
+        let files = &access_grants[1];
+        assert_eq!(files.resource, "project_files");
+        assert_eq!(files.operations[0].operation, "read");
+        assert_eq!(files.operations[0].globs, vec!["docs/**".to_owned()]);
+    }
+
+    #[test]
+    fn rejects_empty_resource_less_access_grant_shorthand() {
+        let (_, diagnostics) = parse_rule_body(
+            "invoke Child { task task }\n  with access to {\n  }\n  as child",
+            0,
+            BodyMode::Rule,
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("grants no resources")),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]

@@ -25,7 +25,9 @@ use whipplescript_kernel::{BrokeredTurnContext, RuntimeKernel};
 use whipplescript_parser::IrWorkflowContractKind;
 use whipplescript_store::coordination::{AcquireOutcome, CoordinationStore};
 use whipplescript_store::items::WorkItemStore;
-use whipplescript_store::{StoreError, StoreResult, StoredEvent};
+use whipplescript_store::{
+    RegisteredProfilePolicy, SqliteStore, StoreError, StoreResult, StoredEvent,
+};
 
 use crate::coerce_runtime::{resolve_credential_with_source, UreqCoerceTransport};
 
@@ -39,6 +41,8 @@ pub const TOOL_BASH: &str = "bash";
 pub const TOOL_LIST_TODOS: &str = "list_todos";
 pub const TOOL_ADD_TODO: &str = "add_todo";
 pub const TOOL_UPDATE_TODO: &str = "update_todo";
+
+const TRACKER_RESOURCE: &str = "tracker";
 
 /// Default wall-clock cap for a single `bash` command, in seconds.
 const BASH_DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -95,8 +99,13 @@ const DEFAULT_MAX_BYTES: usize = 50_000;
 /// Bound on files visited by `find`/`grep` so a huge tree cannot stall a turn.
 const MAX_FILES_WALKED: usize = 5_000;
 
-/// The model-facing tool specs (names + JSON schemas) offered to the model.
-pub fn file_tool_specs() -> Vec<ToolSpec> {
+#[cfg(test)]
+fn file_tool_specs_for_profile(profile: Option<&str>) -> Vec<ToolSpec> {
+    let policy = HarnessProfilePolicy::for_profile(profile);
+    file_tool_specs_for_policy(&policy)
+}
+
+fn file_tool_specs_for_policy(policy: &HarnessProfilePolicy) -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: TOOL_READ.into(),
@@ -209,6 +218,53 @@ pub fn file_tool_specs() -> Vec<ToolSpec> {
             }),
         },
     ]
+    .into_iter()
+    .filter(|spec| policy.allows_tool(&spec.name))
+    .collect()
+}
+
+fn file_tool_specs_for_turn(
+    policy: &HarnessProfilePolicy,
+    access: &TurnToolAccess,
+) -> Vec<ToolSpec> {
+    let read_files = access.file.read_globs.is_some();
+    let write_files = access.file.write_globs.is_some();
+    file_tool_specs_for_policy(policy)
+        .into_iter()
+        .filter(|spec| match spec.name.as_str() {
+            TOOL_READ | TOOL_GREP | TOOL_FIND | TOOL_LS => read_files,
+            TOOL_WRITE => write_files,
+            TOOL_EDIT => read_files && write_files,
+            TOOL_BASH => access.command_run,
+            _ => true,
+        })
+        .collect()
+}
+
+fn tracker_tool_specs_for_turn(
+    policy: &HarnessProfilePolicy,
+    access: &TurnToolAccess,
+) -> Vec<ToolSpec> {
+    tracker_tool_specs()
+        .into_iter()
+        .filter(|spec| match spec.name.as_str() {
+            TOOL_LIST_TODOS => true,
+            TOOL_ADD_TODO => policy.tracker_file && access.tracker.file,
+            TOOL_UPDATE_TODO => policy.allows_tracker_update() && access.tracker.allows_update(),
+            _ => true,
+        })
+        .collect()
+}
+
+fn workflow_tool_specs_for_policy(
+    policy: &HarnessProfilePolicy,
+    specs: Vec<ToolSpec>,
+) -> Vec<ToolSpec> {
+    if policy.workflow_invoke {
+        specs
+    } else {
+        Vec::new()
+    }
 }
 
 /// A registered `@tool` sub-workflow (DR-0025): the tool name the model sees, the
@@ -219,19 +275,25 @@ pub struct WorkflowToolEntry {
     name: String,
     path: PathBuf,
     root: String,
+    package_id: String,
 }
 
 /// Executes the slice-1 file tools against a single workspace root, enforcing the
 /// `file store` path policy (no absolute/`..` escape; optional read/write globs).
 pub struct FileToolExecutor {
     root: PathBuf,
-    store_name: String,
-    allow_read: Vec<String>,
-    allow_write: Vec<String>,
+    file_policy: Option<FileToolPolicy>,
     bash_allow: Vec<String>,
+    profile_policy: HarnessProfilePolicy,
     tracker_queue: Option<String>,
     holder: String,
     max_bytes: usize,
+    /// `None` means no turn-access policy was installed (direct/test executor);
+    /// `Some(false)` is the live owned-turn default-deny command policy.
+    command_run_granted: Option<bool>,
+    /// `None` preserves direct/test executor behavior; live owned turns install
+    /// `Some` so tracker mutations are bound to `with access to tracker { ... }`.
+    tracker_access: Option<TurnTrackerAccess>,
     /// Registered `@tool` sub-workflows (DR-0025), dispatched synchronously.
     workflow_tools: Vec<WorkflowToolEntry>,
     /// Run-store path the sub-workflow child instances are created in. Set
@@ -247,6 +309,325 @@ pub struct FileToolExecutor {
     provider_ctx: Option<crate::SubworkflowProviderContext>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileToolPolicy {
+    store_name: String,
+    read_globs: Option<Vec<String>>,
+    write_globs: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TurnFileAccess {
+    store_name: String,
+    read_globs: Option<Vec<String>>,
+    write_globs: Option<Vec<String>>,
+}
+
+impl TurnFileAccess {
+    fn deny_all() -> Self {
+        Self {
+            store_name: "turn_access".to_owned(),
+            read_globs: None,
+            write_globs: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TurnToolAccess {
+    file: TurnFileAccess,
+    file_resources: Vec<String>,
+    command_run: bool,
+    tracker: TurnTrackerAccess,
+}
+
+impl TurnToolAccess {
+    fn deny_all() -> Self {
+        Self {
+            file: TurnFileAccess::deny_all(),
+            file_resources: Vec::new(),
+            command_run: false,
+            tracker: TurnTrackerAccess::deny_all(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TurnTrackerAccess {
+    file: bool,
+    claim: bool,
+    finish: bool,
+    release: bool,
+}
+
+impl TurnTrackerAccess {
+    fn deny_all() -> Self {
+        Self {
+            file: false,
+            claim: false,
+            finish: false,
+            release: false,
+        }
+    }
+
+    fn grant_update(&mut self) {
+        self.claim = true;
+        self.finish = true;
+        self.release = true;
+    }
+
+    fn grant_write(&mut self) {
+        self.file = true;
+        self.grant_update();
+    }
+
+    fn allows_update(&self) -> bool {
+        self.claim || self.finish || self.release
+    }
+
+    fn allows_status(&self, status: &str) -> bool {
+        match status {
+            "in_progress" => self.claim,
+            "completed" => self.finish,
+            "pending" => self.release,
+            _ => false,
+        }
+    }
+
+    fn mutates(&self) -> bool {
+        self.file || self.allows_update()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HarnessProfilePolicy {
+    profile: Option<String>,
+    read_files: bool,
+    write_files: bool,
+    bash: bool,
+    tracker_file: bool,
+    tracker_claim: bool,
+    tracker_finish: bool,
+    tracker_release: bool,
+    workflow_invoke: bool,
+}
+
+impl HarnessProfilePolicy {
+    fn permissive() -> Self {
+        Self {
+            profile: None,
+            read_files: true,
+            write_files: true,
+            bash: true,
+            tracker_file: true,
+            tracker_claim: true,
+            tracker_finish: true,
+            tracker_release: true,
+            workflow_invoke: true,
+        }
+    }
+
+    fn for_profile(profile: Option<&str>) -> Self {
+        match profile {
+            Some("repo-reader") | Some("human-review") => Self {
+                profile: profile.map(str::to_owned),
+                read_files: true,
+                write_files: false,
+                bash: false,
+                tracker_file: false,
+                tracker_claim: false,
+                tracker_finish: false,
+                tracker_release: false,
+                workflow_invoke: true,
+            },
+            Some("no-repo") | Some("internet-research") => Self {
+                profile: profile.map(str::to_owned),
+                read_files: false,
+                write_files: false,
+                bash: false,
+                tracker_file: false,
+                tracker_claim: false,
+                tracker_finish: false,
+                tracker_release: false,
+                workflow_invoke: true,
+            },
+            Some("repo-writer") | Some("permissive") | Some("release-operator") => Self {
+                profile: profile.map(str::to_owned),
+                read_files: true,
+                write_files: true,
+                bash: true,
+                tracker_file: true,
+                tracker_claim: true,
+                tracker_finish: true,
+                tracker_release: true,
+                workflow_invoke: true,
+            },
+            // Package-defined/custom profiles do not have a local tool-policy
+            // vocabulary in the owned harness yet. Preserve the existing behavior
+            // until the registry-backed profile policy lands.
+            _ => Self::permissive(),
+        }
+    }
+
+    fn for_profile_with_registry(
+        profile: Option<&str>,
+        registered: Option<&RegisteredProfilePolicy>,
+    ) -> Self {
+        let base = Self::for_profile(profile);
+        let Some(registered) = registered else {
+            return base;
+        };
+        base.intersect(&Self::from_registered_policy(profile, registered))
+    }
+
+    fn from_registered_policy(profile: Option<&str>, registered: &RegisteredProfilePolicy) -> Self {
+        if registered.enforcement_mode == "audit" {
+            return Self {
+                profile: profile.map(str::to_owned),
+                read_files: true,
+                write_files: true,
+                bash: true,
+                tracker_file: true,
+                tracker_claim: true,
+                tracker_finish: true,
+                tracker_release: true,
+                workflow_invoke: true,
+            };
+        }
+        let allows = |capability: &str| {
+            registered
+                .allowed_capabilities
+                .iter()
+                .any(|allowed| allowed == "*" || allowed == capability)
+        };
+        Self {
+            profile: profile.map(str::to_owned),
+            read_files: allows("repo.read"),
+            write_files: allows("repo.write"),
+            bash: allows("command.run"),
+            tracker_file: allows("tracker.write") || allows("tracker.file"),
+            tracker_claim: allows("tracker.write")
+                || allows("tracker.update")
+                || allows("tracker.claim"),
+            tracker_finish: allows("tracker.write")
+                || allows("tracker.update")
+                || allows("tracker.finish"),
+            tracker_release: allows("tracker.write")
+                || allows("tracker.update")
+                || allows("tracker.release"),
+            workflow_invoke: allows("workflow.invoke"),
+        }
+    }
+
+    fn from_required_capabilities(required: &[String]) -> Option<Self> {
+        let mut policy = Self {
+            profile: None,
+            read_files: false,
+            write_files: false,
+            bash: false,
+            tracker_file: false,
+            tracker_claim: false,
+            tracker_finish: false,
+            tracker_release: false,
+            workflow_invoke: false,
+        };
+        let mut recognized = false;
+        for capability in required {
+            match capability.as_str() {
+                "repo.read" => {
+                    recognized = true;
+                    policy.read_files = true;
+                }
+                "repo.write" => {
+                    recognized = true;
+                    policy.write_files = true;
+                }
+                "command.run" => {
+                    recognized = true;
+                    policy.bash = true;
+                }
+                "tracker.file" => {
+                    recognized = true;
+                    policy.tracker_file = true;
+                }
+                "tracker.claim" => {
+                    recognized = true;
+                    policy.tracker_claim = true;
+                }
+                "tracker.finish" => {
+                    recognized = true;
+                    policy.tracker_finish = true;
+                }
+                "tracker.release" => {
+                    recognized = true;
+                    policy.tracker_release = true;
+                }
+                "tracker.update" => {
+                    recognized = true;
+                    policy.tracker_claim = true;
+                    policy.tracker_finish = true;
+                    policy.tracker_release = true;
+                }
+                "tracker.write" => {
+                    recognized = true;
+                    policy.tracker_file = true;
+                    policy.tracker_claim = true;
+                    policy.tracker_finish = true;
+                    policy.tracker_release = true;
+                }
+                "workflow.invoke" => {
+                    recognized = true;
+                    policy.workflow_invoke = true;
+                }
+                _ => {}
+            }
+        }
+        recognized.then_some(policy)
+    }
+
+    fn intersect(&self, other: &Self) -> Self {
+        Self {
+            profile: self.profile.clone().or_else(|| other.profile.clone()),
+            read_files: self.read_files && other.read_files,
+            write_files: self.write_files && other.write_files,
+            bash: self.bash && other.bash,
+            tracker_file: self.tracker_file && other.tracker_file,
+            tracker_claim: self.tracker_claim && other.tracker_claim,
+            tracker_finish: self.tracker_finish && other.tracker_finish,
+            tracker_release: self.tracker_release && other.tracker_release,
+            workflow_invoke: self.workflow_invoke && other.workflow_invoke,
+        }
+    }
+
+    fn profile_name(&self) -> &str {
+        self.profile.as_deref().unwrap_or("<unspecified>")
+    }
+
+    fn allows_tool(&self, tool: &str) -> bool {
+        match tool {
+            TOOL_READ | TOOL_GREP | TOOL_FIND | TOOL_LS => self.read_files,
+            TOOL_WRITE | TOOL_EDIT => self.write_files,
+            TOOL_BASH => self.bash,
+            TOOL_ADD_TODO => self.tracker_file,
+            TOOL_UPDATE_TODO => self.allows_tracker_update(),
+            _ => true,
+        }
+    }
+
+    fn allows_tracker_update(&self) -> bool {
+        self.tracker_claim || self.tracker_finish || self.tracker_release
+    }
+
+    fn allows_tracker_status(&self, status: &str) -> bool {
+        match status {
+            "in_progress" => self.tracker_claim,
+            "completed" => self.tracker_finish,
+            "pending" => self.tracker_release,
+            _ => false,
+        }
+    }
+}
+
 impl FileToolExecutor {
     /// A workspace-rooted executor. Empty glob lists apply only the
     /// absolute/`..`-escape guard (the basic slice-1 sandbox); the `file store`
@@ -255,13 +636,14 @@ impl FileToolExecutor {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            store_name: "workspace".to_string(),
-            allow_read: Vec::new(),
-            allow_write: Vec::new(),
+            file_policy: None,
             bash_allow: bash_allow_from_env(),
+            profile_policy: HarnessProfilePolicy::permissive(),
             tracker_queue: None,
             holder: "agent".to_string(),
             max_bytes: DEFAULT_MAX_BYTES,
+            command_run_granted: None,
+            tracker_access: None,
             workflow_tools: Vec::new(),
             store_path: None,
             max_child_iterations: 8,
@@ -308,19 +690,76 @@ impl FileToolExecutor {
         allow_read: Vec<String>,
         allow_write: Vec<String>,
     ) -> Self {
-        self.store_name = store_name.into();
-        self.allow_read = allow_read;
-        self.allow_write = allow_write;
+        self.file_policy = Some(FileToolPolicy {
+            store_name: store_name.into(),
+            read_globs: Some(allow_read),
+            write_globs: Some(allow_write),
+        });
+        self
+    }
+
+    #[cfg(test)]
+    fn with_turn_file_access(mut self, access: TurnFileAccess) -> Self {
+        self.file_policy = Some(FileToolPolicy {
+            store_name: access.store_name,
+            read_globs: access.read_globs,
+            write_globs: access.write_globs,
+        });
+        self.command_run_granted = Some(false);
+        self.tracker_access = Some(TurnTrackerAccess::deny_all());
+        self
+    }
+
+    fn with_turn_tool_access(mut self, access: TurnToolAccess) -> Self {
+        self.file_policy = Some(FileToolPolicy {
+            store_name: access.file.store_name,
+            read_globs: access.file.read_globs,
+            write_globs: access.file.write_globs,
+        });
+        self.command_run_granted = Some(access.command_run);
+        self.tracker_access = Some(access.tracker);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_profile_policy(mut self, profile: Option<&str>) -> Self {
+        self.profile_policy = HarnessProfilePolicy::for_profile(profile);
+        self
+    }
+
+    fn with_resolved_profile_policy(mut self, policy: HarnessProfilePolicy) -> Self {
+        self.profile_policy = policy;
         self
     }
 
     fn policy(&self, path: &str, op: &str) -> Option<String> {
-        let globs = if op == "write" {
-            &self.allow_write
-        } else {
-            &self.allow_read
+        if op == "write" && !self.profile_policy.write_files {
+            return Some(format!(
+                "file write is not permitted by profile `{}`",
+                self.profile_policy.profile_name()
+            ));
+        }
+        if op != "write" && !self.profile_policy.read_files {
+            return Some(format!(
+                "file read is not permitted by profile `{}`",
+                self.profile_policy.profile_name()
+            ));
+        }
+        let Some(policy) = &self.file_policy else {
+            return crate::file_path_policy_error(path, "workspace", &[], op);
         };
-        crate::file_path_policy_error(path, &self.store_name, globs, op)
+        let globs = if op == "write" {
+            policy.write_globs.as_ref()
+        } else {
+            policy.read_globs.as_ref()
+        };
+        match globs {
+            Some(globs) => crate::file_path_policy_error(path, &policy.store_name, globs, op),
+            None => Some(format!(
+                "file {op} is not granted for store `{}` in this turn",
+                policy.store_name
+            )),
+        }
     }
 
     /// Override the bash allow-list (test/programmatic use).
@@ -360,6 +799,12 @@ impl FileToolExecutor {
         tool: &WorkflowToolEntry,
         args: &Value,
     ) -> Result<String, String> {
+        if !self.profile_policy.workflow_invoke {
+            return Err(format!(
+                "workflow tool invoke is not permitted by profile `{}`",
+                self.profile_policy.profile_name()
+            ));
+        }
         let store_path = self.store_path.as_ref().ok_or_else(|| {
             "workflow tools are not enabled for this turn (no store configured)".to_string()
         })?;
@@ -371,6 +816,7 @@ impl FileToolExecutor {
             store_path,
             &tool.path,
             &tool.root,
+            &tool.package_id,
             &input_json,
             self.max_child_iterations,
             &self.work_unit,
@@ -416,6 +862,9 @@ impl FileToolExecutor {
 
     fn edit(&self, args: &Value) -> Result<String, String> {
         let path = str_arg(args, "path")?;
+        if let Some(reason) = self.policy(path, "read") {
+            return Err(reason);
+        }
         if let Some(reason) = self.policy(path, "write") {
             return Err(reason);
         }
@@ -545,11 +994,29 @@ impl FileToolExecutor {
     /// combined stdout+stderr, truncated; a non-zero exit is an error result.
     fn bash(&self, args: &Value) -> Result<String, String> {
         let command = str_arg(args, "command")?;
+        if !self.profile_policy.bash {
+            return Err(format!(
+                "bash is not permitted by profile `{}`",
+                self.profile_policy.profile_name()
+            ));
+        }
+        if self.command_run_granted == Some(false) {
+            return Err(
+                "bash is not granted for this turn (`with access to command { run }` required)"
+                    .to_owned(),
+            );
+        }
         if !self.command_allowed(command) {
             return Err(format!(
                 "command refused: `{command}` is not permitted by WHIPPLESCRIPT_HARNESS_BASH_ALLOW"
             ));
         }
+        self.enforce_command_read_boundary(command)?;
+        self.enforce_command_write_boundary(command)?;
+        if let Some(reason) = command_argument_policy_violation(command) {
+            return Err(format!("command refused: {reason}"));
+        }
+        self.enforce_command_path_argument_boundary(command)?;
         let timeout = std::time::Duration::from_secs(
             args.get("timeout")
                 .and_then(Value::as_u64)
@@ -568,6 +1035,11 @@ impl FileToolExecutor {
     /// followed by whitespace (so `git` permits `git status` but not `gitfoo`).
     fn command_allowed(&self, command: &str) -> bool {
         let command = command.trim();
+        self.command_prefix_allowed(command)
+    }
+
+    fn command_prefix_allowed(&self, command: &str) -> bool {
+        let command = command.trim();
         self.bash_allow.iter().any(|prefix| {
             let prefix = prefix.trim();
             !prefix.is_empty()
@@ -576,6 +1048,51 @@ impl FileToolExecutor {
                         .strip_prefix(prefix)
                         .is_some_and(|rest| rest.starts_with(char::is_whitespace)))
         })
+    }
+
+    fn enforce_command_write_boundary(&self, command: &str) -> Result<(), String> {
+        for target in command_output_redirection_targets(command)? {
+            if is_fd_redirection_target(&target) || target == "/dev/null" {
+                continue;
+            }
+            if target.contains(['$', '`', '*', '?', '[', ']', '{', '}', '~']) {
+                return Err(format!(
+                    "command output redirection target `{target}` must be a literal workspace-relative path"
+                ));
+            }
+            if let Some(reason) = self.policy(&target, "write") {
+                return Err(format!(
+                    "command output redirection to `{target}` refused: {reason}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_command_read_boundary(&self, command: &str) -> Result<(), String> {
+        for target in command_input_redirection_targets(command)? {
+            if target.contains(['$', '`', '*', '?', '[', ']', '{', '}', '~']) {
+                return Err(format!(
+                    "command input redirection target `{target}` must be a literal workspace-relative path"
+                ));
+            }
+            if let Some(reason) = self.policy(&target, "read") {
+                return Err(format!(
+                    "command input redirection from `{target}` refused: {reason}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_command_path_argument_boundary(&self, command: &str) -> Result<(), String> {
+        let words = command_words(command)?;
+        for word in &words {
+            if let Some(reason) = command_path_argument_policy_violation(word) {
+                return Err(format!("command path argument `{word}` refused: {reason}"));
+            }
+        }
+        Ok(())
     }
 
     fn tracker(&self) -> Result<(WorkItemStore, String), String> {
@@ -587,9 +1104,53 @@ impl FileToolExecutor {
         Ok((store, queue))
     }
 
+    fn tracker_write_policy(&self, action: &str, status: Option<&str>) -> Option<String> {
+        let profile_allows = match action {
+            "file" => self.profile_policy.tracker_file,
+            "update" => status
+                .map(|status| self.profile_policy.allows_tracker_status(status))
+                .unwrap_or_else(|| self.profile_policy.allows_tracker_update()),
+            _ => true,
+        };
+        if !profile_allows {
+            return Some(format!(
+                "tracker {action} is not permitted by profile `{}`",
+                self.profile_policy.profile_name()
+            ));
+        }
+        let Some(access) = &self.tracker_access else {
+            return None;
+        };
+        let granted = match action {
+            "file" => access.file,
+            "update" => status
+                .map(|status| access.allows_status(status))
+                .unwrap_or_else(|| access.allows_update()),
+            _ => true,
+        };
+        if granted {
+            None
+        } else {
+            let expected = match (action, status) {
+                ("file", _) => "`with access to tracker { file }`",
+                ("update", Some("in_progress")) => "`with access to tracker { claim }`",
+                ("update", Some("completed")) => "`with access to tracker { finish }`",
+                ("update", Some("pending")) => "`with access to tracker { release }`",
+                ("update", _) => "`with access to tracker { update }`",
+                _ => "`with access to tracker { write }`",
+            };
+            Some(format!(
+                "tracker {action} is not granted for this turn ({expected} required)"
+            ))
+        }
+    }
+
     /// File a new tracker item (shared-state participation, refined I3): produces
     /// durable tracker state the workflow may observe, never a rule-matchable fact.
     fn add_todo(&self, args: &Value) -> Result<String, String> {
+        if let Some(reason) = self.tracker_write_policy("file", None) {
+            return Err(reason);
+        }
         let content = str_arg(args, "content")?;
         let (mut store, queue) = self.tracker()?;
         let holder = format!("agent:{}", self.holder);
@@ -629,6 +1190,9 @@ impl FileToolExecutor {
     fn update_todo(&self, args: &Value) -> Result<String, String> {
         let id = str_arg(args, "id")?;
         let status = str_arg(args, "status")?;
+        if let Some(reason) = self.tracker_write_policy("update", Some(status)) {
+            return Err(reason);
+        }
         let (mut store, _queue) = self.tracker()?;
         let holder = format!("agent:{}", self.holder);
         match status {
@@ -686,6 +1250,398 @@ fn bash_allow_from_env() -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn command_argument_policy_violation(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if single_quoted {
+            if byte == b'\'' {
+                single_quoted = false;
+            }
+            index += 1;
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if double_quoted {
+            match byte {
+                b'\\' => {
+                    escaped = true;
+                    index += 1;
+                    continue;
+                }
+                b'"' => {
+                    double_quoted = false;
+                    index += 1;
+                    continue;
+                }
+                b'`' => {
+                    return Some("command substitution with backticks is not permitted".to_owned());
+                }
+                b'$' if bytes.get(index + 1).is_some_and(|next| *next == b'(') => {
+                    return Some("command substitution with `$(` is not permitted".to_owned());
+                }
+                b'$' => {
+                    return Some("shell variable expansion is not permitted".to_owned());
+                }
+                _ => {
+                    index += 1;
+                    continue;
+                }
+            }
+        }
+        match byte {
+            b'\\' => escaped = true,
+            b'\'' => single_quoted = true,
+            b'"' => double_quoted = true,
+            b'`' => {
+                return Some("command substitution with backticks is not permitted".to_owned());
+            }
+            b'$' if bytes.get(index + 1).is_some_and(|next| *next == b'(') => {
+                return Some("command substitution with `$(` is not permitted".to_owned());
+            }
+            b'$' => {
+                return Some("shell variable expansion is not permitted".to_owned());
+            }
+            b'*' | b'?' => {
+                return Some("shell glob expansion is not permitted".to_owned());
+            }
+            b'[' | b']' if !is_shell_test_bracket_delimiter(command, index, byte) => {
+                return Some("shell glob expansion is not permitted".to_owned());
+            }
+            b'{' | b'}' => {
+                return Some("shell brace expansion is not permitted".to_owned());
+            }
+            b'~' => {
+                return Some("shell tilde expansion is not permitted".to_owned());
+            }
+            b';' | b'|' | b'&' | b'(' | b')' => {
+                return Some(format!(
+                    "shell control operator `{}` is not permitted",
+                    byte as char
+                ));
+            }
+            b'\n' | b'\r' => {
+                if command[index..].trim().is_empty() {
+                    break;
+                }
+                return Some("shell command separators are not permitted".to_owned());
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if single_quoted || double_quoted {
+        return Some("command has an unterminated quote".to_owned());
+    }
+    if escaped {
+        return Some("command has a trailing escape".to_owned());
+    }
+    None
+}
+
+fn is_shell_test_bracket_delimiter(command: &str, index: usize, byte: u8) -> bool {
+    let bytes = command.as_bytes();
+    match byte {
+        b'[' => {
+            command[..index].trim().is_empty()
+                && bytes
+                    .get(index + 1)
+                    .is_some_and(|next| next.is_ascii_whitespace())
+        }
+        b']' => {
+            command[index + 1..].trim().is_empty()
+                && command.trim_start().starts_with("[ ")
+                && index > 0
+                && bytes[index - 1].is_ascii_whitespace()
+        }
+        _ => false,
+    }
+}
+
+fn command_words(command: &str) -> Result<Vec<String>, String> {
+    let bytes = command.as_bytes();
+    let mut words = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        if matches!(bytes[index], b'<' | b'>') {
+            index += 1;
+            while index < bytes.len() && matches!(bytes[index], b'<' | b'>' | b'|') {
+                index += 1;
+            }
+            let (_, next_index) = shell_word_at(command, index)?;
+            index = next_index;
+            continue;
+        }
+        let (word, next_index) = shell_word_at(command, index)?;
+        match word {
+            Some(word) => {
+                words.push(word);
+                index = next_index;
+            }
+            None => {
+                index = index.saturating_add(1);
+            }
+        }
+    }
+    Ok(words)
+}
+
+fn command_path_argument_policy_violation(word: &str) -> Option<String> {
+    if path_argument_escapes_workspace(word) {
+        return Some("must stay within the workspace".to_owned());
+    }
+    if let Some((_, value)) = word.split_once('=') {
+        if path_argument_escapes_workspace(value) {
+            return Some("must stay within the workspace".to_owned());
+        }
+    }
+    None
+}
+
+fn path_argument_escapes_workspace(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    if value == "~" || value.starts_with("~/") || value.starts_with('/') {
+        return true;
+    }
+    Path::new(value)
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+fn command_output_redirection_targets(command: &str) -> Result<Vec<String>, String> {
+    let bytes = command.as_bytes();
+    let mut targets = Vec::new();
+    let mut index = 0usize;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if single_quoted {
+            if byte == b'\'' {
+                single_quoted = false;
+            }
+            index += 1;
+            continue;
+        }
+        if double_quoted {
+            if escaped {
+                escaped = false;
+                index += 1;
+                continue;
+            }
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => double_quoted = false,
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\\' => {
+                escaped = true;
+                index += 1;
+            }
+            b'\'' => {
+                single_quoted = true;
+                index += 1;
+            }
+            b'"' => {
+                double_quoted = true;
+                index += 1;
+            }
+            b'>' => {
+                let mut target_start = index + 1;
+                if bytes
+                    .get(target_start)
+                    .is_some_and(|next| *next == b'>' || *next == b'|')
+                {
+                    target_start += 1;
+                }
+                let (target, next_index) = shell_word_at(command, target_start)?;
+                let Some(target) = target else {
+                    return Err("command output redirection is missing a target path".to_owned());
+                };
+                targets.push(target);
+                index = next_index;
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(targets)
+}
+
+fn command_input_redirection_targets(command: &str) -> Result<Vec<String>, String> {
+    let bytes = command.as_bytes();
+    let mut targets = Vec::new();
+    let mut index = 0usize;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if single_quoted {
+            if byte == b'\'' {
+                single_quoted = false;
+            }
+            index += 1;
+            continue;
+        }
+        if double_quoted {
+            if escaped {
+                escaped = false;
+                index += 1;
+                continue;
+            }
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => double_quoted = false,
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\\' => {
+                escaped = true;
+                index += 1;
+            }
+            b'\'' => {
+                single_quoted = true;
+                index += 1;
+            }
+            b'"' => {
+                double_quoted = true;
+                index += 1;
+            }
+            b'<' => {
+                let mut target_start = index + 1;
+                match bytes.get(target_start) {
+                    // Here-doc and here-string redirections do not name a file.
+                    Some(b'<') => {
+                        index += 2;
+                        continue;
+                    }
+                    Some(b'>') => {
+                        // Read/write redirection (`<> path`): this function
+                        // enforces the read half; the output scanner enforces
+                        // the write half.
+                        target_start += 1;
+                    }
+                    _ => {}
+                }
+                let (target, next_index) = shell_word_at(command, target_start)?;
+                let Some(target) = target else {
+                    return Err("command input redirection is missing a target path".to_owned());
+                };
+                targets.push(target);
+                index = next_index;
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(targets)
+}
+
+fn shell_word_at(command: &str, start: usize) -> Result<(Option<String>, usize), String> {
+    let bytes = command.as_bytes();
+    let mut index = start;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if index >= bytes.len() {
+        return Ok((None, index));
+    }
+    let mut word = String::new();
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if single_quoted {
+            if byte == b'\'' {
+                single_quoted = false;
+            } else {
+                word.push(byte as char);
+            }
+            index += 1;
+            continue;
+        }
+        if double_quoted {
+            if escaped {
+                word.push(byte as char);
+                escaped = false;
+                index += 1;
+                continue;
+            }
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => double_quoted = false,
+                _ => word.push(byte as char),
+            }
+            index += 1;
+            continue;
+        }
+        if escaped {
+            word.push(byte as char);
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'<') {
+            break;
+        }
+        match byte {
+            b'\\' => escaped = true,
+            b'\'' => single_quoted = true,
+            b'"' => double_quoted = true,
+            _ => word.push(byte as char),
+        }
+        index += 1;
+    }
+    if single_quoted || double_quoted {
+        return Err("command output redirection target has an unterminated quote".to_owned());
+    }
+    if word.is_empty() {
+        Ok((None, index))
+    } else {
+        Ok((Some(word), index))
+    }
+}
+
+fn is_fd_redirection_target(target: &str) -> bool {
+    target
+        .strip_prefix('&')
+        .is_some_and(|rest| rest == "-" || rest.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 struct CommandOutput {
@@ -834,9 +1790,9 @@ fn walk(root: &Path, dir: &Path, walked: &mut usize, visit: &mut dyn FnMut(&str)
 }
 
 /// System prompt for the slice-1 owned harness.
-const OWNED_SYSTEM_PROMPT: &str =
-    "You are a coding agent. Use the provided file tools to do the task, then \
-     reply with a short summary and no further tool calls.";
+const OWNED_SYSTEM_PROMPT: &str = "You are a coding agent. Use only the provided \
+tools and the authority granted for this turn to do the task. When finished, \
+reply with a short summary and make no further tool calls.";
 
 /// Default per-turn model-step budget (overridable via WHIPPLESCRIPT_HARNESS_MAX_STEPS).
 const OWNED_MAX_STEPS: usize = 16;
@@ -910,6 +1866,7 @@ impl HarnessModelClient for FixtureModelClient {
 fn tool_spec_and_entry(
     ir: &whipplescript_parser::IrProgram,
     source_path: PathBuf,
+    package_id: String,
 ) -> (ToolSpec, WorkflowToolEntry) {
     let input_schema = ir
         .workflow_contracts
@@ -938,6 +1895,7 @@ fn tool_spec_and_entry(
             name: ir.workflow.clone(),
             path: source_path,
             root: ir.workflow.clone(),
+            package_id,
         },
     )
 }
@@ -973,7 +1931,11 @@ fn load_workflow_tools() -> Result<(Vec<ToolSpec>, Vec<WorkflowToolEntry>), Stri
                 ir.workflow
             ));
         }
-        let (spec, entry) = tool_spec_and_entry(&ir, PathBuf::from(path));
+        let (spec, entry) = tool_spec_and_entry(
+            &ir,
+            PathBuf::from(path),
+            crate::LOCAL_WORKFLOW_PACKAGE.to_owned(),
+        );
         specs.push(spec);
         entries.push(entry);
     }
@@ -1006,11 +1968,50 @@ fn load_agent_granted_tools(
     for tool in &agent_ir.tools {
         let resolved = crate::resolve_tool_grant(program_path, &ir, tool, package_lock_path)
             .map_err(|reason| format!("agent `{agent}` is granted `{tool}`: {reason}"))?;
-        let (spec, entry) = tool_spec_and_entry(&resolved.tool_ir, resolved.source_path);
+        let (spec, entry) =
+            tool_spec_and_entry(&resolved.tool_ir, resolved.source_path, resolved.package_id);
         specs.push(spec);
         entries.push(entry);
     }
+    enforce_workflow_tool_invoke_governance(&entries)?;
     Ok((specs, entries))
+}
+
+fn enforce_workflow_tool_invoke_governance(entries: &[WorkflowToolEntry]) -> Result<(), String> {
+    let resources = entries
+        .iter()
+        .filter(|entry| entry.package_id != crate::LOCAL_WORKFLOW_PACKAGE)
+        .map(|entry| {
+            (
+                entry.name.as_str(),
+                format!("invoke:{}/{}", entry.package_id, entry.name),
+            )
+        })
+        .collect::<Vec<_>>();
+    if resources.is_empty() {
+        return Ok(());
+    }
+    match crate::ifc::VerifiedEnvelope::load_from_env() {
+        crate::ifc::EnvelopeStatus::Ungoverned => Ok(()),
+        crate::ifc::EnvelopeStatus::Rejected(message) => {
+            Err(format!("governance envelope rejected: {message}"))
+        }
+        crate::ifc::EnvelopeStatus::Verified(verified) => {
+            let missing = resources
+                .into_iter()
+                .filter(|(_, resource)| !verified.governs(resource))
+                .map(|(name, resource)| format!("{name} ({resource})"))
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "cross-package workflow tool invoke door(s) not governed by the active envelope: {}",
+                    missing.join(", ")
+                ))
+            }
+        }
+    }
 }
 
 /// The workspace root a brokered turn operates in: `WHIPPLESCRIPT_HARNESS_WORKSPACE`
@@ -1020,6 +2021,177 @@ pub fn owned_workspace_root() -> PathBuf {
     std::env::var_os("WHIPPLESCRIPT_HARNESS_WORKSPACE")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn merge_grant_globs(slot: &mut Option<Vec<String>>, globs: Vec<String>) {
+    match slot {
+        None => *slot = Some(globs),
+        Some(existing) if existing.is_empty() => {}
+        Some(existing) if globs.is_empty() => existing.clear(),
+        Some(existing) => {
+            existing.extend(globs);
+            existing.sort();
+            existing.dedup();
+        }
+    }
+}
+
+fn globs_from_operation(operation: &Value) -> Result<Vec<String>, String> {
+    let Some(globs) = operation.get("globs") else {
+        return Ok(Vec::new());
+    };
+    let globs = globs
+        .as_array()
+        .ok_or_else(|| "access grant operation `globs` must be an array".to_owned())?;
+    globs
+        .iter()
+        .map(|glob| {
+            glob.as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| "access grant operation glob must be a non-empty string".to_owned())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn turn_file_access_from_input(input_json: &str) -> Result<TurnFileAccess, String> {
+    Ok(turn_tool_access_from_input(input_json)?.file)
+}
+
+fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, String> {
+    let input = serde_json::from_str::<Value>(input_json)
+        .map_err(|error| format!("owned turn input is not valid JSON: {error}"))?;
+    let Some(grants) = input.get("access_grants").and_then(Value::as_array) else {
+        return Ok(TurnToolAccess::deny_all());
+    };
+    if grants.is_empty() {
+        return Ok(TurnToolAccess::deny_all());
+    }
+    let mut store_names = Vec::<String>::new();
+    let mut read_globs = None;
+    let mut write_globs = None;
+    let mut command_run = false;
+    let mut tracker = TurnTrackerAccess::deny_all();
+    for (grant_index, grant) in grants.iter().enumerate() {
+        let resource = grant
+            .get("resource")
+            .and_then(Value::as_str)
+            .filter(|resource| !resource.is_empty())
+            .ok_or_else(|| format!("access_grants[{grant_index}] is missing `resource`"))?;
+        let operations = grant
+            .get("operations")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("access_grants[{grant_index}].operations must be an array"))?;
+        let mut has_file_operation = false;
+        for operation in operations {
+            let operation_name = operation
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let globs = globs_from_operation(operation)?;
+            match operation_name {
+                "read" | "import" if resource != TRACKER_RESOURCE => {
+                    has_file_operation = true;
+                    merge_grant_globs(&mut read_globs, globs)
+                }
+                "write" | "export" if resource != TRACKER_RESOURCE => {
+                    has_file_operation = true;
+                    merge_grant_globs(&mut write_globs, globs)
+                }
+                "run" if resource == "command" => command_run = true,
+                "file" | "add" if resource == TRACKER_RESOURCE => tracker.file = true,
+                "claim" if resource == TRACKER_RESOURCE => tracker.claim = true,
+                "finish" | "complete" | "close" if resource == TRACKER_RESOURCE => {
+                    tracker.finish = true
+                }
+                "release" | "reopen" if resource == TRACKER_RESOURCE => tracker.release = true,
+                "update" if resource == TRACKER_RESOURCE => tracker.grant_update(),
+                "write" if resource == TRACKER_RESOURCE => tracker.grant_write(),
+                _ => {}
+            }
+        }
+        if has_file_operation && !store_names.iter().any(|existing| existing == resource) {
+            store_names.push(resource.to_owned());
+        }
+    }
+    let store_name = match store_names.as_slice() {
+        [only] => only.clone(),
+        [] => "turn_access".to_owned(),
+        _ => "turn_access".to_owned(),
+    };
+    Ok(TurnToolAccess {
+        file: TurnFileAccess {
+            store_name,
+            read_globs,
+            write_globs,
+        },
+        file_resources: store_names,
+        command_run,
+        tracker,
+    })
+}
+
+fn enforce_turn_access_governance(access: &TurnToolAccess) -> Result<(), String> {
+    match crate::ifc::VerifiedEnvelope::load_from_env() {
+        crate::ifc::EnvelopeStatus::Ungoverned => Ok(()),
+        crate::ifc::EnvelopeStatus::Rejected(message) => {
+            Err(format!("governance envelope rejected: {message}"))
+        }
+        crate::ifc::EnvelopeStatus::Verified(verified) => {
+            let mut resources = access.file_resources.to_vec();
+            if access.command_run {
+                resources.push("command".to_owned());
+            }
+            if access.tracker.mutates() {
+                resources.push(TRACKER_RESOURCE.to_owned());
+            }
+            let missing = resources
+                .into_iter()
+                .filter(|resource| !verified.governs(resource))
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "turn access grants resource(s) not governed by the active envelope: {}",
+                    missing.join(", ")
+                ))
+            }
+        }
+    }
+}
+
+fn registered_profile_policy_from_store(
+    store_path: &Path,
+    profile: Option<&str>,
+) -> StoreResult<Option<RegisteredProfilePolicy>> {
+    let Some(profile) = profile else {
+        return Ok(None);
+    };
+    SqliteStore::open(store_path)?.registered_profile_policy(profile)
+}
+
+fn required_capabilities_from_json(
+    required_capabilities_json: &str,
+) -> Result<Vec<String>, String> {
+    let value = serde_json::from_str::<Value>(required_capabilities_json)
+        .map_err(|error| format!("effect required_capabilities is not valid JSON: {error}"))?;
+    let Some(items) = value.as_array() else {
+        return Err("effect required_capabilities must be an array".to_owned());
+    };
+    let mut capabilities = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(capability) = item.as_str().filter(|capability| !capability.is_empty()) else {
+            return Err(format!(
+                "effect required_capabilities[{index}] must be a non-empty string"
+            ));
+        };
+        capabilities.push(capability.to_owned());
+    }
+    capabilities.sort();
+    capabilities.dedup();
+    Ok(capabilities)
 }
 
 /// Resolved configuration for the live owned-harness model client. Mirrors the
@@ -1097,6 +2269,7 @@ pub fn run_owned_agent_turn(
     effect_id: &str,
     agent: &str,
     profile: Option<&str>,
+    required_capabilities_json: &str,
     input_json: &str,
     store_path: &Path,
     max_child_iterations: usize,
@@ -1137,15 +2310,34 @@ pub fn run_owned_agent_turn(
         workflow_tools.push(entry);
     }
     let workspace = owned_workspace_root();
-    let mut executor = FileToolExecutor::new(&workspace);
-    let mut tools = file_tool_specs();
+    let turn_tool_access = turn_tool_access_from_input(input_json).map_err(StoreError::Conflict)?;
+    enforce_turn_access_governance(&turn_tool_access).map_err(StoreError::Conflict)?;
+    let registered_profile_policy = registered_profile_policy_from_store(store_path, profile)?;
+    let mut profile_policy = HarnessProfilePolicy::for_profile_with_registry(
+        profile,
+        registered_profile_policy.as_ref(),
+    );
+    let required_capabilities = required_capabilities_from_json(required_capabilities_json)
+        .map_err(StoreError::Conflict)?;
+    if let Some(required_policy) =
+        HarnessProfilePolicy::from_required_capabilities(&required_capabilities)
+    {
+        profile_policy = profile_policy.intersect(&required_policy);
+    }
+    let mut executor = FileToolExecutor::new(&workspace)
+        .with_turn_tool_access(turn_tool_access.clone())
+        .with_resolved_profile_policy(profile_policy.clone());
+    let mut tools = file_tool_specs_for_turn(&profile_policy, &turn_tool_access);
     // Tracker tools (slice 4): offered only when a tracker queue is configured.
     if let Some(queue) = std::env::var("WHIPPLESCRIPT_HARNESS_TRACKER")
         .ok()
         .filter(|value| !value.is_empty())
     {
         executor = executor.with_tracker(queue, instance_id);
-        tools.extend(tracker_tool_specs());
+        tools.extend(tracker_tool_specs_for_turn(
+            &profile_policy,
+            &turn_tool_access,
+        ));
     }
     // Sub-workflow tools (DR-0025): curated, convergence-checked workflows the
     // model may invoke synchronously as typed tools.
@@ -1157,7 +2349,10 @@ pub fn run_owned_agent_turn(
             work_unit,
             provider_ctx,
         );
-        tools.extend(workflow_tool_specs);
+        tools.extend(workflow_tool_specs_for_policy(
+            &profile_policy,
+            workflow_tool_specs,
+        ));
     }
     let input = BrokeredTurnInput {
         system: OWNED_SYSTEM_PROMPT.to_string(),
@@ -1243,6 +2438,8 @@ fn owned_max_steps() -> usize {
 mod tests {
     use super::*;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn temp_root() -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1262,6 +2459,16 @@ mod tests {
             name: name.into(),
             arguments: args,
         }
+    }
+
+    #[test]
+    fn owned_system_prompt_describes_turn_scoped_tool_authority() {
+        assert!(OWNED_SYSTEM_PROMPT.contains("provided tools"));
+        assert!(OWNED_SYSTEM_PROMPT.contains("authority granted for this turn"));
+        assert!(
+            !OWNED_SYSTEM_PROMPT.contains("file tools"),
+            "owned harness prompt must not imply file tools are the whole surface"
+        );
     }
 
     #[test]
@@ -1357,6 +2564,920 @@ mod tests {
     }
 
     #[test]
+    fn turn_file_access_denies_file_tools_without_grants() {
+        let root = temp_root();
+        std::fs::write(root.join("note.txt"), "secret").expect("seed");
+        let access = turn_file_access_from_input(r#"{"prompt":"work"}"#).expect("parse input");
+        let exec = FileToolExecutor::new(&root).with_turn_file_access(access);
+
+        let blocked = exec.execute(&call(TOOL_READ, json!({ "path": "note.txt" })));
+
+        assert_eq!(blocked.status, ToolStatus::Error);
+        assert!(blocked.content.contains("not granted"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn turn_file_access_applies_read_and_write_globs() {
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/in.txt"), "ok").expect("seed");
+        let input = json!({
+            "access_grants": [
+                {
+                    "resource": "project_files",
+                    "operations": [
+                        {"operation": "read", "globs": ["src/**"]},
+                        {"operation": "write", "globs": ["out/**"]}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+        let access = turn_file_access_from_input(&input).expect("parse grants");
+        let exec = FileToolExecutor::new(&root).with_turn_file_access(access);
+
+        let read_allowed = exec.execute(&call(TOOL_READ, json!({ "path": "src/in.txt" })));
+        let read_blocked = exec.execute(&call(TOOL_READ, json!({ "path": "secret.txt" })));
+        let write_allowed = exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "out/new.txt", "content": "ok" }),
+        ));
+        let write_blocked = exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "src/new.txt", "content": "no" }),
+        ));
+
+        assert_eq!(read_allowed.status, ToolStatus::Ok);
+        assert_eq!(read_blocked.status, ToolStatus::Error);
+        assert_eq!(write_allowed.status, ToolStatus::Ok);
+        assert_eq!(write_blocked.status, ToolStatus::Error);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn turn_tool_access_tracks_file_resources_for_governance() {
+        let input = json!({
+            "access_grants": [
+                {
+                    "resource": "project_files",
+                    "operations": [
+                        {"operation": "read", "globs": ["src/**"]}
+                    ]
+                },
+                {
+                    "resource": "command",
+                    "operations": [
+                        {"operation": "run"}
+                    ]
+                },
+                {
+                    "resource": "docs",
+                    "operations": [
+                        {"operation": "write", "globs": ["docs/**"]}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+
+        let access = turn_tool_access_from_input(&input).expect("parse grants");
+
+        assert_eq!(
+            access.file_resources,
+            vec!["project_files".to_owned(), "docs".to_owned()]
+        );
+        assert!(access.command_run);
+    }
+
+    #[test]
+    fn tracker_write_grants_filter_model_facing_tracker_tools() {
+        let policy = HarnessProfilePolicy::for_profile(Some("repo-writer"));
+        let no_tracker = turn_tool_access_from_input(r#"{"prompt":"work"}"#)
+            .expect("missing grants deny tracker writes");
+        let no_tracker_names = tracker_tool_specs_for_turn(&policy, &no_tracker)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(no_tracker_names, vec![TOOL_LIST_TODOS.to_owned()]);
+
+        let file_only = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "tracker",
+                        "operations": [
+                            {"operation": "file"}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("tracker file grant parses");
+        let file_names = tracker_tool_specs_for_turn(&policy, &file_only)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            file_names,
+            vec![TOOL_LIST_TODOS.to_owned(), TOOL_ADD_TODO.to_owned()]
+        );
+
+        let update = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "tracker",
+                        "operations": [
+                            {"operation": "finish"}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("tracker update grant parses");
+        let update_names = tracker_tool_specs_for_turn(&policy, &update)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            update_names,
+            vec![TOOL_LIST_TODOS.to_owned(), TOOL_UPDATE_TODO.to_owned()]
+        );
+
+        let reader_policy = HarnessProfilePolicy::for_profile(Some("repo-reader"));
+        let reader_names = tracker_tool_specs_for_turn(&reader_policy, &file_only)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(reader_names, vec![TOOL_LIST_TODOS.to_owned()]);
+    }
+
+    #[test]
+    fn tracker_mutations_require_turn_grants_and_status_specific_update_grants() {
+        let root = temp_root();
+        let no_tracker = turn_tool_access_from_input(r#"{"prompt":"work"}"#)
+            .expect("missing grants deny tracker writes");
+        let exec = FileToolExecutor::new(&root)
+            .with_tracker("queue", "instance")
+            .with_turn_tool_access(no_tracker)
+            .with_profile_policy(Some("repo-writer"));
+
+        let add = exec.execute(&call(TOOL_ADD_TODO, json!({ "content": "do a thing" })));
+        assert_eq!(add.status, ToolStatus::Error);
+        assert!(add.content.contains("tracker file is not granted"));
+
+        let claim_only = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "tracker",
+                        "operations": [
+                            {"operation": "claim"}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("claim grant parses");
+        let exec = FileToolExecutor::new(&root)
+            .with_tracker("queue", "instance")
+            .with_turn_tool_access(claim_only)
+            .with_profile_policy(Some("repo-writer"));
+        let finish = exec.execute(&call(
+            TOOL_UPDATE_TODO,
+            json!({ "id": "item-1", "status": "completed" }),
+        ));
+        assert_eq!(finish.status, ToolStatus::Error);
+        assert!(finish.content.contains("tracker update is not granted"));
+        assert!(finish.content.contains("finish"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn turn_access_governance_requires_envelope_to_cover_file_resources() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_envelope = std::env::var_os("WHIPPLESCRIPT_IFC_ENVELOPE");
+        let root = temp_root();
+        let envelope_path = root.join("env.policy");
+
+        std::fs::write(
+            &envelope_path,
+            "grant file_store project_files -> file:/srv/project public\n",
+        )
+        .expect("write envelope");
+        std::env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope_path);
+
+        let governed = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "project_files",
+                        "operations": [
+                            {"operation": "read", "globs": ["src/**"]}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("governed grant parses");
+        enforce_turn_access_governance(&governed).expect("resource is governed");
+
+        let ungoverned = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "secret_files",
+                        "operations": [
+                            {"operation": "read", "globs": ["secrets/**"]}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("ungoverned grant parses");
+        let error = enforce_turn_access_governance(&ungoverned)
+            .expect_err("ungoverned resource must fail closed");
+        assert!(error.contains("secret_files"));
+        assert!(error.contains("not governed"));
+
+        let command = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "command",
+                        "operations": [
+                            {"operation": "run"}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("command grant parses");
+        let error = enforce_turn_access_governance(&command)
+            .expect_err("ungoverned command must fail closed");
+        assert!(error.contains("command"));
+
+        std::fs::write(&envelope_path, "grant command command -> command public\n")
+            .expect("write command envelope");
+        enforce_turn_access_governance(&command).expect("command resource is governed");
+
+        let tracker = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "tracker",
+                        "operations": [
+                            {"operation": "file"}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("tracker grant parses");
+        let error = enforce_turn_access_governance(&tracker)
+            .expect_err("ungoverned tracker must fail closed");
+        assert!(error.contains("tracker"));
+
+        std::fs::write(&envelope_path, "grant tracker tracker -> tracker public\n")
+            .expect("write tracker envelope");
+        enforce_turn_access_governance(&tracker).expect("tracker resource is governed");
+
+        match previous_envelope {
+            Some(value) => std::env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", value),
+            None => std::env::remove_var("WHIPPLESCRIPT_IFC_ENVELOPE"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn package_workflow_tool_invoke_requires_governed_door() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_envelope = std::env::var_os("WHIPPLESCRIPT_IFC_ENVELOPE");
+        let root = temp_root();
+        let envelope_path = root.join("env.policy");
+
+        let entry = WorkflowToolEntry {
+            name: "LeakyTool".to_owned(),
+            path: root.join("tool.whip"),
+            root: "LeakyTool".to_owned(),
+            package_id: "package-leaky".to_owned(),
+        };
+        let local_entry = WorkflowToolEntry {
+            name: "LocalTool".to_owned(),
+            path: root.join("local.whip"),
+            root: "LocalTool".to_owned(),
+            package_id: crate::LOCAL_WORKFLOW_PACKAGE.to_owned(),
+        };
+
+        enforce_workflow_tool_invoke_governance(std::slice::from_ref(&local_entry))
+            .expect("same-bundle workflow tools do not cross a package boundary");
+
+        std::fs::write(
+            &envelope_path,
+            "grant file_store project_files -> file:/srv/project public\n",
+        )
+        .expect("write envelope");
+        std::env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope_path);
+
+        let error = enforce_workflow_tool_invoke_governance(std::slice::from_ref(&entry))
+            .expect_err("cross-package tool invoke must be governed");
+        assert!(error.contains("LeakyTool"));
+        assert!(error.contains("invoke:package-leaky/LeakyTool"));
+
+        std::fs::write(
+            &envelope_path,
+            "grant invoke LeakyTool -> invoke:package-leaky/LeakyTool public\n",
+        )
+        .expect("write invoke envelope");
+        enforce_workflow_tool_invoke_governance(std::slice::from_ref(&entry))
+            .expect("cross-package invoke door is governed");
+
+        match previous_envelope {
+            Some(value) => std::env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", value),
+            None => std::env::remove_var("WHIPPLESCRIPT_IFC_ENVELOPE"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn turn_file_access_edit_requires_read_and_write() {
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/in.txt"), "old").expect("seed");
+
+        let write_only_input = json!({
+            "access_grants": [
+                {
+                    "resource": "project_files",
+                    "operations": [
+                        {"operation": "write", "globs": ["src/**"]}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+        let write_only_access =
+            turn_file_access_from_input(&write_only_input).expect("parse write grants");
+        let write_only_exec = FileToolExecutor::new(&root).with_turn_file_access(write_only_access);
+        let missing_read = write_only_exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "src/in.txt", "edits": [{ "oldText": "old", "newText": "new" }] }),
+        ));
+
+        assert_eq!(missing_read.status, ToolStatus::Error);
+        assert!(missing_read.content.contains("read is not granted"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/in.txt")).expect("read src/in.txt"),
+            "old"
+        );
+
+        let read_only_input = json!({
+            "access_grants": [
+                {
+                    "resource": "project_files",
+                    "operations": [
+                        {"operation": "read", "globs": ["src/**"]}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+        let read_only_access =
+            turn_file_access_from_input(&read_only_input).expect("parse read grants");
+        let read_only_exec = FileToolExecutor::new(&root).with_turn_file_access(read_only_access);
+        let missing_write = read_only_exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "src/in.txt", "edits": [{ "oldText": "old", "newText": "new" }] }),
+        ));
+
+        assert_eq!(missing_write.status, ToolStatus::Error);
+        assert!(missing_write.content.contains("write is not granted"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/in.txt")).expect("read src/in.txt"),
+            "old"
+        );
+
+        let read_write_input = json!({
+            "access_grants": [
+                {
+                    "resource": "project_files",
+                    "operations": [
+                        {"operation": "read", "globs": ["src/**"]},
+                        {"operation": "write", "globs": ["src/**"]}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+        let read_write_access =
+            turn_file_access_from_input(&read_write_input).expect("parse read/write grants");
+        let read_write_exec = FileToolExecutor::new(&root).with_turn_file_access(read_write_access);
+        let edited = read_write_exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "src/in.txt", "edits": [{ "oldText": "old", "newText": "new" }] }),
+        ));
+
+        assert_eq!(edited.status, ToolStatus::Ok);
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/in.txt")).expect("read src/in.txt"),
+            "new"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn profile_policy_intersects_file_and_bash_tools() {
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/in.txt"), "old").expect("seed");
+        let input = json!({
+            "access_grants": [
+                {
+                    "resource": "project_files",
+                    "operations": [
+                        {"operation": "read", "globs": ["src/**"]},
+                        {"operation": "write", "globs": ["src/**"]}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+        let access = turn_file_access_from_input(&input).expect("parse grants");
+        let exec = FileToolExecutor::new(&root)
+            .with_turn_file_access(access)
+            .with_profile_policy(Some("repo-reader"))
+            .with_bash_allow(vec!["echo".into()]);
+
+        let read = exec.execute(&call(TOOL_READ, json!({ "path": "src/in.txt" })));
+        let write = exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "src/out.txt", "content": "new" }),
+        ));
+        let edit = exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "src/in.txt", "edits": [{ "oldText": "old", "newText": "new" }] }),
+        ));
+        let bash = exec.execute(&call(TOOL_BASH, json!({ "command": "echo hello" })));
+
+        assert_eq!(read.status, ToolStatus::Ok);
+        assert_eq!(write.status, ToolStatus::Error);
+        assert!(write.content.contains("profile `repo-reader`"));
+        assert_eq!(edit.status, ToolStatus::Error);
+        assert!(edit.content.contains("profile `repo-reader`"));
+        assert_eq!(bash.status, ToolStatus::Error);
+        assert!(bash.content.contains("profile `repo-reader`"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/in.txt")).expect("read src/in.txt"),
+            "old"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn no_repo_profile_blocks_file_tools_even_with_grants() {
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/in.txt"), "old").expect("seed");
+        let input = json!({
+            "access_grants": [
+                {
+                    "resource": "project_files",
+                    "operations": [
+                        {"operation": "read", "globs": ["src/**"]}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+        let access = turn_file_access_from_input(&input).expect("parse grants");
+        let exec = FileToolExecutor::new(&root)
+            .with_turn_file_access(access)
+            .with_profile_policy(Some("no-repo"));
+
+        let read = exec.execute(&call(TOOL_READ, json!({ "path": "src/in.txt" })));
+
+        assert_eq!(read.status, ToolStatus::Error);
+        assert!(read.content.contains("profile `no-repo`"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn profile_policy_filters_model_facing_file_tools() {
+        let names = |profile| {
+            file_tool_specs_for_profile(profile)
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>()
+        };
+
+        let reader = names(Some("repo-reader"));
+        assert!(reader.contains(&TOOL_READ.to_owned()));
+        assert!(reader.contains(&TOOL_GREP.to_owned()));
+        assert!(reader.contains(&TOOL_FIND.to_owned()));
+        assert!(reader.contains(&TOOL_LS.to_owned()));
+        assert!(!reader.contains(&TOOL_WRITE.to_owned()));
+        assert!(!reader.contains(&TOOL_EDIT.to_owned()));
+        assert!(!reader.contains(&TOOL_BASH.to_owned()));
+
+        let writer = names(Some("repo-writer"));
+        assert!(writer.contains(&TOOL_WRITE.to_owned()));
+        assert!(writer.contains(&TOOL_EDIT.to_owned()));
+        assert!(writer.contains(&TOOL_BASH.to_owned()));
+
+        assert!(names(Some("no-repo")).is_empty());
+    }
+
+    #[test]
+    fn command_run_turn_grant_filters_model_facing_bash_tool() {
+        let policy = HarnessProfilePolicy::for_profile(Some("repo-writer"));
+        let without_command = turn_tool_access_from_input(r#"{"prompt":"work"}"#)
+            .expect("missing grants deny command");
+        let with_command = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "command",
+                        "operations": [
+                            {"operation": "run"}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("command grant parses");
+
+        let without_names = file_tool_specs_for_turn(&policy, &without_command)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        let with_names = file_tool_specs_for_turn(&policy, &with_command)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+
+        assert!(!without_names.contains(&TOOL_BASH.to_owned()));
+        assert!(with_names.contains(&TOOL_BASH.to_owned()));
+    }
+
+    #[test]
+    fn required_capabilities_intersect_owned_harness_tool_policy() {
+        let base = HarnessProfilePolicy::for_profile(Some("repo-writer"));
+        let access = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "project_files",
+                        "operations": [
+                            {"operation": "read", "globs": ["src/**"]},
+                            {"operation": "write", "globs": ["src/**"]}
+                        ]
+                    },
+                    {
+                        "resource": "command",
+                        "operations": [
+                            {"operation": "run"}
+                        ]
+                    },
+                    {
+                        "resource": "tracker",
+                        "operations": [
+                            {"operation": "write"}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("turn grants parse");
+
+        let required = |capabilities: &[&str]| {
+            let capabilities = capabilities
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect::<Vec<_>>();
+            HarnessProfilePolicy::from_required_capabilities(&capabilities)
+        };
+        let file_names = |policy: &HarnessProfilePolicy| {
+            file_tool_specs_for_turn(policy, &access)
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>()
+        };
+        let tracker_names = |policy: &HarnessProfilePolicy| {
+            tracker_tool_specs_for_turn(policy, &access)
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>()
+        };
+        let workflow_names = |policy: &HarnessProfilePolicy| {
+            workflow_tool_specs_for_policy(
+                policy,
+                vec![ToolSpec {
+                    name: "EchoTool".to_owned(),
+                    description: "Echo test tool".to_owned(),
+                    input_schema: json!({"type": "object"}),
+                }],
+            )
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>()
+        };
+
+        assert!(required(&["agent.tell"]).is_none());
+
+        let read_only = base.intersect(&required(&["repo.read"]).expect("repo.read policy"));
+        let read_names = file_names(&read_only);
+        assert!(read_names.contains(&TOOL_READ.to_owned()));
+        assert!(read_names.contains(&TOOL_GREP.to_owned()));
+        assert!(!read_names.contains(&TOOL_WRITE.to_owned()));
+        assert!(!read_names.contains(&TOOL_BASH.to_owned()));
+        assert_eq!(tracker_names(&read_only), vec![TOOL_LIST_TODOS.to_owned()]);
+        assert!(workflow_names(&read_only).is_empty());
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/in.txt"), "old").expect("seed");
+        let exec = FileToolExecutor::new(&root)
+            .with_turn_tool_access(access.clone())
+            .with_resolved_profile_policy(read_only.clone());
+        let read = exec.execute(&call(TOOL_READ, json!({ "path": "src/in.txt" })));
+        let write = exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "src/out.txt", "content": "new" }),
+        ));
+        assert_eq!(read.status, ToolStatus::Ok);
+        assert_eq!(write.status, ToolStatus::Error);
+        assert!(write.content.contains("profile `repo-writer`"));
+        std::fs::remove_dir_all(&root).ok();
+
+        let command_only = base.intersect(&required(&["command.run"]).expect("command.run policy"));
+        let command_names = file_names(&command_only);
+        assert_eq!(command_names, vec![TOOL_BASH.to_owned()]);
+        assert_eq!(
+            tracker_names(&command_only),
+            vec![TOOL_LIST_TODOS.to_owned()]
+        );
+        assert!(workflow_names(&command_only).is_empty());
+
+        let tracker_finish =
+            base.intersect(&required(&["tracker.finish"]).expect("tracker.finish policy"));
+        assert!(file_names(&tracker_finish).is_empty());
+        assert_eq!(
+            tracker_names(&tracker_finish),
+            vec![TOOL_LIST_TODOS.to_owned(), TOOL_UPDATE_TODO.to_owned()]
+        );
+        assert!(workflow_names(&tracker_finish).is_empty());
+
+        let workflow_only =
+            base.intersect(&required(&["workflow.invoke"]).expect("workflow.invoke policy"));
+        assert!(file_names(&workflow_only).is_empty());
+        assert_eq!(
+            tracker_names(&workflow_only),
+            vec![TOOL_LIST_TODOS.to_owned()]
+        );
+        assert_eq!(workflow_names(&workflow_only), vec!["EchoTool".to_owned()]);
+    }
+
+    #[test]
+    fn required_capabilities_json_must_be_a_string_array() {
+        assert_eq!(
+            required_capabilities_from_json(r#"["agent.tell","repo.read","repo.read"]"#)
+                .expect("valid required capabilities"),
+            vec!["agent.tell".to_owned(), "repo.read".to_owned()]
+        );
+        assert!(
+            required_capabilities_from_json(r#"{"capability":"repo.read"}"#)
+                .expect_err("non-array rejects")
+                .contains("must be an array")
+        );
+        assert!(required_capabilities_from_json(r#"[1]"#)
+            .expect_err("non-string rejects")
+            .contains("non-empty string"));
+    }
+
+    #[test]
+    fn turn_file_grants_filter_model_facing_file_tools() {
+        let policy = HarnessProfilePolicy::for_profile(Some("repo-writer"));
+        let names_for = |input: Value| {
+            let access =
+                turn_tool_access_from_input(&input.to_string()).expect("turn grants parse");
+            file_tool_specs_for_turn(&policy, &access)
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>()
+        };
+
+        let read_only = names_for(json!({
+            "access_grants": [
+                {
+                    "resource": "project_files",
+                    "operations": [
+                        {"operation": "read", "globs": ["src/**"]}
+                    ]
+                }
+            ]
+        }));
+        assert!(read_only.contains(&TOOL_READ.to_owned()));
+        assert!(read_only.contains(&TOOL_GREP.to_owned()));
+        assert!(read_only.contains(&TOOL_FIND.to_owned()));
+        assert!(read_only.contains(&TOOL_LS.to_owned()));
+        assert!(!read_only.contains(&TOOL_WRITE.to_owned()));
+        assert!(!read_only.contains(&TOOL_EDIT.to_owned()));
+
+        let write_only = names_for(json!({
+            "access_grants": [
+                {
+                    "resource": "project_files",
+                    "operations": [
+                        {"operation": "write", "globs": ["src/**"]}
+                    ]
+                }
+            ]
+        }));
+        assert!(!write_only.contains(&TOOL_READ.to_owned()));
+        assert!(write_only.contains(&TOOL_WRITE.to_owned()));
+        assert!(!write_only.contains(&TOOL_EDIT.to_owned()));
+
+        let read_write = names_for(json!({
+            "access_grants": [
+                {
+                    "resource": "project_files",
+                    "operations": [
+                        {"operation": "read", "globs": ["src/**"]},
+                        {"operation": "write", "globs": ["src/**"]}
+                    ]
+                }
+            ]
+        }));
+        assert!(read_write.contains(&TOOL_READ.to_owned()));
+        assert!(read_write.contains(&TOOL_WRITE.to_owned()));
+        assert!(read_write.contains(&TOOL_EDIT.to_owned()));
+    }
+
+    #[test]
+    fn registered_custom_profile_policy_filters_model_facing_file_tools() {
+        let registered = RegisteredProfilePolicy {
+            enforcement_mode: "enforce".to_owned(),
+            allowed_capabilities: vec!["repo.read".to_owned()],
+        };
+        let policy =
+            HarnessProfilePolicy::for_profile_with_registry(Some("docs-reader"), Some(&registered));
+        let names = file_tool_specs_for_policy(&policy)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&TOOL_READ.to_owned()));
+        assert!(names.contains(&TOOL_GREP.to_owned()));
+        assert!(names.contains(&TOOL_FIND.to_owned()));
+        assert!(names.contains(&TOOL_LS.to_owned()));
+        assert!(!names.contains(&TOOL_WRITE.to_owned()));
+        assert!(!names.contains(&TOOL_EDIT.to_owned()));
+        assert!(!names.contains(&TOOL_BASH.to_owned()));
+        assert!(workflow_tool_specs_for_policy(
+            &policy,
+            vec![ToolSpec {
+                name: "EchoTool".to_owned(),
+                description: "Echo test tool".to_owned(),
+                input_schema: json!({"type": "object"}),
+            }]
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn registered_custom_profile_policy_filters_workflow_tools() {
+        let workflow_tool = || ToolSpec {
+            name: "EchoTool".to_owned(),
+            description: "Echo test tool".to_owned(),
+            input_schema: json!({"type": "object"}),
+        };
+        let registered_without_invoke = RegisteredProfilePolicy {
+            enforcement_mode: "enforce".to_owned(),
+            allowed_capabilities: vec!["repo.read".to_owned()],
+        };
+        let without_invoke = HarnessProfilePolicy::for_profile_with_registry(
+            Some("docs-reader"),
+            Some(&registered_without_invoke),
+        );
+        assert!(workflow_tool_specs_for_policy(&without_invoke, vec![workflow_tool()]).is_empty());
+
+        let registered_with_invoke = RegisteredProfilePolicy {
+            enforcement_mode: "enforce".to_owned(),
+            allowed_capabilities: vec!["workflow.invoke".to_owned()],
+        };
+        let with_invoke = HarnessProfilePolicy::for_profile_with_registry(
+            Some("tool-runner"),
+            Some(&registered_with_invoke),
+        );
+        let names = workflow_tool_specs_for_policy(&with_invoke, vec![workflow_tool()])
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["EchoTool".to_owned()]);
+    }
+
+    #[test]
+    fn workflow_tool_dispatch_requires_profile_capability() {
+        let root = temp_root();
+        let mut exec = FileToolExecutor::new(&root).with_resolved_profile_policy(
+            HarnessProfilePolicy::from_required_capabilities(&["repo.read".to_owned()])
+                .expect("repo.read required policy"),
+        );
+        exec.workflow_tools.push(WorkflowToolEntry {
+            name: "EchoTool".to_owned(),
+            path: root.join("tool.whip"),
+            root: "EchoTool".to_owned(),
+            package_id: crate::LOCAL_WORKFLOW_PACKAGE.to_owned(),
+        });
+
+        let denied = exec.execute(&call("EchoTool", json!({})));
+        assert_eq!(denied.status, ToolStatus::Error);
+        assert!(denied
+            .content
+            .contains("workflow tool invoke is not permitted"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn registered_custom_profile_policy_intersects_file_and_bash_tools() {
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/in.txt"), "old").expect("seed");
+        let input = json!({
+            "access_grants": [
+                {
+                    "resource": "project_files",
+                    "operations": [
+                        {"operation": "read", "globs": ["src/**"]},
+                        {"operation": "write", "globs": ["src/**"]}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+        let access = turn_file_access_from_input(&input).expect("parse grants");
+        let registered = RegisteredProfilePolicy {
+            enforcement_mode: "enforce".to_owned(),
+            allowed_capabilities: vec!["repo.read".to_owned()],
+        };
+        let policy =
+            HarnessProfilePolicy::for_profile_with_registry(Some("docs-reader"), Some(&registered));
+        let exec = FileToolExecutor::new(&root)
+            .with_turn_file_access(access)
+            .with_resolved_profile_policy(policy)
+            .with_bash_allow(vec!["echo".into()]);
+
+        let read = exec.execute(&call(TOOL_READ, json!({ "path": "src/in.txt" })));
+        let write = exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "src/out.txt", "content": "new" }),
+        ));
+        let bash = exec.execute(&call(TOOL_BASH, json!({ "command": "echo hello" })));
+
+        assert_eq!(read.status, ToolStatus::Ok);
+        assert_eq!(write.status, ToolStatus::Error);
+        assert!(write.content.contains("profile `docs-reader`"));
+        assert_eq!(bash.status, ToolStatus::Error);
+        assert!(bash.content.contains("profile `docs-reader`"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn registered_profile_policy_loads_from_store() {
+        let root = temp_root();
+        let store_path = root.join("profile-store.sqlite");
+        let store = SqliteStore::open(&store_path).expect("store opens");
+        store
+            .register_profile(whipplescript_store::ProfileRegistration {
+                profile_id: "profile_docs_reader",
+                name: "docs-reader",
+                description: "Read project docs.",
+                enforcement_mode: "enforce",
+                allowed_capabilities_json: r#"["repo.read"]"#,
+                config_json: "{}",
+            })
+            .expect("profile registers");
+        drop(store);
+
+        let registered = registered_profile_policy_from_store(&store_path, Some("docs-reader"))
+            .expect("profile lookup succeeds")
+            .expect("profile exists");
+
+        assert_eq!(registered.enforcement_mode, "enforce");
+        assert_eq!(registered.allowed_capabilities, vec!["repo.read"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn grep_and_find_and_ls() {
         let root = temp_root();
         let exec = FileToolExecutor::new(&root);
@@ -1406,143 +3527,212 @@ mod tests {
     }
 
     #[test]
-    fn tracker_tools_refused_without_configuration() {
-        // Default-deny: without with_tracker (no WHIPPLESCRIPT_HARNESS_TRACKER),
-        // the tracker tools are refused before touching any store.
+    fn bash_requires_command_run_turn_grant_when_turn_policy_is_installed() {
         let root = temp_root();
-        let exec = FileToolExecutor::new(&root);
-        let r = exec.execute(&call(TOOL_ADD_TODO, json!({ "content": "do a thing" })));
-        assert_eq!(r.status, ToolStatus::Error);
-        assert!(r.content.contains("not enabled"));
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn todo_status_mapping_round_trips() {
-        assert_eq!(todo_to_item_status("pending"), "open");
-        assert_eq!(todo_to_item_status("in_progress"), "in_progress");
-        assert_eq!(todo_to_item_status("completed"), "done");
-        assert_eq!(item_to_todo_status("open"), "pending");
-        assert_eq!(item_to_todo_status("in_progress"), "in_progress");
-        assert_eq!(item_to_todo_status("done"), "completed");
-        assert_eq!(item_to_todo_status("cancelled"), "completed");
-    }
-
-    /// A convergent `@tool` leaf workflow that echoes its input back as output,
-    /// so a test can assert input flowed in and the terminal payload flowed out.
-    const ECHO_TOOL_SRC: &str = r#"@tool
-description "Echo the request text back as the result."
-workflow EchoTool {
-  input request EchoRequest
-  output result EchoResult
-
-  class EchoRequest {
-    text string
-  }
-
-  class EchoResult {
-    echoed string
-  }
-
-  rule echo
-    when EchoRequest as request
-  => {
-    done request
-    complete result {
-      echoed request.text
-    }
-  }
-}
-"#;
-
-    /// A `@tool` leaf that always fails, to exercise non-`completed` surfacing.
-    const FAILING_TOOL_SRC: &str = r#"@tool
-workflow FailingTool {
-  input request FailReq
-  output result FailRes
-  failure error FailErr
-
-  class FailReq {
-    text string
-  }
-
-  class FailRes {
-    ok "yes"
-  }
-
-  class FailErr {
-    reason string
-  }
-
-  rule boom
-    when FailReq as request
-  => {
-    done request
-    fail error {
-      reason "tool refused"
-    }
-  }
-}
-"#;
-
-    fn workflow_tool_executor(root: &Path, src: &str, name: &str) -> FileToolExecutor {
-        let tool_path = root.join(format!("{name}.whip"));
-        std::fs::write(&tool_path, src).expect("write tool source");
-        let store_path = root.join("store.db");
-        let entry = WorkflowToolEntry {
-            name: name.to_owned(),
-            path: tool_path,
-            root: name.to_owned(),
-        };
-        FileToolExecutor::new(root).with_workflow_tools(
-            vec![entry],
-            store_path,
-            8,
-            "work-unit-root",
-            crate::SubworkflowProviderContext::fixture(),
+        let read_only = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "project_files",
+                        "operations": [
+                            {"operation": "read", "globs": ["src/**"]}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
         )
+        .expect("read-only grant parses");
+        let exec = FileToolExecutor::new(&root)
+            .with_turn_tool_access(read_only)
+            .with_profile_policy(Some("repo-writer"))
+            .with_bash_allow(vec!["echo".into()]);
+
+        let denied = exec.execute(&call(TOOL_BASH, json!({ "command": "echo hello" })));
+
+        assert_eq!(denied.status, ToolStatus::Error);
+        assert!(denied.content.contains("command { run }"));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn invokes_a_tool_subworkflow_synchronously_and_returns_its_payload() {
+    fn bash_runs_when_profile_turn_grant_and_allow_list_all_permit() {
         let root = temp_root();
-        let exec = workflow_tool_executor(&root, ECHO_TOOL_SRC, "EchoTool");
-        let out = exec.execute(&call(
-            "EchoTool",
-            json!({ "request": { "text": "alpha beta gamma" } }),
+        let command_only = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "command",
+                        "operations": [
+                            {"operation": "run"}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("command grant parses");
+        let exec = FileToolExecutor::new(&root)
+            .with_turn_tool_access(command_only)
+            .with_profile_policy(Some("repo-writer"))
+            .with_bash_allow(vec!["echo".into()]);
+
+        let ok = exec.execute(&call(TOOL_BASH, json!({ "command": "echo hello" })));
+
+        assert_eq!(ok.status, ToolStatus::Ok);
+        assert!(ok.content.contains("hello"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bash_output_redirection_requires_turn_write_grant() {
+        let root = temp_root();
+        let command_only = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "command",
+                        "operations": [
+                            {"operation": "run"}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("command grant parses");
+        let exec = FileToolExecutor::new(&root)
+            .with_turn_tool_access(command_only)
+            .with_profile_policy(Some("repo-writer"))
+            .with_bash_allow(vec!["echo".into()]);
+
+        let denied = exec.execute(&call(
+            TOOL_BASH,
+            json!({ "command": "echo hello > out.txt" }),
         ));
-        assert_eq!(out.status, ToolStatus::Ok, "content: {}", out.content);
-        // The child's output payload comes back as the tool result: input flowed
-        // in (request.text) and the terminal `complete result` flowed out.
-        assert!(
-            out.content.contains("alpha beta gamma"),
-            "payload: {}",
-            out.content
-        );
+
+        assert_eq!(denied.status, ToolStatus::Error);
+        assert!(denied.content.contains("out.txt"));
+        assert!(denied.content.contains("file write is not granted"));
+        assert!(!root.join("out.txt").exists());
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn a_failed_tool_subworkflow_surfaces_as_a_tool_error() {
+    fn bash_input_redirection_requires_turn_read_grant() {
         let root = temp_root();
-        let exec = workflow_tool_executor(&root, FAILING_TOOL_SRC, "FailingTool");
-        let out = exec.execute(&call("FailingTool", json!({ "request": { "text": "x" } })));
-        assert_eq!(out.status, ToolStatus::Error, "content: {}", out.content);
-        assert!(
-            out.content.contains("failed") || out.content.contains("tool refused"),
-            "payload: {}",
-            out.content
-        );
+        std::fs::write(root.join("input.txt"), "hello\n").expect("seed input");
+        let command_only = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "command",
+                        "operations": [
+                            {"operation": "run"}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("command grant parses");
+        let exec = FileToolExecutor::new(&root)
+            .with_turn_tool_access(command_only)
+            .with_profile_policy(Some("repo-writer"))
+            .with_bash_allow(vec!["cat".into()]);
+
+        let denied = exec.execute(&call(TOOL_BASH, json!({ "command": "cat < input.txt" })));
+
+        assert_eq!(denied.status, ToolStatus::Error);
+        assert!(denied.content.contains("input.txt"));
+        assert!(denied.content.contains("file read is not granted"));
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn an_unregistered_workflow_tool_is_an_unknown_tool() {
+    fn bash_refuses_shell_control_operators_before_execution() {
         let root = temp_root();
-        let exec = workflow_tool_executor(&root, ECHO_TOOL_SRC, "EchoTool");
-        let out = exec.execute(&call("NotRegistered", json!({})));
-        assert_eq!(out.status, ToolStatus::Error);
-        assert!(out.content.contains("unknown tool"));
+        let exec = FileToolExecutor::new(&root).with_bash_allow(vec!["echo".into()]);
+
+        for command in [
+            "echo ok; touch owned.txt",
+            "echo ok && touch owned.txt",
+            "echo ok | touch owned.txt",
+            "echo ok\n touch owned.txt",
+        ] {
+            let denied = exec.execute(&call(TOOL_BASH, json!({ "command": command })));
+            assert_eq!(denied.status, ToolStatus::Error, "command: {command}");
+            assert!(denied.content.contains("command refused"));
+        }
+        assert!(!root.join("owned.txt").exists());
+
+        let quoted = exec.execute(&call(
+            TOOL_BASH,
+            json!({ "command": "echo 'a; b | c && d (x)'" }),
+        ));
+        assert_eq!(quoted.status, ToolStatus::Ok);
+        assert!(quoted.content.contains("a; b | c && d (x)"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bash_refuses_command_substitution_before_execution() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root).with_bash_allow(vec!["echo".into()]);
+
+        let dollar = exec.execute(&call(
+            TOOL_BASH,
+            json!({ "command": "echo $(touch owned.txt)" }),
+        ));
+        let backticks = exec.execute(&call(
+            TOOL_BASH,
+            json!({ "command": "echo `touch backtick-owned.txt`" }),
+        ));
+
+        assert_eq!(dollar.status, ToolStatus::Error);
+        assert!(dollar.content.contains("command substitution"));
+        assert_eq!(backticks.status, ToolStatus::Error);
+        assert!(backticks.content.contains("command substitution"));
+        assert!(!root.join("owned.txt").exists());
+        assert!(!root.join("backtick-owned.txt").exists());
+
+        let literal = exec.execute(&call(
+            TOOL_BASH,
+            json!({ "command": "echo '$(touch literal.txt)'" }),
+        ));
+        assert_eq!(literal.status, ToolStatus::Ok);
+        assert!(literal.content.contains("$(touch literal.txt)"));
+        assert!(!root.join("literal.txt").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bash_refuses_dynamic_shell_expansion_before_execution() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root).with_bash_allow(vec!["echo".into()]);
+
+        for command in ["echo $HOME", "echo *.rs", "echo {a,b}", "echo ~/secret"] {
+            let denied = exec.execute(&call(TOOL_BASH, json!({ "command": command })));
+            assert_eq!(denied.status, ToolStatus::Error, "command: {command}");
+            assert!(denied.content.contains("command refused"));
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bash_refuses_out_of_workspace_path_arguments() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root).with_bash_allow(vec!["echo".into()]);
+
+        for command in [
+            "echo ../secret",
+            "echo /tmp/secret",
+            "echo --input=../secret",
+        ] {
+            let denied = exec.execute(&call(TOOL_BASH, json!({ "command": command })));
+            assert_eq!(denied.status, ToolStatus::Error, "command: {command}");
+            assert!(denied.content.contains("must stay within the workspace"));
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 

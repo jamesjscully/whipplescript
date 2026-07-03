@@ -4824,6 +4824,110 @@ rule start_native_work
 }
 
 #[test]
+fn dev_provider_config_profile_allowlist_blocks_effect_recoverably() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("provider-profile-allowlist");
+    let config_path = temp_workflow_path("provider-profile-allowlist-config");
+    fs::write(
+        &source_path,
+        r#"
+workflow ProviderProfileAllowlist
+
+harness runner: command
+
+agent worker using runner {
+  profile "repo-reader"
+  capacity 1
+}
+
+rule start_work
+  when started
+  when worker is available
+=> {
+  tell worker "this command harness should be blocked by profile allow-list"
+}
+"#,
+    )
+    .expect("write provider profile allowlist workflow");
+    fs::write(
+        &config_path,
+        json!({
+            "providers": [
+                {
+                    "provider_id": "runner",
+                    "provider_kind": "command",
+                    "surface": "command",
+                    "workspace_policy": "read_only",
+                    "cancellation_depth": "none",
+                    "artifact_policy": "metadata",
+                    "profile_ids": ["repo-writer"],
+                    "executable": "sh",
+                    "args": ["-c", "echo should-not-run"]
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write provider config");
+
+    let store_str = store_path.to_str().expect("utf-8 temp path");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_str,
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--provider-config",
+            config_path.to_str().expect("utf-8 config path"),
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let effects = run_json(
+        bin,
+        &["--store", store_str, "--json", "effects", instance_id],
+    );
+    let tell = effects
+        .as_array()
+        .expect("effects array")
+        .iter()
+        .find(|effect| effect.get("kind").and_then(Value::as_str) == Some("agent.tell"))
+        .expect("agent.tell effect");
+
+    assert_eq!(tell.get("status").and_then(Value::as_str), Some("blocked"));
+    assert_eq!(
+        tell.pointer("/policy_block/category")
+            .and_then(Value::as_str),
+        Some("provider_config")
+    );
+    assert!(
+        tell.pointer("/policy_block/detail")
+            .and_then(Value::as_str)
+            .is_some_and(|detail| detail.contains("does not allow profile `repo-reader`")),
+        "block detail: {tell}"
+    );
+    assert!(
+        run_json(bin, &["--store", store_str, "--json", "runs", instance_id])
+            .as_array()
+            .expect("runs array")
+            .is_empty()
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(config_path);
+}
+
+#[test]
 fn dev_native_fixture_stress_records_one_terminal_per_effect() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();

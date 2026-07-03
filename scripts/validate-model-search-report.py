@@ -38,6 +38,10 @@ ALLOWED_IR_PREDICATES = {
     "revision-stale-rule",
     "revision-effect-attribution",
     "revision-completes-cancelled",
+    "workflow-complete",
+    "workflow-complete-requires-action",
+    "workflow-fail",
+    "workflow-fail-requires-action",
 }
 
 
@@ -783,20 +787,34 @@ def validate_ir_obligation(
 
 
 def parse_snapshot_facts(snapshot: str) -> dict[str, Any]:
-    facts: dict[str, Any] = {"rules": {}, "rule_order": [], "assertion_count": 0}
+    facts: dict[str, Any] = {
+        "rules": {},
+        "rule_order": [],
+        "assertion_count": 0,
+        "workflow_name": "",
+        "workflow_contracts": [],
+    }
     section = ""
     current_rule: str | None = None
     current_rule_subsection = ""
 
     for line in snapshot.splitlines():
         if not line.startswith(" "):
-            section = line.split(maxsplit=1)[0] if line.split(maxsplit=1) else ""
+            parts = line.split()
+            section = parts[0] if parts else ""
+            if section == "workflow" and len(parts) > 1:
+                facts["workflow_name"] = parts[1]
             current_rule = None
             current_rule_subsection = ""
             continue
         if section == "assertions":
             if line.startswith("  assert "):
                 facts["assertion_count"] += 1
+            continue
+        if section == "workflow_contracts":
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] in ("output", "failure"):
+                facts["workflow_contracts"].append((parts[0], parts[1]))
             continue
         if section != "rules":
             continue
@@ -1040,6 +1058,49 @@ def expected_ir_rows(facts: dict[str, Any]) -> list[tuple[str, str, str, str, st
                     "no_solution",
                 )
             )
+    # Workflow-terminal composition searches: the generator emits two searches
+    # per declared output/failure contract, in contract order, after all rule
+    # and assertion searches (mirrors append_composition_model_searches).
+    workflow = facts.get("workflow_name", "")
+    for kind, name in facts.get("workflow_contracts", []):
+        if kind == "output":
+            rows.append(
+                (
+                    f"{workflow} complete {name} reaches terminal",
+                    workflow,
+                    "workflow-complete",
+                    "workflowCompletedEvt",
+                    "solution",
+                )
+            )
+            rows.append(
+                (
+                    f"{workflow} completion requires explicit complete {name}",
+                    workflow,
+                    "workflow-complete-requires-action",
+                    "workflowCompletedEvt",
+                    "no_solution",
+                )
+            )
+        elif kind == "failure":
+            rows.append(
+                (
+                    f"{workflow} fail {name} reaches terminal",
+                    workflow,
+                    "workflow-fail",
+                    "workflowFailedEvt",
+                    "solution",
+                )
+            )
+            rows.append(
+                (
+                    f"{workflow} failure requires explicit fail {name}",
+                    workflow,
+                    "workflow-fail-requires-action",
+                    "workflowFailedEvt",
+                    "no_solution",
+                )
+            )
     return rows
 
 
@@ -1122,6 +1183,18 @@ def snapshot_supports_obligation(
         )
     if predicate == "revision-completes-cancelled":
         return snapshot_has_dependency(facts, upstream, "completes", downstream)
+    if predicate in {"workflow-complete", "workflow-complete-requires-action"}:
+        return (
+            downstream == "workflowCompletedEvt"
+            and upstream == facts.get("workflow_name", "")
+            and any(kind == "output" for kind, _ in facts.get("workflow_contracts", []))
+        )
+    if predicate in {"workflow-fail", "workflow-fail-requires-action"}:
+        return (
+            downstream == "workflowFailedEvt"
+            and upstream == facts.get("workflow_name", "")
+            and any(kind == "failure" for kind, _ in facts.get("workflow_contracts", []))
+        )
     return False
 
 

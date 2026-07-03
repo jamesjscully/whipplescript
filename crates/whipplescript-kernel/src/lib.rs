@@ -41,10 +41,10 @@ use whipplescript_store::{
     ArtifactRecord, ClaimableEffect, DerivedFact, DiagnosticRecord, EffectCancellation,
     EffectCompletion, EvidenceRecord, ExpiredLease, FactBatch, FactBatchOutcome,
     InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent, NewFact, NewInboxItem,
-    NewInstance, NewProgramVersion, NewWorkflowInvocation, ProgramVersionRecord, RetryEffect,
-    RevisionActivation, RuleCommit, RuleCommitRevisionGuard, RunStart, SkillEvidence, SqliteStore,
-    StoreError, StoreResult, StoredEvent, TerminalDiagnosticRecord, WorkflowInvocationView,
-    WorkflowRevisionView,
+    NewInstance, NewInstanceAuthority, NewProgramVersion, NewWorkflowInvocation,
+    ProgramVersionRecord, RetryEffect, RevisionActivation, RuleCommit, RuleCommitRevisionGuard,
+    RunStart, SkillEvidence, SqliteStore, StoreError, StoreResult, StoredEvent,
+    TerminalDiagnosticRecord, WorkflowInvocationView, WorkflowRevisionView,
 };
 
 pub struct RuntimeKernel {
@@ -451,12 +451,24 @@ impl RuntimeKernel {
         version: &ProgramVersionRecord,
         input_json: &str,
     ) -> StoreResult<String> {
+        self.create_instance_with_authority(version, input_json, NewInstanceAuthority::empty())
+    }
+
+    pub fn create_instance_with_authority(
+        &self,
+        version: &ProgramVersionRecord,
+        input_json: &str,
+        authority: NewInstanceAuthority<'_>,
+    ) -> StoreResult<String> {
         self.store
-            .create_instance(NewInstance {
-                program_id: &version.program_id,
-                version_id: &version.version_id,
-                input_json,
-            })
+            .create_instance_with_authority(
+                NewInstance {
+                    program_id: &version.program_id,
+                    version_id: &version.version_id,
+                    input_json,
+                },
+                authority,
+            )
             .map(|instance| instance.instance_id)
     }
 

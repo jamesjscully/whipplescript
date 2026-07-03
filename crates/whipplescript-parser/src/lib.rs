@@ -379,6 +379,7 @@ pub struct LeaseDecl {
     pub key_type: Ident,
     pub slots: u32,
     pub ttl_seconds: u64,
+    pub shared: bool,
     pub span: SourceSpan,
 }
 
@@ -388,6 +389,7 @@ pub struct LedgerDecl {
     pub entry_schema: Ident,
     pub partition_field: Ident,
     pub retain_seconds: u64,
+    pub shared: bool,
     pub span: SourceSpan,
 }
 
@@ -397,6 +399,7 @@ pub struct CounterDecl {
     pub key_type: Ident,
     pub cap: i64,
     pub reset: String,
+    pub shared: bool,
     pub span: SourceSpan,
 }
 
@@ -829,12 +832,19 @@ pub struct IrProgram {
     pub leases: Vec<IrLease>,
     pub ledgers: Vec<IrLedger>,
     pub counters: Vec<IrCounter>,
+    pub shared_coordination_usage: Vec<IrSharedCoordinationUsage>,
     pub schemas: Vec<IrSchema>,
     pub agents: Vec<IrAgent>,
     pub coerces: Vec<IrCoerce>,
     pub assertions: Vec<IrAssertion>,
     pub rules: Vec<IrRule>,
     pub rule_dependencies: Vec<IrRuleDependency>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrSharedCoordinationUsage {
+    pub resource: String,
+    pub workflow_principals: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1038,6 +1048,7 @@ pub struct IrLease {
     pub key_type: String,
     pub slots: u32,
     pub ttl_seconds: u64,
+    pub shared: bool,
     pub span: SourceSpan,
 }
 
@@ -1047,6 +1058,7 @@ pub struct IrLedger {
     pub entry_schema: String,
     pub partition_field: String,
     pub retain_seconds: u64,
+    pub shared: bool,
     pub span: SourceSpan,
 }
 
@@ -1056,6 +1068,7 @@ pub struct IrCounter {
     pub key_type: String,
     pub cap: i64,
     pub reset: String,
+    pub shared: bool,
     pub span: SourceSpan,
 }
 
@@ -1195,6 +1208,12 @@ pub struct IrRuleMetadata {
     /// snapshot). Union across branches; a `Shorthand` field resolves to the
     /// terminal's `from` binding.
     pub complete_field_reads: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    /// Per `emit milestone "<name>"` egress, the binding roots each MILESTONE FIELD
+    /// references — same shape and purpose as `complete_field_reads`, but keyed by
+    /// milestone name. Milestone payloads are child-to-parent egresses, so IFC needs
+    /// their per-field flow signature too (D3′). IFC-only (NOT in the `.ir`
+    /// snapshot). Union across branches.
+    pub milestone_field_reads: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     /// Bounded-type projection egresses (`record <T> from <src>`): each is governed
     /// by the kept fields' per-field label join, like an explicit `redact`. IFC-only
     /// (NOT in the `.ir` snapshot). DR-0027 auto-redaction, the bounded-type reading.
@@ -1290,6 +1309,10 @@ pub struct IrEffectNode {
     /// analysis can model the turn's egress to that agent's provider. `None` for
     /// non-`tell` effects. Not part of the `.ir` snapshot.
     pub agent: Option<String>,
+    /// The workflow an `invoke` addresses, surfaced so information-flow analysis can
+    /// enumerate and govern invoke membrane ports. `None` for non-`invoke` effects.
+    /// Not part of the `.ir` snapshot.
+    pub workflow_target: Option<String>,
     /// The `endorsed` source marker (DR-0027 I-IFC3): the author declared this effect
     /// (a `coerce`) an integrity-raising crossing. Surfaced so the trusted surface is
     /// visible at the source crossing point. Not part of the `.ir` snapshot.
@@ -1734,6 +1757,7 @@ pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOut
     // per-rule during lowering.
     let mut invoke_recursion_diagnostics = Vec::new();
     detect_workflow_invoke_recursion(&parsed.program, &mut invoke_recursion_diagnostics);
+    detect_private_workflow_invocations(&parsed.program, &mut invoke_recursion_diagnostics);
     if !invoke_recursion_diagnostics.is_empty() {
         return CompileOutput {
             ir: None,
@@ -1743,6 +1767,7 @@ pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOut
     }
 
     let workflow_inputs = collect_workflow_input_surfaces(&parsed.program);
+    let shared_coordination_usage = collect_shared_coordination_usage(&parsed.program);
 
     // Whole-program validation (RESOLVED 2026-07-01): when a program declares
     // more than one explicit `workflow`, validate EVERY workflow — not only the
@@ -1788,7 +1813,14 @@ pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOut
                 .filter_map(|item| referenced_decl_name(item).map(|(name, _)| name))
                 .collect();
             let mut diagnostics = match select_root_workflow(parsed.program.clone(), Some(&name)) {
-                Ok(scoped) => lower_program(scoped, workflow_inputs.clone()).diagnostics,
+                Ok(scoped) => {
+                    lower_program(
+                        scoped,
+                        workflow_inputs.clone(),
+                        shared_coordination_usage.clone(),
+                    )
+                    .diagnostics
+                }
                 Err(diagnostics) => diagnostics,
             };
             for diagnostic in &mut diagnostics {
@@ -1812,7 +1844,7 @@ pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOut
     }
 
     match select_root_workflow(parsed.program, root) {
-        Ok(program) => lower_program(program, workflow_inputs),
+        Ok(program) => lower_program(program, workflow_inputs, shared_coordination_usage),
         Err(diagnostics) => CompileOutput {
             ir: None,
             diagnostics,
@@ -2754,6 +2786,20 @@ impl IrProgram {
             }
         }
 
+        if !self.shared_coordination_usage.is_empty() {
+            push_line(&mut snapshot, "shared_coordination_usage");
+            for usage in &self.shared_coordination_usage {
+                push_line(
+                    &mut snapshot,
+                    format!(
+                        "{} <- {}",
+                        usage.resource,
+                        usage.workflow_principals.join(",")
+                    ),
+                );
+            }
+        }
+
         if !self.includes.is_empty() {
             push_line(&mut snapshot, "includes");
             for include in &self.includes {
@@ -3343,7 +3389,7 @@ fn effect_contract_for_kind(
         ),
         IrEffectKind::Coerce => (
             "std.coerce",
-            strings(&["coerce", "decide"]),
+            strings(&["coerce", "decide", "prompt"]),
             Some("coerce.input"),
             Some("typed-provider-output"),
             strings(&["model.invoke"]),
@@ -3665,6 +3711,7 @@ impl IrPrimitiveType {
 fn lower_program(
     program: Program,
     workflow_inputs: BTreeMap<String, WorkflowInputSurface>,
+    shared_coordination_usage: Vec<IrSharedCoordinationUsage>,
 ) -> CompileOutput {
     let mut diagnostics = Vec::new();
     let mut warnings = Vec::new();
@@ -3736,6 +3783,7 @@ fn lower_program(
         leases: Vec::new(),
         ledgers: Vec::new(),
         counters: Vec::new(),
+        shared_coordination_usage,
         schemas: Vec::new(),
         agents: Vec::new(),
         coerces: Vec::new(),
@@ -3848,6 +3896,7 @@ fn lower_program(
                     key_type: lease.key_type.name,
                     slots: lease.slots.max(1),
                     ttl_seconds: lease.ttl_seconds,
+                    shared: lease.shared,
                     span: lease.span,
                 });
             }
@@ -3868,6 +3917,7 @@ fn lower_program(
                     entry_schema: ledger.entry_schema.name,
                     partition_field: ledger.partition_field.name,
                     retain_seconds: ledger.retain_seconds,
+                    shared: ledger.shared,
                     span: ledger.span,
                 });
             }
@@ -3891,6 +3941,7 @@ fn lower_program(
                     key_type: counter.key_type.name,
                     cap: counter.cap,
                     reset: counter.reset,
+                    shared: counter.shared,
                     span: counter.span,
                 });
             }
@@ -4255,6 +4306,53 @@ fn detect_workflow_invoke_recursion(program: &Program, diagnostics: &mut Vec<Dia
                 ),
             });
         }
+    }
+}
+
+fn detect_private_workflow_invocations(program: &Program, diagnostics: &mut Vec<Diagnostic>) {
+    let private_workflows = program
+        .workflows
+        .iter()
+        .filter(|workflow| workflow.tags.iter().any(|tag| tag.name == "private"))
+        .map(|workflow| workflow.name.name.as_str())
+        .collect::<BTreeSet<_>>();
+    if private_workflows.is_empty() {
+        return;
+    }
+
+    let mut record_private_invokes = |caller: &str, items: &[Item]| {
+        for item in items {
+            let Item::Rule(rule) = item else {
+                continue;
+            };
+            for statement in workflow_invoke_statements(&rule.body.text) {
+                let Some((target, _)) = invoke_statement_parts(&statement) else {
+                    continue;
+                };
+                if caller == target || !private_workflows.contains(target) {
+                    continue;
+                }
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` invokes private workflow `{target}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some(
+                        "remove `@private` from the target workflow or expose a public wrapper workflow"
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+    };
+
+    if let Some(root) = &program.workflow {
+        record_private_invokes(&root.name, &program.items);
+    }
+    for workflow in &program.workflows {
+        record_private_invokes(&workflow.name.name, &workflow.items);
     }
 }
 
@@ -5136,6 +5234,113 @@ fn collect_workflow_input_surfaces(program: &Program) -> BTreeMap<String, Workfl
     }
 
     surfaces
+}
+
+fn collect_shared_coordination_usage(program: &Program) -> Vec<IrSharedCoordinationUsage> {
+    let global_shared = shared_coordination_declarations(&program.items);
+    let mut usage: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    let mut record_workflow = |workflow_name: &str, local_items: &[Item]| {
+        let mut shared = global_shared.clone();
+        shared.extend(shared_coordination_declarations(local_items));
+        if shared.is_empty() {
+            return;
+        }
+        let principal = format!("workflow:local/{workflow_name}");
+        for resource in coordination_resources_used_by_items(&program.items)
+            .into_iter()
+            .chain(coordination_resources_used_by_items(local_items))
+        {
+            if shared.contains(&resource) {
+                usage.entry(resource).or_default().insert(principal.clone());
+            }
+        }
+    };
+
+    if let Some(workflow) = &program.workflow {
+        record_workflow(&workflow.name, &[]);
+    }
+    for workflow in &program.workflows {
+        record_workflow(&workflow.name.name, &workflow.items);
+    }
+
+    usage
+        .into_iter()
+        .map(|(resource, principals)| IrSharedCoordinationUsage {
+            resource: format!("resource:{resource}"),
+            workflow_principals: principals.into_iter().collect(),
+        })
+        .collect()
+}
+
+fn shared_coordination_declarations(items: &[Item]) -> BTreeSet<String> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Lease(lease) if lease.shared => Some(lease.name.name.clone()),
+            Item::Ledger(ledger) if ledger.shared => Some(ledger.name.name.clone()),
+            Item::Counter(counter) if counter.shared => Some(counter.name.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn coordination_resources_used_by_items(items: &[Item]) -> BTreeSet<String> {
+    let mut resources = BTreeSet::new();
+    for item in items {
+        let Item::Rule(rule) = item else {
+            continue;
+        };
+        let (body, _) =
+            body::parse_rule_body(&rule.body.text, rule.body.span.start, body::BodyMode::Rule);
+        collect_coordination_resources_from_statements(&body.statements, &mut resources);
+    }
+    resources
+}
+
+fn collect_coordination_resources_from_statements(
+    statements: &[body::BodyStmt],
+    resources: &mut BTreeSet<String>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => match &effect.kind {
+                body::BodyEffectKind::LeaseAcquire { resource, .. } => {
+                    resources.insert(resource.clone());
+                }
+                body::BodyEffectKind::LedgerAppend { ledger, .. } => {
+                    resources.insert(ledger.clone());
+                }
+                body::BodyEffectKind::CounterConsume { counter, .. } => {
+                    resources.insert(counter.clone());
+                }
+                _ => {}
+            },
+            body::BodyStmt::After(after) => {
+                collect_coordination_resources_from_statements(&after.body, resources);
+            }
+            body::BodyStmt::Case(case_stmt) => {
+                for branch in &case_stmt.branches {
+                    collect_coordination_resources_from_statements(&branch.body, resources);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                collect_coordination_resources_from_statements(&branch.then_body, resources);
+                if let Some(else_body) = &branch.else_body {
+                    collect_coordination_resources_from_statements(else_body, resources);
+                }
+            }
+            body::BodyStmt::Handler(handler) => {
+                collect_coordination_resources_from_statements(&handler.body, resources);
+            }
+            body::BodyStmt::Record(_)
+            | body::BodyStmt::Done { .. }
+            | body::BodyStmt::Terminal(_)
+            | body::BodyStmt::Cancel { .. }
+            | body::BodyStmt::Milestone { .. }
+            | body::BodyStmt::Redact { .. } => {}
+        }
+    }
 }
 
 /// Scans a workflow's rule bodies for `emit milestone "<name>" [of <Class>]`
@@ -6943,12 +7148,12 @@ const EVIDENCE_ONLY_TURN_FACTS: [&str; 3] = [
     "agent.turn.artifact_captured",
 ];
 
-/// Structural well-formedness of turn-access grants (`with access to <resource> { … }`)
-/// on `agent.tell` effects: a grant must grant at least one operation, and a single
-/// tell must not list the same resource twice (merge them). The deeper "required
-/// Resource/Operation/Capability ports" validation against the capability registry is a
-/// separate construct-graph-layer concern, so this stays registry-independent and
-/// zero-false-positive.
+/// Structural well-formedness of access grants (`with access to <resource> { … }`):
+/// a grant must grant at least one operation, and a single effect must not list the
+/// same resource twice (merge them). The deeper "required
+/// Resource/Operation/Capability ports" validation against the capability registry
+/// is a separate construct-graph-layer concern, so this stays registry-independent
+/// and zero-false-positive.
 fn validate_turn_access_grants(
     rule: &RuleDecl,
     metadata: &IrRuleMetadata,
@@ -6979,7 +7184,7 @@ fn validate_turn_access_grants(
                     related: Vec::new(),
                     span: effect.span,
                     message: format!(
-                        "rule `{}` lists turn-access resource `{}` more than once on one `tell`",
+                        "rule `{}` lists access resource `{}` more than once on one effect",
                         rule.name.name, grant.resource
                     ),
                     suggestion: Some(
@@ -7488,6 +7693,7 @@ fn analyze_rule(
         &rule.name.name,
         &mut effect_payload_types,
     );
+    collect_prompt_payload_types(&body_ast.statements, &mut effect_payload_types);
     // `redact … as <binding>` result carries the synthesized `redact.<rule>.<binding>`
     // projected class (see `collect_redact_schemas`), so access through it resolves
     // against the kept-only fields.
@@ -7838,6 +8044,7 @@ fn analyze_rule(
                 access_grants: Vec::new(),
                 resource: None,
                 agent: None,
+                workflow_target: None,
                 endorsed: false,
                 declassified: false,
                 selected_by: None,
@@ -7887,6 +8094,7 @@ fn analyze_rule(
             .extend(roots);
     }
     collect_complete_field_reads(&body_ast.statements, &mut metadata.complete_field_reads);
+    collect_milestone_field_reads(&body_ast.statements, &mut metadata.milestone_field_reads);
     metadata
 }
 
@@ -7941,6 +8149,54 @@ fn collect_complete_field_reads(
                 }
             }
             body::BodyStmt::Handler(handler) => collect_complete_field_reads(&handler.body, out),
+            _ => {}
+        }
+    }
+}
+
+/// For each `emit milestone "<name>" { field: <expr>, … }` egress in a rule body
+/// (recursing into nested blocks), collect the binding roots EACH milestone field
+/// references. This mirrors `collect_complete_field_reads`: the IFC checker uses it
+/// to expose and gate a child-to-parent milestone payload with a per-field flow
+/// signature (D3′).
+fn collect_milestone_field_reads(
+    statements: &[body::BodyStmt],
+    out: &mut BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Milestone { name, fields, .. } => {
+                let per_field = out.entry(name.clone()).or_default();
+                for field in fields {
+                    let mut roots = BTreeSet::new();
+                    match &field.value {
+                        body::FieldValue::Shorthand => {}
+                        body::FieldValue::Expr { expr, .. } => {
+                            collect_expr_binding_roots(expr, &mut roots)
+                        }
+                        body::FieldValue::Nested { fields, .. } => {
+                            collect_payload_field_roots(fields, None, &mut roots)
+                        }
+                    }
+                    per_field
+                        .entry(field.name.clone())
+                        .or_default()
+                        .extend(roots);
+                }
+            }
+            body::BodyStmt::After(after) => collect_milestone_field_reads(&after.body, out),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_milestone_field_reads(&branch.body, out);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                collect_milestone_field_reads(&branch.then_body, out);
+                if let Some(else_body) = &branch.else_body {
+                    collect_milestone_field_reads(else_body, out);
+                }
+            }
+            body::BodyStmt::Handler(handler) => collect_milestone_field_reads(&handler.body, out),
             _ => {}
         }
     }
@@ -8202,6 +8458,11 @@ fn collect_egress_payload_reads(
                 replacement: Some(record),
                 ..
             } => out.push(record_payload_reads(record)),
+            body::BodyStmt::Milestone { name, fields, .. } => {
+                let mut roots = BTreeSet::new();
+                collect_payload_field_roots(fields, None, &mut roots);
+                out.push((format!("milestone:{name}"), roots));
+            }
             // `send via <channel> { text … }` egresses to the channel; its payload
             // fields (text/markdown/thread_id) are construct-use source text. Keyed by
             // the channel (the engine's send sink, per `resource_for_body`).
@@ -8339,6 +8600,9 @@ fn terminal_completed_payload_type(
     semantic: &SemanticContext,
 ) -> IrType {
     match kind {
+        IrEffectKind::Coerce if line.starts_with("prompt ") => {
+            IrType::Primitive(IrPrimitiveType::String)
+        }
         IrEffectKind::Coerce => parse_coerce_call_name(line)
             .and_then(|name| semantic.coerce_outputs.get(name))
             .cloned()
@@ -8854,10 +9118,12 @@ fn ir_field(name: &str, ty: IrType) -> IrClassField {
     }
 }
 
-/// Lower a `tell`'s parsed turn-access grants to IR. Empty for any other effect kind.
+/// Lower parsed access grants to IR for effects that carry authority-narrowing
+/// metadata (`tell` turns and `invoke` start grants).
 fn ir_access_grants_for_body(kind: &body::BodyEffectKind) -> Vec<IrAccessGrant> {
     match kind {
-        body::BodyEffectKind::Tell { access_grants, .. } => access_grants
+        body::BodyEffectKind::Tell { access_grants, .. }
+        | body::BodyEffectKind::Invoke { access_grants, .. } => access_grants
             .iter()
             .map(|grant| IrAccessGrant {
                 resource: grant.resource.clone(),
@@ -8879,9 +9145,9 @@ fn ir_access_grants_for_body(kind: &body::BodyEffectKind) -> Vec<IrAccessGrant> 
 fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
     match kind {
         body::BodyEffectKind::Tell { .. } => IrEffectKind::AgentTell,
-        body::BodyEffectKind::Coerce { .. } | body::BodyEffectKind::Decide { .. } => {
-            IrEffectKind::Coerce
-        }
+        body::BodyEffectKind::Coerce { .. }
+        | body::BodyEffectKind::Prompt { .. }
+        | body::BodyEffectKind::Decide { .. } => IrEffectKind::Coerce,
         body::BodyEffectKind::AskHuman { .. } => IrEffectKind::HumanAsk,
         body::BodyEffectKind::Call { .. }
         | body::BodyEffectKind::ConstructCapabilityCall { .. } => IrEffectKind::CapabilityCall,
@@ -8908,6 +9174,14 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
 fn agent_for_body(kind: &body::BodyEffectKind) -> Option<String> {
     match kind {
         body::BodyEffectKind::Tell { target, .. } => Some(target.clone()),
+        _ => None,
+    }
+}
+
+/// The workflow an `invoke` targets, surfaced for IFC membrane-door enumeration.
+fn workflow_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
+    match kind {
+        body::BodyEffectKind::Invoke { workflow, .. } => Some(workflow.clone()),
         _ => None,
     }
 }
@@ -8949,6 +9223,11 @@ fn resource_for_body(kind: &body::BodyEffectKind) -> Option<String> {
         // emit-port door, DR-0027 E6/H8); surfaced so the IFC checker can carry the
         // emitter's label to the receiver and enumerate the port in the surface.
         body::BodyEffectKind::Notify { event, .. } => Some(format!("signal:{event}")),
+        // Coordination is governed as a resource label under E-COORD. The IFC
+        // checker decides whether this declaration is partitioned or `shared`.
+        body::BodyEffectKind::LeaseAcquire { resource, .. } => Some(format!("resource:{resource}")),
+        body::BodyEffectKind::LedgerAppend { ledger, .. } => Some(format!("resource:{ledger}")),
+        body::BodyEffectKind::CounterConsume { counter, .. } => Some(format!("resource:{counter}")),
         _ => None,
     }
 }
@@ -8980,7 +9259,8 @@ fn is_ast_only_effect_kind(kind: &body::BodyEffectKind) -> bool {
     }
     matches!(
         kind,
-        body::BodyEffectKind::Timer { .. }
+        body::BodyEffectKind::Prompt { .. }
+            | body::BodyEffectKind::Timer { .. }
             | body::BodyEffectKind::Exec { .. }
             | body::BodyEffectKind::Decide { .. }
             | body::BodyEffectKind::QueueFile { .. }
@@ -8991,6 +9271,9 @@ fn is_ast_only_effect_kind(kind: &body::BodyEffectKind) -> bool {
             | body::BodyEffectKind::LedgerAppend { .. }
             | body::BodyEffectKind::CounterConsume { .. }
             | body::BodyEffectKind::Notify { .. }
+            // `invoke` payload blocks put post-payload modifiers on the closing line
+            // in flow-generated rules, so the line scanner may miss `as <binding>`.
+            | body::BodyEffectKind::Invoke { .. }
             // `write`/`export` put their `as <binding>` on the block's closing
             // line, so the line-based scanner cannot see it; seed it from the AST
             // so `after <binding>` blocks and sequence checks resolve.
@@ -9137,6 +9420,7 @@ fn walk_effects(
                 let access_grants = ir_access_grants_for_body(&effect.kind);
                 let resource = resource_for_body(&effect.kind);
                 let agent = agent_for_body(&effect.kind);
+                let workflow_target = workflow_target_for_body(&effect.kind);
                 let endorsed = endorsed_for_body(&effect.kind);
                 let declassified = declassified_for_body(&effect.kind);
                 effects.push(IrEffectNode {
@@ -9151,6 +9435,7 @@ fn walk_effects(
                     access_grants,
                     resource,
                     agent,
+                    workflow_target,
                     endorsed,
                     declassified,
                     selected_by: case_stack.last().cloned(),
@@ -12054,7 +12339,22 @@ fn invoke_statement_parts(statement: &str) -> Option<(&str, &str)> {
         return None;
     }
     let open = statement.find('{')?;
-    let close = statement.rfind('}')?;
+    let mut depth = 0i32;
+    let mut close = None;
+    for (offset, ch) in statement[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
     (close > open).then_some((target, statement[open + 1..close].trim()))
 }
 
@@ -12166,6 +12466,40 @@ fn collect_decide_payload_types(
             binding.to_owned(),
             IrType::Ref(inline_decide_schema_name(rule_name, binding)),
         );
+    }
+}
+
+fn collect_prompt_payload_types(
+    statements: &[body::BodyStmt],
+    payloads: &mut BTreeMap<String, IrType>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                if matches!(&effect.kind, body::BodyEffectKind::Prompt { .. }) {
+                    if let Some(binding) = &effect.binding {
+                        payloads
+                            .insert(binding.clone(), IrType::Primitive(IrPrimitiveType::String));
+                    }
+                }
+            }
+            body::BodyStmt::After(after) => collect_prompt_payload_types(&after.body, payloads),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_prompt_payload_types(&branch.body, payloads);
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                collect_prompt_payload_types(&branch.then_body, payloads);
+                if let Some(else_body) = &branch.else_body {
+                    collect_prompt_payload_types(else_body, payloads);
+                }
+            }
+            body::BodyStmt::Handler(handler) => {
+                collect_prompt_payload_types(&handler.body, payloads)
+            }
+            _ => {}
+        }
     }
 }
 
@@ -15164,7 +15498,7 @@ fn validate_union_literal(
 fn parse_effect_line(line: &str) -> Option<(IrEffectKind, Option<String>)> {
     let kind = if line.starts_with("tell ") {
         IrEffectKind::AgentTell
-    } else if line.starts_with("coerce ") {
+    } else if line.starts_with("coerce ") || line.starts_with("prompt ") {
         IrEffectKind::Coerce
     } else if line.starts_with("claim ") {
         IrEffectKind::LoftClaim
@@ -15692,6 +16026,9 @@ fn format_item(item: Item, formatted: &mut String) {
         Item::Test(test) => format_test(test, formatted),
         Item::Lease(lease) => {
             push_line(formatted, format!("lease {} {{", lease.name.name));
+            if lease.shared {
+                push_line(formatted, "  shared");
+            }
             push_line(formatted, format!("  key {}", lease.key_type.name));
             push_line(formatted, format!("  slots {}", lease.slots));
             push_line(formatted, format!("  ttl {}s", lease.ttl_seconds));
@@ -15699,6 +16036,9 @@ fn format_item(item: Item, formatted: &mut String) {
         }
         Item::Ledger(ledger) => {
             push_line(formatted, format!("ledger {} {{", ledger.name.name));
+            if ledger.shared {
+                push_line(formatted, "  shared");
+            }
             push_line(formatted, format!("  entry {}", ledger.entry_schema.name));
             push_line(
                 formatted,
@@ -15709,6 +16049,9 @@ fn format_item(item: Item, formatted: &mut String) {
         }
         Item::Counter(counter) => {
             push_line(formatted, format!("counter {} {{", counter.name.name));
+            if counter.shared {
+                push_line(formatted, "  shared");
+            }
             push_line(formatted, format!("  key {}", counter.key_type.name));
             push_line(formatted, format!("  cap {}", counter.cap));
             push_line(formatted, format!("  reset {}", counter.reset));
@@ -17318,12 +17661,14 @@ impl Parser<'_> {
         let mut key_type = None;
         let mut slots = 1u32;
         let mut ttl_seconds = None;
+        let mut shared = false;
         while !self.is_at_end() && !self.at_symbol('}') {
             let Some(field) = self.expect_ident("lease field") else {
                 self.synchronize_to_block_item();
                 continue;
             };
             match field.name.as_str() {
+                "shared" => shared = true,
                 "key" => key_type = self.expect_ident("key type"),
                 "slots" => {
                     slots = self
@@ -17337,7 +17682,9 @@ impl Parser<'_> {
                         related: Vec::new(),
                         span: field.span,
                         message: format!("unknown lease field `{other}`"),
-                        suggestion: Some("lease fields are `key`, `slots`, and `ttl`".to_owned()),
+                        suggestion: Some(
+                            "lease fields are `shared`, `key`, `slots`, and `ttl`".to_owned(),
+                        ),
                     });
                     self.synchronize_to_block_item();
                 }
@@ -17367,6 +17714,7 @@ impl Parser<'_> {
             key_type,
             slots,
             ttl_seconds,
+            shared,
             span,
         })
     }
@@ -17378,12 +17726,14 @@ impl Parser<'_> {
         let mut entry_schema = None;
         let mut partition_field = None;
         let mut retain_seconds = None;
+        let mut shared = false;
         while !self.is_at_end() && !self.at_symbol('}') {
             let Some(field) = self.expect_ident("ledger field") else {
                 self.synchronize_to_block_item();
                 continue;
             };
             match field.name.as_str() {
+                "shared" => shared = true,
                 "entry" => entry_schema = self.expect_ident("entry schema"),
                 "partition" => {
                     if self.at_ident("by") {
@@ -17405,7 +17755,8 @@ impl Parser<'_> {
                         span: field.span,
                         message: format!("unknown ledger field `{other}`"),
                         suggestion: Some(
-                            "ledger fields are `entry`, `partition by`, and `retain`".to_owned(),
+                            "ledger fields are `shared`, `entry`, `partition by`, and `retain`"
+                                .to_owned(),
                         ),
                     });
                     self.synchronize_to_block_item();
@@ -17438,6 +17789,7 @@ impl Parser<'_> {
             entry_schema,
             partition_field,
             retain_seconds,
+            shared,
             span,
         })
     }
@@ -17449,12 +17801,14 @@ impl Parser<'_> {
         let mut key_type = None;
         let mut cap = None;
         let mut reset = None;
+        let mut shared = false;
         while !self.is_at_end() && !self.at_symbol('}') {
             let Some(field) = self.expect_ident("counter field") else {
                 self.synchronize_to_block_item();
                 continue;
             };
             match field.name.as_str() {
+                "shared" => shared = true,
                 "key" => key_type = self.expect_ident("key type"),
                 "cap" => {
                     cap = self
@@ -17483,7 +17837,9 @@ impl Parser<'_> {
                         related: Vec::new(),
                         span: field.span,
                         message: format!("unknown counter field `{other}`"),
-                        suggestion: Some("counter fields are `key`, `cap`, and `reset`".to_owned()),
+                        suggestion: Some(
+                            "counter fields are `shared`, `key`, `cap`, and `reset`".to_owned(),
+                        ),
                     });
                     self.synchronize_to_block_item();
                 }
@@ -17511,6 +17867,7 @@ impl Parser<'_> {
             key_type,
             cap,
             reset,
+            shared,
             span,
         })
     }
@@ -19833,6 +20190,7 @@ rule start
         assert_eq!(coerce.library_id, "std.coerce");
         assert_eq!(coerce.validation, TypedOutputValidation::RuntimeBoundary);
         assert!(coerce.source_forms.contains(&"coerce".to_owned()));
+        assert!(coerce.source_forms.contains(&"prompt".to_owned()));
         assert!(coerce
             .required_capabilities
             .contains(&"model.invoke".to_owned()));
@@ -19936,6 +20294,551 @@ rule start
         );
         assert_eq!(ir.construct_uses().len(), 1);
         assert!(ir.to_snapshot().contains("construct=recall->memory.query"));
+    }
+
+    fn b1g_body_matrix_program(body: &str) -> String {
+        r#"
+workflow B1gMatrix {
+  use memory
+
+  output result Done
+  failure error Failed
+
+  class Ticket {
+    id string
+    title string
+    due_at time
+    amount int
+  }
+
+  class TicketPublic {
+    id string
+    title string
+  }
+
+  class Workspace {
+    id string
+  }
+
+  class Note {
+    text string
+  }
+
+  class Done {
+    ok bool
+  }
+
+  class Failed {
+    reason string
+  }
+
+  class Review {
+    summary string
+    fixed bool
+  }
+
+  class LedgerEntry {
+    area string
+    text string
+  }
+
+  class Row {
+    title string
+  }
+
+  signal deploy.finished {
+    service string
+    status string
+  }
+
+  queue backlog {
+    tracker builtin
+  }
+
+  lease workspace_slot {
+    key Workspace
+    slots 1
+    ttl 30m
+  }
+
+  ledger review_log {
+    entry LedgerEntry
+    partition by area
+    retain 30d
+  }
+
+  counter request_budget {
+    key Ticket
+    cap 10
+    reset daily
+  }
+
+  file store docs {
+    root "./data"
+  }
+
+  channel ops_room {
+    provider slack
+  }
+
+  agent worker {
+    provider fixture
+    profile "repo-writer"
+    capacity 1
+  }
+
+  coerce classify(title string) -> Review {
+    prompt "classify"
+  }
+
+  rule probe
+    when Ticket as ticket
+    when Workspace as workspace
+    when backlog has ready item as item
+    when worker is available
+  => {
+__BODY__
+  }
+}
+
+workflow Child {
+  input task ChildTask
+  output result ChildResult
+
+  class ChildTask {
+    title string
+  }
+
+  class ChildResult {
+    summary string
+  }
+
+  rule finish
+    when ChildTask as task
+  => {
+    complete result {
+      summary task.title
+    }
+  }
+}
+"#
+        .replace("__BODY__", body)
+    }
+
+    #[test]
+    fn coordination_shared_declarations_lower_to_ir() {
+        let source = r#"
+workflow SharedCoord
+
+class Key {
+  id string
+}
+
+class Entry {
+  area string
+}
+
+lease shared_slot {
+  shared
+  key Key
+  slots 1
+  ttl 30m
+}
+
+ledger shared_log {
+  shared
+  entry Entry
+  partition by area
+  retain 30d
+}
+
+counter shared_budget {
+  shared
+  key Key
+  cap 10
+  reset daily
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("valid IR");
+        assert!(ir
+            .leases
+            .iter()
+            .any(|lease| lease.name == "shared_slot" && lease.shared && lease.ttl_seconds == 1800));
+        assert!(ir
+            .ledgers
+            .iter()
+            .any(|ledger| ledger.name == "shared_log" && ledger.shared));
+        assert!(ir
+            .counters
+            .iter()
+            .any(|counter| counter.name == "shared_budget" && counter.shared));
+    }
+
+    #[test]
+    fn formatter_preserves_shared_coordination_declarations() {
+        let source = r#"
+workflow SharedCoord
+class Key { id string }
+lease shared_slot { shared key Key slots 1 ttl 30m }
+"#;
+        let formatted = format_program(source);
+        assert_eq!(formatted.diagnostics, Vec::new());
+        let formatted = formatted.formatted.expect("formats");
+        assert!(formatted.contains("lease shared_slot {\n  shared\n  key Key"));
+    }
+
+    fn b1g_probe_rule(case_name: &str, body: &str) -> IrRule {
+        let source = b1g_body_matrix_program(body);
+        let compiled = compile_program_with_root(&source, Some("B1gMatrix"));
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{case_name} emitted diagnostics: {:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("valid matrix IR");
+        ir.rules
+            .into_iter()
+            .find(|rule| rule.name == "probe")
+            .expect("probe rule")
+    }
+
+    fn b1g_effect<'a>(
+        rule: &'a IrRule,
+        kind: IrEffectKind,
+        binding: Option<&str>,
+        case_name: &str,
+    ) -> &'a IrEffectNode {
+        rule.metadata
+            .effects
+            .iter()
+            .find(|effect| effect.kind == kind && effect.binding.as_deref() == binding)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{case_name} did not lower {kind:?} / {binding:?}; effects: {:?}",
+                    rule.metadata.effects
+                )
+            })
+    }
+
+    #[test]
+    fn accepted_rule_body_matrix_has_no_silent_noops() {
+        let effect_cases = [
+            (
+                "tell",
+                r#"    tell worker as turn "go""#,
+                IrEffectKind::AgentTell,
+                Some("turn"),
+            ),
+            (
+                "coerce",
+                r#"    coerce classify(ticket.title) as review"#,
+                IrEffectKind::Coerce,
+                Some("review"),
+            ),
+            (
+                "prompt",
+                r#"    prompt "Summarize {{ ticket.title }}" using fixture as summary"#,
+                IrEffectKind::Coerce,
+                Some("summary"),
+            ),
+            (
+                "ask_human",
+                r#"    askHuman as answer choices ["yes", "no"] "approve?""#,
+                IrEffectKind::HumanAsk,
+                Some("answer"),
+            ),
+            (
+                "decide",
+                r#"    decide "fixed?" -> { fixed bool } as verdict"#,
+                IrEffectKind::Coerce,
+                Some("verdict"),
+            ),
+            (
+                "call",
+                r#"    call memory.query for ticket as called"#,
+                IrEffectKind::CapabilityCall,
+                Some("called"),
+            ),
+            (
+                "recall",
+                r#"    recall project_memory for ticket.title as memories"#,
+                IrEffectKind::CapabilityCall,
+                Some("memories"),
+            ),
+            (
+                "send",
+                r#"    send via ops_room { text ticket.title } as sent"#,
+                IrEffectKind::CapabilityCall,
+                Some("sent"),
+            ),
+            (
+                "invoke",
+                r#"    invoke Child { task { title ticket.title } } as child"#,
+                IrEffectKind::WorkflowInvoke,
+                Some("child"),
+            ),
+            (
+                "timer_duration",
+                r#"    timer 5m as wait"#,
+                IrEffectKind::TimerWait,
+                Some("wait"),
+            ),
+            (
+                "timer_until",
+                r#"    timer until ticket.due_at as deadline"#,
+                IrEffectKind::TimerWait,
+                Some("deadline"),
+            ),
+            (
+                "exec_raw",
+                r#"    exec "echo hi" as run"#,
+                IrEffectKind::ExecCommand,
+                Some("run"),
+            ),
+            (
+                "queue_file",
+                r#"    file item into backlog { title ticket.title body "body" } as filed"#,
+                IrEffectKind::QueueFile,
+                Some("filed"),
+            ),
+            (
+                "queue_claim",
+                r#"    claim item as lease"#,
+                IrEffectKind::QueueClaim,
+                Some("lease"),
+            ),
+            (
+                "queue_release",
+                r#"    release item"#,
+                IrEffectKind::QueueRelease,
+                None,
+            ),
+            (
+                "queue_finish",
+                r#"    finish item { summary ticket.title }"#,
+                IrEffectKind::QueueFinish,
+                None,
+            ),
+            (
+                "lease_acquire",
+                r#"    acquire workspace_slot for workspace until ttl as slot"#,
+                IrEffectKind::LeaseAcquire,
+                Some("slot"),
+            ),
+            (
+                "ledger_append",
+                r#"    append LedgerEntry { area ticket.id text ticket.title } to review_log as entry"#,
+                IrEffectKind::LedgerAppend,
+                Some("entry"),
+            ),
+            (
+                "counter_consume",
+                r#"    consume request_budget for ticket amount ticket.amount as spend
+
+    after spend ok {
+      record Note { text "ok" }
+    }
+
+    after spend over {
+      record Note { text "over" }
+    }"#,
+                IrEffectKind::CounterConsume,
+                Some("spend"),
+            ),
+            (
+                "notify",
+                r#"    emit signal deploy.finished to ticket.id { service ticket.title status "ok" } as signal_sent"#,
+                IrEffectKind::EventNotify,
+                Some("signal_sent"),
+            ),
+            (
+                "file_read",
+                r#"    read text from docs at "note.md" as file_read"#,
+                IrEffectKind::FileRead,
+                Some("file_read"),
+            ),
+            (
+                "file_write",
+                r#"    write text to docs at "out.md" { body ticket.title mode create } as file_write"#,
+                IrEffectKind::FileWrite,
+                Some("file_write"),
+            ),
+            (
+                "file_import",
+                r#"    import json Row from docs at "rows.json" as imported"#,
+                IrEffectKind::FileImport,
+                Some("imported"),
+            ),
+            (
+                "file_export",
+                r#"    export json Row to docs at "rows.json" { mode create } as exported"#,
+                IrEffectKind::FileExport,
+                Some("exported"),
+            ),
+        ];
+
+        for (case_name, body, kind, binding) in effect_cases {
+            let rule = b1g_probe_rule(case_name, body);
+            let effect = b1g_effect(&rule, kind, binding, case_name);
+            match case_name {
+                "send" => {
+                    assert_eq!(effect.resource.as_deref(), Some("ops_room"));
+                    assert_eq!(
+                        effect
+                            .construct_use
+                            .as_ref()
+                            .map(|use_| use_.keyword.as_str()),
+                        Some("send")
+                    );
+                }
+                "notify" => {
+                    assert_eq!(effect.resource.as_deref(), Some("signal:deploy.finished"));
+                }
+                "file_read" | "file_write" | "file_import" | "file_export" => {
+                    assert_eq!(effect.resource.as_deref(), Some("docs"));
+                }
+                _ => {}
+            }
+        }
+
+        let record = b1g_probe_rule("record", r#"    record Note { text ticket.title }"#);
+        assert!(record
+            .metadata
+            .fact_writes
+            .contains(&"schema:Note".to_owned()));
+        assert!(record
+            .metadata
+            .egress_payload_reads
+            .get("fact:Note")
+            .is_some_and(|roots| roots.contains("ticket")));
+
+        let done = b1g_probe_rule("done", r#"    done ticket"#);
+        assert!(done
+            .metadata
+            .fact_consumes
+            .contains(&"schema:Ticket".to_owned()));
+
+        let done_replacement = b1g_probe_rule(
+            "done_replacement",
+            r#"    done ticket -> record Note { text ticket.title }"#,
+        );
+        assert!(done_replacement
+            .metadata
+            .fact_consumes
+            .contains(&"schema:Ticket".to_owned()));
+        assert!(done_replacement
+            .metadata
+            .fact_writes
+            .contains(&"schema:Note".to_owned()));
+
+        let complete = b1g_probe_rule("complete", r#"    complete result { ok true }"#);
+        assert!(complete
+            .metadata
+            .terminal_completes
+            .contains(&"result".to_owned()));
+
+        let fail = b1g_probe_rule("fail", r#"    fail error { reason "bad" }"#);
+        assert_eq!(fail.metadata.effects, Vec::new());
+
+        let exec_each = b1g_probe_rule("exec_each", r#"    exec "printf '{}'" -> each Row"#);
+        b1g_effect(&exec_each, IrEffectKind::ExecCommand, None, "exec_each");
+        assert!(exec_each
+            .metadata
+            .fact_writes
+            .contains(&"schema:Row".to_owned()));
+
+        let bounded = b1g_probe_rule(
+            "bounded_record",
+            r#"    record TicketPublic from ticket {
+      id
+      title
+    }"#,
+        );
+        assert!(
+            bounded
+                .metadata
+                .bounded_egresses
+                .iter()
+                .any(|egress| egress.sink == "fact:TicketPublic"
+                    && egress.keep == vec!["id".to_owned(), "title".to_owned()]),
+            "{:?}",
+            bounded.metadata.bounded_egresses
+        );
+
+        let redaction = b1g_probe_rule(
+            "redaction",
+            r#"    redact ticket keep [id, title] as safe
+    record TicketPublic from safe {
+      id
+      title
+    }"#,
+        );
+        assert!(redaction
+            .metadata
+            .redactions
+            .iter()
+            .any(|projection| projection.source == "ticket" && projection.binding == "safe"));
+        assert!(redaction
+            .metadata
+            .fact_writes
+            .contains(&"schema:TicketPublic".to_owned()));
+    }
+
+    #[test]
+    fn prompt_lowers_to_coerce_with_string_payload() {
+        let source = r#"
+workflow PromptText
+
+output result string
+
+class Ticket {
+  title string
+}
+
+rule ask
+  when Ticket as ticket
+=> {
+  prompt "Summarize {{ ticket.title }}" using fixture as answer
+
+  after answer succeeds as text {
+    complete result text
+  }
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "prompt program diagnostics: {:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("program compiles");
+        let rule = ir
+            .rules
+            .iter()
+            .find(|rule| rule.name == "ask")
+            .expect("ask rule");
+        let effect = rule
+            .metadata
+            .effects
+            .iter()
+            .find(|effect| effect.binding.as_deref() == Some("answer"))
+            .expect("prompt effect");
+        assert_eq!(effect.kind, IrEffectKind::Coerce);
+
+        let coerce = ir
+            .contract_registry()
+            .effect_contracts
+            .into_iter()
+            .find(|contract| contract.id == "coerce")
+            .expect("coerce contract");
+        assert!(coerce.source_forms.contains(&"prompt".to_owned()));
     }
 
     #[test]
@@ -20677,6 +21580,10 @@ workflow Child {
         assert_eq!(rule.metadata.effects.len(), 1);
         assert_eq!(rule.metadata.effects[0].kind, IrEffectKind::WorkflowInvoke);
         assert_eq!(rule.metadata.effects[0].binding.as_deref(), Some("child"));
+        assert_eq!(
+            rule.metadata.effects[0].workflow_target.as_deref(),
+            Some("Child")
+        );
         assert!(ir
             .to_snapshot()
             .contains("child kind=workflow.invoke binding=child"));
@@ -23787,6 +24694,72 @@ workflow C {
     }
 
     #[test]
+    fn rejects_invoking_private_sibling_workflow() {
+        let source = r#"
+class Job { id string }
+class Report { id string }
+
+@private
+workflow Child {
+  input task Job
+  output result Report
+  rule work
+    when Job as t
+  => {
+    complete result { id t.id }
+  }
+}
+
+workflow Parent {
+  input task Job
+  output result Report
+  rule go
+    when Job as t
+  => {
+    invoke Child { task t } as child
+    after child succeeds as r { complete result { id r.id } }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Parent"));
+        assert!(compiled.ir.is_none());
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("private workflow `Child`")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn accepts_private_workflow_as_selected_root() {
+        let source = r#"
+class Job { id string }
+class Report { id string }
+
+@private
+workflow Child {
+  input task Job
+  output result Report
+  rule work
+    when Job as t
+  => {
+    complete result { id t.id }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Child"));
+        let ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("private root compiles: {:?}", compiled.diagnostics));
+        assert!(ir.source_tags.iter().any(|tag| {
+            tag.name == "private" && tag.target_kind == "workflow" && tag.target == "Child"
+        }));
+    }
+
+    #[test]
     fn typed_invoke_result_checks_field_access_against_child_output() {
         // The child's output is a shared top-level class `Report`. The parent's
         // `after child succeeds as r` binds r to Report, so `r.missing` (not a
@@ -25637,6 +26610,113 @@ rule work
     }
 
     #[test]
+    fn lowers_start_access_grants_onto_the_workflow_invoke_effect() {
+        // `with access to <resource> { … }` on an invoke lowers to the same
+        // `access_grants` metadata, ready for the start-grant attenuation seam.
+        let source = r#"
+workflow Parent {
+  class Task { id string }
+
+  rule dispatch
+    when Task as task
+  => {
+    invoke Child { task task }
+      with access to project_files {
+        read ["docs/**"]
+      }
+      as child
+  }
+}
+
+workflow Child {
+  input task Task
+  class Task { id string }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Parent"));
+        let ir = compiled.ir.unwrap_or_else(|| {
+            panic!(
+                "source should compile, diagnostics: {:?}",
+                compiled
+                    .diagnostics
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            )
+        });
+        let invoke = ir
+            .rules
+            .iter()
+            .flat_map(|rule| rule.metadata.effects.iter())
+            .find(|effect| effect.kind == IrEffectKind::WorkflowInvoke)
+            .expect("workflow.invoke effect");
+        assert_eq!(invoke.binding.as_deref(), Some("child"));
+        assert_eq!(invoke.access_grants.len(), 1);
+        let files = &invoke.access_grants[0];
+        assert_eq!(files.resource, "project_files");
+        assert_eq!(files.operations[0].operation, "read");
+        assert_eq!(files.operations[0].globs, vec!["docs/**".to_owned()]);
+    }
+
+    #[test]
+    fn lowers_resource_less_start_access_grant_shorthand_onto_the_workflow_invoke_effect() {
+        // `with access to { <resource> { ... } ... }` is syntax sugar for multiple
+        // resource-specific start grants.
+        let source = r#"
+workflow Parent {
+  class Task { id string }
+
+  rule dispatch
+    when Task as task
+  => {
+    invoke Child { task task }
+      with access to {
+        project_memory {
+          recall for task
+        }
+        project_files {
+          read ["docs/**"]
+        }
+      }
+      as child
+  }
+}
+
+workflow Child {
+  input task Task
+  class Task { id string }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Parent"));
+        let ir = compiled.ir.unwrap_or_else(|| {
+            panic!(
+                "source should compile, diagnostics: {:?}",
+                compiled
+                    .diagnostics
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            )
+        });
+        let invoke = ir
+            .rules
+            .iter()
+            .flat_map(|rule| rule.metadata.effects.iter())
+            .find(|effect| effect.kind == IrEffectKind::WorkflowInvoke)
+            .expect("workflow.invoke effect");
+        assert_eq!(invoke.binding.as_deref(), Some("child"));
+        assert_eq!(invoke.access_grants.len(), 2);
+        let memory = &invoke.access_grants[0];
+        assert_eq!(memory.resource, "project_memory");
+        assert_eq!(memory.operations[0].operation, "recall");
+        assert_eq!(memory.operations[0].target.as_deref(), Some("task"));
+        let files = &invoke.access_grants[1];
+        assert_eq!(files.resource, "project_files");
+        assert_eq!(files.operations[0].operation, "read");
+        assert_eq!(files.operations[0].globs, vec!["docs/**".to_owned()]);
+    }
+
+    #[test]
     fn rejects_rule_matching_evidence_only_turn_fact() {
         // In-turn observations (streamed/tool_requested/artifact_captured) are
         // evidence, never rule-matchable (spec/agent-harness.md); a `when` on them is
@@ -26220,6 +27300,71 @@ when Shared as item
             "    when Shared as item\n",
             "  => {\n",
             "    complete result {id item.id}\n",
+            "  }\n",
+            "}\n",
+        );
+
+        assert_eq!(formatted.formatted.as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn formats_invoke_start_access_grants() {
+        let source = r#"workflow Parent {
+file store project_files { root "./data" allow read ["docs/**"] allow write ["reports/**"] }
+class Task { id string }
+rule dispatch
+when Task as task
+=> {
+invoke Child {
+task task
+}
+with access to project_files {
+read ["docs/**"]
+write ["reports/**"]
+}
+as child
+}
+}
+
+workflow Child {
+input task Task
+class Task { id string }
+}
+"#;
+
+        let formatted = format_program(source);
+        assert_eq!(formatted.diagnostics, Vec::new());
+        let expected = concat!(
+            "workflow Parent {\n",
+            "  file store project_files {\n",
+            "    root \"./data\"\n",
+            "    allow read [\"docs/**\"]\n",
+            "    allow write [\"reports/**\"]\n",
+            "  }\n",
+            "\n",
+            "  class Task {\n",
+            "    id string\n",
+            "  }\n",
+            "\n",
+            "  rule dispatch\n",
+            "    when Task as task\n",
+            "  => {\n",
+            "    invoke Child {\n",
+            "      task task\n",
+            "    }\n",
+            "    with access to project_files {\n",
+            "      read [\"docs/**\"]\n",
+            "      write [\"reports/**\"]\n",
+            "    }\n",
+            "    as child\n",
+            "  }\n",
+            "}\n",
+            "\n",
+            "workflow Child {\n",
+            "  input task Task\n",
+            "\n",
+            "  class Task {\n",
+            "    id string\n",
             "  }\n",
             "}\n",
         );
@@ -26960,6 +28105,56 @@ workflow Producer {
             per_field.get("note"),
             Some(&BTreeSet::from(["b".to_owned()])),
             "note references only b: {per_field:?}"
+        );
+    }
+
+    #[test]
+    fn milestone_field_reads_are_collected_per_field() {
+        // D3′: milestone payload fields get the same per-field root metadata as
+        // `complete result`, so a parent can audit each milestone field separately.
+        let source = r#"
+workflow Child {
+  input request Req
+  output result R
+  class Req { id string }
+  class A { x string }
+  class B { y string }
+  class R { ok bool }
+  class Progress { hot string  cold string }
+
+  rule report
+    when A as a
+    when B as b
+  => {
+    emit milestone "halfway" of Progress {
+      hot a.x
+      cold b.y
+    }
+    complete result { ok true }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        let ir = compiled.ir.expect("program compiles");
+        let rule = ir
+            .rules
+            .iter()
+            .find(|r| r.name == "report")
+            .expect("report rule");
+        let per_field = rule
+            .metadata
+            .milestone_field_reads
+            .get("halfway")
+            .expect("milestone has per-field reads");
+        assert_eq!(
+            per_field.get("hot"),
+            Some(&BTreeSet::from(["a".to_owned()])),
+            "hot references only a: {per_field:?}"
+        );
+        assert_eq!(
+            per_field.get("cold"),
+            Some(&BTreeSet::from(["b".to_owned()])),
+            "cold references only b: {per_field:?}"
         );
     }
 }

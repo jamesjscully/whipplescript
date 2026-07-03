@@ -18,11 +18,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use whipplescript_parser::{Diagnostic, IrEffectKind, IrProgram, IrRule};
+use whipplescript_parser::{
+    Diagnostic, IrEffectKind, IrEffectNode, IrProgram, IrRule, IrWorkflowContractKind,
+};
 
 /// The bottom reader-authority: data readable by `public` is readable by anyone,
 /// and `public` itself holds no authority above itself.
 const PUBLIC: &str = "public";
+
+type FieldReadMap = BTreeMap<String, BTreeMap<String, BTreeSet<String>>>;
 
 /// The party-relative confidentiality projection of the governance envelope
 /// (DR-0027 I-IFC1): each governed resource has a **reader authority** (a role);
@@ -56,6 +60,10 @@ pub struct Envelope {
     /// defaulting low, and an external `whip signal` injection of it is refused (no
     /// laundering). A signal absent here is an external-entry point (stage a).
     internal_signals: BTreeSet<String>,
+    /// workflow-invoke resources (`invoke:<name>`) governance marks INTERNAL (E2):
+    /// the target is attested as a bundle-private workflow, not a cross-boundary
+    /// invocation endpoint.
+    internal_workflows: BTreeSet<String>,
     /// handles that name a PRINCIPAL (a provider/model endpoint, a human) rather
     /// than protected data. A principal carries a clearance (so it may be a sink
     /// target), but it is not itself a secret — so it must not be listed as a
@@ -115,6 +123,7 @@ impl Envelope {
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
         let mut internal_signals = BTreeSet::new();
+        let mut internal_workflows = BTreeSet::new();
         let mut address_of = BTreeMap::new();
         let mut party_of = BTreeMap::new();
         // a signed/canonical envelope carries the handle -> address bindings; a
@@ -170,7 +179,11 @@ impl Envelope {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false)
                 {
-                    internal_signals.insert(name.clone());
+                    if name.starts_with("invoke:") {
+                        internal_workflows.insert(name.clone());
+                    } else {
+                        internal_signals.insert(name.clone());
+                    }
                 }
             }
         }
@@ -219,6 +232,7 @@ impl Envelope {
             endorse,
             principals,
             internal_signals,
+            internal_workflows,
             address_of,
             party_of,
         })
@@ -238,6 +252,7 @@ impl Envelope {
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
         let mut internal_signals = BTreeSet::new();
+        let mut internal_workflows = BTreeSet::new();
         let mut address_of: BTreeMap<String, String> = BTreeMap::new();
         let mut party_of: BTreeMap<String, String> = BTreeMap::new();
         for (index, raw) in text.lines().enumerate() {
@@ -341,7 +356,11 @@ impl Envelope {
             // `internal` marks a signal an internal channel (H8 stage b): its
             // integrity is derived from its emitters, not the external-entry low.
             if label.contains(&"internal") {
-                internal_signals.insert(address.clone());
+                if address.starts_with("invoke:") {
+                    internal_workflows.insert(address.clone());
+                } else {
+                    internal_signals.insert(address.clone());
+                }
             }
             // `from <Role>[, <Role>...]` sets the integrity (vouching) SET: the
             // compartments after `from` to the end.
@@ -361,6 +380,7 @@ impl Envelope {
             endorse,
             principals,
             internal_signals,
+            internal_workflows,
             address_of,
             party_of,
         })
@@ -381,7 +401,7 @@ impl Envelope {
             if self.principals.contains(name) {
                 entry["principal"] = serde_json::Value::Bool(true);
             }
-            if self.internal_signals.contains(name) {
+            if self.internal_signals.contains(name) || self.internal_workflows.contains(name) {
                 entry["internal"] = serde_json::Value::Bool(true);
             }
             resources.insert(name.clone(), entry);
@@ -540,6 +560,20 @@ impl Envelope {
         self.internal_signals.contains(self.resolve(resource))
     }
 
+    /// Whether governance marks `resource` (an `invoke:<name>`) an INTERNAL
+    /// workflow endpoint (E2): the workflow is private to the bundle and should
+    /// not be externally nameable.
+    pub fn is_internal_workflow(&self, resource: &str) -> bool {
+        self.internal_workflows.contains(self.resolve(resource))
+    }
+
+    /// Whether this envelope governs `resource`, after applying handle->address
+    /// bindings. This is the narrow runtime authority query used by owned-harness
+    /// tool enforcement; it does not expose labels or acts-for internals.
+    pub fn governs(&self, resource: &str) -> bool {
+        self.governed.contains(self.resolve(resource))
+    }
+
     /// An integrity label rendered for diagnostics: `public` for the empty set, else
     /// the compartments joined by `, `.
     fn integrity_label(&self, resource: &str) -> String {
@@ -643,15 +677,23 @@ fn meet_integrity(a: CarriedIntegrity, b: CarriedIntegrity) -> CarriedIntegrity 
 /// The read sources of a rule (for computing the integrity its `emit`s carry): file
 /// reads, turn-grant reads, inbound message channels, signal triggers, and human
 /// answers — the same source recognition the rule-level join box uses.
-fn rule_read_resources(rule: &IrRule, signal_names: &BTreeSet<&str>) -> Vec<String> {
+fn rule_read_resources(
+    rule: &IrRule,
+    signal_names: &BTreeSet<&str>,
+    shared_coordination: &BTreeSet<String>,
+) -> Vec<String> {
     let mut reads: Vec<String> = Vec::new();
     for effect in &rule.metadata.effects {
-        if let Some(resource) = &effect.resource {
+        if let Some(resource) = ifc_resource_for_effect(effect, shared_coordination) {
             if matches!(
                 effect.kind,
-                IrEffectKind::FileRead | IrEffectKind::FileImport
+                IrEffectKind::FileRead
+                    | IrEffectKind::FileImport
+                    | IrEffectKind::LeaseAcquire
+                    | IrEffectKind::LedgerAppend
+                    | IrEffectKind::CounterConsume
             ) {
-                reads.push(resource.clone());
+                reads.push(resource.to_owned());
             }
         }
         for grant in &effect.access_grants {
@@ -686,9 +728,10 @@ fn carried_integrity_of_rule(
     envelope: &Envelope,
     rule: &IrRule,
     signal_names: &BTreeSet<&str>,
+    shared_coordination: &BTreeSet<String>,
 ) -> CarriedIntegrity {
     let mut acc: CarriedIntegrity = None;
-    for src in rule_read_resources(rule, signal_names) {
+    for src in rule_read_resources(rule, signal_names, shared_coordination) {
         acc = meet_integrity(acc, Some(envelope.integrity_set(&src)));
     }
     acc
@@ -730,12 +773,14 @@ fn derived_signal_integrity(
     let mut derived: BTreeMap<String, CarriedIntegrity> = BTreeMap::new();
     for ir in programs {
         let signal_names: BTreeSet<&str> = ir.events.iter().map(|e| e.name.as_str()).collect();
+        let shared_coordination = shared_coordination_resources(ir);
         for rule in &ir.rules {
             let ports = emitted_signal_ports(rule);
             if ports.is_empty() {
                 continue;
             }
-            let carried = carried_integrity_of_rule(envelope, rule, &signal_names);
+            let carried =
+                carried_integrity_of_rule(envelope, rule, &signal_names, &shared_coordination);
             for port in ports {
                 let merged = match derived.remove(&port) {
                     None => carried.clone(),
@@ -768,6 +813,94 @@ fn is_egress_op(operation: &str) -> bool {
         operation,
         "write" | "learn" | "send" | "notify" | "emit" | "export" | "append" | "queue"
     )
+}
+
+fn is_coordination_effect(kind: &IrEffectKind) -> bool {
+    matches!(
+        kind,
+        IrEffectKind::LeaseAcquire | IrEffectKind::LedgerAppend | IrEffectKind::CounterConsume
+    )
+}
+
+fn shared_coordination_resources(ir: &IrProgram) -> BTreeSet<String> {
+    if !ir.shared_coordination_usage.is_empty() {
+        return ir
+            .shared_coordination_usage
+            .iter()
+            .filter(|usage| usage.workflow_principals.len() >= 2)
+            .map(|usage| usage.resource.clone())
+            .collect();
+    }
+
+    ir.leases
+        .iter()
+        .filter(|lease| lease.shared)
+        .map(|lease| format!("resource:{}", lease.name))
+        .chain(
+            ir.ledgers
+                .iter()
+                .filter(|ledger| ledger.shared)
+                .map(|ledger| format!("resource:{}", ledger.name)),
+        )
+        .chain(
+            ir.counters
+                .iter()
+                .filter(|counter| counter.shared)
+                .map(|counter| format!("resource:{}", counter.name)),
+        )
+        .collect()
+}
+
+fn ifc_resource_for_effect<'a>(
+    effect: &'a IrEffectNode,
+    shared_coordination: &BTreeSet<String>,
+) -> Option<&'a str> {
+    let resource = effect.resource.as_deref()?;
+    if is_coordination_effect(&effect.kind) && !shared_coordination.contains(resource) {
+        return None;
+    }
+    Some(resource)
+}
+
+fn selected_effect_integrity_sinks(
+    effect: &IrEffectNode,
+    shared_coordination: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut sinks = Vec::new();
+    if let Some(resource) = ifc_resource_for_effect(effect, shared_coordination) {
+        if matches!(
+            effect.kind,
+            IrEffectKind::FileWrite
+                | IrEffectKind::FileExport
+                | IrEffectKind::CapabilityCall
+                | IrEffectKind::LeaseAcquire
+                | IrEffectKind::LedgerAppend
+                | IrEffectKind::CounterConsume
+        ) {
+            sinks.push(resource.to_owned());
+        }
+    }
+    for grant in &effect.access_grants {
+        if grant
+            .operations
+            .iter()
+            .any(|op| is_egress_op(&op.operation))
+        {
+            sinks.push(grant.resource.clone());
+        }
+    }
+    if effect.kind == IrEffectKind::HumanAsk {
+        sinks.push("human".to_owned());
+    }
+    if matches!(
+        effect.kind,
+        IrEffectKind::EventEmit | IrEffectKind::EventNotify
+    ) {
+        sinks.push("stream".to_owned());
+    }
+    sinks.sort();
+    sinks.dedup();
+    sinks
 }
 
 /// The env-discovered envelope path; `None` = ungoverned dev mode.
@@ -839,6 +972,12 @@ impl VerifiedEnvelope {
         &self.envelope
     }
 
+    /// Whether the verified envelope governs `resource`, after applying
+    /// handle->address bindings.
+    pub fn governs(&self, resource: &str) -> bool {
+        self.envelope.governs(resource)
+    }
+
     /// Wrap a raw envelope as verified — TESTS ONLY (unit tests exercise the checker
     /// algebra directly, without the signing boundary), mirroring
     /// `gov::SignedEnvelope::sign_for_test`.
@@ -859,6 +998,16 @@ pub fn report_for_check(ir: &IrProgram) -> Option<String> {
             "information-flow guarantee report\n  REFUSED: {message}\n"
         )),
         EnvelopeStatus::Verified(verified) => Some(governance_report(ir, &verified).render()),
+    }
+}
+
+pub fn internal_workflow_from_env(resources: &[String]) -> Result<bool, String> {
+    match VerifiedEnvelope::load_from_env() {
+        EnvelopeStatus::Ungoverned => Ok(false),
+        EnvelopeStatus::Rejected(message) => Err(message),
+        EnvelopeStatus::Verified(verified) => Ok(resources
+            .iter()
+            .any(|resource| verified.envelope().is_internal_workflow(resource))),
     }
 }
 
@@ -954,13 +1103,12 @@ fn imported_surface_gaps<'a>(
     imported: &'a [(String, Vec<String>)],
     verified: &VerifiedEnvelope,
 ) -> Vec<(&'a str, Vec<&'a str>)> {
-    let envelope = verified.envelope();
     let mut gaps = Vec::new();
     for (tool, surface) in imported {
         let ungoverned: Vec<&str> = surface
             .iter()
             .map(String::as_str)
-            .filter(|door| !envelope.governed.contains(envelope.resolve(door)))
+            .filter(|door| !verified.governs(door))
             .collect();
         if !ungoverned.is_empty() {
             gaps.push((tool.as_str(), ungoverned));
@@ -986,9 +1134,14 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
 /// everything the tool reads).
 fn program_read_resources(ir: &IrProgram) -> Vec<String> {
     let signal_names: BTreeSet<&str> = ir.events.iter().map(|e| e.name.as_str()).collect();
+    let shared_coordination = shared_coordination_resources(ir);
     let mut reads: BTreeSet<String> = BTreeSet::new();
     for rule in &ir.rules {
-        reads.extend(rule_read_resources(rule, &signal_names));
+        reads.extend(rule_read_resources(
+            rule,
+            &signal_names,
+            &shared_coordination,
+        ));
     }
     reads.into_iter().collect()
 }
@@ -1021,7 +1174,8 @@ fn result_dependency_reads(tool: &IrProgram) -> Vec<String> {
 /// producer→consumer fact-dependency graph), unioned over their read resources.
 /// This is the reach primitive behind both the whole-result signature
 /// (`result_dependency_reads`, seeded by the completing rules) and the per-field
-/// signature (`result_field_dependency_reads`, seeded by a single fact's producers).
+/// signatures (`result_field_dependency_reads` / milestone D3′, seeded by a single
+/// fact's producers).
 fn reach_reads_from(tool: &IrProgram, seed: BTreeSet<&str>) -> BTreeSet<String> {
     let mut contributing = seed;
     loop {
@@ -1038,25 +1192,30 @@ fn reach_reads_from(tool: &IrProgram, seed: BTreeSet<&str>) -> BTreeSet<String> 
         }
     }
     let signal_names: BTreeSet<&str> = tool.events.iter().map(|e| e.name.as_str()).collect();
+    let shared_coordination = shared_coordination_resources(tool);
     let mut reads: BTreeSet<String> = BTreeSet::new();
     for rule in &tool.rules {
         if contributing.contains(rule.name.as_str()) {
-            reads.extend(rule_read_resources(rule, &signal_names));
+            reads.extend(rule_read_resources(
+                rule,
+                &signal_names,
+                &shared_coordination,
+            ));
         }
     }
     reads
 }
 
-/// A result field's flow signature: the binding, the field name, and the reads
-/// reaching that field — the PER-FIELD refinement of `result_dependency_reads`
-/// (DR-0030 X2 v2). The refinement is at FACT granularity and preserves the
-/// rule-level opaque box (I-IFC2): the completing rule's OWN reads reach every
+/// An egress field's flow signature: the egress binding/name, the field name, and
+/// the reads reaching that field — the PER-FIELD refinement of that egress's whole
+/// dependency reach (DR-0030 X2 v2 / D3′). The refinement is at FACT granularity
+/// and preserves the rule-level opaque box (I-IFC2): the emitting rule's OWN reads reach every
 /// field, and only the BETWEEN-rule fact provenance is refined per field. A field
 /// root that is a DIRECT `when <Fact> as root` binding contributes only that fact's
 /// producer reach; any other root (a within-rule derived binding, or a `when`
 /// binding of an inbound/external fact with no internal producer) has opaque
-/// provenance and FALLS BACK to the whole-result reach — the fail-closed core, so
-/// a field reach is always a subset of the whole-result reach and never
+/// provenance and FALLS BACK to the egress's whole reach — the fail-closed core, so
+/// a field reach is always a subset of the whole egress reach and never
 /// under-reports. Proven in `models/maude/infoflow-field-signature.maude`.
 ///
 /// CONSUMER-SIDE NOTE (documented boundary, not a gap): the per-field signature is
@@ -1067,20 +1226,25 @@ fn reach_reads_from(tool: &IrProgram, seed: BTreeSet<&str>) -> BTreeSet<String> 
 /// the whole-result reach. Per-field ENFORCEMENT needs a non-opaque consumer (turn
 /// field-access grants, or IFC-tracked `invoke` result-field access); until then
 /// the field signature is exposed for audit, and the whole-result join still governs.
-fn result_field_dependency_reads(tool: &IrProgram) -> Vec<(String, String, Vec<String>)> {
-    let whole: BTreeSet<String> = result_dependency_reads(tool).into_iter().collect();
+fn field_dependency_reads(
+    tool: &IrProgram,
+    whole: BTreeSet<String>,
+    select: fn(&IrRule) -> &FieldReadMap,
+) -> Vec<(String, String, Vec<String>)> {
     let signal_names: BTreeSet<&str> = tool.events.iter().map(|e| e.name.as_str()).collect();
-    // binding -> field -> reads, unioned across every completing rule.
+    let shared_coordination = shared_coordination_resources(tool);
+    // egress -> field -> reads, unioned across every emitting/completing rule.
     let mut per_field: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     for rule in &tool.rules {
-        if rule.metadata.complete_field_reads.is_empty() {
+        let field_reads = select(rule);
+        if field_reads.is_empty() {
             continue;
         }
-        let own: BTreeSet<String> = rule_read_resources(rule, &signal_names)
+        let own: BTreeSet<String> = rule_read_resources(rule, &signal_names, &shared_coordination)
             .into_iter()
             .collect();
         let when_facts = when_binding_facts(rule);
-        for (binding, fields) in &rule.metadata.complete_field_reads {
+        for (egress, fields) in field_reads {
             for (field, roots) in fields {
                 let mut reads = own.clone();
                 for root in roots {
@@ -1108,7 +1272,7 @@ fn result_field_dependency_reads(tool: &IrProgram) -> Vec<(String, String, Vec<S
                     }
                 }
                 per_field
-                    .entry((binding.clone(), field.clone()))
+                    .entry((egress.clone(), field.clone()))
                     .or_default()
                     .extend(reads);
             }
@@ -1118,6 +1282,25 @@ fn result_field_dependency_reads(tool: &IrProgram) -> Vec<(String, String, Vec<S
         .into_iter()
         .map(|((binding, field), reads)| (binding, field, reads.into_iter().collect()))
         .collect()
+}
+
+fn result_field_dependency_reads(tool: &IrProgram) -> Vec<(String, String, Vec<String>)> {
+    let whole: BTreeSet<String> = result_dependency_reads(tool).into_iter().collect();
+    field_dependency_reads(tool, whole, |rule| &rule.metadata.complete_field_reads)
+}
+
+fn milestone_field_dependency_reads(tool: &IrProgram) -> Vec<(String, String, Vec<String>)> {
+    let emitting: BTreeSet<&str> = tool
+        .rules
+        .iter()
+        .filter(|rule| !rule.metadata.milestone_field_reads.is_empty())
+        .map(|rule| rule.name.as_str())
+        .collect();
+    if emitting.is_empty() {
+        return Vec::new();
+    }
+    let whole = reach_reads_from(tool, emitting);
+    field_dependency_reads(tool, whole, |rule| &rule.metadata.milestone_field_reads)
 }
 
 /// A rule's `when <Fact> as <binding>` bindings, mapped `binding -> schema:<Fact>`
@@ -1263,6 +1446,7 @@ pub fn check_with_envelope_imports(
     // (the untrusted/fail-closed bottom) — exactly as channels work — so an
     // unrecognized signal can no longer fail OPEN past a governed envelope.
     let signal_names: BTreeSet<&str> = ir.events.iter().map(|e| e.name.as_str()).collect();
+    let shared_coordination = shared_coordination_resources(ir);
     // H8 stage b: the integrity each emitted signal carries to its receivers (the
     // meet over its emitters, across the consumer AND every imported tool). An
     // `internal`-marked signal reads this instead of the external-entry default, so
@@ -1287,20 +1471,29 @@ pub fn check_with_envelope_imports(
         let mut writes: Vec<&str> = Vec::new();
         let mut span = None;
         for effect in &rule.metadata.effects {
-            if let Some(resource) = &effect.resource {
+            if let Some(resource) = ifc_resource_for_effect(effect, &shared_coordination) {
                 match effect.kind {
                     IrEffectKind::FileRead | IrEffectKind::FileImport => {
-                        reads.push(resource.as_str());
+                        reads.push(resource);
                         span.get_or_insert(effect.span);
                     }
                     IrEffectKind::FileWrite | IrEffectKind::FileExport => {
-                        writes.push(resource.as_str());
+                        writes.push(resource);
                         span.get_or_insert(effect.span);
                     }
                     // `send via <channel>` lowers to a capability call carrying the
                     // channel as its resource; it is an egress sink.
                     IrEffectKind::CapabilityCall => {
-                        writes.push(resource.as_str());
+                        writes.push(resource);
+                        span.get_or_insert(effect.span);
+                    }
+                    // Shared coordination is bidirectional: the mutation writes the
+                    // resource, and the outcome/discriminant reads it.
+                    IrEffectKind::LeaseAcquire
+                    | IrEffectKind::LedgerAppend
+                    | IrEffectKind::CounterConsume => {
+                        reads.push(resource);
+                        writes.push(resource);
                         span.get_or_insert(effect.span);
                     }
                     _ => {}
@@ -1412,6 +1605,12 @@ pub fn check_with_envelope_imports(
             rule.metadata.terminal_completes.clone()
         };
         let record_sinks = record_candidates;
+        let milestone_sinks: Vec<String> = rule
+            .metadata
+            .milestone_field_reads
+            .keys()
+            .map(|name| format!("milestone:{name}"))
+            .collect();
         // Redact refinement (PURELY ADDITIVE — DR-0027): a fully-redacted egress must
         // have its sink dominate the kept fields' per-field label join. This does NOT
         // exempt the egress from the conservative read×sink leak below — the kept
@@ -1422,6 +1621,7 @@ pub fn check_with_envelope_imports(
             .iter()
             .cloned()
             .chain(record_sinks.iter().cloned())
+            .chain(milestone_sinks.iter().cloned())
             .chain(writes.iter().map(|sink| (*sink).to_owned()))
             .collect();
         flag_redacted_egress_projections(
@@ -1559,6 +1759,7 @@ pub fn check_with_envelope_imports(
                 .iter()
                 .copied()
                 .chain(record_sinks.iter().map(String::as_str))
+                .chain(milestone_sinks.iter().map(String::as_str))
                 .chain(result_sinks.iter().map(String::as_str))
             {
                 if leak.is_none() && envelope.leaks(src, sink) {
@@ -1650,15 +1851,29 @@ pub fn check_with_envelope_imports(
                 None
             })
             .collect();
+        let input_roots: BTreeSet<&str> = ir
+            .workflow_contracts
+            .iter()
+            .filter(|contract| matches!(contract.kind, IrWorkflowContractKind::Input))
+            .map(|contract| contract.name.as_str())
+            .collect();
+        let invoke_selector_port = format!("invoke:{}", ir.workflow);
         for effect in &rule.metadata.effects {
-            if !(effect.endorsed || effect.declassified) {
-                continue;
-            }
             let Some((scrutinee, pattern)) = &effect.selected_by else {
                 continue;
             };
             let root = scrutinee.split('.').next().unwrap_or(scrutinee.as_str());
-            if low_integrity_bindings.contains(&root) {
+            let selector_is_invoke_input = input_roots.contains(root);
+            let selector_integrity = if selector_is_invoke_input {
+                Some(envelope.integrity_set(&invoke_selector_port))
+            } else if low_integrity_bindings.contains(&root) {
+                Some(BTreeSet::new())
+            } else {
+                None
+            };
+            if selector_integrity.as_ref().is_some_and(BTreeSet::is_empty)
+                && (effect.endorsed || effect.declassified)
+            {
                 let crossing = if effect.declassified {
                     "declassify"
                 } else {
@@ -1675,6 +1890,34 @@ pub fn check_with_envelope_imports(
                     suggestion: Some(format!(
                         "do not branch a crossing on untrusted `{scrutinee}`; gate the `case` on \
                          high-integrity data, or endorse `{root}` before the `case`"
+                    )),
+                    related: Vec::new(),
+                });
+            }
+            let Some(selector_integrity) = selector_integrity else {
+                continue;
+            };
+            if !selector_is_invoke_input {
+                continue;
+            }
+            for sink in selected_effect_integrity_sinks(effect, &shared_coordination) {
+                let required = envelope.integrity_set(&sink);
+                if envelope.dominates(&selector_integrity, &required) {
+                    continue;
+                }
+                diagnostics.push(Diagnostic {
+                    span: effect.span,
+                    message: format!(
+                        "integrity violation in rule `{rule}`: the low-integrity selector \
+                         `{scrutinee}` (arm `{pattern}`) controls `{sink}`, which requires \
+                         integrity {sink_int} (NMIF-on-invoke-selector)",
+                        rule = rule.name,
+                        sink_int = envelope.integrity_label(&sink),
+                    ),
+                    suggestion: Some(format!(
+                        "do not let `{scrutinee}` select a higher-integrity effect; vouch the \
+                         inbound invoke port `{invoke_selector_port}` with `grant invoke ... from \
+                         <role>`, or move the effect outside the untrusted `case`"
                     )),
                     related: Vec::new(),
                 });
@@ -1697,17 +1940,22 @@ pub fn check_principal_ceiling(
 ) -> Vec<Diagnostic> {
     let envelope = verified.envelope();
     let signal_names: BTreeSet<&str> = ir.events.iter().map(|e| e.name.as_str()).collect();
+    let shared_coordination = shared_coordination_resources(ir);
     let mut diagnostics = Vec::new();
     let mut flagged: BTreeSet<String> = BTreeSet::new();
     for rule in &ir.rules {
         let mut reads: Vec<(String, whipplescript_parser::SourceSpan)> = Vec::new();
         for effect in &rule.metadata.effects {
-            if let Some(resource) = &effect.resource {
+            if let Some(resource) = ifc_resource_for_effect(effect, &shared_coordination) {
                 if matches!(
                     effect.kind,
-                    IrEffectKind::FileRead | IrEffectKind::FileImport
+                    IrEffectKind::FileRead
+                        | IrEffectKind::FileImport
+                        | IrEffectKind::LeaseAcquire
+                        | IrEffectKind::LedgerAppend
+                        | IrEffectKind::CounterConsume
                 ) {
-                    reads.push((resource.clone(), effect.span));
+                    reads.push((resource.to_owned(), effect.span));
                 }
             }
             for grant in &effect.access_grants {
@@ -1767,11 +2015,15 @@ pub fn check_principal_ceiling(
 /// exactly the set of handles the checker would treat as a source or sink.
 pub fn ifc_surface(ir: &IrProgram) -> Vec<String> {
     let signal_names: BTreeSet<&str> = ir.events.iter().map(|e| e.name.as_str()).collect();
+    let shared_coordination = shared_coordination_resources(ir);
     let mut surface: BTreeSet<String> = BTreeSet::new();
     for rule in &ir.rules {
         for effect in &rule.metadata.effects {
-            if let Some(resource) = &effect.resource {
-                surface.insert(resource.clone());
+            if let Some(resource) = ifc_resource_for_effect(effect, &shared_coordination) {
+                surface.insert(resource.to_owned());
+            }
+            if let Some(target) = &effect.workflow_target {
+                surface.insert(format!("invoke:{target}"));
             }
             for grant in &effect.access_grants {
                 surface.insert(grant.resource.clone());
@@ -1900,8 +2152,12 @@ pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> Governa
     trusted_surface.sort();
     let violations = check_with_envelope(ir, verified).len();
     let mut touched: BTreeSet<String> = BTreeSet::new();
+    let shared_coordination = shared_coordination_resources(ir);
     for rule in &ir.rules {
         for effect in &rule.metadata.effects {
+            if let Some(resource) = ifc_resource_for_effect(effect, &shared_coordination) {
+                touched.insert(resource.to_owned());
+            }
             for grant in &effect.access_grants {
                 touched.insert(grant.resource.clone());
             }
@@ -1956,11 +2212,16 @@ pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> Governa
             )
         })
         .collect();
-    // The per-field flow signature: for each result field, the reads reaching it
-    // (fact-granular). A field with no reaching reads is stated as `independent` —
-    // an audited non-interference claim the invoker can rely on.
+    // The per-field flow signature: for each result or milestone field, the reads
+    // reaching it (fact-granular). A field with no reaching reads is stated as
+    // `independent` — an audited non-interference claim the invoker can rely on.
     let flow_signature: Vec<String> = result_field_dependency_reads(ir)
         .into_iter()
+        .chain(
+            milestone_field_dependency_reads(ir)
+                .into_iter()
+                .map(|(milestone, field, reads)| (format!("milestone:{milestone}"), field, reads)),
+        )
         .map(|(binding, field, reads)| {
             if reads.is_empty() {
                 format!("{binding}.{field}: independent of every governed read")
@@ -2029,7 +2290,7 @@ impl GovernanceReport {
         }
         if !self.flow_signature.is_empty() {
             out.push_str(
-                "  result flow signature (per field, the reads a consumer inherits, \
+                "  result/milestone flow signature (per field, the reads a consumer inherits, \
                  fact-granular):\n",
             );
             for field in &self.flow_signature {
@@ -2043,7 +2304,7 @@ impl GovernanceReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use whipplescript_parser::compile_program;
+    use whipplescript_parser::{compile_program, compile_program_with_root};
 
     const ENVELOPE: &str = r#"{ "resources": {
         "ledger": { "confidential": true },
@@ -2225,6 +2486,250 @@ rule work
             "rule-body read->write should be flagged, got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+
+    fn coordination_counter_program(shared: bool) -> String {
+        let shared = if shared { "  shared\n" } else { "" };
+        format!(
+            r#"
+@service
+workflow SharedCoordIfc
+
+output result Done
+
+class Done {{
+  note string
+}}
+
+class Customer {{
+  id string
+}}
+
+counter budget {{
+{shared}  key Customer
+  cap 1
+  reset daily
+}}
+
+rule seed
+  when started
+=> {{
+  record Customer {{
+    id "cust"
+  }}
+}}
+
+rule spend
+  when Customer as c
+=> {{
+  consume budget for c.id amount 1 as spend
+
+  after spend ok {{
+    complete result {{
+      note "ok"
+    }}
+  }}
+  after spend over {{
+    complete result {{
+      note "over"
+    }}
+  }}
+}}
+"#
+        )
+    }
+
+    fn contended_coordination_counter_program() -> &'static str {
+        r#"
+class Done {
+  note string
+}
+
+class Customer {
+  id string
+}
+
+counter budget {
+  shared
+  key Customer
+  cap 1
+  reset daily
+}
+
+workflow SharedCoordIfc {
+  output result Done
+
+  rule seed
+    when started
+  => {
+    record Customer {
+      id "cust"
+    }
+  }
+
+  rule spend
+    when Customer as c
+  => {
+    consume budget for c.id amount 1 as spend
+
+    after spend ok {
+      complete result {
+        note "ok"
+      }
+    }
+    after spend over {
+      complete result {
+        note "over"
+      }
+    }
+  }
+}
+
+workflow OtherCoordUser {
+  output result Done
+
+  rule seed
+    when started
+  => {
+    record Customer {
+      id "other"
+    }
+  }
+
+  rule spend
+    when Customer as c
+  => {
+    consume budget for c.id amount 1 as spend
+
+    after spend ok {
+      complete result {
+        note "ok"
+      }
+    }
+    after spend over {
+      complete result {
+        note "over"
+      }
+    }
+  }
+}
+"#
+    }
+
+    #[test]
+    fn shared_coordination_outcome_is_a_confidential_read_source() {
+        let ir = compile_program_with_root(
+            contended_coordination_counter_program(),
+            Some("SharedCoordIfc"),
+        )
+        .ir
+        .expect("compiles");
+        let envelope = Envelope::from_dsl(
+            "grant coordination budget -> resource:budget readable by Operator\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.message.contains("information-flow violation")
+                    && d.message.contains("resource:budget")
+                    && d.message.contains("result")
+            }),
+            "shared coordination outcome should be checked as a read source, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shared_coordination_outcome_may_flow_to_a_cleared_sink() {
+        let ir = compile_program_with_root(
+            contended_coordination_counter_program(),
+            Some("SharedCoordIfc"),
+        )
+        .ir
+        .expect("compiles");
+        let envelope = Envelope::from_dsl(
+            "grant coordination budget -> resource:budget readable by Operator\n\
+             grant output result -> result readable by Operator\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("information-flow violation")),
+            "cleared result should accept shared coordination outcome, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn partitioned_coordination_is_not_a_cross_principal_ifc_source() {
+        let ir = compile_program(&coordination_counter_program(false))
+            .ir
+            .expect("compiles");
+        let envelope = Envelope::from_dsl(
+            "grant coordination budget -> resource:budget readable by Operator\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics.is_empty(),
+            "partitioned self-coordination should stay out of IFC, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert!(
+            !ifc_surface(&ir).contains(&"resource:budget".to_owned()),
+            "partitioned coordination should not open a shared IFC door"
+        );
+    }
+
+    #[test]
+    fn single_principal_shared_coordination_is_not_a_cross_principal_ifc_source() {
+        let ir = compile_program(&coordination_counter_program(true))
+            .ir
+            .expect("compiles");
+        let envelope = Envelope::from_dsl(
+            "grant coordination budget -> resource:budget readable by Operator\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics.is_empty(),
+            "single-principal shared coordination should stay unlabeled, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert!(
+            !ifc_surface(&ir).contains(&"resource:budget".to_owned()),
+            "single-principal shared coordination should not open a cross-principal door"
+        );
+    }
+
+    #[test]
+    fn shared_coordination_is_in_the_ifc_surface() {
+        let ir = compile_program_with_root(
+            contended_coordination_counter_program(),
+            Some("SharedCoordIfc"),
+        )
+        .ir
+        .expect("compiles");
+        assert!(
+            ifc_surface(&ir).contains(&"resource:budget".to_owned()),
+            "shared coordination should be surfaced"
+        );
+    }
+
+    #[test]
+    fn envelope_tracks_internal_workflow_markers() {
+        let env =
+            Envelope::from_dsl("grant workflow child -> invoke:Child internal\n").expect("valid");
+        assert!(env.is_internal_workflow("invoke:Child"));
+        assert!(!env.is_internal_signal("invoke:Child"));
+
+        let canonical = env.to_canonical_json();
+        let round_trip = Envelope::from_json(&canonical).expect("canonical envelope");
+        assert!(round_trip.is_internal_workflow("invoke:Child"));
+        assert!(!round_trip.is_internal_signal("invoke:Child"));
     }
 
     #[test]
@@ -3177,7 +3682,119 @@ workflow Splitter {
             "flow signature should attribute pub_in to cold: {:?}",
             report.flow_signature
         );
-        assert!(report.render().contains("result flow signature"));
+        assert!(report.render().contains("result/milestone flow signature"));
+    }
+
+    #[test]
+    fn report_exposes_milestone_per_field_flow_signature() {
+        // D3′: milestone payloads carry the same fact-granular per-field provenance
+        // as `complete result`; `hot` depends on secret, `cold` on public.
+        let ir = compile_program(
+            r#"@tool
+workflow MilestoneProducer {
+  input request Req
+  output result R
+  class Req { id string }
+  class Secret { s string }
+  class Pub { p string }
+  class R { ok bool }
+  class Progress { hot string  cold string }
+  file store secret { root "./sec"  allow read ["**"] }
+  file store pub_in { root "./pin"  allow read ["**"] }
+
+  rule load_secret
+    when Req as request
+  => {
+    read text from secret at "s.txt" as s
+    after s succeeds as sv {
+      record Secret { s sv.content }
+    }
+  }
+
+  rule load_pub
+    when Req as request
+  => {
+    read text from pub_in at "p.txt" as p
+    after p succeeds as pv {
+      record Pub { p pv.content }
+    }
+  }
+
+  rule progress
+    when Secret as sec
+    when Pub as pb
+  => {
+    emit milestone "halfway" of Progress {
+      hot sec.s
+      cold pb.p
+    }
+    complete result { ok true }
+  }
+}
+"#,
+        )
+        .ir
+        .expect("tool compiles");
+        let envelope = Envelope::from_json(r#"{ "resources": {} }"#).expect("valid envelope");
+        let report = governance_report(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            report
+                .flow_signature
+                .iter()
+                .any(|line| line.contains("milestone:halfway.hot") && line.contains("secret")),
+            "flow signature should attribute secret to milestone hot: {:?}",
+            report.flow_signature
+        );
+        assert!(
+            report
+                .flow_signature
+                .iter()
+                .any(|line| line.contains("milestone:halfway.cold") && line.contains("pub_in")),
+            "flow signature should attribute pub_in to milestone cold: {:?}",
+            report.flow_signature
+        );
+    }
+
+    #[test]
+    fn milestone_egress_is_checked_as_a_sink() {
+        let ir = compile_program(
+            r#"@service
+workflow MilestoneLeak {
+  output result R
+  class R { ok bool }
+  class Req { id string }
+  class Progress { hot string }
+  file store secret { root "./sec"  allow read ["**"] }
+
+  table seed as Req [ { id "T1" } ]
+
+  rule progress
+    when Req as request
+  => {
+    read text from secret at "s.txt" as s
+    after s succeeds as sv {
+      emit milestone "halfway" of Progress { hot sv.content }
+      complete result { ok true }
+    }
+  }
+}
+"#,
+        )
+        .ir
+        .expect("workflow compiles");
+        let envelope =
+            Envelope::from_json(r#"{ "resources": { "secret": { "confidential": true } } }"#)
+                .expect("valid envelope");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("information-flow violation")
+                    && d.message.contains("secret")
+                    && d.message.contains("milestone:halfway")),
+            "confidential read should not flow to uncleared milestone: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -3377,6 +3994,78 @@ rule ingest
                 .iter()
                 .any(|d| d.message.contains("integrity violation")),
             "a vouched signal should not inject, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    fn invoke_selector_write_ir() -> IrProgram {
+        let program = r##"@service
+workflow Child
+
+input request Req
+output result R
+class Req { mode "drain" | "noop" }
+class R { ok bool }
+
+file store ledger { root "./ledger"  allow write ["**"] }
+
+rule dispatch
+  when Req as request
+=> {
+  case request.mode {
+    "drain" => {
+      write text to ledger at "notes.txt" {
+        body "drain"
+        mode append
+      } as noted
+      after noted succeeds {
+        complete result { ok true }
+      }
+    }
+    "noop" => {
+      complete result { ok true }
+    }
+  }
+}
+"##;
+        compile_program(program).ir.expect("compiles")
+    }
+
+    #[test]
+    fn invoke_input_selector_cannot_gate_a_higher_integrity_sink() {
+        // D2b: a workflow input is caller-controlled. Without a vouched
+        // `invoke:<workflow>` port, a case on that input may not select a branch
+        // that drives an Operator-integrity sink.
+        let ir = invoke_selector_write_ir();
+        let envelope =
+            Envelope::from_dsl("grant file_store ledger -> file:/srv/ledger.db from Operator\n")
+                .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("NMIF-on-invoke-selector")
+                    && d.message.contains("request.mode")
+                    && d.message.contains("ledger")),
+            "unvouched invoke input selector should not gate ledger: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn vouched_invoke_input_selector_may_gate_matching_integrity_sink() {
+        let ir = invoke_selector_write_ir();
+        let envelope = Envelope::from_dsl(
+            "grant file_store ledger -> file:/srv/ledger.db from Operator\n\
+             grant invoke Child -> invoke:Child from Operator\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("NMIF-on-invoke-selector")),
+            "vouched invoke input should meet ledger integrity: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
@@ -3690,35 +4379,52 @@ rule finish
     fn ifc_surface_enumerates_every_door() {
         // the surface (X1) is the full set of resources/egresses/principals a
         // workflow touches — files, channels, the fact-base, providers, etc.
-        let program = r##"@service
-workflow IfcSurface
+        let program = r##"
+@service
+workflow IfcSurface {
+  output result R
+  class R { ok bool }
+  class Note { id string }
+  class Ticket { id string  status "open" }
 
-output result R
-class R { ok bool }
-class Note { id string }
-class Ticket { id string  status "open" }
+  agent coder { provider fixture  profile "p"  capacity 1 }
+  file store crm { root "./crm"  allow read ["**"] }
+  channel out { provider slack  destination "#out" }
 
-agent coder { provider fixture  profile "p"  capacity 1 }
-file store crm { root "./crm"  allow read ["**"] }
-channel out { provider slack  destination "#out" }
+  table seed as Ticket [ { id "T1"  status "open" } ]
 
-table seed as Ticket [ { id "T1"  status "open" } ]
-
-rule work
-  when Ticket as ticket where ticket.status == "open"
-=> {
-  read text from crm at "c.json" as loaded
-  after loaded succeeds as file {
-    send via out { text "hi" } as sent
-    after sent succeeds {
-      record Note { id "n1" }
+  rule work
+    when Ticket as ticket where ticket.status == "open"
+  => {
+    read text from crm at "c.json" as loaded
+    after loaded succeeds as file {
+      send via out { text "hi" } as sent
+      after sent succeeds {
+        invoke Child { ticket ticket } as child
+        record Note { id "n1" }
+      }
     }
   }
 }
+
+workflow Child {
+  input ticket Ticket
+  class Ticket { id string  status "open" }
+}
 "##;
-        let ir = compile_program(program).ir.expect("compiles");
+        let compiled = compile_program_with_root(program, Some("IfcSurface"));
+        let ir = compiled.ir.unwrap_or_else(|| {
+            panic!(
+                "compiles, diagnostics: {:?}",
+                compiled
+                    .diagnostics
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            )
+        });
         let surface = ifc_surface(&ir);
-        for expected in ["crm", "out", "fact:Note"] {
+        for expected in ["crm", "out", "fact:Note", "invoke:Child"] {
             assert!(
                 surface.iter().any(|d| d == expected),
                 "surface should include `{expected}`, got: {surface:?}"

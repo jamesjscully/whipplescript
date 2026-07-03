@@ -62,11 +62,12 @@ use whipplescript_store::{
     DiagnosticRecord, DiagnosticView, EffectCancellation, EffectCancellationRequest,
     EffectCompletion, EffectView, EventView, EvidenceLink, EvidenceLinkView, EvidenceRecord,
     EvidenceView, FactView, HumanAnswer, InboxItemView, InstanceView, NewEffect,
-    NewEffectDependency, NewEvent, NewFact, NewInboxItem, NewWorkflowInvocation,
-    ProviderValidationEvidence, RetryEffect, RevisionActivation, RevisionCancellationImpact,
-    RevisionCandidate, RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RuleCommit,
-    RuleCommitRevisionGuard, RunStart, RunView, SqliteStore, StatusView, StoreError,
-    WorkflowInvocationView, WorkflowRevisionView, WorkflowTerminal, WorkflowTerminalKind,
+    NewEffectDependency, NewEvent, NewFact, NewInboxItem, NewInstanceAuthority,
+    NewWorkflowInvocation, ProviderValidationEvidence, RetryEffect, RevisionActivation,
+    RevisionCancellationImpact, RevisionCandidate, RevisionCompatibilityDiagnostic,
+    RevisionCompatibilityReport, RuleCommit, RuleCommitRevisionGuard, RunStart, RunView,
+    SqliteStore, StatusView, StoreError, WorkflowInvocationView, WorkflowRevisionView,
+    WorkflowTerminal, WorkflowTerminalKind,
 };
 
 mod auth;
@@ -1895,9 +1896,10 @@ fn lsp_completion_kind(kind: &str) -> i32 {
 const LSP_KEYWORDS: &[&str] = &[
     "workflow", "class", "enum", "agent", "rule", "coerce", "flow", "action", "signal", "source",
     "table", "queue", "channel", "lease", "ledger", "counter", "output", "failure", "input",
-    "when", "record", "done", "tell", "decide", "askHuman", "exec", "call", "invoke", "emit",
-    "after", "case", "complete", "fail", "timer", "cancel", "claim", "release", "finish", "file",
-    "recall", "acquire", "append", "consume",
+    "when", "record", "done", "tell", "decide", "askHuman", "exec", "call", "invoke", "with",
+    "access", "to", "read", "write", "import", "export", "recall", "learn", "emit", "after",
+    "case", "complete", "fail", "timer", "cancel", "claim", "release", "finish", "file", "acquire",
+    "append", "consume",
 ];
 
 /// Compile `text` and publish its diagnostics (errors + warnings) for `uri`. This
@@ -3649,6 +3651,18 @@ fn imported_tool_irs(
     out
 }
 
+fn package_tool_ifc_surface(
+    package_id: &str,
+    tool_name: &str,
+    tool_ir: &whipplescript_parser::IrProgram,
+) -> Vec<String> {
+    let mut surface = ifc::ifc_surface(tool_ir);
+    surface.push(format!("invoke:{package_id}/{tool_name}"));
+    surface.sort();
+    surface.dedup();
+    surface
+}
+
 fn imported_tool_surfaces(package_lock: Option<&LoadedPackageLock>) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
     if let Some(lock) = package_lock {
@@ -3656,7 +3670,10 @@ fn imported_tool_surfaces(package_lock: Option<&LoadedPackageLock>) -> Vec<(Stri
             for tool in &manifest.workflow_tools {
                 if let Ok(source) = std::fs::read_to_string(&tool.source) {
                     if let Some(tool_ir) = whipplescript_parser::compile_program(&source).ir {
-                        out.push((tool.name.clone(), ifc::ifc_surface(&tool_ir)));
+                        out.push((
+                            tool.name.clone(),
+                            package_tool_ifc_surface(&manifest.package_id, &tool.name, &tool_ir),
+                        ));
                     }
                 }
             }
@@ -3685,7 +3702,7 @@ fn package_workflow_tool_attestations_json(manifests: &[PackageManifest]) -> Vec
             if let Ok(source) = std::fs::read_to_string(&tool.source) {
                 if let Some(tool_ir) = whipplescript_parser::compile_program(&source).ir {
                     entry["information_flow"] = json!({
-                        "surface": ifc::ifc_surface(&tool_ir),
+                        "surface": package_tool_ifc_surface(&manifest.package_id, &tool.name, &tool_ir),
                         "flow": "join_box",
                         "ifc_attested": true,
                     });
@@ -11255,8 +11272,16 @@ fn execute_scenario(
     let input_value: Value = serde_json::from_str(&input_json)
         .map_err(|error| format!("given input is not valid JSON: {error}"))?;
     let input_facts = validate_workflow_start_input(ir, &input_value)?;
+    let (workflow_principal, effective_authority_json) = authority_for_ir(ir);
     let instance_id = kernel
-        .create_instance(&version, &input_json)
+        .create_instance_with_authority(
+            &version,
+            &input_json,
+            NewInstanceAuthority {
+                workflow_principal: &workflow_principal,
+                effective_authority_json: &effective_authority_json,
+            },
+        )
         .map_err(store_error)?;
     let started_event = kernel
         .ingest_external_event(
@@ -14765,6 +14790,10 @@ fn verify_model_search_ir_obligation(
             | "revision-stale-rule"
             | "revision-effect-attribution"
             | "revision-completes-cancelled"
+            | "workflow-complete"
+            | "workflow-complete-requires-action"
+            | "workflow-fail"
+            | "workflow-fail-requires-action"
     ) {
         return Err(format!(
             "{label} model_search ir obligation[{index}] has unknown generated predicate `{predicate}`"
@@ -14785,6 +14814,9 @@ struct IrSnapshotFacts {
     rule_order: Vec<String>,
     rules: BTreeMap<String, IrSnapshotRuleFacts>,
     assertion_count: usize,
+    workflow_name: String,
+    /// `(kind, name)` in declaration order, kind ∈ {"output", "failure"}.
+    workflow_contracts: Vec<(String, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -14810,7 +14842,13 @@ impl IrSnapshotFacts {
 
         for line in snapshot.lines() {
             if !line.starts_with(' ') {
-                section = line.split_whitespace().next().unwrap_or("");
+                let mut parts = line.split_whitespace();
+                section = parts.next().unwrap_or("");
+                if section == "workflow" {
+                    if let Some(name) = parts.next() {
+                        facts.workflow_name = name.to_owned();
+                    }
+                }
                 current_rule = None;
                 current_rule_subsection = "";
                 continue;
@@ -14818,6 +14856,17 @@ impl IrSnapshotFacts {
             if section == "assertions" {
                 if line.strip_prefix("  assert ").is_some() {
                     facts.assertion_count += 1;
+                }
+                continue;
+            }
+            if section == "workflow_contracts" {
+                let mut parts = line.split_whitespace();
+                if let (Some(kind), Some(name)) = (parts.next(), parts.next()) {
+                    if matches!(kind, "output" | "failure") {
+                        facts
+                            .workflow_contracts
+                            .push((kind.to_owned(), name.to_owned()));
+                    }
                 }
                 continue;
             }
@@ -14940,6 +14989,22 @@ impl IrSnapshotFacts {
             }
             "revision-completes-cancelled" => {
                 self.has_dependency(upstream, "completes", downstream)
+            }
+            "workflow-complete" | "workflow-complete-requires-action" => {
+                downstream == "workflowCompletedEvt"
+                    && upstream == self.workflow_name
+                    && self
+                        .workflow_contracts
+                        .iter()
+                        .any(|(kind, _)| kind == "output")
+            }
+            "workflow-fail" | "workflow-fail-requires-action" => {
+                downstream == "workflowFailedEvt"
+                    && upstream == self.workflow_name
+                    && self
+                        .workflow_contracts
+                        .iter()
+                        .any(|(kind, _)| kind == "failure")
             }
             _ => false,
         }
@@ -15139,6 +15204,52 @@ impl IrSnapshotFacts {
                     "ruleCommitEvt".to_owned(),
                     "no_solution".to_owned(),
                 ));
+            }
+        }
+        // Workflow-terminal composition searches: two per declared
+        // output/failure contract, in contract order, after all rule and
+        // assertion searches (mirrors append_composition_model_searches).
+        for (kind, name) in &self.workflow_contracts {
+            match kind.as_str() {
+                "output" => {
+                    sequence.push((
+                        format!("{} complete {} reaches terminal", self.workflow_name, name),
+                        self.workflow_name.clone(),
+                        "workflow-complete".to_owned(),
+                        "workflowCompletedEvt".to_owned(),
+                        "solution".to_owned(),
+                    ));
+                    sequence.push((
+                        format!(
+                            "{} completion requires explicit complete {}",
+                            self.workflow_name, name
+                        ),
+                        self.workflow_name.clone(),
+                        "workflow-complete-requires-action".to_owned(),
+                        "workflowCompletedEvt".to_owned(),
+                        "no_solution".to_owned(),
+                    ));
+                }
+                "failure" => {
+                    sequence.push((
+                        format!("{} fail {} reaches terminal", self.workflow_name, name),
+                        self.workflow_name.clone(),
+                        "workflow-fail".to_owned(),
+                        "workflowFailedEvt".to_owned(),
+                        "solution".to_owned(),
+                    ));
+                    sequence.push((
+                        format!(
+                            "{} failure requires explicit fail {}",
+                            self.workflow_name, name
+                        ),
+                        self.workflow_name.clone(),
+                        "workflow-fail-requires-action".to_owned(),
+                        "workflowFailedEvt".to_owned(),
+                        "no_solution".to_owned(),
+                    ));
+                }
+                _ => {}
             }
         }
         sequence
@@ -19109,6 +19220,185 @@ struct StartedWorkflow {
     workflow: String,
 }
 
+const LOCAL_WORKFLOW_PACKAGE: &str = "local";
+const FILE_STORE_AUTHORITY_OPERATIONS: [&str; 4] = ["import", "export", "read", "write"];
+
+fn package_principal(package: &str) -> String {
+    format!("package:{package}")
+}
+
+fn workflow_principal(package: &str, workflow: &str) -> String {
+    format!("workflow:{package}/{workflow}")
+}
+
+fn resource_operation_principal(resource: &str, operation: &str) -> String {
+    format!("resource:{resource}/{operation}")
+}
+
+fn authority_json_from_set(authority: BTreeSet<String>) -> String {
+    json!(authority.into_iter().collect::<Vec<_>>()).to_string()
+}
+
+fn declared_workflow_authority_set(package: &str, ir: &IrProgram) -> BTreeSet<String> {
+    let mut authority = BTreeSet::new();
+    authority.insert(package_principal(package));
+    authority.insert(workflow_principal(package, &ir.workflow));
+    for store in &ir.file_stores {
+        for operation in FILE_STORE_AUTHORITY_OPERATIONS {
+            authority.insert(resource_operation_principal(&store.name, operation));
+        }
+    }
+    authority
+}
+
+fn declared_workflow_authority_json(package: &str, ir: &IrProgram) -> String {
+    authority_json_from_set(declared_workflow_authority_set(package, ir))
+}
+
+fn authority_for_ir_in_package(package: &str, ir: &IrProgram) -> (String, String) {
+    let principal = workflow_principal(package, &ir.workflow);
+    let authority = declared_workflow_authority_json(package, ir);
+    (principal, authority)
+}
+
+fn authority_for_ir(ir: &IrProgram) -> (String, String) {
+    authority_for_ir_in_package(LOCAL_WORKFLOW_PACKAGE, ir)
+}
+
+fn authority_set_from_json(text: &str) -> BTreeSet<String> {
+    serde_json::from_str::<Vec<String>>(text)
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+fn package_for_workflow_principal(principal: &str) -> Option<&str> {
+    principal
+        .strip_prefix("workflow:")
+        .and_then(|identity| identity.split_once('/').map(|(package, _)| package))
+        .filter(|package| !package.is_empty())
+}
+
+fn authority_covers(authority: &BTreeSet<String>, principal: &str) -> bool {
+    if authority.contains(principal) {
+        return true;
+    }
+    package_for_workflow_principal(principal)
+        .map(|package| authority.contains(&package_principal(package)))
+        .unwrap_or(false)
+}
+
+fn attenuated_authority_set(declared_json: &str, effective_json: &str) -> BTreeSet<String> {
+    let declared = authority_set_from_json(declared_json);
+    let effective = authority_set_from_json(effective_json);
+    declared
+        .into_iter()
+        .filter(|principal| authority_covers(&effective, principal))
+        .collect()
+}
+
+#[cfg(test)]
+fn attenuated_authority_json(declared_json: &str, effective_json: &str) -> String {
+    authority_json_from_set(attenuated_authority_set(declared_json, effective_json))
+}
+
+fn attenuated_authority_json_with_grant(
+    declared_json: &str,
+    effective_json: &str,
+    start_grant_authority: Option<&BTreeSet<String>>,
+) -> Result<String, Vec<String>> {
+    let automatic_cap = attenuated_authority_set(declared_json, effective_json);
+    let Some(grant) = start_grant_authority else {
+        return Ok(authority_json_from_set(automatic_cap));
+    };
+    let disallowed = grant
+        .iter()
+        .filter(|principal| !automatic_cap.contains(*principal))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !disallowed.is_empty() {
+        return Err(disallowed);
+    }
+    Ok(authority_json_from_set(
+        automatic_cap
+            .intersection(grant)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+    ))
+}
+
+fn start_grant_authority_from_value(
+    grants: Option<&Value>,
+) -> Result<Option<BTreeSet<String>>, String> {
+    let Some(grants) = grants else {
+        return Ok(None);
+    };
+    let grants = grants
+        .as_array()
+        .ok_or_else(|| "`access_grants` must be an array".to_owned())?;
+    if grants.is_empty() {
+        return Ok(None);
+    }
+    let mut authority = BTreeSet::new();
+    for (grant_index, grant) in grants.iter().enumerate() {
+        let resource = grant
+            .get("resource")
+            .and_then(Value::as_str)
+            .filter(|resource| !resource.is_empty())
+            .ok_or_else(|| format!("access_grants[{grant_index}] is missing `resource`"))?;
+        let operations = grant
+            .get("operations")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("access_grants[{grant_index}].operations must be an array"))?;
+        if operations.is_empty() {
+            return Err(format!(
+                "access_grants[{grant_index}] for `{resource}` grants no operations"
+            ));
+        }
+        for (op_index, operation) in operations.iter().enumerate() {
+            let operation = operation
+                .get("operation")
+                .and_then(Value::as_str)
+                .filter(|operation| !operation.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "access_grants[{grant_index}].operations[{op_index}] is missing `operation`"
+                    )
+                })?;
+            authority.insert(resource_operation_principal(resource, operation));
+        }
+    }
+    Ok(Some(authority))
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ChildStartAuthority {
+    parent_instance_id: Option<String>,
+    delegating: bool,
+    start_grant_authority: Option<BTreeSet<String>>,
+}
+
+impl ChildStartAuthority {
+    fn non_delegating() -> Self {
+        Self {
+            parent_instance_id: None,
+            delegating: false,
+            start_grant_authority: None,
+        }
+    }
+
+    fn delegating(
+        parent_instance_id: &str,
+        start_grant_authority: Option<BTreeSet<String>>,
+    ) -> Self {
+        Self {
+            parent_instance_id: Some(parent_instance_id.to_owned()),
+            delegating: true,
+            start_grant_authority,
+        }
+    }
+}
+
 fn start_workflow_instance(
     path: &str,
     root: Option<&str>,
@@ -19177,7 +19467,15 @@ fn start_workflow_instance(
             return Err(ExitCode::FAILURE);
         }
     };
-    let instance_id = match kernel.create_instance(&version, &input_json) {
+    let (workflow_principal, effective_authority_json) = authority_for_ir(&ir);
+    let instance_id = match kernel.create_instance_with_authority(
+        &version,
+        &input_json,
+        NewInstanceAuthority {
+            workflow_principal: &workflow_principal,
+            effective_authority_json: &effective_authority_json,
+        },
+    ) {
         Ok(instance_id) => instance_id,
         Err(error) => {
             eprintln!("failed to create instance: {}", store_error(error));
@@ -20677,6 +20975,108 @@ fn coordination_store_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".whipplescript/coordination.sqlite"))
 }
 
+fn coordination_owner_from_principal(principal: &str) -> Option<String> {
+    let principal = principal.trim();
+    if principal.is_empty() {
+        return None;
+    }
+    principal
+        .strip_prefix("workflow:")
+        .filter(|owner| !owner.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| Some(principal.to_owned()))
+}
+
+fn coordination_owner_for_instance(
+    store_path: &Path,
+    instance_id: &str,
+) -> Result<String, StoreError> {
+    let store = SqliteStore::open(store_path)?;
+    let instance = store
+        .get_instance(instance_id)?
+        .ok_or_else(|| StoreError::Conflict(format!("instance `{instance_id}` not found")))?;
+    if let Some(owner) = coordination_owner_from_principal(&instance.workflow_principal) {
+        return Ok(owner);
+    }
+    let version = store
+        .get_program_version(&instance.version_id)?
+        .ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "program version `{}` for instance `{instance_id}` not found",
+                instance.version_id
+            ))
+        })?;
+    Ok(format!("{LOCAL_WORKFLOW_PACKAGE}/{}", version.program_name))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkflowRuntimeIdentity {
+    package: String,
+    workflow: String,
+}
+
+fn package_from_workflow_principal(principal: &str) -> Option<String> {
+    principal
+        .trim()
+        .strip_prefix("workflow:")
+        .and_then(|identity| identity.split_once('/').map(|(package, _)| package))
+        .filter(|package| !package.trim().is_empty())
+        .map(str::to_owned)
+}
+
+fn workflow_identity_for_instance(
+    store: &SqliteStore,
+    instance_id: &str,
+) -> Result<WorkflowRuntimeIdentity, StoreError> {
+    let instance = store
+        .get_instance(instance_id)?
+        .ok_or_else(|| StoreError::Conflict(format!("instance `{instance_id}` not found")))?;
+    let version = store
+        .get_program_version(&instance.version_id)?
+        .ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "program version `{}` for instance `{instance_id}` not found",
+                instance.version_id
+            ))
+        })?;
+    Ok(WorkflowRuntimeIdentity {
+        package: package_from_workflow_principal(&instance.workflow_principal)
+            .unwrap_or_else(|| LOCAL_WORKFLOW_PACKAGE.to_owned()),
+        workflow: version.program_name,
+    })
+}
+
+fn invoke_resources_for_identity(identity: &WorkflowRuntimeIdentity) -> Vec<String> {
+    vec![
+        format!("invoke:{}/{}", identity.package, identity.workflow),
+        format!("invoke:{}", identity.workflow),
+    ]
+}
+
+fn internal_workflow_delivery_violation(
+    store_path: &Path,
+    sender_instance_id: &str,
+    target_instance_id: &str,
+) -> Result<Option<String>, StoreError> {
+    let store = SqliteStore::open(store_path)?;
+    let sender = workflow_identity_for_instance(&store, sender_instance_id)?;
+    let target = workflow_identity_for_instance(&store, target_instance_id)?;
+    if sender.package == target.package {
+        return Ok(None);
+    }
+    let resources = invoke_resources_for_identity(&target);
+    match ifc::internal_workflow_from_env(&resources) {
+        Ok(true) => Ok(Some(format!(
+            "target workflow `{}/{}` is internal and cannot be notified from workflow package `{}`",
+            target.package, target.workflow, sender.package
+        ))),
+        Ok(false) => Ok(None),
+        Err(message) => Ok(Some(format!(
+            "governance envelope rejected before internal workflow delivery check: {message}"
+        ))),
+    }
+}
+
 /// Holder-lifetime release on terminal (spec/coordination.md principle 3 +
 /// spec/work-queues.md): an instance that reaches ANY terminal — a rule-driven
 /// `complete`/`fail` OR an operator `cancel` — drops every workspace-scoped
@@ -21480,6 +21880,14 @@ fn run_agent_effect(
             }
         }
     }
+    if let Some(reason) = provider_profile_allowlist_block(&provider_selection, execution.profile) {
+        return kernel.block_effect_binding(
+            instance_id,
+            &effect.effect_id,
+            "provider_config",
+            &reason,
+        );
+    }
     if provider_selection.kind == "owned" {
         // Owned brokered harness (DR-0024 slice 1): the kernel drives the model
         // loop and executes each requested file tool itself, settling to one
@@ -21491,6 +21899,7 @@ fn run_agent_effect(
             &effect.effect_id,
             execution.agent,
             execution.profile,
+            &effect.required_capabilities_json,
             &input_json,
             store_path,
             options.max_child_iterations,
@@ -21648,6 +22057,30 @@ struct AgentProviderSelection {
     /// harness/provider → binding path, or the fallback). Surfaced in the recorded
     /// `provider_selection` metadata so provider routing is explainable.
     selection_reason: String,
+}
+
+fn provider_profile_allowlist_block(
+    selection: &AgentProviderSelection,
+    profile: Option<&str>,
+) -> Option<String> {
+    let config = selection.provider_config.as_ref()?;
+    if config.profile_ids.is_empty() {
+        return None;
+    }
+    let allowed = config.profile_ids.join(", ");
+    let Some(profile) = profile.filter(|profile| !profile.is_empty()) else {
+        return Some(format!(
+            "provider config `{}` allows profiles [{}], but the effect has no profile",
+            config.provider_id, allowed
+        ));
+    };
+    if config.profile_ids.iter().any(|allowed| allowed == profile) {
+        return None;
+    }
+    Some(format!(
+        "provider config `{}` does not allow profile `{profile}` (allowed: [{}])",
+        config.provider_id, allowed
+    ))
 }
 
 fn agent_provider_selection_with_config_paths(
@@ -22678,15 +23111,20 @@ fn run_coerce_effect(
     // provider-native structured-output call instead of the fixture. A
     // misconfiguration (unknown provider, missing credential) surfaces as a
     // clear error rather than silently degrading to a fixture.
-    if let Some(config) =
-        coerce_runtime::resolve_native_coerce_config().map_err(StoreError::Conflict)?
-    {
+    let provider_override = input.get("provider").and_then(Value::as_str);
+    let native_config = match provider_override {
+        Some(provider) => coerce_runtime::resolve_native_coerce_config_for(Some(provider)),
+        None => coerce_runtime::resolve_native_coerce_config(),
+    }
+    .map_err(StoreError::Conflict)?;
+    if let Some(config) = native_config {
         return run_native_coerce_effect(
             store_path,
             instance_id,
             effect,
             options,
             &request,
+            &input,
             config,
         );
     }
@@ -22826,6 +23264,7 @@ fn run_native_coerce_effect(
     effect: &ClaimableEffect,
     options: &WorkerOptions,
     request: &CoerceRequest,
+    input: &Value,
     config: coerce_runtime::NativeCoerceConfig,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let program_path = options.program_path.as_ref().ok_or_else(|| {
@@ -22838,9 +23277,23 @@ fn run_native_coerce_effect(
         .ir
         .ok_or_else(|| StoreError::Conflict("native coerce: program did not compile".to_owned()))?;
     let arguments = json_from_str(&request.arguments_json);
-    let (prompt, output_schema, wrapped, schema_name) =
+    let (prompt, output_schema, wrapped, schema_name) = if request.function_name == "prompt" {
+        let prompt = input
+            .get("prompt")
+            .and_then(Value::as_str)
+            .or_else(|| input.get("prompt_template").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_owned();
+        (
+            prompt,
+            json!({"type": "string"}),
+            false,
+            "string".to_owned(),
+        )
+    } else {
         coerce_runtime::build_coerce_call_parts(&ir, &request.function_name, &arguments)
-            .map_err(StoreError::Conflict)?;
+            .map_err(StoreError::Conflict)?
+    };
     let transport = coerce_runtime::UreqCoerceTransport::new(config.timeout);
     // Codex backend needs a (account_id, session_id) pair; the session id is a
     // stable per-effect identifier.
@@ -23546,6 +23999,10 @@ fn run_notify_effect(
         .is_some();
     if !target_exists {
         errors.push(format!("target instance `{target}` not found"));
+    } else if let Some(reason) =
+        internal_workflow_delivery_violation(store_path, instance_id, &target)?
+    {
+        errors.push(reason);
     }
     if !errors.is_empty() {
         let reason = format!("notify of `{event_name}` rejected: {}", errors.join("; "));
@@ -24541,9 +24998,12 @@ fn run_coordination_effect(
     instance_id: &str,
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    use whipplescript_store::coordination::{AcquireOutcome, ConsumeOutcome, CoordinationStore};
+    use whipplescript_store::coordination::{
+        AcquireOutcome, ConsumeOutcome, CoordinationStore, DEFAULT_COORDINATION_OWNER,
+    };
 
     let input = json_from_str(&effect.input_json);
+    let workflow_owner = coordination_owner_for_instance(store_path, instance_id)?;
     let mut coordination = CoordinationStore::open(coordination_store_path())?;
     let field = |name: &str| {
         input
@@ -24552,11 +25012,20 @@ fn run_coordination_effect(
             .unwrap_or_default()
             .to_owned()
     };
+    let owner = {
+        let declared = field("coordination_owner");
+        if declared.is_empty() {
+            workflow_owner.clone()
+        } else {
+            declared
+        }
+    };
     let value = match effect.kind.as_str() {
         "lease.acquire" => {
             let resource = field("resource");
             let key = field("key");
-            let outcome = coordination.try_acquire(
+            let outcome = coordination.try_acquire_for_owner(
+                &owner,
                 &resource,
                 &key,
                 input.get("slots").and_then(Value::as_i64).unwrap_or(1),
@@ -24602,7 +25071,17 @@ fn run_coordination_effect(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
-            let released = coordination.release(&resource, &key, instance_id)?;
+            let acquire_owner = acquire_input
+                .get("coordination_owner")
+                .and_then(Value::as_str)
+                .filter(|owner| !owner.is_empty())
+                .unwrap_or(&workflow_owner)
+                .to_owned();
+            let mut released =
+                coordination.release_for_owner(&acquire_owner, &resource, &key, instance_id)?;
+            if !released && acquire_owner != DEFAULT_COORDINATION_OWNER {
+                released = coordination.release(&resource, &key, instance_id)?;
+            }
             json!({
                 "variant": "Released",
                 "resource": resource,
@@ -24614,7 +25093,8 @@ fn run_coordination_effect(
             let ledger = field("ledger");
             let partition = field("partition");
             let entry = input.get("entry").cloned().unwrap_or(Value::Null);
-            let seq = coordination.append(
+            let seq = coordination.append_for_owner(
+                &owner,
                 &ledger,
                 &partition,
                 &entry.to_string(),
@@ -24635,7 +25115,8 @@ fn run_coordination_effect(
             let counter = field("counter");
             let key = field("key");
             let period = coordination.current_period(&field("reset"))?;
-            let outcome = coordination.consume(
+            let outcome = coordination.consume_for_owner(
+                &owner,
                 &counter,
                 &key,
                 input.get("amount").and_then(Value::as_i64).unwrap_or(0),
@@ -24676,7 +25157,7 @@ fn run_coordination_effect(
         worker_id: "whip-coordination",
         lease_id: &lease_id,
         lease_expires_at: "2030-01-01T00:00:00Z",
-        metadata_json: &json!({"kind": effect.kind}).to_string(),
+        metadata_json: &json!({"kind": effect.kind, "owner": owner}).to_string(),
     })?;
     let terminal = kernel.complete_run(EffectCompletion {
         instance_id,
@@ -25550,6 +26031,7 @@ fn run_workflow_invoke_effect(
         None => {
             let source_span_json =
                 invocation_store.effect_source_span_json(instance_id, &effect.effect_id)?;
+            let parent_identity = workflow_identity_for_instance(&invocation_store, instance_id)?;
             let store = SqliteStore::open(store_path)?;
             let mut kernel = RuntimeKernel::new(store);
             let started_run = kernel.start_run(RunStart {
@@ -25566,11 +26048,20 @@ fn run_workflow_invoke_effect(
                 })
                 .to_string(),
             })?;
-            let (child_started, child_ir) = match start_child_workflow_instance(
+            let start_grant_authority =
+                match start_grant_authority_from_value(input.get("access_grants")) {
+                    Ok(authority) => authority,
+                    Err(message) => return Err(StoreError::Conflict(message)),
+                };
+            let child_authority =
+                ChildStartAuthority::delegating(instance_id, start_grant_authority);
+            let (child_started, child_ir) = match start_child_workflow_instance_in_package(
                 store_path,
                 program_path,
                 target_workflow,
                 &child_input.to_string(),
+                &parent_identity.package,
+                child_authority,
             ) {
                 Ok(started) => started,
                 Err(error) => {
@@ -25910,11 +26401,31 @@ fn run_workflow_invoke_effect(
     Ok(terminal_event)
 }
 
+#[cfg(test)]
 fn start_child_workflow_instance(
     store_path: &Path,
     program_path: &Path,
     root: &str,
     input_json: &str,
+    authority: ChildStartAuthority,
+) -> Result<(StartedWorkflow, IrProgram), StoreError> {
+    start_child_workflow_instance_in_package(
+        store_path,
+        program_path,
+        root,
+        input_json,
+        LOCAL_WORKFLOW_PACKAGE,
+        authority,
+    )
+}
+
+fn start_child_workflow_instance_in_package(
+    store_path: &Path,
+    program_path: &Path,
+    root: &str,
+    input_json: &str,
+    package: &str,
+    authority: ChildStartAuthority,
 ) -> Result<(StartedWorkflow, IrProgram), StoreError> {
     let input_value = serde_json::from_str::<Value>(input_json)?;
     let input_json = input_value.to_string();
@@ -25924,6 +26435,20 @@ fn start_child_workflow_instance(
     let input_facts = validate_workflow_start_input(&ir, &input_value).map_err(|message| {
         StoreError::Conflict(format!("invalid child workflow input: {message}"))
     })?;
+    if authority.delegating {
+        let diagnostics = ifc::check_ifc_program(&ir);
+        if !diagnostics.is_empty() {
+            let messages = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(StoreError::Conflict(format!(
+                "child workflow `{}` failed IFC admission on delegating invoke edge: {messages}",
+                ir.workflow
+            )));
+        }
+    }
     let snapshot = ir.to_snapshot();
     let store = SqliteStore::open(store_path)?;
     let mut kernel = RuntimeKernel::new(store);
@@ -25936,7 +26461,40 @@ fn start_child_workflow_instance(
         },
         &ir,
     )?;
-    let instance_id = kernel.create_instance(&version, &input_json)?;
+    let (workflow_principal, declared_authority_json) = authority_for_ir_in_package(package, &ir);
+    let effective_authority_json = if authority.delegating {
+        let parent_instance_id = authority.parent_instance_id.as_deref().ok_or_else(|| {
+            StoreError::Conflict(
+                "delegating child workflow start requires a parent instance".to_owned(),
+            )
+        })?;
+        let store = SqliteStore::open(store_path)?;
+        let parent = store.get_instance(parent_instance_id)?.ok_or_else(|| {
+            StoreError::Conflict(format!("parent instance `{parent_instance_id}` not found"))
+        })?;
+        attenuated_authority_json_with_grant(
+            &declared_authority_json,
+            &parent.effective_authority_json,
+            authority.start_grant_authority.as_ref(),
+        )
+        .map_err(|disallowed| {
+            StoreError::Conflict(format!(
+                "start grant for child workflow `{}` would widen authority beyond the automatic cap: {}",
+                ir.workflow,
+                disallowed.join(", ")
+            ))
+        })?
+    } else {
+        declared_authority_json
+    };
+    let instance_id = kernel.create_instance_with_authority(
+        &version,
+        &input_json,
+        NewInstanceAuthority {
+            workflow_principal: &workflow_principal,
+            effective_authority_json: &effective_authority_json,
+        },
+    )?;
     let started_event = kernel.ingest_external_event(
         &instance_id,
         "external.started",
@@ -26064,35 +26622,27 @@ impl SubworkflowProviderContext {
             virtual_now: options.virtual_now.clone(),
         }
     }
-
-    /// A credential-free fixture context for tests: the child sub-workflow runs
-    /// under the deterministic fixture provider.
-    #[cfg(test)]
-    fn fixture() -> Self {
-        Self {
-            provider: "fixture".to_owned(),
-            exec_profile: ExecProfile::from_env(),
-            script_manifest_path: None,
-            package_lock_path: None,
-            provider_config_paths: Vec::new(),
-            agent_outcomes: std::collections::BTreeMap::new(),
-            coerce_outputs: std::collections::BTreeMap::new(),
-            virtual_now: None,
-        }
-    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drive_subworkflow_tool(
     store_path: &Path,
     program_path: &Path,
     root: &str,
+    package: &str,
     input_json: &str,
     max_child_iterations: usize,
     work_unit_root: &str,
     provider_ctx: &SubworkflowProviderContext,
 ) -> Result<WorkflowTerminalSummary, StoreError> {
-    let (started, child_ir) =
-        start_child_workflow_instance(store_path, program_path, root, input_json)?;
+    let (started, child_ir) = start_child_workflow_instance_in_package(
+        store_path,
+        program_path,
+        root,
+        input_json,
+        package,
+        ChildStartAuthority::non_delegating(),
+    )?;
     let child_instance_id = started.instance_id;
     let iterations = max_child_iterations.max(1);
     for _ in 0..iterations {
@@ -26149,6 +26699,7 @@ fn drive_subworkflow_tool(
 /// take priority over schema-derived generation so those assertions stay stable.
 fn fixture_coerce_value_known(output_type: &str) -> Option<Value> {
     let value = match output_type {
+        "string" => json!("Fixture prompt response"),
         "MessageClassification" => json!({
             "priority": "Normal",
             "summary": "Fixture classification",
@@ -30144,6 +30695,7 @@ fn empty_ir_program() -> IrProgram {
         workflow: String::new(),
         source_tags: Vec::new(),
         source_descriptions: Vec::new(),
+        shared_coordination_usage: Vec::new(),
         sources: Vec::new(),
         tests: Vec::new(),
         includes: Vec::new(),
@@ -31845,6 +32397,17 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
             index += 1;
             continue;
         }
+        // Record blocks are fact writes, not effects; their field lines (`prompt
+        // "..."`, `release ...`, ...) must not be scanned as effect statements.
+        // The whole block is balanced, so skipping it leaves after-scope brace
+        // accounting unchanged (net zero delta).
+        if trimmed.starts_with("record ")
+            || (trimmed.starts_with("done ") && trimmed.contains("-> record "))
+        {
+            let (_, next_index) = parse_statement_until_balanced_braces(&lines, index, trimmed);
+            index = next_index + 1;
+            continue;
+        }
         let current_after = after_scopes.last().map(|scope| scope.scope.clone());
         if let Some(rest) = trimmed.strip_prefix("invoke ") {
             let (statement, next_index) =
@@ -31900,7 +32463,6 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
-            index += 1;
         } else if trimmed.strip_prefix("send ").is_some() {
             // send via <channel> { text <expr> [markdown <expr>] [thread_id <expr>] }
             // as <binding> (std.messaging). The block spans lines; the channel and
@@ -32051,7 +32613,6 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
-            index += 1;
         } else if trimmed.strip_prefix("export ").is_some() {
             // export <format> <Schema> to <store> at <path> { [where <pred>] mode
             // <mode> } as <binding> (std.files). The block spans lines; the where
@@ -32137,7 +32698,6 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
-            index += 1;
         } else if let Some(rest) = trimmed.strip_prefix("timer ") {
             let duration = rest.split_whitespace().next().unwrap_or_default();
             let duration_seconds =
@@ -32155,7 +32715,6 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
-            index += 1;
         } else if let Some(rest) = trimmed.strip_prefix("file ") {
             let (statement, next_index) =
                 parse_statement_until_balanced_braces(&lines, index, trimmed);
@@ -32199,7 +32758,6 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
-            index += 1;
         } else if let Some(rest) = trimmed.strip_prefix("release ") {
             let item = rest
                 .split_whitespace()
@@ -32218,12 +32776,11 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
-            index += 1;
         } else if let Some(rest) = trimmed.strip_prefix("finish ") {
             let (statement, next_index) = if trimmed.contains('{') {
                 parse_statement_until_balanced_braces(&lines, index, trimmed)
             } else {
-                (trimmed.to_owned(), index + 1)
+                (trimmed.to_owned(), index)
             };
             let item = rest
                 .split_whitespace()
@@ -32269,7 +32826,6 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
-            index += 1;
         } else if let Some(rest) = trimmed.strip_prefix("exec ") {
             let mut target = None;
             let mut name = None;
@@ -32337,7 +32893,6 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
-            index += 1;
         } else if let Some(rest) = trimmed.strip_prefix("emit signal ") {
             // emit signal <name> to <instance-expr> { payload }
             let (statement, next_index) =
@@ -32407,7 +32962,6 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
-            index += 1;
         } else if let Some(rest) = trimmed.strip_prefix("append ") {
             // append <Schema> { fields } to <ledger> [as x]
             let (statement, next_index) =
@@ -32485,7 +33039,6 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
-            index += 1;
         } else if let Some(rest) = trimmed.strip_prefix("tell ") {
             let target_expr = rest.split_whitespace().next().unwrap_or("agent");
             let (prompt, next_index) = parse_prompt_from_lines(&lines, index, trimmed);
@@ -32502,6 +33055,32 @@ fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffec
                 after: current_after,
             });
             index = next_index;
+        } else if trimmed.starts_with("prompt ") {
+            let (prompt, next_index) = parse_prompt_from_lines(&lines, index, trimmed);
+            let statement_end = next_index.min(lines.len().saturating_sub(1));
+            let statement = lines[index..=statement_end]
+                .iter()
+                .map(|line| line.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            // `prompt` requires an `as` binding (enforced by the parser); a bare
+            // `prompt "..."` line is a payload field, not an effect.
+            let binding = binding_after_as(&statement);
+            if binding.is_some() {
+                effects.push(ParsedEffect {
+                    timeout_seconds: parse_timeout_clause_seconds(&statement),
+                    kind: "coerce".to_owned(),
+                    target: prompt_provider_after_using(&statement),
+                    name: Some("prompt".to_owned()),
+                    binding,
+                    args: Vec::new(),
+                    prompt: Some(interpolate_prompt(&prompt.text, context)),
+                    prompt_content_type: prompt.content_type,
+                    required_capabilities: parse_required_capabilities(&statement),
+                    after: current_after,
+                });
+                index = next_index;
+            }
         } else if let Some(rest) = trimmed.strip_prefix("coerce ") {
             let (statement, next_index) =
                 parse_statement_until_balanced_parens(&lines, index, trimmed);
@@ -32723,6 +33302,7 @@ fn parsed_effect_input_json(
     let mut input = match effect.kind.as_str() {
         "agent.tell" => json!({
             "prompt": effect.prompt.as_deref().unwrap_or_default(),
+            "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::AgentTell),
             "rule": rule.name,
             "bindings": context_bindings_json(context),
         }),
@@ -32913,7 +33493,14 @@ fn parsed_effect_input_json(
         }
         "coerce" => {
             let function_name = effect.name.as_deref().unwrap_or("coerce");
-            let coerce_prompt = coerce_prompt_from_ir(ir, function_name);
+            let coerce_prompt = if function_name == "prompt" {
+                Some(ParsedPrompt {
+                    text: effect.prompt.clone().unwrap_or_default(),
+                    content_type: effect.prompt_content_type.clone(),
+                })
+            } else {
+                coerce_prompt_from_ir(ir, function_name)
+            };
             let output_type = if function_name == "decide" {
                 // Inline `decide -> { … } as <binding>` has no named coerce; its
                 // anonymous shape was synthesized at lowering into a hygienic
@@ -32924,6 +33511,8 @@ fn parsed_effect_input_json(
                     &rule.name,
                     effect.binding.as_deref().unwrap_or_default(),
                 )
+            } else if function_name == "prompt" {
+                "string".to_owned()
             } else {
                 ir.coerces
                     .iter()
@@ -32983,6 +33572,9 @@ fn parsed_effect_input_json(
             }
             if let Some(prompt) = coerce_prompt {
                 if let Some(object) = input.as_object_mut() {
+                    if function_name == "prompt" {
+                        object.insert("prompt".to_owned(), Value::String(prompt.text.clone()));
+                    }
                     object.insert("prompt_template".to_owned(), Value::String(prompt.text));
                     if let Some(content_type) = prompt.content_type {
                         object.insert(
@@ -32990,6 +33582,11 @@ fn parsed_effect_input_json(
                             Value::String(content_type),
                         );
                     }
+                }
+            }
+            if function_name == "prompt" {
+                if let (Some(provider), Some(object)) = (&effect.target, input.as_object_mut()) {
+                    object.insert("provider".to_owned(), Value::String(provider.clone()));
                 }
             }
             input
@@ -33088,6 +33685,7 @@ fn parsed_effect_input_json(
             );
             json!({
                 "resource": effect.target,
+                "coordination_owner": lease.and_then(|lease| lease.shared.then_some("shared")).unwrap_or_default(),
                 "key": coordination_key_string(&key),
                 "slots": lease.map(|lease| lease.slots).unwrap_or(1),
                 "ttl_seconds": lease.map(|lease| lease.ttl_seconds).unwrap_or(600),
@@ -33125,6 +33723,7 @@ fn parsed_effect_input_json(
                 .unwrap_or_default();
             json!({
                 "ledger": effect.target,
+                "coordination_owner": ledger.and_then(|ledger| ledger.shared.then_some("shared")).unwrap_or_default(),
                 "schema": effect.args.first().cloned().unwrap_or_default(),
                 "entry": entry,
                 "partition": partition,
@@ -33153,6 +33752,7 @@ fn parsed_effect_input_json(
             );
             json!({
                 "counter": effect.target,
+                "coordination_owner": counter.and_then(|counter| counter.shared.then_some("shared")).unwrap_or_default(),
                 "key": coordination_key_string(&key),
                 "amount": amount.as_i64().unwrap_or(0),
                 "cap": counter.map(|counter| counter.cap).unwrap_or(0),
@@ -33264,6 +33864,7 @@ fn parsed_effect_input_json(
             json!({
                 "target_workflow": effect.target,
                 "input": Value::Object(parse_record_fields(body, context, None, errors)),
+                "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::WorkflowInvoke),
                 "bindings": context_bindings_json(context),
                 "rule": rule.name,
             })
@@ -33284,7 +33885,7 @@ fn parsed_effect_input_json(
             }
         }
     }
-    if matches!(effect.kind.as_str(), "agent.tell" | "human.ask") {
+    if matches!(effect.kind.as_str(), "agent.tell" | "human.ask" | "coerce") {
         if let Some(content_type) = &effect.prompt_content_type {
             if let Some(object) = input.as_object_mut() {
                 object.insert(
@@ -33295,6 +33896,47 @@ fn parsed_effect_input_json(
         }
     }
     input.to_string()
+}
+
+fn effect_access_grants_json(rule: &IrRule, effect: &ParsedEffect, kind: IrEffectKind) -> Value {
+    let Some(node) = rule.metadata.effects.iter().find(|node| {
+        if node.kind != kind {
+            return false;
+        }
+        if let Some(binding) = &effect.binding {
+            if node.binding.as_ref() != Some(binding) {
+                return false;
+            }
+        }
+        match kind {
+            IrEffectKind::AgentTell => node.agent == effect.target,
+            IrEffectKind::WorkflowInvoke => node.workflow_target == effect.target,
+            _ => true,
+        }
+    }) else {
+        return json!([]);
+    };
+    Value::Array(
+        node.access_grants
+            .iter()
+            .map(|grant| {
+                json!({
+                    "resource": grant.resource,
+                    "operations": grant
+                        .operations
+                        .iter()
+                        .map(|op| {
+                            json!({
+                                "operation": op.operation,
+                                "target": op.target,
+                                "globs": op.globs,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn coerce_prompt_from_ir(ir: &IrProgram, function_name: &str) -> Option<ParsedPrompt> {
@@ -33326,6 +33968,22 @@ fn binding_after_as(line: &str) -> Option<String> {
                 .next()
                 .map(|binding| binding.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_'))
                 .filter(|binding| !binding.is_empty())
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
+fn prompt_provider_after_using(line: &str) -> Option<String> {
+    let mut tokens = line.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "using" {
+            return tokens
+                .next()
+                .map(|provider| {
+                    provider.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                })
+                .filter(|provider| !provider.is_empty())
                 .map(str::to_owned);
         }
     }
@@ -35860,6 +36518,7 @@ fn coordination_list(options: &CliOptions, kind: &str) -> ExitCode {
                     rows.iter()
                         .map(|row| {
                             json!({
+                                "owner": row.owner,
                                 "resource": row.resource,
                                 "key": row.key,
                                 "holder": row.holder,
@@ -35875,8 +36534,8 @@ fn coordination_list(options: &CliOptions, kind: &str) -> ExitCode {
             }
             for row in rows {
                 println!(
-                    "{}/{} held by {} (expires {})",
-                    row.resource, row.key, row.holder, row.expires_at
+                    "{}::{}/{} held by {} (expires {})",
+                    row.owner, row.resource, row.key, row.holder, row.expires_at
                 );
             }
             ExitCode::SUCCESS
@@ -35897,6 +36556,7 @@ fn coordination_list(options: &CliOptions, kind: &str) -> ExitCode {
                     rows.iter()
                         .map(|row| {
                             json!({
+                                "owner": row.owner,
                                 "ledger": row.ledger,
                                 "partition": row.partition,
                                 "seq": row.seq,
@@ -35913,7 +36573,8 @@ fn coordination_list(options: &CliOptions, kind: &str) -> ExitCode {
             }
             for row in rows {
                 println!(
-                    "{}#{} [{}] by {}: {}",
+                    "{}::{}#{} [{}] by {}: {}",
+                    row.owner,
                     row.ledger,
                     row.seq,
                     row.partition,
@@ -35933,6 +36594,7 @@ fn coordination_list(options: &CliOptions, kind: &str) -> ExitCode {
                     rows.iter()
                         .map(|row| {
                             json!({
+                                "owner": row.owner,
                                 "counter": row.counter,
                                 "key": row.key,
                                 "consumed": row.consumed,
@@ -35947,8 +36609,8 @@ fn coordination_list(options: &CliOptions, kind: &str) -> ExitCode {
             }
             for row in rows {
                 println!(
-                    "{}/{} consumed={} period={}",
-                    row.counter, row.key, row.consumed, row.period
+                    "{}::{}/{} consumed={} period={}",
+                    row.owner, row.counter, row.key, row.consumed, row.period
                 );
             }
             ExitCode::SUCCESS
@@ -37424,6 +38086,7 @@ fn resolve_tool_grant(
         Ok(tool_ir) => Ok(ResolvedToolGrant {
             tool_ir,
             source_path: program_path.to_path_buf(),
+            package_id: LOCAL_WORKFLOW_PACKAGE.to_owned(),
         }),
         Err(local_reason) => {
             match resolve_package_tool_grant(program_path, ir, name, package_lock_path) {
@@ -37440,6 +38103,7 @@ fn resolve_tool_grant(
 struct ResolvedToolGrant {
     tool_ir: IrProgram,
     source_path: PathBuf,
+    package_id: String,
 }
 
 /// Resolve a tool grant against a `use`d package's exported `@tool` workflows
@@ -37473,9 +38137,9 @@ fn resolve_package_tool_grant(
             .workflow_tools
             .iter()
             .find(|tool| tool.name == name)
-            .map(|tool| tool.source.clone())
+            .map(|tool| (manifest.package_id.clone(), tool.source.clone()))
     });
-    let Some(source) = resolved else {
+    let Some((package_id, source)) = resolved else {
         // A clearer message when the tool exists but its package is not `use`d.
         if let Some(manifest) = lock
             .manifests
@@ -37501,6 +38165,7 @@ fn resolve_package_tool_grant(
     Ok(ResolvedToolGrant {
         tool_ir,
         source_path: source,
+        package_id,
     })
 }
 
@@ -40618,6 +41283,8 @@ fn instance_to_json(instance: &InstanceView) -> Value {
         "program_id": instance.program_id,
         "version_id": instance.version_id,
         "revision_epoch": instance.revision_epoch,
+        "workflow_principal": instance.workflow_principal,
+        "effective_authority": json_from_str(&instance.effective_authority_json),
         "status": instance.status,
         "input": json_from_str(&instance.input_json),
         "created_at": instance.created_at,
@@ -41872,6 +42539,8 @@ fn line_column(source: &str, byte_index: usize) -> (usize, usize) {
 mod tests {
     use super::*;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn lint_flags_tool_grant_on_non_owned_agent_only() {
         // DR-0025: a `tools [...]` grant only works under the owned harness. A
@@ -41961,6 +42630,18 @@ workflow EchoText {
                 .any(|(start, end)| *start == grant_offset && &source[*start..*end] == "EchoText"),
             "the grant occurrence should be tracked: {occurrences:?}"
         );
+    }
+
+    #[test]
+    fn lsp_completes_access_grant_surface_keywords() {
+        for keyword in [
+            "with", "access", "to", "read", "write", "import", "export", "recall", "learn",
+        ] {
+            assert!(
+                LSP_KEYWORDS.contains(&keyword),
+                "missing LSP completion keyword `{keyword}`"
+            );
+        }
     }
 
     #[test]
@@ -49296,6 +49977,115 @@ assert count(Item where status == "done") == 1
     }
 
     #[test]
+    fn parse_effect_statements_skips_record_block_fields() {
+        // A record field named like an effect keyword (`prompt`, `release`, ...)
+        // must not be scanned as an effect statement — six same-shaped rows in a
+        // fixture table produced colliding effect idempotency keys (the
+        // provider-language e2e regression).
+        let body = r#"
+record LanguageTask {
+  provider codex
+  prompt "Write a four-line original poem about rain."
+  release "not-an-effect"
+  status "queued"
+}
+record LanguageTask {
+  provider claude
+  prompt "Write a four-line original poem about snow."
+  status "queued"
+}
+done task -> record Archived {
+  prompt "still not an effect"
+}
+prompt "Summarize {{ ticket.title }}" as summary
+"#;
+        let effects = parse_effect_statements(body, &RuleContext::default());
+        assert_eq!(effects.len(), 1, "only the real prompt effect: {effects:?}");
+        assert_eq!(effects[0].kind, "coerce");
+        assert_eq!(effects[0].name.as_deref(), Some("prompt"));
+        assert_eq!(effects[0].binding.as_deref(), Some("summary"));
+    }
+
+    #[test]
+    fn parse_effect_statements_covers_accepted_body_surface() {
+        let body = r#"
+tell worker as turn "go"
+coerce classify(ticket.title) as review
+prompt "Summarize {{ ticket.title }}" using fixture as summary
+askHuman as answer choices ["yes", "no"] "approve?"
+decide "fixed?" -> { fixed bool } as verdict
+call memory.query for ticket as called
+recall project_memory for ticket.title as memories
+send via ops_room { text ticket.title } as sent
+invoke Child { item ticket.title } as child
+timer 5m as wait
+timer until ticket.due_at as deadline
+exec "echo hi" as run
+file item into backlog { title ticket.title body "body" } as filed
+claim item as lease
+release item
+finish item { summary ticket.title }
+acquire workspace_slot for workspace until ttl as slot
+append LedgerEntry { area ticket.id text ticket.title } to review_log as entry
+consume request_budget for ticket amount ticket.amount as spend
+emit signal deploy.finished to ticket.id { service ticket.title status "ok" } as signal_sent
+read text from docs at "note.md" as file_read
+write text to docs at "out.md" { body ticket.title mode create } as file_write
+import json Row from docs at "rows.json" as imported
+export json Row to docs at "rows.json" { mode create } as exported
+"#;
+
+        let effects = parse_effect_statements(body, &RuleContext::default());
+        let expected = [
+            ("agent.tell", Some("turn")),
+            ("coerce", Some("review")),
+            ("coerce", Some("summary")),
+            ("human.ask", Some("answer")),
+            ("coerce", Some("verdict")),
+            ("capability.call", Some("called")),
+            ("capability.call", Some("memories")),
+            ("capability.call", Some("sent")),
+            ("workflow.invoke", Some("child")),
+            ("timer.wait", Some("wait")),
+            ("timer.wait", Some("deadline")),
+            ("exec.command", Some("run")),
+            ("queue.file", Some("filed")),
+            ("queue.claim", Some("lease")),
+            ("queue.release", None),
+            ("queue.finish", None),
+            ("lease.acquire", Some("slot")),
+            ("ledger.append", Some("entry")),
+            ("counter.consume", Some("spend")),
+            ("event.notify", Some("signal_sent")),
+            ("file.read", Some("file_read")),
+            ("file.write", Some("file_write")),
+            ("file.import", Some("imported")),
+            ("file.export", Some("exported")),
+        ];
+
+        assert_eq!(effects.len(), expected.len(), "{effects:?}");
+        for (kind, binding) in expected {
+            assert!(
+                effects
+                    .iter()
+                    .any(|effect| effect.kind == kind && effect.binding.as_deref() == binding),
+                "missing {kind} / {binding:?} in {effects:?}"
+            );
+        }
+
+        let prompt = effects
+            .iter()
+            .find(|effect| effect.binding.as_deref() == Some("summary"))
+            .expect("prompt effect");
+        assert_eq!(prompt.name.as_deref(), Some("prompt"));
+        assert_eq!(prompt.target.as_deref(), Some("fixture"));
+        assert_eq!(
+            prompt.prompt.as_deref(),
+            Some("Summarize {{ ticket.title }}")
+        );
+    }
+
+    #[test]
     fn whipplescript_author_skill_has_discovery_frontmatter() {
         let source = include_str!("../../../skills/whipplescript-author/SKILL.md");
         let metadata = parse_skill_frontmatter(source).expect("skill frontmatter parses");
@@ -49844,6 +50634,222 @@ rule start
         assert_eq!(
             input.get("prompt_content_type").and_then(Value::as_str),
             Some("markdown")
+        );
+    }
+
+    #[test]
+    fn prompt_effect_input_json_uses_plain_string_shape() {
+        let source = r#"
+workflow PromptInput
+
+class Done {
+  ok bool
+}
+
+output result Done
+
+rule start
+  when started
+=> {
+  complete result { ok true }
+}
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compile");
+        let effect = ParsedEffect {
+            kind: "coerce".to_owned(),
+            target: Some("fixture".to_owned()),
+            name: Some("prompt".to_owned()),
+            binding: Some("answer".to_owned()),
+            args: Vec::new(),
+            prompt: Some("Summarize this.".to_owned()),
+            prompt_content_type: Some("markdown".to_owned()),
+            required_capabilities: Vec::new(),
+            after: None,
+            timeout_seconds: None,
+        };
+        let mut errors = Vec::new();
+        let input_json = parsed_effect_input_json(
+            &ir,
+            &ir.rules[0],
+            &effect,
+            &RuleContext::default(),
+            &std::collections::BTreeMap::new(),
+            &mut errors,
+        );
+
+        assert_eq!(errors, Vec::<String>::new());
+        let input = json_from_str(&input_json);
+        assert_eq!(
+            input.get("function_name").and_then(Value::as_str),
+            Some("prompt")
+        );
+        assert_eq!(
+            input.get("output_type").and_then(Value::as_str),
+            Some("string")
+        );
+        assert_eq!(
+            input.get("prompt").and_then(Value::as_str),
+            Some("Summarize this.")
+        );
+        assert_eq!(
+            input.get("prompt_template").and_then(Value::as_str),
+            Some("Summarize this.")
+        );
+        assert_eq!(
+            input.get("provider").and_then(Value::as_str),
+            Some("fixture")
+        );
+        assert_eq!(
+            input.get("prompt_content_type").and_then(Value::as_str),
+            Some("markdown")
+        );
+    }
+
+    #[test]
+    fn agent_tell_input_json_carries_turn_access_grants() {
+        let source = r#"
+workflow OwnedGrantInput
+
+agent coder {
+  provider owned
+  profile "repo-writer"
+  capacity 1
+}
+
+file store project_files {
+  root "."
+  allow read ["src/**"]
+}
+
+rule start
+  when started
+=> {
+  tell coder as turn
+    with access to project_files {
+      read ["src/**"]
+    }
+    with access to command {
+      run
+    }
+    "work"
+}
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compile");
+        let lowering = lower_rule(
+            "ins_test",
+            "ver_test",
+            "0",
+            &ir,
+            &ir.rules[0],
+            &RuleContext::default(),
+            &[],
+            &[],
+            None,
+        );
+        let tell = lowering
+            .effects
+            .iter()
+            .find(|effect| effect.kind == "agent.tell")
+            .expect("agent tell effect");
+        let input = json_from_str(&tell.input_json);
+        let grants = input
+            .get("access_grants")
+            .and_then(Value::as_array)
+            .expect("access grants");
+
+        assert_eq!(grants.len(), 2);
+        assert_eq!(
+            grants[0].get("resource").and_then(Value::as_str),
+            Some("project_files")
+        );
+        assert_eq!(
+            grants[0]
+                .pointer("/operations/0/operation")
+                .and_then(Value::as_str),
+            Some("read")
+        );
+        assert_eq!(
+            grants[0].pointer("/operations/0/globs"),
+            Some(&json!(["src/**"]))
+        );
+        assert_eq!(
+            grants[1].get("resource").and_then(Value::as_str),
+            Some("command")
+        );
+        assert_eq!(
+            grants[1]
+                .pointer("/operations/0/operation")
+                .and_then(Value::as_str),
+            Some("run")
+        );
+    }
+
+    #[test]
+    fn workflow_invoke_input_json_carries_start_access_grants() {
+        let source = r#"
+class Done { ok bool }
+
+workflow Parent {
+  output result Done
+  rule start
+    when started
+  => {
+    invoke Child { }
+      with access to child_authority {
+        invoke
+      }
+      as child
+    complete result { ok true }
+  }
+}
+
+workflow Child {
+  output result Done
+  rule start
+    when started
+  => {
+    complete result { ok true }
+  }
+}
+"#;
+        let ir = whipplescript_parser::compile_program_with_root(source, Some("Parent"))
+            .ir
+            .expect("compile");
+        let lowering = lower_rule(
+            "ins_test",
+            "ver_test",
+            "0",
+            &ir,
+            &ir.rules[0],
+            &RuleContext::default(),
+            &[],
+            &[],
+            None,
+        );
+        let invoke = lowering
+            .effects
+            .iter()
+            .find(|effect| effect.kind == "workflow.invoke")
+            .expect("workflow invoke effect");
+        let input = json_from_str(&invoke.input_json);
+        let grants = input
+            .get("access_grants")
+            .and_then(Value::as_array)
+            .expect("access grants");
+        assert_eq!(grants.len(), 1);
+        assert_eq!(
+            grants[0].get("resource").and_then(Value::as_str),
+            Some("child_authority")
+        );
+        assert_eq!(
+            grants[0]
+                .pointer("/operations/0/operation")
+                .and_then(Value::as_str),
+            Some("invoke")
         );
     }
 
@@ -50428,6 +51434,983 @@ case classification {
     }
 
     #[test]
+    fn workflow_authority_mints_package_and_workflow_principals() {
+        let mut ir = empty_ir_program();
+        ir.workflow = "Review".to_owned();
+        let (principal, authority_json) = authority_for_ir(&ir);
+
+        assert_eq!(principal, "workflow:local/Review");
+        assert_eq!(
+            json_from_str(&authority_json),
+            json!(["package:local", "workflow:local/Review"])
+        );
+    }
+
+    #[test]
+    fn package_child_start_persists_package_workflow_principal() {
+        let store_path = unique_test_path("package-child-authority", "sqlite");
+        let program_path = unique_test_path("package-child-authority", "whip");
+        let source = r#"
+workflow Tool {
+  file store project_files {
+    root "."
+    allow read ["**"]
+  }
+}
+"#;
+
+        fs::write(&program_path, source).expect("write program");
+        let (started, _ir) = start_child_workflow_instance_in_package(
+            &store_path,
+            &program_path,
+            "Tool",
+            "{}",
+            "pkg-tools",
+            ChildStartAuthority::non_delegating(),
+        )
+        .expect("child starts");
+        let store = SqliteStore::open(&store_path).expect("reopen store");
+        let child_instance = store
+            .get_instance(&started.instance_id)
+            .expect("get child")
+            .expect("child row");
+
+        assert_eq!(child_instance.workflow_principal, "workflow:pkg-tools/Tool");
+        assert_eq!(
+            json_from_str(&child_instance.effective_authority_json),
+            json!([
+                "package:pkg-tools",
+                "resource:project_files/export",
+                "resource:project_files/import",
+                "resource:project_files/read",
+                "resource:project_files/write",
+                "workflow:pkg-tools/Tool",
+            ])
+        );
+
+        let _ = fs::remove_file(&program_path);
+        let _ = fs::remove_file(&store_path);
+    }
+
+    #[test]
+    fn package_tool_ifc_surface_includes_package_invoke_door() {
+        let tool_ir = whipplescript_parser::compile_program(
+            r#"@tool
+workflow EchoText
+input request Q
+output result R
+class Q { text string }
+class R { text string }
+rule go
+  when Q as request
+=> {
+  complete result { text request.text }
+}
+"#,
+        )
+        .ir
+        .expect("tool compiles");
+
+        let surface = package_tool_ifc_surface("toolkit", "EchoText", &tool_ir);
+
+        assert!(surface.contains(&"invoke:toolkit/EchoText".to_owned()));
+    }
+
+    #[test]
+    fn workflow_authority_includes_declared_file_store_operations() {
+        let mut ir = empty_ir_program();
+        ir.workflow = "Review".to_owned();
+        ir.file_stores.push(whipplescript_parser::IrFileStore {
+            name: "project_files".to_owned(),
+            root: ".".to_owned(),
+            read_globs: vec!["src/**".to_owned()],
+            write_globs: vec!["src/**".to_owned()],
+        });
+
+        let (_principal, authority_json) = authority_for_ir(&ir);
+
+        assert_eq!(
+            json_from_str(&authority_json),
+            json!([
+                "package:local",
+                "resource:project_files/export",
+                "resource:project_files/import",
+                "resource:project_files/read",
+                "resource:project_files/write",
+                "workflow:local/Review",
+            ])
+        );
+    }
+
+    #[test]
+    fn attenuated_authority_uses_package_ancestor_for_workflows() {
+        let declared = json!(["package:local", "workflow:local/Child"]).to_string();
+        let same_package_parent = json!(["package:local", "workflow:local/Parent"]).to_string();
+        assert_eq!(
+            json_from_str(&attenuated_authority_json(&declared, &same_package_parent)),
+            json!(["package:local", "workflow:local/Child"])
+        );
+
+        let different_package_parent =
+            json!(["package:other", "workflow:other/Parent"]).to_string();
+        assert_eq!(
+            json_from_str(&attenuated_authority_json(
+                &declared,
+                &different_package_parent
+            )),
+            json!([])
+        );
+    }
+
+    #[test]
+    fn start_grant_narrows_authority_below_the_automatic_cap() {
+        let declared = json!([
+            "package:local",
+            "resource:project_files/read",
+            "resource:project_files/write",
+            "workflow:local/Child",
+        ])
+        .to_string();
+        let parent_effective = json!([
+            "package:local",
+            "resource:project_files/read",
+            "resource:project_files/write",
+            "workflow:local/Parent",
+        ])
+        .to_string();
+        let grant = BTreeSet::from(["resource:project_files/read".to_owned()]);
+
+        let narrowed =
+            attenuated_authority_json_with_grant(&declared, &parent_effective, Some(&grant))
+                .expect("grant is within cap");
+
+        assert_eq!(
+            json_from_str(&narrowed),
+            json!(["resource:project_files/read"])
+        );
+    }
+
+    #[test]
+    fn start_grant_rejects_never_widen_violation() {
+        let declared = json!([
+            "resource:project_files/read",
+            "resource:project_files/write"
+        ])
+        .to_string();
+        let parent_effective = json!(["resource:project_files/read"]).to_string();
+        let grant = BTreeSet::from([
+            "resource:project_files/read".to_owned(),
+            "resource:project_files/write".to_owned(),
+        ]);
+
+        let error =
+            attenuated_authority_json_with_grant(&declared, &parent_effective, Some(&grant))
+                .expect_err("grant must not widen");
+
+        assert_eq!(error, vec!["resource:project_files/write"]);
+    }
+
+    #[test]
+    fn no_start_grant_uses_the_automatic_authority_cap() {
+        let declared = json!([
+            "package:local",
+            "resource:project_files/read",
+            "resource:project_files/write",
+            "workflow:local/Child",
+        ])
+        .to_string();
+        let parent_effective =
+            json!(["resource:project_files/read", "workflow:local/Parent",]).to_string();
+
+        let automatic_cap =
+            attenuated_authority_json_with_grant(&declared, &parent_effective, None)
+                .expect("automatic cap is well-formed");
+
+        assert_eq!(
+            json_from_str(&automatic_cap),
+            json!(["resource:project_files/read"])
+        );
+    }
+
+    #[test]
+    fn start_grant_authority_uses_operation_principals() {
+        let grants = json!([
+            {
+                "resource": "project_files",
+                "operations": [
+                    {"operation": "read", "target": null, "globs": ["src/**"]},
+                    {"operation": "write", "target": null, "globs": ["src/generated/**"]},
+                ]
+            }
+        ]);
+
+        let authority = start_grant_authority_from_value(Some(&grants))
+            .expect("well-formed grants")
+            .expect("non-empty grants");
+
+        assert_eq!(
+            authority,
+            BTreeSet::from([
+                "resource:project_files/read".to_owned(),
+                "resource:project_files/write".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn delegating_child_start_persists_start_grant_narrowed_authority() {
+        let store_path = unique_test_path("start-grant-authority", "sqlite");
+        let program_path = unique_test_path("start-grant-authority", "whip");
+        let source = r#"
+workflow Parent {
+  file store project_files {
+    root "."
+    allow read ["**"]
+    allow write ["**"]
+  }
+}
+
+workflow Child {
+  file store project_files {
+    root "."
+    allow read ["**"]
+    allow write ["**"]
+  }
+}
+"#;
+
+        fs::write(&program_path, source).expect("write program");
+        let (source_text, parent_ir) = match compile_source_path_with_root(
+            program_path.to_str().unwrap_or_default(),
+            Some("Parent"),
+        ) {
+            Ok(compiled) => compiled,
+            Err(error) => panic!("{}", child_compile_error("Parent", error)),
+        };
+        let snapshot = parent_ir.to_snapshot();
+        let mut kernel = RuntimeKernel::new(SqliteStore::open(&store_path).expect("store"));
+        let parent_version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &parent_ir.workflow,
+                    source_hash: &stable_hash_hex(&source_text),
+                    ir_hash: &stable_hash_hex(&snapshot),
+                    compiler_version: whipplescript_core::version(),
+                },
+                &parent_ir,
+            )
+            .expect("parent version");
+        let (parent_principal, parent_authority) = authority_for_ir(&parent_ir);
+        let parent_instance_id = kernel
+            .create_instance_with_authority(
+                &parent_version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: &parent_principal,
+                    effective_authority_json: &parent_authority,
+                },
+            )
+            .expect("parent instance");
+        let grant = BTreeSet::from(["resource:project_files/read".to_owned()]);
+        let (child, _child_ir) = start_child_workflow_instance(
+            &store_path,
+            &program_path,
+            "Child",
+            "{}",
+            ChildStartAuthority::delegating(&parent_instance_id, Some(grant)),
+        )
+        .expect("child starts");
+        let store = SqliteStore::open(&store_path).expect("reopen store");
+        let child_instance = store
+            .get_instance(&child.instance_id)
+            .expect("get child")
+            .expect("child row");
+
+        assert_eq!(
+            json_from_str(&child_instance.effective_authority_json),
+            json!(["resource:project_files/read"])
+        );
+
+        let _ = fs::remove_file(&program_path);
+        let _ = fs::remove_file(&store_path);
+    }
+
+    #[test]
+    fn delegating_child_start_without_grant_persists_automatic_cap() {
+        let store_path = unique_test_path("automatic-cap-authority", "sqlite");
+        let program_path = unique_test_path("automatic-cap-authority", "whip");
+        let source = r#"
+workflow Parent {
+  file store project_files {
+    root "."
+    allow read ["**"]
+  }
+}
+
+workflow Child {
+  file store project_files {
+    root "."
+    allow read ["**"]
+    allow write ["**"]
+  }
+}
+"#;
+
+        fs::write(&program_path, source).expect("write program");
+        let (source_text, parent_ir) = match compile_source_path_with_root(
+            program_path.to_str().unwrap_or_default(),
+            Some("Parent"),
+        ) {
+            Ok(compiled) => compiled,
+            Err(error) => panic!("{}", child_compile_error("Parent", error)),
+        };
+        let snapshot = parent_ir.to_snapshot();
+        let mut kernel = RuntimeKernel::new(SqliteStore::open(&store_path).expect("store"));
+        let parent_version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &parent_ir.workflow,
+                    source_hash: &stable_hash_hex(&source_text),
+                    ir_hash: &stable_hash_hex(&snapshot),
+                    compiler_version: whipplescript_core::version(),
+                },
+                &parent_ir,
+            )
+            .expect("parent version");
+        let (parent_principal, _parent_authority) = authority_for_ir(&parent_ir);
+        let narrowed_parent_authority =
+            json!(["resource:project_files/read", "workflow:local/Parent"]).to_string();
+        let parent_instance_id = kernel
+            .create_instance_with_authority(
+                &parent_version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: &parent_principal,
+                    effective_authority_json: &narrowed_parent_authority,
+                },
+            )
+            .expect("parent instance");
+        let (child, _child_ir) = start_child_workflow_instance(
+            &store_path,
+            &program_path,
+            "Child",
+            "{}",
+            ChildStartAuthority::delegating(&parent_instance_id, None),
+        )
+        .expect("child starts");
+        let store = SqliteStore::open(&store_path).expect("reopen store");
+        let child_instance = store
+            .get_instance(&child.instance_id)
+            .expect("get child")
+            .expect("child row");
+
+        assert_eq!(
+            json_from_str(&child_instance.effective_authority_json),
+            json!(["resource:project_files/read"])
+        );
+
+        let _ = fs::remove_file(&program_path);
+        let _ = fs::remove_file(&store_path);
+    }
+
+    #[test]
+    fn workflow_invoke_without_grant_starts_child_under_automatic_cap() {
+        let store_path = unique_test_path("invoke-automatic-cap-authority", "sqlite");
+        let program_path = unique_test_path("invoke-automatic-cap-authority", "whip");
+        let source = r#"
+workflow Parent {
+  file store project_files {
+    root "."
+    allow read ["**"]
+  }
+}
+
+workflow Child {
+  file store project_files {
+    root "."
+    allow read ["**"]
+    allow write ["**"]
+  }
+}
+"#;
+
+        fs::write(&program_path, source).expect("write program");
+        let (source_text, parent_ir) = match compile_source_path_with_root(
+            program_path.to_str().unwrap_or_default(),
+            Some("Parent"),
+        ) {
+            Ok(compiled) => compiled,
+            Err(error) => panic!("{}", child_compile_error("Parent", error)),
+        };
+        let snapshot = parent_ir.to_snapshot();
+        let mut kernel = RuntimeKernel::new(SqliteStore::open(&store_path).expect("store"));
+        let parent_version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &parent_ir.workflow,
+                    source_hash: &stable_hash_hex(&source_text),
+                    ir_hash: &stable_hash_hex(&snapshot),
+                    compiler_version: whipplescript_core::version(),
+                },
+                &parent_ir,
+            )
+            .expect("parent version");
+        let (parent_principal, _parent_authority) = authority_for_ir(&parent_ir);
+        let narrowed_parent_authority =
+            json!(["resource:project_files/read", "workflow:local/Parent"]).to_string();
+        let parent_instance_id = kernel
+            .create_instance_with_authority(
+                &parent_version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: &parent_principal,
+                    effective_authority_json: &narrowed_parent_authority,
+                },
+            )
+            .expect("parent instance");
+        let effect_input = json!({
+            "target_workflow": "Child",
+            "input": {}
+        })
+        .to_string();
+        let effects = [NewEffect {
+            effect_id: "invoke-child",
+            kind: "workflow.invoke",
+            target: Some("Child"),
+            input_json: &effect_input,
+            status: "queued",
+            idempotency_key: "rule=start;effect=invoke-child",
+            required_capabilities_json: r#"["workflow.invoke"]"#,
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        }];
+        drop(kernel);
+        SqliteStore::open(&store_path)
+            .expect("reopen store for commit")
+            .commit_rule(RuleCommit {
+                instance_id: &parent_instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("commit invoke effect");
+
+        let claimable = ClaimableEffect {
+            effect_id: "invoke-child".to_owned(),
+            kind: "workflow.invoke".to_owned(),
+            target: Some("Child".to_owned()),
+            profile: None,
+            input_json: effect_input,
+            required_capabilities_json: r#"["workflow.invoke"]"#.to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+        let options = WorkerOptions {
+            instance_id: parent_instance_id.clone(),
+            provider: "fixture".to_owned(),
+            exec_profile: ExecProfile::from_env(),
+            script_manifest_path: None,
+            package_lock_path: None,
+            outcome: FixtureOutcome::Completed,
+            variant: None,
+            program_path: Some(program_path.clone()),
+            root: Some("Parent".to_owned()),
+            provider_config_paths: Vec::new(),
+            max_child_iterations: 0,
+            agent_outcomes: BTreeMap::new(),
+            coerce_outputs: BTreeMap::new(),
+            virtual_now: None,
+            work_unit_root: None,
+        };
+
+        run_workflow_invoke_effect(&store_path, &parent_instance_id, &claimable, &options)
+            .expect("invoke effect starts child");
+
+        let store = SqliteStore::open(&store_path).expect("reopen store");
+        let invocation = store
+            .get_workflow_invocation(&parent_instance_id, "invoke-child")
+            .expect("get invocation")
+            .expect("invocation row");
+        let child_instance = store
+            .get_instance(&invocation.child_instance_id)
+            .expect("get child")
+            .expect("child row");
+
+        assert_eq!(
+            json_from_str(&child_instance.effective_authority_json),
+            json!(["resource:project_files/read"])
+        );
+
+        let _ = fs::remove_file(&program_path);
+        let _ = fs::remove_file(&store_path);
+    }
+
+    #[test]
+    fn workflow_invoke_preserves_parent_package_identity_for_child_start() {
+        let store_path = unique_test_path("invoke-package-authority", "sqlite");
+        let program_path = unique_test_path("invoke-package-authority", "whip");
+        let source = r#"
+workflow Parent {
+  file store project_files {
+    root "."
+    allow read ["**"]
+  }
+}
+
+workflow Child {
+  file store project_files {
+    root "."
+    allow read ["**"]
+    allow write ["**"]
+  }
+}
+"#;
+
+        fs::write(&program_path, source).expect("write program");
+        let (source_text, parent_ir) = match compile_source_path_with_root(
+            program_path.to_str().unwrap_or_default(),
+            Some("Parent"),
+        ) {
+            Ok(compiled) => compiled,
+            Err(error) => panic!("{}", child_compile_error("Parent", error)),
+        };
+        let snapshot = parent_ir.to_snapshot();
+        let mut kernel = RuntimeKernel::new(SqliteStore::open(&store_path).expect("store"));
+        let parent_version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &parent_ir.workflow,
+                    source_hash: &stable_hash_hex(&source_text),
+                    ir_hash: &stable_hash_hex(&snapshot),
+                    compiler_version: whipplescript_core::version(),
+                },
+                &parent_ir,
+            )
+            .expect("parent version");
+        let parent_instance_id = kernel
+            .create_instance_with_authority(
+                &parent_version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "workflow:pkg-suite/Parent",
+                    effective_authority_json: &json!([
+                        "package:pkg-suite",
+                        "resource:project_files/read",
+                        "workflow:pkg-suite/Parent",
+                    ])
+                    .to_string(),
+                },
+            )
+            .expect("parent instance");
+        let effect_input = json!({
+            "target_workflow": "Child",
+            "input": {}
+        })
+        .to_string();
+        let effects = [NewEffect {
+            effect_id: "invoke-child",
+            kind: "workflow.invoke",
+            target: Some("Child"),
+            input_json: &effect_input,
+            status: "queued",
+            idempotency_key: "rule=start;effect=invoke-child",
+            required_capabilities_json: r#"["workflow.invoke"]"#,
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        }];
+        drop(kernel);
+        SqliteStore::open(&store_path)
+            .expect("reopen store for commit")
+            .commit_rule(RuleCommit {
+                instance_id: &parent_instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("commit invoke effect");
+
+        let claimable = ClaimableEffect {
+            effect_id: "invoke-child".to_owned(),
+            kind: "workflow.invoke".to_owned(),
+            target: Some("Child".to_owned()),
+            profile: None,
+            input_json: effect_input,
+            required_capabilities_json: r#"["workflow.invoke"]"#.to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+        let options = WorkerOptions {
+            instance_id: parent_instance_id.clone(),
+            provider: "fixture".to_owned(),
+            exec_profile: ExecProfile::from_env(),
+            script_manifest_path: None,
+            package_lock_path: None,
+            outcome: FixtureOutcome::Completed,
+            variant: None,
+            program_path: Some(program_path.clone()),
+            root: Some("Parent".to_owned()),
+            provider_config_paths: Vec::new(),
+            max_child_iterations: 0,
+            agent_outcomes: BTreeMap::new(),
+            coerce_outputs: BTreeMap::new(),
+            virtual_now: None,
+            work_unit_root: None,
+        };
+
+        run_workflow_invoke_effect(&store_path, &parent_instance_id, &claimable, &options)
+            .expect("invoke effect starts child");
+
+        let store = SqliteStore::open(&store_path).expect("reopen store");
+        let invocation = store
+            .get_workflow_invocation(&parent_instance_id, "invoke-child")
+            .expect("get invocation")
+            .expect("invocation row");
+        let child_instance = store
+            .get_instance(&invocation.child_instance_id)
+            .expect("get child")
+            .expect("child row");
+
+        assert_eq!(
+            child_instance.workflow_principal,
+            "workflow:pkg-suite/Child"
+        );
+        assert_eq!(
+            json_from_str(&child_instance.effective_authority_json),
+            json!([
+                "package:pkg-suite",
+                "resource:project_files/read",
+                "workflow:pkg-suite/Child",
+            ])
+        );
+
+        let _ = fs::remove_file(&program_path);
+        let _ = fs::remove_file(&store_path);
+    }
+
+    #[test]
+    fn delegating_workflow_invoke_refuses_child_ifc_violation() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_envelope = env::var_os("WHIPPLESCRIPT_IFC_ENVELOPE");
+        let store_path = unique_test_path("invoke-child-ifc-admission", "sqlite");
+        let program_path = unique_test_path("invoke-child-ifc-admission", "whip");
+        let envelope_path = unique_test_path("invoke-child-ifc-admission-envelope", "json");
+        let source = r#"
+workflow Parent {
+}
+
+@service
+workflow Child {
+  output result R
+  class R { ok bool }
+  class Ticket { id string  status "open" }
+
+  agent coder { provider fixture  profile "repo-reader"  capacity 1 }
+  file store ledger { root "./ledger"  allow read ["**"] }
+
+  table seed as Ticket [ { id "T1"  status "open" } ]
+
+  rule work
+    when Ticket as ticket where ticket.status == "open"
+    when coder is available
+  => {
+    tell coder as turn
+      with access to ledger {
+        read ["**"]
+      }
+    "go"
+
+    after turn succeeds as outcome {
+      complete result { ok true }
+    }
+  }
+}
+"#;
+
+        fs::write(&program_path, source).expect("write program");
+        fs::write(
+            &envelope_path,
+            r#"{ "resources": { "ledger": { "confidential": true } } }"#,
+        )
+        .expect("write envelope");
+        env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope_path);
+
+        let (source_text, parent_ir) = match compile_source_path_with_root(
+            program_path.to_str().unwrap_or_default(),
+            Some("Parent"),
+        ) {
+            Ok(compiled) => compiled,
+            Err(error) => panic!("{}", child_compile_error("Parent", error)),
+        };
+        let snapshot = parent_ir.to_snapshot();
+        let mut kernel = RuntimeKernel::new(SqliteStore::open(&store_path).expect("store"));
+        let parent_version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &parent_ir.workflow,
+                    source_hash: &stable_hash_hex(&source_text),
+                    ir_hash: &stable_hash_hex(&snapshot),
+                    compiler_version: whipplescript_core::version(),
+                },
+                &parent_ir,
+            )
+            .expect("parent version");
+        let (parent_principal, parent_authority) = authority_for_ir(&parent_ir);
+        let parent_instance_id = kernel
+            .create_instance_with_authority(
+                &parent_version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: &parent_principal,
+                    effective_authority_json: &parent_authority,
+                },
+            )
+            .expect("parent instance");
+        let effect_input = json!({
+            "target_workflow": "Child",
+            "input": {}
+        })
+        .to_string();
+        let effects = [NewEffect {
+            effect_id: "invoke-child",
+            kind: "workflow.invoke",
+            target: Some("Child"),
+            input_json: &effect_input,
+            status: "queued",
+            idempotency_key: "rule=start;effect=invoke-child",
+            required_capabilities_json: r#"["workflow.invoke"]"#,
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        }];
+        drop(kernel);
+        SqliteStore::open(&store_path)
+            .expect("reopen store for commit")
+            .commit_rule(RuleCommit {
+                instance_id: &parent_instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("commit invoke effect");
+
+        let claimable = ClaimableEffect {
+            effect_id: "invoke-child".to_owned(),
+            kind: "workflow.invoke".to_owned(),
+            target: Some("Child".to_owned()),
+            profile: None,
+            input_json: effect_input,
+            required_capabilities_json: r#"["workflow.invoke"]"#.to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+        let options = WorkerOptions {
+            instance_id: parent_instance_id.clone(),
+            provider: "fixture".to_owned(),
+            exec_profile: ExecProfile::from_env(),
+            script_manifest_path: None,
+            package_lock_path: None,
+            outcome: FixtureOutcome::Completed,
+            variant: None,
+            program_path: Some(program_path.clone()),
+            root: Some("Parent".to_owned()),
+            provider_config_paths: Vec::new(),
+            max_child_iterations: 0,
+            agent_outcomes: BTreeMap::new(),
+            coerce_outputs: BTreeMap::new(),
+            virtual_now: None,
+            work_unit_root: None,
+        };
+
+        let _terminal =
+            run_workflow_invoke_effect(&store_path, &parent_instance_id, &claimable, &options)
+                .expect("invoke effect records a recoverable failure");
+
+        let store = SqliteStore::open(&store_path).expect("reopen store");
+        assert!(
+            store
+                .get_workflow_invocation(&parent_instance_id, "invoke-child")
+                .expect("get invocation")
+                .is_none(),
+            "a child refused at IFC admission must not persist an invocation link"
+        );
+        let invoke = store
+            .list_effects(&parent_instance_id)
+            .expect("list effects")
+            .into_iter()
+            .find(|effect| effect.effect_id == "invoke-child")
+            .expect("invoke effect exists");
+        assert_eq!(invoke.status, "failed");
+
+        match previous_envelope {
+            Some(value) => env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", value),
+            None => env::remove_var("WHIPPLESCRIPT_IFC_ENVELOPE"),
+        }
+        let _ = fs::remove_file(&program_path);
+        let _ = fs::remove_file(&store_path);
+        let _ = fs::remove_file(&envelope_path);
+    }
+
+    #[test]
+    fn coordination_owner_strips_workflow_principal_prefix() {
+        assert_eq!(
+            coordination_owner_from_principal("workflow:local/Review").as_deref(),
+            Some("local/Review")
+        );
+        assert_eq!(coordination_owner_from_principal(""), None);
+    }
+
+    fn unique_test_path(label: &str, ext: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "whipplescript-{label}-{}-{stamp}.{ext}",
+            std::process::id()
+        ))
+    }
+
+    fn create_runtime_identity_instance(
+        store: &mut SqliteStore,
+        workflow: &str,
+        principal: &str,
+    ) -> String {
+        let version = store
+            .create_program_version(whipplescript_store::NewProgramVersion {
+                program_name: workflow,
+                source_hash: &format!("{workflow}-source"),
+                ir_hash: &format!("{workflow}-ir"),
+                compiler_version: "test",
+                declared_capabilities_json: "[]",
+                declared_profiles_json: "[]",
+                declared_skills_json: "[]",
+                declared_schemas_json: "[]",
+                analysis_summary_json: "{}",
+                generated_artifacts_json: "[]",
+                artifact_root: None,
+            })
+            .expect("program version");
+        store
+            .create_instance_with_authority(
+                whipplescript_store::NewInstance {
+                    program_id: &version.program_id,
+                    version_id: &version.version_id,
+                    input_json: "{}",
+                },
+                NewInstanceAuthority {
+                    workflow_principal: principal,
+                    effective_authority_json: "[]",
+                },
+            )
+            .expect("instance")
+            .instance_id
+    }
+
+    #[test]
+    fn notify_refuses_cross_package_internal_workflow_target() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_envelope = env::var_os("WHIPPLESCRIPT_IFC_ENVELOPE");
+        let store_path = unique_test_path("e2-dyn", "sqlite");
+        let envelope_path = unique_test_path("e2-dyn-envelope", "json");
+
+        let mut store = SqliteStore::open(&store_path).expect("store");
+        let sender =
+            create_runtime_identity_instance(&mut store, "Sender", "workflow:local/Sender");
+        let target =
+            create_runtime_identity_instance(&mut store, "Target", "workflow:other/Target");
+        let input_json = json!({
+            "target_instance": target,
+            "event": "external.poke",
+            "payload": {"ok": true},
+            "shape": "json",
+        })
+        .to_string();
+        let effects = [NewEffect {
+            effect_id: "notify-internal",
+            kind: "event.notify",
+            target: None,
+            input_json: &input_json,
+            status: "queued",
+            idempotency_key: "notify-internal",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &sender,
+                rule: "send",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-notify"),
+            })
+            .expect("queued notify effect");
+
+        fs::write(
+            &envelope_path,
+            r#"{ "resources": { "invoke:other/Target": { "internal": true } } }"#,
+        )
+        .expect("envelope");
+        env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope_path);
+
+        let effect = ClaimableEffect {
+            effect_id: "notify-internal".to_owned(),
+            kind: "event.notify".to_owned(),
+            target: None,
+            profile: None,
+            input_json,
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+        run_notify_effect(&store_path, &sender, &effect).expect("notify run");
+        let store = SqliteStore::open(&store_path).expect("store");
+        let sender_facts = store.list_facts(&sender).expect("sender facts");
+        assert!(
+            sender_facts
+                .iter()
+                .any(|fact| fact.name == "event.notify.failed"),
+            "sender should receive a branchable notify failure"
+        );
+        let target_events = store.list_events(&target).expect("target events");
+        assert!(
+            !target_events
+                .iter()
+                .any(|event| event.event_type == "external.poke"),
+            "internal target should not receive the injected event"
+        );
+
+        match previous_envelope {
+            Some(value) => env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", value),
+            None => env::remove_var("WHIPPLESCRIPT_IFC_ENVELOPE"),
+        }
+        let _ = fs::remove_file(&store_path);
+        let _ = fs::remove_file(&envelope_path);
+    }
+
+    #[test]
     fn status_json_includes_effects_and_runs_provider_selection() {
         let status = StatusView {
             instance: InstanceView {
@@ -50435,6 +52418,8 @@ case classification {
                 program_id: "prog-1".to_owned(),
                 version_id: "ver-1".to_owned(),
                 revision_epoch: 0,
+                workflow_principal: "workflow:local/Root".to_owned(),
+                effective_authority_json: r#"["package:local","workflow:local/Root"]"#.to_owned(),
                 status: "running".to_owned(),
                 input_json: "{}".to_owned(),
                 created_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -51750,6 +53735,36 @@ rule finish_batch
             Some("env:OPENAI_API_KEY")
         );
         let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn provider_profile_allowlist_blocks_mismatched_effect_profile() {
+        let config = ProviderBindingConfig::from_value(&json!({
+            "provider_id": "coder",
+            "provider_kind": "codex",
+            "surface": "codex_app_server",
+            "profile_ids": ["repo-writer"]
+        }))
+        .expect("provider config parses");
+        let selection = AgentProviderSelection {
+            provider_id: "coder".to_owned(),
+            kind: "codex".to_owned(),
+            source_harness_id: Some("coder".to_owned()),
+            surface: Some("codex_app_server".to_owned()),
+            provider_config: Some(config),
+            command_plan: None,
+            selection_reason: "test".to_owned(),
+        };
+
+        assert!(provider_profile_allowlist_block(&selection, Some("repo-writer")).is_none());
+        assert!(
+            provider_profile_allowlist_block(&selection, Some("repo-reader"))
+                .expect("profile mismatch blocks")
+                .contains("does not allow profile `repo-reader`")
+        );
+        assert!(provider_profile_allowlist_block(&selection, None)
+            .expect("missing profile blocks")
+            .contains("effect has no profile"));
     }
 
     #[test]

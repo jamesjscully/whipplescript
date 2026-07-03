@@ -1072,6 +1072,40 @@ fn print_fields(
     }
 }
 
+fn format_access_grants(
+    access_grants: &[body::AccessGrant],
+    rn: &dyn Fn(&str) -> String,
+) -> String {
+    access_grants
+        .iter()
+        .map(|grant| {
+            let ops = grant
+                .operations
+                .iter()
+                .map(|op| {
+                    let mut clause = op.operation.clone();
+                    if let Some(target) = &op.target {
+                        clause.push_str(&format!(" for {}", rn(target)));
+                    }
+                    if !op.globs.is_empty() {
+                        clause.push_str(&format!(
+                            " [{}]",
+                            op.globs
+                                .iter()
+                                .map(|glob| format!("{glob:?}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    clause
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(" with access to {} {{ {ops} }}", grant.resource)
+        })
+        .collect::<String>()
+}
+
 fn print_effect(
     effect: &body::EffectStmt,
     indent: usize,
@@ -1106,37 +1140,32 @@ fn print_effect(
             access_grants,
         } => {
             // Re-serialize `with access to <resource> { <op clauses> }` grants so a
-            // flow `tell` preserves its turn-access metadata. `for <target>` refs are
-            // flow bindings (renamed); resource names and globs are literals.
-            let grants = access_grants
-                .iter()
-                .map(|grant| {
-                    let ops = grant
-                        .operations
-                        .iter()
-                        .map(|op| {
-                            let mut clause = op.operation.clone();
-                            if let Some(target) = &op.target {
-                                clause.push_str(&format!(" for {}", rn(target)));
-                            }
-                            if !op.globs.is_empty() {
-                                clause.push_str(&format!(
-                                    " [{}]",
-                                    op.globs
-                                        .iter()
-                                        .map(|glob| format!("{glob:?}"))
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                ));
-                            }
-                            clause
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    format!(" with access to {} {{ {ops} }}", grant.resource)
-                })
-                .collect::<String>();
+            // flow `tell` preserves its access metadata. `for <target>` refs are flow
+            // bindings (renamed); resource names and globs are literals.
+            let grants = format_access_grants(access_grants, rn);
             format!("tell {}{requires}{binding}{timeout}{grants}", rn(target))
+        }
+        BodyEffectKind::Prompt { provider } => {
+            let using = provider
+                .as_ref()
+                .map(|provider| format!(" using {provider}"))
+                .unwrap_or_default();
+            let (text, content_type) = effect
+                .prompt
+                .as_ref()
+                .map(|prompt| (prompt.text.as_str(), prompt.content_type.as_deref()))
+                .unwrap_or(("", None));
+            let annotation = content_type.unwrap_or_default();
+            push_stmt_line(out, indent, &format!("prompt \"\"\"{annotation}"));
+            for line in rn(text).lines() {
+                push_stmt_line(out, indent, line);
+            }
+            push_stmt_line(
+                out,
+                indent,
+                &format!("\"\"\"{using}{requires}{binding}{timeout}"),
+            );
+            return;
         }
         BodyEffectKind::AskHuman { choices } => {
             let choices = if choices.is_empty() {
@@ -1243,10 +1272,19 @@ fn print_effect(
             }
             return;
         }
-        BodyEffectKind::Invoke { workflow, payload } => {
+        BodyEffectKind::Invoke {
+            workflow,
+            payload,
+            access_grants,
+        } => {
             push_stmt_line(out, indent, &format!("invoke {workflow} {{"));
             print_fields(payload, indent + 1, &rn, out);
-            push_stmt_line(out, indent, &format!("}}{binding}"));
+            let grants = format_access_grants(access_grants, rn);
+            push_stmt_line(
+                out,
+                indent,
+                &format!("}}{requires}{binding}{timeout}{grants}"),
+            );
             return;
         }
         BodyEffectKind::Timer {
@@ -1424,7 +1462,7 @@ fn print_effect(
 
 #[cfg(test)]
 mod tests {
-    use crate::compile_program;
+    use crate::{compile_program, compile_program_with_root};
 
     const TRIAGE: &str = r#"
 workflow TicketTriage
@@ -1603,7 +1641,17 @@ flow handle
   complete result { ok true }
 }
 "#;
-        let ir = compile_program(source).ir.expect("compiles");
+        let compiled = compile_program(source);
+        let ir = compiled.ir.unwrap_or_else(|| {
+            panic!(
+                "compiles, diagnostics: {:?}",
+                compiled
+                    .diagnostics
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            )
+        });
         let tell = ir
             .rules
             .iter()
@@ -1617,6 +1665,63 @@ flow handle
         );
         assert_eq!(tell.access_grants[0].resource, "project_memory");
         assert_eq!(tell.access_grants[0].operations[0].operation, "recall");
+    }
+
+    #[test]
+    fn flow_invoke_preserves_start_access_grants_through_expansion() {
+        // A `with access to` grant on a flow `invoke` must survive flow
+        // re-serialization and lower onto the generated workflow.invoke effect.
+        use crate::IrEffectKind;
+        let source = r#"
+workflow Parent {
+  output result R
+  class R { ok bool }
+  class Task { id string }
+
+  table seed as Task [ { id "T1" } ]
+
+  flow handle
+    when Task as task
+  {
+    invoke Child { task task }
+      with access to project_files {
+        read ["docs/**"]
+      }
+      as child
+
+    complete result { ok true }
+  }
+}
+
+workflow Child {
+  input task Task
+  class Task { id string }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Parent"));
+        let ir = compiled.ir.unwrap_or_else(|| {
+            panic!(
+                "compiles, diagnostics: {:?}",
+                compiled
+                    .diagnostics
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            )
+        });
+        let invoke = ir
+            .rules
+            .iter()
+            .flat_map(|rule| rule.metadata.effects.iter())
+            .find(|effect| effect.kind == IrEffectKind::WorkflowInvoke)
+            .expect("workflow.invoke effect from the flow");
+        assert_eq!(
+            invoke.access_grants.len(),
+            1,
+            "grant preserved through flow expansion"
+        );
+        assert_eq!(invoke.access_grants[0].resource, "project_files");
+        assert_eq!(invoke.access_grants[0].operations[0].operation, "read");
     }
 
     #[test]
@@ -1901,6 +2006,49 @@ flow f
 
         // No `flow` item survives into the IR — it is fully expanded.
         assert!(!ir.rules.is_empty());
+    }
+
+    #[test]
+    fn flow_prompt_preserves_prompt_effect() {
+        let source = r#"
+workflow PromptFlow
+
+output result string
+
+class Ticket {
+  title string
+}
+
+flow f
+  when Ticket as ticket
+{
+  prompt "Summarize {{ ticket.title }}" using fixture as summary
+  complete result summary
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(
+            compiled.diagnostics,
+            Vec::new(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("flow compiles");
+        let rule = ir
+            .rules
+            .iter()
+            .find(|rule| rule.name == "flow.f.seg0")
+            .expect("flow segment");
+
+        assert!(
+            rule.body.contains("prompt") && rule.body.contains("using fixture"),
+            "{}",
+            rule.body
+        );
+        assert!(rule.metadata.effects.iter().any(|effect| {
+            effect.kind == crate::IrEffectKind::Coerce
+                && effect.binding.as_deref() == Some("summary")
+        }));
     }
 
     #[test]

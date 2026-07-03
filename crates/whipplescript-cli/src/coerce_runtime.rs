@@ -71,9 +71,21 @@ pub(crate) fn codex_config_model() -> Option<String> {
 /// Resolve native coerce configuration from the environment. `Ok(None)` selects
 /// the fixture path; `Err` is a binding-time credential failure.
 pub fn resolve_native_coerce_config() -> Result<Option<NativeCoerceConfig>, String> {
-    let Some(provider_name) = env_nonempty("WHIPPLESCRIPT_COERCE_PROVIDER") else {
+    resolve_native_coerce_config_for(None)
+}
+
+pub fn resolve_native_coerce_config_for(
+    provider_override: Option<&str>,
+) -> Result<Option<NativeCoerceConfig>, String> {
+    let Some(provider_name) = provider_override
+        .map(str::to_owned)
+        .or_else(|| env_nonempty("WHIPPLESCRIPT_COERCE_PROVIDER"))
+    else {
         return Ok(None);
     };
+    if provider_name.eq_ignore_ascii_case("fixture") {
+        return Ok(None);
+    }
     let provider = parse_provider(&provider_name)?;
     let (api_key, source) = resolve_credential_with_source(provider)
         .ok_or_else(|| missing_credential_message(provider))?;
