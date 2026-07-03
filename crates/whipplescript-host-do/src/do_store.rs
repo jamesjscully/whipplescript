@@ -67,6 +67,126 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
     pub fn new(sql: Sql) -> Self {
         Self { sql }
     }
+
+    /// Shared terminal-completion path for `complete_effect` /
+    /// `complete_effect_with_terminal_diagnostic` / `resolve_effect_uncertain`:
+    /// record the `effect.terminal` event, transition the run (guarded against a
+    /// double terminal), release the lease, transition the effect, resolve any
+    /// cancellation requests, satisfy newly-unblocked dependencies, and optionally
+    /// record a terminal diagnostic. Mirrors `complete_effect_terminal_inner`.
+    fn complete_effect_terminal_inner(
+        &self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        run_status: &str,
+    ) -> StoreResult<StoredEvent> {
+        let payload = effect_completion_payload(&completion, diagnostic.as_ref());
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: completion.instance_id,
+                event_type: "effect.terminal",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(completion.effect_id),
+                correlation_id: None,
+                idempotency_key: completion.idempotency_key,
+            },
+        )?;
+        let updated_run = self
+            .sql
+            .execute(
+                "UPDATE runs SET status = ?1, completed_at = CURRENT_TIMESTAMP, exit_code = ?2, \
+                 summary = ?3, metadata_json = ?4 \
+                 WHERE run_id = ?5 AND effect_id = ?6 AND instance_id = ?7 AND status = 'running'",
+                &[
+                    text(run_status),
+                    completion.exit_code.map_or(SqlValue::Null, int),
+                    opt_text(completion.summary),
+                    text(completion.metadata_json),
+                    text(completion.run_id),
+                    text(completion.effect_id),
+                    text(completion.instance_id),
+                ],
+            )
+            .map_err(sql_err)?;
+        if updated_run == 0 {
+            let terminal_exists = !self
+                .sql
+                .query(
+                    "SELECT 1 FROM runs WHERE run_id = ?1 AND effect_id = ?2 AND instance_id = ?3 \
+                     AND status IN ('completed', 'failed', 'timed_out', 'cancelled', 'uncertain')",
+                    &[
+                        text(completion.run_id),
+                        text(completion.effect_id),
+                        text(completion.instance_id),
+                    ],
+                )
+                .map_err(sql_err)?
+                .is_empty();
+            if terminal_exists {
+                return Err(StoreError::Conflict(
+                    "run already has a terminal completion".to_owned(),
+                ));
+            }
+            return Err(StoreError::Conflict("run is not running".to_owned()));
+        }
+        self.sql
+            .execute(
+                "UPDATE leases SET status = 'released', released_at = CURRENT_TIMESTAMP \
+                 WHERE run_id = ?1 AND effect_id = ?2 AND instance_id = ?3 AND status = 'active'",
+                &[
+                    text(completion.run_id),
+                    text(completion.effect_id),
+                    text(completion.instance_id),
+                ],
+            )
+            .map_err(sql_err)?;
+        self.sql
+            .execute(
+                "UPDATE effects SET status = ?1, updated_at = CURRENT_TIMESTAMP \
+                 WHERE effect_id = ?2 AND instance_id = ?3",
+                &[
+                    text(completion.status),
+                    text(completion.effect_id),
+                    text(completion.instance_id),
+                ],
+            )
+            .map_err(sql_err)?;
+        do_mark_cancellation_requests_terminal(
+            &self.sql,
+            completion.instance_id,
+            completion.effect_id,
+            &event.event_id,
+        )?;
+        self.satisfy_dependencies(completion.instance_id)?;
+        if let Some(diagnostic) = diagnostic {
+            do_insert_diagnostic(
+                &self.sql,
+                DiagnosticRecord {
+                    instance_id: Some(completion.instance_id),
+                    program_id: diagnostic.program_id.as_deref(),
+                    program_version_id: diagnostic.program_version_id.as_deref(),
+                    severity: diagnostic.severity,
+                    code: diagnostic.code.as_deref(),
+                    message: &diagnostic.message,
+                    source_span_json: diagnostic.source_span_json.as_deref(),
+                    subject_type: diagnostic.subject_type.as_deref(),
+                    subject_id: diagnostic.subject_id.as_deref(),
+                    event_id: Some(&event.event_id),
+                    effect_id: Some(completion.effect_id),
+                    run_id: Some(completion.run_id),
+                    assertion_id: diagnostic.assertion_id.as_deref(),
+                    evidence_ids_json: &diagnostic.evidence_ids_json,
+                    artifact_ids_json: &diagnostic.artifact_ids_json,
+                    causation_id: diagnostic.causation_id.as_deref(),
+                    correlation_id: diagnostic.correlation_id.as_deref(),
+                    idempotency_key: diagnostic.idempotency_key.as_deref(),
+                },
+            )?;
+        }
+        Ok(event)
+    }
 }
 
 fn sql_err(message: String) -> StoreError {
@@ -557,6 +677,67 @@ fn do_append_event<Sql: DoSql>(sql: &Sql, event: NewEvent<'_>) -> StoreResult<St
         event_id: as_text(&row[0]),
         sequence: as_i64(&row[1]),
     })
+}
+
+/// The `effect.terminal` event payload, mirroring `effect_completion_payload`.
+fn effect_completion_payload(
+    completion: &EffectCompletion<'_>,
+    diagnostic: Option<&TerminalDiagnosticRecord>,
+) -> String {
+    serde_json::json!({
+        "effect_id": completion.effect_id,
+        "run_id": completion.run_id,
+        "provider": completion.provider,
+        "worker_id": completion.worker_id,
+        "status": completion.status,
+        "exit_code": completion.exit_code,
+        "summary": completion.summary,
+        "metadata": serde_json::from_str::<Value>(completion.metadata_json).unwrap_or(Value::Null),
+        "diagnostic": diagnostic.map(terminal_diagnostic_payload),
+    })
+    .to_string()
+}
+
+/// The nested diagnostic object in a terminal payload, mirroring
+/// `terminal_diagnostic_payload`.
+fn terminal_diagnostic_payload(diagnostic: &TerminalDiagnosticRecord) -> Value {
+    serde_json::json!({
+        "program_id": diagnostic.program_id,
+        "program_version_id": diagnostic.program_version_id,
+        "severity": diagnostic.severity.as_str(),
+        "code": diagnostic.code,
+        "message": diagnostic.message,
+        "source_span": diagnostic.source_span_json.as_deref()
+            .map(|span| serde_json::from_str::<Value>(span).unwrap_or(Value::Null)),
+        "subject_type": diagnostic.subject_type,
+        "subject_id": diagnostic.subject_id,
+        "assertion_id": diagnostic.assertion_id,
+        "evidence_ids": serde_json::from_str::<Value>(&diagnostic.evidence_ids_json)
+            .unwrap_or_else(|_| serde_json::json!([])),
+        "artifact_ids": serde_json::from_str::<Value>(&diagnostic.artifact_ids_json)
+            .unwrap_or_else(|_| serde_json::json!([])),
+        "causation_id": diagnostic.causation_id,
+        "correlation_id": diagnostic.correlation_id,
+        "idempotency_key": diagnostic.idempotency_key,
+    })
+}
+
+/// Resolves any open cancellation requests for an effect to `terminal`, mirroring
+/// `mark_cancellation_requests_terminal_on`.
+fn do_mark_cancellation_requests_terminal<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    effect_id: &str,
+    event_id: &str,
+) -> StoreResult<()> {
+    sql.execute(
+        "UPDATE effect_cancellation_requests SET status = 'terminal', \
+         resolved_by_event_id = ?1, updated_at = CURRENT_TIMESTAMP \
+         WHERE instance_id = ?2 AND effect_id = ?3 AND status = 'requested'",
+        &[text(event_id), text(instance_id), text(effect_id)],
+    )
+    .map_err(sql_err)?;
+    Ok(())
 }
 
 /// The execution fingerprint for a run: `H(input_json | sorted upstream ids)`,
@@ -1852,7 +2033,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn complete_effect(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
-        todo!("Phase 5b: port `complete_effect` SQL to DoSql + verify against a live DO")
+        self.complete_effect_with_terminal_diagnostic(completion, None)
     }
 
     fn complete_effect_with_terminal_diagnostic(
@@ -1860,7 +2041,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
     ) -> StoreResult<StoredEvent> {
-        todo!("Phase 5b: port `complete_effect_with_terminal_diagnostic` SQL to DoSql + verify against a live DO")
+        let run_status = completion.status;
+        self.complete_effect_terminal_inner(completion, diagnostic, run_status)
     }
 
     fn resolve_effect_uncertain(
@@ -1868,7 +2050,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
     ) -> StoreResult<StoredEvent> {
-        todo!("Phase 5b: port `resolve_effect_uncertain` SQL to DoSql + verify against a live DO")
+        self.complete_effect_terminal_inner(completion, diagnostic, "uncertain")
     }
 
     fn claimable_effects(&self, instance_id: &str) -> StoreResult<Vec<ClaimableEffect>> {
@@ -3828,7 +4010,7 @@ mod tests {
                 run_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, effect_id TEXT NOT NULL,
                 provider TEXT NOT NULL, worker_id TEXT NOT NULL, status TEXT NOT NULL,
                 started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}'
+                exit_code INTEGER, summary TEXT, metadata_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE effect_cancellation_requests (
                 request_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, effect_id TEXT NOT NULL,
@@ -5596,5 +5778,166 @@ mod tests {
                 metadata_json: "{}",
             })
             .is_err());
+    }
+
+    /// complete_effect records the terminal event, transitions run/lease/effect,
+    /// satisfies dependents, and is guarded against a double terminal.
+    /// complete_effect_with_terminal_diagnostic also records a diagnostic. Real SQL.
+    #[test]
+    fn do_store_complete_effect_runs_real_sql() {
+        use whipplescript_core::Severity;
+        let mut store = store();
+        // Seed a running effect + run + lease, plus a dependent blocked on it.
+        for (sql, params) in [
+            (
+                "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![text("eff_1"), text("i1"), text("coerce"), text("running"), text("{}")],
+            ),
+            (
+                "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![text("eff_dep"), text("i1"), text("coerce"), text("blocked_by_dependency"), text("{}")],
+            ),
+            (
+                "INSERT INTO effect_dependencies (instance_id, downstream_effect_id, \
+                 upstream_effect_id, predicate) VALUES (?1, ?2, ?3, ?4)",
+                vec![text("i1"), text("eff_dep"), text("eff_1"), text("succeeds")],
+            ),
+            (
+                "INSERT INTO runs (run_id, instance_id, effect_id, provider, worker_id, status) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                vec![text("run_1"), text("i1"), text("eff_1"), text("p"), text("w"), text("running")],
+            ),
+            (
+                "INSERT INTO leases (lease_id, instance_id, run_id, effect_id, status, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                vec![text("lse_1"), text("i1"), text("run_1"), text("eff_1"), text("active"), text("2026-01-01T00:00:00Z")],
+            ),
+        ] {
+            store.sql.execute(sql, &params).expect("seed");
+        }
+
+        let completion = EffectCompletion {
+            instance_id: "i1",
+            effect_id: "eff_1",
+            run_id: "run_1",
+            provider: "p",
+            worker_id: "w",
+            status: "completed",
+            exit_code: Some(0),
+            summary: Some("ok"),
+            metadata_json: "{}",
+            idempotency_key: Some("done-1"),
+        };
+        let ev = store.complete_effect(completion).expect("complete");
+        assert!(ev.event_id.starts_with("evt_"));
+        // run -> completed, lease -> released, effect -> completed.
+        let run = store
+            .sql
+            .query(
+                "SELECT status FROM runs WHERE run_id = ?1",
+                &[text("run_1")],
+            )
+            .expect("run");
+        assert_eq!(as_text(&run[0][0]), "completed");
+        let lease = store
+            .sql
+            .query(
+                "SELECT status FROM leases WHERE lease_id = ?1",
+                &[text("lse_1")],
+            )
+            .expect("lease");
+        assert_eq!(as_text(&lease[0][0]), "released");
+        // The dependent effect is now queued (dependency satisfied).
+        let dep = store
+            .sql
+            .query(
+                "SELECT status FROM effects WHERE effect_id = ?1",
+                &[text("eff_dep")],
+            )
+            .expect("dep");
+        assert_eq!(as_text(&dep[0][0]), "queued");
+
+        // A second completion of the same run is rejected (double terminal).
+        let again = store.complete_effect(EffectCompletion {
+            instance_id: "i1",
+            effect_id: "eff_1",
+            run_id: "run_1",
+            provider: "p",
+            worker_id: "w",
+            status: "completed",
+            exit_code: Some(0),
+            summary: None,
+            metadata_json: "{}",
+            idempotency_key: Some("done-2"),
+        });
+        assert!(again.is_err());
+
+        // complete_effect_with_terminal_diagnostic records a diagnostic row.
+        store
+            .sql
+            .execute(
+                "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    text("eff_2"),
+                    text("i1"),
+                    text("coerce"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed eff_2");
+        store
+            .sql
+            .execute(
+                "INSERT INTO runs (run_id, instance_id, effect_id, provider, worker_id, status) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[
+                    text("run_2"),
+                    text("i1"),
+                    text("eff_2"),
+                    text("p"),
+                    text("w"),
+                    text("running"),
+                ],
+            )
+            .expect("seed run_2");
+        store
+            .complete_effect_with_terminal_diagnostic(
+                EffectCompletion {
+                    instance_id: "i1",
+                    effect_id: "eff_2",
+                    run_id: "run_2",
+                    provider: "p",
+                    worker_id: "w",
+                    status: "failed",
+                    exit_code: Some(1),
+                    summary: Some("boom"),
+                    metadata_json: "{}",
+                    idempotency_key: Some("fail-1"),
+                },
+                Some(TerminalDiagnosticRecord {
+                    program_id: None,
+                    program_version_id: None,
+                    severity: Severity::Error,
+                    code: Some("E9".to_owned()),
+                    message: "kaboom".to_owned(),
+                    source_span_json: None,
+                    subject_type: None,
+                    subject_id: None,
+                    assertion_id: None,
+                    evidence_ids_json: "[]".to_owned(),
+                    artifact_ids_json: "[]".to_owned(),
+                    causation_id: None,
+                    correlation_id: None,
+                    idempotency_key: Some("diag-f1".to_owned()),
+                }),
+            )
+            .expect("complete with diagnostic");
+        let diags = store.list_diagnostics(Some("i1")).expect("diags");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].effect_id.as_deref(), Some("eff_2"));
     }
 }
