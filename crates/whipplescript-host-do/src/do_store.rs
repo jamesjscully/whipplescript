@@ -32,7 +32,7 @@
 //! needs a live Durable Object (`worker` crate) to build and verify; the tracker's
 //! Phase-5 store box stays open until that port + live verification is done.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 use whipplescript_store::{NewEvent, RuntimeStore, StoreError, StoreResult, StoredEvent};
@@ -1428,6 +1428,605 @@ fn do_insert_diagnostic<Sql: DoSql>(
 }
 
 // ---------------------------------------------------------------------------
+// Revision compatibility-analysis suite — the structural diff + fact-typecheck
+// the revision commands run to decide whether a candidate version is safe to
+// activate against a live instance. The `validate_*` / `compare_*` / signature
+// helpers are pure (serde_json + BTreeMap), copied verbatim from the native store;
+// the three `do_*` helpers touch `DoSql`.
+// ---------------------------------------------------------------------------
+
+struct RevisionInstanceContext {
+    program_id: String,
+    program_name: String,
+    active_version_id: String,
+    status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ContractSummary {
+    ty: String,
+    source_span_json: Option<String>,
+}
+
+fn revision_compatibility_diagnostic(
+    code: &str,
+    message: String,
+    subject: Option<&str>,
+) -> RevisionCompatibilityDiagnostic {
+    revision_compatibility_diagnostic_with_span(code, message, subject, None)
+}
+
+fn revision_compatibility_diagnostic_with_span(
+    code: &str,
+    message: String,
+    subject: Option<&str>,
+    source_span_json: Option<String>,
+) -> RevisionCompatibilityDiagnostic {
+    RevisionCompatibilityDiagnostic {
+        code: code.to_owned(),
+        message,
+        subject: subject.map(str::to_owned),
+        source_span_json,
+    }
+}
+
+fn add_instance_revision_diagnostics(
+    context: &RevisionInstanceContext,
+    diagnostics: &mut Vec<RevisionCompatibilityDiagnostic>,
+) {
+    if matches!(
+        context.status.as_str(),
+        "completed" | "failed" | "cancelled"
+    ) {
+        diagnostics.push(revision_compatibility_diagnostic(
+            "revision.terminal_instance",
+            format!(
+                "instance is {}; revisions require a non-terminal instance",
+                context.status
+            ),
+            None,
+        ));
+    }
+}
+
+fn contracts_by_name(summary: &Value, kind: &str) -> BTreeMap<String, ContractSummary> {
+    summary
+        .get("workflow_contracts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|contract| contract.get("kind").and_then(Value::as_str) == Some(kind))
+        .filter_map(|contract| {
+            Some((
+                contract.get("name")?.as_str()?.to_owned(),
+                ContractSummary {
+                    ty: contract.get("type")?.as_str()?.to_owned(),
+                    source_span_json: summary_source_span_json(contract),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn compare_contracts(
+    kind: &str,
+    reject_candidate_additions: bool,
+    active: &Value,
+    candidate: &Value,
+    diagnostics: &mut Vec<RevisionCompatibilityDiagnostic>,
+) {
+    let active_contracts = contracts_by_name(active, kind);
+    let candidate_contracts = contracts_by_name(candidate, kind);
+    for (name, active_ty) in &active_contracts {
+        match candidate_contracts.get(name) {
+            Some(candidate_ty) if candidate_ty.ty == active_ty.ty => {}
+            Some(candidate_ty) => diagnostics.push(revision_compatibility_diagnostic_with_span(
+                "revision.contract_changed",
+                format!(
+                    "{kind} contract `{name}` changed from `{}` to `{}`",
+                    active_ty.ty, candidate_ty.ty
+                ),
+                Some(name.as_str()),
+                candidate_ty.source_span_json.clone(),
+            )),
+            None => diagnostics.push(revision_compatibility_diagnostic_with_span(
+                "revision.contract_removed",
+                format!("{kind} contract `{name}` is missing from the candidate version"),
+                Some(name.as_str()),
+                active_ty.source_span_json.clone(),
+            )),
+        }
+    }
+    if reject_candidate_additions {
+        for (name, candidate_ty) in candidate_contracts {
+            if !active_contracts.contains_key(&name) {
+                diagnostics.push(revision_compatibility_diagnostic_with_span(
+                    "revision.input_contract_added",
+                    format!(
+                        "candidate adds input contract `{name}` with type `{}` to an already-started instance",
+                        candidate_ty.ty
+                    ),
+                    Some(name.as_str()),
+                    candidate_ty.source_span_json,
+                ));
+            }
+        }
+    }
+}
+
+fn compare_revision_summaries(
+    active: &Value,
+    candidate: &Value,
+    diagnostics: &mut Vec<RevisionCompatibilityDiagnostic>,
+) {
+    let active_workflow = active.get("workflow").and_then(Value::as_str);
+    let candidate_workflow = candidate.get("workflow").and_then(Value::as_str);
+    match (active_workflow, candidate_workflow) {
+        (Some(active_workflow), Some(candidate_workflow))
+            if active_workflow != candidate_workflow =>
+        {
+            diagnostics.push(revision_compatibility_diagnostic(
+                "revision.root_workflow_changed",
+                format!(
+                    "candidate root workflow `{candidate_workflow}` does not match active root `{active_workflow}`"
+                ),
+                Some(candidate_workflow),
+            ));
+        }
+        (None, _) => diagnostics.push(revision_compatibility_diagnostic(
+            "revision.active_analysis_missing",
+            "active version does not include revision analysis metadata".to_owned(),
+            None,
+        )),
+        (_, None) => diagnostics.push(revision_compatibility_diagnostic(
+            "revision.candidate_analysis_missing",
+            "candidate version does not include revision analysis metadata".to_owned(),
+            None,
+        )),
+        _ => {}
+    }
+    compare_contracts("input", true, active, candidate, diagnostics);
+    compare_contracts("output", false, active, candidate, diagnostics);
+    compare_contracts("failure", false, active, candidate, diagnostics);
+}
+
+fn schemas_by_name(summary: &Value) -> BTreeMap<String, Value> {
+    summary
+        .get("schemas")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|schema| Some((schema.get("name")?.as_str()?.to_owned(), schema.clone())))
+        .collect()
+}
+
+fn summary_source_span_json(summary: &Value) -> Option<String> {
+    summary.get("source_span").map(Value::to_string)
+}
+
+fn fact_schema_name<'a>(
+    fact_name: &'a str,
+    schema_id: Option<&'a str>,
+    active_schemas: &BTreeMap<String, Value>,
+    candidate_schemas: &BTreeMap<String, Value>,
+) -> Option<&'a str> {
+    if let Some(schema_id) = schema_id {
+        if active_schemas.contains_key(schema_id) || candidate_schemas.contains_key(schema_id) {
+            return Some(schema_id);
+        }
+    }
+    if active_schemas.contains_key(fact_name) || candidate_schemas.contains_key(fact_name) {
+        return Some(fact_name);
+    }
+    None
+}
+
+fn is_optional_signature(signature: &str) -> bool {
+    signature_envelope(signature, "optional").is_some()
+}
+
+fn signature_envelope<'a>(signature: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}<");
+    signature
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix('>'))
+}
+
+fn split_top_level(input: &str, separator: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < input.len() {
+        let rest = &input[index..];
+        if depth == 0 && rest.starts_with(separator) {
+            parts.push(input[start..index].trim().to_owned());
+            index += separator.len();
+            start = index;
+            continue;
+        }
+        if let Some(ch) = rest.chars().next() {
+            match ch {
+                '<' => depth += 1,
+                '>' => depth -= 1,
+                _ => {}
+            }
+            index += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    parts.push(input[start..].trim().to_owned());
+    parts.retain(|part| !part.is_empty());
+    parts
+}
+
+fn validate_value_against_object_signature(
+    value: &Value,
+    inner: &str,
+    schemas: &BTreeMap<String, Value>,
+    path: &str,
+    errors: &mut Vec<String>,
+    depth: usize,
+) {
+    let Some(fields) = inner
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        errors.push(format!("{path} uses malformed object type"));
+        return;
+    };
+    let fields = split_top_level(fields, ", ")
+        .into_iter()
+        .filter_map(|field| {
+            let (name, signature) = field.split_once(' ')?;
+            Some(serde_json::json!({ "name": name, "type": signature }))
+        })
+        .collect::<Vec<_>>();
+    validate_value_against_fields(value, Some(&fields), schemas, path, errors, depth + 1);
+}
+
+fn validate_value_against_type_signature(
+    value: &Value,
+    signature: &str,
+    schemas: &BTreeMap<String, Value>,
+    path: &str,
+    errors: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > 32 {
+        errors.push(format!("{path} exceeded schema recursion limit"));
+        return;
+    }
+    match signature {
+        "string" | "duration" | "time" | "image" | "audio" | "pdf" | "video" => {
+            if !value.is_string() {
+                errors.push(format!("{path} must be {signature}"));
+            }
+        }
+        "int" => {
+            if value.as_i64().is_none() {
+                errors.push(format!("{path} must be int"));
+            }
+        }
+        "float" => {
+            if value.as_f64().is_none() {
+                errors.push(format!("{path} must be float"));
+            }
+        }
+        "bool" => {
+            if !value.is_boolean() {
+                errors.push(format!("{path} must be bool"));
+            }
+        }
+        "null" => {
+            if !value.is_null() {
+                errors.push(format!("{path} must be null"));
+            }
+        }
+        _ => {
+            if let Some(expected) = signature_envelope(signature, "literal") {
+                let expected = serde_json::from_str::<String>(expected)
+                    .unwrap_or_else(|_| expected.to_owned());
+                if value.as_str() != Some(expected.as_str()) {
+                    errors.push(format!("{path} must be literal {expected:?}"));
+                }
+            } else if let Some(schema_name) = signature_envelope(signature, "ref") {
+                match schemas.get(schema_name) {
+                    Some(schema) => validate_fact_value_against_schema(
+                        value,
+                        schema,
+                        schemas,
+                        path,
+                        errors,
+                        depth + 1,
+                    ),
+                    None => errors.push(format!(
+                        "{path} references schema `{schema_name}` missing from candidate"
+                    )),
+                }
+            } else if let Some(inner) = signature_envelope(signature, "optional") {
+                if !value.is_null() {
+                    validate_value_against_type_signature(
+                        value,
+                        inner,
+                        schemas,
+                        path,
+                        errors,
+                        depth + 1,
+                    );
+                }
+            } else if let Some(inner) = signature_envelope(signature, "array") {
+                match value.as_array() {
+                    Some(items) => {
+                        for (index, item) in items.iter().enumerate() {
+                            validate_value_against_type_signature(
+                                item,
+                                inner,
+                                schemas,
+                                &format!("{path}[{index}]"),
+                                errors,
+                                depth + 1,
+                            );
+                        }
+                    }
+                    None => errors.push(format!("{path} must be an array")),
+                }
+            } else if let Some(inner) = signature_envelope(signature, "map") {
+                match value.as_object() {
+                    Some(map) => {
+                        for (key, item) in map {
+                            validate_value_against_type_signature(
+                                item,
+                                inner,
+                                schemas,
+                                &format!("{path}.{key}"),
+                                errors,
+                                depth + 1,
+                            );
+                        }
+                    }
+                    None => errors.push(format!("{path} must be an object map")),
+                }
+            } else if let Some(inner) = signature_envelope(signature, "union") {
+                let variants = split_top_level(inner, " | ");
+                if !variants.iter().any(|variant| {
+                    let mut candidate_errors = Vec::new();
+                    validate_value_against_type_signature(
+                        value,
+                        variant,
+                        schemas,
+                        path,
+                        &mut candidate_errors,
+                        depth + 1,
+                    );
+                    candidate_errors.is_empty()
+                }) {
+                    errors.push(format!(
+                        "{path} must match one of: {}",
+                        variants.join(" | ")
+                    ));
+                }
+            } else if let Some(inner) = signature_envelope(signature, "object") {
+                validate_value_against_object_signature(value, inner, schemas, path, errors, depth);
+            } else if let Some(inner) = signature_envelope(signature, "agentref") {
+                let agents = split_top_level(inner, " | ");
+                match value.as_str() {
+                    Some(agent) if agents.iter().any(|candidate| candidate == agent) => {}
+                    Some(_) => errors.push(format!(
+                        "{path} must name one of these agents: {}",
+                        agents.join(", ")
+                    )),
+                    None => errors.push(format!("{path} must be an agent name string")),
+                }
+            } else {
+                errors.push(format!("{path} uses unsupported type `{signature}`"));
+            }
+        }
+    }
+}
+
+fn validate_value_against_fields(
+    value: &Value,
+    fields: Option<&Vec<Value>>,
+    schemas: &BTreeMap<String, Value>,
+    path: &str,
+    errors: &mut Vec<String>,
+    depth: usize,
+) {
+    let Some(object) = value.as_object() else {
+        errors.push(format!("{path} must be an object"));
+        return;
+    };
+    let fields = fields.map(Vec::as_slice).unwrap_or(&[]);
+    let declared = fields
+        .iter()
+        .filter_map(|field| Some((field.get("name")?.as_str()?, field.get("type")?.as_str()?)))
+        .collect::<BTreeMap<_, _>>();
+    for key in object.keys() {
+        if !declared.contains_key(key.as_str()) {
+            errors.push(format!("{path}.{key} is not declared by candidate"));
+        }
+    }
+    for (name, signature) in declared {
+        let field_path = format!("{path}.{name}");
+        match object.get(name) {
+            Some(value) => {
+                validate_value_against_type_signature(
+                    value,
+                    signature,
+                    schemas,
+                    &field_path,
+                    errors,
+                    depth + 1,
+                );
+            }
+            None if is_optional_signature(signature) => {}
+            None => errors.push(format!("{field_path} is required by candidate")),
+        }
+    }
+}
+
+fn validate_fact_value_against_schema(
+    value: &Value,
+    schema: &Value,
+    schemas: &BTreeMap<String, Value>,
+    path: &str,
+    errors: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > 32 {
+        errors.push(format!("{path} exceeded schema recursion limit"));
+        return;
+    }
+    match schema.get("kind").and_then(Value::as_str) {
+        Some("class") => validate_value_against_fields(
+            value,
+            schema.get("fields").and_then(Value::as_array),
+            schemas,
+            path,
+            errors,
+            depth,
+        ),
+        Some("enum") => {
+            let variants = schema
+                .get("variants")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            match value.as_str() {
+                Some(variant) if variants.contains(&variant) => {}
+                Some(variant) => errors.push(format!(
+                    "{path} has enum variant `{variant}` not declared by candidate"
+                )),
+                None => errors.push(format!("{path} must be a string enum variant")),
+            }
+        }
+        Some(kind) => errors.push(format!("{path} uses unsupported schema kind `{kind}`")),
+        None => errors.push(format!("{path} uses schema without a kind")),
+    }
+}
+
+/// The active revision context (program + version + status) for an instance,
+/// mirroring `revision_instance_context_on`.
+fn do_revision_instance_context<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+) -> StoreResult<RevisionInstanceContext> {
+    let rows = sql
+        .query(
+            "SELECT instances.program_id, programs.name, instances.version_id, instances.status \
+             FROM instances JOIN programs ON programs.program_id = instances.program_id \
+             WHERE instances.instance_id = ?1",
+            &[text(instance_id)],
+        )
+        .map_err(sql_err)?;
+    let row = rows
+        .first()
+        .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))?;
+    Ok(RevisionInstanceContext {
+        program_id: as_text(&row[0]),
+        program_name: as_text(&row[1]),
+        active_version_id: as_text(&row[2]),
+        status: as_text(&row[3]),
+    })
+}
+
+/// `(program_id, analysis_summary)` for a version, mirroring
+/// `program_version_analysis_on`.
+fn do_program_version_analysis<Sql: DoSql>(
+    sql: &Sql,
+    version_id: &str,
+) -> StoreResult<(String, Value)> {
+    let rows = sql
+        .query(
+            "SELECT program_id, analysis_summary FROM program_versions WHERE version_id = ?1",
+            &[text(version_id)],
+        )
+        .map_err(sql_err)?;
+    let row = rows
+        .first()
+        .ok_or_else(|| StoreError::Conflict("program version does not exist".to_owned()))?;
+    Ok((
+        as_text(&row[0]),
+        serde_json::from_str::<Value>(&as_text(&row[1]))?,
+    ))
+}
+
+/// Adds diagnostics for active facts that no longer typecheck against the
+/// candidate's schemas, mirroring `add_active_fact_schema_diagnostics`.
+fn do_add_active_fact_schema_diagnostics<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    active_summary: &Value,
+    candidate_summary: &Value,
+    diagnostics: &mut Vec<RevisionCompatibilityDiagnostic>,
+) -> StoreResult<()> {
+    let active_schemas = schemas_by_name(active_summary);
+    let candidate_schemas = schemas_by_name(candidate_summary);
+    if active_schemas.is_empty() && candidate_schemas.is_empty() {
+        return Ok(());
+    }
+    let rows = sql
+        .query(
+            "SELECT fact_id, name, schema_id, value_json FROM facts \
+             WHERE instance_id = ?1 AND consumed_at IS NULL ORDER BY fact_id",
+            &[text(instance_id)],
+        )
+        .map_err(sql_err)?;
+    for row in &rows {
+        let fact_id = as_text(&row[0]);
+        let name = as_text(&row[1]);
+        let schema_id = as_opt_text(&row[2]);
+        let value_json = as_text(&row[3]);
+        let Some(schema_name) = fact_schema_name(
+            &name,
+            schema_id.as_deref(),
+            &active_schemas,
+            &candidate_schemas,
+        ) else {
+            continue;
+        };
+        let Some(candidate_schema) = candidate_schemas.get(schema_name) else {
+            let source_span_json = active_schemas
+                .get(schema_name)
+                .and_then(summary_source_span_json);
+            diagnostics.push(revision_compatibility_diagnostic_with_span(
+                "revision.active_fact_schema_removed",
+                format!("active fact `{fact_id}` uses schema `{schema_name}` missing from candidate version"),
+                Some(schema_name),
+                source_span_json,
+            ));
+            continue;
+        };
+        let value = serde_json::from_str::<Value>(&value_json)?;
+        let mut errors = Vec::new();
+        validate_fact_value_against_schema(
+            &value,
+            candidate_schema,
+            &candidate_schemas,
+            "$",
+            &mut errors,
+            0,
+        );
+        if !errors.is_empty() {
+            diagnostics.push(revision_compatibility_diagnostic_with_span(
+                "revision.active_fact_incompatible",
+                format!(
+                    "active fact `{fact_id}` no longer typechecks as `{schema_name}`: {}",
+                    errors.join("; ")
+                ),
+                Some(schema_name),
+                summary_source_span_json(candidate_schema),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Policy / capacity block engine — the capability + profile enforcement the
 // scheduler applies when deciding whether an effect is claimable. Ported from the
 // native store's policy helpers; the pure-JSON helpers are backend-agnostic, the
@@ -2182,7 +2781,37 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         instance_id: &str,
         candidate_version_id: &str,
     ) -> StoreResult<RevisionCompatibilityReport> {
-        todo!("Phase 5b: port `analyze_revision_compatibility` SQL to DoSql + verify against a live DO")
+        let context = do_revision_instance_context(&self.sql, instance_id)?;
+        let (active_program_id, active_summary) =
+            do_program_version_analysis(&self.sql, &context.active_version_id)?;
+        let (candidate_program_id, candidate_summary) =
+            do_program_version_analysis(&self.sql, candidate_version_id)?;
+
+        let mut diagnostics = Vec::new();
+        add_instance_revision_diagnostics(&context, &mut diagnostics);
+        if active_program_id != context.program_id || candidate_program_id != context.program_id {
+            diagnostics.push(revision_compatibility_diagnostic(
+                "revision.program_mismatch",
+                "candidate version belongs to a different program".to_owned(),
+                Some(candidate_version_id),
+            ));
+        }
+        compare_revision_summaries(&active_summary, &candidate_summary, &mut diagnostics);
+        do_add_active_fact_schema_diagnostics(
+            &self.sql,
+            instance_id,
+            &active_summary,
+            &candidate_summary,
+            &mut diagnostics,
+        )?;
+
+        Ok(RevisionCompatibilityReport {
+            instance_id: instance_id.to_owned(),
+            active_version_id: context.active_version_id,
+            candidate_version_id: candidate_version_id.to_owned(),
+            compatible: diagnostics.is_empty(),
+            diagnostics,
+        })
     }
 
     fn analyze_revision_candidate(
@@ -2190,7 +2819,39 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         instance_id: &str,
         candidate: RevisionCandidate<'_>,
     ) -> StoreResult<RevisionCompatibilityReport> {
-        todo!("Phase 5b: port `analyze_revision_candidate` SQL to DoSql + verify against a live DO")
+        let context = do_revision_instance_context(&self.sql, instance_id)?;
+        let (_active_program_id, active_summary) =
+            do_program_version_analysis(&self.sql, &context.active_version_id)?;
+        let candidate_summary = serde_json::from_str::<Value>(candidate.analysis_summary_json)?;
+
+        let mut diagnostics = Vec::new();
+        add_instance_revision_diagnostics(&context, &mut diagnostics);
+        if candidate.program_name != context.program_name {
+            diagnostics.push(revision_compatibility_diagnostic(
+                "revision.program_mismatch",
+                format!(
+                    "candidate program `{}` does not match active program `{}`",
+                    candidate.program_name, context.program_name
+                ),
+                Some(candidate.program_name),
+            ));
+        }
+        compare_revision_summaries(&active_summary, &candidate_summary, &mut diagnostics);
+        do_add_active_fact_schema_diagnostics(
+            &self.sql,
+            instance_id,
+            &active_summary,
+            &candidate_summary,
+            &mut diagnostics,
+        )?;
+
+        Ok(RevisionCompatibilityReport {
+            instance_id: instance_id.to_owned(),
+            active_version_id: context.active_version_id,
+            candidate_version_id: candidate.candidate_version_id.to_owned(),
+            compatible: diagnostics.is_empty(),
+            diagnostics,
+        })
     }
 
     fn activate_revision(
@@ -6839,5 +7500,93 @@ mod tests {
 
         // Unknown policy rejected.
         assert!(store.revision_cancellation_impact("i1", "bogus").is_err());
+    }
+
+    /// analyze_revision_compatibility / analyze_revision_candidate run the structural
+    /// diff (root workflow + contracts) and the active-fact schema typecheck.
+    #[test]
+    fn do_store_analyze_revision_runs_real_sql() {
+        let store = store();
+        let seed = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
+        seed(
+            "INSERT INTO programs (program_id, name) VALUES (?1, ?2)",
+            &[text("prog_1"), text("orders")],
+        );
+        // Active version: workflow "main", one input contract q:int.
+        let active_summary = r#"{"workflow":"main","workflow_contracts":[
+            {"kind":"input","name":"q","type":"int"}],"schemas":[]}"#;
+        seed(
+            "INSERT INTO program_versions (version_id, program_id, source_hash, analysis_summary) \
+             VALUES (?1, ?2, ?3, ?4)",
+            &[
+                text("ver_active"),
+                text("prog_1"),
+                text("sh_active"),
+                text(active_summary),
+            ],
+        );
+        // Compatible candidate: identical summary.
+        seed(
+            "INSERT INTO program_versions (version_id, program_id, source_hash, analysis_summary) \
+             VALUES (?1, ?2, ?3, ?4)",
+            &[
+                text("ver_ok"),
+                text("prog_1"),
+                text("sh_ok"),
+                text(active_summary),
+            ],
+        );
+        // Incompatible candidate: root workflow renamed + contract type changed.
+        let bad_summary = r#"{"workflow":"other","workflow_contracts":[
+            {"kind":"input","name":"q","type":"string"}],"schemas":[]}"#;
+        seed(
+            "INSERT INTO program_versions (version_id, program_id, source_hash, analysis_summary) \
+             VALUES (?1, ?2, ?3, ?4)",
+            &[
+                text("ver_bad"),
+                text("prog_1"),
+                text("sh_bad"),
+                text(bad_summary),
+            ],
+        );
+        seed(
+            "INSERT INTO instances (instance_id, program_id, version_id, workflow_principal, \
+             effective_authority, status, input_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                text("i1"),
+                text("prog_1"),
+                text("ver_active"),
+                text("root"),
+                text("{}"),
+                text("running"),
+                text("{}"),
+            ],
+        );
+
+        let ok = store
+            .analyze_revision_compatibility("i1", "ver_ok")
+            .expect("ok");
+        assert!(ok.compatible, "identical summary is compatible");
+
+        let bad = store
+            .analyze_revision_compatibility("i1", "ver_bad")
+            .expect("bad");
+        assert!(!bad.compatible);
+        let codes: Vec<&str> = bad.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"revision.root_workflow_changed"));
+        assert!(codes.contains(&"revision.contract_changed"));
+
+        // analyze_revision_candidate against an inline summary flags the mismatch.
+        let cand = store
+            .analyze_revision_candidate(
+                "i1",
+                RevisionCandidate {
+                    candidate_version_id: "ver_x",
+                    program_name: "orders",
+                    analysis_summary_json: bad_summary,
+                },
+            )
+            .expect("candidate");
+        assert!(!cand.compatible);
     }
 }
