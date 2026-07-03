@@ -7,6 +7,7 @@ pub mod claude_agent_sdk;
 pub mod codex_app_server;
 pub mod coerce;
 pub mod coerce_native;
+pub mod effect_config;
 pub mod harness;
 pub mod harness_loop;
 pub mod harness_model;

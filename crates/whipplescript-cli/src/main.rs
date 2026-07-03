@@ -28,6 +28,7 @@ use whipplescript_kernel::codex_app_server::{
 };
 use whipplescript_kernel::{
     coerce::{CoerceRequest, FakeCoerceClient},
+    effect_config::EffectConfig,
     harness::{CommandAgentHarness, CommandLaunchPlan},
     idempotency_key,
     loft::{FakeLoftClient, LoftAction, LoftEffectRequest},
@@ -20222,6 +20223,15 @@ struct WorkerOptions {
 }
 
 impl WorkerOptions {
+    /// Project the native options into the host-neutral `EffectConfig` the generic
+    /// handler cores read (DR-0033 chunk 4).
+    fn effect_config(&self) -> EffectConfig {
+        EffectConfig {
+            provider: self.provider.clone(),
+            outcome_failed: self.outcome.is_failed(),
+        }
+    }
+
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut instance_id = None;
         let mut provider = "fixture".to_owned();
@@ -22921,7 +22931,7 @@ fn run_loft_effect(
     options: &WorkerOptions,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_loft_effect_generic(&mut kernel, instance_id, effect, options)
+    run_loft_effect_generic(&mut kernel, instance_id, effect, &options.effect_config())
 }
 
 /// Host-agnostic core (DR-0033 chunk 3): the loft claim + terminal over a held
@@ -22930,7 +22940,7 @@ fn run_loft_effect_generic<S: RuntimeStore>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     effect: &ClaimableEffect,
-    options: &WorkerOptions,
+    config: &EffectConfig,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input = json_from_str(&effect.input_json);
     let issue_id = input
@@ -22959,7 +22969,7 @@ fn run_loft_effect_generic<S: RuntimeStore>(
         expect_heads: Vec::new(),
         metadata_json: effect.input_json.clone(),
     };
-    let client = if options.outcome.is_failed() {
+    let client = if config.outcome_failed {
         FakeLoftClient::fails("fixture loft failure")
     } else {
         FakeLoftClient::succeeds(
@@ -22983,7 +22993,7 @@ fn run_loft_effect_generic<S: RuntimeStore>(
             instance_id,
             effect_id: &effect.effect_id,
             run_id: &run_id,
-            provider: &options.provider,
+            provider: &config.provider,
             worker_id: "whip-worker",
             lease_id: &lease_id,
             lease_expires_at: "2030-01-01T00:00:00Z",
@@ -23000,7 +23010,7 @@ fn run_human_effect(
     options: &WorkerOptions,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_human_effect_generic(&mut kernel, instance_id, effect, options)
+    run_human_effect_generic(&mut kernel, instance_id, effect, &options.effect_config())
 }
 
 /// Host-agnostic core (DR-0033 chunk 3): issue the human.ask + its terminal/fact
@@ -23010,7 +23020,7 @@ fn run_human_effect_generic<S: RuntimeStore>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     effect: &ClaimableEffect,
-    options: &WorkerOptions,
+    config: &EffectConfig,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input_json =
         resolve_effect_input_after_bindings_generic(kernel.store(), instance_id, effect)?;
@@ -23035,7 +23045,7 @@ fn run_human_effect_generic<S: RuntimeStore>(
         instance_id,
         effect_id: &effect.effect_id,
         run_id: &run_id,
-        provider: &options.provider,
+        provider: &config.provider,
         worker_id: "whip-worker",
         lease_id: &lease_id,
         lease_expires_at: "2030-01-01T00:00:00Z",
@@ -23184,7 +23194,13 @@ fn run_capability_effect(
     package_lock: Option<&LoadedPackageLock>,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_capability_effect_generic(&mut kernel, instance_id, effect, options, package_lock)
+    run_capability_effect_generic(
+        &mut kernel,
+        instance_id,
+        effect,
+        &options.effect_config(),
+        package_lock,
+    )
 }
 
 /// Host-agnostic core (DR-0033 chunk 3): run the capability call + its terminal
@@ -23193,7 +23209,7 @@ fn run_capability_effect_generic<S: RuntimeStore>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     effect: &ClaimableEffect,
-    options: &WorkerOptions,
+    config: &EffectConfig,
     package_lock: Option<&LoadedPackageLock>,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input = json_from_str(&effect.input_json);
@@ -23203,7 +23219,7 @@ fn run_capability_effect_generic<S: RuntimeStore>(
         instance_id,
         effect_id: &effect.effect_id,
         run_id: &run_id,
-        provider: &options.provider,
+        provider: &config.provider,
         worker_id: "whip-worker",
         lease_id: &lease_id,
         lease_expires_at: "2030-01-01T00:00:00Z",
@@ -23214,7 +23230,7 @@ fn run_capability_effect_generic<S: RuntimeStore>(
         .to_string(),
     })?;
 
-    let terminal = if options.outcome.is_failed() {
+    let terminal = if config.outcome_failed {
         let metadata_json = json!({
             "failure": {
                 "phase": "provider.capability.failed",
@@ -23229,7 +23245,7 @@ fn run_capability_effect_generic<S: RuntimeStore>(
             instance_id,
             effect_id: &effect.effect_id,
             run_id: &run_id,
-            provider: &options.provider,
+            provider: &config.provider,
             worker_id: "whip-worker",
             status: "failed",
             exit_code: Some(1),
@@ -23288,7 +23304,7 @@ fn run_capability_effect_generic<S: RuntimeStore>(
                 instance_id,
                 effect_id: &effect.effect_id,
                 run_id: &run_id,
-                provider: &options.provider,
+                provider: &config.provider,
                 worker_id: "whip-worker",
                 status: "failed",
                 exit_code: Some(1),
@@ -23337,7 +23353,7 @@ fn run_capability_effect_generic<S: RuntimeStore>(
             instance_id,
             effect_id: &effect.effect_id,
             run_id: &run_id,
-            provider: &options.provider,
+            provider: &config.provider,
             worker_id: "whip-worker",
             status: "completed",
             exit_code: Some(0),
@@ -25310,7 +25326,7 @@ fn run_queue_effect(
         coordination_store_path(),
         items_store_path(),
     )?);
-    run_queue_effect_generic(&mut kernel, instance_id, effect, options)
+    run_queue_effect_generic(&mut kernel, instance_id, effect, &options.effect_config())
 }
 
 /// Host-agnostic core (DR-0033 chunk 3): claim/release/finish a work item + record
@@ -25320,7 +25336,7 @@ fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     effect: &ClaimableEffect,
-    options: &WorkerOptions,
+    _config: &EffectConfig,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     use whipplescript_store::items::ClaimOutcome;
     let input = json_from_str(&effect.input_json);
@@ -25405,7 +25421,6 @@ fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
         other => Err(format!("unknown queue effect kind `{other}`")),
     };
 
-    let _ = options;
     match outcome {
         Ok(value) => {
             let terminal = kernel.complete_run(EffectCompletion {
@@ -25494,7 +25509,7 @@ fn run_event_effect(
     options: &WorkerOptions,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_event_effect_generic(&mut kernel, instance_id, effect, options)
+    run_event_effect_generic(&mut kernel, instance_id, effect, &options.effect_config())
 }
 
 /// Host-agnostic core (DR-0033 chunk 3): emit the event + its terminal + facts
@@ -25504,7 +25519,7 @@ fn run_event_effect_generic<S: RuntimeStore>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     effect: &ClaimableEffect,
-    options: &WorkerOptions,
+    config: &EffectConfig,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input = json_from_str(&effect.input_json);
     let event_type = input
@@ -25522,7 +25537,7 @@ fn run_event_effect_generic<S: RuntimeStore>(
         instance_id,
         effect_id: &effect.effect_id,
         run_id: &run_id,
-        provider: &options.provider,
+        provider: &config.provider,
         worker_id: "whip-worker",
         lease_id: &lease_id,
         lease_expires_at: "2030-01-01T00:00:00Z",
@@ -25555,7 +25570,7 @@ fn run_event_effect_generic<S: RuntimeStore>(
         instance_id,
         effect_id: &effect.effect_id,
         run_id: &run_id,
-        provider: &options.provider,
+        provider: &config.provider,
         worker_id: "whip-worker",
         status: "completed",
         exit_code: Some(0),
