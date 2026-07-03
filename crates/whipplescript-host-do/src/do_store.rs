@@ -439,6 +439,54 @@ fn optional_string(value: Option<&Value>) -> Option<String> {
     value.and_then(Value::as_str).map(str::to_owned)
 }
 
+/// The first non-empty string among `fields`, or a `Conflict` error naming them.
+/// Mirrors `required_manifest_string`.
+fn required_manifest_string(value: &Value, fields: &[&str]) -> StoreResult<String> {
+    fields
+        .iter()
+        .find_map(|field| {
+            value
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "manifest entry must have one of these non-empty string fields: {}",
+                fields
+                    .iter()
+                    .map(|field| format!("`{field}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
+}
+
+/// A string field or the empty string, mirroring `required_string`.
+fn required_string(value: &Value, field: &str) -> String {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Resolves a provider entry's effect kind from its aliases, mirroring
+/// `manifest_effect_kind`.
+fn manifest_effect_kind(provider: &Value) -> String {
+    provider
+        .get("effect_kind")
+        .or_else(|| provider.get("core_effect_kind"))
+        .or_else(|| provider.get("capability"))
+        .or_else(|| provider.get("effect_contract"))
+        .or_else(|| provider.get("effect_contract_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("capability.call")
+        .to_owned()
+}
+
 /// Validates that `json` parses to a JSON array, mirroring `parse_json_array`.
 fn parse_json_array(json: &str) -> StoreResult<()> {
     if serde_json::from_str::<Value>(json)?.is_array() {
@@ -767,7 +815,66 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         &mut self,
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
-        todo!("Phase 5b: port `create_program_version` SQL to DoSql + verify against a live DO")
+        self.sql
+            .execute(
+                "INSERT INTO programs (program_id, name) \
+                 VALUES ('prg_' || lower(hex(randomblob(16))), ?1) ON CONFLICT(name) DO NOTHING",
+                &[text(version.program_name)],
+            )
+            .map_err(sql_err)?;
+        let program_rows = self
+            .sql
+            .query(
+                "SELECT program_id FROM programs WHERE name = ?1",
+                &[text(version.program_name)],
+            )
+            .map_err(sql_err)?;
+        let program_id = program_rows
+            .first()
+            .map(|r| as_text(&r[0]))
+            .ok_or_else(|| sql_err("program row missing after insert".to_string()))?;
+        self.sql
+            .execute(
+                "INSERT INTO program_versions (version_id, program_id, source_hash, ir_hash, \
+                 compiler_version, declared_capabilities, declared_profiles, declared_skills, \
+                 declared_schemas, analysis_summary, generated_artifacts, artifact_root) VALUES \
+                 ('ver_' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
+                 ?11) ON CONFLICT(program_id, source_hash, ir_hash) DO NOTHING",
+                &[
+                    text(&program_id),
+                    text(version.source_hash),
+                    text(version.ir_hash),
+                    text(version.compiler_version),
+                    text(version.declared_capabilities_json),
+                    text(version.declared_profiles_json),
+                    text(version.declared_skills_json),
+                    text(version.declared_schemas_json),
+                    text(version.analysis_summary_json),
+                    text(version.generated_artifacts_json),
+                    opt_text(version.artifact_root),
+                ],
+            )
+            .map_err(sql_err)?;
+        let version_rows = self
+            .sql
+            .query(
+                "SELECT version_id FROM program_versions \
+                 WHERE program_id = ?1 AND source_hash = ?2 AND ir_hash = ?3",
+                &[
+                    text(&program_id),
+                    text(version.source_hash),
+                    text(version.ir_hash),
+                ],
+            )
+            .map_err(sql_err)?;
+        let version_id = version_rows
+            .first()
+            .map(|r| as_text(&r[0]))
+            .ok_or_else(|| sql_err("program_version row missing after insert".to_string()))?;
+        Ok(ProgramVersionRecord {
+            program_id,
+            version_id,
+        })
     }
 
     fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>> {
@@ -1189,7 +1296,115 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn register_package_manifest(&self, manifest_json: &str) -> StoreResult<String> {
-        todo!("Phase 5b: port `register_package_manifest` SQL to DoSql + verify against a live DO")
+        let manifest: Value = serde_json::from_str(manifest_json)?;
+        let package_id = required_manifest_string(&manifest, &["package_id", "plugin_id"])?;
+        let name = required_manifest_string(&manifest, &["name"])?;
+        let version = required_manifest_string(&manifest, &["version"])?;
+
+        self.register_package(PackageRegistration {
+            package_id: &package_id,
+            name: &name,
+            version: &version,
+            manifest_json,
+        })?;
+
+        for capability in manifest
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let schema_json = capability
+                .get("schema")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "{}".to_owned());
+            self.register_capability_schema(CapabilitySchemaRegistration {
+                capability: &required_manifest_string(capability, &["capability", "id"])?,
+                description: capability
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                schema_json: &schema_json,
+                registered_by_package_id: Some(&package_id),
+            })?;
+        }
+
+        for provider in manifest
+            .get("providers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let config_json = provider
+                .get("config")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "{}".to_owned());
+            self.register_effect_provider(EffectProviderRegistration {
+                provider_id: &required_manifest_string(provider, &["provider_id", "id"])?,
+                effect_kind: &manifest_effect_kind(provider),
+                provider: &required_manifest_string(
+                    provider,
+                    &["provider", "provider_kind", "kind"],
+                )?,
+                capability: &required_manifest_string(
+                    provider,
+                    &["capability", "effect_contract", "effect_contract_id"],
+                )?,
+                config_json: &config_json,
+                registered_by_package_id: Some(&package_id),
+            })?;
+        }
+
+        for profile in manifest
+            .get("profiles")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let config_json = profile
+                .get("config")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "{}".to_owned());
+            let allowed_json = profile
+                .get("allowed_capabilities")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "[]".to_owned());
+            self.register_profile(ProfileRegistration {
+                profile_id: &required_manifest_string(profile, &["profile_id", "id"])?,
+                name: &required_string(profile, "name"),
+                description: profile
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                enforcement_mode: profile
+                    .get("enforcement_mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("enforce"),
+                allowed_capabilities_json: &allowed_json,
+                config_json: &config_json,
+            })?;
+        }
+
+        for binding in manifest
+            .get("bindings")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let config_json = binding
+                .get("config")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "{}".to_owned());
+            self.bind_capability(CapabilityBinding {
+                binding_id: &required_manifest_string(binding, &["binding_id", "id"])?,
+                program_id: binding.get("program_id").and_then(Value::as_str),
+                capability: &required_manifest_string(binding, &["capability"])?,
+                provider: &required_manifest_string(binding, &["provider", "provider_kind"])?,
+                config_json: &config_json,
+            })?;
+        }
+
+        Ok(package_id)
     }
 
     fn register_capability_schema(
@@ -2555,12 +2770,20 @@ mod tests {
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE TABLE programs (program_id TEXT PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE programs (
+                program_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE
+            );
             CREATE TABLE program_versions (
                 version_id TEXT PRIMARY KEY, program_id TEXT NOT NULL DEFAULT '',
                 source_hash TEXT NOT NULL DEFAULT '', ir_hash TEXT NOT NULL DEFAULT '',
-                compiler_version TEXT NOT NULL DEFAULT '', analysis_summary TEXT NOT NULL DEFAULT '{}',
-                declared_profiles TEXT NOT NULL DEFAULT '[]'
+                compiler_version TEXT NOT NULL DEFAULT '',
+                declared_capabilities TEXT NOT NULL DEFAULT '[]',
+                declared_profiles TEXT NOT NULL DEFAULT '[]',
+                declared_skills TEXT NOT NULL DEFAULT '[]',
+                declared_schemas TEXT NOT NULL DEFAULT '[]',
+                analysis_summary TEXT NOT NULL DEFAULT '{}',
+                generated_artifacts TEXT NOT NULL DEFAULT '[]', artifact_root TEXT,
+                UNIQUE(program_id, source_hash, ir_hash)
             );
             CREATE TABLE artifacts (
                 artifact_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -3914,5 +4137,80 @@ mod tests {
         assert_eq!(out2.skipped, 2);
         // 1 derived + 2 imported = 3 active facts.
         assert_eq!(store.list_facts("i1").expect("facts").len(), 3);
+    }
+
+    /// create_program_version upserts a program + version (idempotent on the
+    /// content hashes); register_package_manifest fans a manifest out across the
+    /// registration tables. Both verified against real SQLite.
+    #[test]
+    fn do_store_program_and_manifest_registration_run_real_sql() {
+        let mut store = store();
+
+        let mk = || NewProgramVersion {
+            program_name: "orders",
+            source_hash: "sh1",
+            ir_hash: "ih1",
+            compiler_version: "1.0",
+            declared_capabilities_json: "[]",
+            declared_profiles_json: "[]",
+            declared_skills_json: "[]",
+            declared_schemas_json: "[]",
+            analysis_summary_json: "{}",
+            generated_artifacts_json: "[]",
+            artifact_root: None,
+        };
+        let rec = store.create_program_version(mk()).expect("create pv");
+        assert!(rec.program_id.starts_with("prg_"));
+        assert!(rec.version_id.starts_with("ver_"));
+        // Idempotent: same name + hashes returns the same ids.
+        let rec2 = store.create_program_version(mk()).expect("create pv again");
+        assert_eq!(rec, rec2);
+        assert_eq!(
+            store
+                .get_program_version(&rec.version_id)
+                .expect("get")
+                .expect("some")
+                .program_name,
+            "orders"
+        );
+
+        // register_package_manifest fans out into every registration table.
+        let manifest = r#"{
+            "package_id": "pkg.demo",
+            "name": "demo",
+            "version": "0.1.0",
+            "capabilities": [{"capability": "demo.read", "description": "read", "schema": {}}],
+            "providers": [{"provider_id": "prov.a", "effect_kind": "demo.read",
+                           "provider": "local", "capability": "demo.read", "config": {}}],
+            "profiles": [{"profile_id": "prof.a", "name": "demo-default",
+                          "allowed_capabilities": ["demo.read"], "config": {}}],
+            "bindings": [{"binding_id": "bind.a", "capability": "demo.read",
+                          "provider": "local", "config": {}}]
+        }"#;
+        let pkg_id = store
+            .register_package_manifest(manifest)
+            .expect("register manifest");
+        assert_eq!(pkg_id, "pkg.demo");
+        for (table, col, key) in [
+            ("package_registrations", "package_id", "pkg.demo"),
+            ("capability_schemas", "capability", "demo.read"),
+            ("effect_providers", "provider_id", "prov.a"),
+            ("profiles", "profile_id", "prof.a"),
+            ("capability_bindings", "binding_id", "bind.a"),
+        ] {
+            let rows = store
+                .sql
+                .query(
+                    &format!("SELECT 1 FROM {table} WHERE {col} = ?1"),
+                    &[text(key)],
+                )
+                .expect("read");
+            assert_eq!(rows.len(), 1, "{table} populated by manifest");
+        }
+
+        // A manifest missing a required field is rejected.
+        assert!(store
+            .register_package_manifest(r#"{"name": "x", "version": "1"}"#)
+            .is_err());
     }
 }
