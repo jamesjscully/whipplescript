@@ -1075,11 +1075,29 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
 
         let mut result = harness.run(request);
         enforce_required_artifact_capture_failure(&mut result);
-        let evidence = self.record_provider_result(execution, &result)?;
+        self.settle_provider_run_result(execution, run_metadata_json, &result)
+    }
+
+    /// Settle an already-computed [`ProviderRunResult`] (an agent turn's outcome) to
+    /// its terminal: record the provider evidence, emit the redacted diagnostics,
+    /// complete/fail/timeout the run, and append the agent-turn event + fact. This
+    /// is the store half of `run_agent_turn_with_metadata`, split out (like
+    /// [`settle_coerce_result`](Self::settle_coerce_result)) so a host that drives
+    /// the model turn itself can settle the outcome — the durable object's sans-IO
+    /// agent turn drives its `BrokeredTurnMachine` over `fetch` and settles the
+    /// `ProviderRunResult` here, reusing the exact evidence/diagnostic/fact path the
+    /// native host uses. Pair with a prior [`start_run`](Self::start_run).
+    pub fn settle_provider_run_result(
+        &mut self,
+        execution: AgentTurnExecution<'_>,
+        run_metadata_json: &str,
+        result: &ProviderRunResult,
+    ) -> StoreResult<StoredEvent> {
+        let evidence = self.record_provider_result(execution, result)?;
         let (metadata_json, terminal_hash, provider_correlation_id) = provider_terminal_metadata(
             execution.instance_id,
             execution.run_id,
-            &result,
+            result,
             run_metadata_json,
         );
         let safe_summary = redacted_provider_summary(&result.summary);
@@ -1127,7 +1145,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 self.timeout_run_with_diagnostic(completion, diagnostic)?
             }
         };
-        self.append_agent_turn_event_and_fact(execution, &result)?;
+        self.append_agent_turn_event_and_fact(execution, result)?;
         Ok(event)
     }
 
