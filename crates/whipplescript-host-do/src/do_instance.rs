@@ -16,6 +16,8 @@
 //! a silent skip. Effect-free workflows (a rule that reaches a terminal) already
 //! drive end to end, proving the DO runs the scheduler over its store.
 
+use whipplescript_kernel::effect_config::EffectConfig;
+use whipplescript_kernel::effect_handlers::run_event_effect_generic;
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_pass::step_instance_generic;
 use whipplescript_kernel::sansio::{HttpResponse, TransportError};
@@ -59,11 +61,27 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
         effect: &ClaimableEffect,
         _incoming: Option<Result<HttpResponse, TransportError>>,
     ) -> Result<EffectStep, StoreError> {
-        Err(StoreError::Conflict(format!(
-            "effect kind `{}` is not yet executable on the durable object \
-             (the DO-reachable handler cores + FetchHost wiring are chunk 5b)",
-            effect.kind
-        )))
+        // The store-only handler cores are host-agnostic (`kernel::effect_handlers`),
+        // so the DO runs them over its `RuntimeKernel<DoSqliteStore>`. Fixture
+        // outcomes do not apply on the DO (real execution), so `outcome_failed` is
+        // false. The rest of the store-only cores + the HTTP effects land as they
+        // are lifted (chunk 5b); an unlifted kind errors clearly rather than skips.
+        let config = EffectConfig {
+            provider: "do".to_owned(),
+            outcome_failed: false,
+        };
+        let event = match effect.kind.as_str() {
+            "event.emit" => {
+                run_event_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
+            }
+            other => {
+                return Err(StoreError::Conflict(format!(
+                    "effect kind `{other}` is not yet executable on the durable object \
+                     (its handler core is not lifted / HTTP wiring pending — chunk 5b)"
+                )))
+            }
+        };
+        Ok(EffectStep::Done(event))
     }
 }
 

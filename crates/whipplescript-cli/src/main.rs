@@ -29,6 +29,7 @@ use whipplescript_kernel::codex_app_server::{
 use whipplescript_kernel::{
     coerce::{CoerceRequest, FakeCoerceClient},
     effect_config::EffectConfig,
+    effect_handlers::run_event_effect_generic,
     harness::{CommandAgentHarness, CommandLaunchPlan},
     idempotency_key,
     instance_machine::{EffectStep, InstanceDriver},
@@ -25651,124 +25652,6 @@ fn run_event_effect(
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
     run_event_effect_generic(&mut kernel, instance_id, effect, &options.effect_config())
-}
-
-/// Host-agnostic core (DR-0033 chunk 3): emit the event + its terminal + facts
-/// over a held `RuntimeKernel<S>` — no store re-open, so the DO step machine runs
-/// it over `DoSqliteStore`. Uses only kernel methods, so `S: RuntimeStore` suffices.
-fn run_event_effect_generic<S: RuntimeStore>(
-    kernel: &mut RuntimeKernel<S>,
-    instance_id: &str,
-    effect: &ClaimableEffect,
-    config: &EffectConfig,
-) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    let input = json_from_str(&effect.input_json);
-    let event_type = input
-        .get("event_type")
-        .and_then(Value::as_str)
-        .or(effect.target.as_deref())
-        .unwrap_or("event.emitted");
-    let payload = input
-        .get("payload")
-        .cloned()
-        .unwrap_or_else(|| json!({"effect_id": effect.effect_id, "event_type": event_type}));
-    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "event-run"]);
-    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "event-lease"]);
-    kernel.start_run(RunStart {
-        instance_id,
-        effect_id: &effect.effect_id,
-        run_id: &run_id,
-        provider: &config.provider,
-        worker_id: "whip-worker",
-        lease_id: &lease_id,
-        lease_expires_at: "2030-01-01T00:00:00Z",
-        metadata_json: &json!({
-            "event_type": event_type,
-            "input": input,
-        })
-        .to_string(),
-    })?;
-
-    let emitted = kernel.ingest_external_event(
-        instance_id,
-        event_type,
-        &payload.to_string(),
-        Some(&idempotency_key(&[
-            instance_id,
-            &effect.effect_id,
-            event_type,
-            "event.emit",
-        ])),
-    )?;
-    let metadata_json = json!({
-        "event_type": event_type,
-        "event_id": emitted.event_id,
-        "input": input,
-        "value": payload,
-    })
-    .to_string();
-    let terminal = kernel.complete_run(EffectCompletion {
-        instance_id,
-        effect_id: &effect.effect_id,
-        run_id: &run_id,
-        provider: &config.provider,
-        worker_id: "whip-worker",
-        status: "completed",
-        exit_code: Some(0),
-        summary: Some("fixture event emitted"),
-        metadata_json: &metadata_json,
-        idempotency_key: Some(&idempotency_key(&[
-            instance_id,
-            &effect.effect_id,
-            "terminal",
-        ])),
-    })?;
-    let mut emitted_value = payload.as_object().cloned().unwrap_or_default();
-    emitted_value.insert(
-        "event_id".to_owned(),
-        Value::String(emitted.event_id.clone()),
-    );
-    emitted_value.insert(
-        "event_type".to_owned(),
-        Value::String(event_type.to_owned()),
-    );
-    emitted_value.insert("payload".to_owned(), payload.clone());
-    let value_json = json!({
-        "effect_id": effect.effect_id,
-        "run_id": run_id,
-        "event_id": emitted.event_id,
-        "event_type": event_type,
-        "status": "completed",
-        "value": Value::Object(emitted_value),
-        "summary": "fixture event emitted",
-    })
-    .to_string();
-    kernel.derive_fact(
-        instance_id,
-        "event.emit.succeeded",
-        &effect.effect_id,
-        &value_json,
-        Some(&terminal.event_id),
-        Some(&idempotency_key(&[
-            instance_id,
-            &effect.effect_id,
-            "event.emit.succeeded",
-        ])),
-    )?;
-    kernel.derive_fact(
-        instance_id,
-        event_type,
-        &effect.effect_id,
-        &value_json,
-        Some(&emitted.event_id),
-        Some(&idempotency_key(&[
-            instance_id,
-            &effect.effect_id,
-            event_type,
-            "fact",
-        ])),
-    )?;
-    Ok(terminal)
 }
 
 fn run_workflow_invoke_effect(
