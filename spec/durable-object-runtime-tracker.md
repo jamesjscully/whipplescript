@@ -456,7 +456,20 @@ linear undo chain). No phase work now.
                 the `InstanceStepMachine` drives `step_instance_generic` + serial
                 effect dispatch, raising `NeedsIo(Http)` for the HTTP effects (which
                 lands the agent/coerce sans-IO wiring + the workflow-invoke/agent
-                recursion at the same time);
+                recursion at the same time). **DESIGN FORK found 2026-07-03 (needs
+                Jack):** the handler-core relocation is NOT mechanical — 5 of 8
+                store-only cores take `options: &WorkerOptions` (a heavily native
+                struct: exec_profile / provider_config_paths / script_manifest /
+                work_unit_root / agent_outcomes / coerce_outputs) and one takes
+                `LoadedPackageLock`; only notify/coordination/file×4 are
+                entanglement-free (they still pull a ~2.4k-line closure of pure
+                helpers — effect_failure_base / file_path_policy_error /
+                effect_allow_globs / import-export codecs). To move the
+                WorkerOptions-taking cores to the wasm-clean kernel, the DO's
+                effect-config surface must be decided: split `WorkerOptions` into a
+                host-neutral `EffectConfig` (what handlers actually read) + a
+                native-only remainder, OR hand handlers a narrower trait. That is
+                the significant design question gating (4)'s finish;
             (5) wire the DO host (`RuntimeKernel<DoSqliteStore>` + `FetchHost`) to
                 the wasm-bindgen surface below.
       - [ ] The `wasm-bindgen` surface the shell imports (`createInstance`/`step`/
