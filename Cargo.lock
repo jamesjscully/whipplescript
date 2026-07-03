@@ -727,6 +727,15 @@ name = "whipplescript-core"
 version = "0.1.0"
 
 [[package]]
+name = "whipplescript-host-do"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "whipplescript-kernel",
+ "whipplescript-store",
+]
+
+[[package]]
 name = "whipplescript-kernel"
 version = "0.1.0"
 dependencies = [
