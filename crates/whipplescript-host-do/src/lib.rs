@@ -31,6 +31,7 @@ use whipplescript_kernel::sansio::{
 };
 use whipplescript_store::files::FileStore;
 
+pub mod do_instance;
 /// `RuntimeStore` over the DO's synchronous SQLite (`DoSql`).
 pub mod do_store;
 

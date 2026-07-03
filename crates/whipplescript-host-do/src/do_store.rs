@@ -6771,14 +6771,12 @@ impl<Sql: DoSql> Coordination for DoSqliteStore<Sql> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use rusqlite::types::{Value, ValueRef};
     use rusqlite::Connection;
 
-    /// Backs `DoSql` with real in-memory SQLite, so the ported store SQL is
-    /// checked against an actual engine.
-    struct RusqliteDoSql {
+    pub(crate) struct RusqliteDoSql {
         conn: Connection,
     }
 
@@ -6829,7 +6827,7 @@ mod tests {
         }
     }
 
-    fn store() -> DoSqliteStore<RusqliteDoSql> {
+    pub(crate) fn store() -> DoSqliteStore<RusqliteDoSql> {
         let conn = Connection::open_in_memory().expect("sqlite");
         conn.execute_batch(
             r#"
@@ -7032,6 +7030,15 @@ mod tests {
         .expect("schema");
         DoSqliteStore::new(RusqliteDoSql { conn })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Backs `DoSql` with real in-memory SQLite, so the ported store SQL is
+    /// checked against an actual engine.
+    use super::test_support::store;
 
     #[test]
     fn do_work_items_file_claim_release_finish_over_dosql() {
