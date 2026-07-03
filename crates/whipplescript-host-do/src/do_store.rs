@@ -32,6 +32,8 @@
 //! needs a live Durable Object (`worker` crate) to build and verify; the tracker's
 //! Phase-5 store box stays open until that port + live verification is done.
 
+use std::collections::BTreeSet;
+
 use serde_json::Value;
 use whipplescript_store::{NewEvent, RuntimeStore, StoreError, StoreResult, StoredEvent};
 // The remaining ported methods reference the full set of store data types.
@@ -781,6 +783,540 @@ fn do_insert_diagnostic<Sql: DoSql>(
         .ok_or_else(|| sql_err("insert_diagnostic returned no row".to_string()))
 }
 
+// ---------------------------------------------------------------------------
+// Policy / capacity block engine — the capability + profile enforcement the
+// scheduler applies when deciding whether an effect is claimable. Ported from the
+// native store's policy helpers; the pure-JSON helpers are backend-agnostic, the
+// SQL ones run over `DoSql`.
+// ---------------------------------------------------------------------------
+
+/// The scheduling-relevant projection of an effect used by the policy engine.
+struct PolicyEffect {
+    kind: String,
+    target: Option<String>,
+    status: String,
+    required_capabilities_json: String,
+    profile: Option<String>,
+    program_id: String,
+    declared_profiles_json: String,
+}
+
+/// A scheduling block: the `blocked_by_*` status the effect should take and why.
+/// `claimable_effects` only checks presence; `start_run` (a later chunk) reads
+/// `status`/`reason` to record the block, hence the allow until then.
+#[allow(dead_code)]
+struct PolicyBlock {
+    status: &'static str,
+    reason: String,
+}
+
+fn capability_allowed(allowed: &[String], capability: &str) -> bool {
+    allowed.iter().any(|item| item == "*" || item == capability)
+}
+
+fn capabilities_value(value: &Value) -> BTreeSet<String> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn capacity_value(value: &Value) -> Option<i64> {
+    value.as_i64().or_else(|| {
+        value
+            .as_u64()
+            .and_then(|capacity| i64::try_from(capacity).ok())
+    })
+}
+
+fn agent_profile_in_value(value: &Value, agent: &str) -> Option<Option<String>> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| agent_profile_in_value(item, agent)),
+        Value::Object(object) => {
+            if let Some(entry) = object.get(agent) {
+                return Some(
+                    entry
+                        .get("profile")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+            if let Some(profile) = object
+                .get("agents")
+                .and_then(|agents| agent_profile_in_value(agents, agent))
+            {
+                return Some(profile);
+            }
+            let declared_agent = object
+                .get("name")
+                .or_else(|| object.get("agent"))
+                .or_else(|| object.get("agent_name"))
+                .or_else(|| object.get("target"))
+                .and_then(Value::as_str);
+            if declared_agent == Some(agent) {
+                Some(
+                    object
+                        .get("profile")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                )
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn agent_capabilities_in_value(value: &Value, agent: &str) -> Option<BTreeSet<String>> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| agent_capabilities_in_value(item, agent)),
+        Value::Object(object) => {
+            if let Some(entry) = object.get(agent) {
+                return Some(capabilities_value(entry.get("capabilities")?));
+            }
+            if let Some(capabilities) = object
+                .get("agents")
+                .and_then(|agents| agent_capabilities_in_value(agents, agent))
+            {
+                return Some(capabilities);
+            }
+            let declared_agent = object
+                .get("name")
+                .or_else(|| object.get("agent"))
+                .or_else(|| object.get("agent_name"))
+                .or_else(|| object.get("target"))
+                .and_then(Value::as_str);
+            if declared_agent == Some(agent) {
+                object.get("capabilities").map(capabilities_value)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn agent_capacity_in_value(value: &Value, agent: &str) -> Option<i64> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| agent_capacity_in_value(item, agent)),
+        Value::Object(object) => {
+            if let Some(capacity) = object.get(agent).and_then(capacity_value) {
+                return Some(capacity);
+            }
+            if let Some(capacity) = object
+                .get(agent)
+                .and_then(|entry| entry.get("capacity"))
+                .and_then(capacity_value)
+            {
+                return Some(capacity);
+            }
+            if let Some(capacity) = object
+                .get("agents")
+                .and_then(|agents| agent_capacity_in_value(agents, agent))
+            {
+                return Some(capacity);
+            }
+            let declared_agent = object
+                .get("name")
+                .or_else(|| object.get("agent"))
+                .or_else(|| object.get("agent_name"))
+                .or_else(|| object.get("target"))
+                .and_then(Value::as_str);
+            if declared_agent == Some(agent) {
+                object.get("capacity").and_then(capacity_value)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn declared_agent_profile(
+    declared_profiles_json: &str,
+    agent: &str,
+) -> StoreResult<Option<Option<String>>> {
+    Ok(agent_profile_in_value(
+        &serde_json::from_str::<Value>(declared_profiles_json)?,
+        agent,
+    ))
+}
+
+fn declared_agents_present(declared_profiles_json: &str) -> StoreResult<bool> {
+    let parsed = serde_json::from_str::<Value>(declared_profiles_json)?;
+    Ok(match &parsed {
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(object) => {
+            object
+                .get("agents")
+                .and_then(Value::as_array)
+                .is_some_and(|agents| !agents.is_empty())
+                || object.iter().any(|(key, value)| {
+                    if matches!(key.as_str(), "harnesses" | "workflow" | "schemas") {
+                        return false;
+                    }
+                    value.as_object().is_some_and(|entry| {
+                        entry.contains_key("profile")
+                            || entry.contains_key("capacity")
+                            || entry.contains_key("capabilities")
+                            || entry.contains_key("harness")
+                            || entry.contains_key("provider")
+                    })
+                })
+        }
+        _ => false,
+    })
+}
+
+fn declared_agent_capabilities(
+    declared_profiles_json: &str,
+    agent: &str,
+) -> StoreResult<BTreeSet<String>> {
+    Ok(agent_capabilities_in_value(
+        &serde_json::from_str::<Value>(declared_profiles_json)?,
+        agent,
+    )
+    .unwrap_or_default())
+}
+
+fn declared_agent_capacity(declared_profiles_json: &str, agent: &str) -> StoreResult<Option<i64>> {
+    Ok(agent_capacity_in_value(
+        &serde_json::from_str::<Value>(declared_profiles_json)?,
+        agent,
+    ))
+}
+
+fn explicit_required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
+    let parsed = serde_json::from_str::<Value>(&effect.required_capabilities_json)?;
+    let mut capabilities = parsed
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    capabilities.sort();
+    capabilities.dedup();
+    Ok(capabilities)
+}
+
+fn required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
+    let mut capabilities = explicit_required_capabilities(effect)?;
+    if capabilities.is_empty() {
+        capabilities.push(effect.kind.clone());
+    }
+    capabilities.sort();
+    capabilities.dedup();
+    Ok(capabilities)
+}
+
+fn do_effect_provider_exists<Sql: DoSql>(sql: &Sql, effect_kind: &str) -> StoreResult<bool> {
+    Ok(!sql
+        .query(
+            "SELECT 1 FROM effect_providers WHERE effect_kind = ?1 LIMIT 1",
+            &[text(effect_kind)],
+        )
+        .map_err(sql_err)?
+        .is_empty())
+}
+
+fn do_capability_schema_exists<Sql: DoSql>(sql: &Sql, capability: &str) -> StoreResult<bool> {
+    Ok(!sql
+        .query(
+            "SELECT 1 FROM capability_schemas WHERE capability = ?1 LIMIT 1",
+            &[text(capability)],
+        )
+        .map_err(sql_err)?
+        .is_empty())
+}
+
+fn do_capability_bound<Sql: DoSql>(
+    sql: &Sql,
+    program_id: &str,
+    capability: &str,
+) -> StoreResult<bool> {
+    Ok(!sql
+        .query(
+            "SELECT 1 FROM capability_bindings WHERE capability = ?1 \
+             AND (program_id = ?2 OR program_id IS NULL) LIMIT 1",
+            &[text(capability), text(program_id)],
+        )
+        .map_err(sql_err)?
+        .is_empty())
+}
+
+/// `(enforcement_mode, allowed_capabilities)` for a registered profile, mirroring
+/// the native `profile_policy`.
+fn do_profile_policy<Sql: DoSql>(
+    sql: &Sql,
+    profile: &str,
+) -> StoreResult<Option<(String, Vec<String>)>> {
+    let rows = sql
+        .query(
+            "SELECT enforcement_mode, allowed_capabilities FROM profiles WHERE name = ?1",
+            &[text(profile)],
+        )
+        .map_err(sql_err)?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let allowed = serde_json::from_str::<Value>(&as_text(&row[1]))?
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(Some((as_text(&row[0]), allowed)))
+}
+
+/// Agent-declaration policy for `agent.tell` effects (pure — reads the declared
+/// profiles JSON). Mirrors `agent_target_policy_block`.
+fn agent_target_policy_block(effect: &PolicyEffect) -> StoreResult<Option<PolicyBlock>> {
+    if effect.kind != "agent.tell" {
+        return Ok(None);
+    }
+    let Some(target) = effect.target.as_deref() else {
+        return Ok(None);
+    };
+    if !declared_agents_present(&effect.declared_profiles_json)? {
+        return Ok(None);
+    }
+    let Some(declared_profile) = declared_agent_profile(&effect.declared_profiles_json, target)?
+    else {
+        return Ok(Some(PolicyBlock {
+            status: "blocked_by_profile",
+            reason: format!("agent `{target}` is not declared by the program"),
+        }));
+    };
+    match (effect.profile.as_deref(), declared_profile.as_deref()) {
+        (Some(actual), Some(expected)) if actual != expected => Ok(Some(PolicyBlock {
+            status: "blocked_by_profile",
+            reason: format!(
+                "agent `{target}` uses profile `{actual}`, expected declared profile `{expected}`"
+            ),
+        })),
+        (None, Some(expected)) => Ok(Some(PolicyBlock {
+            status: "blocked_by_profile",
+            reason: format!("agent `{target}` requires declared profile `{expected}`"),
+        })),
+        _ => {
+            let declared_capabilities =
+                declared_agent_capabilities(&effect.declared_profiles_json, target)?;
+            for capability in explicit_required_capabilities(effect)? {
+                if !declared_capabilities.contains(&capability) {
+                    return Ok(Some(PolicyBlock {
+                        status: "blocked_by_capability",
+                        reason: format!(
+                            "agent `{target}` does not declare required capability `{capability}`"
+                        ),
+                    }));
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn do_policy_block_for_capabilities<Sql: DoSql>(
+    sql: &Sql,
+    effect: &PolicyEffect,
+    capabilities: &[String],
+) -> StoreResult<Option<PolicyBlock>> {
+    for capability in capabilities {
+        if !do_capability_schema_exists(sql, capability)? {
+            return Ok(Some(PolicyBlock {
+                status: "blocked_by_capability",
+                reason: format!("capability `{capability}` is not registered"),
+            }));
+        }
+        if !do_capability_bound(sql, &effect.program_id, capability)? {
+            return Ok(Some(PolicyBlock {
+                status: "blocked_by_capability",
+                reason: format!(
+                    "capability `{capability}` is not bound for program {}",
+                    effect.program_id
+                ),
+            }));
+        }
+    }
+    if let Some(profile) = &effect.profile {
+        let Some((enforcement_mode, allowed_capabilities)) = do_profile_policy(sql, profile)?
+        else {
+            return Ok(Some(PolicyBlock {
+                status: "blocked_by_profile",
+                reason: format!("profile `{profile}` is not registered"),
+            }));
+        };
+        if enforcement_mode != "audit" {
+            for capability in capabilities {
+                if !capability_allowed(&allowed_capabilities, capability) {
+                    return Ok(Some(PolicyBlock {
+                        status: "blocked_by_profile",
+                        reason: format!(
+                            "profile `{profile}` does not allow capability `{capability}`"
+                        ),
+                    }));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a queued effect is blocked by capability/profile policy. Mirrors
+/// `policy_block_on`.
+fn do_policy_block<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    effect_id: &str,
+) -> StoreResult<Option<PolicyBlock>> {
+    let rows = sql
+        .query(
+            "SELECT effects.kind, effects.target, effects.status, effects.required_capabilities, \
+             effects.profile, COALESCE(effect_versions.program_id, instances.program_id), \
+             COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles) \
+             FROM effects JOIN instances ON instances.instance_id = effects.instance_id \
+             JOIN program_versions AS active_versions \
+             ON active_versions.version_id = instances.version_id \
+             LEFT JOIN program_versions AS effect_versions \
+             ON effect_versions.version_id = effects.program_version_id \
+             WHERE effects.instance_id = ?1 AND effects.effect_id = ?2",
+            &[text(instance_id), text(effect_id)],
+        )
+        .map_err(sql_err)?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let effect = PolicyEffect {
+        kind: as_text(&row[0]),
+        target: as_opt_text(&row[1]),
+        status: as_text(&row[2]),
+        required_capabilities_json: as_text(&row[3]),
+        profile: as_opt_text(&row[4]),
+        program_id: as_text(&row[5]),
+        declared_profiles_json: as_text(&row[6]),
+    };
+    if !matches!(
+        effect.status.as_str(),
+        "queued" | "blocked_by_dependency" | "blocked_by_capacity"
+    ) {
+        return Ok(None);
+    }
+    if let Some(block) = agent_target_policy_block(&effect)? {
+        return Ok(Some(block));
+    }
+    // Timers, builtin-queue verbs, and coordination verbs are runtime-resolved:
+    // no provider/capability/profile applies.
+    if effect.kind == "timer.wait"
+        || effect.kind.starts_with("queue.")
+        || effect.kind.starts_with("lease.")
+        || effect.kind.starts_with("ledger.")
+        || effect.kind.starts_with("counter.")
+        || effect.kind == "event.notify"
+        || effect.kind.starts_with("file.")
+    {
+        return Ok(None);
+    }
+    if effect.kind == "exec.command" {
+        let capabilities = explicit_required_capabilities(&effect)?;
+        return do_policy_block_for_capabilities(sql, &effect, &capabilities);
+    }
+    if effect.kind == "capability.call" {
+        let mut capabilities = explicit_required_capabilities(&effect)?;
+        if capabilities.is_empty() {
+            match effect.target.as_deref().filter(|target| !target.is_empty()) {
+                Some(target) => capabilities.push(target.to_owned()),
+                None => {
+                    return Ok(Some(PolicyBlock {
+                        status: "blocked_by_capability",
+                        reason: "capability.call effect has no target capability requirement"
+                            .to_owned(),
+                    }))
+                }
+            }
+        }
+        return do_policy_block_for_capabilities(sql, &effect, &capabilities);
+    }
+    let capabilities = required_capabilities(&effect)?;
+    if !do_effect_provider_exists(sql, &effect.kind)? {
+        return Ok(Some(PolicyBlock {
+            status: "blocked_by_capability",
+            reason: format!("no effect provider is registered for `{}`", effect.kind),
+        }));
+    }
+    do_policy_block_for_capabilities(sql, &effect, &capabilities)
+}
+
+/// Whether an `agent.tell` effect is blocked by its agent's running-capacity cap.
+/// Mirrors `capacity_block_on`.
+fn do_capacity_block<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    effect_id: &str,
+) -> StoreResult<Option<String>> {
+    let rows = sql
+        .query(
+            "SELECT effects.kind, effects.target, \
+             COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles) \
+             FROM effects JOIN instances ON instances.instance_id = effects.instance_id \
+             JOIN program_versions AS active_versions \
+             ON active_versions.version_id = instances.version_id \
+             LEFT JOIN program_versions AS effect_versions \
+             ON effect_versions.version_id = effects.program_version_id \
+             WHERE effects.instance_id = ?1 AND effects.effect_id = ?2",
+            &[text(instance_id), text(effect_id)],
+        )
+        .map_err(sql_err)?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let kind = as_text(&row[0]);
+    if kind != "agent.tell" {
+        return Ok(None);
+    }
+    let Some(agent) = as_opt_text(&row[1]) else {
+        return Ok(None);
+    };
+    let Some(capacity) = declared_agent_capacity(&as_text(&row[2]), &agent)? else {
+        return Ok(None);
+    };
+    let running_rows = sql
+        .query(
+            "SELECT COUNT(*) FROM effects WHERE instance_id = ?1 AND kind = 'agent.tell' \
+             AND target = ?2 AND status = 'running'",
+            &[text(instance_id), text(&agent)],
+        )
+        .map_err(sql_err)?;
+    let running = running_rows.first().map(|r| as_i64(&r[0])).unwrap_or(0);
+    if running >= capacity {
+        Ok(Some(format!(
+            "agent `{agent}` capacity exhausted ({running}/{capacity} running)"
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
 /// The shared 19-column workflow-invocation projection (parent/child active
 /// versions joined, status folded to the parent effect's terminal). Callers
 /// append their own `WHERE ... ORDER BY ...` clause. Mirrors the native SQL.
@@ -1276,7 +1812,75 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn claimable_effects(&self, instance_id: &str) -> StoreResult<Vec<ClaimableEffect>> {
-        todo!("Phase 5b: port `claimable_effects` SQL to DoSql + verify against a live DO")
+        // Only a running instance yields claimable work.
+        let status_rows = self
+            .sql
+            .query(
+                "SELECT status FROM instances WHERE instance_id = ?1",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        if let Some(row) = status_rows.first() {
+            if as_text(&row[0]) != "running" {
+                return Ok(Vec::new());
+            }
+        }
+        let rows = self
+            .sql
+            .query(
+                "SELECT candidate.effect_id, candidate.kind, candidate.target, candidate.profile, \
+                 candidate.input_json, candidate.required_capabilities, \
+                 COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]') \
+                 FROM effects AS candidate \
+                 LEFT JOIN instances ON instances.instance_id = candidate.instance_id \
+                 LEFT JOIN program_versions AS active_versions \
+                 ON active_versions.version_id = instances.version_id \
+                 LEFT JOIN program_versions AS effect_versions \
+                 ON effect_versions.version_id = candidate.program_version_id \
+                 WHERE candidate.instance_id = ?1 AND candidate.kind != 'timer.wait' \
+                 AND ( \
+                   candidate.status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity') \
+                   OR (candidate.kind = 'workflow.invoke' AND candidate.status = 'running') \
+                 ) AND NOT EXISTS ( \
+                   SELECT 1 FROM effect_cancellation_requests AS request \
+                   WHERE request.instance_id = candidate.instance_id \
+                     AND request.effect_id = candidate.effect_id AND request.status = 'requested' \
+                 ) AND NOT EXISTS ( \
+                   SELECT 1 FROM effect_dependencies AS dependency \
+                   JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
+                    AND upstream.instance_id = dependency.instance_id \
+                   WHERE dependency.instance_id = candidate.instance_id \
+                     AND dependency.downstream_effect_id = candidate.effect_id AND NOT ( \
+                       (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
+                       OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
+                       OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
+                       OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
+                       OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
+                     ) \
+                 ) ORDER BY candidate.created_at, candidate.effect_id",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        let mut claimable = Vec::new();
+        for row in &rows {
+            let effect = ClaimableEffect {
+                effect_id: as_text(&row[0]),
+                kind: as_text(&row[1]),
+                target: as_opt_text(&row[2]),
+                profile: as_opt_text(&row[3]),
+                input_json: as_text(&row[4]),
+                required_capabilities_json: as_text(&row[5]),
+                declared_profiles_json: as_text(&row[6]),
+            };
+            if do_policy_block(&self.sql, instance_id, &effect.effect_id)?.is_some() {
+                continue;
+            }
+            if do_capacity_block(&self.sql, instance_id, &effect.effect_id)?.is_some() {
+                continue;
+            }
+            claimable.push(effect);
+        }
+        Ok(claimable)
     }
 
     fn fact_exists(&self, instance_id: &str, fact_name: &str) -> StoreResult<bool> {
@@ -4490,5 +5094,114 @@ mod tests {
                 idempotency_key: None,
             })
             .is_err());
+    }
+
+    /// claimable_effects applies the dependency gate, the cancellation-request
+    /// exclusion, and the capability policy block. Real SQL end-to-end.
+    #[test]
+    fn do_store_claimable_effects_runs_real_sql() {
+        let store = store();
+        let seed = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
+        seed(
+            "INSERT INTO programs (program_id, name) VALUES (?1, ?2)",
+            &[text("prog_1"), text("orders")],
+        );
+        seed(
+            "INSERT INTO program_versions (version_id, program_id, declared_profiles) \
+             VALUES (?1, ?2, ?3)",
+            &[text("ver_1"), text("prog_1"), text("[]")],
+        );
+        seed(
+            "INSERT INTO instances (instance_id, program_id, version_id, workflow_principal, \
+             effective_authority, status, input_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                text("i1"),
+                text("prog_1"),
+                text("ver_1"),
+                text("root"),
+                text("{}"),
+                text("running"),
+                text("{}"),
+            ],
+        );
+
+        // A queued coordination effect (timer-like builtin: no policy applies) is
+        // immediately claimable.
+        seed(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                text("eff_q"),
+                text("i1"),
+                text("queue.push"),
+                text("queued"),
+                text("{}"),
+                text("2026-01-01T00:00:00Z"),
+            ],
+        );
+        // A provider effect with no registered provider is policy-blocked (filtered out).
+        seed(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json, \
+             required_capabilities, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                text("eff_p"),
+                text("i1"),
+                text("coerce"),
+                text("queued"),
+                text("{}"),
+                text("[]"),
+                text("2026-01-01T00:00:01Z"),
+            ],
+        );
+        // A dependency-blocked effect whose upstream has NOT completed is gated out.
+        seed(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                text("eff_up"),
+                text("i1"),
+                text("queue.push"),
+                text("queued"),
+                text("{}"),
+                text("2026-01-01T00:00:02Z"),
+            ],
+        );
+        seed(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                text("eff_down"),
+                text("i1"),
+                text("queue.push"),
+                text("blocked_by_dependency"),
+                text("{}"),
+                text("2026-01-01T00:00:03Z"),
+            ],
+        );
+        seed(
+            "INSERT INTO effect_dependencies (instance_id, downstream_effect_id, \
+             upstream_effect_id, predicate) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                text("i1"),
+                text("eff_down"),
+                text("eff_up"),
+                text("succeeds"),
+            ],
+        );
+
+        let claimable = store.claimable_effects("i1").expect("claimable");
+        let ids: Vec<&str> = claimable.iter().map(|e| e.effect_id.as_str()).collect();
+        // eff_q and eff_up are claimable; eff_p is policy-blocked; eff_down is gated.
+        assert_eq!(ids, vec!["eff_q", "eff_up"]);
+
+        // A non-running instance yields nothing.
+        store
+            .sql
+            .execute(
+                "UPDATE instances SET status = 'paused' WHERE instance_id = ?1",
+                &[text("i1")],
+            )
+            .expect("pause");
+        assert!(store.claimable_effects("i1").expect("none").is_empty());
     }
 }
