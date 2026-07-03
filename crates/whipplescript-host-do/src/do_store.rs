@@ -314,18 +314,34 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         &self,
         capability: CapabilitySchemaRegistration<'_>,
     ) -> StoreResult<()> {
-        todo!("Phase 5b: port `register_capability_schema` SQL to DoSql + verify against a live DO")
+        serde_json::from_str::<Value>(capability.schema_json)?;
+        self.sql.execute(
+            "INSERT INTO capability_schemas (capability, description, schema_json, registered_by_package_id) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(capability) DO UPDATE SET description = excluded.description, schema_json = excluded.schema_json, registered_by_package_id = excluded.registered_by_package_id",
+            &[text(capability.capability), text(capability.description), text(capability.schema_json), opt_text(capability.registered_by_package_id)],
+        ).map_err(sql_err)?;
+        Ok(())
     }
 
     fn register_effect_provider(
         &self,
         provider: EffectProviderRegistration<'_>,
     ) -> StoreResult<()> {
-        todo!("Phase 5b: port `register_effect_provider` SQL to DoSql + verify against a live DO")
+        serde_json::from_str::<Value>(provider.config_json)?;
+        self.sql.execute(
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json, registered_by_package_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(effect_kind, provider) DO UPDATE SET capability = excluded.capability, config_json = excluded.config_json, registered_by_package_id = excluded.registered_by_package_id",
+            &[text(provider.provider_id), text(provider.effect_kind), text(provider.provider), text(provider.capability), text(provider.config_json), opt_text(provider.registered_by_package_id)],
+        ).map_err(sql_err)?;
+        Ok(())
     }
 
     fn register_profile(&self, profile: ProfileRegistration<'_>) -> StoreResult<()> {
-        todo!("Phase 5b: port `register_profile` SQL to DoSql + verify against a live DO")
+        serde_json::from_str::<Value>(profile.allowed_capabilities_json)?;
+        serde_json::from_str::<Value>(profile.config_json)?;
+        self.sql.execute(
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(name) DO UPDATE SET description = excluded.description, enforcement_mode = excluded.enforcement_mode, allowed_capabilities = excluded.allowed_capabilities, config_json = excluded.config_json",
+            &[text(profile.profile_id), text(profile.name), text(profile.description), text(profile.enforcement_mode), text(profile.allowed_capabilities_json), text(profile.config_json)],
+        ).map_err(sql_err)?;
+        Ok(())
     }
 
     fn registered_profile_policy(
@@ -336,7 +352,12 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn bind_capability(&self, binding: CapabilityBinding<'_>) -> StoreResult<()> {
-        todo!("Phase 5b: port `bind_capability` SQL to DoSql + verify against a live DO")
+        serde_json::from_str::<Value>(binding.config_json)?;
+        self.sql.execute(
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(binding_id) DO UPDATE SET program_id = excluded.program_id, capability = excluded.capability, provider = excluded.provider, config_json = excluded.config_json",
+            &[text(binding.binding_id), opt_text(binding.program_id), text(binding.capability), text(binding.provider), text(binding.config_json)],
+        ).map_err(sql_err)?;
+        Ok(())
     }
 
     fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {
@@ -675,6 +696,24 @@ mod tests {
                 package_id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL,
                 manifest_json TEXT NOT NULL
             );
+            CREATE TABLE capability_schemas (
+                capability TEXT PRIMARY KEY, description TEXT NOT NULL, schema_json TEXT NOT NULL,
+                registered_by_package_id TEXT
+            );
+            CREATE TABLE effect_providers (
+                provider_id TEXT NOT NULL, effect_kind TEXT NOT NULL, provider TEXT NOT NULL,
+                capability TEXT NOT NULL, config_json TEXT NOT NULL, registered_by_package_id TEXT,
+                UNIQUE(effect_kind, provider)
+            );
+            CREATE TABLE profiles (
+                profile_id TEXT NOT NULL, name TEXT PRIMARY KEY, description TEXT NOT NULL,
+                enforcement_mode TEXT NOT NULL, allowed_capabilities TEXT NOT NULL,
+                config_json TEXT NOT NULL
+            );
+            CREATE TABLE capability_bindings (
+                binding_id TEXT PRIMARY KEY, program_id TEXT, capability TEXT NOT NULL,
+                provider TEXT NOT NULL, config_json TEXT NOT NULL
+            );
             "#,
         )
         .expect("schema");
@@ -744,5 +783,65 @@ mod tests {
             )
             .expect("read package");
         assert_eq!(as_text(&rows[0][0]), "std");
+    }
+
+    /// The ported registration methods run their real INSERT...ON CONFLICT SQL.
+    #[test]
+    fn do_store_registration_methods_run_real_sql() {
+        let store = store();
+
+        store
+            .register_capability_schema(CapabilitySchemaRegistration {
+                capability: "std.files",
+                description: "file access",
+                schema_json: "{}",
+                registered_by_package_id: Some("pkg_1"),
+            })
+            .expect("cap schema");
+        store
+            .register_effect_provider(EffectProviderRegistration {
+                provider_id: "prov_1",
+                effect_kind: "coerce",
+                provider: "anthropic",
+                capability: "std.model",
+                config_json: "{}",
+                registered_by_package_id: None,
+            })
+            .expect("provider");
+        store
+            .register_profile(ProfileRegistration {
+                profile_id: "prof_1",
+                name: "default",
+                description: "d",
+                enforcement_mode: "enforce",
+                allowed_capabilities_json: "[]",
+                config_json: "{}",
+            })
+            .expect("profile");
+        store
+            .bind_capability(CapabilityBinding {
+                binding_id: "bind_1",
+                program_id: Some("prg_1"),
+                capability: "std.files",
+                provider: "local",
+                config_json: "{}",
+            })
+            .expect("binding");
+
+        for (table, key_col, key) in [
+            ("capability_schemas", "capability", "std.files"),
+            ("effect_providers", "provider_id", "prov_1"),
+            ("profiles", "profile_id", "prof_1"),
+            ("capability_bindings", "binding_id", "bind_1"),
+        ] {
+            let rows = store
+                .sql
+                .query(
+                    &format!("SELECT 1 FROM {table} WHERE {key_col} = ?1"),
+                    &[text(key)],
+                )
+                .expect("read");
+            assert_eq!(rows.len(), 1, "{table} row present");
+        }
     }
 }
