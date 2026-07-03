@@ -463,6 +463,38 @@ fn skill_to_json(skill: &SkillView) -> Value {
     })
 }
 
+/// Appends an event with a per-instance monotonic sequence, returning its id +
+/// sequence. Shared by the `append_event` trait method and the lifecycle methods
+/// (which the native store threads through a transaction). Mirrors
+/// `append_event_on`.
+fn do_append_event<Sql: DoSql>(sql: &Sql, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
+    let rows = sql
+        .query(
+            "INSERT INTO events (event_id, instance_id, sequence, event_type, payload_json, \
+             occurred_at, source, causation_id, correlation_id, idempotency_key) VALUES \
+             ('evt_' || lower(hex(randomblob(16))), ?1, \
+             (SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE instance_id = ?1), \
+             ?2, ?3, CURRENT_TIMESTAMP, ?4, ?5, ?6, ?7) RETURNING event_id, sequence",
+            &[
+                text(event.instance_id),
+                text(event.event_type),
+                text(event.payload_json),
+                text(event.source),
+                opt_text(event.causation_id),
+                opt_text(event.correlation_id),
+                opt_text(event.idempotency_key),
+            ],
+        )
+        .map_err(sql_err)?;
+    let row = rows
+        .first()
+        .ok_or_else(|| sql_err("append_event returned no row".to_string()))?;
+    Ok(StoredEvent {
+        event_id: as_text(&row[0]),
+        sequence: as_i64(&row[1]),
+    })
+}
+
 /// Inserts an evidence link (idempotent on the natural key), mirroring
 /// `insert_evidence_link_on`.
 fn do_insert_evidence_link<Sql: DoSql>(sql: &Sql, link: EvidenceLink<'_>) -> StoreResult<()> {
@@ -673,32 +705,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn append_event(&self, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
-        let rows = self
-            .sql
-            .query(
-                "INSERT INTO events (event_id, instance_id, sequence, event_type, \
-                 payload_json, occurred_at, source, causation_id, correlation_id, \
-                 idempotency_key) VALUES ('evt_' || lower(hex(randomblob(16))), ?1, \
-                 (SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE instance_id = ?1), \
-                 ?2, ?3, CURRENT_TIMESTAMP, ?4, ?5, ?6, ?7) RETURNING event_id, sequence",
-                &[
-                    text(event.instance_id),
-                    text(event.event_type),
-                    text(event.payload_json),
-                    text(event.source),
-                    opt_text(event.causation_id),
-                    opt_text(event.correlation_id),
-                    opt_text(event.idempotency_key),
-                ],
-            )
-            .map_err(sql_err)?;
-        let row = rows
-            .first()
-            .ok_or_else(|| sql_err("append_event returned no row".to_string()))?;
-        Ok(StoredEvent {
-            event_id: as_text(&row[0]),
-            sequence: as_i64(&row[1]),
-        })
+        do_append_event(&self.sql, event)
     }
 
     fn create_program_version(
@@ -1687,7 +1694,15 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn cancel_pending_inbox_for_instance(&mut self, instance_id: &str) -> StoreResult<usize> {
-        todo!("Phase 5b: port `cancel_pending_inbox_for_instance` SQL to DoSql + verify against a live DO")
+        let changed = self
+            .sql
+            .execute(
+                "UPDATE inbox_items SET status = 'cancelled' \
+                 WHERE instance_id = ?1 AND status = 'pending'",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(changed as usize)
     }
 
     fn record_skill_evidence(&self, evidence: SkillEvidence<'_>) -> StoreResult<String> {
@@ -1984,14 +1999,137 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         category: &str,
         detail: &str,
     ) -> StoreResult<StoredEvent> {
-        todo!("Phase 5b: port `block_effect_binding` SQL to DoSql + verify against a live DO")
+        let current = self
+            .sql
+            .query(
+                "SELECT status, policy_block_category FROM effects \
+                 WHERE instance_id = ?1 AND effect_id = ?2",
+                &[text(instance_id), text(effect_id)],
+            )
+            .map_err(sql_err)?;
+        let already_blocked = current.first().is_some_and(|r| {
+            as_text(&r[0]) == "blocked" && as_opt_text(&r[1]).as_deref() == Some(category)
+        });
+        if already_blocked {
+            // Return the existing block event without recording a new one.
+            let rows = self
+                .sql
+                .query(
+                    "SELECT event_id, sequence FROM events \
+                     WHERE instance_id = ?1 AND event_type = 'effect.blocked' AND causation_id = ?2 \
+                     ORDER BY sequence DESC LIMIT 1",
+                    &[text(instance_id), text(effect_id)],
+                )
+                .map_err(sql_err)?;
+            let row = rows
+                .first()
+                .ok_or_else(|| sql_err("missing prior block event".to_string()))?;
+            return Ok(StoredEvent {
+                event_id: as_text(&row[0]),
+                sequence: as_i64(&row[1]),
+            });
+        }
+        let payload = serde_json::json!({
+            "effect_id": effect_id,
+            "status": "blocked",
+            "category": category,
+            "reason": detail,
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id,
+                event_type: "effect.blocked",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(effect_id),
+                correlation_id: None,
+                idempotency_key: Some(&format!(
+                    "binding-block:{instance_id}:{effect_id}:{category}"
+                )),
+            },
+        )?;
+        self.sql
+            .execute(
+                "UPDATE effects SET status = 'blocked', policy_block_reason = ?1, \
+                 policy_block_category = ?2, updated_at = CURRENT_TIMESTAMP \
+                 WHERE instance_id = ?3 AND effect_id = ?4 \
+                 AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')",
+                &[text(detail), text(category), text(instance_id), text(effect_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(event)
     }
 
     fn transition_instance(
         &mut self,
         transition: InstanceTransition<'_>,
     ) -> StoreResult<StoredEvent> {
-        todo!("Phase 5b: port `transition_instance` SQL to DoSql + verify against a live DO")
+        fn transition_allowed(current: &str, next: &str) -> bool {
+            matches!(
+                (current, next),
+                ("running", "paused")
+                    | ("paused", "running")
+                    | ("running", "cancelled")
+                    | ("paused", "cancelled")
+                    | ("blocked", "cancelled")
+                    | ("running", "failed")
+                    | ("paused", "failed")
+                    | ("blocked", "failed")
+            )
+        }
+
+        let current_rows = self
+            .sql
+            .query(
+                "SELECT status FROM instances WHERE instance_id = ?1",
+                &[text(transition.instance_id)],
+            )
+            .map_err(sql_err)?;
+        let current_status = current_rows
+            .first()
+            .map(|r| as_text(&r[0]))
+            .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))?;
+        if !transition_allowed(&current_status, transition.status) {
+            return Err(StoreError::Conflict(format!(
+                "cannot transition instance from {current_status} to {}",
+                transition.status
+            )));
+        }
+        let payload = serde_json::json!({
+            "instance_id": transition.instance_id,
+            "status": transition.status,
+            "reason": transition.reason,
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: transition.instance_id,
+                event_type: "instance.transitioned",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: transition.idempotency_key,
+            },
+        )?;
+        self.sql
+            .execute(
+                "UPDATE instances SET status = ?1, last_event_id = ?2, last_error = ?3, \
+                 updated_at = CURRENT_TIMESTAMP, completed_at = CASE \
+                 WHEN ?1 IN ('completed', 'cancelled', 'failed') THEN CURRENT_TIMESTAMP \
+                 ELSE completed_at END WHERE instance_id = ?4",
+                &[
+                    text(transition.status),
+                    text(&event.event_id),
+                    opt_text(transition.reason),
+                    text(transition.instance_id),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(event)
     }
 
     fn due_time_effects(&self, instance_id: &str, now: &str) -> StoreResult<Vec<DueTimeEffect>> {
@@ -2103,7 +2241,37 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         effect_id: &str,
         idempotency_key: Option<&str>,
     ) -> StoreResult<StoredEvent> {
-        todo!("Phase 5b: port `expire_effect` SQL to DoSql + verify against a live DO")
+        let payload = serde_json::json!({
+            "effect_id": effect_id,
+            "status": "timed_out",
+            "reason": "deadline exceeded",
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id,
+                event_type: "effect.terminal",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(effect_id),
+                correlation_id: None,
+                idempotency_key,
+            },
+        )?;
+        let changed = self
+            .sql
+            .execute(
+                "UPDATE effects SET status = 'timed_out', updated_at = CURRENT_TIMESTAMP \
+                 WHERE instance_id = ?1 AND effect_id = ?2 \
+                 AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')",
+                &[text(instance_id), text(effect_id)],
+            )
+            .map_err(sql_err)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict("effect cannot expire".to_owned()));
+        }
+        Ok(event)
     }
 
     fn retire_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
@@ -2231,7 +2399,8 @@ mod tests {
                 instance_id TEXT PRIMARY KEY, program_id TEXT NOT NULL, version_id TEXT NOT NULL,
                 revision_epoch INTEGER NOT NULL DEFAULT 0, workflow_principal TEXT NOT NULL,
                 effective_authority TEXT NOT NULL, status TEXT NOT NULL, input_json TEXT NOT NULL,
-                started_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started_at TEXT, last_event_id TEXT, last_error TEXT, completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE programs (program_id TEXT PRIMARY KEY, name TEXT NOT NULL);
@@ -3380,5 +3549,126 @@ mod tests {
             )
             .expect("read");
         assert_eq!(as_text(&down_status[0][0]), "queued");
+    }
+
+    /// The event-plus-update lifecycle methods (transition_instance,
+    /// block_effect_binding, expire_effect, cancel_pending_inbox_for_instance) run
+    /// their real event-append + update SQL and enforce their guards.
+    #[test]
+    fn do_store_lifecycle_transitions_run_real_sql() {
+        let mut store = store();
+        // These methods take `&mut self`, so seed rows via direct short-lived
+        // `store.sql.execute` calls rather than a borrow-holding closure.
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, workflow_principal, \
+                 effective_authority, status, input_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("v"),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+
+        // transition_instance: running -> paused is allowed and records an event +
+        // sets last_event_id; a disallowed jump errors.
+        let ev = store
+            .transition_instance(InstanceTransition {
+                instance_id: "i1",
+                status: "paused",
+                reason: Some("halt"),
+                idempotency_key: None,
+            })
+            .expect("transition");
+        assert!(ev.event_id.starts_with("evt_"));
+        let inst = store.get_instance("i1").expect("get").expect("some");
+        assert_eq!(inst.status, "paused");
+        // paused -> completed is not an allowed transition.
+        assert!(store
+            .transition_instance(InstanceTransition {
+                instance_id: "i1",
+                status: "completed",
+                reason: None,
+                idempotency_key: None,
+            })
+            .is_err());
+
+        // block_effect_binding: first call records; a second call with the same
+        // category returns the SAME event (idempotent) without a new row.
+        store
+            .sql
+            .execute(
+                "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    text("eff_1"),
+                    text("i1"),
+                    text("coerce"),
+                    text("queued"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed eff_1");
+        let b1 = store
+            .block_effect_binding("i1", "eff_1", "credentials", "no token")
+            .expect("block");
+        let b2 = store
+            .block_effect_binding("i1", "eff_1", "credentials", "no token")
+            .expect("block again");
+        assert_eq!(b1.event_id, b2.event_id);
+        let blocked = store
+            .sql
+            .query(
+                "SELECT status FROM effects WHERE effect_id = ?1",
+                &[text("eff_1")],
+            )
+            .expect("read");
+        assert_eq!(as_text(&blocked[0][0]), "blocked");
+
+        // expire_effect times out a live effect; a second expire errors (guarded).
+        store
+            .sql
+            .execute(
+                "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    text("eff_t"),
+                    text("i1"),
+                    text("timer.wait"),
+                    text("queued"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed eff_t");
+        store.expire_effect("i1", "eff_t", None).expect("expire");
+        assert!(store.expire_effect("i1", "eff_t", None).is_err());
+
+        // cancel_pending_inbox_for_instance flips only pending rows.
+        store
+            .sql
+            .execute(
+                "INSERT INTO inbox_items (inbox_item_id, instance_id, status, prompt) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[text("ibx_1"), text("i1"), text("pending"), text("q")],
+            )
+            .expect("seed inbox");
+        assert_eq!(
+            store
+                .cancel_pending_inbox_for_instance("i1")
+                .expect("cancel"),
+            1
+        );
+        assert_eq!(
+            store
+                .cancel_pending_inbox_for_instance("i1")
+                .expect("cancel again"),
+            0
+        );
     }
 }
