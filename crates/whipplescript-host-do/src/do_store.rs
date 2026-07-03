@@ -495,6 +495,61 @@ fn do_append_event<Sql: DoSql>(sql: &Sql, event: NewEvent<'_>) -> StoreResult<St
     })
 }
 
+/// The active `(program_version_id, revision_epoch)` for an instance, or
+/// `(None, 0)` when the instance row is absent. Mirrors `active_revision_on`.
+fn do_active_revision<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+) -> StoreResult<(Option<String>, i64)> {
+    let rows = sql
+        .query(
+            "SELECT version_id, revision_epoch FROM instances WHERE instance_id = ?1",
+            &[text(instance_id)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows
+        .first()
+        .map(|r| (Some(as_text(&r[0])), as_i64(&r[1])))
+        .unwrap_or((None, 0)))
+}
+
+/// Inserts a fact row (validating any `source_span_json`), mirroring `insert_fact`.
+fn do_insert_fact<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    rule: &str,
+    event_id: &str,
+    program_version_id: Option<&str>,
+    revision_epoch: i64,
+    fact: &NewFact<'_>,
+) -> StoreResult<()> {
+    if let Some(source_span_json) = fact.source_span_json {
+        serde_json::from_str::<Value>(source_span_json)?;
+    }
+    sql.execute(
+        "INSERT INTO facts (fact_id, instance_id, program_version_id, revision_epoch, name, key, \
+         value_json, source_event_id, source_rule, schema_id, provenance_class, correlation_id, \
+         source_span_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        &[
+            text(fact.fact_id),
+            text(instance_id),
+            opt_text(program_version_id),
+            int(revision_epoch),
+            text(fact.name),
+            text(fact.key),
+            text(fact.value_json),
+            text(event_id),
+            text(rule),
+            opt_text(fact.schema_id),
+            text(fact.provenance_class),
+            opt_text(fact.correlation_id),
+            opt_text(fact.source_span_json),
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
 /// Inserts an evidence link (idempotent on the natural key), mirroring
 /// `insert_evidence_link_on`.
 fn do_insert_evidence_link<Sql: DoSql>(sql: &Sql, link: EvidenceLink<'_>) -> StoreResult<()> {
@@ -977,11 +1032,106 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn derive_fact(&mut self, derived: DerivedFact<'_>) -> StoreResult<StoredEvent> {
-        todo!("Phase 5b: port `derive_fact` SQL to DoSql + verify against a live DO")
+        let payload = serde_json::json!({
+            "fact_id": derived.fact.fact_id,
+            "name": derived.fact.name,
+            "key": derived.fact.key,
+            "value": serde_json::from_str::<Value>(derived.fact.value_json)?,
+            "schema_id": derived.fact.schema_id,
+            "provenance_class": derived.fact.provenance_class,
+            "correlation_id": derived.fact.correlation_id,
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: derived.instance_id,
+                event_type: "fact.derived",
+                payload_json: &payload,
+                source: derived.source,
+                causation_id: derived.causation_id,
+                correlation_id: derived.fact.correlation_id,
+                idempotency_key: derived.idempotency_key,
+            },
+        )?;
+        let (program_version_id, revision_epoch) =
+            do_active_revision(&self.sql, derived.instance_id)?;
+        do_insert_fact(
+            &self.sql,
+            derived.instance_id,
+            derived.source,
+            &event.event_id,
+            program_version_id.as_deref(),
+            revision_epoch,
+            &derived.fact,
+        )?;
+        Ok(event)
     }
 
     fn admit_fact_batch(&mut self, batch: FactBatch<'_>) -> StoreResult<FactBatchOutcome> {
-        todo!("Phase 5b: port `admit_fact_batch` SQL to DoSql + verify against a live DO")
+        let (program_version_id, revision_epoch) =
+            do_active_revision(&self.sql, batch.instance_id)?;
+        let mut admitted = 0usize;
+        let mut skipped = 0usize;
+        for row in batch.rows {
+            // Idempotent skip: a row whose derived key already produced a fact is
+            // absorbed (the admitted-set membership guard).
+            let exists = !self
+                .sql
+                .query(
+                    "SELECT 1 FROM facts WHERE fact_id = ?1 AND instance_id = ?2",
+                    &[text(row.fact_id), text(batch.instance_id)],
+                )
+                .map_err(sql_err)?
+                .is_empty();
+            if exists {
+                skipped += 1;
+                continue;
+            }
+            let value: Value = serde_json::from_str(row.value_json)?;
+            let payload = serde_json::json!({
+                "fact_id": row.fact_id,
+                "name": batch.schema_name,
+                "key": row.key,
+                "value": value,
+                "schema_id": batch.schema_id,
+                "provenance_class": "import",
+                "correlation_id": batch.correlation_id,
+            })
+            .to_string();
+            let event = do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: batch.instance_id,
+                    event_type: "fact.derived",
+                    payload_json: &payload,
+                    source: batch.source,
+                    causation_id: batch.causation_id,
+                    correlation_id: batch.correlation_id,
+                    idempotency_key: Some(row.fact_id),
+                },
+            )?;
+            do_insert_fact(
+                &self.sql,
+                batch.instance_id,
+                batch.source,
+                &event.event_id,
+                program_version_id.as_deref(),
+                revision_epoch,
+                &NewFact {
+                    fact_id: row.fact_id,
+                    name: batch.schema_name,
+                    key: row.key,
+                    value_json: row.value_json,
+                    schema_id: batch.schema_id,
+                    provenance_class: "import",
+                    correlation_id: batch.correlation_id,
+                    source_span_json: None,
+                },
+            )?;
+            admitted += 1;
+        }
+        Ok(FactBatchOutcome { admitted, skipped })
     }
 
     fn complete_effect(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
@@ -2392,8 +2542,10 @@ mod tests {
                 fact_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, program_version_id TEXT,
                 revision_epoch INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL,
                 key TEXT NOT NULL DEFAULT '', value_json TEXT NOT NULL DEFAULT '{}',
-                provenance_class TEXT NOT NULL DEFAULT 'derived', source_span_json TEXT,
-                consumed_at TEXT, updated_at TEXT
+                source_event_id TEXT, source_rule TEXT, schema_id TEXT,
+                provenance_class TEXT NOT NULL DEFAULT 'derived', correlation_id TEXT,
+                source_span_json TEXT, consumed_at TEXT, updated_at TEXT,
+                UNIQUE(instance_id, name, key)
             );
             CREATE TABLE instances (
                 instance_id TEXT PRIMARY KEY, program_id TEXT NOT NULL, version_id TEXT NOT NULL,
@@ -3670,5 +3822,97 @@ mod tests {
                 .expect("cancel again"),
             0
         );
+    }
+
+    /// derive_fact and admit_fact_batch append a `fact.derived` event and insert the
+    /// fact row(s); the batch is idempotent on the per-row `fact_id`.
+    #[test]
+    fn do_store_fact_derivation_runs_real_sql() {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(2),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+
+        // derive_fact stamps the active (version, epoch) onto the fact row.
+        let ev = store
+            .derive_fact(DerivedFact {
+                instance_id: "i1",
+                fact: NewFact {
+                    fact_id: "fct_1",
+                    name: "ready",
+                    key: "k",
+                    value_json: "true",
+                    schema_id: None,
+                    provenance_class: "derived",
+                    correlation_id: None,
+                    source_span_json: None,
+                },
+                source: "rule.a",
+                causation_id: None,
+                idempotency_key: Some("d1"),
+            })
+            .expect("derive_fact");
+        assert!(ev.event_id.starts_with("evt_"));
+        let facts = store.list_facts("i1").expect("facts");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].program_version_id.as_deref(), Some("ver_1"));
+        assert_eq!(facts[0].revision_epoch, 2);
+
+        // admit_fact_batch admits new rows; re-admitting the same fact_ids is skipped.
+        let rows = [
+            FactBatchRow {
+                fact_id: "row_1",
+                key: "a",
+                value_json: "1",
+            },
+            FactBatchRow {
+                fact_id: "row_2",
+                key: "b",
+                value_json: "2",
+            },
+        ];
+        let out = store
+            .admit_fact_batch(FactBatch {
+                instance_id: "i1",
+                source: "import.x",
+                causation_id: None,
+                correlation_id: None,
+                schema_name: "Order",
+                schema_id: Some("sch_1"),
+                rows: &rows,
+            })
+            .expect("admit");
+        assert_eq!(out.admitted, 2);
+        assert_eq!(out.skipped, 0);
+        let out2 = store
+            .admit_fact_batch(FactBatch {
+                instance_id: "i1",
+                source: "import.x",
+                causation_id: None,
+                correlation_id: None,
+                schema_name: "Order",
+                schema_id: Some("sch_1"),
+                rows: &rows,
+            })
+            .expect("re-admit");
+        assert_eq!(out2.admitted, 0);
+        assert_eq!(out2.skipped, 2);
+        // 1 derived + 2 imported = 3 active facts.
+        assert_eq!(store.list_facts("i1").expect("facts").len(), 3);
     }
 }
