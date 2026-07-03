@@ -293,6 +293,141 @@ fn workflow_invocation_from_row(row: &[SqlValue]) -> WorkflowInvocationView {
     }
 }
 
+/// Maps a 7-column program-version row (joined with `programs.name`) to a
+/// `ProgramVersionView`.
+fn program_version_from_row(row: &[SqlValue]) -> ProgramVersionView {
+    ProgramVersionView {
+        program_id: as_text(&row[0]),
+        program_name: as_text(&row[1]),
+        version_id: as_text(&row[2]),
+        source_hash: as_text(&row[3]),
+        ir_hash: as_text(&row[4]),
+        compiler_version: as_text(&row[5]),
+        analysis_summary_json: as_text(&row[6]),
+    }
+}
+
+/// Maps a 7-column artifact row to an `ArtifactView` (nullable: `content_hash`,
+/// `mime_type`).
+fn artifact_from_row(row: &[SqlValue]) -> ArtifactView {
+    ArtifactView {
+        artifact_id: as_text(&row[0]),
+        run_id: as_text(&row[1]),
+        kind: as_text(&row[2]),
+        path: as_text(&row[3]),
+        content_hash: as_opt_text(&row[4]),
+        mime_type: as_opt_text(&row[5]),
+        created_at: as_text(&row[6]),
+    }
+}
+
+/// Maps an 11-column workspace row to a `WorkspaceView`.
+fn workspace_from_row(row: &[SqlValue]) -> WorkspaceView {
+    WorkspaceView {
+        workspace_id: as_text(&row[0]),
+        instance_id: as_opt_text(&row[1]),
+        effect_id: as_opt_text(&row[2]),
+        run_id: as_opt_text(&row[3]),
+        provider: as_opt_text(&row[4]),
+        policy: as_text(&row[5]),
+        uri: as_text(&row[6]),
+        status: as_text(&row[7]),
+        metadata_json: as_text(&row[8]),
+        created_at: as_text(&row[9]),
+        updated_at: as_text(&row[10]),
+    }
+}
+
+/// Maps a 20-column diagnostics row to a `DiagnosticView`.
+fn diagnostic_from_row(row: &[SqlValue]) -> DiagnosticView {
+    DiagnosticView {
+        diagnostic_id: as_text(&row[0]),
+        instance_id: as_opt_text(&row[1]),
+        program_id: as_opt_text(&row[2]),
+        program_version_id: as_opt_text(&row[3]),
+        severity: as_text(&row[4]),
+        code: as_opt_text(&row[5]),
+        message: as_text(&row[6]),
+        source_span_json: as_opt_text(&row[7]),
+        subject_type: as_opt_text(&row[8]),
+        subject_id: as_opt_text(&row[9]),
+        event_id: as_opt_text(&row[10]),
+        effect_id: as_opt_text(&row[11]),
+        run_id: as_opt_text(&row[12]),
+        assertion_id: as_opt_text(&row[13]),
+        evidence_ids_json: as_text(&row[14]),
+        artifact_ids_json: as_text(&row[15]),
+        causation_id: as_opt_text(&row[16]),
+        correlation_id: as_opt_text(&row[17]),
+        idempotency_key: as_opt_text(&row[18]),
+        created_at: as_text(&row[19]),
+    }
+}
+
+/// Maps a 10-column evidence row to an `EvidenceView`.
+fn evidence_from_row(row: &[SqlValue]) -> EvidenceView {
+    EvidenceView {
+        evidence_id: as_text(&row[0]),
+        instance_id: as_text(&row[1]),
+        kind: as_text(&row[2]),
+        subject_type: as_text(&row[3]),
+        subject_id: as_text(&row[4]),
+        causation_id: as_opt_text(&row[5]),
+        correlation_id: as_opt_text(&row[6]),
+        summary: as_opt_text(&row[7]),
+        metadata_json: as_text(&row[8]),
+        created_at: as_text(&row[9]),
+    }
+}
+
+/// Maps a 5-column evidence-link row to an `EvidenceLinkView`.
+fn evidence_link_from_row(row: &[SqlValue]) -> EvidenceLinkView {
+    EvidenceLinkView {
+        evidence_id: as_text(&row[0]),
+        target_type: as_text(&row[1]),
+        target_id: as_text(&row[2]),
+        relation: as_text(&row[3]),
+        created_at: as_text(&row[4]),
+    }
+}
+
+/// The shared 11-column workspace projection; callers append a WHERE/ORDER clause.
+fn workspace_select_sql(predicate: &str) -> String {
+    format!(
+        "SELECT workspace_id, instance_id, effect_id, run_id, provider, policy, uri, status, \
+         metadata_json, created_at, updated_at FROM workspaces {predicate}"
+    )
+}
+
+/// Workspace-policy allow-list, mirroring the native validator.
+fn validate_workspace_policy(policy: &str) -> StoreResult<()> {
+    match policy {
+        "shared"
+        | "read_only"
+        | "per_effect_worktree"
+        | "per_issue_worktree"
+        | "remote_sandbox" => Ok(()),
+        _ => Err(StoreError::Conflict(format!(
+            "unsupported workspace policy `{policy}`"
+        ))),
+    }
+}
+
+/// Workspace-status allow-list, mirroring the native validator.
+fn validate_workspace_status(status: &str) -> StoreResult<()> {
+    match status {
+        "prepared" | "active" | "released" | "failed" => Ok(()),
+        _ => Err(StoreError::Conflict(format!(
+            "unsupported workspace status `{status}`"
+        ))),
+    }
+}
+
+/// JSON string value or `None`, mirroring the native `optional_string`.
+fn optional_string(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_str).map(str::to_owned)
+}
+
 /// The shared 19-column workflow-invocation projection (parent/child active
 /// versions joined, status folded to the parent effect's terminal). Callers
 /// append their own `WHERE ... ORDER BY ...` clause. Mirrors the native SQL.
@@ -370,11 +505,23 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>> {
-        todo!("Phase 5b: port `get_program_version` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT program_versions.program_id, programs.name, \
+                 program_versions.version_id, program_versions.source_hash, \
+                 program_versions.ir_hash, program_versions.compiler_version, \
+                 program_versions.analysis_summary FROM program_versions \
+                 JOIN programs ON programs.program_id = program_versions.program_id \
+                 WHERE program_versions.version_id = ?1",
+                &[text(version_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|r| program_version_from_row(r)))
     }
 
     fn create_instance(&self, instance: NewInstance<'_>) -> StoreResult<InstanceRecord> {
-        todo!("Phase 5b: port `create_instance` SQL to DoSql + verify against a live DO")
+        self.create_instance_with_authority(instance, NewInstanceAuthority::empty())
     }
 
     fn create_instance_with_authority(
@@ -382,7 +529,29 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         instance: NewInstance<'_>,
         authority: NewInstanceAuthority<'_>,
     ) -> StoreResult<InstanceRecord> {
-        todo!("Phase 5b: port `create_instance_with_authority` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "INSERT INTO instances (instance_id, program_id, version_id, workflow_principal, \
+                 effective_authority, status, input_json, started_at) VALUES \
+                 ('ins_' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, 'running', ?5, \
+                 CURRENT_TIMESTAMP) RETURNING instance_id, status",
+                &[
+                    text(instance.program_id),
+                    text(instance.version_id),
+                    text(authority.workflow_principal),
+                    text(authority.effective_authority_json),
+                    text(instance.input_json),
+                ],
+            )
+            .map_err(sql_err)?;
+        let row = rows
+            .first()
+            .ok_or_else(|| sql_err("create_instance returned no row".to_string()))?;
+        Ok(InstanceRecord {
+            instance_id: as_text(&row[0]),
+            status: as_text(&row[1]),
+        })
     }
 
     fn list_instance_revisions(&self, instance_id: &str) -> StoreResult<Vec<WorkflowRevisionView>> {
@@ -700,7 +869,31 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         &self,
         profile: &str,
     ) -> StoreResult<Option<RegisteredProfilePolicy>> {
-        todo!("Phase 5b: port `registered_profile_policy` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT enforcement_mode, allowed_capabilities FROM profiles WHERE name = ?1",
+                &[text(profile)],
+            )
+            .map_err(sql_err)?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let enforcement_mode = as_text(&row[0]);
+        let allowed_capabilities = serde_json::from_str::<Value>(&as_text(&row[1]))?
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(Some(RegisteredProfilePolicy {
+            enforcement_mode,
+            allowed_capabilities,
+        }))
     }
 
     fn bind_capability(&self, binding: CapabilityBinding<'_>) -> StoreResult<()> {
@@ -851,21 +1044,69 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn list_artifacts_for_run(&self, run_id: &str) -> StoreResult<Vec<ArtifactView>> {
-        todo!("Phase 5b: port `list_artifacts_for_run` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT artifact_id, run_id, kind, path, content_hash, mime_type, created_at \
+                 FROM artifacts WHERE run_id = ?1 ORDER BY created_at, artifact_id",
+                &[text(run_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| artifact_from_row(r)).collect())
     }
 
     fn record_workspace(&self, workspace: WorkspaceRecord<'_>) -> StoreResult<String> {
-        todo!("Phase 5b: port `record_workspace` SQL to DoSql + verify against a live DO")
+        validate_workspace_policy(workspace.policy)?;
+        validate_workspace_status(workspace.status)?;
+        serde_json::from_str::<Value>(workspace.metadata_json)?;
+        let rows = self
+            .sql
+            .query(
+                "INSERT INTO workspaces (workspace_id, instance_id, effect_id, run_id, provider, \
+                 policy, uri, status, metadata_json, updated_at) VALUES \
+                 ('wsp_' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
+                 CURRENT_TIMESTAMP) ON CONFLICT(instance_id, effect_id, run_id, policy) \
+                 DO UPDATE SET provider = excluded.provider, uri = excluded.uri, \
+                 status = excluded.status, metadata_json = excluded.metadata_json, \
+                 updated_at = CURRENT_TIMESTAMP RETURNING workspace_id",
+                &[
+                    opt_text(workspace.instance_id),
+                    opt_text(workspace.effect_id),
+                    opt_text(workspace.run_id),
+                    opt_text(workspace.provider),
+                    text(workspace.policy),
+                    text(workspace.uri),
+                    text(workspace.status),
+                    text(workspace.metadata_json),
+                ],
+            )
+            .map_err(sql_err)?;
+        let row = rows
+            .first()
+            .ok_or_else(|| sql_err("record_workspace returned no row".to_string()))?;
+        Ok(as_text(&row[0]))
     }
 
     fn get_workspace(&self, workspace_id: &str) -> StoreResult<Option<WorkspaceView>> {
-        todo!("Phase 5b: port `get_workspace` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                &workspace_select_sql("WHERE workspace_id = ?1"),
+                &[text(workspace_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|r| workspace_from_row(r)))
     }
 
     fn list_workspaces_for_instance(&self, instance_id: &str) -> StoreResult<Vec<WorkspaceView>> {
-        todo!(
-            "Phase 5b: port `list_workspaces_for_instance` SQL to DoSql + verify against a live DO"
-        )
+        let rows = self
+            .sql
+            .query(
+                &workspace_select_sql("WHERE instance_id = ?1 ORDER BY created_at, workspace_id"),
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| workspace_from_row(r)).collect())
     }
 
     fn record_diagnostic(&self, diagnostic: DiagnosticRecord<'_>) -> StoreResult<String> {
@@ -873,13 +1114,77 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn list_diagnostics(&self, instance_id: Option<&str>) -> StoreResult<Vec<DiagnosticView>> {
-        todo!("Phase 5b: port `list_diagnostics` SQL to DoSql + verify against a live DO")
+        let mut sql = "SELECT diagnostic_id, instance_id, program_id, program_version_id, \
+             severity, code, message, source_span_json, subject_type, subject_id, event_id, \
+             effect_id, run_id, assertion_id, evidence_ids_json, artifact_ids_json, causation_id, \
+             correlation_id, idempotency_key, created_at FROM diagnostics"
+            .to_owned();
+        if instance_id.is_some() {
+            sql.push_str(" WHERE instance_id = ?1");
+        }
+        sql.push_str(" ORDER BY created_at, diagnostic_id");
+        let params: Vec<SqlValue> = instance_id.map(|i| vec![text(i)]).unwrap_or_default();
+        let rows = self.sql.query(&sql, &params).map_err(sql_err)?;
+        Ok(rows.iter().map(|r| diagnostic_from_row(r)).collect())
     }
 
     fn list_diagnostics_from_events(&self, instance_id: &str) -> StoreResult<Vec<DiagnosticView>> {
-        todo!(
-            "Phase 5b: port `list_diagnostics_from_events` SQL to DoSql + verify against a live DO"
-        )
+        let rows = self
+            .sql
+            .query(
+                "SELECT event_id, payload_json, occurred_at FROM events \
+                 WHERE instance_id = ?1 AND event_type = 'effect.terminal' ORDER BY sequence",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        let mut diagnostics = Vec::new();
+        for row in &rows {
+            let event_id = as_text(&row[0]);
+            let payload = serde_json::from_str::<Value>(&as_text(&row[1]))?;
+            let occurred_at = as_text(&row[2]);
+            let Some(diagnostic) = payload.get("diagnostic").filter(|value| !value.is_null())
+            else {
+                continue;
+            };
+            diagnostics.push(DiagnosticView {
+                diagnostic_id: format!("dia_event_{}", stable_hash_hex(&event_id)),
+                instance_id: Some(instance_id.to_owned()),
+                program_id: optional_string(diagnostic.get("program_id")),
+                program_version_id: optional_string(diagnostic.get("program_version_id")),
+                severity: optional_string(diagnostic.get("severity"))
+                    .unwrap_or_else(|| "error".to_owned()),
+                code: optional_string(diagnostic.get("code")),
+                message: optional_string(diagnostic.get("message")).unwrap_or_default(),
+                source_span_json: diagnostic.get("source_span").and_then(|value| {
+                    if value.is_null() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    }
+                }),
+                subject_type: optional_string(diagnostic.get("subject_type")),
+                subject_id: optional_string(diagnostic.get("subject_id")),
+                event_id: Some(event_id.clone()),
+                effect_id: optional_string(payload.get("effect_id")),
+                run_id: optional_string(payload.get("run_id")),
+                assertion_id: optional_string(diagnostic.get("assertion_id")),
+                evidence_ids_json: diagnostic
+                    .get("evidence_ids")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([]))
+                    .to_string(),
+                artifact_ids_json: diagnostic
+                    .get("artifact_ids")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([]))
+                    .to_string(),
+                causation_id: optional_string(diagnostic.get("causation_id")),
+                correlation_id: optional_string(diagnostic.get("correlation_id")),
+                idempotency_key: optional_string(diagnostic.get("idempotency_key")),
+                created_at: occurred_at,
+            });
+        }
+        Ok(diagnostics)
     }
 
     fn effect_source_span_json(
@@ -887,7 +1192,32 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         instance_id: &str,
         effect_id: &str,
     ) -> StoreResult<Option<String>> {
-        todo!("Phase 5b: port `effect_source_span_json` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT events.payload_json FROM effects \
+                 JOIN events ON events.event_id = effects.created_by_event_id \
+                 WHERE effects.instance_id = ?1 AND effects.effect_id = ?2",
+                &[text(instance_id), text(effect_id)],
+            )
+            .map_err(sql_err)?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let payload = serde_json::from_str::<Value>(&as_text(&row[0]))?;
+        let span = payload
+            .get("effects")
+            .and_then(Value::as_array)
+            .and_then(|effects| {
+                effects.iter().find_map(|effect| {
+                    (effect.get("effect_id").and_then(Value::as_str) == Some(effect_id))
+                        .then(|| effect.get("source_span"))
+                        .flatten()
+                        .filter(|value| !value.is_null())
+                        .map(Value::to_string)
+                })
+            });
+        Ok(span)
     }
 
     fn create_inbox_item(&self, item: NewInboxItem<'_>) -> StoreResult<()> {
@@ -958,7 +1288,16 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn list_evidence(&self, instance_id: &str) -> StoreResult<Vec<EvidenceView>> {
-        todo!("Phase 5b: port `list_evidence` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT evidence_id, instance_id, kind, subject_type, subject_id, causation_id, \
+                 correlation_id, summary, metadata_json, created_at FROM evidence \
+                 WHERE instance_id = ?1 ORDER BY created_at, evidence_id",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| evidence_from_row(r)).collect())
     }
 
     fn list_evidence_for_subject(
@@ -966,11 +1305,29 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         subject_type: &str,
         subject_id: &str,
     ) -> StoreResult<Vec<EvidenceView>> {
-        todo!("Phase 5b: port `list_evidence_for_subject` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT evidence_id, instance_id, kind, subject_type, subject_id, causation_id, \
+                 correlation_id, summary, metadata_json, created_at FROM evidence \
+                 WHERE subject_type = ?1 AND subject_id = ?2 ORDER BY created_at, evidence_id",
+                &[text(subject_type), text(subject_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| evidence_from_row(r)).collect())
     }
 
     fn list_evidence_links(&self, instance_id: &str) -> StoreResult<Vec<EvidenceLinkView>> {
-        todo!("Phase 5b: port `list_evidence_links` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT evidence_id, target_type, target_id, relation, created_at \
+                 FROM evidence_links WHERE instance_id = ?1 \
+                 ORDER BY created_at, evidence_id, target_type, target_id, relation",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| evidence_link_from_row(r)).collect())
     }
 
     fn list_instances(&self) -> StoreResult<Vec<InstanceView>> {
@@ -1323,11 +1680,48 @@ mod tests {
                 instance_id TEXT PRIMARY KEY, program_id TEXT NOT NULL, version_id TEXT NOT NULL,
                 revision_epoch INTEGER NOT NULL DEFAULT 0, workflow_principal TEXT NOT NULL,
                 effective_authority TEXT NOT NULL, status TEXT NOT NULL, input_json TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE programs (program_id TEXT PRIMARY KEY, name TEXT NOT NULL);
             CREATE TABLE program_versions (
-                version_id TEXT PRIMARY KEY, declared_profiles TEXT NOT NULL DEFAULT '[]'
+                version_id TEXT PRIMARY KEY, program_id TEXT NOT NULL DEFAULT '',
+                source_hash TEXT NOT NULL DEFAULT '', ir_hash TEXT NOT NULL DEFAULT '',
+                compiler_version TEXT NOT NULL DEFAULT '', analysis_summary TEXT NOT NULL DEFAULT '{}',
+                declared_profiles TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE artifacts (
+                artifact_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, kind TEXT NOT NULL,
+                path TEXT NOT NULL, content_hash TEXT, mime_type TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE workspaces (
+                workspace_id TEXT PRIMARY KEY, instance_id TEXT, effect_id TEXT, run_id TEXT,
+                provider TEXT, policy TEXT NOT NULL, uri TEXT NOT NULL, status TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(instance_id, effect_id, run_id, policy)
+            );
+            CREATE TABLE diagnostics (
+                diagnostic_id TEXT PRIMARY KEY, instance_id TEXT, program_id TEXT,
+                program_version_id TEXT, severity TEXT NOT NULL, code TEXT, message TEXT NOT NULL,
+                source_span_json TEXT, subject_type TEXT, subject_id TEXT, event_id TEXT,
+                effect_id TEXT, run_id TEXT, assertion_id TEXT,
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                artifact_ids_json TEXT NOT NULL DEFAULT '[]', causation_id TEXT, correlation_id TEXT,
+                idempotency_key TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE evidence (
+                evidence_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, kind TEXT NOT NULL,
+                subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, causation_id TEXT,
+                correlation_id TEXT, summary TEXT, metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE evidence_links (
+                evidence_id TEXT NOT NULL, instance_id TEXT NOT NULL, target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL, relation TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE effects (
                 effect_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -1335,7 +1729,8 @@ mod tests {
                 created_by_rule TEXT NOT NULL DEFAULT '', program_version_id TEXT,
                 revision_epoch INTEGER NOT NULL DEFAULT 0, profile TEXT,
                 required_capabilities TEXT NOT NULL DEFAULT '[]', policy_block_reason TEXT,
-                policy_block_category TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                policy_block_category TEXT, created_by_event_id TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE runs (
                 run_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, effect_id TEXT NOT NULL,
@@ -1930,5 +2325,246 @@ mod tests {
         assert_eq!(status.revisions.len(), 1);
         assert_eq!(status.child_invocations.len(), 1);
         assert!(store.status("ghost").expect("missing status").is_none());
+    }
+
+    /// The program-version / instance-create / profile-policy / workspace /
+    /// artifact / diagnostic / evidence read+record family runs real SQL.
+    #[test]
+    fn do_store_program_workspace_diagnostic_evidence_run_real_sql() {
+        let store = store();
+        let e = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
+
+        // get_program_version joins programs.name.
+        e(
+            "INSERT INTO programs (program_id, name) VALUES (?1, ?2)",
+            &[text("prog_1"), text("orders")],
+        );
+        e(
+            "INSERT INTO program_versions (version_id, program_id, source_hash, ir_hash, \
+             compiler_version, analysis_summary) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                text("ver_1"),
+                text("prog_1"),
+                text("sh"),
+                text("ih"),
+                text("1.0"),
+                text("{}"),
+            ],
+        );
+        let pv = store
+            .get_program_version("ver_1")
+            .expect("get pv")
+            .expect("some");
+        assert_eq!(pv.program_name, "orders");
+        assert!(store.get_program_version("nope").expect("none").is_none());
+
+        // create_instance mints an ins_ id via RETURNING and defaults status=running.
+        let rec = store
+            .create_instance(NewInstance {
+                program_id: "prog_1",
+                version_id: "ver_1",
+                input_json: "{}",
+            })
+            .expect("create_instance");
+        assert!(rec.instance_id.starts_with("ins_"));
+        assert_eq!(rec.status, "running");
+        assert_eq!(
+            store
+                .get_instance(&rec.instance_id)
+                .expect("get")
+                .expect("some")
+                .status,
+            "running"
+        );
+
+        // registered_profile_policy decodes the allowed-capabilities JSON array.
+        store
+            .register_profile(ProfileRegistration {
+                profile_id: "prof_1",
+                name: "guarded",
+                description: "d",
+                enforcement_mode: "enforce",
+                allowed_capabilities_json: "[\"std.files\",\"std.model\"]",
+                config_json: "{}",
+            })
+            .expect("register_profile");
+        let policy = store
+            .registered_profile_policy("guarded")
+            .expect("policy")
+            .expect("some");
+        assert_eq!(policy.enforcement_mode, "enforce");
+        assert_eq!(policy.allowed_capabilities, vec!["std.files", "std.model"]);
+        assert!(store
+            .registered_profile_policy("absent")
+            .expect("none")
+            .is_none());
+
+        // record_workspace upserts (RETURNING id) and validates policy/status/metadata;
+        // a re-record with the same conflict key returns the same id.
+        let ws_id = store
+            .record_workspace(WorkspaceRecord {
+                instance_id: Some("i1"),
+                effect_id: Some("eff_1"),
+                run_id: Some("run_1"),
+                provider: Some("git"),
+                policy: "per_effect_worktree",
+                uri: "file:///w",
+                status: "active",
+                metadata_json: "{}",
+            })
+            .expect("record_workspace");
+        let ws_id2 = store
+            .record_workspace(WorkspaceRecord {
+                instance_id: Some("i1"),
+                effect_id: Some("eff_1"),
+                run_id: Some("run_1"),
+                provider: Some("git"),
+                policy: "per_effect_worktree",
+                uri: "file:///w2",
+                status: "released",
+                metadata_json: "{}",
+            })
+            .expect("re-record");
+        assert_eq!(ws_id, ws_id2);
+        assert_eq!(
+            store
+                .get_workspace(&ws_id)
+                .expect("get")
+                .expect("some")
+                .status,
+            "released"
+        );
+        assert_eq!(
+            store
+                .list_workspaces_for_instance("i1")
+                .expect("list")
+                .len(),
+            1
+        );
+        // A bad policy is rejected before touching SQL.
+        assert!(store
+            .record_workspace(WorkspaceRecord {
+                instance_id: Some("i1"),
+                effect_id: None,
+                run_id: None,
+                provider: None,
+                policy: "bogus",
+                uri: "file:///x",
+                status: "active",
+                metadata_json: "{}",
+            })
+            .is_err());
+
+        // list_artifacts_for_run.
+        e(
+            "INSERT INTO artifacts (artifact_id, run_id, kind, path, content_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                text("art_1"),
+                text("run_1"),
+                text("log"),
+                text("/l"),
+                SqlValue::Null,
+            ],
+        );
+        let artifacts = store.list_artifacts_for_run("run_1").expect("artifacts");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].content_hash, None);
+
+        // list_diagnostics (stored table) + list_diagnostics_from_events (event JSON).
+        e(
+            "INSERT INTO diagnostics (diagnostic_id, instance_id, severity, message) \
+             VALUES (?1, ?2, ?3, ?4)",
+            &[text("dia_1"), text("i1"), text("error"), text("boom")],
+        );
+        assert_eq!(store.list_diagnostics(Some("i1")).expect("diag").len(), 1);
+        assert_eq!(store.list_diagnostics(None).expect("all diag").len(), 1);
+        e(
+            "INSERT INTO events (event_id, instance_id, sequence, event_type, payload_json, \
+             occurred_at, source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                text("evt_term"),
+                text("i1"),
+                int(1),
+                text("effect.terminal"),
+                text("{\"effect_id\":\"eff_1\",\"diagnostic\":{\"severity\":\"warning\",\"message\":\"m\"}}"),
+                text("2026-01-01T00:00:00Z"),
+                text("kernel"),
+            ],
+        );
+        let from_events = store
+            .list_diagnostics_from_events("i1")
+            .expect("diag from events");
+        assert_eq!(from_events.len(), 1);
+        assert_eq!(from_events[0].severity, "warning");
+        assert_eq!(from_events[0].effect_id.as_deref(), Some("eff_1"));
+
+        // effect_source_span_json digs the span out of the creating event's payload.
+        e(
+            "INSERT INTO events (event_id, instance_id, sequence, event_type, payload_json, \
+             occurred_at, source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                text("evt_create"),
+                text("i1"),
+                int(2),
+                text("rule.committed"),
+                text("{\"effects\":[{\"effect_id\":\"eff_1\",\"source_span\":{\"line\":4}}]}"),
+                text("2026-01-01T00:00:01Z"),
+                text("kernel"),
+            ],
+        );
+        e(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, created_by_event_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                text("eff_1"),
+                text("i1"),
+                text("coerce"),
+                text("queued"),
+                text("evt_create"),
+            ],
+        );
+        assert_eq!(
+            store
+                .effect_source_span_json("i1", "eff_1")
+                .expect("span")
+                .as_deref(),
+            Some("{\"line\":4}")
+        );
+        assert!(store
+            .effect_source_span_json("i1", "missing")
+            .expect("no span")
+            .is_none());
+
+        // Evidence + evidence links.
+        e(
+            "INSERT INTO evidence (evidence_id, instance_id, kind, subject_type, subject_id, \
+             summary) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                text("ev_1"),
+                text("i1"),
+                text("provider_validation"),
+                text("effect"),
+                text("eff_1"),
+                text("ok"),
+            ],
+        );
+        e(
+            "INSERT INTO evidence_links (evidence_id, instance_id, target_type, target_id, relation) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[text("ev_1"), text("i1"), text("effect"), text("eff_1"), text("supports")],
+        );
+        assert_eq!(store.list_evidence("i1").expect("evidence").len(), 1);
+        assert_eq!(
+            store
+                .list_evidence_for_subject("effect", "eff_1")
+                .expect("subject")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.list_evidence_links("i1").expect("links")[0].relation,
+            "supports"
+        );
     }
 }
