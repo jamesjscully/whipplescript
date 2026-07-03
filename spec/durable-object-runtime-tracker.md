@@ -412,11 +412,13 @@ linear undo chain). No phase work now.
             (3) lift the effect executor: the ~15 `run_*_effect` handlers each →
                 thin native wrapper (opens the store) + host-agnostic
                 `*_generic<S>(kernel, …)` core the DO step machine calls.
-                **IN PROGRESS (3a, commit 2b1b255):** the two cleanest handlers
-                (`run_event_effect`, `run_capability_effect` — kernel-methods-only,
-                `S: RuntimeStore`) converted; pattern established. REMAINING (a
-                deeper grind): `coerce`/`human` resolve input via a store-opening
-                helper (`resolve_effect_input_after_bindings`) + open twice; the
+                **IN PROGRESS.** Store-only handlers converted so far (wrapper +
+                `*_generic<S: RuntimeStore>` core): `run_event_effect`,
+                `run_capability_effect` (3a, 2b1b255), `run_loft_effect`,
+                `run_human_effect` + the shared read-only helper
+                `resolve_effect_input_after_bindings` (3b, 93ffefd). REMAINING (a
+                deeper grind): `run_notify_effect` nests
+                `internal_workflow_delivery_violation`(store_path); the
                 `file*` handlers need `FileStore`, `coordination`/`queue` need
                 `Coordination`/`WorkItems` (audit for inherent-vs-trait methods —
                 e.g. `try_acquire_for_owner`); `workflow_invoke` (435 ln) recurses
