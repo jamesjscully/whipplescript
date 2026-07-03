@@ -522,13 +522,7 @@ linear undo chain). No phase work now.
             (5b) **DO-reachable effect handler cores — STARTED (commit 9124f67).**
             Pattern established: lift each store-only core into
             `kernel::effect_handlers` (host-neutral, `EffectConfig`-only) so both
-            `InstanceDriver` bindings dispatch it. event+loft+human+queue+coordination+file(read/write/import) cores lifted to kernel::effect_handlers (9124f67,8bdfe2c,36422c7); DO dispatches ALL 8 store-only families incl. file (via FileStore seam, b106095). notify lifted via DeliveryGovernance projection (27b5637); ONLY capability(LoadedPackageLock) store-only core remains. Then HTTP effects (coerce/agent→FetchHost NeedsHttp), workflow_invoke, exec(native-only) — lifted to the
-            kernel, native wrapper imports it, the DO's `run_effect` executes it over
-            `RuntimeKernel<DoSqliteStore>` (its first executable effect). REMAINING:
-            lift the other ~10 store-only cores the same way (loft/human/queue/
-            coordination/notify/file×4 — a few pull small helper closures per the
-            curation notes) + wire the two HTTP effects (coerce/agent) to
-            `FetchHost`'s `NeedsHttp` path; then the DO runs effectful workflows;
+            `InstanceDriver` bindings dispatch it. event+loft+human+queue+coordination+file(read/write/import) cores lifted to kernel::effect_handlers (9124f67,8bdfe2c,36422c7); DO dispatches ALL 8 store-only families incl. file (via FileStore seam, b106095). notify lifted via DeliveryGovernance projection (27b5637); capability lifted via CapabilityContract projection (d88630d) — ALL 10 store-only families execute on the DO. **coerce HTTP effect DONE + PROVEN (6c52884):** DoInstanceDriver dispatches `coerce` — build_coerce_call_parts+build_request→EffectStep::NeedsHttp→(fetch)→parse_response→settle_coerce_result, every piece host-neutral in the kernel (c543428/659c933); test drives a when-started→coerce→complete workflow to Terminal with a fake Anthropic fetch response. The DO SUSPENDS a real provider effect on fetch + RESUMES to terminal — DR-0033's crux, proven in-repo. REMAINING HTTP: (a) coerce LIVE creds = the CoerceProviderConfig's real values from the DO secrets plane (infra); (b) the **agent turn** — multi-round (BrokeredTurnMachine), needs conversation checkpointing in the store across HTTP rounds + a DO HttpModelClient impl (secrets) + a DO ToolExecutor — genuinely infra-adjacent, harder than coerce's single round; workflow_invoke; exec(native-only, DR-0033 Decision 7);
             (5c) **`DoInstanceDriver` DONE (commit e0b68bc):** the DO counterpart to
             `NativeInstanceDriver` over `RuntimeKernel<DoSqliteStore>` — implements the
             `InstanceDriver` seam (advance_rules→`step_instance_generic`,
