@@ -28,6 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
+use whipplescript_store::items::{ClaimOutcome, WorkItem, WorkItems};
 use whipplescript_store::{NewEvent, RuntimeStore, StoreError, StoreResult, StoredEvent};
 // The remaining ported methods reference the full set of store data types.
 #[allow(unused_imports)]
@@ -6293,6 +6294,193 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 }
 
+// -- WorkItems over DoSql (DR-0033 chunk 5a) --------------------------------
+//
+// The builtin work-item tracker (`spec/work-queues.md`) ported to the DO's one
+// SQLite, so the DO backs the `WorkItems` surface the rule pass reaches
+// (`project_queue_items` / holder-release) the same way it backs `RuntimeStore`.
+// Natively this is a separate `.whipplescript/items.sqlite`; on the DO it is the
+// `items` + `item_counter` tables in the single durable store. The native SQL used
+// a rusqlite transaction for the file/claim atomic pairs; the DO's single-writer
+// per-invocation model supplies that atomicity (these methods never yield
+// mid-sequence), so no explicit transaction is needed — the same argument as the
+// RuntimeStore port.
+
+const DO_ITEM_COLS: &str = "item_id, queue, title, body, status, labels_json, \
+     metadata_json, claimed_by, filed_by, created_at, updated_at";
+
+/// Map a positional `items` row to a `WorkItem` (column order = `DO_ITEM_COLS`).
+fn do_work_item_row(row: &[SqlValue]) -> WorkItem {
+    WorkItem {
+        id: as_text(&row[0]),
+        queue: as_text(&row[1]),
+        title: as_text(&row[2]),
+        body: as_text(&row[3]),
+        status: as_text(&row[4]),
+        labels: serde_json::from_str(&as_text(&row[5])).unwrap_or_default(),
+        metadata: serde_json::from_str(&as_text(&row[6])).unwrap_or_else(|_| serde_json::json!({})),
+        claimed_by: as_opt_text(&row[7]),
+        filed_by: as_opt_text(&row[8]),
+        created_at: as_text(&row[9]),
+        updated_at: as_text(&row[10]),
+    }
+}
+
+impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
+    fn file_item(
+        &mut self,
+        queue: &str,
+        title: &str,
+        body: &str,
+        labels: &[String],
+        metadata: &serde_json::Value,
+        filed_by: Option<&str>,
+    ) -> StoreResult<WorkItem> {
+        // Mint the next sequential id (`WS-1`, `WS-2`, …); single-writer per
+        // invocation makes the counter bump + insert atomic without a txn.
+        let bumped = self
+            .sql
+            .query(
+                "UPDATE item_counter SET next_id = next_id + 1 WHERE singleton = 1 \
+                 RETURNING next_id - 1",
+                &[],
+            )
+            .map_err(sql_err)?;
+        let next = bumped
+            .first()
+            .map(|row| as_i64(&row[0]))
+            .ok_or_else(|| StoreError::Conflict("item_counter row missing".to_owned()))?;
+        let item_id = format!("WS-{next}");
+        let labels_json =
+            serde_json::to_string(labels).map_err(|error| sql_err(error.to_string()))?;
+        self.sql
+            .execute(
+                "INSERT INTO items (item_id, queue, title, body, labels_json, metadata_json, \
+                 filed_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                &[
+                    text(&item_id),
+                    text(queue),
+                    text(title),
+                    text(body),
+                    text(&labels_json),
+                    text(&metadata.to_string()),
+                    opt_text(filed_by),
+                ],
+            )
+            .map_err(sql_err)?;
+        self.get_item(&item_id)?
+            .ok_or_else(|| StoreError::Conflict("filed item missing".to_owned()))
+    }
+
+    fn get_item(&self, item_id: &str) -> StoreResult<Option<WorkItem>> {
+        let rows = self
+            .sql
+            .query(
+                &format!("SELECT {DO_ITEM_COLS} FROM items WHERE item_id = ?1"),
+                &[text(item_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| do_work_item_row(row)))
+    }
+
+    fn list_items(&self, queue: Option<&str>, status: Option<&str>) -> StoreResult<Vec<WorkItem>> {
+        let rows = self
+            .sql
+            .query(
+                &format!(
+                    "SELECT {DO_ITEM_COLS} FROM items \
+                     WHERE (?1 IS NULL OR queue = ?1) AND (?2 IS NULL OR status = ?2) \
+                     ORDER BY created_at, item_id"
+                ),
+                &[opt_text(queue), opt_text(status)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|row| do_work_item_row(row)).collect())
+    }
+
+    fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>> {
+        let rows = self
+            .sql
+            .query(
+                &format!(
+                    "SELECT {DO_ITEM_COLS} FROM items \
+                     WHERE queue = ?1 AND status = 'open' AND claimed_by IS NULL \
+                     ORDER BY created_at, item_id"
+                ),
+                &[text(queue)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|row| do_work_item_row(row)).collect())
+    }
+
+    fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome> {
+        let changed = self
+            .sql
+            .execute(
+                "UPDATE items SET status = 'in_progress', claimed_by = ?2, \
+                 updated_at = CURRENT_TIMESTAMP \
+                 WHERE item_id = ?1 AND status = 'open' AND claimed_by IS NULL",
+                &[text(item_id), text(claimed_by)],
+            )
+            .map_err(sql_err)?;
+        if changed == 1 {
+            return Ok(ClaimOutcome::Claimed);
+        }
+        let holder = self
+            .sql
+            .query(
+                "SELECT claimed_by FROM items WHERE item_id = ?1",
+                &[text(item_id)],
+            )
+            .map_err(sql_err)?;
+        match holder.first() {
+            None => Ok(ClaimOutcome::NotFound),
+            Some(row) => Ok(ClaimOutcome::AlreadyClaimed {
+                holder: as_opt_text(&row[0]).unwrap_or_default(),
+            }),
+        }
+    }
+
+    fn release_item(&mut self, item_id: &str) -> StoreResult<bool> {
+        let changed = self
+            .sql
+            .execute(
+                "UPDATE items SET status = 'open', claimed_by = NULL, \
+                 updated_at = CURRENT_TIMESTAMP \
+                 WHERE item_id = ?1 AND status = 'in_progress'",
+                &[text(item_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(changed == 1)
+    }
+
+    fn release_claims_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
+        let changed = self
+            .sql
+            .execute(
+                "UPDATE items SET status = 'open', claimed_by = NULL, \
+                 updated_at = CURRENT_TIMESTAMP \
+                 WHERE claimed_by = ?1 AND status = 'in_progress'",
+                &[text(holder)],
+            )
+            .map_err(sql_err)?;
+        Ok(changed as usize)
+    }
+
+    fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool> {
+        let changed = self
+            .sql
+            .execute(
+                "UPDATE items SET status = 'done', claim_summary = ?2, \
+                 updated_at = CURRENT_TIMESTAMP \
+                 WHERE item_id = ?1 AND status IN ('open', 'in_progress')",
+                &[text(item_id), opt_text(summary)],
+            )
+            .map_err(sql_err)?;
+        Ok(changed == 1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6520,10 +6708,108 @@ mod tests {
                 binding_id TEXT PRIMARY KEY, program_id TEXT, capability TEXT NOT NULL,
                 provider TEXT NOT NULL, config_json TEXT NOT NULL
             );
+            CREATE TABLE items (
+                item_id TEXT PRIMARY KEY, queue TEXT NOT NULL, title TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open',
+                labels_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT NOT NULL DEFAULT '{}',
+                claimed_by TEXT, claim_summary TEXT, filed_by TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE item_counter (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_id INTEGER NOT NULL
+            );
+            INSERT INTO item_counter (singleton, next_id) VALUES (1, 1);
             "#,
         )
         .expect("schema");
         DoSqliteStore::new(RusqliteDoSql { conn })
+    }
+
+    #[test]
+    fn do_work_items_file_claim_release_finish_over_dosql() {
+        let mut store = store();
+        // File two items; ids are minted sequentially (WS-1, WS-2).
+        let a = WorkItems::file_item(
+            &mut store,
+            "triage",
+            "first",
+            "b1",
+            &[],
+            &serde_json::json!({}),
+            Some("f"),
+        )
+        .expect("file a");
+        let b = WorkItems::file_item(
+            &mut store,
+            "triage",
+            "second",
+            "",
+            &[],
+            &serde_json::json!({}),
+            None,
+        )
+        .expect("file b");
+        assert_eq!(a.id, "WS-1");
+        assert_eq!(b.id, "WS-2");
+
+        // Both are ready (open + unclaimed); listing filters by queue/status.
+        assert_eq!(
+            WorkItems::ready_items(&store, "triage")
+                .expect("ready")
+                .len(),
+            2
+        );
+        assert_eq!(
+            WorkItems::list_items(&store, Some("triage"), Some("open"))
+                .expect("list")
+                .len(),
+            2
+        );
+
+        // Claim WS-1: the first claim wins; a second contends with the holder.
+        assert_eq!(
+            WorkItems::claim_item(&mut store, "WS-1", "worker:x").expect("claim"),
+            ClaimOutcome::Claimed
+        );
+        assert_eq!(
+            WorkItems::claim_item(&mut store, "WS-1", "worker:y").expect("reclaim"),
+            ClaimOutcome::AlreadyClaimed {
+                holder: "worker:x".to_owned()
+            }
+        );
+        assert_eq!(
+            WorkItems::claim_item(&mut store, "WS-9", "worker:x").expect("missing"),
+            ClaimOutcome::NotFound
+        );
+        // Only WS-2 remains ready now.
+        assert_eq!(
+            WorkItems::ready_items(&store, "triage")
+                .expect("ready2")
+                .len(),
+            1
+        );
+
+        // Holder-release returns WS-1 to open; then finish it.
+        assert_eq!(
+            WorkItems::release_claims_for_holder(&mut store, "worker:x").expect("release"),
+            1
+        );
+        assert_eq!(
+            WorkItems::get_item(&store, "WS-1")
+                .expect("get")
+                .expect("row")
+                .status,
+            "open"
+        );
+        assert!(WorkItems::finish_item(&mut store, "WS-1", Some("done by hand")).expect("finish"));
+        assert_eq!(
+            WorkItems::get_item(&store, "WS-1")
+                .expect("get2")
+                .expect("row")
+                .status,
+            "done"
+        );
     }
 
     /// The ported core methods run their real SQL against a real engine.
