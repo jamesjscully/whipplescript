@@ -68,6 +68,178 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         Self { sql }
     }
 
+    /// Shared rule-commit path for `commit_rule` /
+    /// `commit_rule_with_revision_guard`: record `rule.committed`, insert derived
+    /// facts, consume triggering facts, insert queued effects + dependency edges,
+    /// optionally record a workflow-terminal event + instance transition, and
+    /// record the rule-commit evidence with its full link fan-out. Mirrors
+    /// `commit_rule_inner`.
+    fn commit_rule_inner(
+        &self,
+        commit: RuleCommit<'_>,
+        guard: Option<RuleCommitRevisionGuard<'_>>,
+    ) -> StoreResult<StoredEvent> {
+        let status_rows = self
+            .sql
+            .query(
+                "SELECT status FROM instances WHERE instance_id = ?1",
+                &[text(commit.instance_id)],
+            )
+            .map_err(sql_err)?;
+        if let Some(row) = status_rows.first() {
+            let status = as_text(&row[0]);
+            if status != "running" {
+                return Err(StoreError::Conflict(format!(
+                    "instance is {status}; rule commits require a running instance"
+                )));
+            }
+        }
+        let (program_version_id, revision_epoch) =
+            do_active_revision(&self.sql, commit.instance_id)?;
+        if let Some(guard) = guard {
+            if program_version_id.as_deref() != Some(guard.program_version_id)
+                || revision_epoch != guard.revision_epoch
+            {
+                return Err(StoreError::Conflict(format!(
+                    "active revision changed before rule commit (expected version {} epoch {}, got version {} epoch {})",
+                    guard.program_version_id,
+                    guard.revision_epoch,
+                    program_version_id.as_deref().unwrap_or("<none>"),
+                    revision_epoch
+                )));
+            }
+        }
+        let payload = rule_commit_payload(&commit, program_version_id.as_deref(), revision_epoch)?;
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: commit.instance_id,
+                event_type: "rule.committed",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: commit.trigger_event_id,
+                correlation_id: None,
+                idempotency_key: commit.idempotency_key,
+            },
+        )?;
+        for fact in commit.facts {
+            do_insert_fact(
+                &self.sql,
+                commit.instance_id,
+                commit.rule,
+                &event.event_id,
+                program_version_id.as_deref(),
+                revision_epoch,
+                fact,
+            )?;
+        }
+        do_consume_facts(&self.sql, commit.instance_id, commit.consumed_fact_ids)?;
+        for effect in commit.effects {
+            do_insert_effect(
+                &self.sql,
+                commit.instance_id,
+                commit.rule,
+                &event.event_id,
+                program_version_id.as_deref(),
+                revision_epoch,
+                effect,
+            )?;
+        }
+        for dependency in commit.dependencies {
+            do_insert_effect_dependency(&self.sql, commit.instance_id, commit.rule, dependency)?;
+        }
+        if let Some(terminal) = commit.terminal {
+            let terminal_payload = workflow_terminal_payload(&commit, terminal)?;
+            let terminal_event = do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: commit.instance_id,
+                    event_type: terminal.kind.event_type(),
+                    payload_json: &terminal_payload,
+                    source: "kernel",
+                    causation_id: Some(&event.event_id),
+                    correlation_id: Some(commit.rule),
+                    idempotency_key: terminal.idempotency_key,
+                },
+            )?;
+            self.sql
+                .execute(
+                    "UPDATE instances SET status = ?1, last_event_id = ?2, \
+                     last_error = CASE WHEN ?1 = 'failed' THEN ?3 ELSE last_error END, \
+                     updated_at = CURRENT_TIMESTAMP, completed_at = CURRENT_TIMESTAMP \
+                     WHERE instance_id = ?4",
+                    &[
+                        text(terminal.kind.instance_status()),
+                        text(&terminal_event.event_id),
+                        text(terminal.name),
+                        text(commit.instance_id),
+                    ],
+                )
+                .map_err(sql_err)?;
+        }
+        let evidence_metadata = serde_json::json!({
+            "rule": commit.rule,
+            "trigger_event_id": commit.trigger_event_id,
+            "event_id": event.event_id,
+            "program_version_id": program_version_id,
+            "revision_epoch": revision_epoch,
+            "facts": commit.facts.iter().map(|fact| fact.fact_id).collect::<Vec<_>>(),
+            "consumed_facts": commit.consumed_fact_ids,
+            "effects": commit.effects.iter().map(|effect| effect.effect_id).collect::<Vec<_>>(),
+            "terminal": commit.terminal.map(|terminal| serde_json::json!({
+                "action": terminal.kind.action(),
+                "name": terminal.name,
+                "payload": serde_json::from_str::<Value>(terminal.payload_json).unwrap_or(Value::Null),
+            })),
+            "dependencies": commit
+                .dependencies
+                .iter()
+                .map(|dependency| dependency.dependency_id)
+                .collect::<Vec<_>>(),
+        })
+        .to_string();
+        let evidence_id = do_insert_evidence(
+            &self.sql,
+            EvidenceRecord {
+                instance_id: commit.instance_id,
+                kind: "rule.committed",
+                subject_type: "rule_commit",
+                subject_id: &event.event_id,
+                causation_id: commit.trigger_event_id,
+                correlation_id: Some(commit.rule),
+                summary: Some("rule committed facts and effects"),
+                metadata_json: &evidence_metadata,
+            },
+        )?;
+        let link = |target_type: &str, target_id: &str, relation: &str| {
+            do_insert_evidence_link(
+                &self.sql,
+                EvidenceLink {
+                    evidence_id: &evidence_id,
+                    instance_id: commit.instance_id,
+                    target_type,
+                    target_id,
+                    relation,
+                },
+            )
+        };
+        link("event", &event.event_id, "emitted")?;
+        link("rule", commit.rule, "committed")?;
+        for fact in commit.facts {
+            link("fact", fact.fact_id, "recorded")?;
+        }
+        for fact_id in commit.consumed_fact_ids {
+            link("fact", fact_id, "consumed")?;
+        }
+        for effect in commit.effects {
+            link("effect", effect.effect_id, "queued")?;
+        }
+        for dependency in commit.dependencies {
+            link("effect_dependency", dependency.dependency_id, "created")?;
+        }
+        Ok(event)
+    }
+
     /// Shared terminal-completion path for `complete_effect` /
     /// `complete_effect_with_terminal_diagnostic` / `resolve_effect_uncertain`:
     /// record the `effect.terminal` event, transition the run (guarded against a
@@ -855,6 +1027,197 @@ fn do_insert_fact<Sql: DoSql>(
     )
     .map_err(sql_err)?;
     Ok(())
+}
+
+/// Consumes each fact (marks `consumed_at`), erroring if any is already
+/// inactive. Mirrors `consume_facts`.
+fn do_consume_facts<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    fact_ids: &[&str],
+) -> StoreResult<()> {
+    for fact_id in fact_ids {
+        let changed = sql
+            .execute(
+                "UPDATE facts SET consumed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+                 WHERE instance_id = ?1 AND fact_id = ?2 AND consumed_at IS NULL",
+                &[text(instance_id), text(fact_id)],
+            )
+            .map_err(sql_err)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "fact `{fact_id}` is not active and cannot be consumed"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Inserts an effect row, mirroring `insert_effect`.
+fn do_insert_effect<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    rule: &str,
+    event_id: &str,
+    program_version_id: Option<&str>,
+    revision_epoch: i64,
+    effect: &NewEffect<'_>,
+) -> StoreResult<()> {
+    sql.execute(
+        "INSERT INTO effects (effect_id, instance_id, kind, target, input_json, status, \
+         created_by_rule, created_by_event_id, program_version_id, revision_epoch, correlation_id, \
+         idempotency_key, required_capabilities, profile, timeout_seconds) VALUES \
+         (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        &[
+            text(effect.effect_id),
+            text(instance_id),
+            text(effect.kind),
+            opt_text(effect.target),
+            text(effect.input_json),
+            text(effect.status),
+            text(rule),
+            text(event_id),
+            opt_text(program_version_id),
+            int(revision_epoch),
+            opt_text(effect.correlation_id),
+            text(effect.idempotency_key),
+            text(effect.required_capabilities_json),
+            opt_text(effect.profile),
+            effect.timeout_seconds.map_or(SqlValue::Null, int),
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+/// Inserts an effect dependency edge, mirroring `insert_effect_dependency`.
+fn do_insert_effect_dependency<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    rule: &str,
+    dependency: &NewEffectDependency<'_>,
+) -> StoreResult<()> {
+    sql.execute(
+        "INSERT INTO effect_dependencies (dependency_id, instance_id, upstream_effect_id, \
+         downstream_effect_id, predicate, created_by_rule) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        &[
+            text(dependency.dependency_id),
+            text(instance_id),
+            text(dependency.upstream_effect_id),
+            text(dependency.downstream_effect_id),
+            text(dependency.predicate),
+            text(rule),
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+/// The workflow-terminal event payload, mirroring `workflow_terminal_payload`.
+fn workflow_terminal_payload(
+    commit: &RuleCommit<'_>,
+    terminal: WorkflowTerminal<'_>,
+) -> StoreResult<String> {
+    let payload = serde_json::json!({
+        "workflow_action": terminal.kind.action(),
+        "workflow_status": terminal.kind.instance_status(),
+        "terminal_name": terminal.name,
+        "payload": serde_json::from_str::<Value>(terminal.payload_json)?,
+        "rule": commit.rule,
+    });
+    serde_json::to_string(&payload).map_err(Into::into)
+}
+
+/// The `rule.committed` event payload, mirroring `rule_commit_payload`.
+fn rule_commit_payload(
+    commit: &RuleCommit<'_>,
+    program_version_id: Option<&str>,
+    revision_epoch: i64,
+) -> StoreResult<String> {
+    let facts = commit
+        .facts
+        .iter()
+        .map(|fact| {
+            if let Some(source_span_json) = fact.source_span_json {
+                serde_json::from_str::<Value>(source_span_json)?;
+            }
+            Ok(serde_json::json!({
+                "fact_id": fact.fact_id,
+                "name": fact.name,
+                "key": fact.key,
+                "value": serde_json::from_str::<Value>(fact.value_json)?,
+                "program_version_id": program_version_id,
+                "revision_epoch": revision_epoch,
+                "schema_id": fact.schema_id,
+                "provenance_class": fact.provenance_class,
+                "correlation_id": fact.correlation_id,
+                "source_span": fact.source_span_json
+                    .map(serde_json::from_str::<Value>)
+                    .transpose()?
+                    .unwrap_or(Value::Null),
+            }))
+        })
+        .collect::<StoreResult<Vec<_>>>()?;
+    let consumed_facts = commit
+        .consumed_fact_ids
+        .iter()
+        .map(|fact_id| serde_json::json!({ "fact_id": fact_id }))
+        .collect::<Vec<_>>();
+    let effects = commit
+        .effects
+        .iter()
+        .map(|effect| {
+            if let Some(source_span_json) = effect.source_span_json {
+                serde_json::from_str::<Value>(source_span_json)?;
+            }
+            Ok(serde_json::json!({
+                "effect_id": effect.effect_id,
+                "kind": effect.kind,
+                "target": effect.target,
+                "input": serde_json::from_str::<Value>(effect.input_json)?,
+                "status": effect.status,
+                "program_version_id": program_version_id,
+                "revision_epoch": revision_epoch,
+                "idempotency_key": effect.idempotency_key,
+                "required_capabilities": serde_json::from_str::<Value>(effect.required_capabilities_json)?,
+                "profile": effect.profile,
+                "correlation_id": effect.correlation_id,
+                "source_span": effect.source_span_json
+                    .map(serde_json::from_str::<Value>)
+                    .transpose()?
+                    .unwrap_or(Value::Null),
+            }))
+        })
+        .collect::<StoreResult<Vec<_>>>()?;
+    let dependencies = commit
+        .dependencies
+        .iter()
+        .map(|dependency| {
+            serde_json::json!({
+                "dependency_id": dependency.dependency_id,
+                "upstream_effect_id": dependency.upstream_effect_id,
+                "downstream_effect_id": dependency.downstream_effect_id,
+                "predicate": dependency.predicate,
+            })
+        })
+        .collect::<Vec<_>>();
+    let terminal = match commit.terminal {
+        Some(terminal) => Some(serde_json::from_str::<Value>(&workflow_terminal_payload(
+            commit, terminal,
+        )?)?),
+        None => None,
+    };
+    let payload = serde_json::json!({
+        "rule": commit.rule,
+        "program_version_id": program_version_id,
+        "revision_epoch": revision_epoch,
+        "facts": facts,
+        "consumed_facts": consumed_facts,
+        "effects": effects,
+        "dependencies": dependencies,
+        "terminal": terminal,
+    });
+    serde_json::to_string(&payload).map_err(Into::into)
 }
 
 /// Inserts an evidence link (idempotent on the natural key), mirroring
@@ -1918,7 +2281,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn commit_rule(&mut self, commit: RuleCommit<'_>) -> StoreResult<StoredEvent> {
-        todo!("Phase 5b: port `commit_rule` SQL to DoSql + verify against a live DO")
+        self.commit_rule_inner(commit, None)
     }
 
     fn commit_rule_with_revision_guard(
@@ -1926,7 +2289,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         commit: RuleCommit<'_>,
         guard: RuleCommitRevisionGuard<'_>,
     ) -> StoreResult<StoredEvent> {
-        todo!("Phase 5b: port `commit_rule_with_revision_guard` SQL to DoSql + verify against a live DO")
+        self.commit_rule_inner(commit, Some(guard))
     }
 
     fn derive_fact(&mut self, derived: DerivedFact<'_>) -> StoreResult<StoredEvent> {
@@ -3993,7 +4356,8 @@ mod tests {
                 created_by_rule TEXT NOT NULL DEFAULT '', program_version_id TEXT,
                 revision_epoch INTEGER NOT NULL DEFAULT 0, profile TEXT,
                 required_capabilities TEXT NOT NULL DEFAULT '[]', policy_block_reason TEXT,
-                policy_block_category TEXT, created_by_event_id TEXT, timeout_seconds INTEGER,
+                policy_block_category TEXT, created_by_event_id TEXT, correlation_id TEXT,
+                idempotency_key TEXT, timeout_seconds INTEGER,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -5939,5 +6303,111 @@ mod tests {
         let diags = store.list_diagnostics(Some("i1")).expect("diags");
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].effect_id.as_deref(), Some("eff_2"));
+    }
+
+    /// commit_rule records the rule.committed event, inserts derived facts, consumes
+    /// triggering facts, queues effects + dependency edges, and records rule-commit
+    /// evidence. The revision guard rejects a stale expectation. Real SQL.
+    #[test]
+    fn do_store_commit_rule_runs_real_sql() {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(0),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+        // A pre-existing fact the rule will consume.
+        store
+            .sql
+            .execute(
+                "INSERT INTO facts (fact_id, instance_id, name, key, value_json, provenance_class) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[text("f_old"), text("i1"), text("trigger"), text("k"), text("1"), text("derived")],
+            )
+            .expect("seed fact");
+
+        let facts = [NewFact {
+            fact_id: "f_new",
+            name: "ready",
+            key: "k",
+            value_json: "true",
+            schema_id: None,
+            provenance_class: "derived",
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        let effects = [NewEffect {
+            effect_id: "eff_new",
+            kind: "coerce",
+            target: None,
+            input_json: "{}",
+            status: "queued",
+            idempotency_key: "eff-idem",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        }];
+        let consumed = ["f_old"];
+        let ev = store
+            .commit_rule(RuleCommit {
+                instance_id: "i1",
+                rule: "r.a",
+                trigger_event_id: None,
+                facts: &facts,
+                consumed_fact_ids: &consumed,
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-1"),
+            })
+            .expect("commit_rule");
+        assert!(ev.event_id.starts_with("evt_"));
+        // New fact active, old fact consumed, effect queued, evidence recorded.
+        let active: Vec<String> = store
+            .list_facts("i1")
+            .expect("facts")
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(active, vec!["ready".to_string()]);
+        let effs = store.list_effects("i1").expect("effects");
+        assert_eq!(effs.len(), 1);
+        assert_eq!(effs[0].effect_id, "eff_new");
+        assert!(!store.list_evidence("i1").expect("evidence").is_empty());
+
+        // The revision guard rejects a mismatched expectation.
+        let guarded = store.commit_rule_with_revision_guard(
+            RuleCommit {
+                instance_id: "i1",
+                rule: "r.b",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-2"),
+            },
+            RuleCommitRevisionGuard {
+                program_version_id: "ver_WRONG",
+                revision_epoch: 99,
+            },
+        );
+        assert!(guarded.is_err());
     }
 }
