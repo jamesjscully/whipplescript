@@ -104,6 +104,21 @@ pub struct NewInstance<'a> {
     pub input_json: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NewInstanceAuthority<'a> {
+    pub workflow_principal: &'a str,
+    pub effective_authority_json: &'a str,
+}
+
+impl<'a> NewInstanceAuthority<'a> {
+    pub fn empty() -> Self {
+        Self {
+            workflow_principal: "",
+            effective_authority_json: "[]",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstanceRecord {
     pub instance_id: String,
@@ -116,6 +131,8 @@ pub struct InstanceView {
     pub program_id: String,
     pub version_id: String,
     pub revision_epoch: i64,
+    pub workflow_principal: String,
+    pub effective_authority_json: String,
     pub status: String,
     pub input_json: String,
     pub created_at: String,
@@ -272,6 +289,12 @@ pub struct ProfileRegistration<'a> {
     pub enforcement_mode: &'a str,
     pub allowed_capabilities_json: &'a str,
     pub config_json: &'a str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegisteredProfilePolicy {
+    pub enforcement_mode: String,
+    pub allowed_capabilities: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1042,6 +1065,14 @@ impl SqliteStore {
     }
 
     pub fn create_instance(&self, instance: NewInstance<'_>) -> StoreResult<InstanceRecord> {
+        self.create_instance_with_authority(instance, NewInstanceAuthority::empty())
+    }
+
+    pub fn create_instance_with_authority(
+        &self,
+        instance: NewInstance<'_>,
+        authority: NewInstanceAuthority<'_>,
+    ) -> StoreResult<InstanceRecord> {
         self.connection
             .query_row(
                 r#"
@@ -1049,6 +1080,8 @@ impl SqliteStore {
                     instance_id,
                     program_id,
                     version_id,
+                    workflow_principal,
+                    effective_authority,
                     status,
                     input_json,
                     started_at
@@ -1057,8 +1090,10 @@ impl SqliteStore {
                     'ins_' || lower(hex(randomblob(16))),
                     ?1,
                     ?2,
-                    'running',
                     ?3,
+                    ?4,
+                    'running',
+                    ?5,
                     CURRENT_TIMESTAMP
                 )
                 RETURNING instance_id, status
@@ -1066,6 +1101,8 @@ impl SqliteStore {
                 params![
                     instance.program_id,
                     instance.version_id,
+                    authority.workflow_principal,
+                    authority.effective_authority_json,
                     instance.input_json,
                 ],
                 |row| {
@@ -2718,6 +2755,18 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn registered_profile_policy(
+        &self,
+        profile: &str,
+    ) -> StoreResult<Option<RegisteredProfilePolicy>> {
+        Ok(profile_policy(&self.connection, profile)?.map(
+            |(enforcement_mode, allowed_capabilities)| RegisteredProfilePolicy {
+                enforcement_mode,
+                allowed_capabilities,
+            },
+        ))
+    }
+
     pub fn bind_capability(&self, binding: CapabilityBinding<'_>) -> StoreResult<()> {
         serde_json::from_str::<Value>(binding.config_json)?;
         self.connection.execute(
@@ -3850,7 +3899,17 @@ impl SqliteStore {
     pub fn list_instances(&self) -> StoreResult<Vec<InstanceView>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT instance_id, program_id, version_id, revision_epoch, status, input_json, created_at, updated_at
+            SELECT
+                instance_id,
+                program_id,
+                version_id,
+                revision_epoch,
+                workflow_principal,
+                effective_authority,
+                status,
+                input_json,
+                created_at,
+                updated_at
             FROM instances
             ORDER BY created_at, instance_id
             "#,
@@ -3862,10 +3921,12 @@ impl SqliteStore {
                     program_id: row.get(1)?,
                     version_id: row.get(2)?,
                     revision_epoch: row.get(3)?,
-                    status: row.get(4)?,
-                    input_json: row.get(5)?,
-                    created_at: row.get(6)?,
-                    updated_at: row.get(7)?,
+                    workflow_principal: row.get(4)?,
+                    effective_authority_json: row.get(5)?,
+                    status: row.get(6)?,
+                    input_json: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
@@ -3876,7 +3937,17 @@ impl SqliteStore {
         self.connection
             .query_row(
                 r#"
-                SELECT instance_id, program_id, version_id, revision_epoch, status, input_json, created_at, updated_at
+                SELECT
+                    instance_id,
+                    program_id,
+                    version_id,
+                    revision_epoch,
+                    workflow_principal,
+                    effective_authority,
+                    status,
+                    input_json,
+                    created_at,
+                    updated_at
                 FROM instances
                 WHERE instance_id = ?1
                 "#,
@@ -3887,10 +3958,12 @@ impl SqliteStore {
                         program_id: row.get(1)?,
                         version_id: row.get(2)?,
                         revision_epoch: row.get(3)?,
-                        status: row.get(4)?,
-                        input_json: row.get(5)?,
-                        created_at: row.get(6)?,
-                        updated_at: row.get(7)?,
+                        workflow_principal: row.get(4)?,
+                        effective_authority_json: row.get(5)?,
+                        status: row.get(6)?,
+                        input_json: row.get(7)?,
+                        created_at: row.get(8)?,
+                        updated_at: row.get(9)?,
                     })
                 },
             )
@@ -8423,6 +8496,7 @@ fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
     ensure_diagnostics_schema(connection)?;
     ensure_workflow_invocation_schema(connection)?;
     ensure_revision_schema(connection)?;
+    ensure_instance_authority_schema(connection)?;
     ensure_workspace_schema(connection)?;
     ensure_effect_time_columns(connection)?;
     ensure_lookup_indexes(connection)?;
@@ -8464,6 +8538,25 @@ fn ensure_lookup_indexes(connection: &Connection) -> StoreResult<()> {
         if table_exists {
             connection.execute(statement, [])?;
         }
+    }
+    Ok(())
+}
+
+fn ensure_instance_authority_schema(connection: &Connection) -> StoreResult<()> {
+    if !table_exists(connection, "instances")? {
+        return Ok(());
+    }
+    if !column_exists(connection, "instances", "workflow_principal")? {
+        connection.execute(
+            "ALTER TABLE instances ADD COLUMN workflow_principal TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !column_exists(connection, "instances", "effective_authority")? {
+        connection.execute(
+            "ALTER TABLE instances ADD COLUMN effective_authority TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -8902,11 +8995,17 @@ mod tests {
             .create_program_version(test_program_version("Ralph", "source-2", "ir-2"))
             .expect("second program version creates");
         let instance = store
-            .create_instance(NewInstance {
-                program_id: &version.program_id,
-                version_id: &version.version_id,
-                input_json: r#"{"issue":"one"}"#,
-            })
+            .create_instance_with_authority(
+                NewInstance {
+                    program_id: &version.program_id,
+                    version_id: &version.version_id,
+                    input_json: r#"{"issue":"one"}"#,
+                },
+                NewInstanceAuthority {
+                    workflow_principal: "workflow:local/Ralph",
+                    effective_authority_json: r#"["workflow:local/Ralph"]"#,
+                },
+            )
             .expect("instance creates");
 
         assert_eq!(version.version_id, same_version.version_id);
@@ -11858,11 +11957,17 @@ mod tests {
             .create_program_version(program_version)
             .expect("program version creates");
         let instance = store
-            .create_instance(NewInstance {
-                program_id: &version.program_id,
-                version_id: &version.version_id,
-                input_json: r#"{"issue":"one"}"#,
-            })
+            .create_instance_with_authority(
+                NewInstance {
+                    program_id: &version.program_id,
+                    version_id: &version.version_id,
+                    input_json: r#"{"issue":"one"}"#,
+                },
+                NewInstanceAuthority {
+                    workflow_principal: "workflow:local/Ralph",
+                    effective_authority_json: r#"["workflow:local/Ralph"]"#,
+                },
+            )
             .expect("instance creates");
         let instance_id = instance.instance_id;
 
@@ -11906,6 +12011,11 @@ mod tests {
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].instance_id, instance_id);
         assert_eq!(instances[0].status, "running");
+        assert_eq!(instances[0].workflow_principal, "workflow:local/Ralph");
+        assert_eq!(
+            instances[0].effective_authority_json,
+            r#"["workflow:local/Ralph"]"#
+        );
 
         let facts = store.list_facts(&instance_id).expect("facts list");
         assert_eq!(facts.len(), 1);

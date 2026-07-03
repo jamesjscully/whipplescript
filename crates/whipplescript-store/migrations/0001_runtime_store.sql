@@ -26,6 +26,8 @@ CREATE TABLE instances (
     program_id TEXT NOT NULL REFERENCES programs(program_id),
     version_id TEXT NOT NULL REFERENCES program_versions(version_id),
     revision_epoch INTEGER NOT NULL DEFAULT 0,
+    workflow_principal TEXT NOT NULL DEFAULT '',
+    effective_authority TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL,
     input_json TEXT NOT NULL DEFAULT '{}',
     last_event_id TEXT,
@@ -390,6 +392,7 @@ VALUES
     ('messaging.send', 'Send an outbound message through a std.messaging channel.', '{}'),
     ('repo.read', 'Read repository files and metadata.', '{}'),
     ('repo.write', 'Modify repository files and metadata.', '{}'),
+    ('command.run', 'Run local commands under an operator-selected provider policy.', '{}'),
     ('internet.research', 'Use networked research providers.', '{}');
 
 INSERT INTO effect_providers (provider_id, effect_kind, provider, capability)
@@ -416,9 +419,9 @@ INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_c
 VALUES
     ('profile_permissive', 'permissive', 'Allow all registered capabilities.', 'audit', '["*"]'),
     ('profile_repo_reader', 'repo-reader', 'Allow repository reads and agent turns without writes.', 'enforce', '["agent.tell","repo.read","human.ask","coerce","event.emit","workflow.invoke"]'),
-    ('profile_repo_writer', 'repo-writer', 'Allow repository-writing agent workflows.', 'enforce', '["agent.tell","repo.read","repo.write","loft.show","loft.claim","loft.renew","loft.release","loft.note","loft.transition","loft.evidence","loft.resource_intent","loft.complete","loft.fail","human.ask","coerce","event.emit","workflow.invoke","capability.call"]'),
+    ('profile_repo_writer', 'repo-writer', 'Allow repository-writing agent workflows.', 'enforce', '["agent.tell","repo.read","repo.write","command.run","loft.show","loft.claim","loft.renew","loft.release","loft.note","loft.transition","loft.evidence","loft.resource_intent","loft.complete","loft.fail","human.ask","coerce","event.emit","workflow.invoke","capability.call"]'),
     ('profile_internet_research', 'internet-research', 'Allow networked research workflows.', 'enforce', '["agent.tell","internet.research","human.ask","coerce","event.emit","workflow.invoke"]'),
-    ('profile_human_review', 'human-review', 'Allow human review requests and answers.', 'enforce', '["human.ask","event.emit","workflow.invoke"]');
+    ('profile_human_review', 'human-review', 'Allow human review requests, answers, and read-only repository context.', 'enforce', '["human.ask","repo.read","event.emit","workflow.invoke"]');
 
 INSERT INTO capability_bindings (binding_id, program_id, capability, provider)
 VALUES
@@ -440,4 +443,5 @@ VALUES
     ('binding_capability_call_builtin', NULL, 'capability.call', 'builtin-package-call'),
     ('binding_messaging_send_builtin', NULL, 'messaging.send', 'builtin-messaging'),
     ('binding_repo_read_builtin', NULL, 'repo.read', 'builtin-agent-harness'),
-    ('binding_repo_write_builtin', NULL, 'repo.write', 'builtin-agent-harness');
+    ('binding_repo_write_builtin', NULL, 'repo.write', 'builtin-agent-harness'),
+    ('binding_command_run_builtin', NULL, 'command.run', 'builtin-agent-harness');
