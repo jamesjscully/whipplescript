@@ -20254,6 +20254,54 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
     }
 }
 
+/// Drive a whole instance to quiescence through the [`InstanceStepMachine`] over the
+/// native binding — the native counterpart to how the DO host will drive it.
+#[cfg(test)]
+fn run_instance_via_machine(
+    store_path: &Path,
+    instance_id: &str,
+    ir: &IrProgram,
+) -> Result<whipplescript_kernel::instance_machine::InstanceOutcome, StoreError> {
+    use whipplescript_kernel::instance_machine::InstanceStepMachine;
+    let stores = NativeStores::open(store_path, coordination_store_path(), items_store_path())?;
+    let driver = NativeInstanceDriver {
+        kernel: RuntimeKernel::new(stores),
+        ir,
+        instance_id,
+        source_path: None,
+        version_guard: None,
+        config: EffectConfig {
+            provider: "fixture".to_owned(),
+            outcome_failed: false,
+        },
+        package_lock: None,
+    };
+    let mut machine = InstanceStepMachine::new(driver);
+    // Native handlers settle their HTTP internally, so the machine never asks the
+    // host for I/O; a host that refuses all I/O proves it for store-only runs.
+    Ok(whipplescript_kernel::sansio::run_to_completion(
+        &mut machine,
+        &RefuseIoHost,
+    ))
+}
+
+/// A host that fails any I/O request — the native instance driver settles every
+/// effect synchronously, so a well-formed store-only run never reaches it.
+#[cfg(test)]
+struct RefuseIoHost;
+
+#[cfg(test)]
+impl whipplescript_kernel::sansio::HostDriver for RefuseIoHost {
+    fn fulfill(
+        &self,
+        _request: &whipplescript_kernel::sansio::IoRequest,
+    ) -> whipplescript_kernel::sansio::IoResult {
+        whipplescript_kernel::sansio::IoResult::Http(Err(TransportError::Transport(
+            "native instance driver settles effects synchronously; no host I/O expected".to_owned(),
+        )))
+    }
+}
+
 fn worker(options: &CliOptions) -> ExitCode {
     let worker_options = match WorkerOptions::parse(&options.args) {
         Ok(options) => options,
@@ -37871,6 +37919,61 @@ workflow EchoText {
         assert_eq!(options.args, vec!["ins_1"]);
         assert_eq!(options.store_path, PathBuf::from("state.sqlite"));
         assert!(options.json);
+    }
+
+    // End-to-end proof that the instance step machine + its native binding drive a
+    // real started workflow to its terminal — the same terminal the `dev` loop
+    // reaches — over the `NativeInstanceDriver` (DR-0033 chunk 4).
+    #[test]
+    fn instance_step_machine_drives_a_started_workflow_to_its_terminal() {
+        use whipplescript_kernel::instance_machine::InstanceOutcome;
+        let store_path = unique_test_path("instance-machine", "sqlite");
+        let program_path = unique_test_path("instance-machine", "whip");
+        let source = "workflow ScoreTicket(ticket: Ticket) -> float ! string\n\n\
+             class Ticket {\n  id string\n  title string\n}\n\n\
+             rule score\n  when Ticket as ticket\n=> {\n  complete result 0.9\n}\n";
+        fs::write(&program_path, source).expect("write program");
+        let options = CliOptions::parse(vec![
+            "--store".to_owned(),
+            store_path.to_string_lossy().into_owned(),
+            "dev".to_owned(),
+            program_path.to_string_lossy().into_owned(),
+        ])
+        .expect("options parse");
+        let program_str = program_path.to_str().expect("utf8 path");
+        let started = match start_workflow_instance(
+            program_str,
+            None,
+            None,
+            Some(r#"{"ticket":{"id":"t1","title":"x"}}"#),
+            &options,
+        ) {
+            Ok(started) => started,
+            Err(_) => panic!("workflow should start"),
+        };
+        let (_source, ir) = match compile_source_path_with_root(program_str, None) {
+            Ok(compiled) => compiled,
+            Err(_) => panic!("program should compile"),
+        };
+
+        // Drive the whole instance through the InstanceStepMachine (native binding).
+        let outcome = run_instance_via_machine(&store_path, &started.instance_id, &ir)
+            .expect("machine drives the instance");
+        assert!(
+            matches!(outcome, InstanceOutcome::Terminal),
+            "the instance reaches a workflow terminal via the step machine: {outcome:?}"
+        );
+
+        // ...and the durable state agrees: the instance actually completed.
+        let store = SqliteStore::open(&store_path).expect("reopen store");
+        let status = store
+            .status(&started.instance_id)
+            .expect("status")
+            .expect("instance row");
+        assert_eq!(status.instance.status, "completed");
+
+        let _ = fs::remove_file(&program_path);
+        let _ = fs::remove_file(&store_path);
     }
 
     #[test]
