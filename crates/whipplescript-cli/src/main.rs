@@ -20848,11 +20848,10 @@ fn coordination_owner_from_principal(principal: &str) -> Option<String> {
         .or_else(|| Some(principal.to_owned()))
 }
 
-fn coordination_owner_for_instance(
-    store_path: &Path,
+fn coordination_owner_for_instance<S: RuntimeStore>(
+    store: &S,
     instance_id: &str,
 ) -> Result<String, StoreError> {
-    let store = SqliteStore::open(store_path)?;
     let instance = store
         .get_instance(instance_id)?
         .ok_or_else(|| StoreError::Conflict(format!("instance `{instance_id}` not found")))?;
@@ -24946,13 +24945,28 @@ fn run_coordination_effect(
     instance_id: &str,
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let mut kernel = RuntimeKernel::new(NativeStores::open(
+        store_path,
+        coordination_store_path(),
+        items_store_path(),
+    )?);
+    run_coordination_effect_generic(&mut kernel, instance_id, effect)
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): the lease/ledger/counter op + its terminal
+/// over a held `RuntimeKernel<S>`; coordination is the DO's own store there, so
+/// `S: RuntimeStore + Coordination` unifies both surfaces.
+fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
     use whipplescript_store::coordination::{
-        AcquireOutcome, ConsumeOutcome, CoordinationStore, DEFAULT_COORDINATION_OWNER,
+        AcquireOutcome, ConsumeOutcome, DEFAULT_COORDINATION_OWNER,
     };
 
     let input = json_from_str(&effect.input_json);
-    let workflow_owner = coordination_owner_for_instance(store_path, instance_id)?;
-    let mut coordination = CoordinationStore::open(coordination_store_path())?;
+    let workflow_owner = coordination_owner_for_instance(kernel.store(), instance_id)?;
     let field = |name: &str| {
         input
             .get(name)
@@ -24972,7 +24986,7 @@ fn run_coordination_effect(
         "lease.acquire" => {
             let resource = field("resource");
             let key = field("key");
-            let outcome = coordination.try_acquire_for_owner(
+            let outcome = kernel.store_mut().try_acquire_for_owner(
                 &owner,
                 &resource,
                 &key,
@@ -25001,14 +25015,13 @@ fn run_coordination_effect(
             // The release names its acquire; resource and key come from the
             // recorded acquire input, so they cannot drift.
             let acquire_effect_id = field("acquire_effect_id");
-            let store = SqliteStore::open(store_path)?;
-            let acquire_input = store
+            let acquire_input = kernel
+                .store()
                 .list_effects(instance_id)?
                 .into_iter()
                 .find(|candidate| candidate.effect_id == acquire_effect_id)
                 .map(|candidate| json_from_str(&candidate.input_json))
                 .unwrap_or(Value::Null);
-            drop(store);
             let resource = acquire_input
                 .get("resource")
                 .and_then(Value::as_str)
@@ -25025,10 +25038,14 @@ fn run_coordination_effect(
                 .filter(|owner| !owner.is_empty())
                 .unwrap_or(&workflow_owner)
                 .to_owned();
-            let mut released =
-                coordination.release_for_owner(&acquire_owner, &resource, &key, instance_id)?;
+            let mut released = kernel.store_mut().release_for_owner(
+                &acquire_owner,
+                &resource,
+                &key,
+                instance_id,
+            )?;
             if !released && acquire_owner != DEFAULT_COORDINATION_OWNER {
-                released = coordination.release(&resource, &key, instance_id)?;
+                released = kernel.store_mut().release(&resource, &key, instance_id)?;
             }
             json!({
                 "variant": "Released",
@@ -25041,7 +25058,7 @@ fn run_coordination_effect(
             let ledger = field("ledger");
             let partition = field("partition");
             let entry = input.get("entry").cloned().unwrap_or(Value::Null);
-            let seq = coordination.append_for_owner(
+            let seq = kernel.store_mut().append_for_owner(
                 &owner,
                 &ledger,
                 &partition,
@@ -25062,8 +25079,8 @@ fn run_coordination_effect(
         "counter.consume" => {
             let counter = field("counter");
             let key = field("key");
-            let period = coordination.current_period(&field("reset"))?;
-            let outcome = coordination.consume_for_owner(
+            let period = kernel.store_mut().current_period(&field("reset"))?;
+            let outcome = kernel.store_mut().consume_for_owner(
                 &owner,
                 &counter,
                 &key,
@@ -25095,8 +25112,6 @@ fn run_coordination_effect(
 
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "coord-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "coord-lease"]);
-    let store = SqliteStore::open(store_path)?;
-    let mut kernel = RuntimeKernel::new(store);
     kernel.start_run(RunStart {
         instance_id,
         effect_id: &effect.effect_id,
