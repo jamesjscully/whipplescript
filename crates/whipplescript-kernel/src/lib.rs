@@ -1589,8 +1589,24 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         })?;
 
         let result = client.coerce(execution.request);
-        let evidence = self.record_coerce_result(execution, &result)?;
-        let metadata_json = coerce_metadata(&result);
+        self.settle_coerce_result(execution, &result)
+    }
+
+    /// Settle an already-computed [`CoerceResult`] to its terminal: record the
+    /// evidence, emit the redacted provider diagnostics, complete/fail/timeout the
+    /// run, and append the coerce fact. This is the store half of `run_coerce`,
+    /// split out so a host that performs the provider HTTP itself can settle the
+    /// parsed result — the durable object's sans-IO coerce (build_request →
+    /// `NeedsHttp` via `fetch` → `parse_response` → here) reuses it byte-for-byte,
+    /// as the native `run_coerce` does after its synchronous client call. Pair with
+    /// a prior [`start_run`](Self::start_run) so the run row exists.
+    pub fn settle_coerce_result(
+        &mut self,
+        execution: CoerceExecution<'_>,
+        result: &CoerceResult,
+    ) -> StoreResult<StoredEvent> {
+        let evidence = self.record_coerce_result(execution, result)?;
+        let metadata_json = coerce_metadata(result);
         let safe_summary = redacted_provider_summary(&result.summary);
         self.emit_provider_diagnostic(
             execution.run_id,
@@ -1637,7 +1653,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             CoerceStatus::Failed => self.fail_run_with_diagnostic(completion, diagnostic)?,
             CoerceStatus::TimedOut => self.timeout_run_with_diagnostic(completion, diagnostic)?,
         };
-        self.append_coerce_fact(execution, &result)?;
+        self.append_coerce_fact(execution, result)?;
         Ok(event)
     }
 
