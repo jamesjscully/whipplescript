@@ -123,7 +123,7 @@ in flight and expensive to retrofit:
    file manifest. The coordination store is workspace-scoped and
    cross-instance, so a cut that omits it makes replay-from-checkpoint
    non-deterministic and hollows out the subsystem's checkpoint-conditional
-   evidence semantics (research note §7, §16). Phase 3 (store behind
+   evidence semantics (research note §7, §18). Phase 3 (store behind
    a trait) is the cheap moment to shape this: cut the coordination trait with
    a snapshot/manifest capability in view.
 2. **Content-addressing stays canonical and stable** across tiers and hosts
@@ -307,19 +307,27 @@ in flight and expensive to retrofit:
             `package.json`/`tsconfig.json`, and a README mapping each Rust host
             trait to its DO primitive. Deployment scaffold — real code, not built
             here.
-      - [~] `RuntimeStore` over `DoSql` (`do_store.rs`): the `DoSql` seam (the DO's
+      - [x] `RuntimeStore` over `DoSql` (`do_store.rs`): the `DoSql` seam (the DO's
             synchronous SQLite as `execute`/`query`) + `DoSqliteStore<Sql: DoSql>`
             implementing the full 87-method `RuntimeStore` trait — **builds for
-            wasm** (no rusqlite in non-test code). The hot-path core
-            (`schema_version`, `fact_exists`, `append_event` incl. per-instance
-            sequence) is ported and **verified against real SQLite** (the test
-            backs `DoSql` with rusqlite — `do_store_core_methods_run_real_sql`).
-            The other 84 methods are explicit `todo!("port <m> SQL + verify against
-            a live DO")`: the DO runs the *same* SQL the native `SqliteStore` does,
-            so each is a mechanical port, but the full set + final correctness are
-            against the *DO's* SQLite and need a live Durable Object to build
-            (`worker` crate) and verify. Box stays open until that port + live
-            verification lands.
+            wasm** (no rusqlite in non-test code). **All 87 methods are ported and
+            verified against real SQLite**: the tests back `DoSql` with rusqlite, so
+            every method's SQL runs against an actual engine (27 tests spanning the
+            read/query family, registration + manifest fan-out, skills/inbox,
+            evidence/diagnostic/artifact records, clock/time + dependency queries,
+            leases, fact derivation + batch admission, program-version + the whole
+            revision family incl. compatibility analysis, the capability/profile
+            policy + capacity engine behind `claimable_effects`, the transactional
+            write-path core — `commit_rule`(+guard), the `complete_effect` family,
+            `start_run`, `cancel_effect`, `request_effect_cancellation`,
+            `activate_revision` — and `rebuild_projections` with its full
+            `do_replay_*` suite). Zero `todo!()`; clippy `-D warnings` clean. The DO
+            runs the *same* SQL the native `SqliteStore` does; the DO single-writer
+            per-invocation model supplies the atomicity the native path gets from a
+            rusqlite transaction (methods never yield mid-sequence). What remains is
+            *live-DO validation only*: a `DoSql` impl over the real
+            `state.storage.sql` in the `worker` crate, exercised end-to-end against
+            an actual Durable Object.
       - [ ] The `wasm-bindgen` surface the shell imports (`createInstance`/`step`/
             `snapshot`) wiring `RuntimeKernel<DoSqliteStore>` + `FetchHost` to the
             drive loop; routing every new delivery/re-entry seam through the E2-DYN
