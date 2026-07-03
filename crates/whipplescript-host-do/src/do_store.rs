@@ -140,6 +140,86 @@ fn inbox_item_view_from_row(row: &[SqlValue]) -> InboxItemView {
     }
 }
 
+/// Maps a 10-column instance row to an `InstanceView`.
+fn instance_view_from_row(row: &[SqlValue]) -> InstanceView {
+    InstanceView {
+        instance_id: as_text(&row[0]),
+        program_id: as_text(&row[1]),
+        version_id: as_text(&row[2]),
+        revision_epoch: as_i64(&row[3]),
+        workflow_principal: as_text(&row[4]),
+        effective_authority_json: as_text(&row[5]),
+        status: as_text(&row[6]),
+        input_json: as_text(&row[7]),
+        created_at: as_text(&row[8]),
+        updated_at: as_text(&row[9]),
+    }
+}
+
+/// Maps a 6-column event row to an `EventView`.
+fn event_view_from_row(row: &[SqlValue]) -> EventView {
+    EventView {
+        event_id: as_text(&row[0]),
+        sequence: as_i64(&row[1]),
+        event_type: as_text(&row[2]),
+        payload_json: as_text(&row[3]),
+        source: as_text(&row[4]),
+        occurred_at: as_text(&row[5]),
+    }
+}
+
+/// Maps an 8-column fact row to a `FactView` (nullable: `program_version_id`,
+/// `source_span_json`).
+fn fact_view_from_row(row: &[SqlValue]) -> FactView {
+    FactView {
+        fact_id: as_text(&row[0]),
+        program_version_id: as_opt_text(&row[1]),
+        revision_epoch: as_i64(&row[2]),
+        name: as_text(&row[3]),
+        key: as_text(&row[4]),
+        value_json: as_text(&row[5]),
+        provenance_class: as_text(&row[6]),
+        source_span_json: as_opt_text(&row[7]),
+    }
+}
+
+/// Maps a 14-column effect row to an `EffectView` (last column is the
+/// `EXISTS(...)` cancel-requested flag, 0/1).
+fn effect_view_from_row(row: &[SqlValue]) -> EffectView {
+    EffectView {
+        effect_id: as_text(&row[0]),
+        kind: as_text(&row[1]),
+        target: as_opt_text(&row[2]),
+        input_json: as_text(&row[3]),
+        status: as_text(&row[4]),
+        created_by_rule: as_text(&row[5]),
+        program_version_id: as_opt_text(&row[6]),
+        revision_epoch: as_i64(&row[7]),
+        profile: as_opt_text(&row[8]),
+        required_capabilities_json: as_text(&row[9]),
+        policy_block_reason: as_opt_text(&row[10]),
+        policy_block_category: as_opt_text(&row[11]),
+        declared_profiles_json: as_text(&row[12]),
+        cancel_requested: as_i64(&row[13]) != 0,
+    }
+}
+
+/// Maps a 9-column run row to a `RunView` (last column is the `EXISTS(...)`
+/// cancel-requested flag, 0/1).
+fn run_view_from_row(row: &[SqlValue]) -> RunView {
+    RunView {
+        run_id: as_text(&row[0]),
+        effect_id: as_text(&row[1]),
+        provider: as_text(&row[2]),
+        worker_id: as_text(&row[3]),
+        status: as_text(&row[4]),
+        started_at: as_text(&row[5]),
+        completed_at: as_opt_text(&row[6]),
+        metadata_json: as_text(&row[7]),
+        cancel_requested: as_i64(&row[8]) != 0,
+    }
+}
+
 #[allow(unused_variables, clippy::todo, clippy::too_many_arguments)]
 impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     fn schema_version(&self) -> StoreResult<i64> {
@@ -686,31 +766,108 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn list_instances(&self) -> StoreResult<Vec<InstanceView>> {
-        todo!("Phase 5b: port `list_instances` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json, created_at, \
+                 updated_at FROM instances ORDER BY created_at, instance_id",
+                &[],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| instance_view_from_row(r)).collect())
     }
 
     fn get_instance(&self, instance_id: &str) -> StoreResult<Option<InstanceView>> {
-        todo!("Phase 5b: port `get_instance` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json, created_at, \
+                 updated_at FROM instances WHERE instance_id = ?1",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|r| instance_view_from_row(r)))
     }
 
     fn list_events(&self, instance_id: &str) -> StoreResult<Vec<EventView>> {
-        todo!("Phase 5b: port `list_events` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT event_id, sequence, event_type, payload_json, source, occurred_at \
+                 FROM events WHERE instance_id = ?1 ORDER BY sequence",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| event_view_from_row(r)).collect())
     }
 
     fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
-        todo!("Phase 5b: port `list_facts` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, \
+                 provenance_class, source_span_json FROM facts \
+                 WHERE instance_id = ?1 AND consumed_at IS NULL ORDER BY name, key",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| fact_view_from_row(r)).collect())
     }
 
     fn list_facts_including_consumed(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
-        todo!("Phase 5b: port `list_facts_including_consumed` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, \
+                 provenance_class, source_span_json FROM facts \
+                 WHERE instance_id = ?1 ORDER BY name, key",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| fact_view_from_row(r)).collect())
     }
 
     fn list_effects(&self, instance_id: &str) -> StoreResult<Vec<EffectView>> {
-        todo!("Phase 5b: port `list_effects` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT effects.effect_id, effects.kind, effects.target, effects.input_json, \
+                 effects.status, effects.created_by_rule, effects.program_version_id, \
+                 effects.revision_epoch, effects.profile, effects.required_capabilities, \
+                 effects.policy_block_reason, effects.policy_block_category, \
+                 COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'), \
+                 EXISTS (SELECT 1 FROM effect_cancellation_requests AS request \
+                 WHERE request.instance_id = effects.instance_id \
+                 AND request.effect_id = effects.effect_id AND request.status = 'requested') \
+                 FROM effects \
+                 LEFT JOIN instances ON instances.instance_id = effects.instance_id \
+                 LEFT JOIN program_versions AS active_versions \
+                 ON active_versions.version_id = instances.version_id \
+                 LEFT JOIN program_versions AS effect_versions \
+                 ON effect_versions.version_id = effects.program_version_id \
+                 WHERE effects.instance_id = ?1 ORDER BY effects.created_at, effects.effect_id",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| effect_view_from_row(r)).collect())
     }
 
     fn list_runs(&self, instance_id: &str) -> StoreResult<Vec<RunView>> {
-        todo!("Phase 5b: port `list_runs` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT run_id, effect_id, provider, worker_id, status, started_at, \
+                 completed_at, metadata_json, \
+                 EXISTS (SELECT 1 FROM effect_cancellation_requests AS request \
+                 WHERE request.instance_id = runs.instance_id \
+                 AND request.effect_id = runs.effect_id AND request.status = 'requested') \
+                 FROM runs WHERE runs.instance_id = ?1 ORDER BY started_at, run_id",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| run_view_from_row(r)).collect())
     }
 
     fn status(&self, instance_id: &str) -> StoreResult<Option<StatusView>> {
@@ -883,6 +1040,10 @@ mod tests {
         }
     }
 
+    fn int(n: i64) -> SqlValue {
+        SqlValue::Int(n)
+    }
+
     fn store() -> DoSqliteStore<RusqliteDoSql> {
         let conn = Connection::open_in_memory().expect("sqlite");
         conn.execute_batch(
@@ -895,8 +1056,37 @@ mod tests {
                 source TEXT NOT NULL, causation_id TEXT, correlation_id TEXT, idempotency_key TEXT
             );
             CREATE TABLE facts (
-                fact_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, name TEXT NOT NULL,
+                fact_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, program_version_id TEXT,
+                revision_epoch INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL,
+                key TEXT NOT NULL DEFAULT '', value_json TEXT NOT NULL DEFAULT '{}',
+                provenance_class TEXT NOT NULL DEFAULT 'derived', source_span_json TEXT,
                 consumed_at TEXT, updated_at TEXT
+            );
+            CREATE TABLE instances (
+                instance_id TEXT PRIMARY KEY, program_id TEXT NOT NULL, version_id TEXT NOT NULL,
+                revision_epoch INTEGER NOT NULL DEFAULT 0, workflow_principal TEXT NOT NULL,
+                effective_authority TEXT NOT NULL, status TEXT NOT NULL, input_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE program_versions (
+                version_id TEXT PRIMARY KEY, declared_profiles TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE effects (
+                effect_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, kind TEXT NOT NULL,
+                target TEXT, input_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,
+                created_by_rule TEXT NOT NULL DEFAULT '', program_version_id TEXT,
+                revision_epoch INTEGER NOT NULL DEFAULT 0, profile TEXT,
+                required_capabilities TEXT NOT NULL DEFAULT '[]', policy_block_reason TEXT,
+                policy_block_category TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, effect_id TEXT NOT NULL,
+                provider TEXT NOT NULL, worker_id TEXT NOT NULL, status TEXT NOT NULL,
+                started_at TEXT NOT NULL, completed_at TEXT, metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE effect_cancellation_requests (
+                instance_id TEXT NOT NULL, effect_id TEXT NOT NULL, status TEXT NOT NULL
             );
             CREATE TABLE skills (
                 skill_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL,
@@ -1178,5 +1368,129 @@ mod tests {
         // table_exists reflects the schema.
         assert!(store.table_exists("inbox_items").expect("exists"));
         assert!(!store.table_exists("no_such_table").expect("absent"));
+    }
+
+    /// The instance/event/fact/effect/run read-query family runs its real SQL
+    /// (including the effect/run join + EXISTS cancel-requested flag) and decodes
+    /// rows through the ported view mappers.
+    #[test]
+    fn do_store_read_query_family_runs_real_sql() {
+        let store = store();
+        let e = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
+
+        e(
+            "INSERT INTO program_versions (version_id, declared_profiles) VALUES (?1, ?2)",
+            &[text("ver_1"), text("[\"p\"]")],
+        );
+        e(
+            "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+             workflow_principal, effective_authority, status, input_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            &[
+                text("i1"),
+                text("prog_1"),
+                text("ver_1"),
+                int(3),
+                text("root"),
+                text("{}"),
+                text("running"),
+                text("{}"),
+            ],
+        );
+        e(
+            "INSERT INTO events (event_id, instance_id, sequence, event_type, payload_json, \
+             occurred_at, source) VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP, ?6)",
+            &[
+                text("evt_a"),
+                text("i1"),
+                int(1),
+                text("started"),
+                text("{}"),
+                text("kernel"),
+            ],
+        );
+        e(
+            "INSERT INTO facts (fact_id, instance_id, program_version_id, revision_epoch, name, \
+             key, value_json, provenance_class) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            &[
+                text("f_live"),
+                text("i1"),
+                text("ver_1"),
+                int(0),
+                text("ready"),
+                text(""),
+                text("true"),
+                text("derived"),
+            ],
+        );
+        e(
+            "INSERT INTO facts (fact_id, instance_id, name, provenance_class, consumed_at) \
+             VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)",
+            &[text("f_gone"), text("i1"), text("done"), text("derived")],
+        );
+        e(
+            "INSERT INTO effects (effect_id, instance_id, kind, target, status, program_version_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[text("eff_1"), text("i1"), text("coerce"), SqlValue::Null, text("queued"), text("ver_1")],
+        );
+        e(
+            "INSERT INTO runs (run_id, instance_id, effect_id, provider, worker_id, status, \
+             started_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)",
+            &[
+                text("run_1"),
+                text("i1"),
+                text("eff_1"),
+                text("anthropic"),
+                text("w1"),
+                text("running"),
+            ],
+        );
+        e(
+            "INSERT INTO effect_cancellation_requests (instance_id, effect_id, status) \
+             VALUES (?1, ?2, ?3)",
+            &[text("i1"), text("eff_1"), text("requested")],
+        );
+
+        let instances = store.list_instances().expect("list_instances");
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].revision_epoch, 3);
+        assert_eq!(instances[0].workflow_principal, "root");
+        assert_eq!(
+            store.get_instance("i1").expect("get").expect("some").status,
+            "running"
+        );
+        assert!(store
+            .get_instance("missing")
+            .expect("get missing")
+            .is_none());
+
+        let events = store.list_events("i1").expect("list_events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 1);
+
+        // list_facts hides the consumed fact; the "including" variant shows both.
+        let live = store.list_facts("i1").expect("list_facts");
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].name, "ready");
+        assert_eq!(live[0].program_version_id.as_deref(), Some("ver_1"));
+        assert_eq!(
+            store
+                .list_facts_including_consumed("i1")
+                .expect("incl")
+                .len(),
+            2
+        );
+
+        // list_effects joins declared_profiles and computes cancel_requested via EXISTS.
+        let effects = store.list_effects("i1").expect("list_effects");
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].target, None);
+        assert_eq!(effects[0].declared_profiles_json, "[\"p\"]");
+        assert!(effects[0].cancel_requested);
+
+        let runs = store.list_runs("i1").expect("list_runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].provider, "anthropic");
+        assert!(runs[0].cancel_requested);
     }
 }
