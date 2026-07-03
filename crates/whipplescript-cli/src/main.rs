@@ -25627,12 +25627,27 @@ fn run_queue_effect(
     effect: &ClaimableEffect,
     options: &WorkerOptions,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    use whipplescript_store::items::{ClaimOutcome, WorkItemStore};
+    let mut kernel = RuntimeKernel::new(NativeStores::open(
+        store_path,
+        coordination_store_path(),
+        items_store_path(),
+    )?);
+    run_queue_effect_generic(&mut kernel, instance_id, effect, options)
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): claim/release/finish a work item + record
+/// the terminal over a held `RuntimeKernel<S>`. The queue is the DO's own store on
+/// that host, so `S: RuntimeStore + WorkItems` unifies both surfaces.
+fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    options: &WorkerOptions,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    use whipplescript_store::items::ClaimOutcome;
     let input = json_from_str(&effect.input_json);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "queue-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "queue-lease"]);
-    let store = SqliteStore::open(store_path)?;
-    let mut kernel = RuntimeKernel::new(store);
     kernel.start_run(RunStart {
         instance_id,
         effect_id: &effect.effect_id,
@@ -25643,9 +25658,7 @@ fn run_queue_effect(
         lease_expires_at: "2030-01-01T00:00:00Z",
         metadata_json: &effect.input_json,
     })?;
-    drop(kernel);
 
-    let mut items = WorkItemStore::open(items_store_path())?;
     let outcome: Result<Value, String> = match effect.kind.as_str() {
         "queue.file" => {
             let queue = effect.target.clone().unwrap_or_default();
@@ -25668,7 +25681,8 @@ fn run_queue_effect(
                 .unwrap_or_default();
             let metadata = item.get("metadata").cloned().unwrap_or_else(|| json!({}));
             let filed_by = format!("workflow:{instance_id}");
-            items
+            kernel
+                .store_mut()
                 .file_item(&queue, title, body, &labels, &metadata, Some(&filed_by))
                 .map(|filed| {
                     json!({
@@ -25681,7 +25695,7 @@ fn run_queue_effect(
         }
         "queue.claim" => {
             let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
-            match items.claim_item(id, instance_id) {
+            match kernel.store_mut().claim_item(id, instance_id) {
                 Ok(ClaimOutcome::Claimed) => Ok(json!({"id": id, "claimed_by": instance_id})),
                 Ok(ClaimOutcome::AlreadyClaimed { holder }) => {
                     Err(format!("already claimed by `{holder}`"))
@@ -25692,7 +25706,7 @@ fn run_queue_effect(
         }
         "queue.release" => {
             let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
-            match items.release_item(id) {
+            match kernel.store_mut().release_item(id) {
                 Ok(true) => Ok(json!({"id": id, "status": "open"})),
                 Ok(false) => Err(format!("item `{id}` was not in progress")),
                 Err(error) => Err(format!("release failed: {error:?}")),
@@ -25704,7 +25718,7 @@ fn run_queue_effect(
                 .pointer("/payload/summary")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            match items.finish_item(id, summary.as_deref()) {
+            match kernel.store_mut().finish_item(id, summary.as_deref()) {
                 Ok(true) => Ok(json!({"id": id, "status": "done", "summary": summary})),
                 Ok(false) => Err(format!("item `{id}` cannot finish from its current status")),
                 Err(error) => Err(format!("finish failed: {error:?}")),
@@ -25712,10 +25726,7 @@ fn run_queue_effect(
         }
         other => Err(format!("unknown queue effect kind `{other}`")),
     };
-    drop(items);
 
-    let store = SqliteStore::open(store_path)?;
-    let mut kernel = RuntimeKernel::new(store);
     let _ = options;
     match outcome {
         Ok(value) => {
