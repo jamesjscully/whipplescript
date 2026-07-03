@@ -89,6 +89,17 @@ fn as_opt_text(value: &SqlValue) -> Option<String> {
     }
 }
 
+fn as_opt_i64(value: &SqlValue) -> Option<i64> {
+    match value {
+        SqlValue::Int(n) => Some(*n),
+        _ => None,
+    }
+}
+
+fn int(n: i64) -> SqlValue {
+    SqlValue::Int(n)
+}
+
 fn bool_int(value: bool) -> SqlValue {
     SqlValue::Int(if value { 1 } else { 0 })
 }
@@ -220,6 +231,91 @@ fn run_view_from_row(row: &[SqlValue]) -> RunView {
     }
 }
 
+/// Maps a 12-column instance-revision row to a `WorkflowRevisionView`.
+fn workflow_revision_from_row(row: &[SqlValue]) -> WorkflowRevisionView {
+    WorkflowRevisionView {
+        revision_id: as_text(&row[0]),
+        instance_id: as_text(&row[1]),
+        epoch: as_i64(&row[2]),
+        from_version_id: as_text(&row[3]),
+        to_version_id: as_text(&row[4]),
+        activated_by_event_id: as_text(&row[5]),
+        activation_policy_json: as_text(&row[6]),
+        cancellation_policy: as_text(&row[7]),
+        status: as_text(&row[8]),
+        idempotency_key: as_opt_text(&row[9]),
+        created_at: as_text(&row[10]),
+        activated_at: as_text(&row[11]),
+    }
+}
+
+/// Maps a 12-column cancellation-request row to an `EffectCancellationRequestView`.
+fn effect_cancellation_request_from_row(row: &[SqlValue]) -> EffectCancellationRequestView {
+    EffectCancellationRequestView {
+        request_id: as_text(&row[0]),
+        instance_id: as_text(&row[1]),
+        effect_id: as_text(&row[2]),
+        revision_id: as_opt_text(&row[3]),
+        reason: as_opt_text(&row[4]),
+        requested_by: as_text(&row[5]),
+        causation_event_id: as_opt_text(&row[6]),
+        status: as_text(&row[7]),
+        idempotency_key: as_opt_text(&row[8]),
+        created_at: as_text(&row[9]),
+        updated_at: as_text(&row[10]),
+        resolved_by_event_id: as_opt_text(&row[11]),
+    }
+}
+
+/// Maps a 19-column workflow-invocation row (with parent/child active-version
+/// joins) to a `WorkflowInvocationView`.
+fn workflow_invocation_from_row(row: &[SqlValue]) -> WorkflowInvocationView {
+    WorkflowInvocationView {
+        invocation_id: as_text(&row[0]),
+        parent_instance_id: as_text(&row[1]),
+        parent_effect_id: as_text(&row[2]),
+        parent_program_version_id: as_opt_text(&row[3]),
+        parent_revision_epoch: as_i64(&row[4]),
+        parent_active_program_version_id: as_opt_text(&row[5]),
+        parent_active_revision_epoch: as_opt_i64(&row[6]),
+        child_instance_id: as_text(&row[7]),
+        child_program_version_id: as_opt_text(&row[8]),
+        child_revision_epoch: as_opt_i64(&row[9]),
+        child_active_program_version_id: as_opt_text(&row[10]),
+        child_active_revision_epoch: as_opt_i64(&row[11]),
+        target_workflow: as_text(&row[12]),
+        input_json: as_text(&row[13]),
+        status: as_text(&row[14]),
+        terminal_event_id: as_opt_text(&row[15]),
+        source_span_json: as_opt_text(&row[16]),
+        created_at: as_text(&row[17]),
+        updated_at: as_text(&row[18]),
+    }
+}
+
+/// The shared 19-column workflow-invocation projection (parent/child active
+/// versions joined, status folded to the parent effect's terminal). Callers
+/// append their own `WHERE ... ORDER BY ...` clause. Mirrors the native SQL.
+const WORKFLOW_INVOCATION_SELECT: &str = "SELECT invocation_id, parent_instance_id, \
+     parent_effect_id, parent_program_version_id, parent_revision_epoch, \
+     parent_instance.version_id, parent_instance.revision_epoch, child_instance_id, \
+     child_program_version_id, child_revision_epoch, child_instance.version_id, \
+     child_instance.revision_epoch, workflow_invocations.target_workflow, \
+     workflow_invocations.input_json, \
+     CASE WHEN parent_effect.status IN ('completed', 'failed', 'timed_out', 'cancelled') \
+     THEN parent_effect.status ELSE workflow_invocations.status END, \
+     workflow_invocations.terminal_event_id, workflow_invocations.source_span_json, \
+     workflow_invocations.created_at, \
+     COALESCE(workflow_invocations.updated_at, workflow_invocations.created_at) \
+     FROM workflow_invocations \
+     LEFT JOIN instances AS parent_instance \
+     ON parent_instance.instance_id = workflow_invocations.parent_instance_id \
+     LEFT JOIN instances AS child_instance \
+     ON child_instance.instance_id = workflow_invocations.child_instance_id \
+     LEFT JOIN effects AS parent_effect \
+     ON parent_effect.instance_id = workflow_invocations.parent_instance_id \
+     AND parent_effect.effect_id = workflow_invocations.parent_effect_id ";
+
 #[allow(unused_variables, clippy::todo, clippy::too_many_arguments)]
 impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     fn schema_version(&self) -> StoreResult<i64> {
@@ -290,7 +386,17 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn list_instance_revisions(&self, instance_id: &str) -> StoreResult<Vec<WorkflowRevisionView>> {
-        todo!("Phase 5b: port `list_instance_revisions` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT revision_id, instance_id, epoch, from_version_id, to_version_id, \
+                 activated_by_event_id, activation_policy_json, cancellation_policy, status, \
+                 idempotency_key, created_at, activated_at FROM instance_revisions \
+                 WHERE instance_id = ?1 ORDER BY epoch",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| workflow_revision_from_row(r)).collect())
     }
 
     fn revision_cancellation_impact(
@@ -340,18 +446,92 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         instance_id: &str,
         effect_id: &str,
     ) -> StoreResult<bool> {
-        todo!("Phase 5b: port `effect_has_open_cancellation_request` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT 1 FROM effect_cancellation_requests \
+                 WHERE instance_id = ?1 AND effect_id = ?2 AND status = 'requested' LIMIT 1",
+                &[text(instance_id), text(effect_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(!rows.is_empty())
     }
 
     fn list_effect_cancellation_requests(
         &self,
         instance_id: &str,
     ) -> StoreResult<Vec<EffectCancellationRequestView>> {
-        todo!("Phase 5b: port `list_effect_cancellation_requests` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT request_id, instance_id, effect_id, revision_id, reason, requested_by, \
+                 causation_event_id, status, idempotency_key, created_at, updated_at, \
+                 resolved_by_event_id FROM effect_cancellation_requests \
+                 WHERE instance_id = ?1 ORDER BY created_at, request_id",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|r| effect_cancellation_request_from_row(r))
+            .collect())
     }
 
     fn record_workflow_invocation(&self, invocation: NewWorkflowInvocation<'_>) -> StoreResult<()> {
-        todo!("Phase 5b: port `record_workflow_invocation` SQL to DoSql + verify against a live DO")
+        serde_json::from_str::<Value>(invocation.input_json)?;
+        let parent = self
+            .sql
+            .query(
+                "SELECT program_version_id, revision_epoch FROM effects \
+                 WHERE instance_id = ?1 AND effect_id = ?2",
+                &[
+                    text(invocation.parent_instance_id),
+                    text(invocation.parent_effect_id),
+                ],
+            )
+            .map_err(sql_err)?;
+        let parent = parent.first().ok_or_else(|| {
+            StoreError::Conflict("parent workflow invoke effect does not exist".to_owned())
+        })?;
+        let parent_program_version_id = as_opt_text(&parent[0]);
+        let parent_revision_epoch = as_i64(&parent[1]);
+        let child = self
+            .sql
+            .query(
+                "SELECT version_id, revision_epoch FROM instances WHERE instance_id = ?1",
+                &[text(invocation.child_instance_id)],
+            )
+            .map_err(sql_err)?;
+        let child = child.first().ok_or_else(|| {
+            StoreError::Conflict("child workflow instance does not exist".to_owned())
+        })?;
+        let child_program_version_id = as_text(&child[0]);
+        let child_revision_epoch = as_i64(&child[1]);
+        self.sql
+            .execute(
+                "INSERT INTO workflow_invocations (invocation_id, parent_instance_id, \
+                 parent_effect_id, parent_program_version_id, parent_revision_epoch, \
+                 child_instance_id, child_program_version_id, child_revision_epoch, \
+                 target_workflow, input_json, source_span_json, idempotency_key) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+                 ON CONFLICT(idempotency_key) DO NOTHING",
+                &[
+                    text(invocation.invocation_id),
+                    text(invocation.parent_instance_id),
+                    text(invocation.parent_effect_id),
+                    opt_text(parent_program_version_id.as_deref()),
+                    int(parent_revision_epoch),
+                    text(invocation.child_instance_id),
+                    text(&child_program_version_id),
+                    int(child_revision_epoch),
+                    text(invocation.target_workflow),
+                    text(invocation.input_json),
+                    opt_text(invocation.source_span_json),
+                    text(invocation.idempotency_key),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
     }
 
     fn get_workflow_invocation(
@@ -359,21 +539,49 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         parent_instance_id: &str,
         parent_effect_id: &str,
     ) -> StoreResult<Option<WorkflowInvocationView>> {
-        todo!("Phase 5b: port `get_workflow_invocation` SQL to DoSql + verify against a live DO")
+        let sql = format!(
+            "{WORKFLOW_INVOCATION_SELECT}WHERE workflow_invocations.parent_instance_id = ?1 \
+             AND workflow_invocations.parent_effect_id = ?2 \
+             ORDER BY workflow_invocations.created_at DESC, invocation_id DESC LIMIT 1"
+        );
+        let rows = self
+            .sql
+            .query(&sql, &[text(parent_instance_id), text(parent_effect_id)])
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|r| workflow_invocation_from_row(r)))
     }
 
     fn list_child_workflow_invocations(
         &self,
         parent_instance_id: &str,
     ) -> StoreResult<Vec<WorkflowInvocationView>> {
-        todo!("Phase 5b: port `list_child_workflow_invocations` SQL to DoSql + verify against a live DO")
+        let sql = format!(
+            "{WORKFLOW_INVOCATION_SELECT}WHERE workflow_invocations.parent_instance_id = ?1 \
+             ORDER BY workflow_invocations.created_at, invocation_id"
+        );
+        let rows = self
+            .sql
+            .query(&sql, &[text(parent_instance_id)])
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|r| workflow_invocation_from_row(r))
+            .collect())
     }
 
     fn get_parent_workflow_invocation(
         &self,
         child_instance_id: &str,
     ) -> StoreResult<Option<WorkflowInvocationView>> {
-        todo!("Phase 5b: port `get_parent_workflow_invocation` SQL to DoSql + verify against a live DO")
+        let sql = format!(
+            "{WORKFLOW_INVOCATION_SELECT}WHERE workflow_invocations.child_instance_id = ?1 \
+             ORDER BY workflow_invocations.created_at DESC, invocation_id DESC LIMIT 1"
+        );
+        let rows = self
+            .sql
+            .query(&sql, &[text(child_instance_id)])
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|r| workflow_invocation_from_row(r)))
     }
 
     fn commit_rule(&mut self, commit: RuleCommit<'_>) -> StoreResult<StoredEvent> {
@@ -871,7 +1079,60 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn status(&self, instance_id: &str) -> StoreResult<Option<StatusView>> {
-        todo!("Phase 5b: port `status` SQL to DoSql + verify against a live DO")
+        let Some(instance) = self.get_instance(instance_id)? else {
+            return Ok(None);
+        };
+        // COUNT(*) over `table` scoped to the instance, with an optional predicate —
+        // mirrors the native `count_where` helper.
+        let count_where = |table: &str, predicate: Option<&str>| -> StoreResult<i64> {
+            let mut sql = format!("SELECT COUNT(*) FROM {table} WHERE instance_id = ?1");
+            if let Some(predicate) = predicate {
+                sql.push_str(" AND ");
+                sql.push_str(predicate);
+            }
+            let rows = self
+                .sql
+                .query(&sql, &[text(instance_id)])
+                .map_err(sql_err)?;
+            Ok(rows.first().map(|r| as_i64(&r[0])).unwrap_or(0))
+        };
+
+        let fact_count = count_where("facts", None)?;
+        let queued_effect_count = count_where(
+            "effects",
+            Some("status IN ('queued', 'blocked_by_dependency')"),
+        )?;
+        let blocked_effect_count = count_where(
+            "effects",
+            Some(
+                "status IN ('blocked_by_capability', 'blocked_by_profile', 'blocked_by_capacity')",
+            ),
+        )?;
+        let active_run_count = count_where("runs", Some("status = 'running'"))?;
+        let failure_count = count_where("effects", Some("status IN ('failed', 'timed_out')"))?;
+        let cancellation_request_count =
+            count_where("effect_cancellation_requests", Some("status = 'requested'"))?;
+        let mut recent_events = self.list_events(instance_id)?;
+        if recent_events.len() > 5 {
+            recent_events = recent_events.split_off(recent_events.len() - 5);
+        }
+        let revisions = self.list_instance_revisions(instance_id)?;
+        let parent_invocation = self.get_parent_workflow_invocation(instance_id)?;
+        let child_invocations = self.list_child_workflow_invocations(instance_id)?;
+
+        Ok(Some(StatusView {
+            instance,
+            fact_count,
+            queued_effect_count,
+            blocked_effect_count,
+            active_run_count,
+            failure_count,
+            cancellation_request_count,
+            revisions,
+            parent_invocation,
+            child_invocations,
+            recent_events,
+        }))
     }
 
     fn satisfy_dependencies(&self, instance_id: &str) -> StoreResult<usize> {
@@ -1040,10 +1301,6 @@ mod tests {
         }
     }
 
-    fn int(n: i64) -> SqlValue {
-        SqlValue::Int(n)
-    }
-
     fn store() -> DoSqliteStore<RusqliteDoSql> {
         let conn = Connection::open_in_memory().expect("sqlite");
         conn.execute_batch(
@@ -1086,7 +1343,28 @@ mod tests {
                 started_at TEXT NOT NULL, completed_at TEXT, metadata_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE effect_cancellation_requests (
-                instance_id TEXT NOT NULL, effect_id TEXT NOT NULL, status TEXT NOT NULL
+                request_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, effect_id TEXT NOT NULL,
+                revision_id TEXT, reason TEXT, requested_by TEXT NOT NULL DEFAULT 'kernel',
+                causation_event_id TEXT, status TEXT NOT NULL, idempotency_key TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, resolved_by_event_id TEXT
+            );
+            CREATE TABLE instance_revisions (
+                revision_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, epoch INTEGER NOT NULL,
+                from_version_id TEXT NOT NULL, to_version_id TEXT NOT NULL,
+                activated_by_event_id TEXT NOT NULL, activation_policy_json TEXT NOT NULL DEFAULT '{}',
+                cancellation_policy TEXT NOT NULL, status TEXT NOT NULL, idempotency_key TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, activated_at TEXT NOT NULL
+            );
+            CREATE TABLE workflow_invocations (
+                invocation_id TEXT PRIMARY KEY, parent_instance_id TEXT NOT NULL,
+                parent_effect_id TEXT NOT NULL, parent_program_version_id TEXT,
+                parent_revision_epoch INTEGER NOT NULL, child_instance_id TEXT NOT NULL,
+                child_program_version_id TEXT, child_revision_epoch INTEGER,
+                target_workflow TEXT NOT NULL, input_json TEXT NOT NULL DEFAULT '{}',
+                source_span_json TEXT, idempotency_key TEXT UNIQUE, status TEXT NOT NULL DEFAULT 'running',
+                terminal_event_id TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT
             );
             CREATE TABLE skills (
                 skill_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL,
@@ -1492,5 +1770,165 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].provider, "anthropic");
         assert!(runs[0].cancel_requested);
+    }
+
+    /// Revisions, cancellation-request reads, workflow-invocation record/read (with
+    /// the parent/child join), and the composite `status` view all run real SQL.
+    #[test]
+    fn do_store_revisions_invocations_and_status_run_real_sql() {
+        let store = store();
+        let e = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
+
+        // Two instances (parent + child) and a version.
+        e(
+            "INSERT INTO program_versions (version_id, declared_profiles) VALUES (?1, ?2)",
+            &[text("ver_1"), text("[]")],
+        );
+        for id in ["parent", "child"] {
+            e(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text(id),
+                    text("prog_1"),
+                    text("ver_1"),
+                    int(1),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            );
+        }
+        // A parent invoke-effect that the invocation points at.
+        e(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, program_version_id, \
+             revision_epoch) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                text("eff_inv"),
+                text("parent"),
+                text("workflow.invoke"),
+                text("running"),
+                text("ver_1"),
+                int(1),
+            ],
+        );
+
+        // A revision row round-trips.
+        e(
+            "INSERT INTO instance_revisions (revision_id, instance_id, epoch, from_version_id, \
+             to_version_id, activated_by_event_id, cancellation_policy, status, activated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            &[
+                text("rev_1"),
+                text("parent"),
+                int(1),
+                text("ver_0"),
+                text("ver_1"),
+                text("evt_x"),
+                text("keep"),
+                text("activated"),
+                text("2026-01-01T00:00:00Z"),
+            ],
+        );
+        let revisions = store.list_instance_revisions("parent").expect("revisions");
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].to_version_id, "ver_1");
+
+        // A cancellation request round-trips and the open-check sees it.
+        e(
+            "INSERT INTO effect_cancellation_requests (request_id, instance_id, effect_id, \
+             requested_by, status) VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                text("req_1"),
+                text("parent"),
+                text("eff_inv"),
+                text("kernel"),
+                text("requested"),
+            ],
+        );
+        assert!(store
+            .effect_has_open_cancellation_request("parent", "eff_inv")
+            .expect("open?"));
+        assert!(!store
+            .effect_has_open_cancellation_request("parent", "other")
+            .expect("open?"));
+        assert_eq!(
+            store
+                .list_effect_cancellation_requests("parent")
+                .expect("list reqs")
+                .len(),
+            1
+        );
+
+        // record_workflow_invocation resolves parent effect + child instance versions.
+        store
+            .record_workflow_invocation(NewWorkflowInvocation {
+                invocation_id: "inv_1",
+                parent_instance_id: "parent",
+                parent_effect_id: "eff_inv",
+                child_instance_id: "child",
+                target_workflow: "sub",
+                input_json: "{}",
+                source_span_json: None,
+                idempotency_key: "idem_1",
+            })
+            .expect("record invocation");
+        // Idempotent replay is a no-op (ON CONFLICT(idempotency_key) DO NOTHING).
+        store
+            .record_workflow_invocation(NewWorkflowInvocation {
+                invocation_id: "inv_2",
+                parent_instance_id: "parent",
+                parent_effect_id: "eff_inv",
+                child_instance_id: "child",
+                target_workflow: "sub",
+                input_json: "{}",
+                source_span_json: None,
+                idempotency_key: "idem_1",
+            })
+            .expect("replay invocation");
+
+        let got = store
+            .get_workflow_invocation("parent", "eff_inv")
+            .expect("get inv")
+            .expect("some");
+        assert_eq!(got.invocation_id, "inv_1");
+        assert_eq!(got.child_instance_id, "child");
+        assert_eq!(
+            got.child_active_program_version_id.as_deref(),
+            Some("ver_1")
+        );
+        assert_eq!(got.parent_active_revision_epoch, Some(1));
+
+        assert_eq!(
+            store
+                .list_child_workflow_invocations("parent")
+                .expect("children")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_parent_workflow_invocation("child")
+                .expect("parent inv")
+                .expect("some")
+                .invocation_id,
+            "inv_1"
+        );
+
+        // The composite status view assembles counts + reads.
+        e(
+            "INSERT INTO facts (fact_id, instance_id, name, provenance_class) \
+             VALUES (?1, ?2, ?3, ?4)",
+            &[text("f1"), text("parent"), text("ready"), text("derived")],
+        );
+        let status = store.status("parent").expect("status").expect("some");
+        assert_eq!(status.instance.instance_id, "parent");
+        assert_eq!(status.fact_count, 1);
+        assert_eq!(status.cancellation_request_count, 1);
+        assert_eq!(status.revisions.len(), 1);
+        assert_eq!(status.child_invocations.len(), 1);
+        assert!(store.status("ghost").expect("missing status").is_none());
     }
 }
