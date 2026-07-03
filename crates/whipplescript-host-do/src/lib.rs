@@ -31,6 +31,9 @@ use whipplescript_kernel::sansio::{
 };
 use whipplescript_store::files::FileStore;
 
+/// `RuntimeStore` over the DO's synchronous SQLite (`DoSql`).
+pub mod do_store;
+
 // -- HTTP: the fetch host driver ------------------------------------------
 
 /// The DO's HTTP `fetch`, surfaced to the synchronous sans-IO core. A deployment

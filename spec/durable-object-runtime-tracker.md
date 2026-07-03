@@ -307,14 +307,23 @@ in flight and expensive to retrofit:
             `package.json`/`tsconfig.json`, and a README mapping each Rust host
             trait to its DO primitive. Deployment scaffold — real code, not built
             here.
-      - [ ] Full `RuntimeStore` impl over `DoStorage` (the DO runs the same SQL
-            the native `SqliteStore` does, through the DO SQL API) + the
-            `wasm-bindgen` surface the shell imports (`createInstance`/`step`/
-            `snapshot`); routing every new delivery/re-entry seam through the
-            E2-DYN marker door. **Needs a live Cloudflare DO runtime to build and
-            test against** — the seams they plug into (`FetchHost`, `DoStorage`,
-            `Alarms`, `Secrets`, `ObjectStore`, `RuntimeKernel<S>`) are proven
-            here.
+      - [~] `RuntimeStore` over `DoSql` (`do_store.rs`): the `DoSql` seam (the DO's
+            synchronous SQLite as `execute`/`query`) + `DoSqliteStore<Sql: DoSql>`
+            implementing the full 87-method `RuntimeStore` trait — **builds for
+            wasm** (no rusqlite in non-test code). The hot-path core
+            (`schema_version`, `fact_exists`, `append_event` incl. per-instance
+            sequence) is ported and **verified against real SQLite** (the test
+            backs `DoSql` with rusqlite — `do_store_core_methods_run_real_sql`).
+            The other 84 methods are explicit `todo!("port <m> SQL + verify against
+            a live DO")`: the DO runs the *same* SQL the native `SqliteStore` does,
+            so each is a mechanical port, but the full set + final correctness are
+            against the *DO's* SQLite and need a live Durable Object to build
+            (`worker` crate) and verify. Box stays open until that port + live
+            verification lands.
+      - [ ] The `wasm-bindgen` surface the shell imports (`createInstance`/`step`/
+            `snapshot`) wiring `RuntimeKernel<DoSqliteStore>` + `FetchHost` to the
+            drive loop; routing every new delivery/re-entry seam through the E2-DYN
+            marker door. **Needs a live Cloudflare DO runtime.**
 
 ### Phase 6 — Scheduling + config on the DO
 - [~] Seams landed in `whipplescript-host-do` (real, tested, native + wasm):
