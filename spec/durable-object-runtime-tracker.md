@@ -211,7 +211,7 @@ in flight and expensive to retrofit:
       suite exit 0; fmt + `clippy -D warnings` clean. No user-facing surface, so
       no `docs/` change.
 
-### Phase 3 — Store behind a trait — IN PROGRESS (2 of 3 stores)
+### Phase 3 — Store behind a trait — DONE 2026-07-03 (all 3 stores)
 - [x] `CoordinationStore` → `Coordination` trait (`coordination.rs`):
       owner-parameterized primitives required, shared-owner convenience forms
       provided; native impl forwards to the inherent methods (delegation, not
@@ -223,18 +223,20 @@ in flight and expensive to retrofit:
       object-safe pattern; `work_items_trait_seam_is_faithful` drives file/claim/
       release/finish/list through `&mut dyn WorkItems`. Store crate 88 tests green;
       fmt + `clippy -D warnings` clean.
-- [~] `SqliteStore` → trait: **deferred pending a design decision** on how to cut
-      its ~100-method surface — one fat trait vs. role/facet traits (EventLog /
-      FactStore / EffectLedger / InstanceRegistry / …). A mechanical fat-trait
-      delegation is possible but would commit a cut I'm not confident is right; the
-      role-trait cut is the design-sensitive part and wants a short design pass
-      before touching the 14k-line file. *When:* before the Phase 5 DO host needs
-      a DO-backed main store.
-- [~] Snapshot/manifest capability on the coordination/item traits (experimentation-
-      subsystem downstream requirement) — deferred until the checkpoint mechanism
-      lands so it is designed against a real consumer (see the trait doc-comments).
-      *(Ordering: after the encapsulation coordination-partition schema change —
-      satisfied.)*
+- [x] `SqliteStore` → `RuntimeStore` trait (`lib.rs`): all 87 backend-agnostic
+      operation methods (event / fact / effect / instance / registry) behind one
+      object-safe trait; native impl forwards to the inherent methods (same
+      delegating pattern). `runtime_store_trait_seam_is_object_safe_and_faithful`
+      drives it through `&dyn RuntimeStore`. Kept the per-store single-trait shape
+      (consistent with `Coordination`/`WorkItems`); role/facet splitting can be a
+      later refinement. Excluded (inherent-only, native-FS): the constructors
+      `open`/`open_in_memory` and `load_package_manifests_from_dir` (takes
+      `impl AsRef<Path>` + reads the local FS — not a DO operation). Store crate
+      89 tests green; fmt + `clippy -D warnings` clean.
+- [~] Snapshot/manifest capability on the store traits (experimentation-subsystem
+      downstream requirement) — deferred until the checkpoint mechanism lands so
+      it is designed against a real consumer (see the trait doc-comments). This is
+      the only Phase-3 remnant, deferred-with-cause.
 
 ### Phase 4 — Files route through the store trait (tiering seam)
 - [ ] Route `file.read/write/import/export` through the store trait so a second

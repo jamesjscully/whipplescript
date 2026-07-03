@@ -5194,6 +5194,583 @@ impl SqliteStore {
     }
 }
 
+/// The durable runtime store as a backend-agnostic, object-safe trait — the
+/// sans-IO store seam (DR-0033 Phase 3). A durable-object SQLite backend
+/// implements the same event / fact / effect / instance / registry operations
+/// the native rusqlite `SqliteStore` provides, so the DO host can back the
+/// runtime without the language changing. The native impl forwards to the
+/// inherent methods (delegation via inherent-method precedence, guarded by
+/// `unconditional_recursion`).
+///
+/// Excluded from the seam (kept inherent-only): constructors (`open`/
+/// `open_in_memory`) and native-filesystem convenience methods that take an
+/// `impl AsRef<Path>` and read the local FS — the DO host does not load from a
+/// directory. Excluded: `load_package_manifests_from_dir`.
+#[allow(clippy::too_many_arguments)]
+pub trait RuntimeStore {
+    fn schema_version(&self) -> StoreResult<i64>;
+    fn append_event(&self, event: NewEvent<'_>) -> StoreResult<StoredEvent>;
+    fn create_program_version(
+        &mut self,
+        version: NewProgramVersion<'_>,
+    ) -> StoreResult<ProgramVersionRecord>;
+    fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>>;
+    fn create_instance(&self, instance: NewInstance<'_>) -> StoreResult<InstanceRecord>;
+    fn create_instance_with_authority(
+        &self,
+        instance: NewInstance<'_>,
+        authority: NewInstanceAuthority<'_>,
+    ) -> StoreResult<InstanceRecord>;
+    fn list_instance_revisions(&self, instance_id: &str) -> StoreResult<Vec<WorkflowRevisionView>>;
+    fn revision_cancellation_impact(
+        &self,
+        instance_id: &str,
+        cancellation_policy: &str,
+    ) -> StoreResult<RevisionCancellationImpact>;
+    fn analyze_revision_compatibility(
+        &self,
+        instance_id: &str,
+        candidate_version_id: &str,
+    ) -> StoreResult<RevisionCompatibilityReport>;
+    fn analyze_revision_candidate(
+        &self,
+        instance_id: &str,
+        candidate: RevisionCandidate<'_>,
+    ) -> StoreResult<RevisionCompatibilityReport>;
+    fn activate_revision(
+        &mut self,
+        activation: RevisionActivation<'_>,
+    ) -> StoreResult<WorkflowRevisionView>;
+    fn request_effect_cancellation(
+        &mut self,
+        request: EffectCancellationRequest<'_>,
+    ) -> StoreResult<EffectCancellationRequestView>;
+    fn effect_has_open_cancellation_request(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+    ) -> StoreResult<bool>;
+    fn list_effect_cancellation_requests(
+        &self,
+        instance_id: &str,
+    ) -> StoreResult<Vec<EffectCancellationRequestView>>;
+    fn record_workflow_invocation(&self, invocation: NewWorkflowInvocation<'_>) -> StoreResult<()>;
+    fn get_workflow_invocation(
+        &self,
+        parent_instance_id: &str,
+        parent_effect_id: &str,
+    ) -> StoreResult<Option<WorkflowInvocationView>>;
+    fn list_child_workflow_invocations(
+        &self,
+        parent_instance_id: &str,
+    ) -> StoreResult<Vec<WorkflowInvocationView>>;
+    fn get_parent_workflow_invocation(
+        &self,
+        child_instance_id: &str,
+    ) -> StoreResult<Option<WorkflowInvocationView>>;
+    fn commit_rule(&mut self, commit: RuleCommit<'_>) -> StoreResult<StoredEvent>;
+    fn commit_rule_with_revision_guard(
+        &mut self,
+        commit: RuleCommit<'_>,
+        guard: RuleCommitRevisionGuard<'_>,
+    ) -> StoreResult<StoredEvent>;
+    fn derive_fact(&mut self, derived: DerivedFact<'_>) -> StoreResult<StoredEvent>;
+    fn admit_fact_batch(&mut self, batch: FactBatch<'_>) -> StoreResult<FactBatchOutcome>;
+    fn complete_effect(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent>;
+    fn complete_effect_with_terminal_diagnostic(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+    ) -> StoreResult<StoredEvent>;
+    fn resolve_effect_uncertain(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+    ) -> StoreResult<StoredEvent>;
+    fn claimable_effects(&self, instance_id: &str) -> StoreResult<Vec<ClaimableEffect>>;
+    fn fact_exists(&self, instance_id: &str, fact_name: &str) -> StoreResult<bool>;
+    fn register_package(&self, package: PackageRegistration<'_>) -> StoreResult<()>;
+    fn register_package_manifest(&self, manifest_json: &str) -> StoreResult<String>;
+    fn register_capability_schema(
+        &self,
+        capability: CapabilitySchemaRegistration<'_>,
+    ) -> StoreResult<()>;
+    fn register_effect_provider(&self, provider: EffectProviderRegistration<'_>)
+        -> StoreResult<()>;
+    fn register_profile(&self, profile: ProfileRegistration<'_>) -> StoreResult<()>;
+    fn registered_profile_policy(
+        &self,
+        profile: &str,
+    ) -> StoreResult<Option<RegisteredProfilePolicy>>;
+    fn bind_capability(&self, binding: CapabilityBinding<'_>) -> StoreResult<()>;
+    fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()>;
+    fn attach_skill(&self, attachment: SkillAttachment<'_>) -> StoreResult<()>;
+    fn list_skills(&self) -> StoreResult<Vec<SkillView>>;
+    fn list_skill_attachments(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+    ) -> StoreResult<Vec<SkillAttachmentView>>;
+    fn record_evidence(&self, evidence: EvidenceRecord<'_>) -> StoreResult<String>;
+    fn record_provider_validation_evidence(
+        &self,
+        evidence: ProviderValidationEvidence<'_>,
+    ) -> StoreResult<String>;
+    fn record_codex_app_server_evidence(
+        &self,
+        evidence: CodexAppServerEvidence<'_>,
+    ) -> StoreResult<String>;
+    fn record_claude_agent_sdk_evidence(
+        &self,
+        evidence: ClaudeAgentSdkEvidence<'_>,
+    ) -> StoreResult<String>;
+    fn record_pi_rpc_evidence(&self, evidence: PiRpcEvidence<'_>) -> StoreResult<String>;
+    fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()>;
+    fn record_artifact(&self, artifact: ArtifactRecord<'_>) -> StoreResult<String>;
+    fn list_artifacts_for_run(&self, run_id: &str) -> StoreResult<Vec<ArtifactView>>;
+    fn record_workspace(&self, workspace: WorkspaceRecord<'_>) -> StoreResult<String>;
+    fn get_workspace(&self, workspace_id: &str) -> StoreResult<Option<WorkspaceView>>;
+    fn list_workspaces_for_instance(&self, instance_id: &str) -> StoreResult<Vec<WorkspaceView>>;
+    fn record_diagnostic(&self, diagnostic: DiagnosticRecord<'_>) -> StoreResult<String>;
+    fn list_diagnostics(&self, instance_id: Option<&str>) -> StoreResult<Vec<DiagnosticView>>;
+    fn list_diagnostics_from_events(&self, instance_id: &str) -> StoreResult<Vec<DiagnosticView>>;
+    fn effect_source_span_json(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+    ) -> StoreResult<Option<String>>;
+    fn create_inbox_item(&self, item: NewInboxItem<'_>) -> StoreResult<()>;
+    fn list_inbox_items(&self, status: Option<&str>) -> StoreResult<Vec<InboxItemView>>;
+    fn get_inbox_item(&self, inbox_item_id: &str) -> StoreResult<Option<InboxItemView>>;
+    fn answer_inbox_item(&mut self, answer: HumanAnswer<'_>) -> StoreResult<StoredEvent>;
+    fn cancel_pending_inbox_for_instance(&mut self, instance_id: &str) -> StoreResult<usize>;
+    fn record_skill_evidence(&self, evidence: SkillEvidence<'_>) -> StoreResult<String>;
+    fn list_evidence(&self, instance_id: &str) -> StoreResult<Vec<EvidenceView>>;
+    fn list_evidence_for_subject(
+        &self,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> StoreResult<Vec<EvidenceView>>;
+    fn list_evidence_links(&self, instance_id: &str) -> StoreResult<Vec<EvidenceLinkView>>;
+    fn list_instances(&self) -> StoreResult<Vec<InstanceView>>;
+    fn get_instance(&self, instance_id: &str) -> StoreResult<Option<InstanceView>>;
+    fn list_events(&self, instance_id: &str) -> StoreResult<Vec<EventView>>;
+    fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>>;
+    fn list_facts_including_consumed(&self, instance_id: &str) -> StoreResult<Vec<FactView>>;
+    fn list_effects(&self, instance_id: &str) -> StoreResult<Vec<EffectView>>;
+    fn list_runs(&self, instance_id: &str) -> StoreResult<Vec<RunView>>;
+    fn status(&self, instance_id: &str) -> StoreResult<Option<StatusView>>;
+    fn satisfy_dependencies(&self, instance_id: &str) -> StoreResult<usize>;
+    fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent>;
+    fn block_effect_binding(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        category: &str,
+        detail: &str,
+    ) -> StoreResult<StoredEvent>;
+    fn transition_instance(
+        &mut self,
+        transition: InstanceTransition<'_>,
+    ) -> StoreResult<StoredEvent>;
+    fn due_time_effects(&self, instance_id: &str, now: &str) -> StoreResult<Vec<DueTimeEffect>>;
+    fn due_interval_occurrences(
+        &self,
+        after_scheduled: &str,
+        interval_seconds: i64,
+        now: &str,
+    ) -> StoreResult<Vec<String>>;
+    fn resolve_clock(&self, now: &str) -> StoreResult<String>;
+    fn last_clock_occurrence(&self, instance_id: &str, signal: &str)
+        -> StoreResult<Option<String>>;
+    fn pending_time_effects(&self, instance_id: &str) -> StoreResult<Vec<DueTimeEffect>>;
+    fn expire_effect(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent>;
+    fn retire_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()>;
+    fn cancel_effect(&mut self, cancellation: EffectCancellation<'_>) -> StoreResult<StoredEvent>;
+    fn renew_lease(&mut self, renewal: LeaseRenewal<'_>) -> StoreResult<StoredEvent>;
+    fn expire_leases(&mut self, instance_id: &str, now: &str) -> StoreResult<Vec<ExpiredLease>>;
+    fn retry_effect(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent>;
+    fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()>;
+    fn table_exists(&self, table: &str) -> StoreResult<bool>;
+}
+
+#[allow(clippy::too_many_arguments)]
+impl RuntimeStore for SqliteStore {
+    fn schema_version(&self) -> StoreResult<i64> {
+        self.schema_version()
+    }
+    fn append_event(&self, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
+        self.append_event(event)
+    }
+    fn create_program_version(
+        &mut self,
+        version: NewProgramVersion<'_>,
+    ) -> StoreResult<ProgramVersionRecord> {
+        self.create_program_version(version)
+    }
+    fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>> {
+        self.get_program_version(version_id)
+    }
+    fn create_instance(&self, instance: NewInstance<'_>) -> StoreResult<InstanceRecord> {
+        self.create_instance(instance)
+    }
+    fn create_instance_with_authority(
+        &self,
+        instance: NewInstance<'_>,
+        authority: NewInstanceAuthority<'_>,
+    ) -> StoreResult<InstanceRecord> {
+        self.create_instance_with_authority(instance, authority)
+    }
+    fn list_instance_revisions(&self, instance_id: &str) -> StoreResult<Vec<WorkflowRevisionView>> {
+        self.list_instance_revisions(instance_id)
+    }
+    fn revision_cancellation_impact(
+        &self,
+        instance_id: &str,
+        cancellation_policy: &str,
+    ) -> StoreResult<RevisionCancellationImpact> {
+        self.revision_cancellation_impact(instance_id, cancellation_policy)
+    }
+    fn analyze_revision_compatibility(
+        &self,
+        instance_id: &str,
+        candidate_version_id: &str,
+    ) -> StoreResult<RevisionCompatibilityReport> {
+        self.analyze_revision_compatibility(instance_id, candidate_version_id)
+    }
+    fn analyze_revision_candidate(
+        &self,
+        instance_id: &str,
+        candidate: RevisionCandidate<'_>,
+    ) -> StoreResult<RevisionCompatibilityReport> {
+        self.analyze_revision_candidate(instance_id, candidate)
+    }
+    fn activate_revision(
+        &mut self,
+        activation: RevisionActivation<'_>,
+    ) -> StoreResult<WorkflowRevisionView> {
+        self.activate_revision(activation)
+    }
+    fn request_effect_cancellation(
+        &mut self,
+        request: EffectCancellationRequest<'_>,
+    ) -> StoreResult<EffectCancellationRequestView> {
+        self.request_effect_cancellation(request)
+    }
+    fn effect_has_open_cancellation_request(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+    ) -> StoreResult<bool> {
+        self.effect_has_open_cancellation_request(instance_id, effect_id)
+    }
+    fn list_effect_cancellation_requests(
+        &self,
+        instance_id: &str,
+    ) -> StoreResult<Vec<EffectCancellationRequestView>> {
+        self.list_effect_cancellation_requests(instance_id)
+    }
+    fn record_workflow_invocation(&self, invocation: NewWorkflowInvocation<'_>) -> StoreResult<()> {
+        self.record_workflow_invocation(invocation)
+    }
+    fn get_workflow_invocation(
+        &self,
+        parent_instance_id: &str,
+        parent_effect_id: &str,
+    ) -> StoreResult<Option<WorkflowInvocationView>> {
+        self.get_workflow_invocation(parent_instance_id, parent_effect_id)
+    }
+    fn list_child_workflow_invocations(
+        &self,
+        parent_instance_id: &str,
+    ) -> StoreResult<Vec<WorkflowInvocationView>> {
+        self.list_child_workflow_invocations(parent_instance_id)
+    }
+    fn get_parent_workflow_invocation(
+        &self,
+        child_instance_id: &str,
+    ) -> StoreResult<Option<WorkflowInvocationView>> {
+        self.get_parent_workflow_invocation(child_instance_id)
+    }
+    fn commit_rule(&mut self, commit: RuleCommit<'_>) -> StoreResult<StoredEvent> {
+        self.commit_rule(commit)
+    }
+    fn commit_rule_with_revision_guard(
+        &mut self,
+        commit: RuleCommit<'_>,
+        guard: RuleCommitRevisionGuard<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.commit_rule_with_revision_guard(commit, guard)
+    }
+    fn derive_fact(&mut self, derived: DerivedFact<'_>) -> StoreResult<StoredEvent> {
+        self.derive_fact(derived)
+    }
+    fn admit_fact_batch(&mut self, batch: FactBatch<'_>) -> StoreResult<FactBatchOutcome> {
+        self.admit_fact_batch(batch)
+    }
+    fn complete_effect(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
+        self.complete_effect(completion)
+    }
+    fn complete_effect_with_terminal_diagnostic(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+    ) -> StoreResult<StoredEvent> {
+        self.complete_effect_with_terminal_diagnostic(completion, diagnostic)
+    }
+    fn resolve_effect_uncertain(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+    ) -> StoreResult<StoredEvent> {
+        self.resolve_effect_uncertain(completion, diagnostic)
+    }
+    fn claimable_effects(&self, instance_id: &str) -> StoreResult<Vec<ClaimableEffect>> {
+        self.claimable_effects(instance_id)
+    }
+    fn fact_exists(&self, instance_id: &str, fact_name: &str) -> StoreResult<bool> {
+        self.fact_exists(instance_id, fact_name)
+    }
+    fn register_package(&self, package: PackageRegistration<'_>) -> StoreResult<()> {
+        self.register_package(package)
+    }
+    fn register_package_manifest(&self, manifest_json: &str) -> StoreResult<String> {
+        self.register_package_manifest(manifest_json)
+    }
+    fn register_capability_schema(
+        &self,
+        capability: CapabilitySchemaRegistration<'_>,
+    ) -> StoreResult<()> {
+        self.register_capability_schema(capability)
+    }
+    fn register_effect_provider(
+        &self,
+        provider: EffectProviderRegistration<'_>,
+    ) -> StoreResult<()> {
+        self.register_effect_provider(provider)
+    }
+    fn register_profile(&self, profile: ProfileRegistration<'_>) -> StoreResult<()> {
+        self.register_profile(profile)
+    }
+    fn registered_profile_policy(
+        &self,
+        profile: &str,
+    ) -> StoreResult<Option<RegisteredProfilePolicy>> {
+        self.registered_profile_policy(profile)
+    }
+    fn bind_capability(&self, binding: CapabilityBinding<'_>) -> StoreResult<()> {
+        self.bind_capability(binding)
+    }
+    fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {
+        self.register_skill(skill)
+    }
+    fn attach_skill(&self, attachment: SkillAttachment<'_>) -> StoreResult<()> {
+        self.attach_skill(attachment)
+    }
+    fn list_skills(&self) -> StoreResult<Vec<SkillView>> {
+        self.list_skills()
+    }
+    fn list_skill_attachments(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+    ) -> StoreResult<Vec<SkillAttachmentView>> {
+        self.list_skill_attachments(scope_type, scope_id)
+    }
+    fn record_evidence(&self, evidence: EvidenceRecord<'_>) -> StoreResult<String> {
+        self.record_evidence(evidence)
+    }
+    fn record_provider_validation_evidence(
+        &self,
+        evidence: ProviderValidationEvidence<'_>,
+    ) -> StoreResult<String> {
+        self.record_provider_validation_evidence(evidence)
+    }
+    fn record_codex_app_server_evidence(
+        &self,
+        evidence: CodexAppServerEvidence<'_>,
+    ) -> StoreResult<String> {
+        self.record_codex_app_server_evidence(evidence)
+    }
+    fn record_claude_agent_sdk_evidence(
+        &self,
+        evidence: ClaudeAgentSdkEvidence<'_>,
+    ) -> StoreResult<String> {
+        self.record_claude_agent_sdk_evidence(evidence)
+    }
+    fn record_pi_rpc_evidence(&self, evidence: PiRpcEvidence<'_>) -> StoreResult<String> {
+        self.record_pi_rpc_evidence(evidence)
+    }
+    fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()> {
+        self.link_evidence(link)
+    }
+    fn record_artifact(&self, artifact: ArtifactRecord<'_>) -> StoreResult<String> {
+        self.record_artifact(artifact)
+    }
+    fn list_artifacts_for_run(&self, run_id: &str) -> StoreResult<Vec<ArtifactView>> {
+        self.list_artifacts_for_run(run_id)
+    }
+    fn record_workspace(&self, workspace: WorkspaceRecord<'_>) -> StoreResult<String> {
+        self.record_workspace(workspace)
+    }
+    fn get_workspace(&self, workspace_id: &str) -> StoreResult<Option<WorkspaceView>> {
+        self.get_workspace(workspace_id)
+    }
+    fn list_workspaces_for_instance(&self, instance_id: &str) -> StoreResult<Vec<WorkspaceView>> {
+        self.list_workspaces_for_instance(instance_id)
+    }
+    fn record_diagnostic(&self, diagnostic: DiagnosticRecord<'_>) -> StoreResult<String> {
+        self.record_diagnostic(diagnostic)
+    }
+    fn list_diagnostics(&self, instance_id: Option<&str>) -> StoreResult<Vec<DiagnosticView>> {
+        self.list_diagnostics(instance_id)
+    }
+    fn list_diagnostics_from_events(&self, instance_id: &str) -> StoreResult<Vec<DiagnosticView>> {
+        self.list_diagnostics_from_events(instance_id)
+    }
+    fn effect_source_span_json(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+    ) -> StoreResult<Option<String>> {
+        self.effect_source_span_json(instance_id, effect_id)
+    }
+    fn create_inbox_item(&self, item: NewInboxItem<'_>) -> StoreResult<()> {
+        self.create_inbox_item(item)
+    }
+    fn list_inbox_items(&self, status: Option<&str>) -> StoreResult<Vec<InboxItemView>> {
+        self.list_inbox_items(status)
+    }
+    fn get_inbox_item(&self, inbox_item_id: &str) -> StoreResult<Option<InboxItemView>> {
+        self.get_inbox_item(inbox_item_id)
+    }
+    fn answer_inbox_item(&mut self, answer: HumanAnswer<'_>) -> StoreResult<StoredEvent> {
+        self.answer_inbox_item(answer)
+    }
+    fn cancel_pending_inbox_for_instance(&mut self, instance_id: &str) -> StoreResult<usize> {
+        self.cancel_pending_inbox_for_instance(instance_id)
+    }
+    fn record_skill_evidence(&self, evidence: SkillEvidence<'_>) -> StoreResult<String> {
+        self.record_skill_evidence(evidence)
+    }
+    fn list_evidence(&self, instance_id: &str) -> StoreResult<Vec<EvidenceView>> {
+        self.list_evidence(instance_id)
+    }
+    fn list_evidence_for_subject(
+        &self,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> StoreResult<Vec<EvidenceView>> {
+        self.list_evidence_for_subject(subject_type, subject_id)
+    }
+    fn list_evidence_links(&self, instance_id: &str) -> StoreResult<Vec<EvidenceLinkView>> {
+        self.list_evidence_links(instance_id)
+    }
+    fn list_instances(&self) -> StoreResult<Vec<InstanceView>> {
+        self.list_instances()
+    }
+    fn get_instance(&self, instance_id: &str) -> StoreResult<Option<InstanceView>> {
+        self.get_instance(instance_id)
+    }
+    fn list_events(&self, instance_id: &str) -> StoreResult<Vec<EventView>> {
+        self.list_events(instance_id)
+    }
+    fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
+        self.list_facts(instance_id)
+    }
+    fn list_facts_including_consumed(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
+        self.list_facts_including_consumed(instance_id)
+    }
+    fn list_effects(&self, instance_id: &str) -> StoreResult<Vec<EffectView>> {
+        self.list_effects(instance_id)
+    }
+    fn list_runs(&self, instance_id: &str) -> StoreResult<Vec<RunView>> {
+        self.list_runs(instance_id)
+    }
+    fn status(&self, instance_id: &str) -> StoreResult<Option<StatusView>> {
+        self.status(instance_id)
+    }
+    fn satisfy_dependencies(&self, instance_id: &str) -> StoreResult<usize> {
+        self.satisfy_dependencies(instance_id)
+    }
+    fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
+        self.start_run(run)
+    }
+    fn block_effect_binding(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        category: &str,
+        detail: &str,
+    ) -> StoreResult<StoredEvent> {
+        self.block_effect_binding(instance_id, effect_id, category, detail)
+    }
+    fn transition_instance(
+        &mut self,
+        transition: InstanceTransition<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.transition_instance(transition)
+    }
+    fn due_time_effects(&self, instance_id: &str, now: &str) -> StoreResult<Vec<DueTimeEffect>> {
+        self.due_time_effects(instance_id, now)
+    }
+    fn due_interval_occurrences(
+        &self,
+        after_scheduled: &str,
+        interval_seconds: i64,
+        now: &str,
+    ) -> StoreResult<Vec<String>> {
+        self.due_interval_occurrences(after_scheduled, interval_seconds, now)
+    }
+    fn resolve_clock(&self, now: &str) -> StoreResult<String> {
+        self.resolve_clock(now)
+    }
+    fn last_clock_occurrence(
+        &self,
+        instance_id: &str,
+        signal: &str,
+    ) -> StoreResult<Option<String>> {
+        self.last_clock_occurrence(instance_id, signal)
+    }
+    fn pending_time_effects(&self, instance_id: &str) -> StoreResult<Vec<DueTimeEffect>> {
+        self.pending_time_effects(instance_id)
+    }
+    fn expire_effect(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        self.expire_effect(instance_id, effect_id, idempotency_key)
+    }
+    fn retire_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
+        self.retire_fact(instance_id, fact_id)
+    }
+    fn cancel_effect(&mut self, cancellation: EffectCancellation<'_>) -> StoreResult<StoredEvent> {
+        self.cancel_effect(cancellation)
+    }
+    fn renew_lease(&mut self, renewal: LeaseRenewal<'_>) -> StoreResult<StoredEvent> {
+        self.renew_lease(renewal)
+    }
+    fn expire_leases(&mut self, instance_id: &str, now: &str) -> StoreResult<Vec<ExpiredLease>> {
+        self.expire_leases(instance_id, now)
+    }
+    fn retry_effect(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
+        self.retry_effect(retry)
+    }
+    fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
+        self.rebuild_projections(instance_id)
+    }
+    fn table_exists(&self, table: &str) -> StoreResult<bool> {
+        self.table_exists(table)
+    }
+}
+
 #[cfg(unix)]
 fn harden_store_file_permissions(path: &Path) -> StoreResult<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -8798,6 +9375,22 @@ mod tests {
     #[test]
     fn store_scaffold_links_to_core() {
         assert_eq!(store_stage(), "stage-0-skeleton");
+    }
+
+    /// Drive the store through the `RuntimeStore` trait as a `&dyn` object:
+    /// proves the trait is object-safe (a boxed durable-object backend is legal)
+    /// and that its methods delegate to the inherent methods — the contract a
+    /// DO-backed store satisfies. Spot-checks representative reads against known
+    /// post-migration state.
+    #[test]
+    fn runtime_store_trait_seam_is_object_safe_and_faithful() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let runtime: &dyn RuntimeStore = &store;
+        assert_eq!(runtime.schema_version().expect("version"), 1);
+        assert!(runtime.table_exists("events").expect("table exists"));
+        assert!(!runtime
+            .fact_exists("no_such_instance", "no_such_fact")
+            .expect("fact query"));
     }
 
     #[test]
