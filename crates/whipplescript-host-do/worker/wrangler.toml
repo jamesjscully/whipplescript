@@ -1,0 +1,30 @@
+# Cloudflare Worker + Durable Object binding for the WhippleScript DO host
+# (DR-0033 Phase 5). Deploy with `npx wrangler deploy` after building the wasm
+# (`wasm-pack build --target bundler` — see README.md).
+
+name = "whipplescript-do"
+main = "src/index.ts"
+compatibility_date = "2026-07-01"
+
+# The instance store is a Durable Object with the SQLite storage backend — the
+# synchronous `state.storage.sql` API the Rust `DoStorage`/`RuntimeStore`
+# implement over.
+[[durable_objects.bindings]]
+name = "WHIPPLE_INSTANCE"
+class_name = "WhippleInstance"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WhippleInstance"]
+
+# Provider credentials are Worker secrets (the Rust `Secrets` plane), never
+# dotfiles. Set with `npx wrangler secret put ANTHROPIC_API_KEY`, etc.
+# vars listed here are non-secret config only.
+[vars]
+WHIPPLE_FILE_SPILL_THRESHOLD_BYTES = "131072"
+
+# Large-file tier (Phase 7): an R2 bucket backs the Rust `ObjectStore`. Files at
+# or above the spill threshold stream here; the isolate never buffers the bytes.
+[[r2_buckets]]
+binding = "WHIPPLE_OBJECTS"
+bucket_name = "whipplescript-large-objects"

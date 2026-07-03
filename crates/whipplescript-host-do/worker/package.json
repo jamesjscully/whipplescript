@@ -1,0 +1,17 @@
+{
+  "name": "whipplescript-do-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker/Durable Object shell for the WhippleScript sans-IO core",
+  "scripts": {
+    "build:wasm": "wasm-pack build .. --target bundler --out-dir worker/pkg --no-default-features",
+    "typecheck": "tsc --noEmit",
+    "deploy": "npm run build:wasm && wrangler deploy",
+    "dev": "npm run build:wasm && wrangler dev"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260701.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^3.60.0"
+  }
+}

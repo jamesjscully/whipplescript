@@ -300,13 +300,21 @@ in flight and expensive to retrofit:
             space). Tested (`do_file_store_round_trips_through_the_file_seam`).
       - Crate builds native (2 tests green, clippy `-D warnings` clean) **and**
         `--no-default-features --target wasm32-unknown-unknown`.
+      - [~] TS/Worker shell landed (`worker/`): `src/index.ts` (the
+            `WhippleInstance` DO class running the sans-IO drive loop — step the
+            synchronous Rust machine, await `fetch` on `NeedsIo(Http)`, re-enter),
+            `wrangler.toml` (DO SQLite class + R2 large-object bucket + secrets),
+            `package.json`/`tsconfig.json`, and a README mapping each Rust host
+            trait to its DO primitive. Deployment scaffold — real code, not built
+            here.
       - [ ] Full `RuntimeStore` impl over `DoStorage` (the DO runs the same SQL
-            the native `SqliteStore` does, through the DO SQL API); the TS/Worker
-            shell + wrangler + `wasm-bindgen`/`worker`-crate glue; routing every
-            new delivery/re-entry seam through the E2-DYN marker door. **Needs a
-            live Cloudflare DO runtime to build and test against** — the seams
-            they plug into (`FetchHost`, `DoStorage`, `RuntimeKernel<S>`) are
-            proven here.
+            the native `SqliteStore` does, through the DO SQL API) + the
+            `wasm-bindgen` surface the shell imports (`createInstance`/`step`/
+            `snapshot`); routing every new delivery/re-entry seam through the
+            E2-DYN marker door. **Needs a live Cloudflare DO runtime to build and
+            test against** — the seams they plug into (`FetchHost`, `DoStorage`,
+            `Alarms`, `Secrets`, `ObjectStore`, `RuntimeKernel<S>`) are proven
+            here.
 
 ### Phase 6 — Scheduling + config on the DO
 - [~] Seams landed in `whipplescript-host-do` (real, tested, native + wasm):
