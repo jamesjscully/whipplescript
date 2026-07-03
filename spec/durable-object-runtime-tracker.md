@@ -123,7 +123,7 @@ in flight and expensive to retrofit:
    file manifest. The coordination store is workspace-scoped and
    cross-instance, so a cut that omits it makes replay-from-checkpoint
    non-deterministic and hollows out the subsystem's checkpoint-conditional
-   evidence semantics (research note §6, §16). Phase 3 (store behind
+   evidence semantics (research note §7, §16). Phase 3 (store behind
    a trait) is the cheap moment to shape this: cut the coordination trait with
    a snapshot/manifest capability in view.
 2. **Content-addressing stays canonical and stable** across tiers and hosts
@@ -309,15 +309,28 @@ in flight and expensive to retrofit:
             proven here.
 
 ### Phase 6 — Scheduling + config on the DO
-- [ ] Clock-source + timers → DO **alarms** (replaces external polling). Config/
-      credentials → Worker **secrets** (no dotfiles). `chrono` std → data-only
-      `chrono-tz`; `Instant` → injected virtual clock.
+- [~] Seams landed in `whipplescript-host-do` (real, tested, native + wasm):
+      `Alarms` trait (single-wake-up scheduler — clock-source/timers set the next
+      due time here instead of an external poller; the Worker `alarm()` handler
+      steps the instance) and `Secrets` trait (config/credentials plane, no
+      dotfiles). Tested (`alarms_hold_one_wakeup_and_secrets_resolve_config`).
+- [ ] Wire them into the runtime: clock-source + timer effects call `Alarms`;
+      provider credential resolution reads `Secrets`; `chrono` std → data-only
+      `chrono-tz`; `Instant` → injected virtual clock. *(Needs the live DO alarm
+      API + Worker secrets binding.)*
 
 ### Phase 7 — Large-object tier (designed now, built later)
-- [ ] Platform object-store backing behind the same file store trait: content-
-      addressed keys, threshold spill, streamed import/export via a data-plane
-      worker, presigned URLs for client↔storage transfer. Isolate never buffers
-      bytes. Enterprise-tier deliverable (native/OSS backs files with local fs).
+- [~] Seam landed in `whipplescript-host-do` (real, tested, native + wasm):
+      `ObjectStore` trait + `TieredFileStore` — one `FileStore` surface that
+      routes writes by size (small → inline `DoStorage`; ≥ threshold → spilled
+      `ObjectStore`), keeping each file in exactly one tier so reads are
+      unambiguous (DR-0033 Decision 4). Tested
+      (`tiered_file_store_routes_by_size_and_keeps_one_tier`).
+- [ ] Back `ObjectStore` with a real platform store (content-addressed keys,
+      streamed import/export via a data-plane worker, presigned URLs for
+      client↔storage transfer, isolate never buffers bytes). Enterprise-tier
+      deliverable; native/OSS backs files with local fs. *(Needs the platform
+      object store.)*
 
 ---
 

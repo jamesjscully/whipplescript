@@ -112,6 +112,101 @@ impl<S: DoStorage> FileStore for DoFileStore<S> {
     }
 }
 
+// -- Scheduling + config: alarms and secrets (Phase 6) --------------------
+
+/// The DO's single-wake-up alarm scheduler. The clock-source / timer effects set
+/// the next due time here instead of an external poller; the Worker's `alarm()`
+/// handler steps the instance when it fires. One pending wake-up per instance —
+/// the runtime keeps the earliest due time.
+pub trait Alarms {
+    /// Schedule (or reschedule) the next wake-up at `at_unix_ms`.
+    fn set_alarm(&self, at_unix_ms: i64);
+    /// The currently-scheduled wake-up, if any.
+    fn current_alarm(&self) -> Option<i64>;
+    /// Clear the pending wake-up.
+    fn clear_alarm(&self);
+}
+
+/// Worker secrets — the DO's config/credentials plane (no dotfiles). Provider API
+/// keys and endpoint config are read from here.
+pub trait Secrets {
+    fn get(&self, name: &str) -> Option<String>;
+}
+
+// -- Large-object tier (Phase 7) ------------------------------------------
+
+/// A platform object store for large files spilled out of DO SQLite. Keys are
+/// content paths; in a deployment the bytes stream out-of-band (the isolate never
+/// buffers them in the general path).
+pub trait ObjectStore {
+    fn put(&self, key: &str, bytes: &[u8]) -> io::Result<()>;
+    fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>>;
+    fn delete(&self, key: &str) -> io::Result<()>;
+    fn exists(&self, key: &str) -> bool;
+}
+
+/// Runtime-owned file tiering (DR-0033 Decision 4): small files inline in DO
+/// SQLite ([`DoStorage`]); files at or above `threshold_bytes` spill to the
+/// [`ObjectStore`]. One [`FileStore`] surface — the language never sees the
+/// split. Each file lives in exactly one tier: a write picks the tier by size and
+/// clears any copy in the other tier, so reads are unambiguous.
+pub struct TieredFileStore<S: DoStorage, O: ObjectStore> {
+    pub storage: S,
+    pub objects: O,
+    pub threshold_bytes: usize,
+}
+
+impl<S: DoStorage, O: ObjectStore> FileStore for TieredFileStore<S, O> {
+    fn read_to_string(&self, path: &Path) -> io::Result<String> {
+        let key = storage_key(path);
+        if let Some(bytes) = self.objects.get(&key)? {
+            return String::from_utf8(bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+        }
+        match self.storage.read_file(&key)? {
+            Some(content) => Ok(content),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no such file: {}", path.display()),
+            )),
+        }
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        let key = storage_key(path);
+        self.storage.file_exists(&key) || self.objects.exists(&key)
+    }
+
+    fn create_dir_all(&self, _path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let key = storage_key(path);
+        if bytes.len() >= self.threshold_bytes {
+            // Large tier: spill to the object store, drop any inline copy.
+            if self.storage.file_exists(&key) {
+                self.storage.write_file(&key, "")?;
+            }
+            self.objects.put(&key, bytes)
+        } else {
+            // Small tier: inline in SQLite, drop any spilled copy.
+            if self.objects.exists(&key) {
+                self.objects.delete(&key)?;
+            }
+            self.storage
+                .write_file(&key, &String::from_utf8_lossy(bytes))
+        }
+    }
+
+    fn append(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        // Append targets the inline tier; a large spilled file would need a
+        // streamed read-modify-write through the object store (deferred).
+        self.storage
+            .append_file(&storage_key(path), &String::from_utf8_lossy(bytes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +316,108 @@ mod tests {
         files.append(path, b" world").expect("append");
         assert_eq!(files.read_to_string(path).expect("read"), "hello world");
         assert!(files.read_to_string(Path::new("missing")).is_err());
+    }
+
+    // -- large-object tier -------------------------------------------------
+
+    #[derive(Default)]
+    struct MemObjects {
+        blobs: RefCell<HashMap<String, Vec<u8>>>,
+    }
+
+    impl ObjectStore for MemObjects {
+        fn put(&self, key: &str, bytes: &[u8]) -> io::Result<()> {
+            self.blobs
+                .borrow_mut()
+                .insert(key.to_string(), bytes.to_vec());
+            Ok(())
+        }
+        fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+            Ok(self.blobs.borrow().get(key).cloned())
+        }
+        fn delete(&self, key: &str) -> io::Result<()> {
+            self.blobs.borrow_mut().remove(key);
+            Ok(())
+        }
+        fn exists(&self, key: &str) -> bool {
+            self.blobs.borrow().contains_key(key)
+        }
+    }
+
+    #[test]
+    fn tiered_file_store_routes_by_size_and_keeps_one_tier() {
+        let store = TieredFileStore {
+            storage: MemStorage::default(),
+            objects: MemObjects::default(),
+            threshold_bytes: 8,
+        };
+        let small = Path::new("s.txt");
+        let big = Path::new("b.bin");
+
+        // Small file inlines in DO SQLite; not in the object store.
+        store.write(small, b"hi").expect("small write");
+        assert!(store.storage.file_exists("s.txt"));
+        assert!(!store.objects.exists("s.txt"));
+        assert_eq!(store.read_to_string(small).expect("read small"), "hi");
+
+        // Large file spills to the object store; not inline.
+        store.write(big, b"0123456789").expect("big write");
+        assert!(store.objects.exists("b.bin"));
+        assert!(!store.storage.file_exists("b.bin"));
+        assert_eq!(store.read_to_string(big).expect("read big"), "0123456789");
+        assert!(store.exists(big));
+
+        // Rewriting the big file small moves it back to the inline tier (one tier).
+        store.write(big, b"tiny").expect("shrink");
+        assert!(store.storage.file_exists("b.bin"));
+        assert!(!store.objects.exists("b.bin"));
+        assert_eq!(store.read_to_string(big).expect("read shrunk"), "tiny");
+    }
+
+    // -- alarms + secrets --------------------------------------------------
+
+    #[derive(Default)]
+    struct MemAlarms {
+        at: RefCell<Option<i64>>,
+    }
+
+    impl Alarms for MemAlarms {
+        fn set_alarm(&self, at_unix_ms: i64) {
+            *self.at.borrow_mut() = Some(at_unix_ms);
+        }
+        fn current_alarm(&self) -> Option<i64> {
+            *self.at.borrow()
+        }
+        fn clear_alarm(&self) {
+            *self.at.borrow_mut() = None;
+        }
+    }
+
+    struct MemSecrets;
+    impl Secrets for MemSecrets {
+        fn get(&self, name: &str) -> Option<String> {
+            match name {
+                "ANTHROPIC_API_KEY" => Some("sk-ant-test".to_string()),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn alarms_hold_one_wakeup_and_secrets_resolve_config() {
+        let alarms = MemAlarms::default();
+        assert_eq!(alarms.current_alarm(), None);
+        alarms.set_alarm(1_000);
+        alarms.set_alarm(2_000);
+        assert_eq!(alarms.current_alarm(), Some(2_000));
+        alarms.clear_alarm();
+        assert_eq!(alarms.current_alarm(), None);
+
+        let secrets = MemSecrets;
+        assert_eq!(
+            secrets.get("ANTHROPIC_API_KEY").as_deref(),
+            Some("sk-ant-test")
+        );
+        assert_eq!(secrets.get("MISSING"), None);
     }
 }
