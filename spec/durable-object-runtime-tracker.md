@@ -522,7 +522,7 @@ linear undo chain). No phase work now.
             (5b) **DO-reachable effect handler cores — STARTED (commit 9124f67).**
             Pattern established: lift each store-only core into
             `kernel::effect_handlers` (host-neutral, `EffectConfig`-only) so both
-            `InstanceDriver` bindings dispatch it. `event.emit` + `loft.claim` DONE (9124f67, 8bdfe2c) — lifted to the
+            `InstanceDriver` bindings dispatch it. event+loft+human+queue+coordination+file(read/write/import) cores lifted to kernel::effect_handlers (9124f67,8bdfe2c,36422c7); DO dispatches event/loft/human/queue/coordination (file cores await DoFileStore on the driver) — lifted to the
             kernel, native wrapper imports it, the DO's `run_effect` executes it over
             `RuntimeKernel<DoSqliteStore>` (its first executable effect). REMAINING:
             lift the other ~10 store-only cores the same way (loft/human/queue/
