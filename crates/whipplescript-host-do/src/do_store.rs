@@ -2,35 +2,28 @@
 //! synchronous SQLite (`DoSql`), instead of native rusqlite. This is DR-0033
 //! Phase 5's core store binding.
 //!
-//! STATUS (honest): **72 of the 87 `RuntimeStore` methods are ported and verified
-//! against real SQLite** (the tests back `DoSql` with rusqlite, so the ported SQL
-//! runs against an actual engine). Done: the whole read/query family
-//! (`list_*`/`get_*`/`status`), the registration + manifest fan-out, skills,
-//! inbox, evidence/diagnostic/artifact records, the clock/time-obligation and
-//! dependency queries, leases, fact derivation + batch admission, program-version
-//! creation, and the event-append lifecycle transitions
-//! (transition_instance / block_effect_binding / expire_effect / retry_effect /
-//! cancel_pending_inbox_for_instance). A shared `do_append_event` /
-//! `do_insert_fact` / `do_insert_evidence` set mirrors the native inner helpers.
+//! STATUS: **all 87 `RuntimeStore` methods are ported and verified against real
+//! SQLite** — every method's SQL runs against an actual engine because the tests
+//! back `DoSql` with rusqlite. This covers the whole surface: the read/query
+//! family (`list_*`/`get_*`/`status`), registration + manifest fan-out, skills,
+//! inbox, evidence/diagnostic/artifact records, clock/time-obligation + dependency
+//! queries, leases, fact derivation + batch admission, program-version + revision
+//! management, the capability/profile policy + capacity engine (`claimable_effects`),
+//! the transactional write-path core (`commit_rule`(+guard), the `complete_effect`
+//! family, `start_run`, `cancel_effect`, `request_effect_cancellation`,
+//! `activate_revision`, the revision compatibility analysis), and
+//! `rebuild_projections` with its full `do_replay_*` suite (the write path in
+//! replay form). Shared `do_*` helpers mirror the native inner helpers; a couple
+//! of long paths (`commit_rule_inner`, `complete_effect_terminal_inner`,
+//! `insert_effect_cancellation_request`) live as inherent methods.
 //!
-//! REMAINING (15): the deeply-interlocked transactional write-path core, each
-//! with its own multi-helper chain —
-//!   * `commit_rule` / `commit_rule_with_revision_guard` (the rule-engine commit),
-//!   * `complete_effect` / `complete_effect_with_terminal_diagnostic` /
-//!     `resolve_effect_uncertain` (shared `complete_effect_terminal_inner`),
-//!   * `start_run`, `cancel_effect` (holder-resource release),
-//!     `request_effect_cancellation` (evidence + running-run fan-out),
-//!   * `claimable_effects` (needs `policy_block_on` + `capacity_block_on`),
-//!   * `rebuild_projections` (+ its ~10 `replay_*` helpers = the write path in
-//!     replay form),
-//!   * the revision family: `revision_cancellation_impact`,
-//!     `analyze_revision_compatibility`, `analyze_revision_candidate`,
-//!     `activate_revision`.
-//! These run the *same* SQL the native `SqliteStore` does; the DO's single-writer
-//! per-invocation model provides the atomicity the native path gets from a
-//! rusqlite transaction. Final correctness is against the *DO's* SQLite, which
-//! needs a live Durable Object (`worker` crate) to build and verify; the tracker's
-//! Phase-5 store box stays open until that port + live verification is done.
+//! The DO runs the *same* SQL the native `SqliteStore` does; the DO's single-writer
+//! per-invocation model provides the atomicity the native path gets from a rusqlite
+//! transaction (the store methods never yield mid-sequence). What remains before
+//! the Phase-5 store box closes is *live-DO* validation: a `DoSql` impl over the
+//! real `state.storage.sql` in the `worker` crate, exercised end-to-end against an
+//! actual Durable Object. The Rust side is complete and green (native tests +
+//! clippy + `wasm32-unknown-unknown`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1348,6 +1341,627 @@ fn do_insert_effect_dependency<Sql: DoSql>(
             text(dependency.downstream_effect_id),
             text(dependency.predicate),
             text(rule),
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+/// Re-queues `blocked_by_dependency` effects whose dependencies are now satisfied,
+/// returning the count. Mirrors `satisfy_dependencies_on`.
+fn do_satisfy_dependencies<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResult<usize> {
+    let updated = sql
+        .execute(
+            "UPDATE effects SET status = 'queued', updated_at = CURRENT_TIMESTAMP \
+             WHERE instance_id = ?1 AND status = 'blocked_by_dependency' \
+             AND effect_id IN ( \
+               SELECT candidate.effect_id FROM effects AS candidate \
+               WHERE candidate.instance_id = ?1 AND NOT EXISTS ( \
+                 SELECT 1 FROM effect_dependencies AS dependency \
+                 JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
+                  AND upstream.instance_id = dependency.instance_id \
+                 WHERE dependency.instance_id = candidate.instance_id \
+                   AND dependency.downstream_effect_id = candidate.effect_id AND NOT ( \
+                     (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
+                     OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
+                     OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
+                     OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
+                     OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
+                   ) \
+               ) \
+             )",
+            &[text(instance_id)],
+        )
+        .map_err(sql_err)?;
+    Ok(updated as usize)
+}
+
+// ---------------------------------------------------------------------------
+// Projection replay — one `do_replay_*` per persisted event type, reconstructing
+// the facts / effects / runs / leases / revisions / cancellation-request
+// projections from the append-only event log. Mirrors the native `replay_*`
+// helpers; `rebuild_projections` deletes the projections and drives these.
+// ---------------------------------------------------------------------------
+
+fn do_replay_rule_commit<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    event_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let rule = payload
+        .get("rule")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let commit_program_version_id = payload.get("program_version_id").and_then(Value::as_str);
+    let commit_revision_epoch = payload
+        .get("revision_epoch")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+
+    for fact in payload
+        .get("facts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let value_json = fact
+            .get("value")
+            .map(Value::to_string)
+            .unwrap_or_else(|| "{}".to_owned());
+        let source_span_json = fact.get("source_span").map(Value::to_string);
+        let program_version_id = fact
+            .get("program_version_id")
+            .and_then(Value::as_str)
+            .or(commit_program_version_id);
+        let revision_epoch = fact
+            .get("revision_epoch")
+            .and_then(Value::as_i64)
+            .unwrap_or(commit_revision_epoch);
+        let new_fact = NewFact {
+            fact_id: fact.get("fact_id").and_then(Value::as_str).unwrap_or(""),
+            name: fact.get("name").and_then(Value::as_str).unwrap_or(""),
+            key: fact.get("key").and_then(Value::as_str).unwrap_or(""),
+            value_json: &value_json,
+            schema_id: fact.get("schema_id").and_then(Value::as_str),
+            provenance_class: fact
+                .get("provenance_class")
+                .and_then(Value::as_str)
+                .unwrap_or("replayed"),
+            correlation_id: fact.get("correlation_id").and_then(Value::as_str),
+            source_span_json: source_span_json.as_deref(),
+        };
+        do_insert_fact(
+            sql,
+            instance_id,
+            rule,
+            event_id,
+            program_version_id,
+            revision_epoch,
+            &new_fact,
+        )?;
+    }
+
+    let consumed_fact_ids = payload
+        .get("consumed_facts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|fact| {
+            fact.get("fact_id")
+                .and_then(Value::as_str)
+                .or_else(|| fact.as_str())
+        })
+        .collect::<Vec<_>>();
+    do_consume_facts(sql, instance_id, &consumed_fact_ids)?;
+
+    for effect in payload
+        .get("effects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let input_json = effect
+            .get("input")
+            .map(Value::to_string)
+            .unwrap_or_else(|| "{}".to_owned());
+        let required_capabilities_json = effect
+            .get("required_capabilities")
+            .map(Value::to_string)
+            .unwrap_or_else(|| "[]".to_owned());
+        let source_span_json = effect.get("source_span").map(Value::to_string);
+        let program_version_id = effect
+            .get("program_version_id")
+            .and_then(Value::as_str)
+            .or(commit_program_version_id);
+        let revision_epoch = effect
+            .get("revision_epoch")
+            .and_then(Value::as_i64)
+            .unwrap_or(commit_revision_epoch);
+        let new_effect = NewEffect {
+            timeout_seconds: None,
+            effect_id: effect
+                .get("effect_id")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            kind: effect.get("kind").and_then(Value::as_str).unwrap_or(""),
+            target: effect.get("target").and_then(Value::as_str),
+            input_json: &input_json,
+            status: effect
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("queued"),
+            idempotency_key: effect
+                .get("idempotency_key")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            required_capabilities_json: &required_capabilities_json,
+            profile: effect.get("profile").and_then(Value::as_str),
+            correlation_id: effect.get("correlation_id").and_then(Value::as_str),
+            source_span_json: source_span_json.as_deref(),
+        };
+        do_insert_effect(
+            sql,
+            instance_id,
+            rule,
+            event_id,
+            program_version_id,
+            revision_epoch,
+            &new_effect,
+        )?;
+    }
+
+    for dependency in payload
+        .get("dependencies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let new_dependency = NewEffectDependency {
+            dependency_id: dependency
+                .get("dependency_id")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            upstream_effect_id: dependency
+                .get("upstream_effect_id")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            downstream_effect_id: dependency
+                .get("downstream_effect_id")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            predicate: dependency
+                .get("predicate")
+                .and_then(Value::as_str)
+                .unwrap_or("succeeds"),
+        };
+        do_insert_effect_dependency(sql, instance_id, rule, &new_dependency)?;
+    }
+    Ok(())
+}
+
+fn do_replay_fact_derived<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    event_id: &str,
+    source: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let fact_id = payload.get("fact_id").and_then(Value::as_str).unwrap_or("");
+    let name = payload.get("name").and_then(Value::as_str).unwrap_or("");
+    let key = payload.get("key").and_then(Value::as_str).unwrap_or("");
+    if fact_id.is_empty() || name.is_empty() || key.is_empty() {
+        return Ok(());
+    }
+    let value_json = payload
+        .get("value")
+        .cloned()
+        .unwrap_or(Value::Null)
+        .to_string();
+    let fact = NewFact {
+        fact_id,
+        name,
+        key,
+        value_json: &value_json,
+        schema_id: payload.get("schema_id").and_then(Value::as_str),
+        provenance_class: payload
+            .get("provenance_class")
+            .and_then(Value::as_str)
+            .unwrap_or("derived"),
+        correlation_id: payload.get("correlation_id").and_then(Value::as_str),
+        source_span_json: None,
+    };
+    let (program_version_id, revision_epoch) = do_active_revision(sql, instance_id)?;
+    do_insert_fact(
+        sql,
+        instance_id,
+        source,
+        event_id,
+        program_version_id.as_deref(),
+        revision_epoch,
+        &fact,
+    )
+}
+
+fn do_replay_workflow_terminal<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    event_id: &str,
+    event_type: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let status = payload
+        .get("workflow_status")
+        .and_then(Value::as_str)
+        .unwrap_or({
+            if event_type == "workflow.failed" {
+                "failed"
+            } else {
+                "completed"
+            }
+        });
+    let terminal_name = payload
+        .get("terminal_name")
+        .and_then(Value::as_str)
+        .unwrap_or(event_type);
+    sql.execute(
+        "UPDATE instances SET status = ?1, last_event_id = ?2, \
+         last_error = CASE WHEN ?1 = 'failed' THEN ?3 ELSE last_error END, \
+         updated_at = CURRENT_TIMESTAMP, completed_at = CURRENT_TIMESTAMP WHERE instance_id = ?4",
+        &[
+            text(status),
+            text(event_id),
+            text(terminal_name),
+            text(instance_id),
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn do_replay_instance_transition<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    event_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let status = payload.get("status").and_then(Value::as_str).unwrap_or("");
+    if status.is_empty() {
+        return Ok(());
+    }
+    sql.execute(
+        "UPDATE instances SET status = ?1, last_event_id = ?2, last_error = ?3, \
+         updated_at = CURRENT_TIMESTAMP, completed_at = CASE \
+         WHEN ?1 IN ('completed', 'cancelled') THEN CURRENT_TIMESTAMP ELSE completed_at END \
+         WHERE instance_id = ?4",
+        &[
+            text(status),
+            text(event_id),
+            opt_text(payload.get("reason").and_then(Value::as_str)),
+            text(instance_id),
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn do_replay_revision_activation<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    event_id: &str,
+    payload_json: &str,
+    idempotency_key: Option<&str>,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let revision_id = payload
+        .get("revision_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let from_version_id = payload
+        .get("from_version_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let to_version_id = payload
+        .get("to_version_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let epoch = payload
+        .get("to_epoch")
+        .and_then(Value::as_i64)
+        .or_else(|| payload.get("revision_epoch").and_then(Value::as_i64))
+        .unwrap_or(0);
+    if revision_id.is_empty() || from_version_id.is_empty() || to_version_id.is_empty() {
+        return Ok(());
+    }
+    let activation_policy_json = payload
+        .get("activation_policy")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "{}".to_owned());
+    let cancellation_policy = payload
+        .get("cancellation_policy")
+        .and_then(Value::as_str)
+        .unwrap_or("keep");
+    sql.execute(
+        "INSERT INTO instance_revisions (revision_id, instance_id, epoch, from_version_id, \
+         to_version_id, activated_by_event_id, activation_policy_json, cancellation_policy, status, \
+         idempotency_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9) \
+         ON CONFLICT(revision_id) DO NOTHING",
+        &[
+            text(revision_id),
+            text(instance_id),
+            int(epoch),
+            text(from_version_id),
+            text(to_version_id),
+            text(event_id),
+            text(&activation_policy_json),
+            text(cancellation_policy),
+            opt_text(idempotency_key),
+        ],
+    )
+    .map_err(sql_err)?;
+    sql.execute(
+        "UPDATE instances SET version_id = ?1, revision_epoch = ?2, last_event_id = ?3, \
+         updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?4",
+        &[
+            text(to_version_id),
+            int(epoch),
+            text(event_id),
+            text(instance_id),
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn do_replay_run_started<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let effect_id = payload
+        .get("effect_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let run_id = payload.get("run_id").and_then(Value::as_str).unwrap_or("");
+    let lease_id = payload
+        .get("lease_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if effect_id.is_empty() || run_id.is_empty() || lease_id.is_empty() {
+        return Ok(());
+    }
+    let provider = payload
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("replay");
+    let worker_id = payload
+        .get("worker_id")
+        .and_then(Value::as_str)
+        .unwrap_or("replay");
+    let lease_expires_at = payload
+        .get("lease_expires_at")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let metadata_json = payload
+        .get("metadata")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "{}".to_owned());
+    sql.execute(
+        "UPDATE effects SET status = 'running', policy_block_reason = NULL, \
+         updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?1 AND effect_id = ?2 \
+         AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')",
+        &[text(instance_id), text(effect_id)],
+    )
+    .map_err(sql_err)?;
+    sql.execute(
+        "INSERT INTO runs (run_id, effect_id, instance_id, provider, worker_id, status, \
+         metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6) ON CONFLICT(run_id) DO UPDATE SET \
+         effect_id = excluded.effect_id, instance_id = excluded.instance_id, \
+         provider = excluded.provider, worker_id = excluded.worker_id, status = 'running', \
+         completed_at = NULL, exit_code = NULL, summary = NULL, metadata_json = excluded.metadata_json",
+        &[text(run_id), text(effect_id), text(instance_id), text(provider), text(worker_id), text(&metadata_json)],
+    )
+    .map_err(sql_err)?;
+    sql.execute(
+        "INSERT INTO leases (lease_id, run_id, effect_id, instance_id, worker_id, status, \
+         expires_at) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6) ON CONFLICT(lease_id) DO UPDATE SET \
+         run_id = excluded.run_id, effect_id = excluded.effect_id, instance_id = excluded.instance_id, \
+         worker_id = excluded.worker_id, status = 'active', expires_at = excluded.expires_at, \
+         released_at = NULL",
+        &[text(lease_id), text(run_id), text(effect_id), text(instance_id), text(worker_id), text(lease_expires_at)],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn do_replay_effect_terminal<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    event_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let effect_id = payload
+        .get("effect_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let run_id = payload.get("run_id").and_then(Value::as_str).unwrap_or("");
+    if effect_id.is_empty() {
+        return Ok(());
+    }
+    let status = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let provider = payload
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("replay");
+    let worker_id = payload
+        .get("worker_id")
+        .and_then(Value::as_str)
+        .unwrap_or("replay");
+    let metadata_json = payload
+        .get("metadata")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "{}".to_owned());
+    if !run_id.is_empty() {
+        sql.execute(
+            "INSERT INTO runs (run_id, effect_id, instance_id, provider, worker_id, status, \
+             completed_at, exit_code, summary, metadata_json) VALUES \
+             (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP, ?7, ?8, ?9) ON CONFLICT(run_id) DO UPDATE SET \
+             effect_id = excluded.effect_id, instance_id = excluded.instance_id, \
+             provider = excluded.provider, worker_id = excluded.worker_id, status = excluded.status, \
+             completed_at = CURRENT_TIMESTAMP, exit_code = excluded.exit_code, \
+             summary = excluded.summary, metadata_json = excluded.metadata_json",
+            &[
+                text(run_id),
+                text(effect_id),
+                text(instance_id),
+                text(provider),
+                text(worker_id),
+                text(status),
+                payload.get("exit_code").and_then(Value::as_i64).map_or(SqlValue::Null, int),
+                opt_text(payload.get("summary").and_then(Value::as_str)),
+                text(&metadata_json),
+            ],
+        )
+        .map_err(sql_err)?;
+        sql.execute(
+            "UPDATE leases SET status = 'released', released_at = CURRENT_TIMESTAMP \
+             WHERE run_id = ?1 AND effect_id = ?2 AND instance_id = ?3 AND status = 'active'",
+            &[text(run_id), text(effect_id), text(instance_id)],
+        )
+        .map_err(sql_err)?;
+    }
+    sql.execute(
+        "UPDATE effects SET status = ?1, updated_at = CURRENT_TIMESTAMP \
+         WHERE effect_id = ?2 AND instance_id = ?3",
+        &[text(status), text(effect_id), text(instance_id)],
+    )
+    .map_err(sql_err)?;
+    do_mark_cancellation_requests_terminal(sql, instance_id, effect_id, event_id)?;
+    do_satisfy_dependencies(sql, instance_id)?;
+    Ok(())
+}
+
+fn do_replay_effect_cancelled<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    event_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let effect_id = payload
+        .get("effect_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if effect_id.is_empty() {
+        return Ok(());
+    }
+    sql.execute(
+        "UPDATE effects SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP \
+         WHERE instance_id = ?1 AND effect_id = ?2 \
+         AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')",
+        &[text(instance_id), text(effect_id)],
+    )
+    .map_err(sql_err)?;
+    do_mark_cancellation_requests_terminal(sql, instance_id, effect_id, event_id)?;
+    do_satisfy_dependencies(sql, instance_id)?;
+    Ok(())
+}
+
+fn do_replay_lease_expired<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let lease_id = payload
+        .get("lease_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let run_id = payload.get("run_id").and_then(Value::as_str).unwrap_or("");
+    let effect_id = payload
+        .get("effect_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if lease_id.is_empty() || run_id.is_empty() || effect_id.is_empty() {
+        return Ok(());
+    }
+    sql.execute(
+        "UPDATE leases SET status = 'expired', released_at = CURRENT_TIMESTAMP WHERE lease_id = ?1",
+        &[text(lease_id)],
+    )
+    .map_err(sql_err)?;
+    sql.execute(
+        "UPDATE runs SET status = 'lease_expired', completed_at = CURRENT_TIMESTAMP \
+         WHERE run_id = ?1 AND status = 'running'",
+        &[text(run_id)],
+    )
+    .map_err(sql_err)?;
+    sql.execute(
+        "UPDATE effects SET status = 'queued', updated_at = CURRENT_TIMESTAMP \
+         WHERE instance_id = ?1 AND effect_id = ?2 AND status = 'running'",
+        &[text(instance_id), text(effect_id)],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn do_replay_cancellation_request<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    event_id: &str,
+    payload_json: &str,
+    idempotency_key: Option<&str>,
+    causation_event_id: Option<&str>,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let request_id = payload
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let effect_id = payload
+        .get("effect_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if request_id.is_empty() || effect_id.is_empty() {
+        return Ok(());
+    }
+    // Prefer a real causation event, else anchor on this event.
+    let resolved_causation = match causation_event_id {
+        Some(candidate)
+            if !sql
+                .query(
+                    "SELECT 1 FROM events WHERE instance_id = ?1 AND event_id = ?2",
+                    &[text(instance_id), text(candidate)],
+                )
+                .map_err(sql_err)?
+                .is_empty() =>
+        {
+            candidate
+        }
+        _ => event_id,
+    };
+    sql.execute(
+        "INSERT INTO effect_cancellation_requests (request_id, instance_id, effect_id, revision_id, \
+         reason, requested_by, causation_event_id, status, idempotency_key) VALUES \
+         (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'requested', ?8) ON CONFLICT(request_id) DO NOTHING",
+        &[
+            text(request_id),
+            text(instance_id),
+            text(effect_id),
+            opt_text(payload.get("revision_id").and_then(Value::as_str)),
+            opt_text(payload.get("reason").and_then(Value::as_str)),
+            text(payload.get("requested_by").and_then(Value::as_str).unwrap_or("replay")),
+            text(resolved_causation),
+            opt_text(idempotency_key),
         ],
     )
     .map_err(sql_err)?;
@@ -4517,7 +5131,94 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn answer_inbox_item(&mut self, answer: HumanAnswer<'_>) -> StoreResult<StoredEvent> {
-        todo!("Phase 5b: port `answer_inbox_item` SQL to DoSql + verify against a live DO")
+        let answer_value = serde_json::from_str::<Value>(answer.answer_json)?;
+        let rows = self
+            .sql
+            .query(
+                "SELECT instance_id, effect_id, prompt, status FROM inbox_items \
+                 WHERE inbox_item_id = ?1",
+                &[text(answer.inbox_item_id)],
+            )
+            .map_err(sql_err)?;
+        let row = rows
+            .first()
+            .ok_or_else(|| StoreError::Conflict("inbox item was not found".to_owned()))?;
+        let item_instance_id = as_text(&row[0]);
+        let item_effect_id = as_opt_text(&row[1]);
+        let item_prompt = as_text(&row[2]);
+        let item_status = as_text(&row[3]);
+        if item_status != "pending" {
+            return Err(StoreError::Conflict(format!(
+                "inbox item `{}` is not pending",
+                answer.inbox_item_id
+            )));
+        }
+        self.sql
+            .execute(
+                "UPDATE inbox_items SET status = 'answered', answer_json = ?2, answered_by = ?3, \
+                 answered_at = CURRENT_TIMESTAMP WHERE inbox_item_id = ?1 AND status = 'pending'",
+                &[
+                    text(answer.inbox_item_id),
+                    text(answer.answer_json),
+                    text(answer.answered_by),
+                ],
+            )
+            .map_err(sql_err)?;
+        let choice = answer_value
+            .get("choice")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let answer_text = answer_value
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let payload = serde_json::json!({
+            "inbox_item_id": answer.inbox_item_id,
+            "effect_id": item_effect_id,
+            "prompt": item_prompt,
+            "answered_by": answer.answered_by,
+            "choice": choice,
+            "text": answer_text,
+            "answer": answer_value,
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: &item_instance_id,
+                event_type: "human.answer.received",
+                payload_json: &payload,
+                source: "human",
+                causation_id: Some(answer.inbox_item_id),
+                correlation_id: item_effect_id.as_deref(),
+                idempotency_key: answer.idempotency_key,
+            },
+        )?;
+        let fact_id = stable_hash_hex(&format!("{}:human-answer", answer.inbox_item_id));
+        let fact = NewFact {
+            fact_id: &fact_id,
+            name: "human.answer.received",
+            key: answer.inbox_item_id,
+            value_json: &payload,
+            schema_id: Some("HumanAnswer"),
+            provenance_class: "human",
+            correlation_id: item_effect_id.as_deref(),
+            source_span_json: None,
+        };
+        let (program_version_id, revision_epoch) =
+            do_active_revision(&self.sql, &item_instance_id)?;
+        do_insert_fact(
+            &self.sql,
+            &item_instance_id,
+            "human",
+            &event.event_id,
+            program_version_id.as_deref(),
+            revision_epoch,
+            &fact,
+        )?;
+        Ok(event)
     }
 
     fn cancel_pending_inbox_for_instance(&mut self, instance_id: &str) -> StoreResult<usize> {
@@ -4788,31 +5489,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn satisfy_dependencies(&self, instance_id: &str) -> StoreResult<usize> {
-        let updated = self
-            .sql
-            .execute(
-                "UPDATE effects SET status = 'queued', updated_at = CURRENT_TIMESTAMP \
-                 WHERE instance_id = ?1 AND status = 'blocked_by_dependency' \
-                 AND effect_id IN ( \
-                   SELECT candidate.effect_id FROM effects AS candidate \
-                   WHERE candidate.instance_id = ?1 AND NOT EXISTS ( \
-                     SELECT 1 FROM effect_dependencies AS dependency \
-                     JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
-                      AND upstream.instance_id = dependency.instance_id \
-                     WHERE dependency.instance_id = candidate.instance_id \
-                       AND dependency.downstream_effect_id = candidate.effect_id AND NOT ( \
-                         (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
-                         OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
-                         OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
-                         OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
-                         OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
-                       ) \
-                   ) \
-                 )",
-                &[text(instance_id)],
-            )
-            .map_err(sql_err)?;
-        Ok(updated as usize)
+        do_satisfy_dependencies(&self.sql, instance_id)
     }
 
     fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
@@ -5477,7 +6154,131 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
-        todo!("Phase 5b: port `rebuild_projections` SQL to DoSql + verify against a live DO")
+        // Detach artifacts from the runs we're about to delete, then re-link the
+        // surviving ones after replay.
+        let artifact_rows = self
+            .sql
+            .query(
+                "SELECT artifact_id, run_id FROM artifacts \
+                 WHERE run_id IN (SELECT run_id FROM runs WHERE instance_id = ?1) \
+                 ORDER BY artifact_id",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        let artifact_run_links: Vec<(String, String)> = artifact_rows
+            .iter()
+            .map(|r| (as_text(&r[0]), as_text(&r[1])))
+            .collect();
+        for (artifact_id, _) in &artifact_run_links {
+            self.sql
+                .execute(
+                    "UPDATE artifacts SET run_id = NULL WHERE artifact_id = ?1",
+                    &[text(artifact_id)],
+                )
+                .map_err(sql_err)?;
+        }
+        for table in [
+            "effect_cancellation_requests",
+            "leases",
+            "runs",
+            "instance_revisions",
+            "effect_dependencies",
+            "effects",
+            "facts",
+        ] {
+            self.sql
+                .execute(
+                    &format!("DELETE FROM {table} WHERE instance_id = ?1"),
+                    &[text(instance_id)],
+                )
+                .map_err(sql_err)?;
+        }
+
+        let events = self
+            .sql
+            .query(
+                "SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source \
+                 FROM events WHERE instance_id = ?1 AND event_type IN ( \
+                 'rule.committed', 'fact.derived', 'workflow.completed', 'workflow.failed', \
+                 'instance.transitioned', 'workflow.revision_activated', 'effect.run_started', \
+                 'effect.terminal', 'effect.cancelled', 'effect.cancellation_requested', \
+                 'lease.expired') ORDER BY sequence",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        for row in &events {
+            let event_id = as_text(&row[0]);
+            let event_type = as_text(&row[1]);
+            let payload_json = as_text(&row[2]);
+            let idempotency_key = as_opt_text(&row[3]);
+            let causation_id = as_opt_text(&row[4]);
+            let source = as_text(&row[5]);
+            match event_type.as_str() {
+                "rule.committed" => {
+                    do_replay_rule_commit(&self.sql, instance_id, &event_id, &payload_json)?
+                }
+                "fact.derived" => do_replay_fact_derived(
+                    &self.sql,
+                    instance_id,
+                    &event_id,
+                    &source,
+                    &payload_json,
+                )?,
+                "workflow.completed" | "workflow.failed" => do_replay_workflow_terminal(
+                    &self.sql,
+                    instance_id,
+                    &event_id,
+                    &event_type,
+                    &payload_json,
+                )?,
+                "instance.transitioned" => {
+                    do_replay_instance_transition(&self.sql, instance_id, &event_id, &payload_json)?
+                }
+                "workflow.revision_activated" => do_replay_revision_activation(
+                    &self.sql,
+                    instance_id,
+                    &event_id,
+                    &payload_json,
+                    idempotency_key.as_deref(),
+                )?,
+                "effect.run_started" => {
+                    do_replay_run_started(&self.sql, instance_id, &payload_json)?
+                }
+                "effect.terminal" => {
+                    do_replay_effect_terminal(&self.sql, instance_id, &event_id, &payload_json)?
+                }
+                "effect.cancelled" => {
+                    do_replay_effect_cancelled(&self.sql, instance_id, &event_id, &payload_json)?
+                }
+                "effect.cancellation_requested" => do_replay_cancellation_request(
+                    &self.sql,
+                    instance_id,
+                    &event_id,
+                    &payload_json,
+                    idempotency_key.as_deref(),
+                    causation_id.as_deref(),
+                )?,
+                "lease.expired" => do_replay_lease_expired(&self.sql, instance_id, &payload_json)?,
+                _ => {}
+            }
+        }
+
+        for (artifact_id, run_id) in artifact_run_links {
+            let run_exists = !self
+                .sql
+                .query("SELECT 1 FROM runs WHERE run_id = ?1", &[text(&run_id)])
+                .map_err(sql_err)?
+                .is_empty();
+            if run_exists {
+                self.sql
+                    .execute(
+                        "UPDATE artifacts SET run_id = ?1 WHERE artifact_id = ?2",
+                        &[text(&run_id), text(&artifact_id)],
+                    )
+                    .map_err(sql_err)?;
+            }
+        }
+        Ok(())
     }
 
     fn table_exists(&self, table: &str) -> StoreResult<bool> {
@@ -8034,6 +8835,203 @@ mod tests {
                 activation_policy_json: "{}",
                 cancellation_policy: "keep",
                 idempotency_key: Some("act-2"),
+            })
+            .is_err());
+    }
+
+    /// rebuild_projections deletes the projection tables and reconstructs them by
+    /// replaying the event log: a corrupted fact/effect is restored, and a
+    /// run-started + terminal pair rebuilds the run in its completed state.
+    #[test]
+    fn do_store_rebuild_projections_runs_real_sql() {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(0),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+
+        // commit_rule records a rule.committed event + inserts a fact and an effect.
+        let facts = [NewFact {
+            fact_id: "f1",
+            name: "ready",
+            key: "k",
+            value_json: "true",
+            schema_id: None,
+            provenance_class: "derived",
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        let effects = [NewEffect {
+            effect_id: "eff_1",
+            kind: "queue.push",
+            target: None,
+            input_json: "{}",
+            status: "queued",
+            idempotency_key: "e1",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "i1",
+                rule: "r.a",
+                trigger_event_id: None,
+                facts: &facts,
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("c1"),
+            })
+            .expect("commit");
+        // Then start + complete a run for the effect (appends run_started + terminal).
+        store
+            .start_run(RunStart {
+                instance_id: "i1",
+                effect_id: "eff_1",
+                run_id: "run_1",
+                provider: "builtin",
+                worker_id: "w1",
+                lease_id: "lse_1",
+                lease_expires_at: "2026-01-01T01:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("start");
+        store
+            .complete_effect(EffectCompletion {
+                instance_id: "i1",
+                effect_id: "eff_1",
+                run_id: "run_1",
+                provider: "builtin",
+                worker_id: "w1",
+                status: "completed",
+                exit_code: Some(0),
+                summary: None,
+                metadata_json: "{}",
+                idempotency_key: Some("done"),
+            })
+            .expect("complete");
+
+        // Corrupt the projections: wipe the fact and flip the effect status.
+        store
+            .sql
+            .execute("DELETE FROM facts WHERE instance_id = ?1", &[text("i1")])
+            .expect("wipe facts");
+        store
+            .sql
+            .execute(
+                "UPDATE effects SET status = 'queued' WHERE effect_id = ?1",
+                &[text("eff_1")],
+            )
+            .expect("corrupt effect");
+
+        // Rebuild from the event log.
+        store.rebuild_projections("i1").expect("rebuild");
+
+        // The fact is reconstructed, the effect is back to completed, and the run
+        // was rebuilt in its completed state with the lease released.
+        let facts = store.list_facts("i1").expect("facts");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].name, "ready");
+        let eff = store
+            .sql
+            .query(
+                "SELECT status FROM effects WHERE effect_id = ?1",
+                &[text("eff_1")],
+            )
+            .expect("read effect");
+        assert_eq!(as_text(&eff[0][0]), "completed");
+        let runs = store.list_runs("i1").expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "completed");
+    }
+
+    /// answer_inbox_item answers a pending item (guarded), records the
+    /// human.answer.received event + fact, and rejects a non-pending item.
+    #[test]
+    fn do_store_answer_inbox_item_runs_real_sql() {
+        let mut store = store();
+        for (sql, params) in [
+            (
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                vec![
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(0),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            ),
+            (
+                "INSERT INTO inbox_items (inbox_item_id, instance_id, effect_id, status, prompt) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![
+                    text("ibx_1"),
+                    text("i1"),
+                    text("eff_1"),
+                    text("pending"),
+                    text("approve?"),
+                ],
+            ),
+        ] {
+            store.sql.execute(sql, &params).expect("seed");
+        }
+
+        let ev = store
+            .answer_inbox_item(HumanAnswer {
+                inbox_item_id: "ibx_1",
+                answer_json: "{\"choice\":\"yes\",\"text\":\"ok\"}",
+                answered_by: "operator",
+                idempotency_key: Some("ans-1"),
+            })
+            .expect("answer");
+        assert!(ev.event_id.starts_with("evt_"));
+        // Item is answered; a human.answer.received fact was recorded.
+        let got = store.get_inbox_item("ibx_1").expect("get").expect("some");
+        assert_eq!(got.status, "answered");
+        assert_eq!(got.answered_by.as_deref(), Some("operator"));
+        let facts = store.list_facts("i1").expect("facts");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].name, "human.answer.received");
+
+        // Answering it again (now non-pending) is rejected.
+        assert!(store
+            .answer_inbox_item(HumanAnswer {
+                inbox_item_id: "ibx_1",
+                answer_json: "{}",
+                answered_by: "operator",
+                idempotency_key: Some("ans-2"),
+            })
+            .is_err());
+        // An unknown item is rejected.
+        assert!(store
+            .answer_inbox_item(HumanAnswer {
+                inbox_item_id: "nope",
+                answer_json: "{}",
+                answered_by: "operator",
+                idempotency_key: None,
             })
             .is_err());
     }
