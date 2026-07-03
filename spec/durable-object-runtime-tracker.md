@@ -289,12 +289,24 @@ in flight and expensive to retrofit:
       (kernel + `sansio` + `harness_loop`/`harness_model` + `coerce_native`) runs
       on wasm. Native unchanged (kernel 204+17, CLI green, clippy `-D warnings`).
       This proves the DR-0033 architecture end-to-end.
-- [ ] `whipplescript-host-do` (wasm32) + Worker/DO shell: async `fetch` driver for
-      `NeedsIo(Http)`, store traits over synchronous DO SQLite, consumes the
-      sans-IO core. Subprocess effects unavailable / via HTTP sidecar. Every
-      delivery/re-entry seam this host adds routes through the E2-DYN marker
-      door (see Cross-effort ordering above). *(Needs the wasm32 target + the
-      Cloudflare `worker` crate + wrangler — greenfield build.)*
+- [~] `whipplescript-host-do` crate started — the DO binding's building blocks,
+      built for wasm against the wasm-clean core:
+      - [x] `FetchClient` (the DO's `fetch`) + `FetchHost` — the sans-IO
+            `HostDriver` that fulfills a `NeedsIo(Http)` through the isolate's
+            fetch. Any effect step machine (`coerce`, an agent turn) runs on the
+            DO through it. Tested (`fetch_host_drives_a_step_machine_over_the_do_fetch`).
+      - [x] `DoStorage` (the DO's synchronous SQLite) + `DoFileStore` — the file
+            seam (`FileStore`) backed by DO storage (small files inline, flat key
+            space). Tested (`do_file_store_round_trips_through_the_file_seam`).
+      - Crate builds native (2 tests green, clippy `-D warnings` clean) **and**
+        `--no-default-features --target wasm32-unknown-unknown`.
+      - [ ] Full `RuntimeStore` impl over `DoStorage` (the DO runs the same SQL
+            the native `SqliteStore` does, through the DO SQL API); the TS/Worker
+            shell + wrangler + `wasm-bindgen`/`worker`-crate glue; routing every
+            new delivery/re-entry seam through the E2-DYN marker door. **Needs a
+            live Cloudflare DO runtime to build and test against** — the seams
+            they plug into (`FetchHost`, `DoStorage`, `RuntimeKernel<S>`) are
+            proven here.
 
 ### Phase 6 — Scheduling + config on the DO
 - [ ] Clock-source + timers → DO **alarms** (replaces external polling). Config/

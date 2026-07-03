@@ -1,0 +1,26 @@
+[package]
+name = "whipplescript-host-do"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cloudflare Durable Object host binding for the sans-IO WhippleScript core"
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+# The sans-IO core, built WITHOUT the native (rusqlite) backend — the DO supplies
+# its own storage. `sansio` (HostDriver / IoRequest / HttpRequest) lives here.
+whipplescript-kernel = { version = "0.1.0", path = "../whipplescript-kernel", default-features = false }
+# The store TRAITS (RuntimeStore / Coordination / WorkItems / FileStore) + data
+# types, no rusqlite.
+whipplescript-store = { version = "0.1.0", path = "../whipplescript-store", default-features = false }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
