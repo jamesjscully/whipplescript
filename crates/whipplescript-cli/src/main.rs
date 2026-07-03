@@ -75,12 +75,18 @@ use whipplescript_store::{
     NewInboxItem, NewInstanceAuthority, NewWorkflowInvocation, ProviderValidationEvidence,
     RetryEffect, RevisionActivation, RevisionCancellationImpact, RevisionCandidate,
     RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RuleCommit,
-    RuleCommitRevisionGuard, RunStart, RunView, SqliteStore, StatusView, StoreError,
+    RuleCommitRevisionGuard, RunStart, RunView, RuntimeStore, SqliteStore, StatusView, StoreError,
     WorkflowInvocationView, WorkflowRevisionView,
 };
 // File-effect byte I/O routes through the FileStore seam (DR-0033 Phase 4); the
 // native backing is `std::fs`.
 use whipplescript_store::files::{FileStore, NativeFileStore};
+// The lifted rule pass holds one unified store handle; natively that is
+// `NativeStores` (runtime + coordination + work-items on one object), the native
+// counterpart to the DO's `DoSqliteStore` (DR-0033 instance-scheduler lift).
+use whipplescript_store::coordination::Coordination;
+use whipplescript_store::items::WorkItems;
+use whipplescript_store::native_stores::NativeStores;
 
 mod auth;
 mod coerce_runtime;
@@ -20145,8 +20151,33 @@ impl AssertionStatus {
     }
 }
 
+/// Native entry: build the unified `NativeStores` handle (runtime + coordination +
+/// work-items) and drive the generic rule pass over one held `RuntimeKernel`.
 fn step_instance(
     store_path: &Path,
+    instance_id: &str,
+    ir: &IrProgram,
+    source_path: Option<&Path>,
+    active_version_guard: Option<&str>,
+) -> Result<StepReport, StoreError> {
+    let stores = NativeStores::open(store_path, coordination_store_path(), items_store_path())?;
+    let mut kernel = RuntimeKernel::new(stores);
+    step_instance_generic(
+        &mut kernel,
+        instance_id,
+        ir,
+        source_path,
+        active_version_guard,
+    )
+}
+
+/// The host-agnostic rule pass (DR-0033 instance-scheduler lift): the fixpoint of
+/// `project_queue_items` + rule matching/lowering/commit, run over ONE held store
+/// handle instead of re-opening per operation. `S` unifies the runtime,
+/// coordination, and work-items surfaces — natively `NativeStores`, on the DO the
+/// one `DoSqliteStore`.
+fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
+    kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     ir: &IrProgram,
     source_path: Option<&Path>,
@@ -20159,8 +20190,8 @@ fn step_instance(
     let mut made_progress = true;
     while made_progress {
         made_progress = false;
-        let store = SqliteStore::open(store_path)?;
-        let status = store
+        let status = kernel
+            .store()
             .status(instance_id)?
             .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))?;
         if status.instance.status != "running" {
@@ -20177,13 +20208,11 @@ fn step_instance(
         let active_version_id = status.instance.version_id;
         let active_revision_epoch = status.instance.revision_epoch;
         let active_revision_epoch_key = active_revision_epoch.to_string();
-        drop(store);
-        project_queue_items(store_path, instance_id, ir)?;
-        let store = SqliteStore::open(store_path)?;
-        let events = store.list_events(instance_id)?;
-        let facts = store.list_facts(instance_id)?;
-        let all_facts = store.list_facts_including_consumed(instance_id)?;
-        let effects = store.list_effects(instance_id)?;
+        project_queue_items(kernel, instance_id, ir)?;
+        let events = kernel.store().list_events(instance_id)?;
+        let facts = kernel.store().list_facts(instance_id)?;
+        let all_facts = kernel.store().list_facts_including_consumed(instance_id)?;
+        let effects = kernel.store().list_effects(instance_id)?;
         let started_event_id = events
             .iter()
             .find(|event| event.event_type == "external.started")
@@ -20213,7 +20242,7 @@ fn step_instance(
                         rule.name,
                         lowering.errors.join("; ")
                     );
-                    store.record_diagnostic(DiagnosticRecord {
+                    kernel.store().record_diagnostic(DiagnosticRecord {
                         instance_id: Some(instance_id),
                         program_id: None,
                         program_version_id: Some(&active_version_id),
@@ -20267,18 +20296,14 @@ fn step_instance(
                         "flow-autofail",
                         &reason,
                     ]);
-                    let mut store = SqliteStore::open(store_path)?;
-                    let mut kernel = RuntimeKernel::new(store);
                     let event =
                         kernel.fail_instance_internal(instance_id, &reason, Some(&fail_key));
-                    store = kernel.into_store();
-                    drop(store);
                     match event {
                         Ok(_) => {
                             report.committed_rules += 1;
                             // A workflow terminal auto-releases every held lease
                             // (spec/coordination.md), the same as the typed path.
-                            release_holder_resources_on_terminal(instance_id);
+                            release_holder_resources_on_terminal(kernel.store_mut(), instance_id);
                             made_progress = true;
                             break 'rules;
                         }
@@ -20313,8 +20338,6 @@ fn step_instance(
                     .terminal
                     .as_ref()
                     .map(OwnedWorkflowTerminal::as_workflow_terminal);
-                let mut store = SqliteStore::open(store_path)?;
-                let mut kernel = RuntimeKernel::new(store);
                 let lowering_key = lowering_idempotency_key(&lowering);
                 let commit_key = idempotency_key(&[
                     instance_id,
@@ -20341,8 +20364,6 @@ fn step_instance(
                         revision_epoch: active_revision_epoch,
                     },
                 );
-                store = kernel.into_store();
-                drop(store);
                 match event {
                     Ok(committed) => {
                         report.committed_rules += 1;
@@ -20353,10 +20374,10 @@ fn step_instance(
                         // instance reaching a workflow terminal auto-releases
                         // every lease it held.
                         if lowering.terminal.is_some() {
-                            release_holder_resources_on_terminal(instance_id);
+                            release_holder_resources_on_terminal(kernel.store_mut(), instance_id);
                         }
                         apply_rule_cancels(
-                            store_path,
+                            kernel,
                             instance_id,
                             &rule.name,
                             &lowering.cancels,
@@ -20927,7 +20948,18 @@ fn internal_workflow_delivery_violation(
 /// resource type. Best-effort: a cleanup failure degrades to leaving the
 /// resource (lease TTL backstops it) rather than failing an already-committed
 /// terminal.
-fn release_holder_resources_on_terminal(instance_id: &str) {
+fn release_holder_resources_on_terminal<S: Coordination + WorkItems>(
+    store: &mut S,
+    instance_id: &str,
+) {
+    let _ = Coordination::release_all_for_holder(store, instance_id);
+    let _ = WorkItems::release_claims_for_holder(store, instance_id);
+}
+
+/// Native path-based release for callers that hold only a runtime-store kernel
+/// (the `pause`/`cancel` control paths): open the workspace coordination and
+/// work-items stores directly and release this holder's leases/claims.
+fn release_holder_resources_native(instance_id: &str) {
     if let Ok(mut coordination) =
         whipplescript_store::coordination::CoordinationStore::open(coordination_store_path())
     {
@@ -20950,8 +20982,8 @@ fn items_store_path() -> PathBuf {
 /// instance-local `queue.item.ready` facts, and retires projections whose
 /// items are no longer ready. The tracker is the source of truth; the run
 /// store holds a cache keyed (queue, id).
-fn project_queue_items(
-    store_path: &Path,
+fn project_queue_items<S: RuntimeStore + WorkItems>(
+    kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     ir: &IrProgram,
 ) -> Result<(), StoreError> {
@@ -20962,13 +20994,11 @@ fn project_queue_items(
         if queue.tracker != "builtin" {
             continue;
         }
-        let items = whipplescript_store::items::WorkItemStore::open(items_store_path())?;
         // Keep a projection alive while this instance holds the claim: the
         // dispatching rule's multi-stage chain needs its trigger fact until
         // the item is finished or released. Re-fires are idempotent (effect
         // ids are identity-derived), matching the engine's existing idiom.
-        let ready = items
-            .list_items(Some(&queue.name), None)?
+        let ready = WorkItems::list_items(kernel.store(), Some(&queue.name), None)?
             .into_iter()
             .filter(|item| {
                 (item.status == "open" && item.claimed_by.is_none())
@@ -20976,9 +21006,8 @@ fn project_queue_items(
                         && item.claimed_by.as_deref() == Some(instance_id))
             })
             .collect::<Vec<_>>();
-        drop(items);
-        let store = SqliteStore::open(store_path)?;
-        let existing = store
+        let existing = kernel
+            .store()
             .list_facts(instance_id)?
             .into_iter()
             .filter(|fact| fact.name == "queue.item.ready")
@@ -20989,7 +21018,6 @@ fn project_queue_items(
                     == Some(queue.name.as_str())
             })
             .collect::<Vec<_>>();
-        drop(store);
         let ready_prefixes = ready
             .iter()
             .map(|item| format!("{}:{}:", queue.name, item.id))
@@ -21013,8 +21041,6 @@ fn project_queue_items(
                 "metadata": item.metadata,
             })
             .to_string();
-            let store = SqliteStore::open(store_path)?;
-            let mut kernel = RuntimeKernel::new(store);
             // Salt with updated_at: a released item re-projects as a fresh
             // fact generation instead of colliding with its retired one.
             kernel.derive_fact(
@@ -21036,8 +21062,7 @@ fn project_queue_items(
                 .iter()
                 .any(|prefix| fact.key.starts_with(prefix))
             {
-                let mut store = SqliteStore::open(store_path)?;
-                store.retire_fact(instance_id, &fact.fact_id)?;
+                kernel.store_mut().retire_fact(instance_id, &fact.fact_id)?;
             }
         }
     }
@@ -27946,7 +27971,7 @@ fn acceptance_run_actions(
                     .unwrap_or("acceptance fixture cancel");
                 kernel
                     .cancel_instance(instance_id, Some(reason), Some(&idempotency))
-                    .inspect(|_| release_holder_resources_on_terminal(instance_id))
+                    .inspect(|_| release_holder_resources_native(instance_id))
             }
             other => {
                 eprintln!(
@@ -32659,7 +32684,7 @@ fn cancel(options: &CliOptions) -> ExitCode {
                     Some("operator cancel"),
                     Some(&idempotency_key(&[instance_id, "cancel"])),
                 )
-                .inspect(|_| release_holder_resources_on_terminal(instance_id))
+                .inspect(|_| release_holder_resources_native(instance_id))
         },
     )
 }
@@ -36281,43 +36306,42 @@ fn report_compile_failure(path: &str, error: CompileFailure) -> ExitCode {
 /// Applies `cancel <binding>` operations committed by a rule: pending
 /// effects terminal-cancel; running effects get a cancellation request (a
 /// request, not a result); already-terminal effects are a recorded no-op.
-fn apply_rule_cancels(
-    store_path: &Path,
+fn apply_rule_cancels<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     rule_name: &str,
     effect_ids: &[String],
     causation_event_id: &str,
 ) -> Result<(), StoreError> {
     for effect_id in effect_ids {
-        let store = SqliteStore::open(store_path)?;
-        let status = store
+        let status = kernel
+            .store()
             .list_effects(instance_id)?
             .into_iter()
             .find(|effect| &effect.effect_id == effect_id)
             .map(|effect| effect.status);
-        drop(store);
         match status.as_deref() {
             Some("running") => {
-                let mut store = SqliteStore::open(store_path)?;
-                let _ = store.request_effect_cancellation(EffectCancellationRequest {
-                    instance_id,
-                    effect_id,
-                    revision_id: None,
-                    reason: Some("cancelled by rule"),
-                    requested_by: rule_name,
-                    causation_event_id: Some(causation_event_id),
-                    idempotency_key: Some(&idempotency_key(&[
+                let _ = kernel
+                    .store_mut()
+                    .request_effect_cancellation(EffectCancellationRequest {
                         instance_id,
                         effect_id,
-                        rule_name,
-                        "rule-cancel-request",
-                    ])),
-                });
+                        revision_id: None,
+                        reason: Some("cancelled by rule"),
+                        requested_by: rule_name,
+                        causation_event_id: Some(causation_event_id),
+                        idempotency_key: Some(&idempotency_key(&[
+                            instance_id,
+                            effect_id,
+                            rule_name,
+                            "rule-cancel-request",
+                        ])),
+                    });
             }
             Some("completed") | Some("failed") | Some("timed_out") | Some("cancelled") => {
                 // No-op with evidence: cancelling settled work is legal.
-                let store = SqliteStore::open(store_path)?;
-                store.record_diagnostic(DiagnosticRecord {
+                kernel.store().record_diagnostic(DiagnosticRecord {
                     instance_id: Some(instance_id),
                     program_id: None,
                     program_version_id: None,
@@ -36346,8 +36370,6 @@ fn apply_rule_cancels(
                 })?;
             }
             Some(_) => {
-                let store = SqliteStore::open(store_path)?;
-                let mut kernel = RuntimeKernel::new(store);
                 kernel.cancel_effect(EffectCancellation {
                     instance_id,
                     effect_id,

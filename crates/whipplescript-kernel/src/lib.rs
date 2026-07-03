@@ -204,6 +204,19 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         }
     }
 
+    /// Borrow the underlying store. The lifted rule pass holds one kernel across a
+    /// whole step and reaches the store directly for the reads (and, when `S` also
+    /// implements `Coordination`/`WorkItems`, the coordination/queue operations) it
+    /// interleaves with kernel-level commits (DR-0033 instance-scheduler lift).
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
+    /// Mutably borrow the underlying store (see [`RuntimeKernel::store`]).
+    pub fn store_mut(&mut self) -> &mut S {
+        &mut self.store
+    }
+
     /// Run one owned/brokered agent turn (DR-0024 slice 1).
     ///
     /// Opens the run, drives the pure brokered loop (the kernel executes every
