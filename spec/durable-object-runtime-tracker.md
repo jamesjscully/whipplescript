@@ -409,8 +409,20 @@ linear undo chain). No phase work now.
                 pass is still physically in `main.rs`; its relocation to the kernel
                 rides with the chunk-4 step-machine assembly (the DO host calls it
                 from there);
-            (3) lift the effect executor + 13 store-only handlers, then the two
-                HTTP handlers as the already-built sans-IO effect machines;
+            (3) lift the effect executor: the ~15 `run_*_effect` handlers each →
+                thin native wrapper (opens the store) + host-agnostic
+                `*_generic<S>(kernel, …)` core the DO step machine calls.
+                **IN PROGRESS (3a, commit 2b1b255):** the two cleanest handlers
+                (`run_event_effect`, `run_capability_effect` — kernel-methods-only,
+                `S: RuntimeStore`) converted; pattern established. REMAINING (a
+                deeper grind): `coerce`/`human` resolve input via a store-opening
+                helper (`resolve_effect_input_after_bindings`) + open twice; the
+                `file*` handlers need `FileStore`, `coordination`/`queue` need
+                `Coordination`/`WorkItems` (audit for inherent-vs-trait methods —
+                e.g. `try_acquire_for_owner`); `workflow_invoke` (435 ln) recurses
+                into step/worker; `agent`/`coerce` wire the sans-IO
+                `BrokeredTurnMachine`/`CoerceStepMachine` for the DO NeedsIo path;
+                `exec` stays native-only (DR-0033 Decision 7);
             (4) assemble the `InstanceStepMachine` (the fixpoint as a `StepMachine`
                 raising `NeedsIo(Http)`); native `dev`/`worker`/`step` call it;
             (5) wire the DO host (`RuntimeKernel<DoSqliteStore>` + `FetchHost`) to
@@ -443,6 +455,37 @@ linear undo chain). No phase work now.
       client↔storage transfer, isolate never buffers bytes). Enterprise-tier
       deliverable; native/OSS backs files with local fs. *(Needs the platform
       object store.)*
+
+### Phase 8 — Sidecar compute plane (registered 2026-07-03; NOT designed)
+
+The pure-DO host solves the **orchestrator + storage plane**; real workflows
+also trigger exec/agent compute that cannot live in the isolate (Decision 7:
+subprocess effects are HTTP to a container sidecar). This phase registers
+that compute plane as open intent — cloud deployment is only partially
+solved without it. A design pass is required before any box is checked;
+shared design with `versioned-workspace-research-note.md` §9–§10 (the
+materialization boundary must be **evidence-grade**: atomic, recorded,
+complete imports).
+
+- [ ] Sidecar lifecycle: container-per-DO controller model (Cloudflare
+      Containers pairs each container instance with a controlling DO — maps
+      1:1 onto the workflow-instance DO; verify current platform state,
+      knowledge as of early 2026).
+- [ ] Materialization protocol over HTTP: sidecar pulls only missing
+      content-addressed blobs (R2/object tier), materializes the branch
+      manifest, execs, pushes the diff back keyed by effect id — idempotent
+      by Decisions 3/4; just another step-machine effect.
+- [ ] **Image digest = environment hash**: the container image digest slots
+      into generator-hash ambient config (experimentation note §7) — a
+      toolchain bump becomes a visible warm-start, never silent.
+- [ ] Economics: cold starts (seconds) + billed-while-running → exec
+      batching, warm-pool policy, DO↔sidecar placement affinity.
+- [ ] IFC span: egress doors must be enforced where whip cannot see
+      syscalls — container network policy (default-deny egress + per-grant
+      allowlists) as the backstop; stronger than native exec today, weaker
+      than owned-harness — design deliberately, don't inherit accidentally.
+- [ ] `whip deploy` packaging surface: DO bindings, R2 bucket, container
+      images, secrets, wrangler artifacts — an undesigned product surface.
 
 ---
 
