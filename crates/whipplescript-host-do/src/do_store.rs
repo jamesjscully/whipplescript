@@ -2132,9 +2132,157 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         &mut self,
         request: EffectCancellationRequest<'_>,
     ) -> StoreResult<EffectCancellationRequestView> {
-        todo!(
-            "Phase 5b: port `request_effect_cancellation` SQL to DoSql + verify against a live DO"
-        )
+        let status_rows = self
+            .sql
+            .query(
+                "SELECT status FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
+                &[text(request.instance_id), text(request.effect_id)],
+            )
+            .map_err(sql_err)?;
+        let status = status_rows
+            .first()
+            .map(|r| as_text(&r[0]))
+            .ok_or_else(|| StoreError::Conflict("effect does not exist".to_owned()))?;
+        if status != "running" {
+            return Err(StoreError::Conflict(format!(
+                "effect is {status}; cancellation requests require running work"
+            )));
+        }
+        // Idempotent replay: an existing request with the same key is returned.
+        if let Some(idempotency_key) = request.idempotency_key {
+            let existing = self
+                .sql
+                .query(
+                    "SELECT request_id, instance_id, effect_id, revision_id, reason, requested_by, \
+                     causation_event_id, status, idempotency_key, created_at, updated_at, \
+                     resolved_by_event_id FROM effect_cancellation_requests \
+                     WHERE instance_id = ?1 AND idempotency_key = ?2",
+                    &[text(request.instance_id), text(idempotency_key)],
+                )
+                .map_err(sql_err)?;
+            if let Some(row) = existing.first() {
+                return Ok(effect_cancellation_request_from_row(row));
+            }
+        }
+        if self.effect_has_open_cancellation_request(request.instance_id, request.effect_id)? {
+            return Err(StoreError::Conflict(
+                "effect already has an open cancellation request".to_owned(),
+            ));
+        }
+        // Mint a request id (SQLite-side, same shape as random_id_on).
+        let id_rows = self
+            .sql
+            .query(
+                "SELECT ?1 || '_' || lower(hex(randomblob(16)))",
+                &[text("ecr")],
+            )
+            .map_err(sql_err)?;
+        let request_id = id_rows
+            .first()
+            .map(|r| as_text(&r[0]))
+            .ok_or_else(|| sql_err("failed to mint request id".to_string()))?;
+        let payload = serde_json::json!({
+            "request_id": &request_id,
+            "effect_id": request.effect_id,
+            "revision_id": request.revision_id,
+            "reason": request.reason,
+            "requested_by": request.requested_by,
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: request.instance_id,
+                event_type: "effect.cancellation_requested",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: request.causation_event_id.or(Some(request.effect_id)),
+                correlation_id: request.revision_id,
+                idempotency_key: request.idempotency_key,
+            },
+        )?;
+        self.sql
+            .execute(
+                "INSERT INTO effect_cancellation_requests (request_id, instance_id, effect_id, \
+                 revision_id, reason, requested_by, causation_event_id, status, idempotency_key) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'requested', ?8)",
+                &[
+                    text(&request_id),
+                    text(request.instance_id),
+                    text(request.effect_id),
+                    opt_text(request.revision_id),
+                    opt_text(request.reason),
+                    text(request.requested_by),
+                    opt_text(request.causation_event_id),
+                    opt_text(request.idempotency_key),
+                ],
+            )
+            .map_err(sql_err)?;
+        let active_run_rows = self
+            .sql
+            .query(
+                "SELECT run_id FROM runs WHERE instance_id = ?1 AND effect_id = ?2 \
+                 AND status = 'running' ORDER BY started_at, run_id",
+                &[text(request.instance_id), text(request.effect_id)],
+            )
+            .map_err(sql_err)?;
+        let active_run_ids: Vec<String> = active_run_rows.iter().map(|r| as_text(&r[0])).collect();
+        let evidence_metadata = serde_json::json!({
+            "request_id": &request_id,
+            "effect_id": request.effect_id,
+            "revision_id": request.revision_id,
+            "reason": request.reason,
+            "requested_by": request.requested_by,
+            "event_id": event.event_id,
+            "active_run_ids": &active_run_ids,
+        })
+        .to_string();
+        let evidence_id = do_insert_evidence(
+            &self.sql,
+            EvidenceRecord {
+                instance_id: request.instance_id,
+                kind: "effect.cancellation.requested",
+                subject_type: "effect_cancellation_request",
+                subject_id: &request_id,
+                causation_id: Some(&event.event_id),
+                correlation_id: request.revision_id,
+                summary: Some("effect cancellation requested"),
+                metadata_json: &evidence_metadata,
+            },
+        )?;
+        let link = |target_type: &str, target_id: &str, relation: &str| {
+            do_insert_evidence_link(
+                &self.sql,
+                EvidenceLink {
+                    evidence_id: &evidence_id,
+                    instance_id: request.instance_id,
+                    target_type,
+                    target_id,
+                    relation,
+                },
+            )
+        };
+        link("event", &event.event_id, "requested")?;
+        link("effect", request.effect_id, "requested_cancellation")?;
+        if let Some(revision_id) = request.revision_id {
+            link("workflow_revision", revision_id, "requested_by")?;
+        }
+        for run_id in &active_run_ids {
+            link("run", run_id, "active_run")?;
+        }
+        let recorded = self
+            .sql
+            .query(
+                "SELECT request_id, instance_id, effect_id, revision_id, reason, requested_by, \
+                 causation_event_id, status, idempotency_key, created_at, updated_at, \
+                 resolved_by_event_id FROM effect_cancellation_requests WHERE request_id = ?1",
+                &[text(&request_id)],
+            )
+            .map_err(sql_err)?;
+        recorded
+            .first()
+            .map(|r| effect_cancellation_request_from_row(r))
+            .ok_or_else(|| StoreError::Conflict("cancellation request was not recorded".to_owned()))
     }
 
     fn effect_has_open_cancellation_request(
@@ -4062,7 +4210,46 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn cancel_effect(&mut self, cancellation: EffectCancellation<'_>) -> StoreResult<StoredEvent> {
-        todo!("Phase 5b: port `cancel_effect` SQL to DoSql + verify against a live DO")
+        let payload = serde_json::json!({
+            "effect_id": cancellation.effect_id,
+            "status": "cancelled",
+            "reason": cancellation.reason,
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: cancellation.instance_id,
+                event_type: "effect.terminal",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(cancellation.effect_id),
+                correlation_id: None,
+                idempotency_key: cancellation.idempotency_key,
+            },
+        )?;
+        let changed = self
+            .sql
+            .execute(
+                "UPDATE effects SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP \
+                 WHERE instance_id = ?1 AND effect_id = ?2 \
+                 AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')",
+                &[text(cancellation.instance_id), text(cancellation.effect_id)],
+            )
+            .map_err(sql_err)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(
+                "effect cannot be cancelled".to_owned(),
+            ));
+        }
+        do_mark_cancellation_requests_terminal(
+            &self.sql,
+            cancellation.instance_id,
+            cancellation.effect_id,
+            &event.event_id,
+        )?;
+        self.satisfy_dependencies(cancellation.instance_id)?;
+        Ok(event)
     }
 
     fn renew_lease(&mut self, renewal: LeaseRenewal<'_>) -> StoreResult<StoredEvent> {
@@ -6409,5 +6596,107 @@ mod tests {
             },
         );
         assert!(guarded.is_err());
+    }
+
+    /// request_effect_cancellation records a request (idempotent) + evidence for a
+    /// running effect; cancel_effect terminates it and resolves the request. Real SQL.
+    #[test]
+    fn do_store_cancellation_runs_real_sql() {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    text("eff_1"),
+                    text("i1"),
+                    text("agent.tell"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed effect");
+        store
+            .sql
+            .execute(
+                "INSERT INTO runs (run_id, instance_id, effect_id, provider, worker_id, status) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[
+                    text("run_1"),
+                    text("i1"),
+                    text("eff_1"),
+                    text("p"),
+                    text("w"),
+                    text("running"),
+                ],
+            )
+            .expect("seed run");
+
+        let view = store
+            .request_effect_cancellation(EffectCancellationRequest {
+                instance_id: "i1",
+                effect_id: "eff_1",
+                revision_id: None,
+                reason: Some("user asked"),
+                requested_by: "operator",
+                causation_event_id: None,
+                idempotency_key: Some("cancel-idem"),
+            })
+            .expect("request cancel");
+        assert!(view.request_id.starts_with("ecr_"));
+        assert_eq!(view.status, "requested");
+        assert!(store
+            .effect_has_open_cancellation_request("i1", "eff_1")
+            .expect("open?"));
+        // Idempotent replay returns the same request id.
+        let view2 = store
+            .request_effect_cancellation(EffectCancellationRequest {
+                instance_id: "i1",
+                effect_id: "eff_1",
+                revision_id: None,
+                reason: Some("user asked"),
+                requested_by: "operator",
+                causation_event_id: None,
+                idempotency_key: Some("cancel-idem"),
+            })
+            .expect("replay");
+        assert_eq!(view.request_id, view2.request_id);
+        // Evidence + an active_run link were recorded.
+        assert!(store
+            .list_evidence_links("i1")
+            .expect("links")
+            .iter()
+            .any(|l| l.relation == "active_run" && l.target_id == "run_1"));
+
+        // cancel_effect terminates the effect and resolves the request to terminal.
+        store
+            .cancel_effect(EffectCancellation {
+                instance_id: "i1",
+                effect_id: "eff_1",
+                reason: Some("done"),
+                idempotency_key: Some("term-1"),
+            })
+            .expect("cancel");
+        let eff = store
+            .sql
+            .query(
+                "SELECT status FROM effects WHERE effect_id = ?1",
+                &[text("eff_1")],
+            )
+            .expect("read");
+        assert_eq!(as_text(&eff[0][0]), "cancelled");
+        assert!(!store
+            .effect_has_open_cancellation_request("i1", "eff_1")
+            .expect("open?"));
+        // A second cancel is rejected (already terminal).
+        assert!(store
+            .cancel_effect(EffectCancellation {
+                instance_id: "i1",
+                effect_id: "eff_1",
+                reason: None,
+                idempotency_key: Some("term-2"),
+            })
+            .is_err());
     }
 }
