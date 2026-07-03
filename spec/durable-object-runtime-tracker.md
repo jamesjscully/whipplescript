@@ -396,21 +396,19 @@ linear undo chain). No phase work now.
                 the 7 shared-owner Coordination defaults inherited) — the native
                 counterpart to the DO's one `DoSqliteStore` impl'ing all three;
                 tested through all 3 surfaces; store 91 tests green.
-                (2b) NEXT — rewrite `step_instance` + `project_queue_items` +
-                `release_holder_resources_on_terminal` (+ `apply_rule_cancels`)
-                generic over one `RuntimeKernel<S>` where
-                `S: RuntimeStore + Coordination + WorkItems`, and move them to the
-                kernel (most deps — `lower_rule`/`ready_contexts`/`OwnedLowering`/
-                `GuardReport`/`BranchReport`/`idempotency_key` — are already there).
-                Design settled: `fail_instance_internal`/`derive_fact` are
-                `RuntimeKernel` methods (so hold the kernel, not bare `S`); add
-                `RuntimeKernel::store()`/`store_mut()` so the pass reaches `S`'s
-                Coordination/WorkItems + raw reads. **Behavior-sensitive:** native
-                today RE-OPENS the store each loop iteration; the generic holds ONE
-                connection across the pass — equivalent under WAL (autocommit reads
-                see other connections' commits) but must be gate-verified. Updates 6
-                native callers (`step`/`dev`/sub-workflow paths) to build
-                `NativeStores` from the 3 paths and pass one `RuntimeKernel`;
+                (2b) **DONE (commit 4a15053):** `step_instance_generic<S:
+                RuntimeStore + Coordination + WorkItems>` drives the fixpoint over
+                ONE held `RuntimeKernel<S>` (no per-op re-open); `project_queue_items`
+                / `apply_rule_cancels` / `release_holder_resources_on_terminal` are
+                generic too. Native `step_instance` is now a thin wrapper building
+                `RuntimeKernel<NativeStores>` — 6 callers unchanged; DO drives the
+                same pass over `DoSqliteStore`. Added `RuntimeKernel::store()`/
+                `store_mut()`. The behavior-sensitive re-open→held-connection change
+                verified equivalent (kernel 204 / bins 374 / control_plane 162 /
+                soft_middle 56 green, clippy -D, fmt idempotent). NOTE: the generic
+                pass is still physically in `main.rs`; its relocation to the kernel
+                rides with the chunk-4 step-machine assembly (the DO host calls it
+                from there);
             (3) lift the effect executor + 13 store-only handlers, then the two
                 HTTP handlers as the already-built sans-IO effect machines;
             (4) assemble the `InstanceStepMachine` (the fixpoint as a `StepMachine`
