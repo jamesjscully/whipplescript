@@ -539,6 +539,44 @@ fn run_view_from_row(row: &[SqlValue]) -> RunView {
     }
 }
 
+/// Normalizes a revision cancellation-policy token, mirroring
+/// `normalize_cancellation_policy`.
+fn normalize_cancellation_policy(policy: &str) -> StoreResult<&'static str> {
+    match policy {
+        "keep" => Ok("keep"),
+        "cancel_queued" | "cancel queued" | "queued" => Ok("cancel_queued"),
+        "request_running" | "request running" | "running" => Ok("request_running"),
+        _ => Err(StoreError::Conflict(format!(
+            "unsupported revision cancellation policy `{policy}`"
+        ))),
+    }
+}
+
+/// Effect ids a revision policy would act on: running effects (`running=true`) or
+/// pending/blocked effects (`running=false`). Mirrors `revision_policy_effects_on`.
+fn do_revision_policy_effects<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    running: bool,
+) -> StoreResult<Vec<String>> {
+    let predicate = if running {
+        "status = 'running'"
+    } else {
+        "status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', \
+         'blocked_by_capability', 'blocked_by_profile')"
+    };
+    let rows = sql
+        .query(
+            &format!(
+                "SELECT effect_id FROM effects WHERE instance_id = ?1 AND {predicate} \
+                 ORDER BY created_at, effect_id"
+            ),
+            &[text(instance_id)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows.iter().map(|r| as_text(&r[0])).collect())
+}
+
 /// Maps a 12-column instance-revision row to a `WorkflowRevisionView`.
 fn workflow_revision_from_row(row: &[SqlValue]) -> WorkflowRevisionView {
     WorkflowRevisionView {
@@ -2100,9 +2138,43 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         instance_id: &str,
         cancellation_policy: &str,
     ) -> StoreResult<RevisionCancellationImpact> {
-        todo!(
-            "Phase 5b: port `revision_cancellation_impact` SQL to DoSql + verify against a live DO"
-        )
+        let cancellation_policy = normalize_cancellation_policy(cancellation_policy)?;
+        let rows = self
+            .sql
+            .query(
+                "SELECT version_id, revision_epoch, status FROM instances WHERE instance_id = ?1",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        let row = rows
+            .first()
+            .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))?;
+        let active_version_id = as_text(&row[0]);
+        let active_revision_epoch = as_i64(&row[1]);
+        let status = as_text(&row[2]);
+        if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+            return Err(StoreError::Conflict(format!(
+                "instance is {status}; revision impact requires a non-terminal instance"
+            )));
+        }
+        let terminal_cancel_effects = if cancellation_policy == "keep" {
+            Vec::new()
+        } else {
+            do_revision_policy_effects(&self.sql, instance_id, false)?
+        };
+        let request_cancel_effects = if cancellation_policy == "request_running" {
+            do_revision_policy_effects(&self.sql, instance_id, true)?
+        } else {
+            Vec::new()
+        };
+        Ok(RevisionCancellationImpact {
+            instance_id: instance_id.to_owned(),
+            active_version_id,
+            active_revision_epoch,
+            cancellation_policy: cancellation_policy.to_owned(),
+            terminal_cancel_effects,
+            request_cancel_effects,
+        })
     }
 
     fn analyze_revision_compatibility(
@@ -6698,5 +6770,74 @@ mod tests {
                 idempotency_key: Some("term-2"),
             })
             .is_err());
+    }
+
+    /// revision_cancellation_impact classifies pending vs running effects by policy.
+    #[test]
+    fn do_store_revision_cancellation_impact_runs_real_sql() {
+        let store = store();
+        let seed = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
+        seed(
+            "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+             workflow_principal, effective_authority, status, input_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            &[
+                text("i1"),
+                text("p"),
+                text("ver_1"),
+                int(2),
+                text("root"),
+                text("{}"),
+                text("running"),
+                text("{}"),
+            ],
+        );
+        seed(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                text("eff_q"),
+                text("i1"),
+                text("coerce"),
+                text("queued"),
+                text("{}"),
+            ],
+        );
+        seed(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                text("eff_r"),
+                text("i1"),
+                text("coerce"),
+                text("running"),
+                text("{}"),
+            ],
+        );
+
+        // keep: nothing cancelled.
+        let keep = store
+            .revision_cancellation_impact("i1", "keep")
+            .expect("keep");
+        assert!(keep.terminal_cancel_effects.is_empty());
+        assert!(keep.request_cancel_effects.is_empty());
+        assert_eq!(keep.active_revision_epoch, 2);
+
+        // cancel_queued: pending effect terminates, running untouched.
+        let cq = store
+            .revision_cancellation_impact("i1", "cancel_queued")
+            .expect("cancel_queued");
+        assert_eq!(cq.terminal_cancel_effects, vec!["eff_q".to_string()]);
+        assert!(cq.request_cancel_effects.is_empty());
+
+        // request_running: pending terminates + running is request-cancelled.
+        let rr = store
+            .revision_cancellation_impact("i1", "request_running")
+            .expect("request_running");
+        assert_eq!(rr.terminal_cancel_effects, vec!["eff_q".to_string()]);
+        assert_eq!(rr.request_cancel_effects, vec!["eff_r".to_string()]);
+
+        // Unknown policy rejected.
+        assert!(store.revision_cancellation_impact("i1", "bogus").is_err());
     }
 }
