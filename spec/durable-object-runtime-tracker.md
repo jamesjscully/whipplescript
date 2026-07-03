@@ -430,11 +430,13 @@ linear undo chain). No phase work now.
                 dbbf9dc). **11/~15 generic — the store-only executor is fully
                 lifted.** REMAINING = the hard tail (best done WITH the chunk-4 step
                 machine so the NeedsIo suspension is wired, not just store access):
-                the two HTTP effects `run_agent_effect` /
                 `run_coerce_effect`(→`cancel_coerce_effect`/`run_native_coerce_effect`)
-                wire the sans-IO `BrokeredTurnMachine`/`CoerceStepMachine`;
-                `run_workflow_invoke_effect` (435 ln) recurses into
-                `step_instance`/`run_worker_once`; `run_exec_effect` stays
+                wires the sans-IO `CoerceStepMachine`; `run_agent_effect` is NOT a
+                clean store-access conversion — it delegates to
+                `harness_tools::run_owned_agent_turn(&mut kernel, …, store_path, …)`
+                which RECURSES into sub-workflows (step/worker) just like
+                `run_workflow_invoke_effect` (435 ln), so both need the
+                recursion/step-machine design, not mechanical threading; `run_exec_effect` stays
                 native-only (DR-0033 Decision 7, no DO port). Original note: the
                 `file*` handlers need `FileStore`, `coordination`/`queue` need
                 `Coordination`/`WorkItems` (audit for inherent-vs-trait methods —
