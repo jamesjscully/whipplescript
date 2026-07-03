@@ -123,7 +123,8 @@ in flight and expensive to retrofit:
    file manifest. The coordination store is workspace-scoped and
    cross-instance, so a cut that omits it makes replay-from-checkpoint
    non-deterministic and hollows out the subsystem's checkpoint-conditional
-   evidence semantics (research note §7, §18). Phase 3 (store behind
+   evidence semantics (research note, "Evidence identity — the slice hash" +
+   "Architecture" sections). Phase 3 (store behind
    a trait) is the cheap moment to shape this: cut the coordination trait with
    a snapshot/manifest capability in view.
 2. **Content-addressing stays canonical and stable** across tiers and hosts
@@ -456,20 +457,20 @@ linear undo chain). No phase work now.
                 the `InstanceStepMachine` drives `step_instance_generic` + serial
                 effect dispatch, raising `NeedsIo(Http)` for the HTTP effects (which
                 lands the agent/coerce sans-IO wiring + the workflow-invoke/agent
-                recursion at the same time). **DESIGN FORK found 2026-07-03 (needs
-                Jack):** the handler-core relocation is NOT mechanical — 5 of 8
-                store-only cores take `options: &WorkerOptions` (a heavily native
-                struct: exec_profile / provider_config_paths / script_manifest /
-                work_unit_root / agent_outcomes / coerce_outputs) and one takes
-                `LoadedPackageLock`; only notify/coordination/file×4 are
-                entanglement-free (they still pull a ~2.4k-line closure of pure
-                helpers — effect_failure_base / file_path_policy_error /
-                effect_allow_globs / import-export codecs). To move the
-                WorkerOptions-taking cores to the wasm-clean kernel, the DO's
-                effect-config surface must be decided: split `WorkerOptions` into a
-                host-neutral `EffectConfig` (what handlers actually read) + a
-                native-only remainder, OR hand handlers a narrower trait. That is
-                the significant design question gating (4)'s finish;
+                recursion at the same time). **DESIGN FORK (WorkerOptions surface)
+                RESOLVED 2026-07-03, commit b84ba6d:** the option-taking cores read
+                only `provider` + `outcome.is_failed()`, so the fork collapsed to a
+                tiny host-neutral `whipplescript_kernel::effect_config::EffectConfig
+                { provider, outcome_failed }` (Option A, projection form — no 155-site
+                split). `WorkerOptions::effect_config()` projects it natively; a DO
+                builds one from bindings. The 5 store-only cores now take
+                `&EffectConfig`; event/loft/human/queue are fully WorkerOptions-free
+                (capability still carries `LoadedPackageLock`). REMAINING for (4):
+                relocate the store-only cores + their ~2.4k-line pure-helper closure
+                (`effect_failure_base` / `file_path_policy_error` /
+                `effect_allow_globs` / import-export codecs) into the kernel, resolve
+                capability's `LoadedPackageLock` tie, then build the
+                `InstanceStepMachine`;
             (5) wire the DO host (`RuntimeKernel<DoSqliteStore>` + `FetchHost`) to
                 the wasm-bindgen surface below.
       - [ ] The `wasm-bindgen` surface the shell imports (`createInstance`/`step`/
