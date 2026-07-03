@@ -523,9 +523,17 @@ linear undo chain). No phase work now.
             in `main.rs`; the DO's `InstanceDriver::run_effect` needs them in a lib
             (relocate to kernel, or a host-do effect module) + the two HTTP effects
             wired to `FetchHost` (the `NeedsHttp` path the machine already supports);
-            (5c) **`DoInstanceDriver` + wasm-bindgen `createInstance/step/snapshot`**
-            over `RuntimeKernel<DoSqliteStore>` + `FetchHost`, exported from
-            `whipplescript-host-do` for the TS shell;
+            (5c) **`DoInstanceDriver` DONE (commit e0b68bc):** the DO counterpart to
+            `NativeInstanceDriver` over `RuntimeKernel<DoSqliteStore>` — implements the
+            `InstanceDriver` seam (advance_rules→`step_instance_generic`,
+            next_ready→`claimable_effects`). **PROVEN: the DO drives a real workflow
+            (minimal-noop, `when started`→complete) to `completed` through the
+            `InstanceStepMachine`, verified against the rusqlite mock** (host-do 30).
+            So the DO runs the instance scheduler over its store for effect-free
+            workflows. REMAINING in 5c: the **wasm-bindgen `createInstance`/`step`/
+            `snapshot`** surface (the JS↔Rust boundary the TS shell imports — needs
+            the `wasm-bindgen` crate + JS DoSql/fetch callbacks, so it can only be
+            exercised on a live DO); and once 5b lands, run_effect executes effects;
             (5d) **live validation** on a real Cloudflare DO (the only truly
             infra-gated part — Jack's "plug into infra at the end").
 
