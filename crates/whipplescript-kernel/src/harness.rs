@@ -738,6 +738,7 @@ fn command_is_executable(path: &Path) -> bool {
     }
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn configure_child_process(command: &mut Command) {
     #[cfg(unix)]
     {

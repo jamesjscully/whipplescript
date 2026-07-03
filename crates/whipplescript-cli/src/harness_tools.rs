@@ -2264,7 +2264,7 @@ fn resolve_harness_model_config() -> Result<Option<HarnessModelConfig>, String> 
 /// deterministic fixture client so dev/CI need no credentials.
 #[allow(clippy::too_many_arguments)]
 pub fn run_owned_agent_turn(
-    kernel: &mut RuntimeKernel,
+    kernel: &mut RuntimeKernel<SqliteStore>,
     instance_id: &str,
     effect_id: &str,
     agent: &str,

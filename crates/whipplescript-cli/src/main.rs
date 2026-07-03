@@ -37545,7 +37545,7 @@ fn transition_instance(
     options: &CliOptions,
     usage: &str,
     transition: impl FnOnce(
-        &mut RuntimeKernel,
+        &mut RuntimeKernel<SqliteStore>,
         &str,
     ) -> Result<whipplescript_store::StoredEvent, StoreError>,
 ) -> ExitCode {

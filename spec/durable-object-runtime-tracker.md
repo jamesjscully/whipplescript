@@ -274,14 +274,21 @@ in flight and expensive to retrofit:
 - [x] `RuntimeKernel<S: RuntimeStore = SqliteStore>` — the kernel is now generic
       over the store trait (commit fc6d14a); native uses `RuntimeKernel<SqliteStore>`
       (inferred), decoupled from the concrete store. Gate-green.
-- [ ] Store wasm-cleanup so `rusqlite` drops out of the kernel's dep graph (crate
-      split, or feature-gate `rusqlite` + the SQL/`std::fs` impls behind a `native`
-      feature). **Proven the payoff is real (2026-07-03):** `whipplescript-core`
-      and `whipplescript-parser` build for `wasm32-unknown-unknown` today, and the
-      generic kernel's wasm build fails *only* on `libsqlite3-sys` (rusqlite's
-      bundled C — also needs `clang`, and is moot since the DO uses its own
-      SQLite). So this cleanup is the single remaining native blocker to a
-      wasm-buildable core. Native-only, gate-green refactor; large but mechanical.
+- [x] Store wasm-cleanup (commit 376c15c): `whipplescript-store` feature-gates the
+      rusqlite backing behind a default-on `native` feature (`rusqlite` optional;
+      all `SqliteStore`/`CoordinationStore`/`WorkItemStore` impls + ~57 helper fns
+      + the `StoreError::Sqlite` variant gated). Builds for
+      `wasm32-unknown-unknown` with `--no-default-features` (traits + data types
+      only), native completely unchanged (90 tests, clippy clean).
+- [x] **The sans-IO core builds for wasm** — kernel `native` feature forwards
+      to `whipplescript-store/native` (default-on) + `whipplescript-store`
+      dependency is `default-features = false`; `RuntimeKernel` has a
+      `native`-only `SqliteStore` default (wasm form takes explicit `S`).
+      `cargo build -p whipplescript-kernel --no-default-features --target
+      wasm32-unknown-unknown` **succeeds** — the whole evaluation core
+      (kernel + `sansio` + `harness_loop`/`harness_model` + `coerce_native`) runs
+      on wasm. Native unchanged (kernel 204+17, CLI green, clippy `-D warnings`).
+      This proves the DR-0033 architecture end-to-end.
 - [ ] `whipplescript-host-do` (wasm32) + Worker/DO shell: async `fetch` driver for
       `NeedsIo(Http)`, store traits over synchronous DO SQLite, consumes the
       sans-IO core. Subprocess effects unavailable / via HTTP sidecar. Every

@@ -44,15 +44,31 @@ use whipplescript_store::{
     InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent, NewFact, NewInboxItem,
     NewInstance, NewInstanceAuthority, NewProgramVersion, NewWorkflowInvocation,
     ProgramVersionRecord, RetryEffect, RevisionActivation, RuleCommit, RuleCommitRevisionGuard,
-    RunStart, RuntimeStore, SkillEvidence, SqliteStore, StoreError, StoreResult, StoredEvent,
+    RunStart, RuntimeStore, SkillEvidence, StoreError, StoreResult, StoredEvent,
     TerminalDiagnosticRecord, WorkflowInvocationView, WorkflowRevisionView,
 };
+// `SqliteStore` (the rusqlite store) is the default backend for
+// `RuntimeKernel` under the `native` feature and is used by tests; the kernel's
+// non-test code is otherwise generic over `RuntimeStore`, so it builds on wasm
+// (no-native) without it.
+#[cfg(feature = "native")]
+use whipplescript_store::SqliteStore;
 
-/// The runtime kernel over a [`RuntimeStore`] backend. Native uses
-/// `RuntimeKernel<SqliteStore>`; the durable-object host (Phase 5) will use
-/// `RuntimeKernel<DoSqliteStore>` — the kernel calls only trait methods, so it
-/// is decoupled from the concrete rusqlite store (DR-0033 Phase 5 prerequisite).
+/// The runtime kernel over a [`RuntimeStore`] backend. Native defaults the
+/// backend to `SqliteStore` (so existing `RuntimeKernel` type references keep
+/// working); the durable-object host (Phase 5) uses `RuntimeKernel<DoSqliteStore>`.
+/// The kernel calls only trait methods, so it is decoupled from the concrete
+/// rusqlite store and builds on wasm without it (DR-0033 Phase 5) — where there
+/// is no default backend, so `S` is always explicit.
+#[cfg(feature = "native")]
 pub struct RuntimeKernel<S: RuntimeStore = SqliteStore> {
+    store: S,
+    trace: Vec<TraceRecord>,
+}
+
+/// wasm / no-native form: no default backend (rusqlite `SqliteStore` is absent).
+#[cfg(not(feature = "native"))]
+pub struct RuntimeKernel<S: RuntimeStore> {
     store: S,
     trace: Vec<TraceRecord>,
 }
