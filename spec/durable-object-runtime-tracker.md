@@ -503,6 +503,25 @@ linear undo chain). No phase work now.
             `snapshot`) wiring `RuntimeKernel<DoSqliteStore>` + `FetchHost` to the
             drive loop; routing every new delivery/re-entry seam through the E2-DYN
             marker door. **Needs a live Cloudflare DO runtime.**
+            **Concrete chunk-5 map (found 2026-07-03):** the kernel's
+            `InstanceStepMachine` + `InstanceDriver` seam (built + validated in
+            chunk 4) is exactly what the DO plugs into. Four concrete pieces, three
+            code (writable/wasm-buildable/mock-testable) + one live:
+            (5a) **`Coordination` + `WorkItems` on `DoSqliteStore`** — it currently
+            impls `RuntimeStore` ONLY; `step_instance_generic` needs all three. This
+            is a schema + ~400-line SQL port (the `work_items` schema isn't even in
+            migration 0001 — native work-items is a separate store), verifiable
+            against the rusqlite-backed `RusqliteDoSql` mock like the 87-method
+            RuntimeStore port already is;
+            (5b) **DO-reachable effect handler cores** — the store-only cores live
+            in `main.rs`; the DO's `InstanceDriver::run_effect` needs them in a lib
+            (relocate to kernel, or a host-do effect module) + the two HTTP effects
+            wired to `FetchHost` (the `NeedsHttp` path the machine already supports);
+            (5c) **`DoInstanceDriver` + wasm-bindgen `createInstance/step/snapshot`**
+            over `RuntimeKernel<DoSqliteStore>` + `FetchHost`, exported from
+            `whipplescript-host-do` for the TS shell;
+            (5d) **live validation** on a real Cloudflare DO (the only truly
+            infra-gated part — Jack's "plug into infra at the end").
 
 ### Phase 6 — Scheduling + config on the DO
 - [~] Seams landed in `whipplescript-host-do` (real, tested, native + wasm):
