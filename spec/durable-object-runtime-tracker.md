@@ -486,11 +486,17 @@ linear undo chain). No phase work now.
                 handler cores (dispatched by kind, all settle `Done`; HTTP/subproc/
                 recursion tail errors clearly). Compiles + clippy -D clean; the
                 native handlers run HTTP to completion internally so it never
-                suspends (only the DO binding does). REMAINING for (4): swap it into
-                `dev`/`worker`/`step` (behavior-neutral for store-only workflows) +
-                a subprocess integration test proving parity with the dev loop —
-                needs the full instance-run harness. It has no production call site
-                yet (dead-code allow);
+                suspends (only the DO binding does). **VALIDATED END-TO-END
+                (commit 6141c27):** a bin test starts a real store-only workflow and
+                `run_instance_via_machine` drives it through the `InstanceStepMachine`
+                over `NativeInstanceDriver` to `InstanceOutcome::Terminal`, with the
+                durable status confirmed `completed` — the same terminal the dev loop
+                reaches. So the instance scheduler is proven on real components (rule
+                pass + store + machine), not just the mock-driver unit tests. Chunk 4
+                is functionally COMPLETE. The only OPTIONAL remainder: make the
+                machine the DEFAULT native executor in `dev`/`worker`/`step` (a
+                behavior-neutral swap of a working path, whose real payoff is the DO,
+                not native) — deferred as low-value;
             (5) wire the DO host (`RuntimeKernel<DoSqliteStore>` + `FetchHost`) to
                 the wasm-bindgen surface below.
       - [ ] The `wasm-bindgen` surface the shell imports (`createInstance`/`step`/
