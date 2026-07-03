@@ -34,7 +34,7 @@ pub struct ToolSpec {
 }
 
 /// One tool invocation the model requested.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     /// Provider-assigned call id, used to correlate the result back.
     pub id: String,
@@ -45,7 +45,7 @@ pub struct ToolCall {
 /// Terminal status of a single tool execution. Anti-idempotence is intended: a
 /// failed tool result is informative to the model (it retries), not a turn
 /// failure (DR-0024 boundary corollary).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ToolStatus {
     Ok,
     Error,
@@ -67,7 +67,7 @@ pub trait ToolExecutor {
 }
 
 /// One message in the model conversation the driver maintains.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ChatMessage {
     System(String),
     User(String),
@@ -81,7 +81,7 @@ pub enum ChatMessage {
 }
 
 /// A tool result as it appears back in the conversation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolResultMsg {
     pub tool_call_id: String,
     pub tool_name: String,
@@ -180,7 +180,7 @@ impl<M: HttpModelClient + ?Sized> StepMachine for ModelCallMachine<'_, M> {
 
 /// An in-turn stream event. Evidence-grade only (I2): the kernel runner records
 /// each as evidence; none derives a rule-matchable fact.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LoopObservation {
     /// A model call was made at this 0-based step.
     ModelRequest { step: usize },
@@ -347,6 +347,18 @@ where
 /// brokered synchronously by the [`ToolExecutor`] (a tool that itself needs I/O
 /// becomes its own nested step machine in a later phase). Driven natively by
 /// [`run_brokered_turn_http`]; proven equivalent to [`run_brokered_loop`] in tests.
+/// The persistable mid-turn state of a [`BrokeredTurnMachine`] — everything that
+/// varies as the turn progresses. The borrowed model/executor/input/checkpoint are
+/// re-supplied on [`restore`](BrokeredTurnMachine::restore); this is only the state.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct BrokeredTurnSnapshot {
+    pub messages: Vec<ChatMessage>,
+    pub observations: Vec<LoopObservation>,
+    pub usage: Value,
+    pub step: usize,
+    pub started: bool,
+}
+
 pub struct BrokeredTurnMachine<'a, M, E>
 where
     M: HttpModelClient + ?Sized,
@@ -384,6 +396,45 @@ where
             usage: Value::Null,
             step: 0,
             started: false,
+        }
+    }
+
+    /// Reconstruct a mid-turn machine from a persisted [`BrokeredTurnSnapshot`],
+    /// re-supplying the borrowed model/executor/input/checkpoint. This is what makes
+    /// a multi-round agent turn eviction-safe on the durable object (DR-0033
+    /// Decision 3): each `run_effect` re-entry restores the exact machine state
+    /// (conversation + observations + usage + step) from the store and continues,
+    /// so an eviction between two provider `fetch`es loses nothing. Native runs the
+    /// turn to completion in one pass and never needs it.
+    pub fn restore(
+        model: &'a M,
+        executor: &'a E,
+        input: &'a BrokeredTurnInput,
+        checkpoint: &'a mut dyn FnMut(&[ChatMessage]),
+        snapshot: BrokeredTurnSnapshot,
+    ) -> Self {
+        Self {
+            model,
+            executor,
+            input,
+            checkpoint,
+            messages: snapshot.messages,
+            observations: snapshot.observations,
+            usage: snapshot.usage,
+            step: snapshot.step,
+            started: snapshot.started,
+        }
+    }
+
+    /// Capture the machine's full mid-turn state so a host can persist it between
+    /// provider rounds and later [`restore`](Self::restore) it byte-for-byte.
+    pub fn snapshot(&self) -> BrokeredTurnSnapshot {
+        BrokeredTurnSnapshot {
+            messages: self.messages.clone(),
+            observations: self.observations.clone(),
+            usage: self.usage.clone(),
+            step: self.step,
+            started: self.started,
         }
     }
 
@@ -932,6 +983,67 @@ mod tests {
     #[test]
     fn brokered_turn_machine_matches_loop_completing_immediately() {
         assert_loops_equivalent(|| vec![Ok(final_reply("done"))], 8);
+    }
+
+    /// The durable-object eviction test (DR-0033 Decision 3): drive a multi-round
+    /// turn where the machine is snapshotted, JSON round-tripped (proving it fully
+    /// serializes), and reconstructed from that snapshot before EVERY step — as if
+    /// the DO were evicted between each provider `fetch`. The final outcome must be
+    /// identical to an uninterrupted run: eviction mid-turn loses nothing.
+    #[test]
+    fn brokered_turn_survives_eviction_between_every_round() {
+        let replies = || vec![Ok(tool_reply("c1", "read")), Ok(final_reply("done"))];
+        let outcome_of = ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "R".to_string(),
+        };
+
+        // Reference: one uninterrupted stepped run.
+        let http = ScriptedHttpClient::new(replies());
+        let exec = RecordingExecutor::new(outcome_of.clone());
+        let reference = {
+            let mut record = |_: &[ChatMessage]| {};
+            run_brokered_turn_http(&http, &exec, &input(8), &mut record, &DummyHost)
+        };
+
+        // Eviction-simulated: rebuild the machine from a serialized snapshot each
+        // round. The scripted client/executor persist their queues across rebuilds
+        // (the store would); only the machine is torn down and restored.
+        let http2 = ScriptedHttpClient::new(replies());
+        let exec2 = RecordingExecutor::new(outcome_of);
+        let input2 = input(8);
+        let host = DummyHost;
+        let mut snapshot: Option<BrokeredTurnSnapshot> = None;
+        let mut incoming: Option<IoResult> = None;
+        let mut rebuilds = 0usize;
+        let outcome = loop {
+            let mut discard = |_: &[ChatMessage]| {};
+            let mut machine = match snapshot.take() {
+                None => BrokeredTurnMachine::new(&http2, &exec2, &input2, &mut discard),
+                Some(snap) => {
+                    let json = serde_json::to_string(&snap).expect("snapshot serializes");
+                    let restored: BrokeredTurnSnapshot =
+                        serde_json::from_str(&json).expect("snapshot deserializes");
+                    rebuilds += 1;
+                    BrokeredTurnMachine::restore(&http2, &exec2, &input2, &mut discard, restored)
+                }
+            };
+            match machine.step(incoming.take()) {
+                Outcome::NeedsIo(request) => {
+                    incoming = Some(host.fulfill(&request));
+                    snapshot = Some(machine.snapshot());
+                }
+                Outcome::Settle(out) => break out,
+            }
+        };
+
+        assert!(rebuilds >= 2, "the turn was rebuilt across multiple rounds");
+        assert_eq!(outcome.status, reference.status, "status");
+        assert_eq!(outcome.summary, reference.summary, "summary");
+        assert_eq!(outcome.steps, reference.steps, "steps");
+        assert_eq!(outcome.observations, reference.observations, "observations");
+        assert_eq!(outcome.usage, reference.usage, "usage");
+        assert_eq!(*exec.calls.borrow(), *exec2.calls.borrow(), "tool calls");
     }
 
     #[test]
