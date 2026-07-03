@@ -27,8 +27,15 @@ export interface Env {
 // The host callbacks the Rust core calls. Each maps one Rust host trait
 // (FetchClient / DoStorage / Alarms / Secrets / ObjectStore) onto a DO primitive.
 interface HostBindings {
-  // DoStorage: the DO's synchronous SQLite.
-  sqlExec(sql: string, params: unknown[]): unknown[];
+  // DoStorage: the DO's synchronous SQLite. This backs the Rust `DoSql` trait,
+  // whose `query` returns `Vec<Vec<SqlValue>>` — i.e. rows of POSITIONAL column
+  // values, matching the SELECT's column order. Cloudflare's `SqlStorage.exec`
+  // cursor yields column-KEYED row objects by default; `.raw()` is what yields
+  // positional arrays (https://developers.cloudflare.com/durable-objects/api/storage-api/#exec),
+  // so `sqlExec` MUST return an array of arrays (one inner array per row). A
+  // statement (INSERT/UPDATE) yields no rows → `[]`; the Rust side reads
+  // `cursor.rowsWritten` via the return being empty and does not depend on it.
+  sqlExec(sql: string, params: unknown[]): unknown[][];
   // Alarms: single-wake-up scheduler.
   setAlarm(atUnixMs: number): void;
   getAlarm(): number | null;
@@ -52,7 +59,10 @@ export class WhippleInstance {
   private bindings(): HostBindings {
     const sql = this.state.storage.sql;
     return {
-      sqlExec: (query, params) => Array.from(sql.exec(query, ...params)),
+      // `.raw()` yields positional column arrays, matching Rust `DoSql::query`'s
+      // `Vec<Vec<SqlValue>>`. `.toArray()` materializes the whole cursor (the DO
+      // step is synchronous and result sets are small + instance-scoped).
+      sqlExec: (query, params) => sql.exec(query, ...params).raw().toArray(),
       setAlarm: (atUnixMs) => this.state.storage.setAlarm(atUnixMs),
       getAlarm: async () => (await this.state.storage.getAlarm()) ?? null,
       getSecret: (name) => (this.env as Record<string, unknown>)[name] as string ?? null,
