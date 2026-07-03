@@ -272,10 +272,12 @@ linear undo chain). No phase work now.
 > coerce suspend/resume + eviction-safe agent turn), 5c `DoInstanceDriver` +
 > `DurableInstance` + the `#[wasm_bindgen]` `WasmDurableInstance` surface, and
 > 5d the worker shell + end-to-end validation of the real wasm module over real
-> SQLite (commit 56ae999). The ONLY remainder is provisioning: `wrangler deploy`
-> against a live edge DO + `wrangler secret put`, plus the follow-on DO
-> messages-API agent `HttpModelClient` for live agent turns. Details per chunk
-> below.
+> SQLite (commit 56ae999); the DO agent model client landed too (commit 42194cf,
+> `MessagesApiClient`), so agent turns run live in-repo alongside coerce. The ONLY
+> remainders are provisioning (`wrangler deploy` against a live edge DO +
+> `wrangler secret put` for live creds) and one design seam — a DO `ToolExecutor`
+> for agent turns that request tools (the async-tool-over-sidecar boundary).
+> Details per chunk below.
 >
 > **Concrete entry point (found 2026-07-03, Phases 0–4 done).** The sans-IO
 > seams (`sansio.rs`, `HttpModelClient`/`BrokeredTurnMachine`) and the store
@@ -535,13 +537,20 @@ linear undo chain). No phase work now.
             `DurableInstance<JsDoSql>`, `JsDoSql` implements `DoSql` over the JS
             `DoSqlBridge` (`state.storage.sql`), and the step protocol marshals the
             `fetch` request out / response in as JSON. This drives
-            `RuntimeKernel<DoSqliteStore>` through the `InstanceStepMachine`, coerce
-            creds flowing in via `create`'s `coerce_config_json` (DO secrets). What
-            is NOT yet wired: the messages-API agent `HttpModelClient` on the DO
-            (the follow-on seam — coerce runs live, agent needs a DO model client +
-            tool executor) and routing the delivery/re-entry seams through the
-            E2-DYN marker door on the deployed surface. **The only truly infra-gated
-            remainder is `wrangler deploy` against a real edge DO** (5d below).
+            `RuntimeKernel<DoSqliteStore>` through the `InstanceStepMachine`, with
+            coerce AND agent creds flowing in via `create`'s `coerce_config_json` /
+            `agent_config_json` (DO secrets). **The DO agent model client is now
+            wired (commit 42194cf):** `kernel::harness_model::MessagesApiClient` is a
+            transport-free `HttpModelClient` (config-only, reusing the native
+            `build_request`/`parse_response`), so an agent turn suspends on the real
+            `/v1/messages` request and resumes to a terminal — validated in-repo over
+            `node:sqlite` (validate.cjs's third case) exactly like coerce. What is
+            NOT yet wired: an agent turn that requests **tools** needs a DO
+            `ToolExecutor` over an HTTP sidecar (the async-tool boundary — genuine
+            design work, not wiring), and routing the delivery/re-entry seams through
+            the E2-DYN marker door on the deployed surface. **The only truly
+            infra-gated remainder is `wrangler deploy` against a real edge DO + live
+            creds** (5d below).
             **Concrete chunk-5 map (found 2026-07-03):** the kernel's
             `InstanceStepMachine` + `InstanceDriver` seam (built + validated in
             chunk 4) is exactly what the DO plugs into. Four concrete pieces, three
@@ -561,7 +570,14 @@ linear undo chain). No phase work now.
             (5b) **DO-reachable effect handler cores — STARTED (commit 9124f67).**
             Pattern established: lift each store-only core into
             `kernel::effect_handlers` (host-neutral, `EffectConfig`-only) so both
-            `InstanceDriver` bindings dispatch it. event+loft+human+queue+coordination+file(read/write/import) cores lifted to kernel::effect_handlers (9124f67,8bdfe2c,36422c7); DO dispatches ALL 8 store-only families incl. file (via FileStore seam, b106095). notify lifted via DeliveryGovernance projection (27b5637); capability lifted via CapabilityContract projection (d88630d) — ALL 10 store-only families execute on the DO. **coerce HTTP effect DONE + PROVEN (6c52884):** DoInstanceDriver dispatches `coerce` — build_coerce_call_parts+build_request→EffectStep::NeedsHttp→(fetch)→parse_response→settle_coerce_result, every piece host-neutral in the kernel (c543428/659c933); test drives a when-started→coerce→complete workflow to Terminal with a fake Anthropic fetch response. The DO SUSPENDS a real provider effect on fetch + RESUMES to terminal — DR-0033's crux, proven in-repo. coerce PROVEN (6c52884) + agent PROVEN (d89089a: snapshot/restore eviction-safe multi-round, DoInstanceDriver dispatch). THE DO EXECUTES ALL EFFECT FAMILIES. REMAINING HTTP: (a) coerce/agent LIVE creds = the CoerceProviderConfig's real values from the DO secrets plane (infra); (b) the **agent turn** — multi-round (BrokeredTurnMachine), needs conversation checkpointing in the store across HTTP rounds + a DO HttpModelClient impl (secrets) + a DO ToolExecutor — genuinely infra-adjacent, harder than coerce's single round; workflow_invoke; exec(native-only, DR-0033 Decision 7);
+            `InstanceDriver` bindings dispatch it. event+loft+human+queue+coordination+file(read/write/import) cores lifted to kernel::effect_handlers (9124f67,8bdfe2c,36422c7); DO dispatches ALL 8 store-only families incl. file (via FileStore seam, b106095). notify lifted via DeliveryGovernance projection (27b5637); capability lifted via CapabilityContract projection (d88630d) — ALL 10 store-only families execute on the DO. **coerce HTTP effect DONE + PROVEN (6c52884):** DoInstanceDriver dispatches `coerce` — build_coerce_call_parts+build_request→EffectStep::NeedsHttp→(fetch)→parse_response→settle_coerce_result, every piece host-neutral in the kernel (c543428/659c933); test drives a when-started→coerce→complete workflow to Terminal with a fake Anthropic fetch response. The DO SUSPENDS a real provider effect on fetch + RESUMES to terminal — DR-0033's crux, proven in-repo. coerce PROVEN (6c52884) + agent PROVEN (d89089a: snapshot/restore eviction-safe multi-round, DoInstanceDriver dispatch). THE DO EXECUTES ALL EFFECT FAMILIES. **agent turn model client DONE (commit 42194cf):** `MessagesApiClient`
+            (transport-free `HttpModelClient`, reuses native build/parse) is wired
+            through `create`'s `agent_config_json`; a no-tool agent turn suspends on
+            the real `/v1/messages` request + resumes to terminal, live-validated
+            over `node:sqlite`. REMAINING HTTP: (a) coerce/agent LIVE creds from the
+            DO secrets plane (infra); (b) an agent turn requesting **tools** needs a
+            DO `ToolExecutor` over an HTTP sidecar (async-tool boundary — genuine
+            design work); workflow_invoke; exec(native-only, DR-0033 Decision 7);
             (5c) **`DoInstanceDriver` DONE (commit e0b68bc):** the DO counterpart to
             `NativeInstanceDriver` over `RuntimeKernel<DoSqliteStore>` — implements the
             `InstanceDriver` seam (advance_rules→`step_instance_generic`,
