@@ -75,13 +75,7 @@ impl<T: CoerceTransport + ?Sized> HttpModelClient for RealHarnessModelClient<'_,
         &self,
         response: Result<HttpResponse, CoerceTransportError>,
     ) -> Result<ModelReply, HarnessModelError> {
-        match response {
-            Ok(response) => parse_response(self.provider, response.status, &response.body),
-            Err(CoerceTransportError::Timeout) => Err(HarnessModelError::Timeout),
-            Err(CoerceTransportError::Transport(message)) => {
-                Err(HarnessModelError::Transport(message))
-            }
-        }
+        map_transport_response(self.provider, response)
     }
 }
 
@@ -97,6 +91,75 @@ impl<T: CoerceTransport + ?Sized> HarnessModelClient for RealHarnessModelClient<
         // build_request → post → parse_response.
         let mut machine = ModelCallMachine::new(self, messages, tools);
         run_to_completion(&mut machine, self.transport)
+    }
+}
+
+/// A model client that owns only the provider config — no transport — so a host
+/// that performs the HTTP itself drives it purely (DR-0033). This is the agent
+/// counterpart to coerce's `build_coerce_call_parts`: the durable-object host
+/// builds one from its secrets plane and drives it through the `HttpModelClient`
+/// trait (`build_request` → its own `fetch` → `parse_response`) via the
+/// `BrokeredTurnMachine`, never calling `next`/`run_to_completion`. It shares the
+/// exact request-build / response-parse logic the native
+/// [`RealHarnessModelClient`] uses, so the wire format is identical across hosts.
+pub struct MessagesApiClient {
+    provider: CoerceProvider,
+    api_key: String,
+    model: String,
+    base_url: String,
+    max_tokens: u64,
+}
+
+impl MessagesApiClient {
+    pub fn new(
+        provider: CoerceProvider,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        max_tokens: u64,
+    ) -> Self {
+        Self {
+            provider,
+            api_key: api_key.into(),
+            model: model.into(),
+            base_url: base_url.into(),
+            max_tokens,
+        }
+    }
+}
+
+impl HttpModelClient for MessagesApiClient {
+    fn build_request(&self, messages: &[ChatMessage], tools: &[ToolSpec]) -> HttpRequest {
+        build_request(
+            self.provider,
+            &self.base_url,
+            &self.api_key,
+            &self.model,
+            self.max_tokens,
+            messages,
+            tools,
+        )
+    }
+
+    fn parse_response(
+        &self,
+        response: Result<HttpResponse, CoerceTransportError>,
+    ) -> Result<ModelReply, HarnessModelError> {
+        map_transport_response(self.provider, response)
+    }
+}
+
+/// Map a transport outcome to a model reply: parse a delivered response, or lift a
+/// transport failure to the matching [`HarnessModelError`]. Shared by every
+/// [`HttpModelClient`] so the timeout/transport mapping cannot drift between hosts.
+fn map_transport_response(
+    provider: CoerceProvider,
+    response: Result<HttpResponse, CoerceTransportError>,
+) -> Result<ModelReply, HarnessModelError> {
+    match response {
+        Ok(response) => parse_response(provider, response.status, &response.body),
+        Err(CoerceTransportError::Timeout) => Err(HarnessModelError::Timeout),
+        Err(CoerceTransportError::Transport(message)) => Err(HarnessModelError::Transport(message)),
     }
 }
 
@@ -578,6 +641,39 @@ mod tests {
         );
         // sanity: a request was actually built and sent
         assert!(transport.seen.borrow().is_some());
+    }
+
+    #[test]
+    fn messages_api_client_builds_and_parses_without_a_transport() {
+        // The durable-object path: no transport, the host does the fetch. The
+        // config-only client must produce the same request and parse a reply.
+        let client = MessagesApiClient::new(
+            CoerceProvider::Anthropic,
+            "sk-ant-key",
+            "claude-opus-4-8",
+            "https://api.anthropic.com",
+            4096,
+        );
+        let request = client.build_request(&convo(), &tool_specs());
+        assert_eq!(request.url, "https://api.anthropic.com/v1/messages");
+        assert!(request
+            .headers
+            .iter()
+            .any(|(k, v)| k == "x-api-key" && v == "sk-ant-key"));
+
+        let reply = client
+            .parse_response(Ok(HttpResponse {
+                status: 200,
+                body: json!({ "content": [ { "type": "text", "text": "final" } ] }),
+            }))
+            .expect("reply");
+        assert_eq!(reply.text, "final");
+        assert!(reply.is_final());
+
+        assert_eq!(
+            client.parse_response(Err(CoerceTransportError::Timeout)),
+            Err(HarnessModelError::Timeout)
+        );
     }
 
     #[test]

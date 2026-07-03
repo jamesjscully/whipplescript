@@ -43,7 +43,7 @@ function testEffectFree() {
     "  complete result {", '    source "external.started"', '    state "observed"', "  }", "}",
   ].join("\n");
   const bridge = freshInstanceEnv([]);
-  const inst = WasmDurableInstance.create(bridge, source, "{}", "local/MinimalNoop", undefined);
+  const inst = WasmDurableInstance.create(bridge, source, "{}", "local/MinimalNoop", undefined, undefined);
   const outcome = JSON.parse(inst.step(undefined));
   assert.strictEqual(outcome.kind, "terminal", `effect-free: ${JSON.stringify(outcome)}`);
   assert.strictEqual(inst.status(), "completed");
@@ -71,7 +71,7 @@ function testCoerceSuspendResume() {
     provider: "anthropic", base_url: "https://api.anthropic.com",
     api_key: "test-key", model: "claude-test", max_tokens: 1024,
   });
-  const inst = WasmDurableInstance.create(bridge, source, "{}", "local/CoerceScore", coerceConfig);
+  const inst = WasmDurableInstance.create(bridge, source, "{}", "local/CoerceScore", coerceConfig, undefined);
 
   // First step: the coerce effect suspends on `fetch`.
   const first = JSON.parse(inst.step(undefined));
@@ -92,6 +92,51 @@ function testCoerceSuspendResume() {
   console.log("PASS  coerce workflow -> needs_http -> (fetch) -> terminal (two steps)");
 }
 
+// 3) An AGENT workflow: the multi-round turn's first model call SUSPENDS on fetch
+//    (the real Anthropic messages request the MessagesApiClient built), and a canned
+//    final reply RESUMES it to a terminal -- the agent counterpart to (2), through wasm.
+function testAgentSuspendResume() {
+  const source = [
+    "workflow AgentDemo", "", "output result Done", "",
+    "class Done {", "  ok int", "}", "",
+    "agent helper {", "  provider owned", '  profile "repo-reader"', "  capacity 1", "}", "",
+    "rule go", "  when started", "=> {", '  tell helper as reply """', "  Do the thing.", '  """', "",
+    "  after reply succeeds {", "    complete result { ok 1 }", "  }", "",
+    "  after reply fails {", "    complete result { ok 0 }", "  }", "}",
+  ].join("\n");
+  const seed = [
+    "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+    "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+    "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+    "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+  ];
+  const bridge = freshInstanceEnv(seed);
+  const agentConfig = JSON.stringify({
+    provider: "anthropic", base_url: "https://api.anthropic.com",
+    api_key: "test-key", model: "claude-test", max_tokens: 4096,
+  });
+  const inst = WasmDurableInstance.create(bridge, source, "{}", "local/AgentDemo", undefined, agentConfig);
+
+  // First step: the agent turn's first model call suspends on `fetch`.
+  const first = JSON.parse(inst.step(undefined));
+  assert.strictEqual(first.kind, "needs_http", `agent step1: ${JSON.stringify(first)}`);
+  assert.ok(first.request.url.endsWith("/v1/messages"), "request targets the messages endpoint");
+
+  // The shell performs the fetch; feed a canned Anthropic final reply (no tool calls).
+  const response = JSON.stringify({
+    status: 200,
+    body: {
+      content: [{ type: "text", text: "did the thing" }],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+  });
+  const second = JSON.parse(inst.step(response));
+  assert.strictEqual(second.kind, "terminal", `agent step2: ${JSON.stringify(second)}`);
+  assert.strictEqual(inst.status(), "completed");
+  console.log("PASS  agent workflow -> needs_http -> (fetch) -> terminal (two steps)");
+}
+
 testEffectFree();
 testCoerceSuspendResume();
+testAgentSuspendResume();
 console.log("\nALL PASS: the wasm DO runtime drives real workflows over real SQLite through the wasm-bindgen boundary.");

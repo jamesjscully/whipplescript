@@ -11,14 +11,16 @@
 //! The TS shell drives it: `WasmDurableInstance.create(bridge, program, input,
 //! principal)`, then loop `step(responseJson)` — on `{"kind":"needs_http", …}` do the
 //! `fetch` and pass the result back, on `{"kind":"terminal"|"parked"|"failed"}` stop.
-//! Coerce provider creds flow in via `create`'s `coerce_config_json` (from DO
-//! secrets), so the store-only, effect-free, AND coerce paths run on the deployed
-//! surface; the messages-API agent model client is the remaining follow-on seam.
+//! Provider creds flow in via `create`'s `coerce_config_json` / `agent_config_json`
+//! (from DO secrets), so the store-only, effect-free, coerce, AND agent-turn paths
+//! run on the deployed surface. The remaining agent seam is tools: a live turn that
+//! requests tools needs a tool-executor sidecar (the async-tool boundary).
 
 use wasm_bindgen::prelude::*;
 
 use crate::do_store::SqlValue;
 use whipplescript_kernel::coerce_native::CoerceProvider;
+use whipplescript_kernel::harness_model::MessagesApiClient;
 use whipplescript_kernel::sansio::{HttpResponse, TransportError};
 
 use crate::do_instance::CoerceProviderConfig;
@@ -179,6 +181,35 @@ fn parse_coerce_config(json: &str) -> Result<CoerceProviderConfig, String> {
     })
 }
 
+/// Parse the DO-secret agent-model config JSON into a `MessagesApiClient` — the
+/// same `{provider, base_url, api_key, model, max_tokens}` shape as the coerce
+/// config (an agent turn is a multi-round messages/responses call). The client is
+/// transport-free: the shell performs each round's `fetch`.
+fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let provider = match value.get("provider").and_then(serde_json::Value::as_str) {
+        Some("anthropic") => CoerceProvider::Anthropic,
+        Some("openai") => CoerceProvider::OpenAi,
+        other => return Err(format!("unknown agent provider: {other:?}")),
+    };
+    let field = |name: &str| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    Ok(MessagesApiClient::new(
+        provider,
+        field("api_key").ok_or("agent config needs api_key")?,
+        field("model").ok_or("agent config needs model")?,
+        field("base_url").ok_or("agent config needs base_url")?,
+        value
+            .get("max_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(4096),
+    ))
+}
+
 /// The durable-object instance as the Worker shell sees it.
 #[wasm_bindgen]
 pub struct WasmDurableInstance {
@@ -188,21 +219,31 @@ pub struct WasmDurableInstance {
 #[wasm_bindgen]
 impl WasmDurableInstance {
     /// Compile `program` and create + start a fresh instance over the JS-backed DO
-    /// SQLite. Called once when the object is first addressed. `coerce_config_json`
-    /// (optional) carries the provider creds a `coerce` effect needs, from DO
-    /// secrets: `{"provider":"anthropic"|"openai","base_url","api_key","model",
-    /// "max_tokens"}`. The messages-API agent model client is a follow-on seam.
+    /// SQLite. Called once when the object is first addressed. Both config args are
+    /// optional and carry provider creds from DO secrets, same JSON shape
+    /// `{"provider":"anthropic"|"openai","base_url","api_key","model","max_tokens"}`:
+    /// `coerce_config_json` for `coerce` effects, `agent_config_json` for the
+    /// (multi-round) `agent.tell` turn. A live agent turn with tools also needs a
+    /// tool executor over an HTTP sidecar (the remaining async-tool seam).
     pub fn create(
         bridge: DoSqlBridge,
         program: &str,
         input: &str,
         principal: &str,
         coerce_config_json: Option<String>,
+        agent_config_json: Option<String>,
     ) -> Result<WasmDurableInstance, JsValue> {
         let coerce = match coerce_config_json {
             Some(json) => Some(parse_coerce_config(&json).map_err(|e| JsValue::from_str(&e))?),
             None => None,
         };
+        let agent_model: Option<Box<dyn whipplescript_kernel::harness_loop::HttpModelClient>> =
+            match agent_config_json {
+                Some(json) => Some(Box::new(
+                    parse_agent_config(&json).map_err(|e| JsValue::from_str(&e))?,
+                )),
+                None => None,
+            };
         let inner = DurableInstance::create(
             JsDoSql { bridge },
             program,
@@ -210,6 +251,7 @@ impl WasmDurableInstance {
             principal,
             DurableEffectPorts {
                 coerce,
+                agent_model,
                 ..DurableEffectPorts::default()
             },
         )

@@ -358,4 +358,92 @@ mod tests {
             Some("completed")
         );
     }
+
+    /// The worker-shell loop over an AGENT workflow, driving the real
+    /// `MessagesApiClient` (the config-only, transport-free model client a live
+    /// worker builds from its secrets): `create`, `step(None)` yields NeedsHttp
+    /// carrying the REAL Anthropic messages request, the shell performs the `fetch`,
+    /// and `step(response)` parses a final reply and settles to the terminal. This
+    /// is the agent counterpart to the coerce test — the multi-round turn's first
+    /// round suspends over the handle and resumes to a terminal, over the real wire
+    /// format, not a fake model.
+    #[test]
+    fn durable_instance_runs_an_agent_turn_over_fetch_with_the_real_model_client() {
+        use whipplescript_kernel::coerce_native::CoerceProvider;
+        use whipplescript_kernel::harness_model::MessagesApiClient;
+        use whipplescript_kernel::sansio::HttpResponse;
+
+        let source = "workflow AgentDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             agent helper {\n  provider owned\n  profile \"repo-reader\"\n  capacity 1\n}\n\n\
+             rule go\n  when started\n=> {\n  tell helper as reply \"\"\"\n  Do the thing.\n  \"\"\"\n\n\
+             \x20 after reply succeeds {\n    complete result { ok 1 }\n  }\n\n\
+             \x20 after reply fails {\n    complete result { ok 0 }\n  }\n}\n";
+        let base = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) \
+             VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+        ] {
+            base.sql.execute(stmt, &[]).expect("seed agent provider");
+        }
+
+        let ports = DurableEffectPorts {
+            agent_model: Some(Box::new(MessagesApiClient::new(
+                CoerceProvider::Anthropic,
+                "test-key",
+                "claude-test",
+                "https://api.anthropic.com",
+                1024,
+            ))),
+            ..DurableEffectPorts::default()
+        };
+        let mut instance =
+            DurableInstance::create(base.sql, source, "{}", "local/AgentDemo", ports)
+                .expect("create");
+
+        // First step: the agent turn's first model call suspends on `fetch`, and the
+        // request is the real Anthropic messages call the model client built.
+        let request = match instance.step(None) {
+            DurableStepOutcome::NeedsHttp(request) => request,
+            other => panic!("expected NeedsHttp, got {other:?}"),
+        };
+        assert!(
+            request.url.contains("anthropic") && request.url.ends_with("/v1/messages"),
+            "request targets the Anthropic messages endpoint: {}",
+            request.url
+        );
+        assert!(
+            request
+                .headers
+                .iter()
+                .any(|(k, _)| k == "x-api-key" || k == "anthropic-version"),
+            "request carries the Anthropic auth/version headers"
+        );
+
+        // The worker performs the fetch; feed a canned final reply (no tool calls).
+        let response = HttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "content": [{ "type": "text", "text": "did the thing" }],
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            }),
+        };
+        assert!(
+            matches!(
+                instance.step(Some(Ok(response))),
+                DurableStepOutcome::Terminal
+            ),
+            "the resume parses the final reply, settles the turn, and reaches the terminal"
+        );
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed")
+        );
+    }
 }

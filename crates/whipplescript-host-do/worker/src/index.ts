@@ -109,22 +109,28 @@ export class WorkflowInstance implements DurableObject {
     };
 
     const bridge = makeBridge(this.ctx.storage.sql);
-    // Coerce provider creds from DO secrets (optional; store-only workflows omit).
-    const coerceConfig = this.env.ANTHROPIC_API_KEY
-      ? JSON.stringify({
-          provider: "anthropic",
-          base_url: "https://api.anthropic.com",
-          api_key: this.env.ANTHROPIC_API_KEY,
-          model: "claude-3-5-sonnet-latest",
-          max_tokens: 1024,
-        })
-      : undefined;
+    // Provider creds from DO secrets (optional; store-only workflows omit both).
+    // Same JSON shape for coerce and agent turns; a live agent turn with tools
+    // also needs a tool-executor sidecar (the remaining async-tool seam).
+    const anthropicConfig = (model: string, maxTokens: number) =>
+      this.env.ANTHROPIC_API_KEY
+        ? JSON.stringify({
+            provider: "anthropic",
+            base_url: "https://api.anthropic.com",
+            api_key: this.env.ANTHROPIC_API_KEY,
+            model,
+            max_tokens: maxTokens,
+          })
+        : undefined;
+    const coerceConfig = anthropicConfig("claude-3-5-sonnet-latest", 1024);
+    const agentConfig = anthropicConfig("claude-3-5-sonnet-latest", 4096);
     const instance = WasmDurableInstance.create(
       bridge,
       program,
       input ?? "{}",
       principal ?? "local/Workflow",
       coerceConfig,
+      agentConfig,
     );
 
     // The sans-IO loop: step -> maybe fetch -> step, until a terminal. Each `fetch`
