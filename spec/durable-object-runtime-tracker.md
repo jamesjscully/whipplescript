@@ -469,8 +469,21 @@ linear undo chain). No phase work now.
                 relocate the store-only cores + their ~2.4k-line pure-helper closure
                 (`effect_failure_base` / `file_path_policy_error` /
                 `effect_allow_globs` / import-export codecs) into the kernel, resolve
-                capability's `LoadedPackageLock` tie, then build the
-                `InstanceStepMachine`;
+                capability's `LoadedPackageLock` tie. The
+                **`InstanceStepMachine` is BUILT (commit c10b07f):**
+                `whipplescript_kernel::instance_machine` — the instance fixpoint as
+                a resumable sans-IO `StepMachine` (advance rules → terminal?/park? →
+                run ready effect → Done loops, NeedsHttp suspends with
+                `Outcome::NeedsIo(Http)` and resumes next step; in-flight effect held
+                in `self` so a DO eviction loses nothing). Mirrors
+                `InstanceSchedulerLifecycle.tla`; 3 mock-driver tests
+                (store-only→terminal, HTTP suspend+resume, park) — kernel 207,
+                native+wasm, clippy -D. The rule pass + effect execution sit behind
+                an `InstanceDriver` seam. REMAINING for (4): wire the NATIVE
+                `InstanceDriver` impl (advance_rules→`step_instance_generic`,
+                next_ready_effect→`claimable_effects`, run_effect→the handler cores)
+                so native `dev`/`worker`/`step` can drive an instance through the
+                machine, proven to match the dev loop; the DO impl comes in (5);
             (5) wire the DO host (`RuntimeKernel<DoSqliteStore>` + `FetchHost`) to
                 the wasm-bindgen surface below.
       - [ ] The `wasm-bindgen` surface the shell imports (`createInstance`/`step`/
