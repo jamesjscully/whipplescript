@@ -2,15 +2,21 @@
 //! synchronous SQLite (`DoSql`), instead of native rusqlite. This is DR-0033
 //! Phase 5's core store binding.
 //!
-//! STATUS (honest): the `DoSql` seam and the store\'s hot-path core
-//! (`schema_version`, `fact_exists`, `append_event`) are ported and **verified
-//! against real SQLite** (the tests back `DoSql` with rusqlite). The remaining
-//! methods are `todo!()` placeholders — the DO runs the *same* SQL the native
-//! `SqliteStore` does, so each is a mechanical port of that method\'s SQL, but the
-//! full set is large and its final correctness is against the *DO\'s* SQLite,
-//! which needs a live Durable Object to build (`worker` crate) and verify. The
-//! tracker\'s Phase-5 store box stays open until that port + live verification is
-//! done; this establishes the seam and proves the pattern end-to-end.
+//! STATUS (honest): the `DoSql` seam plus the store\'s hot-path core and the
+//! straight-line registration / skill / inbox / fact-retirement / introspection
+//! methods are ported and **verified against real SQLite** (the tests back
+//! `DoSql` with rusqlite). The remaining methods — chiefly the multi-statement
+//! transactional lifecycle (create/activate revisions, admit fact batches,
+//! start/complete/retry effects, rebuild projections) and the large family of
+//! `list_*`/`get_*` view queries — are `todo!()` placeholders. The DO runs the
+//! *same* SQL the native `SqliteStore` does, so each is a port of that method\'s
+//! SQL; the transactional ones additionally need a batch/transaction primitive
+//! on `DoSql` (the DO\'s single-writer invocation gives implicit atomicity, but
+//! faithful native testing wants explicit BEGIN/COMMIT). Final correctness is
+//! against the *DO\'s* SQLite, which needs a live Durable Object (`worker` crate)
+//! to build and verify. The tracker\'s Phase-5 store box stays open until that
+//! port + live verification is done; this establishes the seam, proves the
+//! pattern, and ports the mechanical majority-shape methods.
 
 use serde_json::Value;
 use whipplescript_store::{NewEvent, RuntimeStore, StoreError, StoreResult, StoredEvent};
@@ -73,6 +79,64 @@ fn as_text(value: &SqlValue) -> String {
     match value {
         SqlValue::Text(s) => s.clone(),
         _ => String::new(),
+    }
+}
+
+fn as_opt_text(value: &SqlValue) -> Option<String> {
+    match value {
+        SqlValue::Text(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn bool_int(value: bool) -> SqlValue {
+    SqlValue::Int(if value { 1 } else { 0 })
+}
+
+/// FNV-1a, byte-identical to the native store's `stable_hash_hex` — the DO must
+/// compute the same skill `content_hash` the native path does so a skill
+/// registered under either backend has a stable identity.
+fn stable_hash_hex(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Maps an 8-column skill row (`skill_id..required_capabilities`) to a `SkillView`.
+fn skill_view_from_row(row: &[SqlValue]) -> SkillView {
+    SkillView {
+        skill_id: as_text(&row[0]),
+        name: as_text(&row[1]),
+        version: as_text(&row[2]),
+        source: as_text(&row[3]),
+        source_path: as_text(&row[4]),
+        content_hash: as_text(&row[5]),
+        description: as_text(&row[6]),
+        required_capabilities_json: as_text(&row[7]),
+    }
+}
+
+/// Maps a 14-column inbox row to an `InboxItemView` (nullable columns:
+/// `effect_id`, `answer_json`, `answered_by`, `answered_at`).
+fn inbox_item_view_from_row(row: &[SqlValue]) -> InboxItemView {
+    InboxItemView {
+        inbox_item_id: as_text(&row[0]),
+        instance_id: as_text(&row[1]),
+        effect_id: as_opt_text(&row[2]),
+        status: as_text(&row[3]),
+        prompt: as_text(&row[4]),
+        choices_json: as_text(&row[5]),
+        freeform_allowed: as_i64(&row[6]) != 0,
+        severity: as_text(&row[7]),
+        related_effects_json: as_text(&row[8]),
+        related_artifacts_json: as_text(&row[9]),
+        answer_json: as_opt_text(&row[10]),
+        answered_by: as_opt_text(&row[11]),
+        created_at: as_text(&row[12]),
+        answered_at: as_opt_text(&row[13]),
     }
 }
 
@@ -361,15 +425,75 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {
-        todo!("Phase 5b: port `register_skill` SQL to DoSql + verify against a live DO")
+        serde_json::from_str::<Value>(skill.required_capabilities_json)?;
+        serde_json::from_str::<Value>(skill.metadata_json)?;
+        let content_hash = stable_hash_hex(&format!(
+            "{}\n{}\n{}\n{}",
+            skill.name, skill.version, skill.source_path, skill.source
+        ));
+        self.sql
+            .execute(
+                "INSERT INTO skills (skill_id, name, version, source, source_path, \
+                 content_hash, description, required_capabilities, metadata_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(name) DO UPDATE SET \
+                 version = excluded.version, source = excluded.source, \
+                 source_path = excluded.source_path, content_hash = excluded.content_hash, \
+                 description = excluded.description, \
+                 required_capabilities = excluded.required_capabilities, \
+                 metadata_json = excluded.metadata_json",
+                &[
+                    text(skill.skill_id),
+                    text(skill.name),
+                    text(skill.version),
+                    text(skill.source),
+                    text(skill.source_path),
+                    text(&content_hash),
+                    text(skill.description),
+                    text(skill.required_capabilities_json),
+                    text(skill.metadata_json),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
     }
 
     fn attach_skill(&self, attachment: SkillAttachment<'_>) -> StoreResult<()> {
-        todo!("Phase 5b: port `attach_skill` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT skill_id FROM skills WHERE name = ?1",
+                &[text(attachment.skill_name)],
+            )
+            .map_err(sql_err)?;
+        let skill_id = rows
+            .first()
+            .map(|r| as_text(&r[0]))
+            .ok_or_else(|| sql_err(format!("no skill named `{}`", attachment.skill_name)))?;
+        self.sql
+            .execute(
+                "INSERT INTO skill_attachments (attachment_id, scope_type, scope_id, skill_id) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(scope_type, scope_id, skill_id) DO NOTHING",
+                &[
+                    text(attachment.attachment_id),
+                    text(attachment.scope_type),
+                    text(attachment.scope_id),
+                    text(&skill_id),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
     }
 
     fn list_skills(&self) -> StoreResult<Vec<SkillView>> {
-        todo!("Phase 5b: port `list_skills` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT skill_id, name, version, source, source_path, content_hash, \
+                 description, required_capabilities FROM skills ORDER BY name",
+                &[],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|r| skill_view_from_row(r)).collect())
     }
 
     fn list_skill_attachments(
@@ -377,7 +501,28 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         scope_type: &str,
         scope_id: &str,
     ) -> StoreResult<Vec<SkillAttachmentView>> {
-        todo!("Phase 5b: port `list_skill_attachments` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT attachment.attachment_id, attachment.scope_type, attachment.scope_id, \
+                 skill.skill_id, skill.name, skill.version, skill.source, skill.source_path, \
+                 skill.content_hash, skill.description, skill.required_capabilities \
+                 FROM skill_attachments AS attachment \
+                 JOIN skills AS skill ON skill.skill_id = attachment.skill_id \
+                 WHERE attachment.scope_type = ?1 AND attachment.scope_id = ?2 \
+                 ORDER BY skill.name",
+                &[text(scope_type), text(scope_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|r| SkillAttachmentView {
+                attachment_id: as_text(&r[0]),
+                scope_type: as_text(&r[1]),
+                scope_id: as_text(&r[2]),
+                skill: skill_view_from_row(&r[3..11]),
+            })
+            .collect())
     }
 
     fn record_evidence(&self, evidence: EvidenceRecord<'_>) -> StoreResult<String> {
@@ -458,15 +603,58 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn create_inbox_item(&self, item: NewInboxItem<'_>) -> StoreResult<()> {
-        todo!("Phase 5b: port `create_inbox_item` SQL to DoSql + verify against a live DO")
+        serde_json::from_str::<Value>(item.choices_json)?;
+        serde_json::from_str::<Value>(item.related_effects_json)?;
+        serde_json::from_str::<Value>(item.related_artifacts_json)?;
+        self.sql
+            .execute(
+                "INSERT INTO inbox_items (inbox_item_id, instance_id, effect_id, status, \
+                 prompt, choices_json, freeform_allowed, severity, related_effects_json, \
+                 related_artifacts_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                &[
+                    text(item.inbox_item_id),
+                    text(item.instance_id),
+                    opt_text(item.effect_id),
+                    text(item.status),
+                    text(item.prompt),
+                    text(item.choices_json),
+                    bool_int(item.freeform_allowed),
+                    text(item.severity),
+                    text(item.related_effects_json),
+                    text(item.related_artifacts_json),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
     }
 
     fn list_inbox_items(&self, status: Option<&str>) -> StoreResult<Vec<InboxItemView>> {
-        todo!("Phase 5b: port `list_inbox_items` SQL to DoSql + verify against a live DO")
+        let mut sql = "SELECT inbox_item_id, instance_id, effect_id, status, prompt, \
+             choices_json, freeform_allowed, severity, related_effects_json, \
+             related_artifacts_json, answer_json, answered_by, created_at, answered_at \
+             FROM inbox_items"
+            .to_owned();
+        if status.is_some() {
+            sql.push_str(" WHERE status = ?1");
+        }
+        sql.push_str(" ORDER BY created_at, inbox_item_id");
+        let params: Vec<SqlValue> = status.map(|s| vec![text(s)]).unwrap_or_default();
+        let rows = self.sql.query(&sql, &params).map_err(sql_err)?;
+        Ok(rows.iter().map(|r| inbox_item_view_from_row(r)).collect())
     }
 
     fn get_inbox_item(&self, inbox_item_id: &str) -> StoreResult<Option<InboxItemView>> {
-        todo!("Phase 5b: port `get_inbox_item` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT inbox_item_id, instance_id, effect_id, status, prompt, choices_json, \
+                 freeform_allowed, severity, related_effects_json, related_artifacts_json, \
+                 answer_json, answered_by, created_at, answered_at FROM inbox_items \
+                 WHERE inbox_item_id = ?1",
+                &[text(inbox_item_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|r| inbox_item_view_from_row(r)))
     }
 
     fn answer_inbox_item(&mut self, answer: HumanAnswer<'_>) -> StoreResult<StoredEvent> {
@@ -593,7 +781,15 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn retire_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
-        todo!("Phase 5b: port `retire_fact` SQL to DoSql + verify against a live DO")
+        self.sql
+            .execute(
+                "UPDATE facts SET consumed_at = CURRENT_TIMESTAMP, \
+                 updated_at = CURRENT_TIMESTAMP \
+                 WHERE instance_id = ?1 AND fact_id = ?2 AND consumed_at IS NULL",
+                &[text(instance_id), text(fact_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
     }
 
     fn cancel_effect(&mut self, cancellation: EffectCancellation<'_>) -> StoreResult<StoredEvent> {
@@ -617,7 +813,14 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn table_exists(&self, table: &str) -> StoreResult<bool> {
-        todo!("Phase 5b: port `table_exists` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                &[text(table)],
+            )
+            .map_err(sql_err)?;
+        Ok(!rows.is_empty())
     }
 }
 
@@ -691,7 +894,28 @@ mod tests {
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
                 source TEXT NOT NULL, causation_id TEXT, correlation_id TEXT, idempotency_key TEXT
             );
-            CREATE TABLE facts (instance_id TEXT NOT NULL, name TEXT NOT NULL);
+            CREATE TABLE facts (
+                fact_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, name TEXT NOT NULL,
+                consumed_at TEXT, updated_at TEXT
+            );
+            CREATE TABLE skills (
+                skill_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL,
+                source TEXT NOT NULL, source_path TEXT NOT NULL, content_hash TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '', required_capabilities TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE skill_attachments (
+                attachment_id TEXT PRIMARY KEY, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL,
+                skill_id TEXT NOT NULL, UNIQUE(scope_type, scope_id, skill_id)
+            );
+            CREATE TABLE inbox_items (
+                inbox_item_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, effect_id TEXT,
+                status TEXT NOT NULL, prompt TEXT NOT NULL, choices_json TEXT NOT NULL DEFAULT '[]',
+                freeform_allowed INTEGER NOT NULL DEFAULT 1, severity TEXT NOT NULL DEFAULT 'normal',
+                related_effects_json TEXT NOT NULL DEFAULT '[]',
+                related_artifacts_json TEXT NOT NULL DEFAULT '[]', answer_json TEXT, answered_by TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, answered_at TEXT
+            );
             CREATE TABLE package_registrations (
                 package_id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL,
                 manifest_json TEXT NOT NULL
@@ -843,5 +1067,116 @@ mod tests {
                 .expect("read");
             assert_eq!(rows.len(), 1, "{table} row present");
         }
+    }
+
+    /// Skills, inbox items, fact retirement, and table_exists run their real SQL
+    /// and round-trip through the ported view mappers.
+    #[test]
+    fn do_store_skills_inbox_and_facts_run_real_sql() {
+        let mut store = store();
+
+        // register_skill validates JSON, computes content_hash, upserts by name;
+        // attach_skill resolves skill_id and links a scope; the views round-trip.
+        store
+            .register_skill(SkillRegistration {
+                skill_id: "skl_1",
+                name: "triage",
+                version: "1.0.0",
+                source: "body",
+                source_path: "skills/triage.md",
+                description: "triage inbox",
+                required_capabilities_json: "[]",
+                metadata_json: "{}",
+            })
+            .expect("register_skill");
+        assert_eq!(
+            stable_hash_hex("triage\n1.0.0\nskills/triage.md\nbody"),
+            store.list_skills().expect("list_skills")[0].content_hash,
+        );
+
+        store
+            .attach_skill(SkillAttachment {
+                attachment_id: "att_1",
+                scope_type: "instance",
+                scope_id: "i1",
+                skill_name: "triage",
+            })
+            .expect("attach_skill");
+        // Idempotent re-attach is a no-op (ON CONFLICT DO NOTHING).
+        store
+            .attach_skill(SkillAttachment {
+                attachment_id: "att_2",
+                scope_type: "instance",
+                scope_id: "i1",
+                skill_name: "triage",
+            })
+            .expect("attach_skill again");
+        let attachments = store
+            .list_skill_attachments("instance", "i1")
+            .expect("list_skill_attachments");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].skill.name, "triage");
+
+        // Attaching an unknown skill errors (native query_row would find no row).
+        assert!(store
+            .attach_skill(SkillAttachment {
+                attachment_id: "att_3",
+                scope_type: "instance",
+                scope_id: "i1",
+                skill_name: "missing",
+            })
+            .is_err());
+
+        // create_inbox_item validates its 3 JSON fields and stores freeform_allowed
+        // as an integer; the list/get views decode it back to a bool.
+        store
+            .create_inbox_item(NewInboxItem {
+                inbox_item_id: "ibx_1",
+                instance_id: "i1",
+                effect_id: Some("eff_1"),
+                status: "pending",
+                prompt: "approve?",
+                choices_json: "[\"yes\",\"no\"]",
+                freeform_allowed: false,
+                severity: "normal",
+                related_effects_json: "[]",
+                related_artifacts_json: "[]",
+            })
+            .expect("create_inbox_item");
+        let pending = store
+            .list_inbox_items(Some("pending"))
+            .expect("list pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].effect_id.as_deref(), Some("eff_1"));
+        assert!(!pending[0].freeform_allowed);
+        assert!(store
+            .list_inbox_items(Some("done"))
+            .expect("list done")
+            .is_empty());
+        let got = store.get_inbox_item("ibx_1").expect("get").expect("some");
+        assert_eq!(got.prompt, "approve?");
+        assert!(store.get_inbox_item("nope").expect("get missing").is_none());
+
+        // retire_fact marks an unconsumed fact consumed; a second call is a no-op.
+        store
+            .sql
+            .execute(
+                "INSERT INTO facts (fact_id, instance_id, name) VALUES (?1, ?2, ?3)",
+                &[text("f1"), text("i1"), text("ready")],
+            )
+            .expect("insert fact");
+        store.retire_fact("i1", "f1").expect("retire");
+        let consumed = store
+            .sql
+            .query(
+                "SELECT consumed_at FROM facts WHERE fact_id = ?1",
+                &[text("f1")],
+            )
+            .expect("read fact");
+        assert!(matches!(consumed[0][0], SqlValue::Text(_)));
+
+        // table_exists reflects the schema.
+        assert!(store.table_exists("inbox_items").expect("exists"));
+        assert!(!store.table_exists("no_such_table").expect("absent"));
     }
 }
