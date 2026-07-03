@@ -28,6 +28,7 @@ whipplescript-core = { version = "0.1.0", path = "../whipplescript-core" }
 
 [lib]
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [lints]
 workspace = true
