@@ -24065,6 +24065,19 @@ fn run_file_effect(
     instance_id: &str,
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
+    run_file_effect_generic(&mut kernel, &NativeFileStore, instance_id, effect)
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): read a file through the `FileStore` seam
+/// and record the terminal/fact over a held `RuntimeKernel<S>`. Native passes
+/// `NativeFileStore`; the DO passes `DoFileStore`.
+fn run_file_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    files: &dyn FileStore,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input = json_from_str(&effect.input_json);
     let root = input
         .get("root")
@@ -24086,8 +24099,6 @@ fn run_file_effect(
     let full = Path::new(root).join(path);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
-    let store = SqliteStore::open(store_path)?;
-    let mut kernel = RuntimeKernel::new(store);
     kernel.start_run(RunStart {
         instance_id,
         effect_id: &effect.effect_id,
@@ -24105,7 +24116,7 @@ fn run_file_effect(
     let allow = effect_allow_globs(&input);
     let read_outcome = match file_path_policy_error(path, store_name, &allow, "read") {
         Some(reason) => Err(reason),
-        None => NativeFileStore
+        None => files
             .read_to_string(&full)
             .map_err(|error| format!("read of `{}` failed: {error}", full.display())),
     };
@@ -24196,6 +24207,18 @@ fn run_file_write_effect(
     instance_id: &str,
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
+    run_file_write_effect_generic(&mut kernel, &NativeFileStore, instance_id, effect)
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): write/append a file through the
+/// `FileStore` seam + record the terminal over a held `RuntimeKernel<S>`.
+fn run_file_write_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    files: &dyn FileStore,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input = json_from_str(&effect.input_json);
     let root = input
         .get("root")
@@ -24227,8 +24250,6 @@ fn run_file_write_effect(
     let full = Path::new(root).join(path);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
-    let store = SqliteStore::open(store_path)?;
-    let mut kernel = RuntimeKernel::new(store);
     kernel.start_run(RunStart {
         instance_id,
         effect_id: &effect.effect_id,
@@ -24246,7 +24267,7 @@ fn run_file_write_effect(
         if let Some(reason) = file_path_policy_error(path, store_name, &allow, "write") {
             Err(reason)
         } else {
-            let exists = NativeFileStore.exists(&full);
+            let exists = files.exists(&full);
             // Mode policy (spec/std-library/files.md): no silent overwrite.
             let mode_ok = match mode.as_str() {
                 "create" if exists => Err(format!(
@@ -24260,14 +24281,14 @@ fn run_file_write_effect(
             };
             mode_ok.and_then(|()| {
                 if let Some(parent) = full.parent() {
-                    NativeFileStore
+                    files
                         .create_dir_all(parent)
                         .map_err(|error| format!("create parent of `{path}`: {error}"))?;
                 }
                 let result = if mode == "append" {
-                    NativeFileStore.append(&full, body.as_bytes())
+                    files.append(&full, body.as_bytes())
                 } else {
-                    NativeFileStore.write(&full, body.as_bytes())
+                    files.write(&full, body.as_bytes())
                 };
                 result.map_err(|error| format!("write of `{}` failed: {error}", full.display()))
             })
@@ -24433,6 +24454,18 @@ fn run_file_import_effect(
     instance_id: &str,
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
+    run_file_import_effect_generic(&mut kernel, &NativeFileStore, instance_id, effect)
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): import a file's content into facts
+/// through the `FileStore` seam over a held `RuntimeKernel<S>`.
+fn run_file_import_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    files: &dyn FileStore,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
     use whipplescript_store::{FactBatch, FactBatchRow};
 
     let input = json_from_str(&effect.input_json);
@@ -24478,8 +24511,6 @@ fn run_file_import_effect(
     let full = Path::new(root).join(path);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
-    let store = SqliteStore::open(store_path)?;
-    let mut kernel = RuntimeKernel::new(store);
     kernel.start_run(RunStart {
         instance_id,
         effect_id: &effect.effect_id,
@@ -24498,7 +24529,7 @@ fn run_file_import_effect(
         if let Some(reason) = file_path_policy_error(path, store_name, &allow, "read") {
             return Err(reason);
         }
-        let content = NativeFileStore
+        let content = files
             .read_to_string(&full)
             .map_err(|error| format!("read of `{}` failed: {error}", full.display()))?;
         let rows = decode_import_rows(&format, &content)?;
@@ -24710,6 +24741,18 @@ fn run_file_export_effect(
     instance_id: &str,
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
+    run_file_export_effect_generic(&mut kernel, &NativeFileStore, instance_id, effect)
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): export facts to a file through the
+/// `FileStore` seam over a held `RuntimeKernel<S>`.
+fn run_file_export_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    files: &dyn FileStore,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input = json_from_str(&effect.input_json);
     let root = input
         .get("root")
@@ -24758,8 +24801,6 @@ fn run_file_export_effect(
     let full = Path::new(root).join(path);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
-    let store = SqliteStore::open(store_path)?;
-    let mut kernel = RuntimeKernel::new(store);
     kernel.start_run(RunStart {
         instance_id,
         effect_id: &effect.effect_id,
@@ -24779,8 +24820,8 @@ fn run_file_export_effect(
         }
         // Resolve the collection: facts of <schema> [where predicate], ordered by
         // the store's deterministic (name, key) ordering for reproducible output.
-        let reader = SqliteStore::open(store_path).map_err(|error| format!("{error:?}"))?;
-        let facts = reader
+        let facts = kernel
+            .store()
             .list_facts(instance_id)
             .map_err(|error| format!("{error:?}"))?;
         let mut rows = Vec::new();
@@ -24791,7 +24832,7 @@ fn run_file_export_effect(
                 rows.push(value);
             }
         }
-        let exists = NativeFileStore.exists(&full);
+        let exists = files.exists(&full);
         match mode.as_str() {
             "create" if exists => {
                 return Err(format!(
@@ -24808,16 +24849,16 @@ fn run_file_export_effect(
         }
         let serialized = encode_export_rows(&format, &rows, &fields)?;
         if let Some(parent) = full.parent() {
-            NativeFileStore
+            files
                 .create_dir_all(parent)
                 .map_err(|error| format!("create parent of `{path}`: {error}"))?;
         }
         if mode == "append" {
-            NativeFileStore
+            files
                 .append(&full, serialized.as_bytes())
                 .map_err(|error| format!("append to `{}` failed: {error}", full.display()))?;
         } else {
-            NativeFileStore
+            files
                 .write(&full, serialized.as_bytes())
                 .map_err(|error| format!("write of `{}` failed: {error}", full.display()))?;
         }
