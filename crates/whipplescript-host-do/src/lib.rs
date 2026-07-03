@@ -34,6 +34,8 @@ use whipplescript_store::files::FileStore;
 pub mod do_instance;
 /// `RuntimeStore` over the DO's synchronous SQLite (`DoSql`).
 pub mod do_store;
+#[cfg(target_arch = "wasm32")]
+pub mod do_wasm;
 pub mod do_worker;
 
 // -- HTTP: the fetch host driver ------------------------------------------

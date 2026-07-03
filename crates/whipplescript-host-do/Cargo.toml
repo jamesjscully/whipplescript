@@ -31,3 +31,9 @@ path = "src/lib.rs"
 
 [lints]
 workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The JS<->Rust boundary for the Cloudflare Worker shell. wasm32-only so the native
+# build (and its rusqlite tests) never pull it. The #[wasm_bindgen] surface is a thin
+# wrapper over DurableInstance::create/step/status (do_worker); it carries no logic.
+wasm-bindgen = "0.2"
