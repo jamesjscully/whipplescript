@@ -258,11 +258,27 @@ in flight and expensive to retrofit:
       small-file-inline path is the native default.
 
 ### Phase 5 — DO host crate + TS shell (the wasm target)
+> **Concrete entry point (found 2026-07-03, Phases 0–4 done).** The sans-IO
+> seams (`sansio.rs`, `HttpModelClient`/`BrokeredTurnMachine`) and the store
+> traits (`RuntimeStore`/`Coordination`/`WorkItems`/`FileStore`) all exist, but
+> the core is **not yet wasm-buildable**: `whipplescript-kernel` depends on
+> `whipplescript-store`, which pulls `rusqlite` (bundled C, not wasm), and
+> `RuntimeKernel` holds a concrete `SqliteStore`. The prerequisite refactor is:
+> (1) split the store traits **and the ~40 data types they cross** (`NewEvent`,
+> `StoredEvent`, the `*View`/`*Record` structs, `RuntimeStore`/`Coordination`/
+> `WorkItems`/`FileStore`) into a wasm-clean crate (e.g. `whipplescript-store-api`)
+> that `whipplescript-store` (rusqlite) then implements; (2) make `RuntimeKernel`
+> generic over `S: RuntimeStore` (it calls 29 store methods, all already in the
+> trait) so the CLI uses `RuntimeKernel<SqliteStore>` and the DO host uses
+> `RuntimeKernel<DoSqliteStore>`. Only after that can the wasm host be built.
+- [ ] Store-API crate split + `RuntimeKernel<S: RuntimeStore>` (the wasm-clean
+      prerequisite above). Native-only, gate-green refactor; large but mechanical.
 - [ ] `whipplescript-host-do` (wasm32) + Worker/DO shell: async `fetch` driver for
-      `NeedsIo(Http)`, store trait over synchronous DO SQLite, consumes the
+      `NeedsIo(Http)`, store traits over synchronous DO SQLite, consumes the
       sans-IO core. Subprocess effects unavailable / via HTTP sidecar. Every
       delivery/re-entry seam this host adds routes through the E2-DYN marker
-      door (see Cross-effort ordering above).
+      door (see Cross-effort ordering above). *(Needs the wasm32 target + the
+      Cloudflare `worker` crate + wrangler — greenfield build.)*
 
 ### Phase 6 — Scheduling + config on the DO
 - [ ] Clock-source + timers → DO **alarms** (replaces external polling). Config/
