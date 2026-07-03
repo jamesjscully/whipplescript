@@ -1463,3 +1463,327 @@ pub fn effect_failure_base(
         "kind": kind,
     })
 }
+
+// -- notify + delivery governance (batch lift, DR-0033 chunk 5b) --------------
+
+/// Host projection of the "may this internal-workflow delivery proceed?" check.
+/// The native host answers from its signed governance envelope (env); the DO from
+/// its bindings/secrets. Projecting it (like `EffectConfig`) keeps the notify core
+/// host-neutral instead of reaching into the CLI's `ifc` governance module.
+pub trait DeliveryGovernance {
+    /// Whether any of `resources` names an internal workflow (delivery-forbidden
+    /// across package boundaries). `Err` is a rejected/tampered governance policy.
+    fn any_internal_workflow(&self, resources: &[String]) -> Result<bool, String>;
+}
+
+pub fn package_from_workflow_principal(principal: &str) -> Option<String> {
+    principal
+        .trim()
+        .strip_prefix("workflow:")
+        .and_then(|identity| identity.split_once('/').map(|(package, _)| package))
+        .filter(|package| !package.trim().is_empty())
+        .map(str::to_owned)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowRuntimeIdentity {
+    pub package: String,
+    pub workflow: String,
+}
+
+pub fn workflow_identity_for_instance<S: RuntimeStore>(
+    store: &S,
+    instance_id: &str,
+) -> Result<WorkflowRuntimeIdentity, StoreError> {
+    let instance = store
+        .get_instance(instance_id)?
+        .ok_or_else(|| StoreError::Conflict(format!("instance `{instance_id}` not found")))?;
+    let version = store
+        .get_program_version(&instance.version_id)?
+        .ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "program version `{}` for instance `{instance_id}` not found",
+                instance.version_id
+            ))
+        })?;
+    Ok(WorkflowRuntimeIdentity {
+        package: package_from_workflow_principal(&instance.workflow_principal)
+            .unwrap_or_else(|| LOCAL_WORKFLOW_PACKAGE.to_owned()),
+        workflow: version.program_name,
+    })
+}
+
+pub fn invoke_resources_for_identity(identity: &WorkflowRuntimeIdentity) -> Vec<String> {
+    vec![
+        format!("invoke:{}/{}", identity.package, identity.workflow),
+        format!("invoke:{}", identity.workflow),
+    ]
+}
+
+/// Validates ingested JSON against the embedded structural shape — the
+/// worker-side mirror of `validate_json_for_ir_type`, reading the contract
+/// the effect carries instead of the program IR.
+pub fn validate_ingest_value(value: &Value, shape: &Value, path: &str, errors: &mut Vec<String>) {
+    match shape {
+        Value::String(primitive) => {
+            let valid = match primitive.as_str() {
+                "int" => value.as_i64().is_some(),
+                "float" => value.as_f64().is_some(),
+                "bool" => value.is_boolean(),
+                "null" => value.is_null(),
+                "time" => value
+                    .as_str()
+                    .is_some_and(whipplescript_parser::body::is_iso8601_instant),
+                "json" => true,
+                // string plus media/duration primitives serialize as strings
+                _ => value.is_string(),
+            };
+            if !valid {
+                errors.push(format!("{path} must be {primitive}"));
+            }
+        }
+        Value::Object(map) => {
+            if let Some(literal) = map.get("literal") {
+                if value != literal {
+                    errors.push(format!("{path} must be literal {literal}"));
+                }
+            } else if let Some(variants) = map.get("enum").and_then(Value::as_array) {
+                if !variants.iter().any(|candidate| candidate == value) {
+                    errors.push(format!(
+                        "{path} must be one of: {}",
+                        variants
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            } else if let Some(inner) = map.get("optional") {
+                if !value.is_null() {
+                    validate_ingest_value(value, inner, path, errors);
+                }
+            } else if let Some(inner) = map.get("array") {
+                match value.as_array() {
+                    Some(items) => {
+                        for (index, item) in items.iter().enumerate() {
+                            validate_ingest_value(item, inner, &format!("{path}[{index}]"), errors);
+                        }
+                    }
+                    None => errors.push(format!("{path} must be an array")),
+                }
+            } else if let Some(inner) = map.get("map") {
+                match value.as_object() {
+                    Some(entries) => {
+                        for (key, item) in entries {
+                            validate_ingest_value(item, inner, &format!("{path}.{key}"), errors);
+                        }
+                    }
+                    None => errors.push(format!("{path} must be an object map")),
+                }
+            } else if let Some(options) = map.get("union").and_then(Value::as_array) {
+                let matches_any = options.iter().any(|option| {
+                    let mut probe = Vec::new();
+                    validate_ingest_value(value, option, path, &mut probe);
+                    probe.is_empty()
+                });
+                if !matches_any {
+                    errors.push(format!("{path} matches no arm of the declared union"));
+                }
+            } else if let Some(fields) = map.get("fields").and_then(Value::as_object) {
+                let label = map
+                    .get("class")
+                    .and_then(Value::as_str)
+                    .map(|class| format!(" ({class})"))
+                    .unwrap_or_default();
+                let Some(object) = value.as_object() else {
+                    errors.push(format!("{path} must be an object{label}"));
+                    return;
+                };
+                for key in object.keys() {
+                    if !fields.contains_key(key) {
+                        errors.push(format!("{path}.{key} is not declared{label}"));
+                    }
+                }
+                for (name, field_shape) in fields {
+                    let field_path = format!("{path}.{name}");
+                    match object.get(name) {
+                        Some(field_value) => {
+                            validate_ingest_value(field_value, field_shape, &field_path, errors)
+                        }
+                        None if field_shape.get("optional").is_some() => {}
+                        None => errors.push(format!("{field_path} is required")),
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn internal_workflow_delivery_violation<S: RuntimeStore>(
+    store: &S,
+    sender_instance_id: &str,
+    target_instance_id: &str,
+    governance: &dyn DeliveryGovernance,
+) -> Result<Option<String>, StoreError> {
+    let sender = workflow_identity_for_instance(store, sender_instance_id)?;
+    let target = workflow_identity_for_instance(store, target_instance_id)?;
+    if sender.package == target.package {
+        return Ok(None);
+    }
+    let resources = invoke_resources_for_identity(&target);
+    match governance.any_internal_workflow(&resources) {
+        Ok(true) => Ok(Some(format!(
+            "target workflow `{}/{}` is internal and cannot be notified from workflow package `{}`",
+            target.package, target.workflow, sender.package
+        ))),
+        Ok(false) => Ok(None),
+        Err(message) => Ok(Some(format!(
+            "governance envelope rejected before internal workflow delivery check: {message}"
+        ))),
+    }
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): validate + inject a durable event into a
+/// peer instance over a held `RuntimeKernel<S>` (runtime-store-only).
+pub fn run_notify_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    governance: &dyn DeliveryGovernance,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let input = json_from_str(&effect.input_json);
+    let target = input
+        .get("target_instance")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let event_name = input
+        .get("event")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let payload = input.get("payload").cloned().unwrap_or(Value::Null);
+    let shape = input.get("shape").cloned().unwrap_or(Value::Null);
+
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "notify-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "notify-lease"]);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "notify",
+        worker_id: "whip-notify",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({"target": target, "event": event_name}).to_string(),
+    })?;
+
+    let mut errors = Vec::new();
+    validate_ingest_value(&payload, &shape, "$", &mut errors);
+    let target_exists = kernel.store().get_instance(&target)?.is_some();
+    if !target_exists {
+        errors.push(format!("target instance `{target}` not found"));
+    } else if let Some(reason) =
+        internal_workflow_delivery_violation(kernel.store(), instance_id, &target, governance)?
+    {
+        errors.push(reason);
+    }
+    if !errors.is_empty() {
+        let reason = format!("notify of `{event_name}` rejected: {}", errors.join("; "));
+        let terminal = kernel.fail_run(EffectCompletion {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &run_id,
+            provider: "notify",
+            worker_id: "whip-notify",
+            status: "failed",
+            exit_code: None,
+            summary: Some(&reason),
+            metadata_json: &json!({"failure": {"message": reason}}).to_string(),
+            idempotency_key: Some(&idempotency_key(&[
+                instance_id,
+                &effect.effect_id,
+                "terminal",
+            ])),
+        })?;
+        // DR-0032: derive the `.failed` fact so `after <notify> fails as f` has
+        // something to bind (previously this path emitted no fact at all). `value`
+        // is the EffectError base.
+        kernel.derive_fact(
+            instance_id,
+            "event.notify.failed",
+            &effect.effect_id,
+            &json!({
+                "effect_id": effect.effect_id,
+                "run_id": run_id,
+                "status": "failed",
+                "value": effect_failure_base("event.notify", &reason, &reason, &effect.effect_id, &run_id),
+                "error": {"message": reason},
+            })
+            .to_string(),
+            Some(&terminal.event_id),
+            Some(&idempotency_key(&[
+                instance_id,
+                &effect.effect_id,
+                "notify-fact",
+            ])),
+        )?;
+        return Ok(terminal);
+    }
+
+    let payload_json = payload.to_string();
+    let received = kernel.ingest_external_event(
+        &target,
+        &event_name,
+        &payload_json,
+        Some(&idempotency_key(&[&target, "notify", &effect.effect_id])),
+    )?;
+    kernel.derive_fact(
+        &target,
+        &event_name,
+        &received.event_id,
+        &payload_json,
+        Some(&received.event_id),
+        Some(&idempotency_key(&[
+            &target,
+            "notify-fact",
+            &effect.effect_id,
+        ])),
+    )?;
+    let terminal = kernel.complete_run(EffectCompletion {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "notify",
+        worker_id: "whip-notify",
+        status: "completed",
+        exit_code: Some(0),
+        summary: Some(&format!("notified {target} with `{event_name}`")),
+        metadata_json: &json!({"target": target, "event": event_name}).to_string(),
+        idempotency_key: Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "terminal",
+        ])),
+    })?;
+    kernel.derive_fact(
+        instance_id,
+        "event.notify.completed",
+        &effect.effect_id,
+        &json!({
+            "effect_id": effect.effect_id,
+            "run_id": run_id,
+            "status": "completed",
+            "value": {"target": target, "event": event_name},
+        })
+        .to_string(),
+        Some(&terminal.event_id),
+        Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "notify-self-fact",
+        ])),
+    )?;
+    Ok(terminal)
+}

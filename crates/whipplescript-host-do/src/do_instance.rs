@@ -21,7 +21,8 @@ use whipplescript_kernel::effect_config::EffectConfig;
 use whipplescript_kernel::effect_handlers::{
     run_coordination_effect_generic, run_event_effect_generic, run_file_effect_generic,
     run_file_import_effect_generic, run_file_write_effect_generic, run_human_effect_generic,
-    run_loft_effect_generic, run_queue_effect_generic,
+    run_loft_effect_generic, run_notify_effect_generic, run_queue_effect_generic,
+    DeliveryGovernance,
 };
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_pass::step_instance_generic;
@@ -43,6 +44,17 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     pub files: &'a dyn FileStore,
     pub ir: &'a IrProgram,
     pub instance_id: &'a str,
+}
+
+/// Durable-object delivery governance. The mock DO is ungoverned (no envelope in
+/// env), so no cross-package internal-workflow delivery is forbidden; a live DO
+/// answers this from its bindings/secrets — the governance plane plugged in with
+/// the infra (mirrors the native `IfcDeliveryGovernance`).
+struct DoDeliveryGovernance;
+impl DeliveryGovernance for DoDeliveryGovernance {
+    fn any_internal_workflow(&self, _resources: &[String]) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
@@ -89,6 +101,12 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
             "human.ask" => {
                 run_human_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
             }
+            "event.notify" => run_notify_effect_generic(
+                &mut self.kernel,
+                self.instance_id,
+                effect,
+                &DoDeliveryGovernance,
+            )?,
             "queue.file" | "queue.claim" | "queue.release" | "queue.finish" => {
                 run_queue_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
             }
