@@ -15,6 +15,7 @@ whipplescript-kernel = { version = "0.1.0", path = "../whipplescript-kernel", de
 # The store TRAITS (RuntimeStore / Coordination / WorkItems / FileStore) + data
 # types, no rusqlite.
 whipplescript-store = { version = "0.1.0", path = "../whipplescript-store", default-features = false }
+serde_json = "1"
 
 [dev-dependencies]
 serde_json = "1"

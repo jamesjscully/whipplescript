@@ -12,6 +12,7 @@
 //! tracker\'s Phase-5 store box stays open until that port + live verification is
 //! done; this establishes the seam and proves the pattern end-to-end.
 
+use serde_json::Value;
 use whipplescript_store::{NewEvent, RuntimeStore, StoreError, StoreResult, StoredEvent};
 // The remaining ported methods reference the full set of store data types.
 #[allow(unused_imports)]
@@ -287,7 +288,22 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn register_package(&self, package: PackageRegistration<'_>) -> StoreResult<()> {
-        todo!("Phase 5b: port `register_package` SQL to DoSql + verify against a live DO")
+        serde_json::from_str::<Value>(package.manifest_json)?;
+        self.sql
+            .execute(
+                "INSERT INTO package_registrations (package_id, name, version, manifest_json) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(package_id) DO UPDATE SET \
+                 name = excluded.name, version = excluded.version, \
+                 manifest_json = excluded.manifest_json",
+                &[
+                    text(package.package_id),
+                    text(package.name),
+                    text(package.version),
+                    text(package.manifest_json),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
     }
 
     fn register_package_manifest(&self, manifest_json: &str) -> StoreResult<String> {
@@ -655,6 +671,10 @@ mod tests {
                 source TEXT NOT NULL, causation_id TEXT, correlation_id TEXT, idempotency_key TEXT
             );
             CREATE TABLE facts (instance_id TEXT NOT NULL, name TEXT NOT NULL);
+            CREATE TABLE package_registrations (
+                package_id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL,
+                manifest_json TEXT NOT NULL
+            );
             "#,
         )
         .expect("schema");
@@ -706,5 +726,23 @@ mod tests {
             )
             .expect("insert fact");
         assert!(store.fact_exists("i1", "ready").expect("fact"));
+
+        // register_package runs its real INSERT ... ON CONFLICT and validates JSON.
+        store
+            .register_package(PackageRegistration {
+                package_id: "pkg_1",
+                name: "std",
+                version: "1.0.0",
+                manifest_json: "{}",
+            })
+            .expect("register");
+        let rows = store
+            .sql
+            .query(
+                "SELECT name FROM package_registrations WHERE package_id = ?1",
+                &[text("pkg_1")],
+            )
+            .expect("read package");
+        assert_eq!(as_text(&rows[0][0]), "std");
     }
 }
