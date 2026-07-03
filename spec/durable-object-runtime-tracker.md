@@ -379,7 +379,27 @@ in flight and expensive to retrofit:
                 pure lowering layer now lives in the kernel;
             (2) lift the rule-pass ORCHESTRATION (`step_instance`/
                 `project_queue_items`) generic over held store handles — the crux
-                (open-by-path → threaded `&mut S`). NEXT;
+                (open-by-path → threaded `&mut S`). **OPEN DESIGN FORK (awaiting
+                Jack, asked 2026-07-03):** the rule pass touches all THREE stores
+                (rule commits → runtime; `project_queue_items` → work-items;
+                terminal cleanup → coordination), which are three separate native
+                SQLite structs (`SqliteStore`/`CoordinationStore`/`WorkItemStore`,
+                each with `&mut self` trait methods) but ONE `DoSqliteStore` on the
+                DO. How the lifted pass obtains them:
+                (A, RECOMMENDED) unified facade — generic over one handle
+                `S: RuntimeStore + Coordination + WorkItems`; native `NativeStores`
+                facade holds the 3 connections and delegates (~111 fwds),
+                `DoSqliteStore` already impls all three. Clean single handle for the
+                DO + the step machine; solves the `&mut` aliasing problem; chunks
+                2–4 hold one `S`. (B) three handles threaded separately — DO can't
+                alias one object as three `&mut` → RefCell/interior mutability;
+                messy where the DO lives. (C) lift runtime core only, keep
+                queue/coordination as native hooks — smallest, but the DO can't run
+                them through it, deferring the reconciliation the step machine
+                needs. Also settle here: the generic fn holds one `RuntimeKernel<S>`
+                across the pass (vs. today's per-commit `new`/`into_store`), and
+                `RuntimeKernel<S>` must expose its store for the raw reads +
+                work-items calls the pass interleaves;
             (3) lift the effect executor + 13 store-only handlers, then the two
                 HTTP handlers as the already-built sans-IO effect machines;
             (4) assemble the `InstanceStepMachine` (the fixpoint as a `StepMachine`
