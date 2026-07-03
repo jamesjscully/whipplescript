@@ -23493,11 +23493,22 @@ fn run_capability_effect(
     options: &WorkerOptions,
     package_lock: Option<&LoadedPackageLock>,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
+    run_capability_effect_generic(&mut kernel, instance_id, effect, options, package_lock)
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): run the capability call + its terminal
+/// over a held `RuntimeKernel<S>` (only kernel methods, so `S: RuntimeStore`).
+fn run_capability_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    options: &WorkerOptions,
+    package_lock: Option<&LoadedPackageLock>,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input = json_from_str(&effect.input_json);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "capability-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "capability-lease"]);
-    let store = SqliteStore::open(store_path)?;
-    let mut kernel = RuntimeKernel::new(store);
     kernel.start_run(RunStart {
         instance_id,
         effect_id: &effect.effect_id,
@@ -25717,6 +25728,19 @@ fn run_event_effect(
     effect: &ClaimableEffect,
     options: &WorkerOptions,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
+    run_event_effect_generic(&mut kernel, instance_id, effect, options)
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): emit the event + its terminal + facts
+/// over a held `RuntimeKernel<S>` — no store re-open, so the DO step machine runs
+/// it over `DoSqliteStore`. Uses only kernel methods, so `S: RuntimeStore` suffices.
+fn run_event_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    options: &WorkerOptions,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input = json_from_str(&effect.input_json);
     let event_type = input
         .get("event_type")
@@ -25729,8 +25753,6 @@ fn run_event_effect(
         .unwrap_or_else(|| json!({"effect_id": effect.effect_id, "event_type": event_type}));
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "event-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "event-lease"]);
-    let store = SqliteStore::open(store_path)?;
-    let mut kernel = RuntimeKernel::new(store);
     kernel.start_run(RunStart {
         instance_id,
         effect_id: &effect.effect_id,
