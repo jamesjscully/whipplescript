@@ -10,16 +10,26 @@
 
 use serde_json::{json, Value};
 
+use std::path::Path;
+
+use whipplescript_store::coordination::Coordination;
+use whipplescript_store::files::FileStore;
+use whipplescript_store::items::WorkItems;
 use whipplescript_store::{
-    ClaimableEffect, EffectCompletion, RunStart, RuntimeStore, StoreError, StoredEvent,
+    ClaimableEffect, EffectCompletion, FactView, RunStart, RuntimeStore, StoreError, StoredEvent,
 };
 
 use crate::effect_config::EffectConfig;
 use crate::idempotency_key;
 use crate::loft::{FakeLoftClient, LoftAction, LoftEffectRequest};
-use crate::rule_lowering::json_from_str;
-use crate::LoftEffectExecution;
-use crate::RuntimeKernel;
+use crate::rule_lowering::{
+    effect_binding_value, interpolate_prompt, json_from_str, parse_field_value, stable_hash_hex,
+    RuleContext,
+};
+use crate::{HumanAskExecution, LoftEffectExecution, RuntimeKernel};
+
+/// The local-workflow package name (matches the CLI's `LOCAL_WORKFLOW_PACKAGE`).
+const LOCAL_WORKFLOW_PACKAGE: &str = "local";
 
 /// `event.emit`: ingest a durable event, settle the effect, and derive the
 /// `event.emit.succeeded` + `<event_type>` facts (kernel methods only).
@@ -204,4 +214,1252 @@ pub fn run_loft_effect_generic<S: RuntimeStore>(
         },
         &client,
     )
+}
+
+// -- store-only handler cores + helpers (batch lift, DR-0033 chunk 5b) -------
+
+/// Full-string wildcard match where `*` matches any (possibly empty) run of
+/// characters; every other character is literal. The classic backtracking
+/// two-pointer matcher (`workflow-testing.md` defines `*` as the only wildcard).
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+pub fn coordination_owner_from_principal(principal: &str) -> Option<String> {
+    let principal = principal.trim();
+    if principal.is_empty() {
+        return None;
+    }
+    principal
+        .strip_prefix("workflow:")
+        .filter(|owner| !owner.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| Some(principal.to_owned()))
+}
+
+pub fn coordination_owner_for_instance<S: RuntimeStore>(
+    store: &S,
+    instance_id: &str,
+) -> Result<String, StoreError> {
+    let instance = store
+        .get_instance(instance_id)?
+        .ok_or_else(|| StoreError::Conflict(format!("instance `{instance_id}` not found")))?;
+    if let Some(owner) = coordination_owner_from_principal(&instance.workflow_principal) {
+        return Ok(owner);
+    }
+    let version = store
+        .get_program_version(&instance.version_id)?
+        .ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "program version `{}` for instance `{instance_id}` not found",
+                instance.version_id
+            ))
+        })?;
+    Ok(format!("{LOCAL_WORKFLOW_PACKAGE}/{}", version.program_name))
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): issue the human.ask + its terminal/fact
+/// over a held `RuntimeKernel<S>` (kernel methods + a read-only resolve, so
+/// `S: RuntimeStore`).
+pub fn run_human_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    config: &EffectConfig,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let input_json =
+        resolve_effect_input_after_bindings_generic(kernel.store(), instance_id, effect)?;
+    let input = json_from_str(&input_json);
+    let prompt = input
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or("Human review requested");
+    let choices_json = input
+        .get("choices")
+        .cloned()
+        .unwrap_or_else(|| json!(["accept", "revise", "block"]))
+        .to_string();
+    let severity = input
+        .get("severity")
+        .and_then(Value::as_str)
+        .unwrap_or("normal");
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "human-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "human-lease"]);
+    let inbox_item_id = idempotency_key(&[instance_id, &effect.effect_id, "inbox"]);
+    let terminal = kernel.run_human_ask(HumanAskExecution {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: &config.provider,
+        worker_id: "whip-worker",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        inbox_item_id: &inbox_item_id,
+        prompt,
+        choices_json: &choices_json,
+        freeform_allowed: true,
+        severity,
+        related_effects_json: &json!([effect.effect_id]).to_string(),
+        related_artifacts_json: "[]",
+    })?;
+    // The ask is issued: a completed-status fact lets `after ask succeeds`
+    // branches fire (e.g. flow await-state records carrying the ask's
+    // effect id for answer correlation).
+    let issued_json = json!({
+        "effect_id": effect.effect_id,
+        "run_id": run_id,
+        "inbox_item_id": inbox_item_id,
+        "status": "completed",
+    })
+    .to_string();
+    kernel.derive_fact(
+        instance_id,
+        "human.ask.issued",
+        &effect.effect_id,
+        &issued_json,
+        Some(&terminal.event_id),
+        Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "human.ask.issued",
+        ])),
+    )?;
+    Ok(terminal)
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): fold an `after`-binding into the effect
+/// input using facts read from a held store. Read-only, so `&S` suffices.
+pub fn resolve_effect_input_after_bindings_generic<S: RuntimeStore>(
+    store: &S,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<String, StoreError> {
+    let mut input = json_from_str(&effect.input_json);
+    let Some(after) = input.get("after").cloned() else {
+        return Ok(effect.input_json.clone());
+    };
+    let Some(binding) = after.get("binding").and_then(Value::as_str) else {
+        return Ok(effect.input_json.clone());
+    };
+    let Some(predicate) = after.get("predicate").and_then(Value::as_str) else {
+        return Ok(effect.input_json.clone());
+    };
+    let Some(upstream_effect_id) = after.get("upstream_effect_id").and_then(Value::as_str) else {
+        return Ok(effect.input_json.clone());
+    };
+    let facts = store.list_facts(instance_id)?;
+    let Some(binding_value) = effect_binding_value(&facts, upstream_effect_id, predicate) else {
+        return Ok(effect.input_json.clone());
+    };
+    if let Some(bindings) = input.get_mut("bindings").and_then(Value::as_object_mut) {
+        bindings.insert(binding.to_owned(), binding_value.clone());
+    }
+    let mut context = context_from_input_bindings(&input);
+    context.bindings.push((
+        binding.to_owned(),
+        FactView {
+            fact_id: upstream_effect_id.to_owned(),
+            program_version_id: None,
+            revision_epoch: 0,
+            name: binding.to_owned(),
+            key: upstream_effect_id.to_owned(),
+            value_json: binding_value.to_string(),
+            provenance_class: "effect".to_owned(),
+            source_span_json: None,
+        },
+    ));
+    if let Some(argument_exprs) = input.get("argument_exprs").and_then(Value::as_array) {
+        let mut arguments = serde_json::Map::new();
+        for (index, expr) in argument_exprs.iter().filter_map(Value::as_str).enumerate() {
+            arguments.insert(format!("arg{index}"), parse_field_value(expr, &context));
+        }
+        if let Some(object) = input.as_object_mut() {
+            object.insert("arguments".to_owned(), Value::Object(arguments));
+        }
+    }
+    if let Some(prompt) = input
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    {
+        if let Some(object) = input.as_object_mut() {
+            object.insert(
+                "prompt".to_owned(),
+                Value::String(interpolate_prompt(&prompt, &context)),
+            );
+        }
+    }
+    Ok(input.to_string())
+}
+
+pub fn context_from_input_bindings(input: &Value) -> RuleContext {
+    let mut context = RuleContext {
+        trigger_event_id: None,
+        identity: None,
+        bindings: Vec::new(),
+    };
+    let Some(bindings) = input.get("bindings").and_then(Value::as_object) else {
+        return context;
+    };
+    for (binding, value) in bindings {
+        context.bindings.push((
+            binding.clone(),
+            FactView {
+                fact_id: binding.clone(),
+                program_version_id: None,
+                revision_epoch: 0,
+                name: binding.clone(),
+                key: binding.clone(),
+                value_json: value.to_string(),
+                provenance_class: "input".to_owned(),
+                source_span_json: None,
+            },
+        ));
+    }
+    context
+}
+
+/// Executes a `read` file effect (std.files, piece 4): the local file provider
+/// reads `<store root>/<path>` and completes the effect with the content as its
+/// typed outcome (`succeeds` branch). A read error is a branchable `fails`
+/// outcome, not a workflow failure.
+/// The `file store` scope check shared by `read`/`write`: a path that is
+/// absolute or climbs out of the root with `..` is refused, and — when the store
+/// declares an `allow read/write [...]` list — the path must match one of the
+/// globs. An empty allow list means any path inside the root. Returns the
+/// failure reason, or `None` when the path is permitted.
+pub fn file_path_policy_error(
+    path: &str,
+    store_name: &str,
+    allow_globs: &[String],
+    operation: &str,
+) -> Option<String> {
+    if Path::new(path).is_absolute()
+        || Path::new(path)
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Some(format!(
+            "path `{path}` escapes the `{store_name}` store root"
+        ));
+    }
+    if !allow_globs.is_empty() && !allow_globs.iter().any(|glob| glob_match(glob, path)) {
+        return Some(format!(
+            "path `{path}` is not in the `{store_name}` store's `allow {operation}` policy"
+        ));
+    }
+    None
+}
+
+pub fn effect_allow_globs(input: &Value) -> Vec<String> {
+    input
+        .get("allow")
+        .and_then(Value::as_array)
+        .map(|globs| {
+            globs
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): read a file through the `FileStore` seam
+/// and record the terminal/fact over a held `RuntimeKernel<S>`. Native passes
+/// `NativeFileStore`; the DO passes `DoFileStore`.
+pub fn run_file_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    files: &dyn FileStore,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let input = json_from_str(&effect.input_json);
+    let root = input
+        .get("root")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let format = input
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("text")
+        .to_owned();
+    let store_name = input
+        .get("store")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let full = Path::new(root).join(path);
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "files",
+        worker_id: "whip-files",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({ "path": full.display().to_string() }).to_string(),
+    })?;
+    let terminal_key = idempotency_key(&[instance_id, &effect.effect_id, "terminal"]);
+    let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
+    // The `file store` root + `allow read` policy is the scope boundary
+    // (spec/std-library/files.md), checked before any disk access.
+    let allow = effect_allow_globs(&input);
+    let read_outcome = match file_path_policy_error(path, store_name, &allow, "read") {
+        Some(reason) => Err(reason),
+        None => files
+            .read_to_string(&full)
+            .map_err(|error| format!("read of `{}` failed: {error}", full.display())),
+    };
+    match read_outcome {
+        Ok(content) => {
+            let value = json!({
+                "store": store_name,
+                "path": path,
+                "format": format,
+                "content": content,
+                "bytes": content.len(),
+            });
+            let terminal = kernel.complete_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "files",
+                worker_id: "whip-files",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some(&format!(
+                    "read {} bytes from {}",
+                    content.len(),
+                    full.display()
+                )),
+                metadata_json: &json!({ "value": value }).to_string(),
+                idempotency_key: Some(&terminal_key),
+            })?;
+            // The settled effect becomes a `file.read.completed` fact (keyed by
+            // effect id) so `after <binding> succeeds as r` can bind `r.content`.
+            // Mirrors run_exec_effect's `exec.command.completed` projection.
+            kernel.derive_fact(
+                instance_id,
+                "file.read.completed",
+                &effect.effect_id,
+                &json!({
+                    "effect_id": effect.effect_id,
+                    "run_id": run_id,
+                    "status": "completed",
+                    "value": value,
+                })
+                .to_string(),
+                Some(&terminal.event_id),
+                Some(&fact_key),
+            )?;
+            Ok(terminal)
+        }
+        Err(reason) => {
+            let terminal = kernel.fail_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "files",
+                worker_id: "whip-files",
+                status: "failed",
+                exit_code: None,
+                summary: Some(&reason),
+                metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
+                idempotency_key: Some(&terminal_key),
+            })?;
+            kernel.derive_fact(
+                instance_id,
+                "file.read.failed",
+                &effect.effect_id,
+                &json!({
+                    "effect_id": effect.effect_id,
+                    "run_id": run_id,
+                    "status": "failed",
+                    "value": effect_failure_base("file.read", &reason, &reason, &effect.effect_id, &run_id),
+                    "error": { "message": reason },
+                })
+                .to_string(),
+                Some(&terminal.event_id),
+                Some(&fact_key),
+            )?;
+            Ok(terminal)
+        }
+    }
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): write/append a file through the
+/// `FileStore` seam + record the terminal over a held `RuntimeKernel<S>`.
+pub fn run_file_write_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    files: &dyn FileStore,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let input = json_from_str(&effect.input_json);
+    let root = input
+        .get("root")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let format = input
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("text")
+        .to_owned();
+    let store_name = input
+        .get("store")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mode = input
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("create")
+        .to_owned();
+    let body = input
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let full = Path::new(root).join(path);
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "files",
+        worker_id: "whip-files",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({ "path": full.display().to_string(), "mode": mode }).to_string(),
+    })?;
+    let terminal_key = idempotency_key(&[instance_id, &effect.effect_id, "terminal"]);
+    let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
+    let allow = effect_allow_globs(&input);
+    let write_outcome: Result<(), String> =
+        if let Some(reason) = file_path_policy_error(path, store_name, &allow, "write") {
+            Err(reason)
+        } else {
+            let exists = files.exists(&full);
+            // Mode policy (spec/std-library/files.md): no silent overwrite.
+            let mode_ok = match mode.as_str() {
+                "create" if exists => Err(format!(
+                    "write mode `create` requires `{path}` to not already exist"
+                )),
+                "replace" if !exists => Err(format!(
+                    "write mode `replace` requires `{path}` to already exist"
+                )),
+                "create" | "replace" | "upsert" | "append" => Ok(()),
+                other => Err(format!("unknown write mode `{other}`")),
+            };
+            mode_ok.and_then(|()| {
+                if let Some(parent) = full.parent() {
+                    files
+                        .create_dir_all(parent)
+                        .map_err(|error| format!("create parent of `{path}`: {error}"))?;
+                }
+                let result = if mode == "append" {
+                    files.append(&full, body.as_bytes())
+                } else {
+                    files.write(&full, body.as_bytes())
+                };
+                result.map_err(|error| format!("write of `{}` failed: {error}", full.display()))
+            })
+        };
+    match write_outcome {
+        Ok(()) => {
+            let value = json!({
+                "store": store_name,
+                "path": path,
+                "format": format,
+                "mode": mode,
+                "bytes": body.len(),
+                "content_hash": stable_hash_hex(&body),
+            });
+            let terminal = kernel.complete_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "files",
+                worker_id: "whip-files",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some(&format!("wrote {} bytes to {}", body.len(), full.display())),
+                metadata_json: &json!({ "value": value }).to_string(),
+                idempotency_key: Some(&terminal_key),
+            })?;
+            kernel.derive_fact(
+                instance_id,
+                "file.write.completed",
+                &effect.effect_id,
+                &json!({
+                    "effect_id": effect.effect_id,
+                    "run_id": run_id,
+                    "status": "completed",
+                    "value": value,
+                })
+                .to_string(),
+                Some(&terminal.event_id),
+                Some(&fact_key),
+            )?;
+            Ok(terminal)
+        }
+        Err(reason) => {
+            let terminal = kernel.fail_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "files",
+                worker_id: "whip-files",
+                status: "failed",
+                exit_code: None,
+                summary: Some(&reason),
+                metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
+                idempotency_key: Some(&terminal_key),
+            })?;
+            kernel.derive_fact(
+                instance_id,
+                "file.write.failed",
+                &effect.effect_id,
+                &json!({
+                    "effect_id": effect.effect_id,
+                    "run_id": run_id,
+                    "status": "failed",
+                    "value": effect_failure_base("file.write", &reason, &reason, &effect.effect_id, &run_id),
+                    "error": { "message": reason },
+                })
+                .to_string(),
+                Some(&terminal.event_id),
+                Some(&fact_key),
+            )?;
+            Ok(terminal)
+        }
+    }
+}
+
+/// Split one CSV record into fields with RFC-4180-style quoting: fields may be
+/// double-quoted, a quoted field may contain commas, and `""` inside a quoted
+/// field is a literal quote. v0 assumes one record per line (no embedded
+/// newlines) and all values decode as strings.
+pub fn split_csv_record(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if in_quotes => {
+                if chars.peek() == Some(&'"') {
+                    field.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            }
+            '"' => in_quotes = true,
+            ',' if !in_quotes => {
+                fields.push(std::mem::take(&mut field));
+            }
+            other => field.push(other),
+        }
+    }
+    fields.push(field);
+    fields
+}
+
+/// Decode a structured import file into rows (std.files). v0 decodes `jsonl`
+/// (one JSON value per non-blank line), `json` (a top-level array of values),
+/// and `csv` (a header row mapped over each subsequent record; values are
+/// strings).
+pub fn decode_import_rows(format: &str, content: &str) -> Result<Vec<Value>, String> {
+    match format {
+        "jsonl" => content
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, line)| {
+                serde_json::from_str::<Value>(line.trim())
+                    .map_err(|error| format!("row {index} is not valid JSON: {error}"))
+            })
+            .collect(),
+        "json" => match serde_json::from_str::<Value>(content.trim()) {
+            Ok(Value::Array(rows)) => Ok(rows),
+            Ok(_) => Err("a `json` import must be a top-level array of rows".to_owned()),
+            Err(error) => Err(format!("import file is not valid JSON: {error}")),
+        },
+        "csv" => {
+            let mut lines = content.lines().filter(|line| !line.trim().is_empty());
+            let Some(header_line) = lines.next() else {
+                return Ok(Vec::new());
+            };
+            let header = split_csv_record(header_line);
+            let mut rows = Vec::new();
+            for (index, line) in lines.enumerate() {
+                let values = split_csv_record(line);
+                if values.len() != header.len() {
+                    return Err(format!(
+                        "csv row {index} has {} fields but the header declares {}",
+                        values.len(),
+                        header.len()
+                    ));
+                }
+                let object = header
+                    .iter()
+                    .cloned()
+                    .zip(values.into_iter().map(Value::String))
+                    .collect::<serde_json::Map<String, Value>>();
+                rows.push(Value::Object(object));
+            }
+            Ok(rows)
+        }
+        other => Err(format!("unknown import format `{other}`")),
+    }
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): import a file's content into facts
+/// through the `FileStore` seam over a held `RuntimeKernel<S>`.
+pub fn run_file_import_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    files: &dyn FileStore,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    use whipplescript_store::{FactBatch, FactBatchRow};
+
+    let input = json_from_str(&effect.input_json);
+    let root = input
+        .get("root")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let format = input
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("jsonl")
+        .to_owned();
+    let schema = input
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let store_name = input
+        .get("store")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let allow = effect_allow_globs(&input);
+    let required_fields = input
+        .get("required_fields")
+        .and_then(Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let natural_key_field = input
+        .get("natural_key_field")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let full = Path::new(root).join(path);
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "files",
+        worker_id: "whip-files",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({ "path": full.display().to_string(), "schema": schema }).to_string(),
+    })?;
+    let terminal_key = idempotency_key(&[instance_id, &effect.effect_id, "terminal"]);
+    let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
+
+    // Decode + validate every row before admitting any (all-or-nothing).
+    let decoded: Result<Vec<Value>, String> = (|| {
+        if let Some(reason) = file_path_policy_error(path, store_name, &allow, "read") {
+            return Err(reason);
+        }
+        let content = files
+            .read_to_string(&full)
+            .map_err(|error| format!("read of `{}` failed: {error}", full.display()))?;
+        let rows = decode_import_rows(&format, &content)?;
+        for (index, row) in rows.iter().enumerate() {
+            let object = row
+                .as_object()
+                .ok_or_else(|| format!("row {index} is not a JSON object"))?;
+            for field in &required_fields {
+                if !object.contains_key(field) {
+                    return Err(format!(
+                        "row {index} is missing required field `{field}` for schema `{schema}`"
+                    ));
+                }
+            }
+        }
+        Ok(rows)
+    })();
+
+    match decoded {
+        Ok(rows) => {
+            // Per-row admission key + recorded key. When the schema declares a
+            // `@key` field, key by that field's value (H(effect_key,
+            // natural_key)); otherwise by row index (H(effect_key, row_index)).
+            let row_identity = |index: usize, row: &Value| -> String {
+                if natural_key_field.is_empty() {
+                    return index.to_string();
+                }
+                match row.get(&natural_key_field) {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(other) => other.to_string(),
+                    None => index.to_string(),
+                }
+            };
+            let keys = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| row_identity(index, row))
+                .collect::<Vec<_>>();
+            let fact_ids = keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    if natural_key_field.is_empty() {
+                        idempotency_key(&[&effect.effect_id, "row", &index.to_string()])
+                    } else {
+                        idempotency_key(&[&effect.effect_id, "natkey", key])
+                    }
+                })
+                .collect::<Vec<_>>();
+            let values = rows.iter().map(Value::to_string).collect::<Vec<_>>();
+            let batch_rows = (0..rows.len())
+                .map(|index| FactBatchRow {
+                    fact_id: &fact_ids[index],
+                    key: &keys[index],
+                    value_json: &values[index],
+                })
+                .collect::<Vec<_>>();
+            let admitted = kernel.admit_fact_batch(FactBatch {
+                instance_id,
+                source: "files",
+                causation_id: Some(&effect.effect_id),
+                correlation_id: Some(&effect.effect_id),
+                schema_name: &schema,
+                schema_id: Some(&schema),
+                rows: &batch_rows,
+            })?;
+            let value = json!({
+                "store": store_name,
+                "path": path,
+                "format": format,
+                "schema": schema,
+                "row_count": rows.len(),
+                "admitted": admitted.admitted,
+                "skipped": admitted.skipped,
+            });
+            let terminal = kernel.complete_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "files",
+                worker_id: "whip-files",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some(&format!(
+                    "imported {} rows from {}",
+                    rows.len(),
+                    full.display()
+                )),
+                metadata_json: &json!({ "value": value }).to_string(),
+                idempotency_key: Some(&terminal_key),
+            })?;
+            kernel.derive_fact(
+                instance_id,
+                "file.import.completed",
+                &effect.effect_id,
+                &json!({
+                    "effect_id": effect.effect_id,
+                    "run_id": run_id,
+                    "status": "completed",
+                    "value": value,
+                })
+                .to_string(),
+                Some(&terminal.event_id),
+                Some(&fact_key),
+            )?;
+            Ok(terminal)
+        }
+        Err(reason) => {
+            let terminal = kernel.fail_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "files",
+                worker_id: "whip-files",
+                status: "failed",
+                exit_code: None,
+                summary: Some(&reason),
+                metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
+                idempotency_key: Some(&terminal_key),
+            })?;
+            kernel.derive_fact(
+                instance_id,
+                "file.import.failed",
+                &effect.effect_id,
+                &json!({
+                    "effect_id": effect.effect_id,
+                    "run_id": run_id,
+                    "status": "failed",
+                    "value": effect_failure_base("file.import", &reason, &reason, &effect.effect_id, &run_id),
+                    "error": { "message": reason },
+                })
+                .to_string(),
+                Some(&terminal.event_id),
+                Some(&fact_key),
+            )?;
+            Ok(terminal)
+        }
+    }
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): the lease/ledger/counter op + its terminal
+/// over a held `RuntimeKernel<S>`; coordination is the DO's own store there, so
+/// `S: RuntimeStore + Coordination` unifies both surfaces.
+pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    use whipplescript_store::coordination::{
+        AcquireOutcome, ConsumeOutcome, DEFAULT_COORDINATION_OWNER,
+    };
+
+    let input = json_from_str(&effect.input_json);
+    let workflow_owner = coordination_owner_for_instance(kernel.store(), instance_id)?;
+    let field = |name: &str| {
+        input
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let owner = {
+        let declared = field("coordination_owner");
+        if declared.is_empty() {
+            workflow_owner.clone()
+        } else {
+            declared
+        }
+    };
+    let value = match effect.kind.as_str() {
+        "lease.acquire" => {
+            let resource = field("resource");
+            let key = field("key");
+            let outcome = kernel.store_mut().try_acquire_for_owner(
+                &owner,
+                &resource,
+                &key,
+                input.get("slots").and_then(Value::as_i64).unwrap_or(1),
+                input
+                    .get("ttl_seconds")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(600),
+                instance_id,
+            )?;
+            match outcome {
+                AcquireOutcome::Held => json!({
+                    "variant": "Held",
+                    "resource": resource,
+                    "key": key,
+                }),
+                AcquireOutcome::Contended { holders } => json!({
+                    "variant": "Contended",
+                    "resource": resource,
+                    "key": key,
+                    "holders": holders,
+                }),
+            }
+        }
+        "lease.release" => {
+            // The release names its acquire; resource and key come from the
+            // recorded acquire input, so they cannot drift.
+            let acquire_effect_id = field("acquire_effect_id");
+            let acquire_input = kernel
+                .store()
+                .list_effects(instance_id)?
+                .into_iter()
+                .find(|candidate| candidate.effect_id == acquire_effect_id)
+                .map(|candidate| json_from_str(&candidate.input_json))
+                .unwrap_or(Value::Null);
+            let resource = acquire_input
+                .get("resource")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let key = acquire_input
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let acquire_owner = acquire_input
+                .get("coordination_owner")
+                .and_then(Value::as_str)
+                .filter(|owner| !owner.is_empty())
+                .unwrap_or(&workflow_owner)
+                .to_owned();
+            let mut released = kernel.store_mut().release_for_owner(
+                &acquire_owner,
+                &resource,
+                &key,
+                instance_id,
+            )?;
+            if !released && acquire_owner != DEFAULT_COORDINATION_OWNER {
+                released = kernel.store_mut().release(&resource, &key, instance_id)?;
+            }
+            json!({
+                "variant": "Released",
+                "resource": resource,
+                "key": key,
+                "released": released,
+            })
+        }
+        "ledger.append" => {
+            let ledger = field("ledger");
+            let partition = field("partition");
+            let entry = input.get("entry").cloned().unwrap_or(Value::Null);
+            let seq = kernel.store_mut().append_for_owner(
+                &owner,
+                &ledger,
+                &partition,
+                &entry.to_string(),
+                instance_id,
+                input
+                    .get("retain_seconds")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(86400),
+            )?;
+            json!({
+                "variant": "Appended",
+                "ledger": ledger,
+                "partition": partition,
+                "seq": seq,
+            })
+        }
+        "counter.consume" => {
+            let counter = field("counter");
+            let key = field("key");
+            let period = kernel.store_mut().current_period(&field("reset"))?;
+            let outcome = kernel.store_mut().consume_for_owner(
+                &owner,
+                &counter,
+                &key,
+                input.get("amount").and_then(Value::as_i64).unwrap_or(0),
+                input.get("cap").and_then(Value::as_i64).unwrap_or(0),
+                &period,
+            )?;
+            match outcome {
+                ConsumeOutcome::Ok { remaining } => json!({
+                    "variant": "Ok",
+                    "counter": counter,
+                    "key": key,
+                    "remaining": remaining,
+                }),
+                ConsumeOutcome::Over { remaining } => json!({
+                    "variant": "Over",
+                    "counter": counter,
+                    "key": key,
+                    "remaining": remaining,
+                }),
+            }
+        }
+        other => {
+            return Err(StoreError::Conflict(format!(
+                "unknown coordination effect kind `{other}`"
+            )))
+        }
+    };
+
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "coord-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "coord-lease"]);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "coordination",
+        worker_id: "whip-coordination",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({"kind": effect.kind, "owner": owner}).to_string(),
+    })?;
+    let terminal = kernel.complete_run(EffectCompletion {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "coordination",
+        worker_id: "whip-coordination",
+        status: "completed",
+        exit_code: Some(0),
+        summary: Some(&format!(
+            "{} -> {}",
+            effect.kind,
+            value.get("variant").and_then(Value::as_str).unwrap_or("?")
+        )),
+        metadata_json: &value.to_string(),
+        idempotency_key: Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "terminal",
+        ])),
+    })?;
+    let fact = json!({
+        "effect_id": effect.effect_id,
+        "run_id": run_id,
+        "status": "completed",
+        "value": value,
+    });
+    kernel.derive_fact(
+        instance_id,
+        &format!("{}.completed", effect.kind),
+        &effect.effect_id,
+        &fact.to_string(),
+        Some(&terminal.event_id),
+        Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "coord-fact",
+        ])),
+    )?;
+    Ok(terminal)
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): claim/release/finish a work item + record
+/// the terminal over a held `RuntimeKernel<S>`. The queue is the DO's own store on
+/// that host, so `S: RuntimeStore + WorkItems` unifies both surfaces.
+pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    _config: &EffectConfig,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    use whipplescript_store::items::ClaimOutcome;
+    let input = json_from_str(&effect.input_json);
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "queue-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "queue-lease"]);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "queue",
+        worker_id: "whip-queue",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &effect.input_json,
+    })?;
+
+    let outcome: Result<Value, String> = match effect.kind.as_str() {
+        "queue.file" => {
+            let queue = effect.target.clone().unwrap_or_default();
+            let item = input.get("item").cloned().unwrap_or_else(|| json!({}));
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let body = item.get("body").and_then(Value::as_str).unwrap_or_default();
+            let labels = item
+                .get("labels")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let metadata = item.get("metadata").cloned().unwrap_or_else(|| json!({}));
+            let filed_by = format!("workflow:{instance_id}");
+            kernel
+                .store_mut()
+                .file_item(&queue, title, body, &labels, &metadata, Some(&filed_by))
+                .map(|filed| {
+                    json!({
+                        "queue": filed.queue,
+                        "id": filed.id,
+                        "title": filed.title,
+                    })
+                })
+                .map_err(|error| format!("file failed: {error:?}"))
+        }
+        "queue.claim" => {
+            let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
+            match kernel.store_mut().claim_item(id, instance_id) {
+                Ok(ClaimOutcome::Claimed) => Ok(json!({"id": id, "claimed_by": instance_id})),
+                Ok(ClaimOutcome::AlreadyClaimed { holder }) => {
+                    Err(format!("already claimed by `{holder}`"))
+                }
+                Ok(ClaimOutcome::NotFound) => Err(format!("item `{id}` not found")),
+                Err(error) => Err(format!("claim failed: {error:?}")),
+            }
+        }
+        "queue.release" => {
+            let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
+            match kernel.store_mut().release_item(id) {
+                Ok(true) => Ok(json!({"id": id, "status": "open"})),
+                Ok(false) => Err(format!("item `{id}` was not in progress")),
+                Err(error) => Err(format!("release failed: {error:?}")),
+            }
+        }
+        "queue.finish" => {
+            let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
+            let summary = input
+                .pointer("/payload/summary")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            match kernel.store_mut().finish_item(id, summary.as_deref()) {
+                Ok(true) => Ok(json!({"id": id, "status": "done", "summary": summary})),
+                Ok(false) => Err(format!("item `{id}` cannot finish from its current status")),
+                Err(error) => Err(format!("finish failed: {error:?}")),
+            }
+        }
+        other => Err(format!("unknown queue effect kind `{other}`")),
+    };
+
+    match outcome {
+        Ok(value) => {
+            let terminal = kernel.complete_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "queue",
+                worker_id: "whip-queue",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some("queue operation completed"),
+                metadata_json: &value.to_string(),
+                idempotency_key: Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "terminal",
+                ])),
+            })?;
+            let fact_value = json!({
+                "effect_id": effect.effect_id,
+                "run_id": run_id,
+                "status": "completed",
+                "value": value,
+            })
+            .to_string();
+            kernel.derive_fact(
+                instance_id,
+                &format!("{}.completed", effect.kind),
+                &effect.effect_id,
+                &fact_value,
+                Some(&terminal.event_id),
+                Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "queue-fact",
+                ])),
+            )?;
+            Ok(terminal)
+        }
+        Err(reason) => {
+            let terminal = kernel.fail_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "queue",
+                worker_id: "whip-queue",
+                status: "failed",
+                exit_code: Some(1),
+                summary: Some(&reason),
+                metadata_json: &json!({"failure": {"message": reason}}).to_string(),
+                idempotency_key: Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "terminal",
+                ])),
+            })?;
+            let fact_value = json!({
+                "effect_id": effect.effect_id,
+                "run_id": run_id,
+                "status": "failed",
+                "value": effect_failure_base(&effect.kind, &reason, &reason, &effect.effect_id, &run_id),
+                "error": {"message": reason},
+            })
+            .to_string();
+            kernel.derive_fact(
+                instance_id,
+                &format!("{}.failed", effect.kind),
+                &effect.effect_id,
+                &fact_value,
+                Some(&terminal.event_id),
+                Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "queue-fact",
+                ])),
+            )?;
+            Ok(terminal)
+        }
+    }
+}
+
+/// The `EffectError` base object (DR-0032) every effect `.failed` fact carries
+/// under its `value` key, so a downstream `after <effect> fails as f` binds a
+/// uniform `f` with `{reason, summary, effect_id, run_id, kind}`. Per-kind extras
+/// (exit_code, stderr, …) stay elsewhere on the fact and are not read by `f` until a
+/// variant exposes them. Mirrors the kernel-side `effect_failure_base`.
+pub fn effect_failure_base(
+    kind: &str,
+    reason: &str,
+    summary: &str,
+    effect_id: &str,
+    run_id: &str,
+) -> Value {
+    json!({
+        "reason": reason,
+        "summary": summary,
+        "effect_id": effect_id,
+        "run_id": run_id,
+        "kind": kind,
+    })
 }

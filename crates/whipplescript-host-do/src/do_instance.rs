@@ -17,7 +17,10 @@
 //! drive end to end, proving the DO runs the scheduler over its store.
 
 use whipplescript_kernel::effect_config::EffectConfig;
-use whipplescript_kernel::effect_handlers::{run_event_effect_generic, run_loft_effect_generic};
+use whipplescript_kernel::effect_handlers::{
+    run_coordination_effect_generic, run_event_effect_generic, run_human_effect_generic,
+    run_loft_effect_generic, run_queue_effect_generic,
+};
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_pass::step_instance_generic;
 use whipplescript_kernel::sansio::{HttpResponse, TransportError};
@@ -76,6 +79,15 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
             }
             "loft.claim" => {
                 run_loft_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
+            }
+            "human.ask" => {
+                run_human_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
+            }
+            "queue.file" | "queue.claim" | "queue.release" | "queue.finish" => {
+                run_queue_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
+            }
+            "lease.acquire" | "lease.release" | "ledger.append" | "counter.consume" => {
+                run_coordination_effect_generic(&mut self.kernel, self.instance_id, effect)?
             }
             other => {
                 return Err(StoreError::Conflict(format!(
