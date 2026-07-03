@@ -445,7 +445,18 @@ linear undo chain). No phase work now.
                 `BrokeredTurnMachine`/`CoerceStepMachine` for the DO NeedsIo path;
                 `exec` stays native-only (DR-0033 Decision 7);
             (4) assemble the `InstanceStepMachine` (the fixpoint as a `StepMachine`
-                raising `NeedsIo(Http)`); native `dev`/`worker`/`step` call it;
+                raising `NeedsIo(Http)`); native `dev`/`worker`/`step` call it.
+                **Groundwork DONE (commit d1cb27b):** the rule pass is lifted into
+                `whipplescript_kernel::rule_pass` (`step_instance_generic` + generic
+                helpers + `StepReport` + `lowering_idempotency_key`, ~455 ln;
+                native+wasm) — so the step machine can drive it in the kernel and
+                the CLI keeps only the `NativeStores`-building `step_instance`
+                wrapper. REMAINING for (4): the store-only effect handler cores
+                (all generic, still in `main.rs`) relocate to the kernel too, then
+                the `InstanceStepMachine` drives `step_instance_generic` + serial
+                effect dispatch, raising `NeedsIo(Http)` for the HTTP effects (which
+                lands the agent/coerce sans-IO wiring + the workflow-invoke/agent
+                recursion at the same time);
             (5) wire the DO host (`RuntimeKernel<DoSqliteStore>` + `FetchHost`) to
                 the wasm-bindgen surface below.
       - [ ] The `wasm-bindgen` surface the shell imports (`createInstance`/`step`/
