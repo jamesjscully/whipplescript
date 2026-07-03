@@ -242,6 +242,81 @@ impl WorkItemStore {
     }
 }
 
+/// The work-item tracker as a backend-agnostic trait — the sans-IO store seam
+/// (DR-0033 Phase 3), so a durable-object SQLite backend can back the same queue
+/// operations without the language changing (`spec/work-queues.md`). The native
+/// `WorkItemStore` implements it by forwarding to its inherent methods, so
+/// existing callers are unaffected.
+pub trait WorkItems {
+    fn file_item(
+        &mut self,
+        queue: &str,
+        title: &str,
+        body: &str,
+        labels: &[String],
+        metadata: &Value,
+        filed_by: Option<&str>,
+    ) -> StoreResult<WorkItem>;
+
+    fn get_item(&self, item_id: &str) -> StoreResult<Option<WorkItem>>;
+
+    fn list_items(&self, queue: Option<&str>, status: Option<&str>) -> StoreResult<Vec<WorkItem>>;
+
+    fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>>;
+
+    fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome>;
+
+    fn release_item(&mut self, item_id: &str) -> StoreResult<bool>;
+
+    fn release_claims_for_holder(&mut self, holder: &str) -> StoreResult<usize>;
+
+    fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool>;
+}
+
+impl WorkItems for WorkItemStore {
+    // Forwards to the inherent methods of the same name; inherent methods win
+    // `self.method()` resolution, so this delegates rather than recurses.
+    fn file_item(
+        &mut self,
+        queue: &str,
+        title: &str,
+        body: &str,
+        labels: &[String],
+        metadata: &Value,
+        filed_by: Option<&str>,
+    ) -> StoreResult<WorkItem> {
+        self.file_item(queue, title, body, labels, metadata, filed_by)
+    }
+
+    fn get_item(&self, item_id: &str) -> StoreResult<Option<WorkItem>> {
+        self.get_item(item_id)
+    }
+
+    fn list_items(&self, queue: Option<&str>, status: Option<&str>) -> StoreResult<Vec<WorkItem>> {
+        self.list_items(queue, status)
+    }
+
+    fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>> {
+        self.ready_items(queue)
+    }
+
+    fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome> {
+        self.claim_item(item_id, claimed_by)
+    }
+
+    fn release_item(&mut self, item_id: &str) -> StoreResult<bool> {
+        self.release_item(item_id)
+    }
+
+    fn release_claims_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
+        self.release_claims_for_holder(holder)
+    }
+
+    fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool> {
+        self.finish_item(item_id, summary)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClaimOutcome {
     Claimed,
@@ -294,6 +369,49 @@ mod tests {
         assert_eq!(first.id, "WS-1");
         assert_eq!(second.id, "WS-2");
         assert_eq!(second.filed_by.as_deref(), Some("turn-1"));
+    }
+
+    /// Drive the store through the `WorkItems` trait as a `dyn` object: proves
+    /// the seam is object-safe (a boxed durable-object backend is legal) and
+    /// forwards faithfully to the inherent methods.
+    #[test]
+    fn work_items_trait_seam_is_faithful() {
+        let mut store = open_memory();
+        let items: &mut dyn WorkItems = &mut store;
+
+        let filed = items
+            .file_item(
+                "backlog",
+                "Fix login",
+                "repro",
+                &[],
+                &json!({}),
+                Some("turn-1"),
+            )
+            .expect("file");
+        assert_eq!(filed.id, "WS-1");
+        assert_eq!(items.ready_items("backlog").expect("ready").len(), 1);
+        assert_eq!(
+            items.claim_item(&filed.id, "worker-1").expect("claim"),
+            ClaimOutcome::Claimed
+        );
+        assert!(items.ready_items("backlog").expect("ready").is_empty());
+        let fetched = items.get_item(&filed.id).expect("get").expect("present");
+        assert_eq!(fetched.claimed_by.as_deref(), Some("worker-1"));
+        assert_eq!(
+            items
+                .release_claims_for_holder("worker-1")
+                .expect("release"),
+            1
+        );
+        assert!(items.finish_item(&filed.id, Some("done")).expect("finish"));
+        assert_eq!(
+            items
+                .list_items(Some("backlog"), Some("done"))
+                .expect("list")
+                .len(),
+            1
+        );
     }
 
     #[test]

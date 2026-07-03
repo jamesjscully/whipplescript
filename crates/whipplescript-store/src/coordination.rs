@@ -406,6 +406,254 @@ impl CoordinationStore {
     }
 }
 
+/// The coordination store as a backend-agnostic trait — the sans-IO store seam
+/// (DR-0033 Phase 3). It lets a durable-object SQLite backend implement the same
+/// lease / ledger / counter operations the native rusqlite store provides, so
+/// the DO host can slot a second physical store in without the language
+/// changing. Every operation is one atomic, branchable transaction
+/// (spec/coordination.md) — no read-then-act surface.
+///
+/// The owner-parameterized methods are the primitives an implementation must
+/// supply; the shared-owner convenience forms are provided and delegate to
+/// [`DEFAULT_COORDINATION_OWNER`]. `CoordinationStore` implements this by
+/// forwarding to its inherent methods, so existing callers are unaffected.
+///
+/// Snapshot/manifest note (experimentation-subsystem downstream requirement —
+/// tracker § Downstream-customer note): the owner-scoped `list_*_for_owner`
+/// reads here are the half a checkpoint manifest is built from. A future
+/// `snapshot`/`restore` pair that pins coordination state in a consistent cut is
+/// deferred until the checkpoint mechanism lands, so it is designed against a
+/// real consumer rather than speculatively.
+pub trait Coordination {
+    fn try_acquire_for_owner(
+        &mut self,
+        owner: &str,
+        resource: &str,
+        key: &str,
+        slots: i64,
+        ttl_seconds: i64,
+        holder: &str,
+    ) -> StoreResult<AcquireOutcome>;
+
+    fn release_for_owner(
+        &mut self,
+        owner: &str,
+        resource: &str,
+        key: &str,
+        holder: &str,
+    ) -> StoreResult<bool>;
+
+    fn release_all_for_holder(&mut self, holder: &str) -> StoreResult<usize>;
+
+    fn append_for_owner(
+        &mut self,
+        owner: &str,
+        ledger: &str,
+        partition: &str,
+        payload_json: &str,
+        appended_by: &str,
+        retain_seconds: i64,
+    ) -> StoreResult<i64>;
+
+    fn consume_for_owner(
+        &mut self,
+        owner: &str,
+        counter: &str,
+        key: &str,
+        amount: i64,
+        cap: i64,
+        period: &str,
+    ) -> StoreResult<ConsumeOutcome>;
+
+    fn current_period(&self, reset: &str) -> StoreResult<String>;
+
+    fn list_leases_for_owner(
+        &self,
+        owner: Option<&str>,
+        resource: Option<&str>,
+    ) -> StoreResult<Vec<LeaseRow>>;
+
+    fn list_entries_for_owner(
+        &self,
+        owner: Option<&str>,
+        ledger: Option<&str>,
+        partition: Option<&str>,
+    ) -> StoreResult<Vec<LedgerEntry>>;
+
+    fn list_counters_for_owner(
+        &self,
+        owner: Option<&str>,
+        counter: Option<&str>,
+    ) -> StoreResult<Vec<CounterRow>>;
+
+    // Shared-owner convenience forms (provided).
+
+    fn try_acquire(
+        &mut self,
+        resource: &str,
+        key: &str,
+        slots: i64,
+        ttl_seconds: i64,
+        holder: &str,
+    ) -> StoreResult<AcquireOutcome> {
+        self.try_acquire_for_owner(
+            DEFAULT_COORDINATION_OWNER,
+            resource,
+            key,
+            slots,
+            ttl_seconds,
+            holder,
+        )
+    }
+
+    fn release(&mut self, resource: &str, key: &str, holder: &str) -> StoreResult<bool> {
+        self.release_for_owner(DEFAULT_COORDINATION_OWNER, resource, key, holder)
+    }
+
+    fn append(
+        &mut self,
+        ledger: &str,
+        partition: &str,
+        payload_json: &str,
+        appended_by: &str,
+        retain_seconds: i64,
+    ) -> StoreResult<i64> {
+        self.append_for_owner(
+            DEFAULT_COORDINATION_OWNER,
+            ledger,
+            partition,
+            payload_json,
+            appended_by,
+            retain_seconds,
+        )
+    }
+
+    fn consume(
+        &mut self,
+        counter: &str,
+        key: &str,
+        amount: i64,
+        cap: i64,
+        period: &str,
+    ) -> StoreResult<ConsumeOutcome> {
+        self.consume_for_owner(
+            DEFAULT_COORDINATION_OWNER,
+            counter,
+            key,
+            amount,
+            cap,
+            period,
+        )
+    }
+
+    fn list_leases(&self, resource: Option<&str>) -> StoreResult<Vec<LeaseRow>> {
+        self.list_leases_for_owner(None, resource)
+    }
+
+    fn list_entries(
+        &self,
+        ledger: Option<&str>,
+        partition: Option<&str>,
+    ) -> StoreResult<Vec<LedgerEntry>> {
+        self.list_entries_for_owner(None, ledger, partition)
+    }
+
+    fn list_counters(&self, counter: Option<&str>) -> StoreResult<Vec<CounterRow>> {
+        self.list_counters_for_owner(None, counter)
+    }
+}
+
+impl Coordination for CoordinationStore {
+    // Each method forwards to the inherent method of the same name; inherent
+    // methods win `self.method()` resolution, so this is delegation, not
+    // recursion (the `unconditional_recursion` lint guards the invariant).
+    fn try_acquire_for_owner(
+        &mut self,
+        owner: &str,
+        resource: &str,
+        key: &str,
+        slots: i64,
+        ttl_seconds: i64,
+        holder: &str,
+    ) -> StoreResult<AcquireOutcome> {
+        self.try_acquire_for_owner(owner, resource, key, slots, ttl_seconds, holder)
+    }
+
+    fn release_for_owner(
+        &mut self,
+        owner: &str,
+        resource: &str,
+        key: &str,
+        holder: &str,
+    ) -> StoreResult<bool> {
+        self.release_for_owner(owner, resource, key, holder)
+    }
+
+    fn release_all_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
+        self.release_all_for_holder(holder)
+    }
+
+    fn append_for_owner(
+        &mut self,
+        owner: &str,
+        ledger: &str,
+        partition: &str,
+        payload_json: &str,
+        appended_by: &str,
+        retain_seconds: i64,
+    ) -> StoreResult<i64> {
+        self.append_for_owner(
+            owner,
+            ledger,
+            partition,
+            payload_json,
+            appended_by,
+            retain_seconds,
+        )
+    }
+
+    fn consume_for_owner(
+        &mut self,
+        owner: &str,
+        counter: &str,
+        key: &str,
+        amount: i64,
+        cap: i64,
+        period: &str,
+    ) -> StoreResult<ConsumeOutcome> {
+        self.consume_for_owner(owner, counter, key, amount, cap, period)
+    }
+
+    fn current_period(&self, reset: &str) -> StoreResult<String> {
+        self.current_period(reset)
+    }
+
+    fn list_leases_for_owner(
+        &self,
+        owner: Option<&str>,
+        resource: Option<&str>,
+    ) -> StoreResult<Vec<LeaseRow>> {
+        self.list_leases_for_owner(owner, resource)
+    }
+
+    fn list_entries_for_owner(
+        &self,
+        owner: Option<&str>,
+        ledger: Option<&str>,
+        partition: Option<&str>,
+    ) -> StoreResult<Vec<LedgerEntry>> {
+        self.list_entries_for_owner(owner, ledger, partition)
+    }
+
+    fn list_counters_for_owner(
+        &self,
+        owner: Option<&str>,
+        counter: Option<&str>,
+    ) -> StoreResult<Vec<CounterRow>> {
+        self.list_counters_for_owner(owner, counter)
+    }
+}
+
 fn normalized_owner(owner: &str) -> &str {
     if owner.trim().is_empty() {
         DEFAULT_COORDINATION_OWNER
@@ -689,6 +937,66 @@ mod tests {
                 .expect("op"),
             AcquireOutcome::Held
         );
+    }
+
+    /// Drive the store through the `Coordination` trait as a `dyn` object: proves
+    /// the seam is object-safe (a boxed durable-object backend is legal) and that
+    /// the provided shared-owner forms delegate to the required owner primitives
+    /// exactly as the inherent methods do — the contract a DO backend satisfies.
+    #[test]
+    fn coordination_trait_seam_is_faithful() {
+        let mut store = store();
+        let coordination: &mut dyn Coordination = &mut store;
+
+        // Shared-owner convenience forms route through the owner primitives.
+        assert_eq!(
+            coordination
+                .try_acquire("deploy", "prod", 1, 600, "ins_a")
+                .expect("op"),
+            AcquireOutcome::Held
+        );
+        assert_eq!(
+            coordination
+                .try_acquire("deploy", "prod", 1, 600, "ins_b")
+                .expect("op"),
+            AcquireOutcome::Contended {
+                holders: vec!["ins_a".to_owned()]
+            }
+        );
+        assert!(coordination.release("deploy", "prod", "ins_a").expect("op"));
+
+        // Ledger append + read-back through the trait.
+        coordination
+            .append("events", "p", "{\"n\":1}", "ins_a", 3600)
+            .expect("op");
+        let entries = coordination.list_entries(Some("events"), None).expect("op");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].payload_json, "{\"n\":1}");
+
+        // Counter consume with a fixed period through the trait.
+        assert_eq!(
+            coordination
+                .consume("budget", "k", 3, 5, "2026-07-03")
+                .expect("op"),
+            ConsumeOutcome::Ok { remaining: 2 }
+        );
+        assert_eq!(
+            coordination
+                .consume("budget", "k", 3, 5, "2026-07-03")
+                .expect("op"),
+            ConsumeOutcome::Over { remaining: 2 }
+        );
+
+        // Owner-scoped primitive + list read — the read a checkpoint manifest is
+        // built from (the partitioned `<pkg>/<name>::X` owner).
+        coordination
+            .try_acquire_for_owner("pkg/wf::region", "slot", "eu", 1, 600, "ins_c")
+            .expect("op");
+        let leases = coordination
+            .list_leases_for_owner(Some("pkg/wf::region"), None)
+            .expect("op");
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].holder, "ins_c");
     }
 
     /// An expired TTL frees the slot without an explicit release (crash net).

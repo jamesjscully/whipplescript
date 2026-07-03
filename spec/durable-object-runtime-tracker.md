@@ -123,7 +123,7 @@ in flight and expensive to retrofit:
    file manifest. The coordination store is workspace-scoped and
    cross-instance, so a cut that omits it makes replay-from-checkpoint
    non-deterministic and hollows out the subsystem's checkpoint-conditional
-   evidence semantics (research note §7.2 Tier B, §15). Phase 3 (store behind
+   evidence semantics (research note §6, §16). Phase 3 (store behind
    a trait) is the cheap moment to shape this: cut the coordination trait with
    a snapshot/manifest capability in view.
 2. **Content-addressing stays canonical and stable** across tiers and hosts
@@ -211,12 +211,30 @@ in flight and expensive to retrofit:
       suite exit 0; fmt + `clippy -D warnings` clean. No user-facing surface, so
       no `docs/` change.
 
-### Phase 3 — Store behind a trait
-- [ ] Extract `SqliteStore`/`WorkItemStore`/`CoordinationStore` APIs into traits;
-      native impl = rusqlite. Note where single-writer-per-DO lets the
-      `Immediate`-txn / WAL locking machinery fall away on the DO impl.
+### Phase 3 — Store behind a trait — IN PROGRESS (2 of 3 stores)
+- [x] `CoordinationStore` → `Coordination` trait (`coordination.rs`):
+      owner-parameterized primitives required, shared-owner convenience forms
+      provided; native impl forwards to the inherent methods (delegation, not
+      recursion — `unconditional_recursion` guards it). Object-safe (`&mut dyn
+      Coordination` drives a boxed backend); `coordination_trait_seam_is_faithful`
+      exercises lease/ledger/counter through the trait. Cut around the
+      partitioned `<pkg>/<name>::X` owner (encapsulation Phase 3, satisfied).
+- [x] `WorkItemStore` → `WorkItems` trait (`items.rs`): same delegating,
+      object-safe pattern; `work_items_trait_seam_is_faithful` drives file/claim/
+      release/finish/list through `&mut dyn WorkItems`. Store crate 88 tests green;
+      fmt + `clippy -D warnings` clean.
+- [~] `SqliteStore` → trait: **deferred pending a design decision** on how to cut
+      its ~100-method surface — one fat trait vs. role/facet traits (EventLog /
+      FactStore / EffectLedger / InstanceRegistry / …). A mechanical fat-trait
+      delegation is possible but would commit a cut I'm not confident is right; the
+      role-trait cut is the design-sensitive part and wants a short design pass
+      before touching the 14k-line file. *When:* before the Phase 5 DO host needs
+      a DO-backed main store.
+- [~] Snapshot/manifest capability on the coordination/item traits (experimentation-
+      subsystem downstream requirement) — deferred until the checkpoint mechanism
+      lands so it is designed against a real consumer (see the trait doc-comments).
       *(Ordering: after the encapsulation coordination-partition schema change —
-      see Cross-effort ordering above.)*
+      satisfied.)*
 
 ### Phase 4 — Files route through the store trait (tiering seam)
 - [ ] Route `file.read/write/import/export` through the store trait so a second
