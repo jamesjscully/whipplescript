@@ -369,25 +369,17 @@ in flight and expensive to retrofit:
                 (`OwnedFact/Effect/Dependency/WorkflowTerminal/Lowering` +
                 `BranchReport/BranchStatus`) into `kernel::lowering` —
                 **DONE** (commit a461a41; native+wasm, clippy -D, tests green);
-            (1b) lift the pure lowering CLOSURE into the kernel. Mapped: the
-                transitive col-0 closure of `lower_rule`/`ready_contexts` is **104
-                free functions (~4493 lines), verified 100% pure** (zero
-                `SqliteStore`/`fs`/`Instant`/`thread`/`ureq`/`store_path` refs) — a
-                clean wholesale move. It also needs **18 CLI-local types + all
-                their `impl` blocks** (`RuleContext`, `EvalValue`/`EvalScope`,
+            (1b) lift the pure lowering CLOSURE into `kernel::rule_lowering` —
+                **DONE** (commit e5838bf): 104 free functions + 18 support types
+                with their impl blocks (`RuleContext`, `EvalValue`/`EvalScope`,
                 `ReadyContexts`, `GuardReport`/`GuardStatus`, the parse-block
-                structs `AfterBlock`/`AfterScope`/`ActiveAfterScope`/`CaseBlock`/
-                `CaseBranch`/`CaseSelection`/`RecordBlock`/`MilestoneBlock`/
-                `TerminalBlock`/`ParsedEffect`/`ParsedPrompt`/`FieldAssignment`).
-                Caveat for execution: recompute the closure INCLUDING impl-method
-                bodies as call sources (those methods pull in more helpers the
-                col-0 fn trace misses); the closure is interleaved with non-closure
-                code in 29k–35k so it needs a scripted per-item extraction (col-0
-                boundary heuristic, reverse-line-order deletion), everything `pub`,
-                then rewrite `main.rs` to import the moved set. Atomic move — one
-                focused pass, build (native+wasm)+clippy+tests green before commit;
-            (2) lift the rule pass (`step_instance`/`project_queue_items`) generic
-                over the held store handles;
+                structs) + `split_args`, all verified pure — ~4777 lines left
+                main.rs; it imports the closure via `rule_lowering::*`. native+wasm,
+                clippy -D, fmt idempotent, tests green (unchanged counts). The whole
+                pure lowering layer now lives in the kernel;
+            (2) lift the rule-pass ORCHESTRATION (`step_instance`/
+                `project_queue_items`) generic over held store handles — the crux
+                (open-by-path → threaded `&mut S`). NEXT;
             (3) lift the effect executor + 13 store-only handlers, then the two
                 HTTP handlers as the already-built sans-IO effect machines;
             (4) assemble the `InstanceStepMachine` (the fixpoint as a `StepMachine`
