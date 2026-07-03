@@ -14,6 +14,7 @@ pub mod loft;
 pub mod native_lifecycle;
 pub mod pi_rpc;
 pub mod provider;
+pub mod sansio;
 pub mod trace;
 
 use artifact_manifest::{

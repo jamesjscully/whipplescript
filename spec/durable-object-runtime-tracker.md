@@ -154,14 +154,35 @@ in flight and expensive to retrofit:
       user-facing surface in Phase 0, so no `docs/` change (formal model + design
       record only).
 
-### Phase 1 — Pilot: coerce sans-IO on native (no behavior change)
-- [ ] Introduce the shared types (`HttpRequest`/`IoResult`/`Outcome`) + host
-      driver trait; the `IoRequest` sum has room for a future large-file/blob
-      control variant so it is not a corner.
-- [ ] Reshape coerce into the step machine — `build_request` = prepare,
-      `parse_response` = finish (already pure); native driver runs it via ureq.
-      All coerce tests green; identical behavior.
-- [ ] Model coverage: coerce instance of the Phase-0 lifecycle.
+### Phase 1 — Pilot: coerce sans-IO on native (no behavior change) — DONE 2026-07-03
+- [x] Shared sans-IO vocabulary in `crates/whipplescript-kernel/src/sansio.rs`:
+      `HttpRequest`/`HttpResponse`/`TransportError` (moved here from
+      `coerce_native`, re-exported for source compat), `IoRequest`
+      (`Http(..)` today; sum left open for a future large-object/blob control
+      variant so Phase 7 is additive, not a corner), `IoResult`, `Outcome`
+      (`NeedsIo`/`Settle`), the `StepMachine` + `HostDriver` traits, and
+      `run_to_completion` (the native one-pass driver = the model's
+      `NativeExactlyOnce` refinement). A blanket `impl HostDriver for
+      T: CoerceTransport` bridges the existing `ureq`/fake transports with no
+      change to them.
+- [x] Coerce reshaped as a `CoerceStepMachine` (`coerce_native.rs`): `step(None)`
+      = prepare (`build_request`) → `NeedsIo(Http)`; `step(Some(resp))` = finish
+      (`parse_response` / the identical timeout+transport error branches) →
+      `Settle`. `NativeCoerceClient::coerce` now drives it via
+      `run_to_completion` over its transport. Byte-for-byte identical behavior:
+      all coerce tests green (kernel 199 unit + 17 e2e incl.
+      `native_client_drives_transport_and_parses`/`_maps_timeout`/
+      `e2e_coerce_success_and_failure_branches_are_deterministic`; CLI
+      control_plane 162 + soft_middle 56; full kernel+CLI suite exit 0),
+      `cargo fmt --all --check` clean, `clippy -D warnings` clean.
+- [x] Model coverage: the general Phase-0 lifecycle model
+      (`ResumableEffectLifecycle.tla`) already subsumes coerce as the 1-round
+      native instance (both host modes, rounds 0..2). Code-level conformance
+      tests demonstrate the actual coerce code follows that shape:
+      `coerce_step_machine_is_a_one_round_lifecycle_instance` +
+      `coerce_step_machine_maps_transport_failures_to_terminals` (coerce_native)
+      and `run_to_completion_drives_zero_one_and_many_rounds` (sansio). No
+      user-facing surface, so no `docs/` change.
 
 ### Phase 2 — Generalize the seam to agent turns
 - [ ] Express the owned/model agent loop (`HarnessModelClient::next`) as a

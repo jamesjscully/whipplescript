@@ -37,35 +37,31 @@ impl CoerceProvider {
     }
 }
 
-/// A transport-agnostic HTTP request. The kernel builds these; the CLI's
-/// `ureq` transport executes them.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HttpRequest {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub body: Value,
-}
-
-/// A transport-agnostic HTTP response (status code + decoded JSON body).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub body: Value,
-}
-
-/// Why a transport call did not yield a response.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CoerceTransportError {
-    /// The request exceeded its deadline.
-    Timeout,
-    /// Any other transport-level failure (connect/TLS/decode), redacted message.
-    Transport(String),
-}
+// The transport-agnostic HTTP types now live in the neutral `sansio` module
+// (shared with agent turns and, later, file effects); re-exported here so the
+// many `coerce_native::{HttpRequest, HttpResponse, CoerceTransportError}` paths
+// keep resolving. `CoerceTransportError` is the coerce-facing name for the
+// shared `sansio::TransportError`.
+use crate::sansio::{run_to_completion, HostDriver, IoRequest, IoResult, Outcome, StepMachine};
+pub use crate::sansio::{HttpRequest, HttpResponse, TransportError as CoerceTransportError};
 
 /// The single side effect: POST a request and decode a JSON response. The real
-/// impl lives in the CLI (`ureq`); tests inject a fake.
+/// impl lives in the CLI (`ureq`); tests inject a fake. Every `CoerceTransport`
+/// is a sans-IO [`HostDriver`] (blanket impl below), so a coerce step machine
+/// can be driven by any transport the codebase already has.
 pub trait CoerceTransport {
     fn post(&self, request: &HttpRequest) -> Result<HttpResponse, CoerceTransportError>;
+}
+
+/// Any HTTP transport is a host driver: fulfilling an [`IoRequest::Http`] is just
+/// posting it. This bridges the existing `ureq`/fake transports into the sans-IO
+/// [`HostDriver`] seam without changing them.
+impl<T: CoerceTransport + ?Sized> HostDriver for T {
+    fn fulfill(&self, request: &IoRequest) -> IoResult {
+        match request {
+            IoRequest::Http(http) => IoResult::Http(self.post(http)),
+        }
+    }
 }
 
 // -- JSON Schema synthesis ------------------------------------------------
@@ -648,22 +644,55 @@ impl<T: CoerceTransport> CoerceClient for NativeCoerceClient<'_, T> {
                     session_id,
                 }),
         };
-        let request = build_request(&call);
-        match self.transport.post(&request) {
-            Ok(response) => parse_response(self.provider, &response, self.wrapped),
-            Err(CoerceTransportError::Timeout) => CoerceResult {
-                status: CoerceStatus::TimedOut,
-                value_json: None,
-                error_json: Some(
-                    json!({ "reason": "coerce request timed out", "recoverable": true })
-                        .to_string(),
-                ),
-                summary: "coerce timed out".to_owned(),
-                transcript: "native coerce timeout\n".to_owned(),
-                usage_json: r#"{"input_tokens":0,"output_tokens":0}"#.to_owned(),
-            },
-            Err(CoerceTransportError::Transport(message)) => {
-                failed_result(format!("transport error: {message}"), None)
+        // Coerce is a one-round step machine (prepare → HTTP → finish). The
+        // native host drives it to completion synchronously via its transport;
+        // the behavior is identical to a straight build → post → parse.
+        let mut machine = CoerceStepMachine {
+            call,
+            provider: self.provider,
+            wrapped: self.wrapped,
+        };
+        run_to_completion(&mut machine, self.transport)
+    }
+}
+
+/// The coerce effect as a sans-IO [`StepMachine`] (DR-0033 Decision 1): one HTTP
+/// round, `build_request` as the prepare step and `parse_response`/the transport
+/// error mapping as the finish step. Reusing those pure functions unchanged keeps
+/// behavior byte-for-byte identical to the direct client.
+struct CoerceStepMachine<'a> {
+    call: CoerceCall<'a>,
+    provider: CoerceProvider,
+    wrapped: bool,
+}
+
+impl StepMachine for CoerceStepMachine<'_> {
+    type Output = CoerceResult;
+
+    fn step(&mut self, incoming: Option<IoResult>) -> Outcome<CoerceResult> {
+        match incoming {
+            // Prepare: build the provider request (pure) and hand it to the host.
+            None => Outcome::NeedsIo(IoRequest::Http(build_request(&self.call))),
+            // Finish: decode the response, or map a transport failure to a
+            // terminal — the same three branches the direct client used.
+            Some(IoResult::Http(Ok(response))) => {
+                Outcome::Settle(parse_response(self.provider, &response, self.wrapped))
+            }
+            Some(IoResult::Http(Err(CoerceTransportError::Timeout))) => {
+                Outcome::Settle(CoerceResult {
+                    status: CoerceStatus::TimedOut,
+                    value_json: None,
+                    error_json: Some(
+                        json!({ "reason": "coerce request timed out", "recoverable": true })
+                            .to_string(),
+                    ),
+                    summary: "coerce timed out".to_owned(),
+                    transcript: "native coerce timeout\n".to_owned(),
+                    usage_json: r#"{"input_tokens":0,"output_tokens":0}"#.to_owned(),
+                })
+            }
+            Some(IoResult::Http(Err(CoerceTransportError::Transport(message)))) => {
+                Outcome::Settle(failed_result(format!("transport error: {message}"), None))
             }
         }
     }
@@ -672,6 +701,7 @@ impl<T: CoerceTransport> CoerceClient for NativeCoerceClient<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sansio::{IoRequest, IoResult, Outcome, StepMachine};
     use std::cell::RefCell;
     use whipplescript_parser::{IrClass, IrEnum};
 
@@ -1085,5 +1115,86 @@ mod tests {
             output_schema_hash: "o".to_owned(),
         };
         assert_eq!(client.coerce(&request).status, CoerceStatus::TimedOut);
+    }
+
+    // -- Coerce as a Phase-0 lifecycle instance ---------------------------
+    // These assert the sans-IO shape directly (DR-0033 Decision 1;
+    // models/tla/ResumableEffectLifecycle.tla): coerce is a one-round machine,
+    // prepare -> NeedsIo(Http) -> settle, with transport failures mapped to
+    // terminals in the finish step.
+
+    fn one_round_machine(provider: CoerceProvider, schema: &Value) -> CoerceStepMachine<'_> {
+        CoerceStepMachine {
+            call: CoerceCall {
+                provider,
+                base_url: match provider {
+                    CoerceProvider::Anthropic => "https://api.anthropic.com",
+                    CoerceProvider::OpenAi => "https://api.openai.com",
+                },
+                api_key: "key",
+                model: "m",
+                prompt: "Classify this",
+                output_schema: schema,
+                schema_name: "WorkReview",
+                max_tokens: 1024,
+                codex: None,
+            },
+            provider,
+            wrapped: false,
+        }
+    }
+
+    #[test]
+    fn coerce_step_machine_is_a_one_round_lifecycle_instance() {
+        let schema = json!({ "type": "object" });
+        let mut machine = one_round_machine(CoerceProvider::Anthropic, &schema);
+
+        // First step (incoming = None) prepares the request and asks the host
+        // for exactly one HTTP round.
+        let request = match machine.step(None) {
+            Outcome::NeedsIo(IoRequest::Http(request)) => request,
+            _ => panic!("expected NeedsIo(Http) on the prepare step"),
+        };
+        assert!(
+            request.url.contains("anthropic"),
+            "the prepare step built the provider request"
+        );
+
+        // Feeding the response settles the machine in that one round.
+        let response = HttpResponse {
+            status: 200,
+            body: json!({
+                "content": [{ "type": "tool_use", "input": { "status": "Accepted", "reason": "ok" } }],
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            }),
+        };
+        match machine.step(Some(IoResult::Http(Ok(response)))) {
+            Outcome::Settle(result) => assert_eq!(result.status, CoerceStatus::Succeeded),
+            _ => panic!("expected Settle on the finish step"),
+        }
+    }
+
+    #[test]
+    fn coerce_step_machine_maps_transport_failures_to_terminals() {
+        let schema = json!({ "type": "object" });
+
+        let mut timeout = one_round_machine(CoerceProvider::OpenAi, &schema);
+        assert!(matches!(timeout.step(None), Outcome::NeedsIo(_)));
+        let timed_out = match timeout.step(Some(IoResult::Http(Err(CoerceTransportError::Timeout))))
+        {
+            Outcome::Settle(result) => result.status,
+            _ => panic!("expected Settle"),
+        };
+        assert_eq!(timed_out, CoerceStatus::TimedOut);
+
+        let mut broken = one_round_machine(CoerceProvider::OpenAi, &schema);
+        assert!(matches!(broken.step(None), Outcome::NeedsIo(_)));
+        let failed = match broken.step(Some(IoResult::Http(Err(CoerceTransportError::Transport(
+            "boom".to_owned(),
+        ))))) {
+            Outcome::Settle(result) => result.status,
+            _ => panic!("expected Settle"),
+        };
+        assert_eq!(failed, CoerceStatus::Failed);
     }
 }
