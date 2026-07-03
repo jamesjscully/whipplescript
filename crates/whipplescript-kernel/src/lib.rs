@@ -15,6 +15,7 @@ pub mod lowering;
 pub mod native_lifecycle;
 pub mod pi_rpc;
 pub mod provider;
+pub mod rule_lowering;
 pub mod sansio;
 pub mod trace;
 
