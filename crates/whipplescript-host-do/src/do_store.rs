@@ -428,6 +428,199 @@ fn optional_string(value: Option<&Value>) -> Option<String> {
     value.and_then(Value::as_str).map(str::to_owned)
 }
 
+/// Validates that `json` parses to a JSON array, mirroring `parse_json_array`.
+fn parse_json_array(json: &str) -> StoreResult<()> {
+    if serde_json::from_str::<Value>(json)?.is_array() {
+        Ok(())
+    } else {
+        Err(StoreError::Conflict("expected JSON array".to_owned()))
+    }
+}
+
+/// A `SkillView` as the metadata JSON the native `skill_to_json` emits.
+fn skill_to_json(skill: &SkillView) -> Value {
+    serde_json::json!({
+        "skill_id": skill.skill_id,
+        "name": skill.name,
+        "version": skill.version,
+        "source": skill.source,
+        "source_path": skill.source_path,
+        "content_hash": skill.content_hash,
+        "description": skill.description,
+        "required_capabilities":
+            serde_json::from_str::<Value>(&skill.required_capabilities_json).unwrap_or(Value::Null),
+    })
+}
+
+/// Inserts an evidence link (idempotent on the natural key), mirroring
+/// `insert_evidence_link_on`.
+fn do_insert_evidence_link<Sql: DoSql>(sql: &Sql, link: EvidenceLink<'_>) -> StoreResult<()> {
+    sql.execute(
+        "INSERT INTO evidence_links (link_id, evidence_id, instance_id, target_type, target_id, \
+         relation) VALUES ('evl_' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(evidence_id, target_type, target_id, relation) DO NOTHING",
+        &[
+            text(link.evidence_id),
+            text(link.instance_id),
+            text(link.target_type),
+            text(link.target_id),
+            text(link.relation),
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+/// Inserts an evidence row plus its subject / causation / correlation links,
+/// returning the generated id. Mirrors `insert_evidence_on`.
+fn do_insert_evidence<Sql: DoSql>(sql: &Sql, evidence: EvidenceRecord<'_>) -> StoreResult<String> {
+    serde_json::from_str::<Value>(evidence.metadata_json)?;
+    let rows = sql
+        .query(
+            "INSERT INTO evidence (evidence_id, instance_id, kind, subject_type, subject_id, \
+             causation_id, correlation_id, summary, metadata_json) VALUES \
+             ('evd_' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             RETURNING evidence_id",
+            &[
+                text(evidence.instance_id),
+                text(evidence.kind),
+                text(evidence.subject_type),
+                text(evidence.subject_id),
+                opt_text(evidence.causation_id),
+                opt_text(evidence.correlation_id),
+                opt_text(evidence.summary),
+                text(evidence.metadata_json),
+            ],
+        )
+        .map_err(sql_err)?;
+    let evidence_id = rows
+        .first()
+        .map(|r| as_text(&r[0]))
+        .ok_or_else(|| sql_err("insert_evidence returned no row".to_string()))?;
+    do_insert_evidence_link(
+        sql,
+        EvidenceLink {
+            evidence_id: &evidence_id,
+            instance_id: evidence.instance_id,
+            target_type: evidence.subject_type,
+            target_id: evidence.subject_id,
+            relation: "subject",
+        },
+    )?;
+    if let Some(causation_id) = evidence.causation_id {
+        do_insert_evidence_link(
+            sql,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "causation",
+                target_id: causation_id,
+                relation: "caused_by",
+            },
+        )?;
+    }
+    if let Some(correlation_id) = evidence.correlation_id {
+        do_insert_evidence_link(
+            sql,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "correlation",
+                target_id: correlation_id,
+                relation: "correlates_with",
+            },
+        )?;
+    }
+    Ok(evidence_id)
+}
+
+/// Idempotency lookup for `record_diagnostic`, mirroring `existing_diagnostic_id_on`.
+fn do_existing_diagnostic_id<Sql: DoSql>(
+    sql: &Sql,
+    diagnostic: &DiagnosticRecord<'_>,
+) -> StoreResult<Option<String>> {
+    let Some(idempotency_key) = diagnostic.idempotency_key else {
+        return Ok(None);
+    };
+    let lookup = |where_clause: &str, params: &[SqlValue]| -> StoreResult<Option<String>> {
+        let rows = sql
+            .query(
+                &format!("SELECT diagnostic_id FROM diagnostics WHERE {where_clause}"),
+                params,
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|r| as_text(&r[0])))
+    };
+    if let Some(instance_id) = diagnostic.instance_id {
+        return lookup(
+            "instance_id = ?1 AND idempotency_key = ?2",
+            &[text(instance_id), text(idempotency_key)],
+        );
+    }
+    if let Some(program_version_id) = diagnostic.program_version_id {
+        return lookup(
+            "instance_id IS NULL AND program_version_id = ?1 AND idempotency_key = ?2",
+            &[text(program_version_id), text(idempotency_key)],
+        );
+    }
+    if let Some(program_id) = diagnostic.program_id {
+        return lookup(
+            "instance_id IS NULL AND program_id = ?1 AND idempotency_key = ?2",
+            &[text(program_id), text(idempotency_key)],
+        );
+    }
+    Ok(None)
+}
+
+/// Inserts a diagnostic (idempotent on `idempotency_key`), returning its id.
+/// Mirrors `insert_diagnostic_on`.
+fn do_insert_diagnostic<Sql: DoSql>(
+    sql: &Sql,
+    diagnostic: DiagnosticRecord<'_>,
+) -> StoreResult<String> {
+    if let Some(source_span_json) = diagnostic.source_span_json {
+        serde_json::from_str::<Value>(source_span_json)?;
+    }
+    parse_json_array(diagnostic.evidence_ids_json)?;
+    parse_json_array(diagnostic.artifact_ids_json)?;
+    if let Some(existing_id) = do_existing_diagnostic_id(sql, &diagnostic)? {
+        return Ok(existing_id);
+    }
+    let rows = sql
+        .query(
+            "INSERT INTO diagnostics (diagnostic_id, instance_id, program_id, \
+             program_version_id, severity, code, message, source_span_json, subject_type, \
+             subject_id, event_id, effect_id, run_id, assertion_id, evidence_ids_json, \
+             artifact_ids_json, causation_id, correlation_id, idempotency_key) VALUES \
+             ('dia_' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
+             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) RETURNING diagnostic_id",
+            &[
+                opt_text(diagnostic.instance_id),
+                opt_text(diagnostic.program_id),
+                opt_text(diagnostic.program_version_id),
+                text(diagnostic.severity.as_str()),
+                opt_text(diagnostic.code),
+                text(diagnostic.message),
+                opt_text(diagnostic.source_span_json),
+                opt_text(diagnostic.subject_type),
+                opt_text(diagnostic.subject_id),
+                opt_text(diagnostic.event_id),
+                opt_text(diagnostic.effect_id),
+                opt_text(diagnostic.run_id),
+                opt_text(diagnostic.assertion_id),
+                text(diagnostic.evidence_ids_json),
+                text(diagnostic.artifact_ids_json),
+                opt_text(diagnostic.causation_id),
+                opt_text(diagnostic.correlation_id),
+                opt_text(diagnostic.idempotency_key),
+            ],
+        )
+        .map_err(sql_err)?;
+    rows.first()
+        .map(|r| as_text(&r[0]))
+        .ok_or_else(|| sql_err("insert_diagnostic returned no row".to_string()))
+}
+
 /// The shared 19-column workflow-invocation projection (parent/child active
 /// versions joined, status folded to the parent effect's terminal). Callers
 /// append their own `WHERE ... ORDER BY ...` clause. Mirrors the native SQL.
@@ -1007,40 +1200,243 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn record_evidence(&self, evidence: EvidenceRecord<'_>) -> StoreResult<String> {
-        todo!("Phase 5b: port `record_evidence` SQL to DoSql + verify against a live DO")
+        do_insert_evidence(&self.sql, evidence)
     }
 
     fn record_provider_validation_evidence(
         &self,
         evidence: ProviderValidationEvidence<'_>,
     ) -> StoreResult<String> {
-        todo!("Phase 5b: port `record_provider_validation_evidence` SQL to DoSql + verify against a live DO")
+        let config = serde_json::from_str::<Value>(evidence.config_json)?;
+        let capability = serde_json::from_str::<Value>(evidence.capability_json)?;
+        let validation_results = serde_json::from_str::<Value>(evidence.validation_results_json)?;
+        let metadata = serde_json::json!({
+            "provider_id": evidence.provider_id,
+            "provider_kind": evidence.provider_kind,
+            "surface": evidence.surface,
+            "status": evidence.status,
+            "source_path": evidence.source_path,
+            "config": config,
+            "capability": capability,
+            "validation_results": validation_results,
+        })
+        .to_string();
+        let summary = format!(
+            "provider `{}` validation {} on {}",
+            evidence.provider_id, evidence.status, evidence.surface
+        );
+        let evidence_id = do_insert_evidence(
+            &self.sql,
+            EvidenceRecord {
+                instance_id: evidence.instance_id,
+                kind: "provider.validation",
+                subject_type: "provider_config",
+                subject_id: evidence.provider_id,
+                causation_id: None,
+                correlation_id: evidence.correlation_id,
+                summary: Some(&summary),
+                metadata_json: &metadata,
+            },
+        )?;
+        do_insert_evidence_link(
+            &self.sql,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider",
+                target_id: evidence.provider_id,
+                relation: "validates",
+            },
+        )?;
+        do_insert_evidence_link(
+            &self.sql,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider_capability",
+                target_id: &format!("{}:{}", evidence.provider_kind, evidence.surface),
+                relation: "uses",
+            },
+        )?;
+        Ok(evidence_id)
     }
 
     fn record_codex_app_server_evidence(
         &self,
         evidence: CodexAppServerEvidence<'_>,
     ) -> StoreResult<String> {
-        todo!("Phase 5b: port `record_codex_app_server_evidence` SQL to DoSql + verify against a live DO")
+        let inner = serde_json::from_str::<Value>(evidence.metadata_json)?;
+        let metadata = serde_json::json!({
+            "provider_id": evidence.provider_id,
+            "thread_id": evidence.thread_id,
+            "turn_id": evidence.turn_id,
+            "evidence": inner,
+        })
+        .to_string();
+        let summary = format!(
+            "Codex app-server evidence for provider `{}` turn `{}`",
+            evidence.provider_id, evidence.turn_id
+        );
+        let evidence_id = do_insert_evidence(
+            &self.sql,
+            EvidenceRecord {
+                instance_id: evidence.instance_id,
+                kind: "codex.app_server.evidence",
+                subject_type: "provider_turn",
+                subject_id: evidence.turn_id,
+                causation_id: None,
+                correlation_id: evidence.correlation_id,
+                summary: Some(&summary),
+                metadata_json: &metadata,
+            },
+        )?;
+        do_insert_evidence_link(
+            &self.sql,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider",
+                target_id: evidence.provider_id,
+                relation: "observes",
+            },
+        )?;
+        do_insert_evidence_link(
+            &self.sql,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider_thread",
+                target_id: evidence.thread_id,
+                relation: "observes",
+            },
+        )?;
+        Ok(evidence_id)
     }
 
     fn record_claude_agent_sdk_evidence(
         &self,
         evidence: ClaudeAgentSdkEvidence<'_>,
     ) -> StoreResult<String> {
-        todo!("Phase 5b: port `record_claude_agent_sdk_evidence` SQL to DoSql + verify against a live DO")
+        let inner = serde_json::from_str::<Value>(evidence.metadata_json)?;
+        let metadata = serde_json::json!({
+            "provider_id": evidence.provider_id,
+            "session_id": evidence.session_id,
+            "run_id": evidence.run_id,
+            "evidence": inner,
+        })
+        .to_string();
+        let summary = format!(
+            "Claude Agent SDK evidence for provider `{}` session `{}`",
+            evidence.provider_id, evidence.session_id
+        );
+        let evidence_id = do_insert_evidence(
+            &self.sql,
+            EvidenceRecord {
+                instance_id: evidence.instance_id,
+                kind: "claude.agent_sdk.evidence",
+                subject_type: "provider_session",
+                subject_id: evidence.session_id,
+                causation_id: Some(evidence.run_id),
+                correlation_id: evidence.correlation_id,
+                summary: Some(&summary),
+                metadata_json: &metadata,
+            },
+        )?;
+        do_insert_evidence_link(
+            &self.sql,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider",
+                target_id: evidence.provider_id,
+                relation: "observes",
+            },
+        )?;
+        do_insert_evidence_link(
+            &self.sql,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider_run",
+                target_id: evidence.run_id,
+                relation: "observes",
+            },
+        )?;
+        Ok(evidence_id)
     }
 
     fn record_pi_rpc_evidence(&self, evidence: PiRpcEvidence<'_>) -> StoreResult<String> {
-        todo!("Phase 5b: port `record_pi_rpc_evidence` SQL to DoSql + verify against a live DO")
+        let inner = serde_json::from_str::<Value>(evidence.metadata_json)?;
+        let metadata = serde_json::json!({
+            "provider_id": evidence.provider_id,
+            "session_id": evidence.session_id,
+            "run_id": evidence.run_id,
+            "evidence": inner,
+        })
+        .to_string();
+        let summary = format!(
+            "Pi RPC evidence for provider `{}` session `{}`",
+            evidence.provider_id, evidence.session_id
+        );
+        let evidence_id = do_insert_evidence(
+            &self.sql,
+            EvidenceRecord {
+                instance_id: evidence.instance_id,
+                kind: "pi.rpc.evidence",
+                subject_type: "provider_session",
+                subject_id: evidence.session_id,
+                causation_id: Some(evidence.run_id),
+                correlation_id: evidence.correlation_id,
+                summary: Some(&summary),
+                metadata_json: &metadata,
+            },
+        )?;
+        do_insert_evidence_link(
+            &self.sql,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider",
+                target_id: evidence.provider_id,
+                relation: "observes",
+            },
+        )?;
+        do_insert_evidence_link(
+            &self.sql,
+            EvidenceLink {
+                evidence_id: &evidence_id,
+                instance_id: evidence.instance_id,
+                target_type: "provider_run",
+                target_id: evidence.run_id,
+                relation: "observes",
+            },
+        )?;
+        Ok(evidence_id)
     }
 
     fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()> {
-        todo!("Phase 5b: port `link_evidence` SQL to DoSql + verify against a live DO")
+        do_insert_evidence_link(&self.sql, link)
     }
 
     fn record_artifact(&self, artifact: ArtifactRecord<'_>) -> StoreResult<String> {
-        todo!("Phase 5b: port `record_artifact` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "INSERT INTO artifacts (artifact_id, run_id, kind, path, content_hash, mime_type) \
+                 VALUES ('art_' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5) \
+                 RETURNING artifact_id",
+                &[
+                    text(artifact.run_id),
+                    text(artifact.kind),
+                    text(artifact.path),
+                    opt_text(artifact.content_hash),
+                    opt_text(artifact.mime_type),
+                ],
+            )
+            .map_err(sql_err)?;
+        rows.first()
+            .map(|r| as_text(&r[0]))
+            .ok_or_else(|| sql_err("record_artifact returned no row".to_string()))
     }
 
     fn list_artifacts_for_run(&self, run_id: &str) -> StoreResult<Vec<ArtifactView>> {
@@ -1110,7 +1506,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn record_diagnostic(&self, diagnostic: DiagnosticRecord<'_>) -> StoreResult<String> {
-        todo!("Phase 5b: port `record_diagnostic` SQL to DoSql + verify against a live DO")
+        do_insert_diagnostic(&self.sql, diagnostic)
     }
 
     fn list_diagnostics(&self, instance_id: Option<&str>) -> StoreResult<Vec<DiagnosticView>> {
@@ -1284,7 +1680,53 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn record_skill_evidence(&self, evidence: SkillEvidence<'_>) -> StoreResult<String> {
-        todo!("Phase 5b: port `record_skill_evidence` SQL to DoSql + verify against a live DO")
+        // Resolve each named skill (sorted by name), mirroring `skills_by_name`.
+        let mut skills = Vec::new();
+        for name in evidence.skill_names {
+            let rows = self
+                .sql
+                .query(
+                    "SELECT skill_id, name, version, source, source_path, content_hash, \
+                     description, required_capabilities FROM skills WHERE name = ?1",
+                    &[text(name)],
+                )
+                .map_err(sql_err)?;
+            let row = rows
+                .first()
+                .ok_or_else(|| sql_err(format!("no skill named `{name}`")))?;
+            skills.push(skill_view_from_row(row));
+        }
+        skills.sort_by(|left, right| left.name.cmp(&right.name));
+        let metadata = serde_json::json!({
+            "effect_id": evidence.effect_id,
+            "skills": skills.iter().map(skill_to_json).collect::<Vec<_>>(),
+        })
+        .to_string();
+        let summary = if skills.is_empty() {
+            "no skills injected".to_owned()
+        } else {
+            format!(
+                "injected skills: {}",
+                skills
+                    .iter()
+                    .map(|skill| format!("{}@{}", skill.name, skill.version))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        do_insert_evidence(
+            &self.sql,
+            EvidenceRecord {
+                instance_id: evidence.instance_id,
+                kind: "skills.injected",
+                subject_type: "run",
+                subject_id: evidence.run_id,
+                causation_id: Some(evidence.effect_id),
+                correlation_id: evidence.idempotency_key,
+                summary: Some(&summary),
+                metadata_json: &metadata,
+            },
+        )
     }
 
     fn list_evidence(&self, instance_id: &str) -> StoreResult<Vec<EvidenceView>> {
@@ -1719,9 +2161,10 @@ mod tests {
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE evidence_links (
-                evidence_id TEXT NOT NULL, instance_id TEXT NOT NULL, target_type TEXT NOT NULL,
-                target_id TEXT NOT NULL, relation TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                link_id TEXT PRIMARY KEY, evidence_id TEXT NOT NULL, instance_id TEXT NOT NULL,
+                target_type TEXT NOT NULL, target_id TEXT NOT NULL, relation TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(evidence_id, target_type, target_id, relation)
             );
             CREATE TABLE effects (
                 effect_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -2566,5 +3009,140 @@ mod tests {
             store.list_evidence_links("i1").expect("links")[0].relation,
             "supports"
         );
+    }
+
+    /// The evidence/diagnostic/artifact *record* family runs real INSERT...RETURNING
+    /// SQL (plus the derived evidence-link fan-out) and is idempotent where the
+    /// native path is.
+    #[test]
+    fn do_store_record_evidence_diagnostic_artifact_run_real_sql() {
+        use whipplescript_core::Severity;
+        let store = store();
+
+        // A skill to inject, so record_skill_evidence resolves it.
+        store
+            .register_skill(SkillRegistration {
+                skill_id: "skl_1",
+                name: "triage",
+                version: "2.0.0",
+                source: "b",
+                source_path: "p",
+                description: "",
+                required_capabilities_json: "[]",
+                metadata_json: "{}",
+            })
+            .expect("register_skill");
+
+        // record_evidence mints evd_ id and fans out a "subject" + causation link.
+        let ev_id = store
+            .record_evidence(EvidenceRecord {
+                instance_id: "i1",
+                kind: "note",
+                subject_type: "effect",
+                subject_id: "eff_1",
+                causation_id: Some("cause_1"),
+                correlation_id: None,
+                summary: Some("s"),
+                metadata_json: "{}",
+            })
+            .expect("record_evidence");
+        assert!(ev_id.starts_with("evd_"));
+        let links = store.list_evidence_links("i1").expect("links");
+        assert!(links.iter().any(|l| l.relation == "subject"));
+        assert!(links.iter().any(|l| l.relation == "caused_by"));
+
+        // link_evidence is idempotent on its natural key.
+        for _ in 0..2 {
+            store
+                .link_evidence(EvidenceLink {
+                    evidence_id: &ev_id,
+                    instance_id: "i1",
+                    target_type: "extra",
+                    target_id: "x",
+                    relation: "rel",
+                })
+                .expect("link_evidence");
+        }
+        assert_eq!(
+            store
+                .list_evidence_links("i1")
+                .expect("links")
+                .iter()
+                .filter(|l| l.relation == "rel")
+                .count(),
+            1
+        );
+
+        // Provider-validation evidence records the row + two typed links.
+        let pv_id = store
+            .record_provider_validation_evidence(ProviderValidationEvidence {
+                instance_id: "i1",
+                provider_id: "prov_1",
+                provider_kind: "anthropic",
+                surface: "model",
+                status: "passed",
+                config_json: "{}",
+                capability_json: "{}",
+                validation_results_json: "[]",
+                source_path: None,
+                correlation_id: None,
+            })
+            .expect("provider validation");
+        assert!(pv_id.starts_with("evd_"));
+
+        // record_skill_evidence resolves the skill + records injected-skills evidence.
+        let se_id = store
+            .record_skill_evidence(SkillEvidence {
+                instance_id: "i1",
+                run_id: "run_1",
+                effect_id: "eff_1",
+                skill_names: &["triage"],
+                idempotency_key: Some("idem"),
+            })
+            .expect("skill evidence");
+        assert!(se_id.starts_with("evd_"));
+
+        // record_artifact mints art_ id.
+        let art_id = store
+            .record_artifact(ArtifactRecord {
+                run_id: "run_1",
+                kind: "log",
+                path: "/l",
+                content_hash: Some("h"),
+                mime_type: None,
+            })
+            .expect("record_artifact");
+        assert!(art_id.starts_with("art_"));
+
+        // record_diagnostic mints dia_ id; a second call with the same idempotency
+        // key returns the same id (no duplicate row).
+        let make = || DiagnosticRecord {
+            instance_id: Some("i1"),
+            program_id: None,
+            program_version_id: None,
+            severity: Severity::Error,
+            code: Some("E1"),
+            message: "boom",
+            source_span_json: None,
+            subject_type: None,
+            subject_id: None,
+            event_id: None,
+            effect_id: None,
+            run_id: None,
+            assertion_id: None,
+            evidence_ids_json: "[]",
+            artifact_ids_json: "[]",
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: Some("diag-idem"),
+        };
+        let d1 = store.record_diagnostic(make()).expect("diag 1");
+        let d2 = store.record_diagnostic(make()).expect("diag 2");
+        assert_eq!(d1, d2);
+        assert_eq!(store.list_diagnostics(Some("i1")).expect("diag").len(), 1);
+        // A non-array evidence_ids_json is rejected.
+        let mut bad = make();
+        bad.evidence_ids_json = "{}";
+        assert!(store.record_diagnostic(bad).is_err());
     }
 }
