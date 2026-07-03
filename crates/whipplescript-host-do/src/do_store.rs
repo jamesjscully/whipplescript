@@ -28,6 +28,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
+use whipplescript_store::coordination::{
+    AcquireOutcome, ConsumeOutcome, Coordination, CounterRow, LeaseRow, LedgerEntry,
+};
 use whipplescript_store::items::{ClaimOutcome, WorkItem, WorkItems};
 use whipplescript_store::{NewEvent, RuntimeStore, StoreError, StoreResult, StoredEvent};
 // The remaining ported methods reference the full set of store data types.
@@ -6481,6 +6484,292 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
     }
 }
 
+// -- Coordination over DoSql (DR-0033 chunk 5a) -----------------------------
+//
+// Leases (slot-bounded, TTL), ledgers (append-commute, bounded retention), and
+// coord_counters (atomic consume with lazy period reset) ported to the DO's one SQLite.
+// Natively these live in a separate coordination store; on the DO they are the
+// `coord_leases` / `coord_ledger_seq` / `coord_ledger_entries` / `coord_counters` tables. The native
+// atomic pairs used a rusqlite transaction; the DO single-writer per-invocation
+// model supplies that atomicity. Only the 9 required `*_for_owner` (+
+// `release_all_for_holder` / `current_period`) methods are ported; the 7
+// shared-owner convenience forms are the trait's inherited defaults.
+
+/// Empty owner normalizes to the shared partition (mirrors `normalized_owner`).
+fn do_norm_owner(owner: &str) -> &str {
+    if owner.trim().is_empty() {
+        "shared"
+    } else {
+        owner
+    }
+}
+
+impl<Sql: DoSql> Coordination for DoSqliteStore<Sql> {
+    fn try_acquire_for_owner(
+        &mut self,
+        owner: &str,
+        resource: &str,
+        key: &str,
+        slots: i64,
+        ttl_seconds: i64,
+        holder: &str,
+    ) -> StoreResult<AcquireOutcome> {
+        let owner = do_norm_owner(owner);
+        self.sql
+            .execute(
+                "DELETE FROM coord_leases WHERE owner = ?1 AND resource = ?2 AND key = ?3 AND expires_at <= datetime('now')",
+                &[text(owner), text(resource), text(key)],
+            )
+            .map_err(sql_err)?;
+        let already = self
+            .sql
+            .query(
+                "SELECT COUNT(*) FROM coord_leases WHERE owner = ?1 AND resource = ?2 AND key = ?3 AND holder = ?4",
+                &[text(owner), text(resource), text(key), text(holder)],
+            )
+            .map_err(sql_err)?;
+        if already.first().map(|row| as_i64(&row[0])).unwrap_or(0) > 0 {
+            return Ok(AcquireOutcome::Held);
+        }
+        let holders = self
+            .sql
+            .query(
+                "SELECT COUNT(*) FROM coord_leases WHERE owner = ?1 AND resource = ?2 AND key = ?3",
+                &[text(owner), text(resource), text(key)],
+            )
+            .map_err(sql_err)?;
+        if holders.first().map(|row| as_i64(&row[0])).unwrap_or(0) < slots {
+            self.sql
+                .execute(
+                    "INSERT INTO coord_leases (owner, resource, key, holder, expires_at) VALUES (?1, ?2, ?3, ?4, datetime('now', ?5))",
+                    &[text(owner), text(resource), text(key), text(holder), text(&format!("+{ttl_seconds} seconds"))],
+                )
+                .map_err(sql_err)?;
+            return Ok(AcquireOutcome::Held);
+        }
+        let current = self
+            .sql
+            .query(
+                "SELECT holder FROM coord_leases WHERE owner = ?1 AND resource = ?2 AND key = ?3 ORDER BY acquired_at",
+                &[text(owner), text(resource), text(key)],
+            )
+            .map_err(sql_err)?;
+        Ok(AcquireOutcome::Contended {
+            holders: current.iter().map(|row| as_text(&row[0])).collect(),
+        })
+    }
+
+    fn release_for_owner(
+        &mut self,
+        owner: &str,
+        resource: &str,
+        key: &str,
+        holder: &str,
+    ) -> StoreResult<bool> {
+        let owner = do_norm_owner(owner);
+        let changed = self
+            .sql
+            .execute(
+                "DELETE FROM coord_leases WHERE owner = ?1 AND resource = ?2 AND key = ?3 AND holder = ?4",
+                &[text(owner), text(resource), text(key), text(holder)],
+            )
+            .map_err(sql_err)?;
+        Ok(changed >= 1)
+    }
+
+    fn release_all_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
+        let changed = self
+            .sql
+            .execute(
+                "DELETE FROM coord_leases WHERE holder = ?1",
+                &[text(holder)],
+            )
+            .map_err(sql_err)?;
+        Ok(changed as usize)
+    }
+
+    fn append_for_owner(
+        &mut self,
+        owner: &str,
+        ledger: &str,
+        partition: &str,
+        payload_json: &str,
+        appended_by: &str,
+        retain_seconds: i64,
+    ) -> StoreResult<i64> {
+        let owner = do_norm_owner(owner);
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO coord_ledger_seq (owner, ledger, next_seq) VALUES (?1, ?2, 1)",
+                &[text(owner), text(ledger)],
+            )
+            .map_err(sql_err)?;
+        let bumped = self
+            .sql
+            .query(
+                "UPDATE coord_ledger_seq SET next_seq = next_seq + 1 WHERE owner = ?1 AND ledger = ?2 RETURNING next_seq - 1",
+                &[text(owner), text(ledger)],
+            )
+            .map_err(sql_err)?;
+        let seq = bumped
+            .first()
+            .map(|row| as_i64(&row[0]))
+            .ok_or_else(|| StoreError::Conflict("coord_ledger_seq row missing".to_owned()))?;
+        self.sql
+            .execute(
+                "INSERT INTO coord_ledger_entries (owner, ledger, partition, seq, payload_json, appended_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[text(owner), text(ledger), text(partition), int(seq), text(payload_json), text(appended_by)],
+            )
+            .map_err(sql_err)?;
+        self.sql
+            .execute(
+                "DELETE FROM coord_ledger_entries WHERE owner = ?1 AND ledger = ?2 AND appended_at <= datetime('now', ?3)",
+                &[text(owner), text(ledger), text(&format!("-{retain_seconds} seconds"))],
+            )
+            .map_err(sql_err)?;
+        Ok(seq)
+    }
+
+    fn consume_for_owner(
+        &mut self,
+        owner: &str,
+        counter: &str,
+        key: &str,
+        amount: i64,
+        cap: i64,
+        period: &str,
+    ) -> StoreResult<ConsumeOutcome> {
+        let owner = do_norm_owner(owner);
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO coord_counters (owner, counter, key, consumed, period) VALUES (?1, ?2, ?3, 0, ?4)",
+                &[text(owner), text(counter), text(key), text(period)],
+            )
+            .map_err(sql_err)?;
+        self.sql
+            .execute(
+                "UPDATE coord_counters SET consumed = 0, period = ?4 WHERE owner = ?1 AND counter = ?2 AND key = ?3 AND period != ?4",
+                &[text(owner), text(counter), text(key), text(period)],
+            )
+            .map_err(sql_err)?;
+        let current = self
+            .sql
+            .query(
+                "SELECT consumed FROM coord_counters WHERE owner = ?1 AND counter = ?2 AND key = ?3",
+                &[text(owner), text(counter), text(key)],
+            )
+            .map_err(sql_err)?;
+        let consumed = current.first().map(|row| as_i64(&row[0])).unwrap_or(0);
+        if consumed + amount <= cap {
+            self.sql
+                .execute(
+                    "UPDATE coord_counters SET consumed = consumed + ?4 WHERE owner = ?1 AND counter = ?2 AND key = ?3",
+                    &[text(owner), text(counter), text(key), int(amount)],
+                )
+                .map_err(sql_err)?;
+            return Ok(ConsumeOutcome::Ok {
+                remaining: cap - consumed - amount,
+            });
+        }
+        Ok(ConsumeOutcome::Over {
+            remaining: cap - consumed,
+        })
+    }
+
+    fn current_period(&self, reset: &str) -> StoreResult<String> {
+        let format = match reset {
+            "hourly" => "%Y-%m-%dT%H",
+            "weekly" => "%Y-W%W",
+            "monthly" => "%Y-%m",
+            _ => "%Y-%m-%d",
+        };
+        let rows = self
+            .sql
+            .query("SELECT strftime(?1, 'now')", &[text(format)])
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])).unwrap_or_default())
+    }
+
+    fn list_leases_for_owner(
+        &self,
+        owner: Option<&str>,
+        resource: Option<&str>,
+    ) -> StoreResult<Vec<LeaseRow>> {
+        let owner = owner.map(do_norm_owner);
+        let rows = self
+            .sql
+            .query(
+                "SELECT owner, resource, key, holder, acquired_at, expires_at FROM coord_leases WHERE (?1 IS NULL OR owner = ?1) AND (?2 IS NULL OR resource = ?2) ORDER BY owner, resource, key, acquired_at",
+                &[opt_text(owner), opt_text(resource)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| LeaseRow {
+                owner: as_text(&row[0]),
+                resource: as_text(&row[1]),
+                key: as_text(&row[2]),
+                holder: as_text(&row[3]),
+                acquired_at: as_text(&row[4]),
+                expires_at: as_text(&row[5]),
+            })
+            .collect())
+    }
+
+    fn list_entries_for_owner(
+        &self,
+        owner: Option<&str>,
+        ledger: Option<&str>,
+        partition: Option<&str>,
+    ) -> StoreResult<Vec<LedgerEntry>> {
+        let owner = owner.map(do_norm_owner);
+        let rows = self
+            .sql
+            .query(
+                "SELECT owner, ledger, partition, seq, payload_json, appended_by, appended_at FROM coord_ledger_entries WHERE (?1 IS NULL OR owner = ?1) AND (?2 IS NULL OR ledger = ?2) AND (?3 IS NULL OR partition = ?3) ORDER BY owner, ledger, seq",
+                &[opt_text(owner), opt_text(ledger), opt_text(partition)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| LedgerEntry {
+                owner: as_text(&row[0]),
+                ledger: as_text(&row[1]),
+                partition: as_text(&row[2]),
+                seq: as_i64(&row[3]),
+                payload_json: as_text(&row[4]),
+                appended_by: as_text(&row[5]),
+                appended_at: as_text(&row[6]),
+            })
+            .collect())
+    }
+
+    fn list_counters_for_owner(
+        &self,
+        owner: Option<&str>,
+        counter: Option<&str>,
+    ) -> StoreResult<Vec<CounterRow>> {
+        let owner = owner.map(do_norm_owner);
+        let rows = self
+            .sql
+            .query(
+                "SELECT owner, counter, key, consumed, period FROM coord_counters WHERE (?1 IS NULL OR owner = ?1) AND (?2 IS NULL OR counter = ?2) ORDER BY owner, counter, key",
+                &[opt_text(owner), opt_text(counter)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| CounterRow {
+                owner: as_text(&row[0]),
+                counter: as_text(&row[1]),
+                key: as_text(&row[2]),
+                consumed: as_i64(&row[3]),
+                period: as_text(&row[4]),
+            })
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6720,6 +7009,24 @@ mod tests {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_id INTEGER NOT NULL
             );
             INSERT INTO item_counter (singleton, next_id) VALUES (1, 1);
+            CREATE TABLE coord_leases (
+                owner TEXT NOT NULL, resource TEXT NOT NULL, key TEXT NOT NULL, holder TEXT NOT NULL,
+                acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, expires_at TEXT NOT NULL,
+                PRIMARY KEY (owner, resource, key, holder)
+            );
+            CREATE TABLE coord_ledger_seq (
+                owner TEXT NOT NULL, ledger TEXT NOT NULL, next_seq INTEGER NOT NULL,
+                PRIMARY KEY (owner, ledger)
+            );
+            CREATE TABLE coord_ledger_entries (
+                owner TEXT NOT NULL, ledger TEXT NOT NULL, partition TEXT NOT NULL, seq INTEGER NOT NULL,
+                payload_json TEXT NOT NULL, appended_by TEXT NOT NULL,
+                appended_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (owner, ledger, seq)
+            );
+            CREATE TABLE coord_counters (
+                owner TEXT NOT NULL, counter TEXT NOT NULL, key TEXT NOT NULL,
+                consumed INTEGER NOT NULL DEFAULT 0, period TEXT NOT NULL, PRIMARY KEY (owner, counter, key)
+            );
             "#,
         )
         .expect("schema");
@@ -6810,6 +7117,71 @@ mod tests {
                 .status,
             "done"
         );
+    }
+
+    #[test]
+    fn do_coordination_lease_ledger_counter_over_dosql() {
+        let mut store = store();
+        // Lease: a 1-slot resource holds the first acquirer; a second contends.
+        assert_eq!(
+            Coordination::try_acquire_for_owner(&mut store, "shared", "r", "k", 1, 600, "h1")
+                .expect("acquire"),
+            AcquireOutcome::Held
+        );
+        match Coordination::try_acquire_for_owner(&mut store, "shared", "r", "k", 1, 600, "h2")
+            .expect("contend")
+        {
+            AcquireOutcome::Contended { holders } => assert_eq!(holders, vec!["h1".to_owned()]),
+            other => panic!("expected contention, got {other:?}"),
+        }
+        // Re-acquire by the current holder is idempotent (Held).
+        assert_eq!(
+            Coordination::try_acquire_for_owner(&mut store, "shared", "r", "k", 1, 600, "h1")
+                .expect("reacquire"),
+            AcquireOutcome::Held
+        );
+        assert!(
+            Coordination::release_for_owner(&mut store, "shared", "r", "k", "h1").expect("rel")
+        );
+
+        // Ledger: appends mint monotonic sequence numbers.
+        assert_eq!(
+            Coordination::append_for_owner(&mut store, "shared", "log", "p", "{}", "w", 3600)
+                .expect("a0"),
+            1
+        );
+        assert_eq!(
+            Coordination::append_for_owner(&mut store, "shared", "log", "p", "{}", "w", 3600)
+                .expect("a1"),
+            2
+        );
+        assert_eq!(
+            Coordination::list_entries_for_owner(&store, Some("shared"), Some("log"), None)
+                .expect("entries")
+                .len(),
+            2
+        );
+
+        // Counter: consume under the cap succeeds; over the cap reports Over.
+        match Coordination::consume_for_owner(&mut store, "shared", "c", "k", 2, 3, "2030-01-01")
+            .expect("consume")
+        {
+            ConsumeOutcome::Ok { remaining } => assert_eq!(remaining, 1),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        match Coordination::consume_for_owner(&mut store, "shared", "c", "k", 2, 3, "2030-01-01")
+            .expect("consume over")
+        {
+            ConsumeOutcome::Over { remaining } => assert_eq!(remaining, 1),
+            other => panic!("expected Over, got {other:?}"),
+        }
+        // A rolled period lazily resets the count.
+        match Coordination::consume_for_owner(&mut store, "shared", "c", "k", 1, 3, "2030-01-02")
+            .expect("consume next period")
+        {
+            ConsumeOutcome::Ok { remaining } => assert_eq!(remaining, 2),
+            other => panic!("expected Ok after reset, got {other:?}"),
+        }
     }
 
     /// The ported core methods run their real SQL against a real engine.
