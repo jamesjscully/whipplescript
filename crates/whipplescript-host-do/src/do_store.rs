@@ -2757,7 +2757,35 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn retry_effect(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
-        todo!("Phase 5b: port `retry_effect` SQL to DoSql + verify against a live DO")
+        let payload = serde_json::json!({
+            "effect_id": retry.effect_id,
+            "retry_after": retry.retry_after,
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: retry.instance_id,
+                event_type: "effect.retried",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(retry.effect_id),
+                correlation_id: None,
+                idempotency_key: retry.idempotency_key,
+            },
+        )?;
+        let changed = self
+            .sql
+            .execute(
+                "UPDATE effects SET status = 'queued', updated_at = CURRENT_TIMESTAMP \
+                 WHERE instance_id = ?1 AND effect_id = ?2 AND status IN ('failed', 'timed_out')",
+                &[text(retry.instance_id), text(retry.effect_id)],
+            )
+            .map_err(sql_err)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict("effect is not retryable".to_owned()));
+        }
+        Ok(event)
     }
 
     fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
@@ -4402,5 +4430,51 @@ mod tests {
             )
             .expect("read run");
         assert_eq!(as_text(&run_status[0][0]), "lease_expired");
+    }
+
+    /// retry_effect requeues a failed/timed-out effect (guarded) and records an event.
+    #[test]
+    fn do_store_retry_effect_runs_real_sql() {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    text("eff_1"),
+                    text("i1"),
+                    text("coerce"),
+                    text("failed"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed effect");
+        let ev = store
+            .retry_effect(RetryEffect {
+                instance_id: "i1",
+                effect_id: "eff_1",
+                retry_after: Some("2026-01-01T00:00:00Z"),
+                idempotency_key: None,
+            })
+            .expect("retry");
+        assert!(ev.event_id.starts_with("evt_"));
+        let status = store
+            .sql
+            .query(
+                "SELECT status FROM effects WHERE effect_id = ?1",
+                &[text("eff_1")],
+            )
+            .expect("read");
+        assert_eq!(as_text(&status[0][0]), "queued");
+        // A now-queued (not failed/timed_out) effect is not retryable.
+        assert!(store
+            .retry_effect(RetryEffect {
+                instance_id: "i1",
+                effect_id: "eff_1",
+                retry_after: None,
+                idempotency_key: None,
+            })
+            .is_err());
     }
 }
