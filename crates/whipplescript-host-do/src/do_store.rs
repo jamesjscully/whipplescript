@@ -2656,11 +2656,104 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn renew_lease(&mut self, renewal: LeaseRenewal<'_>) -> StoreResult<StoredEvent> {
-        todo!("Phase 5b: port `renew_lease` SQL to DoSql + verify against a live DO")
+        let payload = serde_json::json!({
+            "lease_id": renewal.lease_id,
+            "run_id": renewal.run_id,
+            "new_expires_at": renewal.new_expires_at,
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: renewal.instance_id,
+                event_type: "lease.renewed",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(renewal.run_id),
+                correlation_id: None,
+                idempotency_key: renewal.idempotency_key,
+            },
+        )?;
+        let changed = self
+            .sql
+            .execute(
+                "UPDATE leases SET expires_at = ?1 WHERE instance_id = ?2 AND lease_id = ?3 \
+                 AND run_id = ?4 AND status = 'active'",
+                &[
+                    text(renewal.new_expires_at),
+                    text(renewal.instance_id),
+                    text(renewal.lease_id),
+                    text(renewal.run_id),
+                ],
+            )
+            .map_err(sql_err)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict("lease cannot be renewed".to_owned()));
+        }
+        Ok(event)
     }
 
     fn expire_leases(&mut self, instance_id: &str, now: &str) -> StoreResult<Vec<ExpiredLease>> {
-        todo!("Phase 5b: port `expire_leases` SQL to DoSql + verify against a live DO")
+        let rows = self
+            .sql
+            .query(
+                "SELECT lease_id, run_id, effect_id FROM leases \
+                 WHERE instance_id = ?1 AND status = 'active' AND expires_at <= ?2 \
+                 ORDER BY expires_at, lease_id",
+                &[text(instance_id), text(now)],
+            )
+            .map_err(sql_err)?;
+        let expired: Vec<ExpiredLease> = rows
+            .iter()
+            .map(|r| ExpiredLease {
+                lease_id: as_text(&r[0]),
+                run_id: as_text(&r[1]),
+                effect_id: as_text(&r[2]),
+            })
+            .collect();
+        for lease in &expired {
+            let payload = serde_json::json!({
+                "lease_id": lease.lease_id,
+                "run_id": lease.run_id,
+                "effect_id": lease.effect_id,
+                "expired_at": now,
+            })
+            .to_string();
+            do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id,
+                    event_type: "lease.expired",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(&lease.run_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&format!("lease-expired:{}", lease.lease_id)),
+                },
+            )?;
+            self.sql
+                .execute(
+                    "UPDATE leases SET status = 'expired', released_at = CURRENT_TIMESTAMP \
+                     WHERE lease_id = ?1",
+                    &[text(&lease.lease_id)],
+                )
+                .map_err(sql_err)?;
+            self.sql
+                .execute(
+                    "UPDATE runs SET status = 'lease_expired', completed_at = CURRENT_TIMESTAMP \
+                     WHERE run_id = ?1 AND status = 'running'",
+                    &[text(&lease.run_id)],
+                )
+                .map_err(sql_err)?;
+            self.sql
+                .execute(
+                    "UPDATE effects SET status = 'queued', updated_at = CURRENT_TIMESTAMP \
+                     WHERE instance_id = ?1 AND effect_id = ?2 AND status = 'running'",
+                    &[text(instance_id), text(&lease.effect_id)],
+                )
+                .map_err(sql_err)?;
+        }
+        Ok(expired)
     }
 
     fn retry_effect(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
@@ -2832,6 +2925,11 @@ mod tests {
             CREATE TABLE effect_dependencies (
                 instance_id TEXT NOT NULL, downstream_effect_id TEXT NOT NULL,
                 upstream_effect_id TEXT NOT NULL, predicate TEXT NOT NULL
+            );
+            CREATE TABLE leases (
+                lease_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, run_id TEXT NOT NULL,
+                effect_id TEXT NOT NULL, status TEXT NOT NULL, expires_at TEXT NOT NULL,
+                released_at TEXT
             );
             CREATE TABLE runs (
                 run_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, effect_id TEXT NOT NULL,
@@ -4212,5 +4310,97 @@ mod tests {
         assert!(store
             .register_package_manifest(r#"{"name": "x", "version": "1"}"#)
             .is_err());
+    }
+
+    /// renew_lease extends an active lease (guarded); expire_leases sweeps expired
+    /// leases, recording an event and requeuing the run + effect. Real SQL.
+    #[test]
+    fn do_store_leases_run_real_sql() {
+        let mut store = store();
+        let seed = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
+        seed(
+            "INSERT INTO leases (lease_id, instance_id, run_id, effect_id, status, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                text("lse_1"),
+                text("i1"),
+                text("run_1"),
+                text("eff_1"),
+                text("active"),
+                text("2026-01-01T00:00:00Z"),
+            ],
+        );
+        seed(
+            "INSERT INTO runs (run_id, instance_id, effect_id, provider, worker_id, status, \
+             started_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)",
+            &[
+                text("run_1"),
+                text("i1"),
+                text("eff_1"),
+                text("p"),
+                text("w"),
+                text("running"),
+            ],
+        );
+        seed(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                text("eff_1"),
+                text("i1"),
+                text("coerce"),
+                text("running"),
+                text("{}"),
+            ],
+        );
+
+        // renew_lease pushes expires_at forward for the active lease.
+        store
+            .renew_lease(LeaseRenewal {
+                instance_id: "i1",
+                lease_id: "lse_1",
+                run_id: "run_1",
+                new_expires_at: "2026-01-01T01:00:00Z",
+                idempotency_key: None,
+            })
+            .expect("renew");
+        // Renewing an unknown lease errors.
+        assert!(store
+            .renew_lease(LeaseRenewal {
+                instance_id: "i1",
+                lease_id: "nope",
+                run_id: "run_1",
+                new_expires_at: "2026-01-01T02:00:00Z",
+                idempotency_key: None,
+            })
+            .is_err());
+
+        // Not yet expired at 00:30.
+        assert!(store
+            .expire_leases("i1", "2026-01-01T00:30:00Z")
+            .expect("not expired")
+            .is_empty());
+        // Expired at 02:00: lease/run/effect all transition.
+        let expired = store
+            .expire_leases("i1", "2026-01-01T02:00:00Z")
+            .expect("expire");
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].effect_id, "eff_1");
+        let effect_status = store
+            .sql
+            .query(
+                "SELECT status FROM effects WHERE effect_id = ?1",
+                &[text("eff_1")],
+            )
+            .expect("read effect");
+        assert_eq!(as_text(&effect_status[0][0]), "queued");
+        let run_status = store
+            .sql
+            .query(
+                "SELECT status FROM runs WHERE run_id = ?1",
+                &[text("run_1")],
+            )
+            .expect("read run");
+        assert_eq!(as_text(&run_status[0][0]), "lease_expired");
     }
 }
