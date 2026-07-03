@@ -184,11 +184,32 @@ in flight and expensive to retrofit:
       and `run_to_completion_drives_zero_one_and_many_rounds` (sansio). No
       user-facing surface, so no `docs/` change.
 
-### Phase 2 — Generalize the seam to agent turns
-- [ ] Express the owned/model agent loop (`HarnessModelClient::next`) as a
-      multi-step machine (each model call a `NeedsIo`; tool calls as nested
-      effects). Define the HTTP-stepped agent driver (native + the one the DO
-      uses). Stdio sidecars (codex/claude/pi) remain native-only opaque drivers.
+### Phase 2 — Generalize the seam to agent turns — DONE 2026-07-03
+- [x] The single agent model call is a sans-IO step: new `HttpModelClient` trait
+      (`harness_loop.rs`) splits an HTTP model client into `build_request`
+      (prepare) + `parse_response` (finish); `RealHarnessModelClient`
+      (`harness_model.rs`) implements it, and its `HarnessModelClient::next` now
+      runs a `ModelCallMachine` via `run_to_completion` over its transport —
+      behavior identical (covered by the existing `harness_model` tests:
+      `non_success_status_is_a_provider_error`, `timeout_maps_to_timeout`,
+      `final_reply_has_no_tool_calls`).
+- [x] The whole tool-use turn is a multi-step machine: `BrokeredTurnMachine`
+      (`harness_loop.rs`) replicates `run_brokered_loop`'s control flow but
+      surfaces each model call as `NeedsIo(Http)` (so a DO isolate can suspend
+      across every provider `fetch`); tool calls stay nested effects brokered
+      synchronously by the `ToolExecutor`. Native driver `run_brokered_turn_http`
+      = `run_to_completion` over the native transport; the DO host (Phase 5)
+      drives the same machine across wakes. **Proven byte-identical to
+      `run_brokered_loop`** across 5 scenarios (immediate-final, tool-then-final,
+      model-error, timeout, step-bound): `brokered_turn_machine_matches_loop_*`
+      compare terminal, summary, steps, observation stream, merged usage, tool
+      calls, and the checkpoint sequence. Native production stays on
+      `run_brokered_loop` (zero behavior change) until Phase 5 flips the DO on.
+- [x] Stdio sidecars (codex/claude/pi) confirmed native-only opaque drivers —
+      they do not implement `HarnessModelClient` and never touch the step
+      machine (DR-0033 Decision 7). Gates: kernel 204 + e2e 17; full kernel+CLI
+      suite exit 0; fmt + `clippy -D warnings` clean. No user-facing surface, so
+      no `docs/` change.
 
 ### Phase 3 — Store behind a trait
 - [ ] Extract `SqliteStore`/`WorkItemStore`/`CoordinationStore` APIs into traits;

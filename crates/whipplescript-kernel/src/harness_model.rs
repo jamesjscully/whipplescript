@@ -14,10 +14,14 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::coerce_native::{CoerceProvider, CoerceTransport, CoerceTransportError, HttpRequest};
-use crate::harness_loop::{
-    ChatMessage, HarnessModelClient, HarnessModelError, ModelReply, ToolCall, ToolSpec,
+use crate::coerce_native::{
+    CoerceProvider, CoerceTransport, CoerceTransportError, HttpRequest, HttpResponse,
 };
+use crate::harness_loop::{
+    ChatMessage, HarnessModelClient, HarnessModelError, HttpModelClient, ModelCallMachine,
+    ModelReply, ToolCall, ToolSpec,
+};
+use crate::sansio::run_to_completion;
 
 /// Cap on a provider control-plane error string crossing into a turn failure
 /// (matches the coerce path; DR-0024 lets operational errors cross redaction).
@@ -54,13 +58,9 @@ impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
     }
 }
 
-impl<T: CoerceTransport + ?Sized> HarnessModelClient for RealHarnessModelClient<'_, T> {
-    fn next(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[ToolSpec],
-    ) -> Result<ModelReply, HarnessModelError> {
-        let request = build_request(
+impl<T: CoerceTransport + ?Sized> HttpModelClient for RealHarnessModelClient<'_, T> {
+    fn build_request(&self, messages: &[ChatMessage], tools: &[ToolSpec]) -> HttpRequest {
+        build_request(
             self.provider,
             &self.base_url,
             &self.api_key,
@@ -68,14 +68,35 @@ impl<T: CoerceTransport + ?Sized> HarnessModelClient for RealHarnessModelClient<
             self.max_tokens,
             messages,
             tools,
-        );
-        match self.transport.post(&request) {
+        )
+    }
+
+    fn parse_response(
+        &self,
+        response: Result<HttpResponse, CoerceTransportError>,
+    ) -> Result<ModelReply, HarnessModelError> {
+        match response {
             Ok(response) => parse_response(self.provider, response.status, &response.body),
             Err(CoerceTransportError::Timeout) => Err(HarnessModelError::Timeout),
             Err(CoerceTransportError::Transport(message)) => {
                 Err(HarnessModelError::Transport(message))
             }
         }
+    }
+}
+
+impl<T: CoerceTransport + ?Sized> HarnessModelClient for RealHarnessModelClient<'_, T> {
+    fn next(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> Result<ModelReply, HarnessModelError> {
+        // One model call as a sans-IO step machine: prepare (`build_request`) →
+        // `NeedsIo(Http)` → finish (`parse_response`), driven to completion
+        // synchronously via the transport. Identical to a direct
+        // build_request → post → parse_response.
+        let mut machine = ModelCallMachine::new(self, messages, tools);
+        run_to_completion(&mut machine, self.transport)
     }
 }
 
@@ -384,7 +405,6 @@ fn provider_error_excerpt(body: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coerce_native::HttpResponse;
     use crate::harness_loop::ToolResultMsg;
     use std::cell::RefCell;
 

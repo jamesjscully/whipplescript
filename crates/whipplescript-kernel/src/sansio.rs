@@ -94,7 +94,10 @@ pub trait HostDriver {
 /// path. This is the concrete instance of the model's eviction-free refinement:
 /// every `NeedsIo` is fulfilled immediately and re-entered, with no suspension,
 /// so at-least-once delivery collapses to exactly-once (`NativeExactlyOnce`).
-pub fn run_to_completion<M: StepMachine>(machine: &mut M, host: &impl HostDriver) -> M::Output {
+pub fn run_to_completion<M: StepMachine, H: HostDriver + ?Sized>(
+    machine: &mut M,
+    host: &H,
+) -> M::Output {
     let mut incoming: Option<IoResult> = None;
     loop {
         match machine.step(incoming.take()) {

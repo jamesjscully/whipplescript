@@ -19,6 +19,11 @@
 
 use serde_json::{json, Value};
 
+use crate::sansio::{
+    run_to_completion, HostDriver, HttpRequest, HttpResponse, IoRequest, IoResult, Outcome,
+    StepMachine, TransportError,
+};
+
 /// A model-facing tool: its name, a one-line description, and the JSON Schema for
 /// its arguments. Built from the file-tool set in slice 1.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,6 +124,58 @@ pub trait HarnessModelClient {
         messages: &[ChatMessage],
         tools: &[ToolSpec],
     ) -> Result<ModelReply, HarnessModelError>;
+}
+
+/// The HTTP half of an agent model client, split so a single model call is a
+/// sans-IO step (DR-0033 Decisions 1–2): `build_request` is the prepare step and
+/// `parse_response` the finish step, with the blocking POST performed by the host
+/// in between. A `next` for an HTTP client is exactly `build_request` →
+/// `NeedsIo(Http)` → `parse_response` driven by [`ModelCallMachine`]; the whole
+/// tool-use turn lifts the same stepping to every model call
+/// ([`BrokeredTurnMachine`]) so the durable-object host can suspend across each
+/// provider `fetch`.
+///
+/// Non-HTTP model clients (fixtures, scripted tests, and the native-only stdio
+/// sidecars — codex/claude/pi, DR-0033 Decision 7) implement [`HarnessModelClient`]
+/// directly and are never put on the step machine.
+pub trait HttpModelClient {
+    fn build_request(&self, messages: &[ChatMessage], tools: &[ToolSpec]) -> HttpRequest;
+
+    fn parse_response(
+        &self,
+        response: Result<HttpResponse, TransportError>,
+    ) -> Result<ModelReply, HarnessModelError>;
+}
+
+/// One model call as a sans-IO [`StepMachine`]: prepare the provider request,
+/// yield it as `NeedsIo(Http)`, then settle on the parsed reply. Any
+/// [`HttpModelClient`] can be driven natively to completion via
+/// [`run_to_completion`], which is how [`HttpModelClient`] satisfies
+/// [`HarnessModelClient::next`] with identical behavior to a direct
+/// build → post → parse.
+pub struct ModelCallMachine<'a, M: HttpModelClient + ?Sized> {
+    client: &'a M,
+    request: HttpRequest,
+}
+
+impl<'a, M: HttpModelClient + ?Sized> ModelCallMachine<'a, M> {
+    pub fn new(client: &'a M, messages: &[ChatMessage], tools: &[ToolSpec]) -> Self {
+        Self {
+            client,
+            request: client.build_request(messages, tools),
+        }
+    }
+}
+
+impl<M: HttpModelClient + ?Sized> StepMachine for ModelCallMachine<'_, M> {
+    type Output = Result<ModelReply, HarnessModelError>;
+
+    fn step(&mut self, incoming: Option<IoResult>) -> Outcome<Self::Output> {
+        match incoming {
+            None => Outcome::NeedsIo(IoRequest::Http(self.request.clone())),
+            Some(IoResult::Http(response)) => Outcome::Settle(self.client.parse_response(response)),
+        }
+    }
 }
 
 /// An in-turn stream event. Evidence-grade only (I2): the kernel runner records
@@ -281,6 +338,193 @@ where
         observations,
         usage,
     }
+}
+
+/// The brokered tool-use loop as a sans-IO [`StepMachine`] (DR-0033 Decisions
+/// 1–2): the exact control flow of [`run_brokered_loop`], but each model call is
+/// surfaced as a `NeedsIo(Http)` the host performs, so a durable-object isolate
+/// can suspend across every provider `fetch`. Tool calls remain nested effects
+/// brokered synchronously by the [`ToolExecutor`] (a tool that itself needs I/O
+/// becomes its own nested step machine in a later phase). Driven natively by
+/// [`run_brokered_turn_http`]; proven equivalent to [`run_brokered_loop`] in tests.
+pub struct BrokeredTurnMachine<'a, M, E>
+where
+    M: HttpModelClient + ?Sized,
+    E: ToolExecutor + ?Sized,
+{
+    model: &'a M,
+    executor: &'a E,
+    input: &'a BrokeredTurnInput,
+    checkpoint: &'a mut dyn FnMut(&[ChatMessage]),
+    messages: Vec<ChatMessage>,
+    observations: Vec<LoopObservation>,
+    usage: Value,
+    step: usize,
+    started: bool,
+}
+
+impl<'a, M, E> BrokeredTurnMachine<'a, M, E>
+where
+    M: HttpModelClient + ?Sized,
+    E: ToolExecutor + ?Sized,
+{
+    pub fn new(
+        model: &'a M,
+        executor: &'a E,
+        input: &'a BrokeredTurnInput,
+        checkpoint: &'a mut dyn FnMut(&[ChatMessage]),
+    ) -> Self {
+        Self {
+            model,
+            executor,
+            input,
+            checkpoint,
+            messages: Vec::new(),
+            observations: Vec::new(),
+            usage: Value::Null,
+            step: 0,
+            started: false,
+        }
+    }
+
+    /// Prepare the model call for the current step, or settle if the step bound
+    /// is reached. Mirrors the top of each `run_brokered_loop` iteration (compact
+    /// → observe → build request), and the after-loop `TimedOut` when the bound
+    /// is hit.
+    fn prepare_model_call(&mut self) -> Outcome<BrokeredTurnOutcome> {
+        if self.step >= self.input.max_steps {
+            return Outcome::Settle(BrokeredTurnOutcome {
+                status: TurnStatus::TimedOut,
+                summary: format!(
+                    "brokered turn exceeded {} model steps",
+                    self.input.max_steps
+                ),
+                steps: self.input.max_steps,
+                observations: std::mem::take(&mut self.observations),
+                usage: std::mem::take(&mut self.usage),
+            });
+        }
+        self.messages = compact_context(
+            std::mem::take(&mut self.messages),
+            COMPACT_MAX_MESSAGES,
+            COMPACT_KEEP_RECENT,
+        );
+        self.observations
+            .push(LoopObservation::ModelRequest { step: self.step });
+        Outcome::NeedsIo(IoRequest::Http(
+            self.model.build_request(&self.messages, &self.input.tools),
+        ))
+    }
+}
+
+impl<M, E> StepMachine for BrokeredTurnMachine<'_, M, E>
+where
+    M: HttpModelClient + ?Sized,
+    E: ToolExecutor + ?Sized,
+{
+    type Output = BrokeredTurnOutcome;
+
+    fn step(&mut self, incoming: Option<IoResult>) -> Outcome<BrokeredTurnOutcome> {
+        // First entry: seed the conversation (or resume) and persist it, then
+        // prepare the step-0 model call.
+        if !self.started {
+            self.started = true;
+            self.messages = if self.input.resume_from.is_empty() {
+                vec![
+                    ChatMessage::System(self.input.system.clone()),
+                    ChatMessage::User(self.input.user.clone()),
+                ]
+            } else {
+                sanitize_resume_messages(self.input.resume_from.clone())
+            };
+            (self.checkpoint)(&self.messages);
+            return self.prepare_model_call();
+        }
+
+        let response = match incoming {
+            Some(IoResult::Http(response)) => response,
+            None => unreachable!("BrokeredTurnMachine re-entered without a model response"),
+        };
+
+        let reply = match self.model.parse_response(response) {
+            Ok(reply) => reply,
+            Err(error) => {
+                return Outcome::Settle(BrokeredTurnOutcome {
+                    status: match error {
+                        HarnessModelError::Timeout => TurnStatus::TimedOut,
+                        _ => TurnStatus::Failed,
+                    },
+                    summary: model_error_summary(&error),
+                    steps: self.step + 1,
+                    observations: std::mem::take(&mut self.observations),
+                    usage: std::mem::take(&mut self.usage),
+                });
+            }
+        };
+        self.usage = merge_usage(std::mem::take(&mut self.usage), reply.usage.clone());
+
+        if reply.is_final() {
+            return Outcome::Settle(BrokeredTurnOutcome {
+                status: TurnStatus::Completed,
+                summary: reply.text,
+                steps: self.step + 1,
+                observations: std::mem::take(&mut self.observations),
+                usage: std::mem::take(&mut self.usage),
+            });
+        }
+
+        // The model requested tools: record the assistant turn, broker each tool
+        // through the executor (nested effects), feed results back, then advance
+        // to the next model call.
+        self.messages.push(ChatMessage::Assistant {
+            text: reply.text.clone(),
+            tool_calls: reply.tool_calls.clone(),
+        });
+        let mut results = Vec::with_capacity(reply.tool_calls.len());
+        for call in &reply.tool_calls {
+            self.observations.push(LoopObservation::ToolRequested {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+            });
+            let outcome = self.executor.execute(call);
+            self.observations.push(LoopObservation::ToolResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                status: outcome.status,
+            });
+            results.push(ToolResultMsg {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                content: outcome.content,
+                is_error: matches!(outcome.status, ToolStatus::Error),
+            });
+        }
+        self.messages.push(ChatMessage::ToolResults(results));
+        (self.checkpoint)(&self.messages);
+        self.step += 1;
+        self.prepare_model_call()
+    }
+}
+
+/// Native driver for a brokered turn over an HTTP model client: run the
+/// [`BrokeredTurnMachine`] to completion in one synchronous pass, fulfilling each
+/// model call's `NeedsIo(Http)` via `host` (the `ureq` transport). Produces the
+/// same [`BrokeredTurnOutcome`] as [`run_brokered_loop`] over an equivalent
+/// client; the durable-object host (Phase 5) drives the same machine across
+/// isolate wakes instead of in one pass.
+pub fn run_brokered_turn_http<M, E>(
+    model: &M,
+    executor: &E,
+    input: &BrokeredTurnInput,
+    checkpoint: &mut dyn FnMut(&[ChatMessage]),
+    host: &impl HostDriver,
+) -> BrokeredTurnOutcome
+where
+    M: HttpModelClient + ?Sized,
+    E: ToolExecutor + ?Sized,
+{
+    let mut machine = BrokeredTurnMachine::new(model, executor, input, checkpoint);
+    run_to_completion(&mut machine, host)
 }
 
 /// Compact when the projected context exceeds this many messages.
@@ -596,6 +840,136 @@ mod tests {
     /// A no-op checkpoint for tests that do not exercise persistence.
     fn no_checkpoint() -> impl FnMut(&[ChatMessage]) {
         |_messages: &[ChatMessage]| {}
+    }
+
+    /// The `HttpModelClient` twin of `ScriptedClient`: it replays the same
+    /// scripted replies, but through the build/parse seam so it drives the
+    /// `BrokeredTurnMachine`.
+    struct ScriptedHttpClient {
+        replies: RefCell<std::collections::VecDeque<Result<ModelReply, HarnessModelError>>>,
+    }
+
+    impl ScriptedHttpClient {
+        fn new(replies: Vec<Result<ModelReply, HarnessModelError>>) -> Self {
+            Self {
+                replies: RefCell::new(replies.into_iter().collect()),
+            }
+        }
+    }
+
+    impl HttpModelClient for ScriptedHttpClient {
+        fn build_request(&self, _messages: &[ChatMessage], _tools: &[ToolSpec]) -> HttpRequest {
+            HttpRequest {
+                url: "https://fake/model".to_string(),
+                headers: Vec::new(),
+                body: json!({}),
+            }
+        }
+
+        fn parse_response(
+            &self,
+            _response: Result<HttpResponse, TransportError>,
+        ) -> Result<ModelReply, HarnessModelError> {
+            self.replies
+                .borrow_mut()
+                .pop_front()
+                .expect("scripted http client ran out of replies")
+        }
+    }
+
+    /// A host that answers any model request with an ignored 200 — the scripted
+    /// client's `parse_response` supplies the reply. Stands in for the ureq/fetch
+    /// transport.
+    struct DummyHost;
+
+    impl HostDriver for DummyHost {
+        fn fulfill(&self, _request: &IoRequest) -> IoResult {
+            IoResult::Http(Ok(HttpResponse {
+                status: 200,
+                body: json!({}),
+            }))
+        }
+    }
+
+    /// Drive the same scenario through both the imperative `run_brokered_loop`
+    /// and the stepped `run_brokered_turn_http`, and assert every observable is
+    /// identical: terminal, summary, step count, the in-turn observation stream,
+    /// merged usage, the brokered tool calls, and the checkpoint sequence.
+    fn assert_loops_equivalent(
+        build_replies: impl Fn() -> Vec<Result<ModelReply, HarnessModelError>>,
+        max_steps: usize,
+    ) {
+        let tool_outcome = ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "R".to_string(),
+        };
+
+        let client = ScriptedClient::new(build_replies());
+        let exec1 = RecordingExecutor::new(tool_outcome.clone());
+        let mut cp1: Vec<Value> = Vec::new();
+        let out1 = {
+            let mut record = |messages: &[ChatMessage]| cp1.push(chat_messages_to_json(messages));
+            run_brokered_loop(&client, &exec1, &input(max_steps), &mut record)
+        };
+
+        let http = ScriptedHttpClient::new(build_replies());
+        let exec2 = RecordingExecutor::new(tool_outcome);
+        let mut cp2: Vec<Value> = Vec::new();
+        let out2 = {
+            let mut record = |messages: &[ChatMessage]| cp2.push(chat_messages_to_json(messages));
+            run_brokered_turn_http(&http, &exec2, &input(max_steps), &mut record, &DummyHost)
+        };
+
+        assert_eq!(out1.status, out2.status, "status");
+        assert_eq!(out1.summary, out2.summary, "summary");
+        assert_eq!(out1.steps, out2.steps, "steps");
+        assert_eq!(out1.observations, out2.observations, "observations");
+        assert_eq!(out1.usage, out2.usage, "usage");
+        assert_eq!(*exec1.calls.borrow(), *exec2.calls.borrow(), "tool calls");
+        assert_eq!(cp1, cp2, "checkpoint sequence");
+    }
+
+    #[test]
+    fn brokered_turn_machine_matches_loop_completing_immediately() {
+        assert_loops_equivalent(|| vec![Ok(final_reply("done"))], 8);
+    }
+
+    #[test]
+    fn brokered_turn_machine_matches_loop_tool_then_final() {
+        assert_loops_equivalent(
+            || vec![Ok(tool_reply("c1", "read")), Ok(final_reply("done"))],
+            8,
+        );
+    }
+
+    #[test]
+    fn brokered_turn_machine_matches_loop_on_model_error() {
+        assert_loops_equivalent(
+            || vec![Err(HarnessModelError::Transport("boom".to_string()))],
+            8,
+        );
+    }
+
+    #[test]
+    fn brokered_turn_machine_matches_loop_on_timeout_error() {
+        assert_loops_equivalent(
+            || {
+                vec![
+                    Ok(tool_reply("c1", "read")),
+                    Err(HarnessModelError::Timeout),
+                ]
+            },
+            8,
+        );
+    }
+
+    #[test]
+    fn brokered_turn_machine_matches_loop_hitting_step_bound() {
+        // Never final within the bound → TimedOut after max_steps model calls.
+        assert_loops_equivalent(
+            || vec![Ok(tool_reply("c1", "read")), Ok(tool_reply("c2", "read"))],
+            2,
+        );
     }
 
     #[test]
