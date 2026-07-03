@@ -507,12 +507,17 @@ linear undo chain). No phase work now.
             `InstanceStepMachine` + `InstanceDriver` seam (built + validated in
             chunk 4) is exactly what the DO plugs into. Four concrete pieces, three
             code (writable/wasm-buildable/mock-testable) + one live:
-            (5a) **`Coordination` + `WorkItems` on `DoSqliteStore`** — it currently
-            impls `RuntimeStore` ONLY; `step_instance_generic` needs all three. This
-            is a schema + ~400-line SQL port (the `work_items` schema isn't even in
-            migration 0001 — native work-items is a separate store), verifiable
+            (5a) **`Coordination` + `WorkItems` on `DoSqliteStore`** — it impl'd
+            `RuntimeStore` ONLY; `step_instance_generic` needs all three, verifiable
             against the rusqlite-backed `RusqliteDoSql` mock like the 87-method
-            RuntimeStore port already is;
+            RuntimeStore port. **`WorkItems` DONE (commit 5eb515c):** all 8 methods +
+            the `items`/`item_counter` schema ported to DoSql, single-writer
+            atomicity (no txn), tested (host-do 28). **REMAINING: `Coordination`**
+            (leases/ledgers/counters) — the bigger half (~498-line native impl: slot
+            leases + TTL, ledger partitions, counter periods, shared-owner
+            partitioning) + its `leases`/`ledger_entries`/`counters` schema; then
+            `step_instance_generic` (hence the whole rule pass) runs over
+            `DoSqliteStore`;
             (5b) **DO-reachable effect handler cores** — the store-only cores live
             in `main.rs`; the DO's `InstanceDriver::run_effect` needs them in a lib
             (relocate to kernel, or a host-do effect module) + the two HTTP effects
