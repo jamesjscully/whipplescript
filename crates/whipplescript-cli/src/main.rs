@@ -31,6 +31,7 @@ use whipplescript_kernel::{
     effect_config::EffectConfig,
     harness::{CommandAgentHarness, CommandLaunchPlan},
     idempotency_key,
+    instance_machine::{EffectStep, InstanceDriver},
     loft::{FakeLoftClient, LoftAction, LoftEffectRequest},
     lowering::{BranchReport, BranchStatus},
     pi_rpc::{PiRpcAdapter, PiRpcClient, StdioPiRpcTransport},
@@ -49,6 +50,7 @@ use whipplescript_kernel::{
     // groundwork); the native `step_instance` wrapper below still builds the
     // `NativeStores` handle and drives it.
     rule_pass::*,
+    sansio::TransportError,
     trace::{
         check_trace, DependencyEdge, DependencyPredicate, EffectStatus, TraceEvent, TraceRecord,
     },
@@ -20159,6 +20161,97 @@ fn step_instance(
         source_path,
         active_version_guard,
     )
+}
+
+/// The native binding of the instance step machine (DR-0033 chunk 4): it wires the
+/// kernel's `InstanceDriver` seam to the concrete native pieces — the rule pass
+/// (`step_instance_generic`), ready-effect discovery (`claimable_effects`), and the
+/// store-only effect handler cores over one held `RuntimeKernel<NativeStores>`.
+/// Because the native effect handlers run their HTTP to completion internally,
+/// `run_effect` here always settles (`Done`) and never suspends — only the DO
+/// binding returns `NeedsHttp`. Effect kinds that are not yet lifted to a generic
+/// core (the HTTP/subprocess/recursion tail: coerce, agent, workflow-invoke, exec)
+/// surface a clear error rather than a silent skip.
+///
+/// This is the concrete counterpart to the DO's future `InstanceDriver`; it is not
+/// yet wired into the `dev`/`worker`/`step` commands (that swap of the native
+/// executor for the machine is the remaining native integration step and changes
+/// no behavior for store-only workflows), so it currently has no production call
+/// site — hence the allow.
+#[allow(dead_code)]
+struct NativeInstanceDriver<'a> {
+    kernel: RuntimeKernel<NativeStores>,
+    ir: &'a IrProgram,
+    instance_id: &'a str,
+    source_path: Option<&'a Path>,
+    version_guard: Option<&'a str>,
+    config: EffectConfig,
+    package_lock: Option<&'a LoadedPackageLock>,
+}
+
+impl InstanceDriver for NativeInstanceDriver<'_> {
+    fn advance_rules(&mut self) -> Result<bool, StoreError> {
+        step_instance_generic(
+            &mut self.kernel,
+            self.instance_id,
+            self.ir,
+            self.source_path,
+            self.version_guard,
+        )?;
+        let terminal = self
+            .kernel
+            .store()
+            .status(self.instance_id)?
+            .map(|status| status.instance.status != "running")
+            .unwrap_or(true);
+        Ok(terminal)
+    }
+
+    fn next_ready_effect(&mut self) -> Result<Option<ClaimableEffect>, StoreError> {
+        Ok(self
+            .kernel
+            .claimable_effects(self.instance_id)?
+            .into_iter()
+            .next())
+    }
+
+    fn run_effect(
+        &mut self,
+        effect: &ClaimableEffect,
+        _incoming: Option<Result<whipplescript_kernel::sansio::HttpResponse, TransportError>>,
+    ) -> Result<EffectStep, StoreError> {
+        let id = self.instance_id;
+        let config = self.config.clone();
+        let package_lock = self.package_lock;
+        let kernel = &mut self.kernel;
+        let event = match effect.kind.as_str() {
+            "event.emit" => run_event_effect_generic(kernel, id, effect, &config)?,
+            "loft.claim" => run_loft_effect_generic(kernel, id, effect, &config)?,
+            "human.ask" => run_human_effect_generic(kernel, id, effect, &config)?,
+            "capability.call" => {
+                run_capability_effect_generic(kernel, id, effect, &config, package_lock)?
+            }
+            "queue.file" | "queue.claim" | "queue.release" | "queue.finish" => {
+                run_queue_effect_generic(kernel, id, effect, &config)?
+            }
+            "lease.acquire" | "lease.release" | "ledger.append" | "counter.consume" => {
+                run_coordination_effect_generic(kernel, id, effect)?
+            }
+            "event.notify" => run_notify_effect_generic(kernel, id, effect)?,
+            "file.read" => run_file_effect_generic(kernel, &NativeFileStore, id, effect)?,
+            "file.write" => run_file_write_effect_generic(kernel, &NativeFileStore, id, effect)?,
+            "file.import" => run_file_import_effect_generic(kernel, &NativeFileStore, id, effect)?,
+            "file.export" => run_file_export_effect_generic(kernel, &NativeFileStore, id, effect)?,
+            other => {
+                return Err(StoreError::Conflict(format!(
+                    "effect kind `{other}` is not yet driven by the instance step machine \
+                     (the HTTP/subprocess/recursion handlers — coerce/agent/workflow-invoke/exec \
+                     — are pending)"
+                )))
+            }
+        };
+        Ok(EffectStep::Done(event))
+    }
 }
 
 fn worker(options: &CliOptions) -> ExitCode {
