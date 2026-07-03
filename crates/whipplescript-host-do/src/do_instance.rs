@@ -7,18 +7,20 @@
 //! implements all three store traits (chunk 5a), the whole rule pass
 //! (`step_instance_generic`) runs over the DO's one SQLite.
 //!
-//! What is wired here: the rule pass (`advance_rules`) and ready-effect discovery
-//! (`next_ready_effect`), both pure store work over the DO SQLite. Effect
-//! *execution* (`run_effect`) is where the DO's HTTP effects will suspend with
-//! `EffectStep::NeedsHttp` and be fulfilled through the isolate's `fetch` — that
-//! wiring (the DO-reachable handler cores + `FetchHost`) is chunk 5b, so for now
-//! `run_effect` surfaces a clear "not yet executable on the DO" error rather than
-//! a silent skip. Effect-free workflows (a rule that reaches a terminal) already
-//! drive end to end, proving the DO runs the scheduler over its store.
+//! What is wired: the rule pass (`advance_rules`), ready-effect discovery
+//! (`next_ready_effect`), and `run_effect` dispatch of the lifted store-only
+//! handler cores over the DO store — `event.emit`, `loft.claim`, `human.ask`, the
+//! `queue.*` family (via `WorkItems`), the lease/ledger/counter coordination family
+//! (via `Coordination`), and the `file.*` family (via the `FileStore` seam). The
+//! HTTP effects (coerce/agent) will suspend with `EffectStep::NeedsHttp` and be
+//! fulfilled through the isolate's `fetch`; that + the remaining coupled cores
+//! (notify/capability) are the rest of chunk 5b, so an unlifted kind still errors
+//! clearly rather than silently skipping.
 
 use whipplescript_kernel::effect_config::EffectConfig;
 use whipplescript_kernel::effect_handlers::{
-    run_coordination_effect_generic, run_event_effect_generic, run_human_effect_generic,
+    run_coordination_effect_generic, run_event_effect_generic, run_file_effect_generic,
+    run_file_import_effect_generic, run_file_write_effect_generic, run_human_effect_generic,
     run_loft_effect_generic, run_queue_effect_generic,
 };
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
@@ -26,6 +28,7 @@ use whipplescript_kernel::rule_pass::step_instance_generic;
 use whipplescript_kernel::sansio::{HttpResponse, TransportError};
 use whipplescript_kernel::RuntimeKernel;
 use whipplescript_parser::IrProgram;
+use whipplescript_store::files::FileStore;
 use whipplescript_store::{ClaimableEffect, RuntimeStore, StoreError};
 
 use crate::do_store::{DoSql, DoSqliteStore};
@@ -35,6 +38,9 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     /// One held kernel over the DO's SQLite (backs runtime + coordination +
     /// work-items surfaces).
     pub kernel: RuntimeKernel<DoSqliteStore<Sql>>,
+    /// The DO's file byte store (small files inline in DO SQLite, large spilled) —
+    /// the `FileStore` seam the file effects cross. `DoFileStore` / `TieredFileStore`.
+    pub files: &'a dyn FileStore,
     pub ir: &'a IrProgram,
     pub instance_id: &'a str,
 }
@@ -89,6 +95,21 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
             "lease.acquire" | "lease.release" | "ledger.append" | "counter.consume" => {
                 run_coordination_effect_generic(&mut self.kernel, self.instance_id, effect)?
             }
+            "file.read" => {
+                run_file_effect_generic(&mut self.kernel, self.files, self.instance_id, effect)?
+            }
+            "file.write" => run_file_write_effect_generic(
+                &mut self.kernel,
+                self.files,
+                self.instance_id,
+                effect,
+            )?,
+            "file.import" => run_file_import_effect_generic(
+                &mut self.kernel,
+                self.files,
+                self.instance_id,
+                effect,
+            )?,
             other => {
                 return Err(StoreError::Conflict(format!(
                     "effect kind `{other}` is not yet executable on the durable object \
@@ -117,6 +138,26 @@ mod tests {
             IoResult::Http(Err(TransportError::Transport(
                 "no DO I/O expected".to_owned(),
             )))
+        }
+    }
+
+    /// A `FileStore` stub for effect-free runs (no file effect touches it).
+    struct NoFiles;
+    impl FileStore for NoFiles {
+        fn read_to_string(&self, _path: &std::path::Path) -> std::io::Result<String> {
+            Err(std::io::Error::other("no files in this test"))
+        }
+        fn exists(&self, _path: &std::path::Path) -> bool {
+            false
+        }
+        fn create_dir_all(&self, _path: &std::path::Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn write(&self, _path: &std::path::Path, _bytes: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::other("no files in this test"))
+        }
+        fn append(&self, _path: &std::path::Path, _bytes: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::other("no files in this test"))
         }
     }
 
@@ -167,6 +208,7 @@ mod tests {
 
         let driver = DoInstanceDriver {
             kernel,
+            files: &NoFiles,
             ir: &ir,
             instance_id: &instance_id,
         };
