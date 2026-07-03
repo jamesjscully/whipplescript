@@ -31,6 +31,10 @@ use whipplescript_kernel::{
     harness::{CommandAgentHarness, CommandLaunchPlan},
     idempotency_key,
     loft::{FakeLoftClient, LoftAction, LoftEffectRequest},
+    lowering::{
+        BranchReport, BranchStatus, OwnedDependency, OwnedEffect, OwnedFact, OwnedLowering,
+        OwnedWorkflowTerminal,
+    },
     pi_rpc::{PiRpcAdapter, PiRpcClient, StdioPiRpcTransport},
     program_analysis_summary_json,
     provider::{
@@ -61,13 +65,13 @@ use whipplescript_store::{
     ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, ClaimableEffect, DerivedFact,
     DiagnosticRecord, DiagnosticView, EffectCancellation, EffectCancellationRequest,
     EffectCompletion, EffectView, EventView, EvidenceLink, EvidenceLinkView, EvidenceRecord,
-    EvidenceView, FactView, HumanAnswer, InboxItemView, InstanceView, NewEffect,
-    NewEffectDependency, NewEvent, NewFact, NewInboxItem, NewInstanceAuthority,
+    EvidenceView, FactView, HumanAnswer, InboxItemView, InstanceView, NewEvent, NewFact,
+    NewInboxItem, NewInstanceAuthority,
     NewWorkflowInvocation, ProviderValidationEvidence, RetryEffect, RevisionActivation,
     RevisionCancellationImpact, RevisionCandidate, RevisionCompatibilityDiagnostic,
     RevisionCompatibilityReport, RuleCommit, RuleCommitRevisionGuard, RunStart, RunView,
     SqliteStore, StatusView, StoreError, WorkflowInvocationView, WorkflowRevisionView,
-    WorkflowTerminal, WorkflowTerminalKind,
+    WorkflowTerminalKind,
 };
 // File-effect byte I/O routes through the FileStore seam (DR-0033 Phase 4); the
 // native backing is `std::fs`.
@@ -20224,33 +20228,6 @@ impl GuardStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct BranchReport {
-    scrutinee: String,
-    status: BranchStatus,
-    matched: bool,
-    tag: Option<String>,
-    actual: Value,
-    error: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum BranchStatus {
-    Matched,
-    NoMatch,
-    Error,
-}
-
-impl BranchStatus {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Matched => "matched",
-            Self::NoMatch => "no_match",
-            Self::Error => "error",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 struct AssertionReport {
     target_id: String,
     event_id: Option<String>,
@@ -29798,124 +29775,6 @@ struct RuleContext {
     trigger_event_id: Option<String>,
     identity: Option<String>,
     bindings: Vec<(String, FactView)>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct OwnedLowering {
-    facts: Vec<OwnedFact>,
-    consumed_fact_ids: Vec<String>,
-    effects: Vec<OwnedEffect>,
-    dependencies: Vec<OwnedDependency>,
-    terminal: Option<OwnedWorkflowTerminal>,
-    branch_reports: Vec<BranchReport>,
-    errors: Vec<String>,
-    /// Effect ids targeted by `cancel <binding>` operations in live scopes.
-    cancels: Vec<String>,
-    /// 503 auto-fail: a generated `flowfail` terminal fired (an unhandled effect
-    /// failure in a self-terminating flow). The string is the failure reason. This
-    /// routes to the kernel `fail_instance_internal` terminal (a generic failed
-    /// status with no typed `failure` payload) rather than the typed terminal
-    /// commit path. Set only inside an `after <step> fails { flowfail }` block when
-    /// the upstream effect actually failed.
-    internal_fail: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct OwnedWorkflowTerminal {
-    kind: WorkflowTerminalKind,
-    name: String,
-    payload_json: String,
-    idempotency_key: String,
-}
-
-impl OwnedWorkflowTerminal {
-    fn as_workflow_terminal(&self) -> WorkflowTerminal<'_> {
-        WorkflowTerminal {
-            kind: self.kind,
-            name: &self.name,
-            payload_json: &self.payload_json,
-            idempotency_key: Some(&self.idempotency_key),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct OwnedFact {
-    fact_id: String,
-    name: String,
-    key: String,
-    value_json: String,
-    schema_id: Option<String>,
-    provenance_class: String,
-    correlation_id: Option<String>,
-    source_span_json: Option<String>,
-}
-
-impl OwnedFact {
-    fn as_new_fact(&self) -> NewFact<'_> {
-        NewFact {
-            fact_id: &self.fact_id,
-            name: &self.name,
-            key: &self.key,
-            value_json: &self.value_json,
-            schema_id: self.schema_id.as_deref(),
-            provenance_class: &self.provenance_class,
-            correlation_id: self.correlation_id.as_deref(),
-            source_span_json: self.source_span_json.as_deref(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct OwnedEffect {
-    effect_id: String,
-    kind: String,
-    target: Option<String>,
-    input_json: String,
-    status: String,
-    idempotency_key: String,
-    required_capabilities_json: String,
-    profile: Option<String>,
-    correlation_id: Option<String>,
-    source_span_json: Option<String>,
-    timeout_seconds: Option<i64>,
-}
-
-impl OwnedEffect {
-    fn as_new_effect(&self) -> NewEffect<'_> {
-        NewEffect {
-            timeout_seconds: self.timeout_seconds,
-            effect_id: &self.effect_id,
-            kind: &self.kind,
-            target: self.target.as_deref(),
-            input_json: &self.input_json,
-            status: &self.status,
-            idempotency_key: &self.idempotency_key,
-            required_capabilities_json: &self.required_capabilities_json,
-            profile: self.profile.as_deref(),
-            correlation_id: self.correlation_id.as_deref(),
-            source_span_json: self.source_span_json.as_deref(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct OwnedDependency {
-    dependency_id: String,
-    upstream_effect_id: String,
-    downstream_effect_id: String,
-    predicate: String,
-}
-
-impl OwnedDependency {
-    fn as_new_dependency(&self) -> NewEffectDependency<'_> {
-        NewEffectDependency {
-            dependency_id: &self.dependency_id,
-            upstream_effect_id: &self.upstream_effect_id,
-            downstream_effect_id: &self.downstream_effect_id,
-            predicate: &self.predicate,
-        }
-    }
 }
 
 fn ready_contexts(
@@ -42537,6 +42396,9 @@ fn line_column(source: &str, byte_index: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `NewEffect` is exercised only by tests here (its production users — the
+    // lowering `as_*` converters — moved to `whipplescript_kernel::lowering`).
+    use whipplescript_store::NewEffect;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

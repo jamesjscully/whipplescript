@@ -11,6 +11,7 @@ pub mod harness;
 pub mod harness_loop;
 pub mod harness_model;
 pub mod loft;
+pub mod lowering;
 pub mod native_lifecycle;
 pub mod pi_rpc;
 pub mod provider;
