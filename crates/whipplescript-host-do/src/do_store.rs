@@ -2,21 +2,35 @@
 //! synchronous SQLite (`DoSql`), instead of native rusqlite. This is DR-0033
 //! Phase 5's core store binding.
 //!
-//! STATUS (honest): the `DoSql` seam plus the store\'s hot-path core and the
-//! straight-line registration / skill / inbox / fact-retirement / introspection
-//! methods are ported and **verified against real SQLite** (the tests back
-//! `DoSql` with rusqlite). The remaining methods — chiefly the multi-statement
-//! transactional lifecycle (create/activate revisions, admit fact batches,
-//! start/complete/retry effects, rebuild projections) and the large family of
-//! `list_*`/`get_*` view queries — are `todo!()` placeholders. The DO runs the
-//! *same* SQL the native `SqliteStore` does, so each is a port of that method\'s
-//! SQL; the transactional ones additionally need a batch/transaction primitive
-//! on `DoSql` (the DO\'s single-writer invocation gives implicit atomicity, but
-//! faithful native testing wants explicit BEGIN/COMMIT). Final correctness is
-//! against the *DO\'s* SQLite, which needs a live Durable Object (`worker` crate)
-//! to build and verify. The tracker\'s Phase-5 store box stays open until that
-//! port + live verification is done; this establishes the seam, proves the
-//! pattern, and ports the mechanical majority-shape methods.
+//! STATUS (honest): **72 of the 87 `RuntimeStore` methods are ported and verified
+//! against real SQLite** (the tests back `DoSql` with rusqlite, so the ported SQL
+//! runs against an actual engine). Done: the whole read/query family
+//! (`list_*`/`get_*`/`status`), the registration + manifest fan-out, skills,
+//! inbox, evidence/diagnostic/artifact records, the clock/time-obligation and
+//! dependency queries, leases, fact derivation + batch admission, program-version
+//! creation, and the event-append lifecycle transitions
+//! (transition_instance / block_effect_binding / expire_effect / retry_effect /
+//! cancel_pending_inbox_for_instance). A shared `do_append_event` /
+//! `do_insert_fact` / `do_insert_evidence` set mirrors the native inner helpers.
+//!
+//! REMAINING (15): the deeply-interlocked transactional write-path core, each
+//! with its own multi-helper chain —
+//!   * `commit_rule` / `commit_rule_with_revision_guard` (the rule-engine commit),
+//!   * `complete_effect` / `complete_effect_with_terminal_diagnostic` /
+//!     `resolve_effect_uncertain` (shared `complete_effect_terminal_inner`),
+//!   * `start_run`, `cancel_effect` (holder-resource release),
+//!     `request_effect_cancellation` (evidence + running-run fan-out),
+//!   * `claimable_effects` (needs `policy_block_on` + `capacity_block_on`),
+//!   * `rebuild_projections` (+ its ~10 `replay_*` helpers = the write path in
+//!     replay form),
+//!   * the revision family: `revision_cancellation_impact`,
+//!     `analyze_revision_compatibility`, `analyze_revision_candidate`,
+//!     `activate_revision`.
+//! These run the *same* SQL the native `SqliteStore` does; the DO's single-writer
+//! per-invocation model provides the atomicity the native path gets from a
+//! rusqlite transaction. Final correctness is against the *DO's* SQLite, which
+//! needs a live Durable Object (`worker` crate) to build and verify; the tracker's
+//! Phase-5 store box stays open until that port + live verification is done.
 
 use serde_json::Value;
 use whipplescript_store::{NewEvent, RuntimeStore, StoreError, StoreResult, StoredEvent};
