@@ -23265,6 +23265,18 @@ fn run_loft_effect(
     effect: &ClaimableEffect,
     options: &WorkerOptions,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
+    run_loft_effect_generic(&mut kernel, instance_id, effect, options)
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): the loft claim + terminal over a held
+/// `RuntimeKernel<S>` (only kernel methods, so `S: RuntimeStore`).
+fn run_loft_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    options: &WorkerOptions,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input = json_from_str(&effect.input_json);
     let issue_id = input
         .pointer("/issue/issue/id")
@@ -23309,8 +23321,6 @@ fn run_loft_effect(
             .to_string(),
         )
     };
-    let store = SqliteStore::open(store_path)?;
-    let mut kernel = RuntimeKernel::new(store);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "loft-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "loft-lease"]);
     kernel.run_loft_effect(
@@ -23334,7 +23344,21 @@ fn run_human_effect(
     effect: &ClaimableEffect,
     options: &WorkerOptions,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    let input_json = resolve_effect_input_after_bindings(store_path, instance_id, effect)?;
+    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
+    run_human_effect_generic(&mut kernel, instance_id, effect, options)
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): issue the human.ask + its terminal/fact
+/// over a held `RuntimeKernel<S>` (kernel methods + a read-only resolve, so
+/// `S: RuntimeStore`).
+fn run_human_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    options: &WorkerOptions,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let input_json =
+        resolve_effect_input_after_bindings_generic(kernel.store(), instance_id, effect)?;
     let input = json_from_str(&input_json);
     let prompt = input
         .get("prompt")
@@ -23349,8 +23373,6 @@ fn run_human_effect(
         .get("severity")
         .and_then(Value::as_str)
         .unwrap_or("normal");
-    let store = SqliteStore::open(store_path)?;
-    let mut kernel = RuntimeKernel::new(store);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "human-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "human-lease"]);
     let inbox_item_id = idempotency_key(&[instance_id, &effect.effect_id, "inbox"]);
@@ -23400,6 +23422,20 @@ fn resolve_effect_input_after_bindings(
     instance_id: &str,
     effect: &ClaimableEffect,
 ) -> Result<String, StoreError> {
+    resolve_effect_input_after_bindings_generic(
+        &SqliteStore::open(store_path)?,
+        instance_id,
+        effect,
+    )
+}
+
+/// Host-agnostic core (DR-0033 chunk 3): fold an `after`-binding into the effect
+/// input using facts read from a held store. Read-only, so `&S` suffices.
+fn resolve_effect_input_after_bindings_generic<S: RuntimeStore>(
+    store: &S,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<String, StoreError> {
     let mut input = json_from_str(&effect.input_json);
     let Some(after) = input.get("after").cloned() else {
         return Ok(effect.input_json.clone());
@@ -23413,7 +23449,6 @@ fn resolve_effect_input_after_bindings(
     let Some(upstream_effect_id) = after.get("upstream_effect_id").and_then(Value::as_str) else {
         return Ok(effect.input_json.clone());
     };
-    let store = SqliteStore::open(store_path)?;
     let facts = store.list_facts(instance_id)?;
     let Some(binding_value) = effect_binding_value(&facts, upstream_effect_id, predicate) else {
         return Ok(effect.input_json.clone());
