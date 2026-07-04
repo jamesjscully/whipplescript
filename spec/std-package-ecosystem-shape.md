@@ -209,10 +209,25 @@ kernel/lib.rs:3010, cli/main.rs:28201) into the kernel map — a half-day that
 cuts each rename's regeneration surface by roughly two-thirds. Then three
 gated slices:
 
-- **(A)** `event.notify` → `signal.emit`, plus purge of the legacy
-  `event.emit` kind and the line-based fallback classifier. Smallest;
-  proves the regeneration pipeline (.ir snapshots, accept fixtures, Maude
-  models, spec references).
+- **(A)** `event.notify` → `signal.emit`. **LANDED 2026-07-04** (S1a
+  commit; `IrEffectKind::EventNotify` → `SignalEmit`, the kind string,
+  derived facts `signal.emit.completed/.failed`, the builtin capability-gate
+  exemption in store + DO mirror, dispatch arms, and the regenerated
+  `examples/event-bridge.ir` — 1115 tests green). Proved the regeneration
+  pipeline. **The `event.emit` purge originally bundled here is DEFERRED with
+  cause:** an investigation before touching it found `event.emit` is *not*
+  dead legacy — `emit milestone` currently produces a phantom `event.emit`
+  effect through the bare-`emit` branch of the text-based rule-body lowering
+  (kernel/rule_lowering.rs:2965), and `event.emit` still carries full
+  capability/provider/binding/profile seed rows in migration 0001. Purging it
+  is therefore a change to milestone/projection lowering (Family C; the
+  package-projection-noun-vocabulary decision record's territory), not a
+  clean legacy removal. Re-entry: a projection-owned slice that removes the
+  phantom `event.emit` from milestone lowering (the real `workflow.milestone:*`
+  fact is derived independently at rule_lowering.rs:1078 and is unaffected),
+  then retires the `event.emit` kind/handler/seeds and reconciles the
+  `parse_effect_line` diagnostic classifier. Sequence it with the projection
+  work, not the rename substrate.
 - **(B)** `coerce` → `schema.coerce` and `std.coerce` → `std.coercion` —
   AND, in the same rekey, the coerce idempotency key gains
   model/prompt/schema-hash commitments (the recorded spec/coerce.md
@@ -226,8 +241,15 @@ gated slices:
   including `archived`.
 
 EVERY slice adds a store-open guard that errors loudly on pending
-legacy-kind effects, converting the fact-checked silent-hang mode
+retired-kind effects, converting the fact-checked silent-hang mode
 (cli/main.rs:20515-20543 unknown-kind fallthrough) into a visible failure.
+**LANDED 2026-07-04** (S1b commit) as a shared, once-built mechanism:
+`run_worker_once` → `guard_no_stale_effect_kinds`, driven by a
+`RETIRED_EFFECT_KINDS` **denylist** (each rename slice appends its old kind).
+A denylist, not an allowlist — because not every live runtime kind has an
+`IrEffectKind` variant (e.g. `lease.release` is dispatched but unmodeled in
+the enum), so an allowlist false-positives on legitimate effects. Later
+rename slices reuse this guard by adding one string, not rebuilding it.
 
 **Why.** Fact-check 3 is definitive: single-baseline migration
 (store/lib.rs:914-918), no store-stability promise in any spec, and
