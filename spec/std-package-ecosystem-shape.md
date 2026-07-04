@@ -192,6 +192,21 @@ the store's default-required-capability rule by construction
 pattern FAMILIES (`script.<name>`). New lock-time check: contract
 required_capabilities ⊆ the owning manifest's capabilities[].
 
+**S4 status (verified 2026-07-04): the lock-time subset check is ALREADY
+SHIPPED — do not rebuild it.** `validate_declared_capability`, driven by
+`validate_package_manifest_consistency` (invoked on every manifest load,
+cli/main.rs:16897), rejects any effect contract whose `required_capabilities`
+(or provider capability, or contract id) is not in the manifest's declared
+`capabilities[]` — exactly this invariant. Tested: a manifest whose contract
+requires `memory.missing` is rejected (cli/main.rs:36942). The id==kind leg is
+true by construction (the store defaults an effect's required capability to its
+kind string, store/lib.rs:6873-6877), so no check enforces it — it is
+structural. The remaining leg, **`bound ⊇ turn-grants`** (a turn grant must be
+within the bound capabilities), is harness-side and belongs to the std.files /
+std.script package tails that own file/script turn grants — tracked there, not
+as standalone S4 work. S4 therefore adds no new substrate code; it is verified
+already-satisfied for its enforceable content.
+
 **Why.** The runtime plane is the only one with teeth today; feeding it is
 zero new mechanism. id==kind makes the manifest and the store agree by
 construction. Unifying the three enforcement engines (admission gate,
