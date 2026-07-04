@@ -480,6 +480,7 @@ pub fn empty_ir_program() -> IrProgram {
         queues: Vec::new(),
         channels: Vec::new(),
         file_stores: Vec::new(),
+        memory_pools: Vec::new(),
         events: Vec::new(),
         leases: Vec::new(),
         ledgers: Vec::new(),

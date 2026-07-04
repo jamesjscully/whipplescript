@@ -130,6 +130,7 @@ pub enum Item {
     Queue(QueueDecl),
     Channel(ChannelDecl),
     FileStore(FileStoreDecl),
+    MemoryPool(MemoryPoolDecl),
     Flow(FlowDecl),
     Action(ActionDecl),
     Agent(AgentDecl),
@@ -160,6 +161,7 @@ impl Item {
             Self::Queue(decl) => decl.span,
             Self::Channel(decl) => decl.span,
             Self::FileStore(decl) => decl.span,
+            Self::MemoryPool(decl) => decl.span,
             Self::Flow(decl) => decl.span,
             Self::Action(decl) => decl.span,
             Self::Agent(decl) => decl.span,
@@ -288,6 +290,21 @@ pub struct FileStoreDecl {
     pub root_span: Option<SourceSpan>,
     pub read_span: Option<SourceSpan>,
     pub write_span: Option<SourceSpan>,
+    pub span: SourceSpan,
+}
+
+/// `memory pool <name> { context limit <n> }` (std.memory, MEM-1): a named
+/// durable memory place. Mirrors `file store` as a `declaration_block` /
+/// `metadata_only` construct providing `Resource<MemoryPool>`. v1 pools are
+/// provider-less; `context limit <n>` (optional, non-negative) is the recall
+/// packing budget. Unknown clauses are rejected (file-store precedent).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryPoolDecl {
+    pub name: Ident,
+    pub context_limit: Option<u64>,
+    /// Source span of the `context` clause keyword, so `whip fmt` can interleave
+    /// body comments by position (file-store precedent).
+    pub context_limit_span: Option<SourceSpan>,
     pub span: SourceSpan,
 }
 
@@ -823,6 +840,7 @@ pub struct IrProgram {
     pub queues: Vec<IrQueue>,
     pub channels: Vec<IrChannel>,
     pub file_stores: Vec<IrFileStore>,
+    pub memory_pools: Vec<IrMemoryPool>,
     pub events: Vec<IrEvent>,
     pub sources: Vec<IrSource>,
     pub tests: Vec<IrTest>,
@@ -965,6 +983,17 @@ pub struct IrFileStore {
     pub read_globs: Vec<String>,
     /// Path globs a `write` may touch; empty = any path inside the root.
     pub write_globs: Vec<String>,
+}
+
+/// A lowered `memory pool` declaration (std.memory, MEM-1): the pool identity +
+/// its optional recall context-limit budget. `metadata_only` — provides
+/// `Resource<MemoryPool>`; providers read `context_limit` from the effect input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrMemoryPool {
+    pub name: String,
+    /// Optional recall packing budget (`context limit <n>`); providers read it
+    /// from the `capability.call` effect input like any other argument.
+    pub context_limit: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1900,6 +1929,7 @@ pub fn document_symbols(source: &str) -> Vec<DeclSymbol> {
             Item::Queue(decl) => ("queue", decl.name.name.clone(), decl.span),
             Item::Channel(decl) => ("channel", decl.name.name.clone(), decl.span),
             Item::FileStore(decl) => ("file store", decl.name.name.clone(), decl.span),
+            Item::MemoryPool(decl) => ("memory pool", decl.name.name.clone(), decl.span),
             Item::Event(decl) => ("signal", decl.name.clone(), decl.span),
             Item::Table(decl) => ("table", decl.name.name.clone(), decl.span),
             _ => continue,
@@ -2520,6 +2550,7 @@ fn referenced_decl_name(item: &Item) -> Option<(String, SourceSpan)> {
         Item::Queue(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::Channel(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::FileStore(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::MemoryPool(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::Event(decl) => Some((decl.name.clone(), decl.span)),
         Item::Table(decl) => Some((decl.name.name.clone(), decl.span)),
         _ => None,
@@ -2965,6 +2996,18 @@ impl IrProgram {
                         &mut snapshot,
                         format!("    allow write {:?}", file_store.write_globs),
                     );
+                }
+            }
+        }
+
+        if !self.memory_pools.is_empty() {
+            push_line(&mut snapshot, "memory_pools");
+            for pool in &self.memory_pools {
+                push_line(&mut snapshot, format!("  memory pool {}", pool.name));
+                // The context limit is serialized only when present, so pools
+                // without it keep a minimal snapshot (no ripple).
+                if let Some(limit) = pool.context_limit {
+                    push_line(&mut snapshot, format!("    context limit {limit}"));
                 }
             }
         }
@@ -3729,6 +3772,7 @@ fn lower_program(
         queues: Vec::new(),
         channels: Vec::new(),
         file_stores: Vec::new(),
+        memory_pools: Vec::new(),
         events: Vec::new(),
         sources: Vec::new(),
         tests: Vec::new(),
@@ -3822,6 +3866,15 @@ fn lower_program(
                     root: file_store.root,
                     read_globs: file_store.read_globs,
                     write_globs: file_store.write_globs,
+                });
+            }
+            // The `memory pool` declaration (std.memory, MEM-1) lowers to its
+            // name + optional recall context-limit budget; providers read the
+            // limit from the `capability.call` effect input.
+            Item::MemoryPool(pool) => {
+                ir.memory_pools.push(IrMemoryPool {
+                    name: pool.name.name,
+                    context_limit: pool.context_limit,
                 });
             }
             Item::Agent(agent) => lower_agent(agent, &mut ir, &harness_names, &mut diagnostics),
@@ -3960,6 +4013,7 @@ fn lower_program(
 
     ir.rule_dependencies = build_rule_dependencies(&ir.rules);
     validate_turn_access_grant_file_operations(&ir, &mut diagnostics);
+    validate_turn_access_grant_memory_operations(&ir, &mut diagnostics);
 
     CompileOutput {
         ir: diagnostics.is_empty().then_some(ir),
@@ -3999,6 +4053,47 @@ fn validate_turn_access_grant_file_operations(ir: &IrProgram, diagnostics: &mut 
                             suggestion: Some(
                                 "file-store grants allow `read`, `write`, `import`, or `export`"
                                     .to_owned(),
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Post-lowering check: a turn-access grant whose resource is a declared `memory
+/// pool` (std.memory, MEM-1) may only grant memory operations
+/// (`recall`/`learn`/`curate`). Runs after the whole program is lowered so every
+/// pool declaration is visible regardless of source order. Grants whose resource
+/// is NOT a declared memory pool are left alone — they may be file stores or
+/// package-provided resources whose operation vocabulary lives elsewhere, so this
+/// stays zero-false-positive. This closes the deliberate memory-grant-validation
+/// deferral (there was no declared-pool list to key it off before MEM-1).
+fn validate_turn_access_grant_memory_operations(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    const MEMORY_OPERATIONS: [&str; 3] = ["recall", "learn", "curate"];
+    let memory_pools: BTreeSet<&str> = ir
+        .memory_pools
+        .iter()
+        .map(|pool| pool.name.as_str())
+        .collect();
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            for grant in &effect.access_grants {
+                if !memory_pools.contains(grant.resource.as_str()) {
+                    continue;
+                }
+                for op in &grant.operations {
+                    if !MEMORY_OPERATIONS.contains(&op.operation.as_str()) {
+                        diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: effect.span,
+                            message: format!(
+                                "rule `{}` grants `{}` on memory pool `{}`, which is not a memory operation",
+                                rule.name, op.operation, grant.resource
+                            ),
+                            suggestion: Some(
+                                "memory-pool grants allow `recall`, `learn`, or `curate`".to_owned(),
                             ),
                         });
                     }
@@ -4632,6 +4727,10 @@ fn expand_pattern_item(
         Item::FileStore(file_store) => Some((
             format!("file-store:{}", file_store.name.name),
             Item::FileStore(file_store),
+        )),
+        Item::MemoryPool(pool) => Some((
+            format!("memory-pool:{}", pool.name.name),
+            Item::MemoryPool(pool),
         )),
         Item::Event(event) => Some((format!("event:{}", event.name), Item::Event(event))),
         Item::Source(source) => {
@@ -16020,6 +16119,13 @@ fn format_item(item: Item, formatted: &mut String) {
             format_globs(formatted, "write", &file_store.write_globs);
             push_line(formatted, "}");
         }
+        Item::MemoryPool(pool) => {
+            push_line(formatted, format!("memory pool {} {{", pool.name.name));
+            if let Some(limit) = pool.context_limit {
+                push_line(formatted, format!("  context limit {limit}"));
+            }
+            push_line(formatted, "}");
+        }
         Item::Flow(flow) => format_flow(flow, formatted),
         Item::Action(action) => {
             let params = action
@@ -17443,6 +17549,10 @@ impl Parser<'_> {
             self.reject_pending_tags(pending_tags, "file store");
             self.reject_pending_description(pending_description, "file store");
             self.parse_file_store().map(Item::FileStore)
+        } else if self.at_ident("memory") {
+            self.reject_pending_tags(pending_tags, "memory pool");
+            self.reject_pending_description(pending_description, "memory pool");
+            self.parse_memory_pool().map(Item::MemoryPool)
         } else if self.at_ident("harness") {
             self.reject_pending_tags(pending_tags, "harness");
             self.reject_pending_description(pending_description, "harness");
@@ -18114,6 +18224,83 @@ impl Parser<'_> {
             root_span,
             read_span,
             write_span,
+            span: SourceSpan {
+                start,
+                end: close.span.end,
+            },
+        })
+    }
+
+    /// `memory pool <name> { context limit <n> }` (std.memory, MEM-1). Mirrors
+    /// `parse_file_store`: a two-word keyword, a name, and a brace block whose
+    /// only v1 clause is the optional `context limit <int>`. Unknown clauses are
+    /// rejected (file-store precedent). v1 pools are provider-less, so there is
+    /// no `provider` clause.
+    fn parse_memory_pool(&mut self) -> Option<MemoryPoolDecl> {
+        let start = self.expect_keyword("memory")?.span.start;
+        if !self.consume_ident("pool") {
+            self.expected("`pool` after `memory`");
+            return None;
+        }
+        let name = self.expect_ident("memory pool name")?;
+        self.expect_symbol('{')?;
+        let mut context_limit = None;
+        let mut context_limit_span = None;
+        while !self.is_at_end() && !self.at_symbol('}') {
+            let Some(field) = self.expect_ident("memory pool field") else {
+                self.synchronize_to_block_item();
+                continue;
+            };
+            match field.name.as_str() {
+                // `context limit <n>`: the optional recall packing budget. Not
+                // provider config — it lowers into the `capability.call` effect
+                // input alongside `pool` and `query`.
+                "context" => {
+                    if !self.consume_ident("limit") {
+                        self.expected("`limit` after `context`");
+                        self.synchronize_to_block_item();
+                        continue;
+                    }
+                    if let Some((value, _span)) = self.expect_u32("context limit value") {
+                        context_limit_span = Some(field.span);
+                        context_limit = Some(u64::from(value));
+                    } else {
+                        self.synchronize_to_block_item();
+                    }
+                }
+                // `provider` is deliberately rejected here: provider selection is
+                // binding-owned (the manifest `bindings[]`), so a pool-level
+                // provider clause would be a decorative clause nothing reads.
+                "provider" => {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: field.span,
+                        message: "memory pools have no `provider` clause".to_owned(),
+                        suggestion: Some(
+                            "provider selection is binding-owned (the manifest `bindings[]`)"
+                                .to_owned(),
+                        ),
+                    });
+                    self.synchronize_to_block_item();
+                }
+                other => {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: field.span,
+                        message: format!("unknown memory pool field `{other}`"),
+                        suggestion: Some(
+                            "the only memory pool field is `context limit <n>`".to_owned(),
+                        ),
+                    });
+                    self.synchronize_to_block_item();
+                }
+            }
+        }
+        let close = self.expect_symbol('}')?;
+        Some(MemoryPoolDecl {
+            name,
+            context_limit,
+            context_limit_span,
             span: SourceSpan {
                 start,
                 end: close.span.end,
@@ -26564,6 +26751,150 @@ rule work
                 .any(|d| d.message.contains("not a file operation")),
             "{:?}",
             ok.diagnostics
+        );
+    }
+
+    #[test]
+    fn parses_memory_pool_declaration_and_snapshots_it() {
+        // MEM-1: a `memory pool` declaration lowers to a metadata-only pool with
+        // its optional `context limit`, and the .ir snapshot renders it.
+        let source = r#"
+workflow PoolDecl
+
+memory pool project_memory {
+  context limit 8
+}
+"#;
+        let compiled = compile_program(source);
+        let ir = compiled.ir.expect("compiles");
+        assert_eq!(ir.memory_pools.len(), 1);
+        assert_eq!(ir.memory_pools[0].name, "project_memory");
+        assert_eq!(ir.memory_pools[0].context_limit, Some(8));
+        let snapshot = ir.to_snapshot();
+        assert!(snapshot.contains("memory_pools"), "{snapshot}");
+        assert!(
+            snapshot.contains("memory pool project_memory"),
+            "{snapshot}"
+        );
+        assert!(snapshot.contains("context limit 8"), "{snapshot}");
+
+        // `context limit` is optional — an absent clause lowers to `None` and
+        // omits the snapshot line (no ripple), mirroring file-store globs.
+        let bare = compile_program("workflow Bare\n\nmemory pool p {\n}\n")
+            .ir
+            .expect("bare pool compiles");
+        assert_eq!(bare.memory_pools[0].context_limit, None);
+        assert!(!bare.to_snapshot().contains("context limit"));
+    }
+
+    #[test]
+    fn rejects_unknown_and_provider_memory_pool_clauses() {
+        // Unknown clauses are rejected (file-store precedent); `provider` gets a
+        // dedicated binding-owned hint since v1 pools are provider-less.
+        let unknown = compile_program("workflow U\n\nmemory pool p {\n  retention 5\n}\n");
+        assert!(
+            unknown
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown memory pool field `retention`")),
+            "{:?}",
+            unknown.diagnostics
+        );
+        let provider = compile_program("workflow P\n\nmemory pool p {\n  provider local\n}\n");
+        assert!(
+            provider
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("memory pools have no `provider` clause")),
+            "{:?}",
+            provider.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_non_memory_operation_on_a_memory_pool_grant() {
+        // MEM-1 static check 2 (mirrors the file-store grant precedent): a grant on
+        // a declared memory pool may only use memory operations; a non-memory op
+        // (e.g. a file `read`) is rejected. A grant on a non-pool resource is left
+        // alone (zero-false-positive) — this closes the memory-grant-validation
+        // deferral, now that `ir.memory_pools` gives a declared-pool list.
+        let program = |op: &str, resource: &str, pool: &str| {
+            format!(
+                r#"
+@service
+workflow MemoryGrant
+
+output result R
+class R {{ ok bool }}
+class Ticket {{ id string  status "open" }}
+
+agent coder {{ provider fixture  profile "repo-writer"  capacity 1 }}
+
+memory pool {pool} {{ context limit 8 }}
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+  when coder is available
+=> {{
+  tell coder as turn
+    with access to {resource} {{
+      {op}
+    }}
+  "go"
+
+  after turn succeeds as outcome {{
+    complete result {{ ok true }}
+  }}
+}}
+"#
+            )
+        };
+
+        // A file `read` on a declared memory pool is not a memory operation.
+        let bad = compile_program(&program(
+            r#"read ["docs/**"]"#,
+            "project_memory",
+            "project_memory",
+        ));
+        assert!(
+            bad.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not a memory operation")),
+            "{:?}",
+            bad.diagnostics
+        );
+
+        // A memory operation (`recall`/`learn`) on the declared pool is accepted.
+        let ok_recall = compile_program(&program(
+            "recall for ticket\n      learn for ticket",
+            "project_memory",
+            "project_memory",
+        ));
+        assert!(
+            !ok_recall
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("not a memory operation")),
+            "{:?}",
+            ok_recall.diagnostics
+        );
+
+        // The same file `read` on a non-pool resource is left alone (no false
+        // positive) — it could be a file store or a package-provided resource.
+        let ok_other = compile_program(&program(
+            r#"read ["docs/**"]"#,
+            "project_files",
+            "project_memory",
+        ));
+        assert!(
+            !ok_other
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("not a memory operation")),
+            "{:?}",
+            ok_other.diagnostics
         );
     }
 

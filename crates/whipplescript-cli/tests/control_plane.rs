@@ -6815,6 +6815,102 @@ fn memory_roundtrip_without_a_lock_uses_the_embedded_manifest() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// MEM-1 pool declaration end-to-end: the `examples/memory-pool-demo.whip` demo
+/// declares `memory pool project_memory { context limit 8 }`, `check` renders the
+/// pool in its `memory_pools` snapshot, and `dev` runs the `learn`/`recall`
+/// against the declared pool to completion (lock-free, embedded manifest).
+#[test]
+fn memory_pool_declaration_demo_checks_and_recalls() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("memory-pool-demo");
+    let store_path = dir.join("store.db");
+    let workflow_src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/memory-pool-demo.whip");
+    let workflow_path = dir.join("wf.whip");
+    fs::copy(&workflow_src, &workflow_path).expect("copy memory-pool demo");
+
+    // `check` resolves `use memory` from the embedded manifest (no lock) and
+    // renders the declared pool + its context limit in the `.ir` snapshot.
+    let checked = Command::new(bin)
+        .args(["check", workflow_path.to_str().expect("utf-8 workflow")])
+        .output()
+        .expect("check runs");
+    assert!(
+        checked.status.success(),
+        "check must pass for the memory-pool demo\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let snapshot = String::from_utf8_lossy(&checked.stdout);
+    assert!(
+        snapshot.contains("memory_pools"),
+        "check snapshot should list memory pools:\n{snapshot}"
+    );
+    assert!(
+        snapshot.contains("memory pool project_memory"),
+        "check snapshot should name the declared pool:\n{snapshot}"
+    );
+    assert!(
+        snapshot.contains("context limit 8"),
+        "check snapshot should render the pool's context limit:\n{snapshot}"
+    );
+
+    // `dev` runs the `learn`/`recall` against the declared pool to completion.
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store"),
+            "--json",
+            "dev",
+            workflow_path.to_str().expect("utf-8 workflow"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+
+    // The `learn` (memory.write) and `recall` (memory.query) both settled against
+    // the declared pool.
+    assert!(
+        facts.iter().any(|fact| {
+            fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded")
+                && fact.pointer("/value/target").and_then(Value::as_str) == Some("memory.write")
+        }),
+        "learn should settle a memory.write success fact"
+    );
+    let recall = facts
+        .iter()
+        .find(|fact| {
+            fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded")
+                && fact.pointer("/value/target").and_then(Value::as_str) == Some("memory.query")
+        })
+        .expect("recall should settle a memory.query success fact");
+    assert_eq!(
+        recall.pointer("/value/value/pool").and_then(Value::as_str),
+        Some("project_memory"),
+        "the recall context reports the declared pool"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// MEM-6 `curate` end-to-end, lock-free (embedded manifest). A workflow learns two
 /// duplicate items (same `source`/`note`) and one distinct item into a pool, then
 /// `curate`s it, then `recall`s. The three learns and the curate/recall are chained
