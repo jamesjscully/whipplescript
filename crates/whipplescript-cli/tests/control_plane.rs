@@ -90,6 +90,38 @@ fn agents_command_lists_declared_agents() {
     assert_eq!(triager.get("capacity").and_then(Value::as_u64), Some(1));
 }
 
+/// `whip providers <workflow>` aggregates every provider the program needs
+/// (agents, channels, sources) with what references each.
+#[test]
+fn providers_command_aggregates_all_providers() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let example = example_path("clock-source.whip");
+    let report = run_json(
+        bin,
+        &["--json", "providers", example.to_str().expect("utf-8")],
+    );
+    let providers = report
+        .get("providers")
+        .and_then(Value::as_array)
+        .expect("providers array");
+    let find = |name: &str| {
+        providers
+            .iter()
+            .find(|p| p.get("provider").and_then(Value::as_str) == Some(name))
+            .and_then(|p| p.get("used_by"))
+            .and_then(Value::as_array)
+            .map(|refs| {
+                refs.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+    };
+    // The `owned` provider is used by the `triager` agent; `clock` by the source.
+    assert_eq!(find("owned"), Some(vec!["agent:triager".to_owned()]));
+    assert_eq!(find("clock"), Some(vec!["source:daily_triage".to_owned()]));
+}
+
 /// (with a hygienic `turn__act0` binding) must run end to end under the fixture
 /// provider: the tell effect completes, the seeded `ChangeRequest` is consumed,
 /// and a `ReviewedChange` fact is recorded.

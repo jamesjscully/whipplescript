@@ -165,6 +165,7 @@ fn main() -> ExitCode {
         Some("gov") => gov(&options),
         Some("agent") => whip_agent(&options),
         Some("agents") => agents(&options),
+        Some("providers") => providers(&options),
         Some("lint") => lint(&options),
         Some("lsp") => lsp(&options),
         Some("fmt") => fmt(&options),
@@ -324,6 +325,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "recover" => "usage: whip recover <instance>",
         "doctor" => "usage: whip doctor [--providers] [--provider-config <path>] [--record-provider-evidence <instance>]",
         "agents" => "usage: whip [--json] agents [--root <workflow>] <workflow.whip>",
+        "providers" => "usage: whip [--json] providers [--root <workflow>] <workflow.whip>",
         "auth" => "usage: whip auth <status | set <openai|anthropic> <key>>",
         "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--from <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
         _ => return None,
@@ -1668,6 +1670,88 @@ fn agents(options: &CliOptions) -> ExitCode {
         }
         if !agent.skills.is_empty() {
             println!("  skills {}", agent.skills.join(", "));
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `whip providers <workflow.whip>` — the operator view of every provider a
+/// program needs: aggregates the `provider` of each declared agent, channel, and
+/// source into a distinct list, with what references each. Reads the compiled IR.
+fn providers(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip [--json] providers [--root <workflow>] <workflow.whip>";
+    let mut source: Option<String> = None;
+    let mut root: Option<String> = None;
+    let mut index = 0;
+    while index < options.args.len() {
+        match options.args[index].as_str() {
+            "--root" => {
+                index += 1;
+                root = options.args.get(index).cloned();
+            }
+            "--package-lock" => {
+                index += 1;
+            }
+            arg if !arg.starts_with('-') => source = Some(arg.to_owned()),
+            other => {
+                eprintln!("unknown providers option `{other}`");
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+        index += 1;
+    }
+    let Some(source_path) = source else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let (_source, ir) = match compile_source_path_with_root(&source_path, root.as_deref()) {
+        Ok(pair) => pair,
+        Err(error) => return report_compile_failure(&source_path, error),
+    };
+
+    // provider name -> sorted, deduped `<kind>:<name>` references.
+    let mut uses: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for agent in &ir.agents {
+        if let Some(provider) = &agent.provider {
+            uses.entry(provider.clone())
+                .or_default()
+                .insert(format!("agent:{}", agent.name));
+        }
+    }
+    for channel in &ir.channels {
+        uses.entry(channel.provider.clone())
+            .or_default()
+            .insert(format!("channel:{}", channel.name));
+    }
+    for src in &ir.sources {
+        uses.entry(src.provider.clone())
+            .or_default()
+            .insert(format!("source:{}", src.name));
+    }
+
+    if options.json {
+        let providers_json: Vec<Value> = uses
+            .iter()
+            .map(|(provider, refs)| {
+                json!({
+                    "provider": provider,
+                    "used_by": refs.iter().cloned().collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        return emit_json(json!({ "providers": providers_json }));
+    }
+
+    if uses.is_empty() {
+        println!("no providers referenced");
+        return ExitCode::SUCCESS;
+    }
+    for (provider, refs) in &uses {
+        println!("provider {provider}");
+        for reference in refs {
+            println!("  {reference}");
         }
     }
     ExitCode::SUCCESS
