@@ -46,6 +46,7 @@ mapfile -t discovered < <(
   find spec -type f \( -name '*tracker*.md' -o -name '*-plan.md' \) \
     | grep -v '^spec/archive/' \
     | grep -v 'spec/decision-records/0002-work-tracker-package.md' \
+    | grep -v '^spec/std-tracker.md$' \
     | sort -u
 )
 
