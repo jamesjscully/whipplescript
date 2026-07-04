@@ -658,6 +658,50 @@ fn send_via_local_channel_delivers_to_local_mailbox() {
     let _ = fs::remove_file(mailbox);
 }
 
+/// `send via <channel>` where the channel declares `provider stdio` is delivered
+/// by the native stdio provider: the workflow completes and a
+/// `[messaging.stdio] channel=… text=…` marker line is written to stdout. The
+/// second real messaging provider behind the S5 seam (local mailbox was first);
+/// non-local/non-stdio channels keep the fixture.
+#[test]
+fn send_via_stdio_channel_writes_marker_to_stdout() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("send-stdio", "sqlite");
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/messaging-stdio-demo.whip");
+    let store_str = store.to_str().expect("utf-8");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store_str,
+            "dev",
+            source.to_str().expect("utf-8"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("dev runs");
+    assert!(
+        output.status.success(),
+        "dev failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[messaging.stdio] channel=console text=hello-stdio"),
+        "expected the stdio delivery marker on stdout, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("status completed"),
+        "workflow did not complete, got:\n{stdout}"
+    );
+
+    let _ = fs::remove_file(store);
+}
+
 /// Inbound messaging (spec/messaging.md): `whip message` injects a `Message` on a
 /// declared channel and a `when message from <channel> as msg` rule fires, binding
 /// the envelope. The fixture-parity counterpart of outbound `send`; live providers

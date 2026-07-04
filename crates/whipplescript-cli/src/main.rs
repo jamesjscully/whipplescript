@@ -23059,6 +23059,17 @@ fn run_capability_effect(
             &contract,
             &mailbox,
         )
+    } else if effect.target.as_deref() == Some("messaging.send")
+        && capability_input_provider(effect).as_deref() == Some("stdio")
+    {
+        run_capability_effect_generic(
+            &mut kernel,
+            instance_id,
+            effect,
+            &options.effect_config(),
+            &contract,
+            &StdioCapabilityProvider,
+        )
     } else if bound_provider.as_deref() == Some("memory-provider") {
         let memory = MemoryCapabilityProvider {
             store_path: store_path.with_extension("memory.jsonl"),
@@ -23164,6 +23175,48 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for LocalMailboxC
             };
         }
 
+        CapabilityOutcome::Produced(json!({
+            "provider_message_id": message_id,
+            "channel": channel,
+            "delivered": true,
+        }))
+    }
+}
+
+/// Native stdio messaging provider: `send via <channel>` where the channel
+/// declares `provider stdio` writes one marker line per message to the process
+/// stdout (`[messaging.stdio] channel=… text=…`). Deterministic message id from
+/// the effect id (no wall-clock). Non-breaking: only channels declaring
+/// `provider stdio` route here; every other channel keeps its existing provider.
+struct StdioCapabilityProvider;
+
+impl whipplescript_kernel::effect_handlers::CapabilityProvider for StdioCapabilityProvider {
+    fn produce(
+        &self,
+        effect: &ClaimableEffect,
+        _config: &EffectConfig,
+    ) -> whipplescript_kernel::effect_handlers::CapabilityOutcome {
+        use whipplescript_kernel::effect_handlers::CapabilityOutcome;
+        let input: Value = match serde_json::from_str(&effect.input_json) {
+            Ok(value) => value,
+            Err(err) => {
+                return CapabilityOutcome::Failed {
+                    error_kind: "messaging_delivery".to_owned(),
+                    message: format!("invalid messaging.send input: {err}"),
+                };
+            }
+        };
+        let message = input.pointer("/message");
+        let channel = message
+            .and_then(|m| m.pointer("/channel"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let text = message
+            .and_then(|m| m.pointer("/text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let message_id = idempotency_key(&[&effect.effect_id, "messaging-message"]);
+        println!("[messaging.stdio] channel={channel} text={text}");
         CapabilityOutcome::Produced(json!({
             "provider_message_id": message_id,
             "channel": channel,
