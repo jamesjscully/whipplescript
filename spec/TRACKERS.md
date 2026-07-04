@@ -104,3 +104,5 @@ Same concern tracked in more than one place. Registry rule: work it in the
 - `spec/control-plane.md` — control-plane specification (draft spec, not a work tracker).
 - `spec/decision-records/0002-work-tracker-package.md` — ADR for the *work-tracker
   standard package*; a design record, not one of our work trackers.
+- `spec/std-tracker.md` — concrete package design for the `std.tracker` standard
+  package (issues/claims surface); a package-contract spec, not a work tracker.
