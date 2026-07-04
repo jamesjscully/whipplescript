@@ -318,4 +318,234 @@ mod WHIPPLESCRIPT-CONSTRUCT-GRAMMAR is
     effect(E, queued)
     requiredCapability(E, Cap)
     runtimeAuthorized(E, P) .
+
+  --- ==================================================================
+  --- DR-0011 Two-Shape Meta-Grammar (S6b, model-first)
+  --- ------------------------------------------------------------------
+  --- The sections above model construct ACCEPTANCE (the compile-time
+  --- graph check). This section models the orthogonal step that runs
+  --- first: PARSING a source statement against a manifest `grammar`
+  --- spec that comes in exactly two shapes. A package construct is
+  --- registered with a manifest grammar; the body parser looks it up and
+  --- parses generically. We model that generic parse as rewriting: a
+  --- well-formed statement plus its grammar spec rewrites to
+  --- `parsedUse(C)`; a malformed statement gets STUCK short of it. The
+  --- two shapes are `declaration_block` and `effect_operation`. A
+  --- statement matching neither shape has no driver and cannot parse.
+  ---
+  --- This fragment is intentionally self-contained: it does not reuse
+  --- the acceptance vocabulary above. Parse success (`parsedUse`) is the
+  --- pre-acceptance milestone; acceptance is modeled separately.
+
+  --- Sample construct identifiers used by the S6b parse checks.
+  ops
+    recallUse sendUse poolDecl
+    recallMissingConn sendUnknownField sendMissingText recallNoBinding
+    mysteryUse
+    : -> ConstructId .
+
+  --- The two grammar shapes plus a sentinel for a statement whose
+  --- construct matches neither shape.
+  sorts PShape PKind PConn PBind .
+  ops declBlock effectOp noShape : -> PShape .
+
+  --- The core-owned field/clause/slot kind vocabulary.
+  ops
+    identifierKind expressionKind durationKind globKind schemaKind scalarKind
+    : -> PKind .
+
+  --- The fixed connective vocabulary (a required word consumed before a
+  --- slot), plus `noConn` for a leading slot with no connective.
+  ops fromConn forConn intoConn toConn viaConn noConn : -> PConn .
+
+  --- The trailing `as <binding>` mode.
+  ops bindRequired bindOptional bindNone : -> PBind .
+
+  --- Slot, clause, and payload-field names.
+  sort PName .
+  ops
+    poolName queryName channelName
+    textField markdownField threadIdField bogusField
+    providerName retainName
+    : -> PName .
+
+  --- effect_operation slot spec list: ordered `slot(name, kind, conn)`.
+  sorts PSlot PSpecList .
+  subsort PSlot < PSpecList .
+  op slot : PName PKind PConn -> PSlot .
+  op noSlots : -> PSpecList .
+  op _>>_ : PSpecList PSpecList -> PSpecList [assoc id: noSlots] .
+
+  --- Field-name sets (order-free): payload provided/required/optional and
+  --- decl-block clause coverage all reduce to set membership.
+  sort PFieldSet .
+  subsort PName < PFieldSet .
+  op noFields : -> PFieldSet .
+  op _++_ : PFieldSet PFieldSet -> PFieldSet [assoc comm id: noFields] .
+
+  --- A payload spec: `noPayload`, or a block carrying its required and
+  --- optional (allowed-but-not-required) field-name sets.
+  sort PPayload .
+  op noPayload : -> PPayload .
+  op withPayload : PFieldSet PFieldSet -> PPayload .
+
+  --- declaration_block clause spec/value sets: order-free `clauseVal`
+  --- pairs of (name, kind).
+  sorts PClauseVal PClauseValSet .
+  subsort PClauseVal < PClauseValSet .
+  op clauseVal : PName PKind -> PClauseVal .
+  op noClauseVals : -> PClauseValSet .
+  op _&_ : PClauseValSet PClauseValSet -> PClauseValSet [assoc comm id: noClauseVals] .
+
+  --- The source statement token stream (the tokens the body parser walks
+  --- after the leading keyword is matched by the driver).
+  sorts PTok PTokList .
+  subsort PTok < PTokList .
+  op connT : PConn -> PTok .            --- a connective word literal
+  op valT : PKind -> PTok .             --- a slot value of a given kind
+  op payloadT : PFieldSet -> PTok .     --- a `{ field* }` payload block
+  op bindT : -> PTok .                  --- a present `as <binding>`
+  op nameT : PKind -> PTok .            --- a declaration_block name value
+  op clausesT : PClauseValSet -> PTok . --- a declaration_block `{ clause* }`
+  op noToks : -> PTokList .
+  op _;_ : PTokList PTokList -> PTokList [assoc id: noToks] .
+
+  --- Manifest grammar spec (soup facts) + the source statement + a
+  --- parse trigger.
+  op grammarShape : ConstructId PShape -> Cfg .
+  op grammarEffectOp : ConstructId PSpecList PPayload PBind -> Cfg .
+  op grammarDeclBlock : ConstructId PKind PClauseValSet PClauseValSet -> Cfg .
+  op stmt : ConstructId PTokList -> Cfg .
+  op beginParse : ConstructId -> Cfg .
+
+  --- Parse-machine work terms.
+  op eoSlots : ConstructId PSpecList PTokList PPayload PBind -> Cfg .
+  op eoPayload : ConstructId PTokList PPayload PBind -> Cfg .
+  op eoPayloadCheck : ConstructId PFieldSet PFieldSet PFieldSet PTokList PBind -> Cfg .
+  op eoBinding : ConstructId PTokList PBind -> Cfg .
+  op eoFinish : ConstructId PTokList -> Cfg .
+  op dbName : ConstructId PKind PTokList PClauseValSet PClauseValSet -> Cfg .
+  op dbClauses : ConstructId PClauseValSet PClauseValSet PClauseValSet -> Cfg .
+
+  --- The parse accept: the statement matched its shape's template.
+  op parsedUse : ConstructId -> Cfg .
+
+  vars Cn : PConn .
+  vars Kd NK : PKind .
+  vars N Fld : PName .
+  vars Bnd : PBind .
+  vars Pay : PPayload .
+  vars SL : PSpecList .
+  vars TT : PTokList .
+  vars PR RR OPT : PFieldSet .
+  vars CV PRc RRc OPTc RQ : PClauseValSet .
+
+  --- Driver 1: an effect_operation statement starts the slot machine.
+  --- The keyword is already matched; the machine walks the remaining
+  --- tokens against the ordered slot list, then payload, then binding.
+  rl [eo-begin] :
+    beginParse(C) grammarShape(C, effectOp)
+    grammarEffectOp(C, SL, Pay, Bnd) stmt(C, TT)
+    =>
+    grammarShape(C, effectOp) grammarEffectOp(C, SL, Pay, Bnd)
+    eoSlots(C, SL, TT, Pay, Bnd) .
+
+  --- A leading slot with no connective consumes just a value of its kind.
+  rl [eo-slot-noconn] :
+    eoSlots(C, (slot(N, Kd, noConn) >> SL), (valT(Kd) ; TT), Pay, Bnd)
+    => eoSlots(C, SL, TT, Pay, Bnd) .
+
+  --- A slot with a required connective consumes that literal word first,
+  --- then a value of its kind. A statement missing the connective leaves
+  --- the value token where the connective was expected, so neither slot
+  --- rule fires and the machine is stuck.
+  rl [eo-slot-conn] :
+    eoSlots(C, (slot(N, Kd, Cn) >> SL), (connT(Cn) ; valT(Kd) ; TT), Pay, Bnd)
+    => eoSlots(C, SL, TT, Pay, Bnd) .
+
+  rl [eo-slots-done] :
+    eoSlots(C, noSlots, TT, Pay, Bnd)
+    => eoPayload(C, TT, Pay, Bnd) .
+
+  --- A `null` payload spec consumes no payload block.
+  rl [eo-payload-none] :
+    eoPayload(C, TT, noPayload, Bnd)
+    => eoBinding(C, TT, Bnd) .
+
+  --- A payload spec requires a payload block; its provided field set is
+  --- then validated against the required/optional (allowed) field sets.
+  rl [eo-payload-block] :
+    eoPayload(C, (payloadT(PR) ; TT), withPayload(RR, OPT), Bnd)
+    => eoPayloadCheck(C, PR, RR, OPT, TT, Bnd) .
+
+  --- A provided field that is required is consumed from both the provided
+  --- and required-remaining sets.
+  rl [pf-required] :
+    eoPayloadCheck(C, (Fld ++ PR), (Fld ++ RR), OPT, TT, Bnd)
+    => eoPayloadCheck(C, PR, RR, OPT, TT, Bnd) .
+
+  --- A provided field that is optional (allowed but not required) is
+  --- consumed from the provided set only.
+  rl [pf-optional] :
+    eoPayloadCheck(C, (Fld ++ PR), RR, (Fld ++ OPT), TT, Bnd)
+    => eoPayloadCheck(C, PR, RR, (Fld ++ OPT), TT, Bnd) .
+
+  --- Payload is well-formed only when every provided field was consumed
+  --- with none unknown and every required field was satisfied. An unknown
+  --- field leaves the provided set non-empty; a missing required field
+  --- leaves the required-remaining set non-empty; either way this rule
+  --- cannot fire and the machine is stuck.
+  rl [pf-done] :
+    eoPayloadCheck(C, noFields, noFields, OPT, TT, Bnd)
+    => eoBinding(C, TT, Bnd) .
+
+  --- The trailing `as <binding>`. A required binding consumes a present
+  --- `bindT`; if it is absent no rule fires and the machine is stuck.
+  rl [eo-bind-required] :
+    eoBinding(C, (bindT ; TT), bindRequired)
+    => eoFinish(C, TT) .
+
+  rl [eo-bind-optional-present] :
+    eoBinding(C, (bindT ; TT), bindOptional)
+    => eoFinish(C, TT) .
+
+  rl [eo-bind-optional-absent] :
+    eoBinding(C, TT, bindOptional)
+    => eoFinish(C, TT) .
+
+  rl [eo-bind-none] :
+    eoBinding(C, TT, bindNone)
+    => eoFinish(C, TT) .
+
+  --- A parse succeeds only when the whole token stream is consumed.
+  rl [eo-finish] :
+    eoFinish(C, noToks)
+    => parsedUse(C) .
+
+  --- Driver 2: a declaration_block statement. Match the name value of the
+  --- declared kind, then validate the order-free clause block.
+  rl [db-begin] :
+    beginParse(C) grammarShape(C, declBlock)
+    grammarDeclBlock(C, NK, RQ, OPTc) stmt(C, TT)
+    =>
+    grammarShape(C, declBlock) grammarDeclBlock(C, NK, RQ, OPTc)
+    dbName(C, NK, TT, RQ, OPTc) .
+
+  rl [db-name] :
+    dbName(C, NK, (nameT(NK) ; clausesT(CV)), RQ, OPTc)
+    => dbClauses(C, CV, RQ, OPTc) .
+
+  rl [db-clause-required] :
+    dbClauses(C, (clauseVal(N, Kd) & PRc), (clauseVal(N, Kd) & RRc), OPTc)
+    => dbClauses(C, PRc, RRc, OPTc) .
+
+  rl [db-clause-optional] :
+    dbClauses(C, (clauseVal(N, Kd) & PRc), RRc, (clauseVal(N, Kd) & OPTc))
+    => dbClauses(C, PRc, RRc, (clauseVal(N, Kd) & OPTc)) .
+
+  --- Clauses are well-formed only when every provided clause matched an
+  --- allowed spec (none unknown) and every required clause was present.
+  rl [db-clause-done] :
+    dbClauses(C, noClauseVals, noClauseVals, OPTc)
+    => parsedUse(C) .
 endm

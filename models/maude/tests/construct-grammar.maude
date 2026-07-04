@@ -279,3 +279,120 @@ search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
   requiredCapability(e2, memoryQuery)
   =>*
   runtimeAuthorized(e2, memoryProvider) .
+
+--- ====================================================================
+--- DR-0011 Two-Shape Meta-Grammar (S6b) parse coverage + bite.
+--- --------------------------------------------------------------------
+
+--- COVERAGE (a): a well-formed declaration_block parses. `memory pool`
+--- has an identifier name, a required `provider` clause, and an optional
+--- `retain` clause; a statement supplying both clauses reaches parsedUse.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(poolDecl)
+  grammarShape(poolDecl, declBlock)
+  grammarDeclBlock(poolDecl, identifierKind,
+    clauseVal(providerName, identifierKind),
+    clauseVal(retainName, durationKind))
+  stmt(poolDecl,
+    nameT(identifierKind) ;
+    clausesT(clauseVal(providerName, identifierKind) & clauseVal(retainName, durationKind)))
+  =>*
+  parsedUse(poolDecl) Rest:Cfg .
+
+--- COVERAGE (b): a well-formed slot-only effect_operation parses. `recall`
+--- has a leading `pool` identifier slot and a `for`-connected `query`
+--- expression slot, no payload, required binding.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(recallUse)
+  grammarShape(recallUse, effectOp)
+  grammarEffectOp(recallUse,
+    (slot(poolName, identifierKind, noConn) >> slot(queryName, expressionKind, forConn)),
+    noPayload, bindRequired)
+  stmt(recallUse,
+    valT(identifierKind) ; connT(forConn) ; valT(expressionKind) ; bindT)
+  =>*
+  parsedUse(recallUse) Rest:Cfg .
+
+--- COVERAGE (c): a well-formed payload effect_operation parses. `send`
+--- has a `via`-connected `channel` slot and a payload block requiring
+--- `text` with optional `markdown`/`thread_id`, required binding. The
+--- statement supplies `text` plus the optional `markdown`.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(sendUse)
+  grammarShape(sendUse, effectOp)
+  grammarEffectOp(sendUse,
+    slot(channelName, identifierKind, viaConn),
+    withPayload(textField, (markdownField ++ threadIdField)),
+    bindRequired)
+  stmt(sendUse,
+    connT(viaConn) ; valT(identifierKind) ; payloadT(textField ++ markdownField) ; bindT)
+  =>*
+  parsedUse(sendUse) Rest:Cfg .
+
+--- BITE (a): a missing required connective cannot parse. `recall pool
+--- query` drops the `for` before the query slot, so the value token sits
+--- where the connective was expected and the slot machine is stuck.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(recallMissingConn)
+  grammarShape(recallMissingConn, effectOp)
+  grammarEffectOp(recallMissingConn,
+    (slot(poolName, identifierKind, noConn) >> slot(queryName, expressionKind, forConn)),
+    noPayload, bindRequired)
+  stmt(recallMissingConn,
+    valT(identifierKind) ; valT(expressionKind) ; bindT)
+  =>*
+  parsedUse(recallMissingConn) Rest:Cfg .
+
+--- BITE (b): an unknown payload block field cannot parse. `send` with a
+--- `bogus` field that is neither required nor optional leaves the
+--- provided set non-empty, so payload validation never completes.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(sendUnknownField)
+  grammarShape(sendUnknownField, effectOp)
+  grammarEffectOp(sendUnknownField,
+    slot(channelName, identifierKind, viaConn),
+    withPayload(textField, (markdownField ++ threadIdField)),
+    bindRequired)
+  stmt(sendUnknownField,
+    connT(viaConn) ; valT(identifierKind) ; payloadT(textField ++ bogusField) ; bindT)
+  =>*
+  parsedUse(sendUnknownField) Rest:Cfg .
+
+--- BITE (c): a missing required payload field cannot parse. `send`
+--- without `text` leaves the required-remaining set non-empty, so
+--- payload validation never completes.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(sendMissingText)
+  grammarShape(sendMissingText, effectOp)
+  grammarEffectOp(sendMissingText,
+    slot(channelName, identifierKind, viaConn),
+    withPayload(textField, (markdownField ++ threadIdField)),
+    bindRequired)
+  stmt(sendMissingText,
+    connT(viaConn) ; valT(identifierKind) ; payloadT(markdownField) ; bindT)
+  =>*
+  parsedUse(sendMissingText) Rest:Cfg .
+
+--- BITE (d): a missing required `as` binding cannot parse. `recall` with
+--- a required binding but no trailing `as <binding>` leaves the binding
+--- machine with nothing to consume.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(recallNoBinding)
+  grammarShape(recallNoBinding, effectOp)
+  grammarEffectOp(recallNoBinding,
+    (slot(poolName, identifierKind, noConn) >> slot(queryName, expressionKind, forConn)),
+    noPayload, bindRequired)
+  stmt(recallNoBinding,
+    valT(identifierKind) ; connT(forConn) ; valT(expressionKind))
+  =>*
+  parsedUse(recallNoBinding) Rest:Cfg .
+
+--- BITE (e): a statement matching neither shape cannot parse. A construct
+--- whose grammar shape is neither declaration_block nor effect_operation
+--- has no driver rule, so parsing never starts.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(mysteryUse)
+  grammarShape(mysteryUse, noShape)
+  stmt(mysteryUse, valT(identifierKind))
+  =>*
+  parsedUse(mysteryUse) Rest:Cfg .
