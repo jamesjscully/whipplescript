@@ -1066,6 +1066,39 @@ manifest/`ConstructRegistration` schema with the `grammar` object (core
 (3) delete `parse_recall`/`parse_send`. The `grammar` field is only non-decorative
 once (2) reads it, so the two land together.
 
+**Parse-time grammar availability (architecture finding, 2026-07-04 — needs a
+decision before S6c code).** `parse_rule_body(source, base, mode)`
+(body.rs:865) takes NO construct registry: rule-body parsing is purely
+syntactic, and construct-use *authorization* happens post-parse
+(`validate_construct_uses_against_registry`, cli/main.rs:3561). That is exactly
+why `recall`/`send` are hardcoded at body.rs:1069-1070 — the parser cannot see a
+package's grammar at parse time. So a data-driven parser needs its grammar
+specs available *during* parsing, and there are two roads:
+
+- **Option A (recommended): read grammar from the embedded std manifests.**
+  Per M5, std packages ship as manifests compiled into the binary, so their
+  `grammar` specs ARE available at parse time (no lock resolution needed). The
+  body parser consults a parse-time table built from the embedded std manifests
+  and parses the two shapes generically; `parse_recall`/`parse_send` are
+  deleted. A new *std* construct then costs a manifest grammar entry, not a
+  parser function — the M1 win, for every package in scope (all std). This
+  **couples S6c with S6d**: the embedded-manifest grammar table (S6d) is the
+  input the parser (S6c) reads, so S6d's grammar-carrying manifests land with —
+  or just before — the S6c parser. Third-party (lock-provided) constructs keep
+  the current hardcoded-or-unsupported path.
+- **Option B (deferred, no demand): thread the resolved lock registry into
+  the parser.** Enables *third-party* data-driven parsing, but requires
+  resolving the lock before/around parsing (a two-pass or a new
+  `parse_rule_body` grammar parameter) — a parse-ordering architecture change.
+  No third-party construct exists today, so this is deferred with cause; the
+  authorize-post-parse fallback already covers third-party constructs' safety.
+
+Recommendation: build Option A (std grammar from embedded manifests) as S6c,
+sequenced with S6d; register Option B as the third-party follow-on. This keeps
+S6c tractable and demand-driven while still deleting the hardcoded std parsers.
+This is a significant architecture call within the M1-ruled build — flagged for
+review before the S6c/S6d code lands.
+
 ### Authorability door (S6, from the coherence pass)
 
 Registering a construct whose lowering class is `package_authorable: false`
