@@ -20100,6 +20100,7 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
                 effect,
                 &config,
                 &PackageLockCapabilityContract(package_lock),
+                &FixtureCapabilityProvider,
             )?,
             "queue.file" | "queue.claim" | "queue.release" | "queue.finish" => {
                 run_queue_effect_generic(kernel, id, effect, &config)?
@@ -22923,6 +22924,7 @@ fn run_capability_effect(
         effect,
         &options.effect_config(),
         &PackageLockCapabilityContract(package_lock),
+        &FixtureCapabilityProvider,
     )
 }
 

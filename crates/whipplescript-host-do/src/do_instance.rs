@@ -26,7 +26,7 @@ use whipplescript_kernel::effect_handlers::{
     run_capability_effect_generic, run_coordination_effect_generic, run_event_effect_generic,
     run_file_effect_generic, run_file_import_effect_generic, run_file_write_effect_generic,
     run_human_effect_generic, run_loft_effect_generic, run_notify_effect_generic,
-    run_queue_effect_generic, CapabilityContract, DeliveryGovernance,
+    run_queue_effect_generic, CapabilityContract, DeliveryGovernance, FixtureCapabilityProvider,
 };
 use whipplescript_kernel::harness_loop::{
     provider_result_from_brokered_turn, BrokeredTurnInput, BrokeredTurnMachine,
@@ -165,6 +165,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 effect,
                 &config,
                 &DoCapabilityContract,
+                &FixtureCapabilityProvider,
             )?,
             // The agent turn: multi-round sans-IO. Each round drives the
             // BrokeredTurnMachine one provider call, persisting its snapshot so an

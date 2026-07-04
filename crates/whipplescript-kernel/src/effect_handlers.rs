@@ -1800,6 +1800,49 @@ pub trait CapabilityContract {
     fn validate_output(&self, effect: &ClaimableEffect, value: &Value) -> Option<String>;
 }
 
+/// Outcome of a capability host projection: either a produced success value (which
+/// still flows through `CapabilityContract::validate_output`) or a provider-side
+/// failure. Mirrors the two arms the fixture drives today.
+pub enum CapabilityOutcome {
+    /// Provider produced a success value (fed to the contract before completion).
+    Produced(Value),
+    /// Provider failed before producing a value.
+    Failed { error_kind: String, message: String },
+}
+
+/// Host projection of the capability provider (mirrors `CapabilityContract`). The
+/// capability core no longer fabricates the fixture output/failure itself; it asks
+/// the provider what to produce, then validates + settles the terminal identically.
+///
+/// Provider *selection* (a `capability_bound` row carrying provider name + config)
+/// is intentionally NOT modeled here: with only the fixture provider it would be
+/// decorative. It lands with the first real provider (the `std.memory` tail).
+pub trait CapabilityProvider {
+    /// Produce the capability outcome for `effect` under `config`.
+    fn produce(&self, effect: &ClaimableEffect, config: &EffectConfig) -> CapabilityOutcome;
+}
+
+/// The fixture capability provider: the behavior the capability core hardcoded
+/// before the seam existed. Failure when `config.outcome_failed`, else the fixed
+/// fixture context value. Shared by the native worker and the durable object so
+/// neither redefines the fixture values.
+pub struct FixtureCapabilityProvider;
+impl CapabilityProvider for FixtureCapabilityProvider {
+    fn produce(&self, effect: &ClaimableEffect, config: &EffectConfig) -> CapabilityOutcome {
+        if config.outcome_failed {
+            CapabilityOutcome::Failed {
+                error_kind: "fixture_failure".to_owned(),
+                message: "fixture capability failure".to_owned(),
+            }
+        } else {
+            CapabilityOutcome::Produced(json!({
+                "summary": "Fixture capability context",
+                "target": effect.target,
+            }))
+        }
+    }
+}
+
 /// Host-agnostic core (DR-0033 chunk 3): run the capability call + its terminal
 /// over a held `RuntimeKernel<S>` (only kernel methods, so `S: RuntimeStore`).
 pub fn run_capability_effect_generic<S: RuntimeStore>(
@@ -1808,6 +1851,7 @@ pub fn run_capability_effect_generic<S: RuntimeStore>(
     effect: &ClaimableEffect,
     config: &EffectConfig,
     contract: &dyn CapabilityContract,
+    provider: &dyn CapabilityProvider,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input = json_from_str(&effect.input_json);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "capability-run"]);
@@ -1827,74 +1871,19 @@ pub fn run_capability_effect_generic<S: RuntimeStore>(
         .to_string(),
     })?;
 
-    let terminal = if config.outcome_failed {
-        let metadata_json = json!({
-            "failure": {
-                "phase": "provider.capability.failed",
-                "error_kind": "fixture_failure",
-                "message": "fixture capability failure"
-            },
-            "target": effect.target,
-            "input": input,
-        })
-        .to_string();
-        let terminal = kernel.fail_run(EffectCompletion {
-            instance_id,
-            effect_id: &effect.effect_id,
-            run_id: &run_id,
-            provider: &config.provider,
-            worker_id: "whip-worker",
-            status: "failed",
-            exit_code: Some(1),
-            summary: Some("fixture capability failure"),
-            metadata_json: &metadata_json,
-            idempotency_key: Some(&idempotency_key(&[
-                instance_id,
-                &effect.effect_id,
-                "terminal",
-            ])),
-        })?;
-        let value_json = json!({
-            "effect_id": effect.effect_id,
-            "run_id": run_id,
-            "target": effect.target,
-            "status": "failed",
-            "value": effect_failure_base("capability.call", "fixture capability failure", "fixture capability failure", &effect.effect_id, &run_id),
-            "error": {
-                "kind": "fixture_failure",
-                "message": "fixture capability failure"
-            },
-            "summary": "fixture capability failure"
-        })
-        .to_string();
-        kernel.derive_fact(
-            instance_id,
-            "capability.call.failed",
-            &effect.effect_id,
-            &value_json,
-            Some(&terminal.event_id),
-            Some(&idempotency_key(&[
-                instance_id,
-                &effect.effect_id,
-                "capability.call.failed",
-            ])),
-        )?;
-        terminal
-    } else {
-        let value = json!({
-            "summary": "Fixture capability context",
-            "target": effect.target,
-        });
-        if let Some(error) = contract.validate_output(effect, &value) {
+    let terminal = match provider.produce(effect, config) {
+        CapabilityOutcome::Failed {
+            error_kind,
+            message,
+        } => {
             let metadata_json = json!({
                 "failure": {
-                    "phase": "provider.capability.output_validation",
-                    "error_kind": "provider_output_validation",
-                    "message": error,
+                    "phase": "provider.capability.failed",
+                    "error_kind": &error_kind,
+                    "message": &message
                 },
                 "target": effect.target,
                 "input": input,
-                "value": value,
             })
             .to_string();
             let terminal = kernel.fail_run(EffectCompletion {
@@ -1905,7 +1894,7 @@ pub fn run_capability_effect_generic<S: RuntimeStore>(
                 worker_id: "whip-worker",
                 status: "failed",
                 exit_code: Some(1),
-                summary: Some("fixture capability output validation failed"),
+                summary: Some(message.as_str()),
                 metadata_json: &metadata_json,
                 idempotency_key: Some(&idempotency_key(&[
                     instance_id,
@@ -1918,12 +1907,12 @@ pub fn run_capability_effect_generic<S: RuntimeStore>(
                 "run_id": run_id,
                 "target": effect.target,
                 "status": "failed",
-                "value": effect_failure_base("capability.call", &error, "fixture capability output validation failed", &effect.effect_id, &run_id),
+                "value": effect_failure_base("capability.call", &message, &message, &effect.effect_id, &run_id),
                 "error": {
-                    "kind": "provider_output_validation",
-                    "message": error,
+                    "kind": &error_kind,
+                    "message": &message
                 },
-                "summary": "fixture capability output validation failed"
+                "summary": &message
             })
             .to_string();
             kernel.derive_fact(
@@ -1938,53 +1927,110 @@ pub fn run_capability_effect_generic<S: RuntimeStore>(
                     "capability.call.failed",
                 ])),
             )?;
-            return Ok(terminal);
+            terminal
         }
-        let metadata_json = json!({
-            "target": effect.target,
-            "input": input,
-            "value": value,
-        })
-        .to_string();
-        let terminal = kernel.complete_run(EffectCompletion {
-            instance_id,
-            effect_id: &effect.effect_id,
-            run_id: &run_id,
-            provider: &config.provider,
-            worker_id: "whip-worker",
-            status: "completed",
-            exit_code: Some(0),
-            summary: Some("fixture capability completed"),
-            metadata_json: &metadata_json,
-            idempotency_key: Some(&idempotency_key(&[
+        CapabilityOutcome::Produced(value) => {
+            if let Some(error) = contract.validate_output(effect, &value) {
+                let metadata_json = json!({
+                    "failure": {
+                        "phase": "provider.capability.output_validation",
+                        "error_kind": "provider_output_validation",
+                        "message": error,
+                    },
+                    "target": effect.target,
+                    "input": input,
+                    "value": value,
+                })
+                .to_string();
+                let terminal = kernel.fail_run(EffectCompletion {
+                    instance_id,
+                    effect_id: &effect.effect_id,
+                    run_id: &run_id,
+                    provider: &config.provider,
+                    worker_id: "whip-worker",
+                    status: "failed",
+                    exit_code: Some(1),
+                    summary: Some("fixture capability output validation failed"),
+                    metadata_json: &metadata_json,
+                    idempotency_key: Some(&idempotency_key(&[
+                        instance_id,
+                        &effect.effect_id,
+                        "terminal",
+                    ])),
+                })?;
+                let value_json = json!({
+                "effect_id": effect.effect_id,
+                "run_id": run_id,
+                "target": effect.target,
+                "status": "failed",
+                "value": effect_failure_base("capability.call", &error, "fixture capability output validation failed", &effect.effect_id, &run_id),
+                "error": {
+                    "kind": "provider_output_validation",
+                    "message": error,
+                },
+                "summary": "fixture capability output validation failed"
+            })
+            .to_string();
+                kernel.derive_fact(
+                    instance_id,
+                    "capability.call.failed",
+                    &effect.effect_id,
+                    &value_json,
+                    Some(&terminal.event_id),
+                    Some(&idempotency_key(&[
+                        instance_id,
+                        &effect.effect_id,
+                        "capability.call.failed",
+                    ])),
+                )?;
+                return Ok(terminal);
+            }
+            let metadata_json = json!({
+                "target": effect.target,
+                "input": input,
+                "value": value,
+            })
+            .to_string();
+            let terminal = kernel.complete_run(EffectCompletion {
                 instance_id,
-                &effect.effect_id,
-                "terminal",
-            ])),
-        })?;
-        let value_json = json!({
-            "effect_id": effect.effect_id,
-            "run_id": run_id,
-            "target": effect.target,
-            "status": "completed",
-            "value": value,
-            "error": null,
-            "summary": "fixture capability completed"
-        })
-        .to_string();
-        kernel.derive_fact(
-            instance_id,
-            "capability.call.succeeded",
-            &effect.effect_id,
-            &value_json,
-            Some(&terminal.event_id),
-            Some(&idempotency_key(&[
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: &config.provider,
+                worker_id: "whip-worker",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some("fixture capability completed"),
+                metadata_json: &metadata_json,
+                idempotency_key: Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "terminal",
+                ])),
+            })?;
+            let value_json = json!({
+                "effect_id": effect.effect_id,
+                "run_id": run_id,
+                "target": effect.target,
+                "status": "completed",
+                "value": value,
+                "error": null,
+                "summary": "fixture capability completed"
+            })
+            .to_string();
+            kernel.derive_fact(
                 instance_id,
-                &effect.effect_id,
                 "capability.call.succeeded",
-            ])),
-        )?;
-        terminal
+                &effect.effect_id,
+                &value_json,
+                Some(&terminal.event_id),
+                Some(&idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "capability.call.succeeded",
+                ])),
+            )?;
+            terminal
+        }
     };
     Ok(terminal)
 }
