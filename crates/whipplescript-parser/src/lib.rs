@@ -6596,6 +6596,28 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
             suggestion: Some("add `url \"https://example.com/feed.json\"`".to_owned()),
         });
     }
+    // The runtime GETs the url with an HTTP client, so it must be an absolute
+    // http(s) URL — catch a scheme-less or wrong-scheme url at `whip check`
+    // rather than as a runtime request error.
+    if is_http {
+        if let Some(url) = &source.url {
+            let scheme_ok = url.value.starts_with("http://") || url.value.starts_with("https://");
+            if !scheme_ok {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: url.span,
+                    message: format!(
+                        "`http` source `{}` url `{}` is not an absolute http(s) URL",
+                        source.name.name, url.value
+                    ),
+                    suggestion: Some(
+                        "use an absolute `http://` or `https://` URL the runtime can GET"
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+    }
     if !is_http {
         if let Some(url) = &source.url {
             diagnostics.push(Diagnostic {
@@ -23831,6 +23853,45 @@ rule grab
                 .iter()
                 .any(|d| d.message.contains("renews unknown lease")),
             "renewing an acquired lease must not be flagged"
+        );
+    }
+
+    #[test]
+    fn http_source_url_must_have_an_http_scheme() {
+        // The runtime GETs the url, so a scheme-less url is caught at check time.
+        let source = "\
+workflow BadUrl
+signal ingress.fed { text string }
+source http as feed {
+  url \"not-a-real-url\"
+  observe as obs
+  emit ingress.fed { text obs.item }
+}
+output result Done
+class Done { ok string }
+rule react
+  when ingress.fed as f
+=> { complete result { ok \"ok\" } }
+";
+        let messages: Vec<String> = compile_program(source)
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("is not an absolute http(s) URL")),
+            "expected the http url-scheme diagnostic, got {messages:?}"
+        );
+        // A well-formed https url must not be flagged.
+        let ok = source.replace("not-a-real-url", "https://example.com/feed.json");
+        assert!(
+            !compile_program(&ok)
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("absolute http(s) URL")),
+            "a well-formed url must not be flagged"
         );
     }
 
