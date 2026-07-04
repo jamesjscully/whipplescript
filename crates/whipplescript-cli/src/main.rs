@@ -166,6 +166,7 @@ fn main() -> ExitCode {
         Some("agent") => whip_agent(&options),
         Some("agents") => agents(&options),
         Some("providers") => providers(&options),
+        Some("skills") => skills(&options),
         Some("lint") => lint(&options),
         Some("lsp") => lsp(&options),
         Some("fmt") => fmt(&options),
@@ -326,6 +327,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "doctor" => "usage: whip doctor [--providers] [--provider-config <path>] [--record-provider-evidence <instance>]",
         "agents" => "usage: whip [--json] agents [--root <workflow>] <workflow.whip>",
         "providers" => "usage: whip [--json] providers [--root <workflow>] <workflow.whip>",
+        "skills" => "usage: whip [--json] skills [--root <workflow>] <workflow.whip>",
         "auth" => "usage: whip auth <status | set <openai|anthropic> <key>>",
         "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--from <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
         _ => return None,
@@ -1752,6 +1754,79 @@ fn providers(options: &CliOptions) -> ExitCode {
         println!("provider {provider}");
         for reference in refs {
             println!("  {reference}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `whip skills <workflow.whip>` — completes the agent-introspection trio
+/// (agents / providers / skills): lists every skill declared across the
+/// program's agents, each with the agents that declare it. Reads the compiled IR.
+fn skills(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip [--json] skills [--root <workflow>] <workflow.whip>";
+    let mut source: Option<String> = None;
+    let mut root: Option<String> = None;
+    let mut index = 0;
+    while index < options.args.len() {
+        match options.args[index].as_str() {
+            "--root" => {
+                index += 1;
+                root = options.args.get(index).cloned();
+            }
+            "--package-lock" => {
+                index += 1;
+            }
+            arg if !arg.starts_with('-') => source = Some(arg.to_owned()),
+            other => {
+                eprintln!("unknown skills option `{other}`");
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+        index += 1;
+    }
+    let Some(source_path) = source else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let (_source, ir) = match compile_source_path_with_root(&source_path, root.as_deref()) {
+        Ok(pair) => pair,
+        Err(error) => return report_compile_failure(&source_path, error),
+    };
+
+    // skill name -> sorted, deduped declaring agents.
+    let mut declared: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for agent in &ir.agents {
+        for skill in &agent.skills {
+            declared
+                .entry(skill.clone())
+                .or_default()
+                .insert(agent.name.clone());
+        }
+    }
+
+    if options.json {
+        let skills_json: Vec<Value> = declared
+            .iter()
+            .map(|(skill, agents)| {
+                json!({
+                    "skill": skill,
+                    "declared_by": agents.iter().cloned().collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        return emit_json(json!({ "skills": skills_json }));
+    }
+
+    if declared.is_empty() {
+        println!("no skills declared");
+        return ExitCode::SUCCESS;
+    }
+    for (skill, agents) in &declared {
+        println!("skill {skill}");
+        for agent in agents {
+            println!("  {agent}");
         }
     }
     ExitCode::SUCCESS

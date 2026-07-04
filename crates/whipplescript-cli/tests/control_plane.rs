@@ -122,6 +122,32 @@ fn providers_command_aggregates_all_providers() {
     assert_eq!(find("clock"), Some(vec!["source:daily_triage".to_owned()]));
 }
 
+/// `whip skills <workflow>` completes the introspection trio: every skill
+/// declared across the program's agents, each with its declaring agents.
+#[test]
+fn skills_command_lists_declared_skills() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let example = example_path("revision-ticket-v1.whip");
+    let report = run_json(bin, &["--json", "skills", example.to_str().expect("utf-8")]);
+    let skills = report
+        .get("skills")
+        .and_then(Value::as_array)
+        .expect("skills array");
+    let author = skills
+        .iter()
+        .find(|s| s.get("skill").and_then(Value::as_str) == Some("whipplescript-author"))
+        .and_then(|s| s.get("declared_by"))
+        .and_then(Value::as_array)
+        .map(|agents| {
+            agents
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
+    assert_eq!(author, Some(vec!["worker".to_owned()]));
+}
+
 /// (with a hygienic `turn__act0` binding) must run end to end under the fixture
 /// provider: the tell effect completes, the seeded `ChangeRequest` is consumed,
 /// and a `ReviewedChange` fact is recorded.
