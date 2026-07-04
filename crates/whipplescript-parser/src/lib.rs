@@ -13079,6 +13079,35 @@ fn validate_coordination_discipline(
     let mut consumes = Vec::new();
     collect_coordination_effects(statements, &mut acquires, &mut consumes);
 
+    // A `renew <binding>` renews a lease acquired in the same rule: its binding
+    // must name an `acquire ... as <binding>` here. Renew resolves the acquire's
+    // recorded resource/key at runtime, so an unknown binding renews nothing —
+    // catch the typo at `whip check`. (Scoped to `renew`, which is new; the
+    // pre-existing `release` binding is validated separately/not yet.)
+    let acquire_bindings: BTreeSet<&str> = acquires.iter().map(|(b, _, _)| b.as_str()).collect();
+    for_each_body(statements, &mut |stmt| {
+        if let body::BodyStmt::Effect(effect) = stmt {
+            if let body::BodyEffectKind::LeaseRenew {
+                acquire_binding, ..
+            } = &effect.kind
+            {
+                if !acquire_bindings.contains(acquire_binding.as_str()) {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: effect.span,
+                        message: format!(
+                            "rule `{}` renews unknown lease `{}`",
+                            rule.name.name, acquire_binding
+                        ),
+                        suggestion: Some(format!(
+                            "`renew {acquire_binding}` must name a lease acquired in this rule with `acquire ... as {acquire_binding}`"
+                        )),
+                    });
+                }
+            }
+        }
+    });
+
     if acquires.len() > 1 {
         diagnostics.push(Diagnostic { related: Vec::new(),
             span: acquires[1].2,
@@ -23758,6 +23787,50 @@ rule react
                 .iter()
                 .any(|d| d.message.contains("observation has no field")),
             "a valid observation field must not be flagged"
+        );
+    }
+
+    #[test]
+    fn renew_of_unacquired_lease_is_flagged_statically() {
+        // `renew <binding>` must name a lease acquired in the same rule; a typo
+        // (here `nonexistent`, no matching acquire) is caught at `whip check`
+        // rather than renewing nothing at runtime.
+        let source = "\
+workflow RenewTypo
+class Ticket { id string }
+class Done { ok string }
+lease slot { shared key Ticket slots 1 ttl 60s }
+output result Done
+table seed as Ticket [ { id \"t\" } ]
+rule grab
+  when Ticket as t
+=> {
+  acquire slot for t.id until ttl as held
+  after held held {
+    renew nonexistent until 300s as r
+    complete result { ok \"ok\" }
+  }
+}
+";
+        let messages: Vec<String> = compile_program(source)
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("renews unknown lease `nonexistent`")),
+            "expected the unknown-lease-renew diagnostic, got {messages:?}"
+        );
+        // Renewing the actually-acquired lease (`held`) must not be flagged.
+        let ok = source.replace("renew nonexistent", "renew held");
+        assert!(
+            !compile_program(&ok)
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("renews unknown lease")),
+            "renewing an acquired lease must not be flagged"
         );
     }
 
