@@ -2801,6 +2801,28 @@ impl SqliteStore {
         ))
     }
 
+    /// The provider name bound to `capability` for the program running
+    /// `instance_id`, mirroring `capability_bound`'s program-scoped-wins-over-global
+    /// scoping. `None` when no binding row exists (or its `provider` column is NULL).
+    /// This is the registry-driven `CapabilityProvider` selection seam (S5 → first
+    /// real provider): the native worker maps the returned name to a concrete impl.
+    pub fn capability_bound_provider(
+        &self,
+        instance_id: &str,
+        capability: &str,
+    ) -> StoreResult<Option<String>> {
+        let program_id = self
+            .connection
+            .query_row(
+                "SELECT program_id FROM instances WHERE instance_id = ?1",
+                [instance_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        capability_bound_provider(&self.connection, &program_id, capability)
+    }
+
     pub fn bind_capability(&self, binding: CapabilityBinding<'_>) -> StoreResult<()> {
         serde_json::from_str::<Value>(binding.config_json)?;
         self.connection.execute(
@@ -6960,6 +6982,36 @@ fn capability_bound(
         )
         .optional()
         .map(|row| row.is_some())
+        .map_err(Into::into)
+}
+
+/// The provider name bound to `capability`, mirroring `capability_bound`'s
+/// program-scoped-wins-over-global scoping (a program-scoped row beats a global
+/// `NULL` one). `Ok(None)` when no binding row exists or its `provider` column is
+/// NULL. This reads the `capability_bindings.provider` column that `capability_bound`
+/// only tested for existence — the registry-driven `CapabilityProvider` selection
+/// seam (S5) that lands with the first real per-capability provider.
+#[cfg(feature = "native")]
+fn capability_bound_provider(
+    connection: &Connection,
+    program_id: &str,
+    capability: &str,
+) -> StoreResult<Option<String>> {
+    connection
+        .query_row(
+            r#"
+            SELECT provider
+            FROM capability_bindings
+            WHERE capability = ?1
+              AND (program_id = ?2 OR program_id IS NULL)
+            ORDER BY (program_id IS NULL) ASC
+            LIMIT 1
+            "#,
+            params![capability, program_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
         .map_err(Into::into)
 }
 

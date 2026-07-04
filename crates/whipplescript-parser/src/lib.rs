@@ -15536,7 +15536,8 @@ fn parse_effect_line(line: &str) -> Option<(IrEffectKind, Option<String>)> {
         IrEffectKind::LoftClaim
     } else if line.starts_with("askHuman") {
         IrEffectKind::HumanAsk
-    } else if line.starts_with("call ") || line.starts_with("recall ") {
+    } else if line.starts_with("call ") || line.starts_with("recall ") || line.starts_with("learn ")
+    {
         IrEffectKind::CapabilityCall
     } else if line.starts_with("emit ") {
         IrEffectKind::EventEmit

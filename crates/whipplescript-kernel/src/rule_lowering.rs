@@ -2944,6 +2944,50 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 required_capabilities: vec![target],
                 after: current_after,
             });
+        } else if trimmed.strip_prefix("learn ").is_some() {
+            // learn from <source> into <pool> [{ note <expr> }] as <binding>
+            // (std.memory). The optional `{ note <expr> }` block may span lines,
+            // so gather it; the source/note expressions resolve at commit against
+            // the (after-)context, so they are carried raw in `args`. Lowers to a
+            // `memory.write` capability.call (round-trip partner of `recall`).
+            let (statement, next_index) =
+                parse_statement_until_balanced_braces(&lines, index, trimmed);
+            let header = statement.split('{').next().unwrap_or(&statement);
+            let after_learn = header.trim().strip_prefix("learn ").unwrap_or("").trim();
+            let after_from = after_learn.strip_prefix("from ").unwrap_or(after_learn);
+            let mut into_split = after_from.splitn(2, " into ");
+            let source_expr = into_split.next().unwrap_or("").trim().to_owned();
+            let pool = into_split
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            // Optional `{ note <expr> }` payload; empty string when absent.
+            let note_expr = invoke_body(&statement)
+                .and_then(|inner| {
+                    inner
+                        .trim()
+                        .strip_prefix("note ")
+                        .map(str::trim)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            let target = "memory.write".to_owned();
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(&statement),
+                kind: "capability.call".to_owned(),
+                target: Some(target.clone()),
+                name: Some("learn".to_owned()),
+                binding: binding_after_as(&statement),
+                args: vec![source_expr, pool, note_expr],
+                prompt: None,
+                prompt_content_type: None,
+                required_capabilities: vec![target],
+                after: current_after,
+            });
+            index = next_index;
         } else if let Some(rest) = trimmed.strip_prefix("call ") {
             let target = rest
                 .split_whitespace()
@@ -3595,6 +3639,26 @@ pub fn parsed_effect_input_json(
                 "bindings": context_bindings_json(context),
                 "rule": rule.name,
             })
+        }
+        "capability.call" if effect.name.as_deref() == Some("learn") => {
+            let source_expr = effect.args.first().cloned().unwrap_or_default();
+            let pool = effect.args.get(1).cloned().unwrap_or_default();
+            let note_expr = effect.args.get(2).cloned().unwrap_or_default();
+            let mut input = serde_json::Map::new();
+            input.insert("target".to_owned(), json!(effect.target));
+            input.insert("source_form".to_owned(), json!("learn"));
+            input.insert("pool".to_owned(), json!(pool));
+            input.insert(
+                "source".to_owned(),
+                parse_field_value(&source_expr, context),
+            );
+            input.insert("source_expr".to_owned(), json!(source_expr));
+            if !note_expr.is_empty() {
+                input.insert("note".to_owned(), parse_field_value(&note_expr, context));
+            }
+            input.insert("bindings".to_owned(), context_bindings_json(context));
+            input.insert("rule".to_owned(), json!(rule.name));
+            Value::Object(input)
         }
         "capability.call" if effect.name.as_deref() == Some("send") => {
             let channel = effect.args.first().cloned().unwrap_or_default();

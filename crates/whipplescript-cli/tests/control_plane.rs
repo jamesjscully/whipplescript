@@ -6607,6 +6607,115 @@ rule recall_before_work
     let _ = fs::remove_file(lock_path);
 }
 
+/// `learn ... into <pool>` then `recall <pool> ...` round-trips through the
+/// file-backed `MemoryCapabilityProvider` (selected by the `memory-provider`
+/// binding): the recalled `MemoryContext` must contain the learned item. This is
+/// the first per-capability real provider — recall is no longer the fixture.
+#[test]
+fn memory_roundtrip_recalls_the_learned_item() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("memory-roundtrip");
+    let store_path = dir.join("store.db");
+    let workflow_src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/memory-roundtrip.whip");
+    let workflow_path = dir.join("wf.whip");
+    fs::copy(&workflow_src, &workflow_path).expect("copy roundtrip example");
+    let memory_manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
+    let manifest_copy = dir.join("memory.json");
+    fs::copy(&memory_manifest, &manifest_copy).expect("copy manifest beside lock");
+    let lock_path = dir.join("whip.lock");
+    run_text(
+        bin,
+        &[
+            "package",
+            "lock",
+            "--output",
+            lock_path.to_str().expect("utf-8 lock"),
+            manifest_copy.to_str().expect("utf-8 manifest"),
+        ],
+    );
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store"),
+            "--json",
+            "dev",
+            workflow_path.to_str().expect("utf-8 workflow"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+            "--package-lock",
+            lock_path.to_str().expect("utf-8 lock"),
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+
+    // The `learn` write settled successfully (memory.write capability).
+    assert!(
+        facts.iter().any(|fact| {
+            fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded")
+                && fact.pointer("/value/target").and_then(Value::as_str) == Some("memory.write")
+        }),
+        "learn should settle a memory.write success fact"
+    );
+
+    // The `recall` read back a real MemoryContext containing the learned item.
+    let context = facts
+        .iter()
+        .find(|fact| {
+            fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded")
+                && fact.pointer("/value/target").and_then(Value::as_str) == Some("memory.query")
+        })
+        .expect("recall should settle a memory.query success fact");
+    let memory = context
+        .pointer("/value/value")
+        .expect("recall context value");
+    assert_eq!(
+        memory.get("pool").and_then(Value::as_str),
+        Some("project_memory"),
+        "context reports its pool"
+    );
+    assert_eq!(
+        memory.get("count").and_then(Value::as_u64),
+        Some(1),
+        "exactly the one learned item is recalled"
+    );
+    let items = memory
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("note").and_then(Value::as_str),
+        Some("remember alpha"),
+        "the recalled item carries the learned note"
+    );
+    assert_eq!(
+        items[0].get("pool").and_then(Value::as_str),
+        Some("project_memory")
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Create a unique temp directory tagged with `label`.
 fn unique_temp_dir(label: &str) -> PathBuf {
     let nanos = SystemTime::now()

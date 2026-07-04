@@ -22919,13 +22919,26 @@ fn run_capability_effect(
     options: &WorkerOptions,
     package_lock: Option<&LoadedPackageLock>,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
+    let store = SqliteStore::open(store_path)?;
+    // Registry-driven provider *selection* (S5 seam, first real providers): read the
+    // `capability_bindings.provider` name bound for this capability. A program-scoped
+    // binding wins over a global one; `None` when unbound (or its provider is NULL).
+    let bound_provider = effect
+        .target
+        .as_deref()
+        .filter(|target| !target.is_empty())
+        .map(|target| store.capability_bound_provider(instance_id, target))
+        .transpose()?
+        .flatten();
+    let mut kernel = RuntimeKernel::new(store);
     let contract = PackageLockCapabilityContract(package_lock);
-    // Provider *selection* (S5 seam, first real provider): a `messaging.send`
-    // whose channel declares `provider local` is delivered by the native
-    // file-backed local mailbox; every other send (and every non-messaging
-    // capability) stays on the fixture provider — this default is what keeps
-    // all existing send tests byte-identical.
+    // A `messaging.send` whose channel declares `provider local` is delivered by the
+    // native file-backed local mailbox (selected from the effect's threaded channel
+    // provider, not a binding row). Then the binding-owned name→impl map: a
+    // `memory-provider` binding (memory.query/memory.write) routes to the file-backed
+    // MemoryCapabilityProvider. Every unmapped provider name — and every unbound
+    // capability — falls back to the fixture, which keeps all existing capability
+    // tests byte-identical.
     if effect.target.as_deref() == Some("messaging.send")
         && capability_input_provider(effect).as_deref() == Some("local")
     {
@@ -22939,6 +22952,18 @@ fn run_capability_effect(
             &options.effect_config(),
             &contract,
             &mailbox,
+        )
+    } else if bound_provider.as_deref() == Some("memory-provider") {
+        let memory = MemoryCapabilityProvider {
+            store_path: store_path.with_extension("memory.jsonl"),
+        };
+        run_capability_effect_generic(
+            &mut kernel,
+            instance_id,
+            effect,
+            &options.effect_config(),
+            &contract,
+            &memory,
         )
     } else {
         run_capability_effect_generic(
@@ -23038,6 +23063,115 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for LocalMailboxC
             "channel": channel,
             "delivered": true,
         }))
+    }
+}
+
+/// Native, file-backed memory provider (S5 first per-capability real provider,
+/// selected by the `memory-provider` binding for `memory.query`/`memory.write`).
+/// A single append-only `<store>.memory.jsonl` holds one JSON record per learned
+/// item; `recall` reads it back filtered by pool. Deterministic: the message id is
+/// derived from the effect id (no wall-clock, no randomness), so replay is stable.
+///
+/// Memory pools are provider-*less* by design — selection is owned by the binding,
+/// not the pool binding on the workflow — so both memory capabilities route here.
+struct MemoryCapabilityProvider {
+    store_path: PathBuf,
+}
+
+impl MemoryCapabilityProvider {
+    /// Read every stored record, keeping only those in `pool`. A missing store is
+    /// an empty history (recall must return a valid context, never fail, when empty).
+    fn items_in_pool(&self, pool: &str) -> Vec<Value> {
+        let Ok(content) = std::fs::read_to_string(&self.store_path) else {
+            return Vec::new();
+        };
+        content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|record| record.get("pool").and_then(Value::as_str) == Some(pool))
+            .collect()
+    }
+}
+
+impl whipplescript_kernel::effect_handlers::CapabilityProvider for MemoryCapabilityProvider {
+    fn produce(
+        &self,
+        effect: &ClaimableEffect,
+        _config: &EffectConfig,
+    ) -> whipplescript_kernel::effect_handlers::CapabilityOutcome {
+        use whipplescript_kernel::effect_handlers::CapabilityOutcome;
+        let input: Value = match serde_json::from_str(&effect.input_json) {
+            Ok(value) => value,
+            Err(err) => {
+                return CapabilityOutcome::Failed {
+                    error_kind: "memory".to_owned(),
+                    message: format!("invalid memory input: {err}"),
+                };
+            }
+        };
+        let pool = input
+            .get("pool")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        // Deterministic message id: derived from the effect id, never wall-clock.
+        let message_id = idempotency_key(&[&effect.effect_id, "memory-message"]);
+
+        match effect.target.as_deref() {
+            Some("memory.write") => {
+                // Append one record for the learned item. `source` is the resolved
+                // `from <source>` value; `note` the optional `{ note <expr> }` field.
+                let mut record = serde_json::Map::new();
+                record.insert("message_id".to_owned(), Value::String(message_id.clone()));
+                record.insert("pool".to_owned(), Value::String(pool.clone()));
+                record.insert(
+                    "source".to_owned(),
+                    input.get("source").cloned().unwrap_or(Value::Null),
+                );
+                if let Some(note) = input.get("note") {
+                    record.insert("note".to_owned(), note.clone());
+                }
+                let mut line = serde_json::to_string(&Value::Object(record))
+                    .unwrap_or_else(|_| "{}".to_owned());
+                line.push('\n');
+                if let Err(err) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.store_path)
+                    .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()))
+                {
+                    return CapabilityOutcome::Failed {
+                        error_kind: "memory".to_owned(),
+                        message: format!(
+                            "memory write to {} failed: {err}",
+                            self.store_path.display()
+                        ),
+                    };
+                }
+                CapabilityOutcome::Produced(json!({
+                    "pool": pool,
+                    "message_id": message_id,
+                    "stored": true,
+                }))
+            }
+            Some("memory.query") => {
+                // A MemoryContext: the stored items for this pool (empty is valid).
+                let items = self.items_in_pool(&pool);
+                CapabilityOutcome::Produced(json!({
+                    "pool": pool,
+                    "count": items.len(),
+                    "items": items,
+                }))
+            }
+            other => CapabilityOutcome::Failed {
+                error_kind: "memory".to_owned(),
+                message: format!(
+                    "memory-provider does not handle capability `{}`",
+                    other.unwrap_or_default()
+                ),
+            },
+        }
     }
 }
 

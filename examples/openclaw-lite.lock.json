@@ -1,7 +1,7 @@
 {
   "packages": [
     {
-      "manifest_sha256": "38a1d961bb2fc9aab9b3f9b5c7875671bc16cebeac324d2bea71721bc8fe6726",
+      "manifest_sha256": "a819e573d045fbcf03911c8f477e5788d18bfb2248f67d2ecafa1db4b6e3a97f",
       "name": "memory",
       "package_id": "package-memory",
       "source": {

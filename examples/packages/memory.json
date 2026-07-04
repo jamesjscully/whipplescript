@@ -16,8 +16,9 @@
             "query": "string"
           },
           "output_schema": {
-            "summary": "string",
-            "target": "string"
+            "pool": "string",
+            "items": ["json"],
+            "count": "int"
           },
           "required_capabilities": ["memory.query"],
           "provider_kinds": ["memory-provider"],
@@ -26,13 +27,15 @@
         {
           "id": "memory.write",
           "effect_kind": "capability.call",
-          "source_forms": ["call memory.write"],
+          "source_forms": ["call memory.write", "learn from <source> into <pool> as <binding>"],
           "input_schema": {
-            "summary": "string"
+            "pool": "string",
+            "source": "json"
           },
           "output_schema": {
-            "summary": "string",
-            "target": "string"
+            "pool": "string",
+            "message_id": "string",
+            "stored": "bool"
           },
           "required_capabilities": ["memory.write"],
           "provider_kinds": ["memory-provider"],
@@ -76,6 +79,48 @@
           ],
           "lowering_target": "capability_call",
           "target_capability": "memory.query"
+        },
+        {
+          "id": "memory.learn",
+          "construct_family": "effect_operation",
+          "keyword": "learn",
+          "scope": "rule_body",
+          "fields": [
+            {
+              "name": "source",
+              "kind": "expression",
+              "required": true
+            },
+            {
+              "name": "pool",
+              "kind": "identifier",
+              "required": true
+            },
+            {
+              "name": "note",
+              "kind": "expression",
+              "required": false
+            },
+            {
+              "name": "binding",
+              "kind": "identifier",
+              "required": true
+            }
+          ],
+          "requires": [
+            {
+              "kind": "Capability",
+              "name": "memory.write"
+            }
+          ],
+          "provides": [
+            {
+              "kind": "EffectHandle",
+              "type": "memory.write.output"
+            }
+          ],
+          "lowering_target": "capability_call",
+          "target_capability": "memory.write"
         }
       ]
     }

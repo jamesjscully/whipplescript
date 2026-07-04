@@ -459,6 +459,31 @@ const EFFECT_OPERATION_GRAMMAR: &[EffectOperationSpec] = &[
         binding: BindingMode::Required,
         target_capability: "messaging.send",
     },
+    // `learn from <source> into <pool> [{ note <expr> }] as <binding>` ->
+    // memory.write. v1 narrows the design's full form (drops the optional
+    // `for <subject>`): the grammar table's slots are all-required, so the
+    // subject would have to be mandatory. `note` stays an optional payload field.
+    EffectOperationSpec {
+        keyword: "learn",
+        slots: &[
+            EffectSlotSpec {
+                name: "source",
+                kind: SlotKind::Expression,
+                connective: Some("from"),
+            },
+            EffectSlotSpec {
+                name: "pool",
+                kind: SlotKind::Identifier,
+                connective: Some("into"),
+            },
+        ],
+        payload: Some(&[PayloadFieldSpec {
+            name: "note",
+            required: false,
+        }]),
+        binding: BindingMode::Required,
+        target_capability: "memory.write",
+    },
 ];
 
 /// Look up the `effect_operation` grammar for a leading rule-body keyword.

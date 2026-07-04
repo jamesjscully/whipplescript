@@ -65,7 +65,7 @@ rule plan_recurring_work
     tell planner as planTurn """markdown
     Recalled context from earlier runs:
 
-    {{ recalled.summary }}
+    {{ recalled.count }} prior notes are on file for pool {{ recalled.pool }}.
 
     Produce one concrete maintenance task for {{ beat.job }}.
     """
