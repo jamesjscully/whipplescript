@@ -13104,12 +13104,16 @@ fn validate_coordination_discipline(
     // A `renew <binding>` renews a lease acquired in the same rule: its binding
     // must name an `acquire ... as <binding>` here. Renew resolves the acquire's
     // recorded resource/key at runtime, so an unknown binding renews nothing —
-    // catch the typo at `whip check`. (Scoped to `renew`, which is new. The
-    // pre-existing `release` binding is deliberately NOT validated here: its
-    // referent is subtle — `release <queue>` names the *queue* a `claim` took,
-    // not the claim's `as` binding, while a lease release names the acquire
-    // binding — so a faithful check needs both referent forms; left as a
-    // follow-on rather than risk false positives.)
+    // catch the typo at `whip check`. (Scoped to `renew`, which is new.)
+    //
+    // NOT extended to `release`: its releasable referent is genuinely broad —
+    // verified against the corpus + the rule-body matrix test, `release <x>`
+    // legitimately names an `acquire ... as <x>` lease, a `claim <x> as ...`
+    // *queue* (the queue name, not the claim's `as` binding), OR a work item
+    // bound by `when <queue> has ready <x> as <x>` and released without a
+    // same-rule claim. A faithful check must admit all three forms (and only
+    // those), which the naive acquire∪claim model does not — both a queue-name
+    // and a when-bound-item version false-positive. Left as a designed follow-on.
     let renewable: BTreeSet<&str> = acquires.iter().map(|(b, _, _)| b.as_str()).collect();
     for_each_body(statements, &mut |stmt| {
         if let body::BodyStmt::Effect(effect) = stmt {
