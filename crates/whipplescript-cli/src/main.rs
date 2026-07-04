@@ -20389,7 +20389,7 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
                 run_queue_effect_generic(kernel, id, effect, &config)?
             }
             "lease.acquire" | "lease.release" | "ledger.append" | "counter.consume" => {
-                run_coordination_effect_generic(kernel, id, effect)?
+                run_coordination_effect_generic(kernel, id, effect, "now")?
             }
             "signal.emit" => run_notify_effect_generic(kernel, id, effect, &IfcDeliveryGovernance)?,
             "file.read" => run_file_effect_generic(kernel, &NativeFileStore, id, effect)?,
@@ -20872,7 +20872,12 @@ fn run_claimable_effect(
             script_manifest,
         ),
         "lease.acquire" | "lease.release" | "ledger.append" | "counter.consume" => {
-            run_coordination_effect(store_path, instance_id, effect)
+            run_coordination_effect(
+                store_path,
+                instance_id,
+                effect,
+                options.virtual_now.as_deref().unwrap_or("now"),
+            )
         }
         "signal.emit" => run_notify_effect(store_path, instance_id, effect),
         "file.read" => run_file_effect(store_path, instance_id, effect),
@@ -21480,6 +21485,14 @@ fn resolve_due_time_effects(
     let due = store.due_time_effects(instance_id, now)?;
     drop(store);
     for effect in due {
+        // A `lease.acquire … wait <duration>` carries a creation-anchored
+        // `timeout_seconds` purely to bound its contention retry, so it surfaces
+        // here once the wait elapses. Its terminal is `contended` (give up), not a
+        // timeout/expiry — the coordination handler on the effect pass owns that
+        // completion, so leave it for the handler rather than expiring it here.
+        if effect.kind == "lease.acquire" {
+            continue;
+        }
         if effect.kind == "timer.wait" {
             let run_id = idempotency_key(&[instance_id, &effect.effect_id, "timer-run"]);
             let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "timer-lease"]);
@@ -24301,13 +24314,14 @@ fn run_coordination_effect(
     store_path: &Path,
     instance_id: &str,
     effect: &ClaimableEffect,
+    now: &str,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(NativeStores::open(
         store_path,
         coordination_store_path(),
         items_store_path(),
     )?);
-    run_coordination_effect_generic(&mut kernel, instance_id, effect)
+    run_coordination_effect_generic(&mut kernel, instance_id, effect, now)
 }
 
 /// The validated result of `-> Schema` / `-> each Schema` stdout ingestion.

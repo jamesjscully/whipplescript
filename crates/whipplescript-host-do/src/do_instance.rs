@@ -354,7 +354,9 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 run_queue_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
             }
             "lease.acquire" | "lease.release" | "ledger.append" | "counter.consume" => {
-                run_coordination_effect_generic(&mut self.kernel, self.instance_id, effect)?
+                // The DO worker uses wall-clock time for the bounded-wait deadline;
+                // deterministic-clock injection is a native/scenario concern.
+                run_coordination_effect_generic(&mut self.kernel, self.instance_id, effect, "now")?
             }
             "file.read" => {
                 run_file_effect_generic(&mut self.kernel, self.files, self.instance_id, effect)?

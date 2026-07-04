@@ -1067,6 +1067,7 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     effect: &ClaimableEffect,
+    now: &str,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     use whipplescript_store::coordination::{
         AcquireOutcome, ConsumeOutcome, DEFAULT_COORDINATION_OWNER,
@@ -1110,12 +1111,44 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
                     "resource": resource,
                     "key": key,
                 }),
-                AcquireOutcome::Contended { holders } => json!({
-                    "variant": "Contended",
-                    "resource": resource,
-                    "key": key,
-                    "holders": holders,
-                }),
+                AcquireOutcome::Contended { holders } => {
+                    // `wait <duration>` (spec/coordination.md): bounded retry on
+                    // contention. While the creation-anchored wait deadline has not
+                    // passed, do not complete the effect — soft-defer so the next
+                    // worker pass re-attempts the acquire (mirrors the capacity
+                    // soft-defer: `run_claimable_effect` maps `CapacityBlocked` to a
+                    // re-claimable `Ok(None)`). The deadline reuses the effect's
+                    // `timeout_seconds` via the store's `due_time_effects` clock
+                    // machinery, so it honors the injected virtual clock and never
+                    // reads wall time here. Once the deadline passes we fall through
+                    // and complete `Contended` (give up), exactly as an acquire with
+                    // no `wait` does on its first attempt.
+                    let waits = input
+                        .get("wait_seconds")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|seconds| seconds > 0);
+                    if waits {
+                        let deadline_passed = kernel
+                            .store()
+                            .due_time_effects(instance_id, now)?
+                            .iter()
+                            .any(|due| due.effect_id == effect.effect_id);
+                        if !deadline_passed {
+                            return Err(StoreError::CapacityBlocked {
+                                effect_id: effect.effect_id.clone(),
+                                reason: format!(
+                                    "lease `{resource}` contended; waiting for a free slot"
+                                ),
+                            });
+                        }
+                    }
+                    json!({
+                        "variant": "Contended",
+                        "resource": resource,
+                        "key": key,
+                        "holders": holders,
+                    })
+                }
             }
         }
         "lease.release" => {

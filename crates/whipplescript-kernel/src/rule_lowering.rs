@@ -2713,30 +2713,50 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
             });
             index = next_index;
         } else if let Some(rest) = trimmed.strip_prefix("acquire ") {
-            // acquire <lease> for <key-expr> [until ttl] as <slot>
+            // acquire <lease> for <key-expr> [until ttl] [wait <duration>] as <slot>
             let resource = rest
                 .split_whitespace()
                 .next()
                 .unwrap_or_default()
                 .to_owned();
-            let key_expr = rest
+            // The operand region is everything between `for` and `as`; it may carry
+            // an `until ttl` and/or a `wait <duration>` clause that are not part of
+            // the key expression.
+            let operand = rest
                 .split_once(" for ")
                 .map(|(_, tail)| tail)
                 .unwrap_or_default()
                 .split(" as ")
                 .next()
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let until_ttl = operand.contains(" until ttl");
+            // `wait <duration>`: bounded retry on contention (spec/coordination.md).
+            // Lowered to `wait_seconds` in the input so the handler knows to
+            // soft-defer, and to the effect's `timeout_seconds` so the store's
+            // creation-anchored deadline machinery bounds the retry.
+            let wait_seconds = operand
+                .split_once(" wait ")
+                .and_then(|(_, tail)| tail.split_whitespace().next())
+                .and_then(whipplescript_parser::body::parse_short_duration_seconds)
+                .map(|seconds| seconds as i64);
+            let key_expr = operand
                 .replace(" until ttl", "")
+                .split(" wait ")
+                .next()
+                .unwrap_or_default()
                 .trim()
                 .to_owned();
-            let until_ttl = rest.contains(" until ttl");
             effects.push(ParsedEffect {
-                timeout_seconds: None,
+                timeout_seconds: wait_seconds,
                 kind: "lease.acquire".to_owned(),
                 target: Some(resource),
                 name: None,
                 binding: binding_after_as(trimmed),
-                args: vec![key_expr, until_ttl.to_string()],
+                args: vec![
+                    key_expr,
+                    until_ttl.to_string(),
+                    wait_seconds.map(|s| s.to_string()).unwrap_or_default(),
+                ],
                 prompt: None,
                 prompt_content_type: None,
                 required_capabilities: Vec::new(),
@@ -3555,6 +3575,7 @@ pub fn parsed_effect_input_json(
                 "slots": lease.map(|lease| lease.slots).unwrap_or(1),
                 "ttl_seconds": lease.map(|lease| lease.ttl_seconds).unwrap_or(600),
                 "until_ttl": effect.args.get(1).map(String::as_str) == Some("true"),
+                "wait_seconds": effect.args.get(2).and_then(|arg| arg.parse::<i64>().ok()),
                 "rule": rule.name,
             })
         }

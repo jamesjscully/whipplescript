@@ -1335,9 +1335,16 @@ fn print_effect(
             resource,
             key_expr,
             until_ttl,
+            wait_seconds,
         } => {
             let until = if *until_ttl { " until ttl" } else { "" };
-            format!("acquire {resource} for {}{until}{binding}", rn(key_expr))
+            let wait = wait_seconds
+                .map(|seconds| format!(" wait {seconds}s"))
+                .unwrap_or_default();
+            format!(
+                "acquire {resource} for {}{until}{wait}{binding}",
+                rn(key_expr)
+            )
         }
         BodyEffectKind::LedgerAppend {
             ledger,

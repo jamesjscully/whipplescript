@@ -286,6 +286,10 @@ pub enum BodyEffectKind {
         key_expr: String,
         /// `until ttl`: fire-and-forget; TTL is the sole release.
         until_ttl: bool,
+        /// `wait <duration>`: bounded retry on contention. `Some(seconds)` retries
+        /// the acquire until it is `held` or the wait elapses (then `contended`);
+        /// `None` reports `contended` on the first attempt.
+        wait_seconds: Option<u64>,
     },
     LedgerAppend {
         ledger: String,
@@ -2795,6 +2799,34 @@ impl<'a> BodyParser<'a> {
             }
             until_ttl = true;
         }
+        // `wait <duration>`: bounded retry on contention (spec/coordination.md). The
+        // acquire re-attempts on each worker pass until it is `held` or the wait
+        // elapses, then reports `contended`.
+        let mut wait_seconds = None;
+        if self.at_ident("wait") {
+            self.pos += 1; // wait
+            let span = self.span_here();
+            let Some(Tok::Number(value)) = self.peek().map(|t| t.tok.clone()) else {
+                self.error(
+                    span,
+                    "expected a duration after `wait`".to_owned(),
+                    Some("use `<n><unit>` with unit s, m, h, or d, e.g. `wait 30s`".to_owned()),
+                );
+                return None;
+            };
+            self.pos += 1;
+            match parse_short_duration_seconds(&value) {
+                Some(seconds) if seconds > 0 => wait_seconds = Some(seconds),
+                _ => {
+                    self.error(
+                        span,
+                        format!("invalid wait duration `{value}`"),
+                        Some("use `<n><unit>` with unit s, m, h, or d".to_owned()),
+                    );
+                    return None;
+                }
+            }
+        }
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
@@ -2817,6 +2849,7 @@ impl<'a> BodyParser<'a> {
                 resource,
                 key_expr,
                 until_ttl,
+                wait_seconds,
             },
             binding,
             requires,
