@@ -605,6 +605,59 @@ rule notify
     let _ = fs::remove_file(source);
 }
 
+/// S5 first real provider: a `send via <channel>` on a channel declaring
+/// `provider local` is delivered by the native, file-backed local mailbox
+/// provider (not the fixture). The workflow completes and the mailbox file
+/// (derived from the store path) carries the delivered message.
+#[test]
+fn send_via_local_channel_delivers_to_local_mailbox() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("send-local", "sqlite");
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/messaging-local-demo.whip");
+
+    let store_str = store.to_str().expect("utf-8");
+    // No `--package-lock`: the std-library exemption lets `send` compile + run.
+    let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &[]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "completed");
+
+    // The messaging.send effect completed under the local provider.
+    let effects = run_json(bin, &["--store", store_str, "--json", "effects", instance]);
+    let send = effects
+        .as_array()
+        .expect("effects")
+        .iter()
+        .find(|effect| effect.get("target").and_then(Value::as_str) == Some("messaging.send"))
+        .expect("messaging.send effect");
+    assert_eq!(
+        send.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+
+    // The local mailbox file (store path with a `.mailbox.jsonl` extension)
+    // carries exactly the delivered message.
+    let mailbox = store.with_extension("mailbox.jsonl");
+    let contents = fs::read_to_string(&mailbox).expect("mailbox file");
+    let line = contents.lines().next().expect("one mailbox line");
+    let record: Value = serde_json::from_str(line).expect("mailbox json line");
+    assert_eq!(
+        record.get("channel").and_then(Value::as_str),
+        Some("alerts")
+    );
+    assert_eq!(record.get("text").and_then(Value::as_str), Some("hello"));
+    assert_eq!(
+        record.get("provider").and_then(Value::as_str),
+        Some("local")
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(mailbox);
+}
+
 /// Inbound messaging (spec/messaging.md): `whip message` injects a `Message` on a
 /// declared channel and a `when message from <channel> as msg` rule fires, binding
 /// the envelope. The fixture-parity counterpart of outbound `send`; live providers

@@ -3602,6 +3602,12 @@ pub fn parsed_effect_input_json(
             let markdown_expr = effect.args.get(2).cloned().unwrap_or_default();
             let thread_expr = effect.args.get(3).cloned().unwrap_or_default();
             let mut message = serde_json::Map::new();
+            // Thread the referenced channel's declared provider into the effect
+            // input so provider *selection* is visible to the host projection
+            // without new plumbing. If the channel isn't declared in the IR, omit.
+            if let Some(decl) = ir.channels.iter().find(|c| c.name == channel) {
+                message.insert("provider".to_owned(), Value::String(decl.provider.clone()));
+            }
             message.insert("channel".to_owned(), Value::String(channel));
             message.insert("text".to_owned(), parse_field_value(&text_expr, context));
             if !markdown_expr.is_empty() {

@@ -20094,6 +20094,8 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
             "event.emit" => run_event_effect_generic(kernel, id, effect, &config)?,
             "loft.claim" => run_loft_effect_generic(kernel, id, effect, &config)?,
             "human.ask" => run_human_effect_generic(kernel, id, effect, &config)?,
+            // Local mailbox is a native-only, file-based provider; the DO/sans-IO
+            // InstanceStepMachine path stays on the fixture provider (out of scope).
             "capability.call" => run_capability_effect_generic(
                 kernel,
                 id,
@@ -22918,14 +22920,125 @@ fn run_capability_effect(
     package_lock: Option<&LoadedPackageLock>,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_capability_effect_generic(
-        &mut kernel,
-        instance_id,
-        effect,
-        &options.effect_config(),
-        &PackageLockCapabilityContract(package_lock),
-        &FixtureCapabilityProvider,
-    )
+    let contract = PackageLockCapabilityContract(package_lock);
+    // Provider *selection* (S5 seam, first real provider): a `messaging.send`
+    // whose channel declares `provider local` is delivered by the native
+    // file-backed local mailbox; every other send (and every non-messaging
+    // capability) stays on the fixture provider — this default is what keeps
+    // all existing send tests byte-identical.
+    if effect.target.as_deref() == Some("messaging.send")
+        && capability_input_provider(effect).as_deref() == Some("local")
+    {
+        let mailbox = LocalMailboxCapabilityProvider {
+            mailbox_path: store_path.with_extension("mailbox.jsonl"),
+        };
+        run_capability_effect_generic(
+            &mut kernel,
+            instance_id,
+            effect,
+            &options.effect_config(),
+            &contract,
+            &mailbox,
+        )
+    } else {
+        run_capability_effect_generic(
+            &mut kernel,
+            instance_id,
+            effect,
+            &options.effect_config(),
+            &contract,
+            &FixtureCapabilityProvider,
+        )
+    }
+}
+
+/// Read the `message.provider` field out of a `messaging.send` effect input,
+/// which lowering threads in from the referenced channel's declared provider.
+fn capability_input_provider(effect: &ClaimableEffect) -> Option<String> {
+    let input: Value = serde_json::from_str(&effect.input_json).ok()?;
+    input
+        .pointer("/message/provider")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Native, file-backed local mailbox provider (S5 first real `CapabilityProvider`).
+/// Selected only for `messaging.send` on channels declaring `provider local`.
+/// Appends one JSON line per delivered message to a mailbox file derived from
+/// the store path. Deterministic: the message id is derived from the effect id
+/// (no wall-clock, no randomness), so replay yields identical mailbox contents.
+struct LocalMailboxCapabilityProvider {
+    mailbox_path: PathBuf,
+}
+
+impl whipplescript_kernel::effect_handlers::CapabilityProvider for LocalMailboxCapabilityProvider {
+    fn produce(
+        &self,
+        effect: &ClaimableEffect,
+        _config: &EffectConfig,
+    ) -> whipplescript_kernel::effect_handlers::CapabilityOutcome {
+        use whipplescript_kernel::effect_handlers::CapabilityOutcome;
+        let input: Value = match serde_json::from_str(&effect.input_json) {
+            Ok(value) => value,
+            Err(err) => {
+                return CapabilityOutcome::Failed {
+                    error_kind: "messaging_delivery".to_owned(),
+                    message: format!("invalid messaging.send input: {err}"),
+                };
+            }
+        };
+        let message = input.pointer("/message");
+        let channel = message
+            .and_then(|m| m.pointer("/channel"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let text = message
+            .and_then(|m| m.pointer("/text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let provider = message
+            .and_then(|m| m.pointer("/provider"))
+            .and_then(Value::as_str)
+            .unwrap_or("local");
+        // Deterministic message id: derived from the effect id, never wall-clock.
+        let message_id = idempotency_key(&[&effect.effect_id, "messaging-message"]);
+
+        let mut record = serde_json::Map::new();
+        record.insert("message_id".to_owned(), Value::String(message_id.clone()));
+        record.insert("channel".to_owned(), Value::String(channel.to_owned()));
+        record.insert("text".to_owned(), Value::String(text.to_owned()));
+        if let Some(markdown) = message.and_then(|m| m.pointer("/markdown")) {
+            record.insert("markdown".to_owned(), markdown.clone());
+        }
+        if let Some(thread_id) = message.and_then(|m| m.pointer("/thread_id")) {
+            record.insert("thread_id".to_owned(), thread_id.clone());
+        }
+        record.insert("provider".to_owned(), Value::String(provider.to_owned()));
+
+        let mut line =
+            serde_json::to_string(&Value::Object(record)).unwrap_or_else(|_| "{}".to_owned());
+        line.push('\n');
+        if let Err(err) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.mailbox_path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()))
+        {
+            return CapabilityOutcome::Failed {
+                error_kind: "messaging_delivery".to_owned(),
+                message: format!(
+                    "local mailbox write to {} failed: {err}",
+                    self.mailbox_path.display()
+                ),
+            };
+        }
+
+        CapabilityOutcome::Produced(json!({
+            "provider_message_id": message_id,
+            "channel": channel,
+            "delivered": true,
+        }))
+    }
 }
 
 /// Native capability contract: validate against the workspace package-lock's
