@@ -1,6 +1,8 @@
 # Standard-Package Ecosystem Shape
 
-Status: feeding-ADR (ecosystem shape settled on recommendation 2026-07-04; two forks flagged for Jack)
+Status: feeding-ADR (ecosystem shape settled 2026-07-04; both ⚑ forks RESOLVED
+by Jack 2026-07-04 — M5 embedded manifests ratified, M1 build-DR-0011-now
+reverses the recommended defer)
 
 This note settles the standard-package design tracker's "overall ecosystem
 shape" gate (its "Process", step 5) so the per-package concrete designs
@@ -78,7 +80,7 @@ Five fact-checked findings underlie every decision here.
 
 ## Mechanism decisions
 
-### M1. Construct grammar: authorize post-parse; meta-grammar deferred with a recorded re-entry sketch ⚑
+### M1. Construct grammar: BUILD the two-shape DR-0011 meta-grammar now (Jack 2026-07-04) ⚑ RESOLVED
 
 **Decision.** For v1 the core parser owns ALL construct grammar. Catalog and
 manifest rows AUTHORIZE constructs post-parse — the shipped recall/send
@@ -119,20 +121,26 @@ Contract's acceptance rule (a package needing a class that does not exist is
 not accepted) covers the interim. The judges split on this fork — hence the
 flag.
 
-> **⚑ FOR JACK'S REVIEW — build DR-0011 now vs defer.**
-> *Defer (chosen):* the mechanism has zero users outside std, std can ship
-> on the existing authorized-post-parse path today, and the two-shape design
-> is recorded so deferral is a decision, not an absence. Classic
-> avoid-premature-abstraction. *Build now:* DR-0011 is accepted baseline,
-> the constrained two-shape version is small, model-first-able
-> (construct-grammar.maude), and validation-by-deletion of parse_recall/
-> parse_send is exactly the greenfield discipline; every std construct
-> added under deferral is one more future re-registration.
-> *Why deferral is cheapest to reverse:* it builds nothing that must be
-> undone — constructs added under authorize-post-parse become the
-> meta-grammar's first re-registration customers, and the sketch above is
-> the design. *What re-opens it:* a third-party construct demand, or Jack
-> preferring DR-0011-now in review.
+> **⚑ RESOLVED 2026-07-04 (Jack): BUILD DR-0011 now — reverses the
+> recommended defer.** Build the constrained two-shape extension meta-grammar
+> now (declaration_block + effect_operation shapes), model-first
+> (construct-grammar.maude with coverage + bite), with validation-by-deletion
+> of parse_recall/parse_send as the greenfield check. The manifest
+> `constructs[]` carries machine-readable grammar specs for the two shapes;
+> std constructs register their grammar through it rather than through
+> hardcoded parser arms. This becomes a load-bearing S6 sub-slice (see build
+> order) and reshapes the per-package designs' M1 assumption from
+> "core parser owns grammar / authorize-post-parse" to
+> "manifest declares grammar in one of the two shapes"; the designs' concrete
+> constructs already fit the two shapes, so the surfaces are unchanged — only
+> the registration path differs. The authorize-post-parse mechanism remains
+> the fallback for a construct the two shapes cannot express (a core-grammar
+> exception, not a shape addition).
+>
+> *Original recommendation was defer* (zero external demand,
+> avoid-premature-abstraction); Jack chose build-now because DR-0011 is
+> accepted baseline and every std construct added under deferral would be a
+> future re-registration.
 
 ### M2. Provider execution seam: three designated seams + the CapabilityProvider host projection now
 
@@ -332,7 +340,12 @@ runtime backstop via per-program seeding, or an IR-uses gate at exec
 dispatch) is specified in the std.script concrete design — the panel was
 unanimous that a check-time gate alone does not resist forged-IR paths.
 
-> **⚑ FOR JACK'S REVIEW — embedded manifests vs compiled-in.**
+> **⚑ RESOLVED 2026-07-04 (Jack): EMBEDDED MANIFESTS** — ratifies the
+> recommendation. std packages ship as embedded manifests; with M1 now
+> build-now (above), the manifests carry real grammar specs, so the
+> "two sources of truth" objection to compiled-in is moot. Below is the
+> decision record kept for provenance.
+>
 > *Embedded manifests (chosen):* std becomes the first customer of the
 > third-party path, so "a package costs a manifest" is verified by
 > construction on every std slice; `use` stops being a lie; the lock
