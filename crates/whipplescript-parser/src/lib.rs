@@ -3911,7 +3911,14 @@ fn lower_program(
             Item::Agent(agent) => lower_agent(agent, &mut ir, &harness_names, &mut diagnostics),
             Item::Enum(enum_decl) => lower_enum(enum_decl, &mut ir, &mut diagnostics),
             Item::Event(event) => lower_event(event, &mut ir, &mut diagnostics),
-            Item::Source(source) => lower_source(source, &mut ir, &mut diagnostics),
+            Item::Source(source) => {
+                validate_source_emit_signal_declared(
+                    &source,
+                    &semantic.schemas.events,
+                    &mut diagnostics,
+                );
+                lower_source(source, &mut ir, &mut diagnostics)
+            }
             Item::Test(test) => lower_test(test, &mut ir, &mut diagnostics),
             Item::Lease(lease) => {
                 if !schema_names.contains(&lease.key_type.name) {
@@ -14090,6 +14097,39 @@ fn collect_all_binding_names(statements: &[body::BodyStmt], out: &mut BTreeSet<S
     }
 }
 
+/// A `source`'s `emit <signal>` must name a declared `signal` — the ingestion
+/// mirror of the rule-side "reacts to undeclared signal" check on `when <signal>`.
+/// Only dotted names are typed signal declarations (a bare name is a class/fact,
+/// consistent with the reaction check). Without this a source silently admits a
+/// signal fact no rule can react to (rules may only react to declared signals),
+/// so ingested data is dropped with no diagnostic — this lifts the guarantee to
+/// static `whip check`, symmetric with the clock/file/http source runtime that
+/// admits `emit_signal`.
+fn validate_source_emit_signal_declared(
+    source: &SourceDecl,
+    declared_signals: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let signal = &source.emit.signal;
+    if signal.contains('.') && !declared_signals.contains(signal) {
+        let suggestion = match closest_name(signal, declared_signals.iter()) {
+            Some(candidate) => {
+                format!("did you mean `{candidate}`? otherwise declare `signal {signal} {{ ... }}`")
+            }
+            None => format!("declare `signal {signal} {{ ... }}` so rules can react to it"),
+        };
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: source.emit.signal_span,
+            message: format!(
+                "source `{}` emits undeclared signal `{}`",
+                source.name.name, signal
+            ),
+            suggestion: Some(suggestion),
+        });
+    }
+}
+
 /// `emit signal <name> to <target>` requires `<name>` to be a declared `signal`
 /// — the declaration is the typed payload contract at the emit site, symmetric
 /// with the reaction-side "reacts to undeclared signal" check on `when <signal>`
@@ -23566,6 +23606,54 @@ rule relay
                 .iter()
                 .any(|m| m.contains("emits undeclared signal `known.sig`")),
             "a declared signal must not be flagged: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn source_emit_of_undeclared_signal_is_flagged_statically() {
+        // The ingestion mirror of the reaction-side check: a `source` whose
+        // `emit <signal>` names an undeclared signal is caught at `whip check`
+        // time, so it cannot silently admit a fact no rule can react to.
+        let source = "\
+workflow SourceEmit
+signal ingress.known { text string }
+source file as feed {
+  path \"/tmp/x.txt\"
+  observe as obs
+  emit ingress.unknown { text obs.line }
+}
+output result Done
+class Done { ok string }
+rule react
+  when ingress.known as k
+=> {
+  complete result { ok \"ok\" }
+}
+";
+        let compiled = compile_program(source);
+        let messages: Vec<&str> = compiled
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(
+            messages.contains(&"source `feed` emits undeclared signal `ingress.unknown`"),
+            "expected the undeclared source-emit diagnostic, got {messages:?}"
+        );
+        // A source emitting a declared signal must not be flagged.
+        let ok_source = source.replace("ingress.unknown", "ingress.known");
+        let ok_compiled = compile_program(&ok_source);
+        assert!(
+            !ok_compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("emits undeclared signal")),
+            "a declared signal must not be flagged: {:?}",
+            ok_compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
         );
     }
 
