@@ -13104,16 +13104,20 @@ fn validate_coordination_discipline(
     // A `renew <binding>` renews a lease acquired in the same rule: its binding
     // must name an `acquire ... as <binding>` here. Renew resolves the acquire's
     // recorded resource/key at runtime, so an unknown binding renews nothing —
-    // catch the typo at `whip check`. (Scoped to `renew`, which is new; the
-    // pre-existing `release` binding is validated separately/not yet.)
-    let acquire_bindings: BTreeSet<&str> = acquires.iter().map(|(b, _, _)| b.as_str()).collect();
+    // catch the typo at `whip check`. (Scoped to `renew`, which is new. The
+    // pre-existing `release` binding is deliberately NOT validated here: its
+    // referent is subtle — `release <queue>` names the *queue* a `claim` took,
+    // not the claim's `as` binding, while a lease release names the acquire
+    // binding — so a faithful check needs both referent forms; left as a
+    // follow-on rather than risk false positives.)
+    let renewable: BTreeSet<&str> = acquires.iter().map(|(b, _, _)| b.as_str()).collect();
     for_each_body(statements, &mut |stmt| {
         if let body::BodyStmt::Effect(effect) = stmt {
             if let body::BodyEffectKind::LeaseRenew {
                 acquire_binding, ..
             } = &effect.kind
             {
-                if !acquire_bindings.contains(acquire_binding.as_str()) {
+                if !renewable.contains(acquire_binding.as_str()) {
                     diagnostics.push(Diagnostic {
                         related: Vec::new(),
                         span: effect.span,
