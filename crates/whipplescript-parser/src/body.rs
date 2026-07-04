@@ -356,6 +356,118 @@ pub struct ConstructUseField {
     pub source: String,
 }
 
+// --- DR-0011 `effect_operation` meta-grammar (compiled-in table) -------------
+//
+// The shipped std package constructs `recall` and `send` share one rule-body
+// shape: `<keyword> [<connective> <slot>]* [{ <payload-field>* }]? as <binding>`.
+// Rather than one hand-written parser per keyword, the two are described by the
+// data below and parsed generically by `parse_effect_operation`. See
+// spec/construct-grammar.md, "DR-0011 Two-Shape Meta-Grammar (S6 build)".
+
+/// A slot's value kind: a bare identifier or a value expression.
+#[derive(Clone, Copy, Debug)]
+enum SlotKind {
+    Identifier,
+    Expression,
+}
+
+/// The trailing `as <binding>` policy for an effect operation. Both shipped
+/// constructs require a binding; `Optional`/`None` complete the DR-0011 mode
+/// vocabulary and are enforced by `parse_effect_operation` when a construct
+/// registers them.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+enum BindingMode {
+    Required,
+    Optional,
+    None,
+}
+
+/// One ordered slot: a named value, optionally introduced by a fixed connective
+/// word consumed before it (`recall <pool>` has none; `send via <channel>` uses
+/// `via`). Connectives are drawn from {`from`, `for`, `into`, `to`, `via`}.
+#[derive(Clone, Copy, Debug)]
+struct EffectSlotSpec {
+    name: &'static str,
+    kind: SlotKind,
+    connective: Option<&'static str>,
+}
+
+/// One field inside the optional `{ ... }` payload block: a named expression,
+/// required or not.
+#[derive(Clone, Copy, Debug)]
+struct PayloadFieldSpec {
+    name: &'static str,
+    required: bool,
+}
+
+/// The full grammar of one `effect_operation` construct.
+#[derive(Clone, Copy, Debug)]
+struct EffectOperationSpec {
+    keyword: &'static str,
+    slots: &'static [EffectSlotSpec],
+    payload: Option<&'static [PayloadFieldSpec]>,
+    binding: BindingMode,
+    target_capability: &'static str,
+}
+
+/// The compiled-in table of `effect_operation` grammars. A leading rule-body
+/// keyword that matches an entry here is parsed by `parse_effect_operation`.
+const EFFECT_OPERATION_GRAMMAR: &[EffectOperationSpec] = &[
+    // `recall <pool> for <query> [modifiers] as <binding>` -> memory.query.
+    EffectOperationSpec {
+        keyword: "recall",
+        slots: &[
+            EffectSlotSpec {
+                name: "pool",
+                kind: SlotKind::Identifier,
+                connective: None,
+            },
+            EffectSlotSpec {
+                name: "query",
+                kind: SlotKind::Expression,
+                connective: Some("for"),
+            },
+        ],
+        payload: None,
+        binding: BindingMode::Required,
+        target_capability: "memory.query",
+    },
+    // `send via <channel> { text <expr> [markdown <expr>] [thread_id <expr>] }
+    // as <binding>` -> messaging.send.
+    EffectOperationSpec {
+        keyword: "send",
+        slots: &[EffectSlotSpec {
+            name: "channel",
+            kind: SlotKind::Identifier,
+            connective: Some("via"),
+        }],
+        payload: Some(&[
+            PayloadFieldSpec {
+                name: "text",
+                required: true,
+            },
+            PayloadFieldSpec {
+                name: "markdown",
+                required: false,
+            },
+            PayloadFieldSpec {
+                name: "thread_id",
+                required: false,
+            },
+        ]),
+        binding: BindingMode::Required,
+        target_capability: "messaging.send",
+    },
+];
+
+/// Look up the `effect_operation` grammar for a leading rule-body keyword.
+fn effect_operation_spec(keyword: &str) -> Option<&'static EffectOperationSpec> {
+    EFFECT_OPERATION_GRAMMAR
+        .iter()
+        .find(|spec| spec.keyword == keyword)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecTarget {
     RawCommand(String),
@@ -1053,6 +1165,11 @@ impl<'a> BodyParser<'a> {
                 return None;
             }
         };
+        // Data-driven `effect_operation` constructs (DR-0011): a leading keyword
+        // registered in the compiled-in grammar table is parsed generically.
+        if let Some(spec) = effect_operation_spec(&keyword) {
+            return self.parse_effect_operation(spec);
+        }
         match keyword.as_str() {
             "record" => self.parse_record_statement().map(BodyStmt::Record),
             // `consume <counter> for <key> ...` is the counter verb
@@ -1066,8 +1183,6 @@ impl<'a> BodyParser<'a> {
             "prompt" => self.parse_prompt_effect(),
             "decide" => self.parse_decide(),
             "call" => self.parse_call(),
-            "recall" => self.parse_recall(),
-            "send" => self.parse_send(),
             "invoke" => self.parse_invoke(),
             "read" => self.parse_read(),
             "write" => self.parse_write(),
@@ -1850,138 +1965,110 @@ impl<'a> BodyParser<'a> {
         }))
     }
 
-    fn parse_recall(&mut self) -> Option<BodyStmt> {
+    /// Parse a data-driven `effect_operation` construct (DR-0011). Reproduces
+    /// the byte-identical success lowering the hand-written `recall`/`send`
+    /// parsers emitted: consume the keyword, then each slot (its connective, if
+    /// any, then its value), then the optional payload block (required/unknown
+    /// checks, expression-typed, in encounter order), then the effect modifiers,
+    /// enforcing the binding mode, and build one `ConstructCapabilityCall` whose
+    /// fields are the slots followed by the payload fields, in order.
+    fn parse_effect_operation(&mut self, spec: &EffectOperationSpec) -> Option<BodyStmt> {
         let start = self.pos;
-        self.pos += 1; // recall
-        let pool = self.ident_text("memory pool after `recall`")?;
-        if !self.consume_ident("for") {
-            let span = self.span_here();
-            self.error(
-                span,
-                "expected `for` after recall pool".to_owned(),
-                Some("write `recall <pool> for <query> as <binding>`".to_owned()),
-            );
-            return None;
-        }
-        let (query, _) = self.parse_value_expression()?;
-        let mut binding = None;
-        let mut requires = Vec::new();
-        let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
-            return None;
-        }
-        if binding.is_none() {
-            let span = self.span_from(start);
-            self.error(
-                span,
-                "`recall` requires an `as` binding".to_owned(),
-                Some("write `recall <pool> for <query> as <binding>`".to_owned()),
-            );
-            return None;
-        }
-        Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::ConstructCapabilityCall {
-                keyword: "recall".to_owned(),
-                target_capability: "memory.query".to_owned(),
-                fields: vec![
-                    ConstructUseField {
-                        name: "pool".to_owned(),
-                        source: pool,
-                    },
-                    ConstructUseField {
-                        name: "query".to_owned(),
-                        source: query,
-                    },
-                ],
-            },
-            binding,
-            requires,
-            timeout_seconds,
-            prompt: None,
-            span: self.span_from(start),
-        }))
-    }
-
-    /// `send via <channel> { text <expr> [markdown <expr>] [thread_id <expr>] }
-    /// as <binding>` (std.messaging): an outbound message lowering to a
-    /// `capability.call` (`messaging.send`), exactly like `recall` but with the
-    /// `as` on the closing-brace line (so it is an AST-only effect). The `channel`
-    /// is carried as a construct field; channel existence is checked statically.
-    fn parse_send(&mut self) -> Option<BodyStmt> {
-        let start = self.pos;
-        self.pos += 1; // send
-        let usage = "write `send via <channel> { text <expr> } as <binding>`".to_owned();
-        if !self.consume_ident("via") {
-            let span = self.span_here();
-            self.error(span, "expected `via` after `send`".to_owned(), Some(usage));
-            return None;
-        }
-        let channel = self.ident_text("channel name after `via`")?;
-        let block_fields = self.parse_field_block(false)?;
-        let mut fields = vec![ConstructUseField {
-            name: "channel".to_owned(),
-            source: channel,
-        }];
-        let mut has_text = false;
-        for field in &block_fields {
-            match field.name.as_str() {
-                "text" | "markdown" | "thread_id" => {
-                    let FieldValue::Expr { source, .. } = &field.value else {
-                        self.error(
-                            field.span,
-                            format!("`send` field `{}` must be an expression", field.name),
-                            Some(usage.clone()),
-                        );
-                        return None;
-                    };
-                    if field.name == "text" {
-                        has_text = true;
-                    }
-                    fields.push(ConstructUseField {
-                        name: field.name.clone(),
-                        source: source.clone(),
-                    });
+        self.pos += 1; // keyword
+        let mut fields: Vec<ConstructUseField> = Vec::new();
+        for slot in spec.slots {
+            if let Some(connective) = slot.connective {
+                if !self.consume_ident(connective) {
+                    let span = self.span_here();
+                    self.error(
+                        span,
+                        format!("expected `{connective}` after `{}`", spec.keyword),
+                        None,
+                    );
+                    return None;
                 }
-                other => {
+            }
+            let source = match slot.kind {
+                SlotKind::Identifier => self.ident_text(slot.name)?,
+                SlotKind::Expression => self.parse_value_expression()?.0,
+            };
+            fields.push(ConstructUseField {
+                name: slot.name.to_owned(),
+                source,
+            });
+        }
+        if let Some(payload) = spec.payload {
+            let block_fields = self.parse_field_block(false)?;
+            let mut seen: Vec<&'static str> = Vec::new();
+            for field in &block_fields {
+                let Some(field_spec) = payload.iter().find(|f| f.name == field.name) else {
+                    self.error(
+                        field.span,
+                        format!("unknown `{}` block field `{}`", spec.keyword, field.name),
+                        None,
+                    );
+                    return None;
+                };
+                let FieldValue::Expr { source, .. } = &field.value else {
                     self.error(
                         field.span,
                         format!(
-                            "unknown `send` block field `{other}` (expected `text`, `markdown`, or `thread_id`)"
+                            "`{}` field `{}` must be an expression",
+                            spec.keyword, field.name
                         ),
-                        Some(usage.clone()),
+                        None,
+                    );
+                    return None;
+                };
+                seen.push(field_spec.name);
+                fields.push(ConstructUseField {
+                    name: field.name.clone(),
+                    source: source.clone(),
+                });
+            }
+            for required in payload.iter().filter(|f| f.required) {
+                if !seen.contains(&required.name) {
+                    let span = self.span_from(start);
+                    self.error(
+                        span,
+                        format!("`{}` requires a `{}` field", spec.keyword, required.name),
+                        None,
                     );
                     return None;
                 }
             }
         }
-        if !has_text {
-            let span = self.span_from(start);
-            self.error(
-                span,
-                "`send` requires a `text` field".to_owned(),
-                Some(usage),
-            );
-            return None;
-        }
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
         if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
             return None;
         }
-        if binding.is_none() {
-            let span = self.span_from(start);
-            self.error(
-                span,
-                "`send` requires an `as` binding".to_owned(),
-                Some(usage),
-            );
-            return None;
+        match spec.binding {
+            BindingMode::Required if binding.is_none() => {
+                let span = self.span_from(start);
+                self.error(
+                    span,
+                    format!("`{}` requires an `as` binding", spec.keyword),
+                    None,
+                );
+                return None;
+            }
+            BindingMode::None if binding.is_some() => {
+                let span = self.span_from(start);
+                self.error(
+                    span,
+                    format!("`{}` does not take an `as` binding", spec.keyword),
+                    None,
+                );
+                return None;
+            }
+            _ => {}
         }
         Some(BodyStmt::Effect(EffectStmt {
             kind: BodyEffectKind::ConstructCapabilityCall {
-                keyword: "send".to_owned(),
-                target_capability: "messaging.send".to_owned(),
+                keyword: spec.keyword.to_owned(),
+                target_capability: spec.target_capability.to_owned(),
                 fields,
             },
             binding,
