@@ -31147,17 +31147,54 @@ fn compile_source_path_for_validation(
     root: Option<&str>,
 ) -> Result<(String, IrProgram), CompileFailure> {
     let (source, ir) = compile_source_path_with_root(path, root)?;
-    let liveness = lint_workflow_liveness(&ir);
-    if !liveness.is_empty() {
-        // Liveness lints are workflow-level (span 0), not attributable to a
-        // single include, so they render against the root path.
+    let mut blocking = lint_workflow_liveness(&ir);
+    // Script hard-off (M5 import ladder, Layer 1): `exec` is a check error unless
+    // the program imports `std.script`. This is the author-facing consent surface;
+    // the load-bearing runtime backstop (import-conditional capability seeding) is
+    // Layer 2, which lands with the embedded-manifest seeding infrastructure (S6d).
+    blocking.extend(check_script_hard_off(&ir));
+    if !blocking.is_empty() {
+        // Workflow-level diagnostics (span 0 for liveness) render against the root
+        // path; the hard-off carries the offending `exec` effect's own span.
         return Err(CompileFailure::Diagnostics {
             source,
             segments: Vec::new(),
-            diagnostics: liveness,
+            diagnostics: blocking,
         });
     }
     Ok((source, ir))
+}
+
+/// Script hard-off, check-time gate (spec/std-script.md "Hard-off semantics",
+/// Layer 1): every `exec` source form — raw (`exec "cmd"`) or capability
+/// (`exec <name> with <rec> -> <Type>`), which both lower to
+/// `IrEffectKind::ExecCommand` — is a check error with id `security.script_disabled`
+/// unless the program contains `use std.script`. The import is the author-facing
+/// declaration that script execution is intended; without it, scripts are truly
+/// off. (Layer 2, the anti-forged-IR runtime backstop, is deferred to S6d.)
+fn check_script_hard_off(ir: &IrProgram) -> Vec<Diagnostic> {
+    if ir.uses.iter().any(|use_decl| use_decl.name == "std.script") {
+        return Vec::new();
+    }
+    let mut diagnostics = Vec::new();
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            if effect.kind == IrEffectKind::ExecCommand {
+                diagnostics.push(Diagnostic {
+                    span: effect.span,
+                    message: "`exec` requires `use std.script` (security.script_disabled): script \
+                         execution is disabled unless the program imports the std.script package"
+                        .to_owned(),
+                    suggestion: Some(
+                        "add `use std.script` at the top of the program to enable script execution"
+                            .to_owned(),
+                    ),
+                    related: Vec::new(),
+                });
+            }
+        }
+    }
+    diagnostics
 }
 
 /// Whether a rule-body line reaches a `complete`/`fail` terminal — at the start

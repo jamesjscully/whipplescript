@@ -1,3 +1,4 @@
+use std.script
 workflow AutoResearchLite
 
 output result ResearchResult

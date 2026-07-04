@@ -2,6 +2,8 @@ workflow ExecJsonIngest
 workflow_contracts
   output result ref<TestSummary>
   failure error ref<TestFailure>
+uses
+  package std.script
 schemas
   class TestSummary
     passed bool

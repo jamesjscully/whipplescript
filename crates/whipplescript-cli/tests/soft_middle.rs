@@ -1353,6 +1353,7 @@ fn hosted_check_rejects_raw_exec() {
     fs::write(
         &source,
         r#"
+use std.script
 workflow HostedRawExec
 
 output result Report
@@ -1391,6 +1392,52 @@ rule go
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("raw `exec \"...\"` is not allowed"));
     let _ = fs::remove_file(source);
+}
+
+#[test]
+fn exec_is_hard_off_without_use_std_script() {
+    // Script hard-off (M5 import ladder, Layer 1): exec is a check error unless
+    // the program imports std.script. Adding the import clears it.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let body = |uses: &str| {
+        format!(
+            "{uses}workflow HardOff\n\
+             output result R\n\
+             class R {{ m string }}\n\
+             rule go\n  when started\n=> {{\n  \
+             exec \"echo hi\" as run\n  \
+             after run succeeds {{ complete result {{ m \"ok\" }} }}\n}}\n"
+        )
+    };
+
+    let without = temp_path("hardoff-without", "whip");
+    fs::write(&without, body("")).expect("write");
+    let out = Command::new(bin)
+        .args(["check", without.to_str().expect("utf-8")])
+        .output()
+        .expect("runs");
+    assert!(
+        !out.status.success(),
+        "exec without use std.script must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("security.script_disabled"),
+        "expected the hard-off diagnostic id"
+    );
+    let _ = fs::remove_file(&without);
+
+    let with = temp_path("hardoff-with", "whip");
+    fs::write(&with, body("use std.script\n")).expect("write");
+    let out = Command::new(bin)
+        .args(["check", with.to_str().expect("utf-8")])
+        .output()
+        .expect("runs");
+    assert!(
+        out.status.success(),
+        "exec with use std.script must pass: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = fs::remove_file(&with);
 }
 
 #[test]
