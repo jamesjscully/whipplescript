@@ -153,7 +153,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
             "human.ask" => {
                 run_human_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
             }
-            "event.notify" => run_notify_effect_generic(
+            "signal.emit" => run_notify_effect_generic(
                 &mut self.kernel,
                 self.instance_id,
                 effect,

@@ -2700,7 +2700,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 .unwrap_or_default();
             effects.push(ParsedEffect {
                 timeout_seconds: None,
-                kind: "event.notify".to_owned(),
+                kind: "signal.emit".to_owned(),
                 target: None,
                 name: Some(event.clone()),
                 binding: binding_after_as(&statement),
@@ -3420,7 +3420,7 @@ pub fn parsed_effect_input_json(
             }
             input
         }
-        "event.notify" => {
+        "signal.emit" => {
             let event_name = effect.args.get(1).cloned().unwrap_or_default();
             let event = ir.events.iter().find(|event| event.name == event_name);
             if event.is_none() {

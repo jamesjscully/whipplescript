@@ -3294,7 +3294,7 @@ fn do_policy_block<Sql: DoSql>(
         || effect.kind.starts_with("lease.")
         || effect.kind.starts_with("ledger.")
         || effect.kind.starts_with("counter.")
-        || effect.kind == "event.notify"
+        || effect.kind == "signal.emit"
         || effect.kind.starts_with("file.")
     {
         return Ok(None);

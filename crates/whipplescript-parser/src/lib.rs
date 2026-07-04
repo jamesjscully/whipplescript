@@ -1371,7 +1371,7 @@ pub enum IrEffectKind {
     LeaseAcquire,
     LedgerAppend,
     CounterConsume,
-    EventNotify,
+    SignalEmit,
     FileRead,
     FileWrite,
     FileImport,
@@ -3537,10 +3537,10 @@ fn effect_contract_for_kind(
             strings(&["effect.output"]),
             TypedOutputValidation::None,
         ),
-        IrEffectKind::EventNotify => (
+        IrEffectKind::SignalEmit => (
             "std.ingress",
             strings(&["emit", "signal"]),
-            Some("event.notify.input"),
+            Some("signal.emit.input"),
             None,
             Vec::new(),
             Vec::new(),
@@ -3627,7 +3627,7 @@ impl IrEffectKind {
             Self::LeaseAcquire => "lease.acquire",
             Self::LedgerAppend => "ledger.append",
             Self::CounterConsume => "counter.consume",
-            Self::EventNotify => "event.notify",
+            Self::SignalEmit => "signal.emit",
             Self::FileRead => "file.read",
             Self::FileWrite => "file.write",
             Self::FileImport => "file.import",
@@ -8625,7 +8625,7 @@ fn terminal_completed_payload_type(
         | IrEffectKind::LeaseAcquire
         | IrEffectKind::LedgerAppend
         | IrEffectKind::CounterConsume
-        | IrEffectKind::EventNotify
+        | IrEffectKind::SignalEmit
         | IrEffectKind::FileRead
         | IrEffectKind::FileWrite
         | IrEffectKind::FileImport
@@ -9163,7 +9163,7 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
         body::BodyEffectKind::LeaseAcquire { .. } => IrEffectKind::LeaseAcquire,
         body::BodyEffectKind::LedgerAppend { .. } => IrEffectKind::LedgerAppend,
         body::BodyEffectKind::CounterConsume { .. } => IrEffectKind::CounterConsume,
-        body::BodyEffectKind::Notify { .. } => IrEffectKind::EventNotify,
+        body::BodyEffectKind::Notify { .. } => IrEffectKind::SignalEmit,
         body::BodyEffectKind::FileRead { .. } => IrEffectKind::FileRead,
         body::BodyEffectKind::FileWrite { .. } => IrEffectKind::FileWrite,
         body::BodyEffectKind::FileImport { .. } => IrEffectKind::FileImport,
@@ -12178,7 +12178,7 @@ fn effect_binding_schema(
         | IrEffectKind::LeaseAcquire
         | IrEffectKind::LedgerAppend
         | IrEffectKind::CounterConsume
-        | IrEffectKind::EventNotify
+        | IrEffectKind::SignalEmit
         | IrEffectKind::FileRead
         | IrEffectKind::FileWrite
         | IrEffectKind::FileImport
@@ -20656,7 +20656,7 @@ lease shared_slot { shared key Key slots 1 ttl 30m }
             (
                 "notify",
                 r#"    emit signal deploy.finished to ticket.id { service ticket.title status "ok" } as signal_sent"#,
-                IrEffectKind::EventNotify,
+                IrEffectKind::SignalEmit,
                 Some("signal_sent"),
             ),
             (

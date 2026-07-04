@@ -1712,13 +1712,13 @@ pub fn run_notify_effect_generic<S: RuntimeStore>(
         // is the EffectError base.
         kernel.derive_fact(
             instance_id,
-            "event.notify.failed",
+            "signal.emit.failed",
             &effect.effect_id,
             &json!({
                 "effect_id": effect.effect_id,
                 "run_id": run_id,
                 "status": "failed",
-                "value": effect_failure_base("event.notify", &reason, &reason, &effect.effect_id, &run_id),
+                "value": effect_failure_base("signal.emit", &reason, &reason, &effect.effect_id, &run_id),
                 "error": {"message": reason},
             })
             .to_string(),
@@ -1769,7 +1769,7 @@ pub fn run_notify_effect_generic<S: RuntimeStore>(
     })?;
     kernel.derive_fact(
         instance_id,
-        "event.notify.completed",
+        "signal.emit.completed",
         &effect.effect_id,
         &json!({
             "effect_id": effect.effect_id,

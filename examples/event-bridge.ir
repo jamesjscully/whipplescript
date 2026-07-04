@@ -15,7 +15,7 @@ rules
     reads
       pattern:deploy.finished as deployed
     effects
-      sent kind=event.notify binding=sent key=86cc210693f3562d
+      sent kind=signal.emit binding=sent key=b31e0a273c6f6e01
     body_hash b1f148a3cc2e40ba
   rule note_acknowledged
     when deploy.acknowledged as ack

@@ -20107,9 +20107,7 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
             "lease.acquire" | "lease.release" | "ledger.append" | "counter.consume" => {
                 run_coordination_effect_generic(kernel, id, effect)?
             }
-            "event.notify" => {
-                run_notify_effect_generic(kernel, id, effect, &IfcDeliveryGovernance)?
-            }
+            "signal.emit" => run_notify_effect_generic(kernel, id, effect, &IfcDeliveryGovernance)?,
             "file.read" => run_file_effect_generic(kernel, &NativeFileStore, id, effect)?,
             "file.write" => run_file_write_effect_generic(kernel, &NativeFileStore, id, effect)?,
             "file.import" => run_file_import_effect_generic(kernel, &NativeFileStore, id, effect)?,
@@ -20535,7 +20533,7 @@ fn run_claimable_effect(
         "lease.acquire" | "lease.release" | "ledger.append" | "counter.consume" => {
             run_coordination_effect(store_path, instance_id, effect)
         }
-        "event.notify" => run_notify_effect(store_path, instance_id, effect),
+        "signal.emit" => run_notify_effect(store_path, instance_id, effect),
         "file.read" => run_file_effect(store_path, instance_id, effect),
         "file.write" => run_file_write_effect(store_path, instance_id, effect),
         "file.import" => run_file_import_effect(store_path, instance_id, effect),
@@ -43144,7 +43142,7 @@ export json Row to docs at "rows.json" { mode create } as exported
             ("lease.acquire", Some("slot")),
             ("ledger.append", Some("entry")),
             ("counter.consume", Some("spend")),
-            ("event.notify", Some("signal_sent")),
+            ("signal.emit", Some("signal_sent")),
             ("file.read", Some("file_read")),
             ("file.write", Some("file_write")),
             ("file.import", Some("imported")),
@@ -45432,7 +45430,7 @@ workflow Child {
         .to_string();
         let effects = [NewEffect {
             effect_id: "notify-internal",
-            kind: "event.notify",
+            kind: "signal.emit",
             target: None,
             input_json: &input_json,
             status: "queued",
@@ -45466,7 +45464,7 @@ workflow Child {
 
         let effect = ClaimableEffect {
             effect_id: "notify-internal".to_owned(),
-            kind: "event.notify".to_owned(),
+            kind: "signal.emit".to_owned(),
             target: None,
             profile: None,
             input_json,
@@ -45479,7 +45477,7 @@ workflow Child {
         assert!(
             sender_facts
                 .iter()
-                .any(|fact| fact.name == "event.notify.failed"),
+                .any(|fact| fact.name == "signal.emit.failed"),
             "sender should receive a branchable notify failure"
         );
         let target_events = store.list_events(&target).expect("target events");

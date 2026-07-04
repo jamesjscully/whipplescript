@@ -738,7 +738,7 @@ fn carried_integrity_of_rule(
 }
 
 /// The signal ports a rule emits (`emit signal <name> [to <peer>]` → resource
-/// `signal:<name>`). The directed form lowers to `EventNotify`, the broadcast form to
+/// `signal:<name>`). The directed form lowers to `SignalEmit`, the broadcast form to
 /// `EventEmit`; both carry the emitter's payload across the boundary.
 fn emitted_signal_ports(rule: &IrRule) -> Vec<String> {
     rule.metadata
@@ -747,7 +747,7 @@ fn emitted_signal_ports(rule: &IrRule) -> Vec<String> {
         .filter(|effect| {
             matches!(
                 effect.kind,
-                IrEffectKind::EventEmit | IrEffectKind::EventNotify
+                IrEffectKind::EventEmit | IrEffectKind::SignalEmit
             )
         })
         .filter_map(|effect| effect.resource.clone())
@@ -894,7 +894,7 @@ fn selected_effect_integrity_sinks(
     }
     if matches!(
         effect.kind,
-        IrEffectKind::EventEmit | IrEffectKind::EventNotify
+        IrEffectKind::EventEmit | IrEffectKind::SignalEmit
     ) {
         sinks.push("stream".to_owned());
     }
@@ -1527,7 +1527,7 @@ pub fn check_with_envelope_imports(
             // to public, so confidential data in an emitted event is caught.
             if matches!(
                 effect.kind,
-                IrEffectKind::EventEmit | IrEffectKind::EventNotify
+                IrEffectKind::EventEmit | IrEffectKind::SignalEmit
             ) {
                 writes.push("stream");
                 span.get_or_insert(effect.span);
@@ -2033,7 +2033,7 @@ pub fn ifc_surface(ir: &IrProgram) -> Vec<String> {
             }
             if matches!(
                 effect.kind,
-                IrEffectKind::EventEmit | IrEffectKind::EventNotify
+                IrEffectKind::EventEmit | IrEffectKind::SignalEmit
             ) {
                 surface.insert("stream".to_owned());
             }

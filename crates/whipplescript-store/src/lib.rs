@@ -6482,7 +6482,7 @@ fn policy_block_on(
         || effect.kind.starts_with("lease.")
         || effect.kind.starts_with("ledger.")
         || effect.kind.starts_with("counter.")
-        || effect.kind == "event.notify"
+        || effect.kind == "signal.emit"
         || effect.kind.starts_with("file.")
     {
         return Ok(None);
