@@ -2091,7 +2091,7 @@ const LSP_KEYWORDS: &[&str] = &[
     "when", "record", "done", "tell", "decide", "askHuman", "exec", "call", "invoke", "with",
     "access", "to", "read", "write", "import", "export", "recall", "learn", "emit", "after",
     "case", "complete", "fail", "timer", "cancel", "claim", "release", "finish", "file", "acquire",
-    "append", "consume",
+    "renew", "append", "consume",
 ];
 
 /// Compile `text` and publish its diagnostics (errors + warnings) for `uri`. This
@@ -20388,9 +20388,8 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
             "queue.file" | "queue.claim" | "queue.release" | "queue.finish" => {
                 run_queue_effect_generic(kernel, id, effect, &config)?
             }
-            "lease.acquire" | "lease.release" | "ledger.append" | "counter.consume" => {
-                run_coordination_effect_generic(kernel, id, effect, "now")?
-            }
+            "lease.acquire" | "lease.release" | "lease.renew" | "ledger.append"
+            | "counter.consume" => run_coordination_effect_generic(kernel, id, effect, "now")?,
             "signal.emit" => run_notify_effect_generic(kernel, id, effect, &IfcDeliveryGovernance)?,
             "file.read" => run_file_effect_generic(kernel, &NativeFileStore, id, effect)?,
             "file.write" => run_file_write_effect_generic(kernel, &NativeFileStore, id, effect)?,
@@ -20878,7 +20877,7 @@ fn run_claimable_effect(
             options.exec_profile,
             script_manifest,
         ),
-        "lease.acquire" | "lease.release" | "ledger.append" | "counter.consume" => {
+        "lease.acquire" | "lease.release" | "lease.renew" | "ledger.append" | "counter.consume" => {
             run_coordination_effect(
                 store_path,
                 instance_id,

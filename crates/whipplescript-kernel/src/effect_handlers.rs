@@ -1194,6 +1194,70 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
                 "released": released,
             })
         }
+        "lease.renew" => {
+            // Renew names its acquire; resource/key/owner come from the recorded
+            // acquire input so they cannot drift (mirrors `lease.release`). The
+            // new TTL is the renew's own `ttl_seconds`, falling back to the
+            // acquire's declared TTL.
+            let acquire_effect_id = field("acquire_effect_id");
+            let acquire_input = kernel
+                .store()
+                .list_effects(instance_id)?
+                .into_iter()
+                .find(|candidate| candidate.effect_id == acquire_effect_id)
+                .map(|candidate| json_from_str(&candidate.input_json))
+                .unwrap_or(Value::Null);
+            let resource = acquire_input
+                .get("resource")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let key = acquire_input
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let acquire_owner = acquire_input
+                .get("coordination_owner")
+                .and_then(Value::as_str)
+                .filter(|owner| !owner.is_empty())
+                .unwrap_or(&workflow_owner)
+                .to_owned();
+            let ttl_seconds = input
+                .get("ttl_seconds")
+                .and_then(Value::as_i64)
+                .or_else(|| acquire_input.get("ttl_seconds").and_then(Value::as_i64))
+                .unwrap_or(600);
+            let mut expires_at = kernel.store_mut().renew_lease_for_owner(
+                &acquire_owner,
+                &resource,
+                &key,
+                ttl_seconds,
+                instance_id,
+            )?;
+            if expires_at.is_none() && acquire_owner != DEFAULT_COORDINATION_OWNER {
+                expires_at = kernel.store_mut().renew_lease_for_owner(
+                    DEFAULT_COORDINATION_OWNER,
+                    &resource,
+                    &key,
+                    ttl_seconds,
+                    instance_id,
+                )?;
+            }
+            match expires_at {
+                Some(expires_at) => json!({
+                    "variant": "Renewed",
+                    "resource": resource,
+                    "key": key,
+                    "expires_at": expires_at,
+                }),
+                None => json!({
+                    "variant": "NotHeld",
+                    "resource": resource,
+                    "key": key,
+                }),
+            }
+        }
         "ledger.append" => {
             let ledger = field("ledger");
             let partition = field("partition");

@@ -2556,6 +2556,38 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
+        } else if let Some(rest) = trimmed.strip_prefix("renew ") {
+            // renew <acquire-binding> [until <duration>] as <out>: extend a held
+            // lease's TTL. The first token names the acquire whose resource/key
+            // this reuses; the optional `until <duration>` is the new TTL.
+            let acquire_binding = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let ttl_seconds = rest
+                .split(" as ")
+                .next()
+                .unwrap_or_default()
+                .split_once(" until ")
+                .and_then(|(_, tail)| tail.split_whitespace().next())
+                .and_then(whipplescript_parser::body::parse_short_duration_seconds)
+                .map(|seconds| seconds as i64);
+            effects.push(ParsedEffect {
+                timeout_seconds: None,
+                kind: "lease.renew".to_owned(),
+                target: None,
+                name: None,
+                binding: binding_after_as(trimmed),
+                args: vec![
+                    acquire_binding,
+                    ttl_seconds.map(|s| s.to_string()).unwrap_or_default(),
+                ],
+                prompt: None,
+                prompt_content_type: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
         } else if let Some(rest) = trimmed.strip_prefix("finish ") {
             let (statement, next_index) = if trimmed.contains('{') {
                 parse_statement_until_balanced_braces(&lines, index, trimmed)
@@ -3584,6 +3616,14 @@ pub fn parsed_effect_input_json(
                 .args
                 .first()
                 .and_then(|binding| effect_bindings.get(binding)),
+            "rule": rule.name,
+        }),
+        "lease.renew" => json!({
+            "acquire_effect_id": effect
+                .args
+                .first()
+                .and_then(|binding| effect_bindings.get(binding)),
+            "ttl_seconds": effect.args.get(1).and_then(|arg| arg.parse::<i64>().ok()),
             "rule": rule.name,
         }),
         "ledger.append" => {

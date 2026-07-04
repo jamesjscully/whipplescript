@@ -11,7 +11,7 @@
 use std::path::Path;
 
 #[cfg(feature = "native")]
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
 use crate::StoreResult;
@@ -177,6 +177,39 @@ impl CoordinationStore {
             params![owner, resource, key, holder],
         )?;
         Ok(changed >= 1)
+    }
+
+    /// Extend a held lease's TTL before it expires (spec/coordination.md,
+    /// lease-renew). One atomic UPDATE keyed by the holder: a still-live hold
+    /// gets `expires_at` bumped to `now + ttl_seconds` and its new expiry is
+    /// returned (`Renewed`); a lease this holder does not currently hold — or one
+    /// already expired — matches no row and yields `None` (`NotHeld`).
+    pub fn renew_lease_for_owner(
+        &mut self,
+        owner: &str,
+        resource: &str,
+        key: &str,
+        ttl_seconds: i64,
+        holder: &str,
+    ) -> StoreResult<Option<String>> {
+        let owner = normalized_owner(owner);
+        let expires_at = self
+            .connection
+            .query_row(
+                "UPDATE leases SET expires_at = datetime('now', ?5) \
+                 WHERE owner = ?1 AND resource = ?2 AND key = ?3 AND holder = ?4 \
+                 AND expires_at > datetime('now') RETURNING expires_at",
+                params![
+                    owner,
+                    resource,
+                    key,
+                    holder,
+                    format!("+{ttl_seconds} seconds")
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(expires_at)
     }
 
     /// Instance-terminal release: a holder reaching a workflow terminal drops
@@ -447,6 +480,17 @@ pub trait Coordination {
         holder: &str,
     ) -> StoreResult<bool>;
 
+    /// Extend a held lease's TTL; returns the new `expires_at` on success,
+    /// `None` when this holder does not hold the (still-live) lease.
+    fn renew_lease_for_owner(
+        &mut self,
+        owner: &str,
+        resource: &str,
+        key: &str,
+        ttl_seconds: i64,
+        holder: &str,
+    ) -> StoreResult<Option<String>>;
+
     fn release_all_for_holder(&mut self, holder: &str) -> StoreResult<usize>;
 
     fn append_for_owner(
@@ -592,6 +636,17 @@ impl Coordination for CoordinationStore {
         holder: &str,
     ) -> StoreResult<bool> {
         self.release_for_owner(owner, resource, key, holder)
+    }
+
+    fn renew_lease_for_owner(
+        &mut self,
+        owner: &str,
+        resource: &str,
+        key: &str,
+        ttl_seconds: i64,
+        holder: &str,
+    ) -> StoreResult<Option<String>> {
+        self.renew_lease_for_owner(owner, resource, key, ttl_seconds, holder)
     }
 
     fn release_all_for_holder(&mut self, holder: &str) -> StoreResult<usize> {

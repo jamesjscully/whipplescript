@@ -1,0 +1,63 @@
+# Lease renew (spec/coordination.md): extend a held lease's TTL before it
+# expires, completing the lease lifecycle (acquire / wait / renew / release).
+#
+# `grab` acquires a shared 1-slot lease with the lease's declared 60s TTL, then
+# `renew`s it out to 300s while still holding it (the renew names the acquire's
+# `as` binding, so its resource and key never drift), and finally releases it and
+# completes. Renewing before expiry keeps a long-running holder's claim alive
+# without dropping and re-contending for the slot.
+
+workflow Renewer
+
+output result Done
+failure error Busy
+
+class Ticket {
+  id string
+}
+
+class Done {
+  note string
+}
+
+class Busy {
+  reason string
+}
+
+lease deploy_slot {
+  shared
+  key Ticket
+  slots 1
+  ttl 60s
+}
+
+rule seed
+  when started
+=> {
+  record Ticket {
+    id "prod"
+  }
+}
+
+rule grab
+  when Ticket as t
+=> {
+  acquire deploy_slot for t.id until ttl as slot
+
+  after slot held {
+    renew slot until 300s as renewed
+  }
+
+  after slot contended {
+    fail error {
+      reason "could not take the slot"
+    }
+  }
+
+  after renewed completes {
+    release slot
+    complete result {
+      note "held, renewed to 300s, then released"
+    }
+  }
+}

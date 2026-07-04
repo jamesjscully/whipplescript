@@ -542,6 +542,18 @@ impl Coordination for NativeStores {
         self.coord.release_for_owner(owner, resource, key, holder)
     }
 
+    fn renew_lease_for_owner(
+        &mut self,
+        owner: &str,
+        resource: &str,
+        key: &str,
+        ttl_seconds: i64,
+        holder: &str,
+    ) -> StoreResult<Option<String>> {
+        self.coord
+            .renew_lease_for_owner(owner, resource, key, ttl_seconds, holder)
+    }
+
     fn release_all_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
         self.coord.release_all_for_holder(holder)
     }

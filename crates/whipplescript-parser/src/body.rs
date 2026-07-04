@@ -291,6 +291,16 @@ pub enum BodyEffectKind {
         /// `None` reports `contended` on the first attempt.
         wait_seconds: Option<u64>,
     },
+    /// `renew <acquire-binding> [until <ttl>] as <b>`: extend a held lease's
+    /// TTL before it expires (spec/coordination.md). Names the acquire's `as`
+    /// binding and works on the same lease; `Renewed`/`NotHeld` outcomes.
+    LeaseRenew {
+        /// The `as` binding of the `acquire` this renew extends.
+        acquire_binding: String,
+        /// `until <duration>`: the new TTL in seconds. `None` reuses the
+        /// acquire's declared TTL.
+        ttl_seconds: Option<u64>,
+    },
     LedgerAppend {
         ledger: String,
         schema: String,
@@ -1247,6 +1257,7 @@ impl<'a> BodyParser<'a> {
             "release" => self.parse_queue_release(),
             "finish" => self.parse_queue_finish(),
             "acquire" => self.parse_lease_acquire(),
+            "renew" => self.parse_lease_renew(),
             "append" => self.parse_ledger_append(),
             "emit" => self.parse_emit_signal(),
             "redact" => self.parse_redact(),
@@ -2859,6 +2870,72 @@ impl<'a> BodyParser<'a> {
         }))
     }
 
+    /// `renew <acquire-binding> [until <ttl>] as <b>`: extend a held lease's
+    /// TTL before it expires (spec/coordination.md). It names the `as` binding
+    /// of the `acquire` it extends, so resource/key never drift, and yields a
+    /// branchable `renewed`/`notHeld` outcome.
+    fn parse_lease_renew(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // renew
+        let acquire_binding = self.ident_text("lease binding after `renew`")?;
+        // `until <duration>`: the new TTL. Unlike `acquire`'s `until ttl` keyword
+        // (fire-and-forget), renew's `until` takes a duration value, e.g.
+        // `until 300s`.
+        let mut ttl_seconds = None;
+        if self.at_ident("until") {
+            self.pos += 1; // until
+            let span = self.span_here();
+            let Some(Tok::Number(value)) = self.peek().map(|t| t.tok.clone()) else {
+                self.error(
+                    span,
+                    "expected a duration after `until`".to_owned(),
+                    Some("use `<n><unit>` with unit s, m, h, or d, e.g. `until 300s`".to_owned()),
+                );
+                return None;
+            };
+            self.pos += 1;
+            match parse_short_duration_seconds(&value) {
+                Some(seconds) if seconds > 0 => ttl_seconds = Some(seconds),
+                _ => {
+                    self.error(
+                        span,
+                        format!("invalid ttl duration `{value}`"),
+                        Some("use `<n><unit>` with unit s, m, h, or d".to_owned()),
+                    );
+                    return None;
+                }
+            }
+        }
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+            return None;
+        }
+        if binding.is_none() {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "`renew` requires an `as` binding".to_owned(),
+                Some(
+                    "branch on it with `after <binding> renewed` and `after <binding> notHeld`"
+                        .to_owned(),
+                ),
+            );
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::LeaseRenew {
+                acquire_binding,
+                ttl_seconds,
+            },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: None,
+            span: self.span_from(start),
+        }))
+    }
+
     /// `append <Schema> { fields } to <ledger> [as x]` (spec/coordination.md).
     fn parse_ledger_append(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
@@ -3611,9 +3688,9 @@ impl<'a> BodyParser<'a> {
 
 const STATEMENT_KEYWORDS: &[&str] = &[
     "record", "done", "consume", "tell", "coerce", "askHuman", "prompt", "claim", "release",
-    "finish", "file", "call", "recall", "send", "invoke", "read", "write", "import", "export",
-    "after", "case", "complete", "fail", "flowfail", "timer", "cancel", "decide", "exec", "when",
-    "on", "else", "redact",
+    "renew", "finish", "file", "call", "recall", "send", "invoke", "read", "write", "import",
+    "export", "after", "case", "complete", "fail", "flowfail", "timer", "cancel", "decide", "exec",
+    "when", "on", "else", "redact",
 ];
 
 #[cfg(test)]

@@ -6577,6 +6577,45 @@ impl<Sql: DoSql> Coordination for DoSqliteStore<Sql> {
         Ok(changed >= 1)
     }
 
+    fn renew_lease_for_owner(
+        &mut self,
+        owner: &str,
+        resource: &str,
+        key: &str,
+        ttl_seconds: i64,
+        holder: &str,
+    ) -> StoreResult<Option<String>> {
+        let owner = do_norm_owner(owner);
+        // One atomic UPDATE of a still-live hold; the DO's single-writer model
+        // supplies the atomicity a native rusqlite transaction would.
+        let changed = self
+            .sql
+            .execute(
+                "UPDATE coord_leases SET expires_at = datetime('now', ?5) \
+                 WHERE owner = ?1 AND resource = ?2 AND key = ?3 AND holder = ?4 \
+                 AND expires_at > datetime('now')",
+                &[
+                    text(owner),
+                    text(resource),
+                    text(key),
+                    text(holder),
+                    text(&format!("+{ttl_seconds} seconds")),
+                ],
+            )
+            .map_err(sql_err)?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let rows = self
+            .sql
+            .query(
+                "SELECT expires_at FROM coord_leases WHERE owner = ?1 AND resource = ?2 AND key = ?3 AND holder = ?4",
+                &[text(owner), text(resource), text(key), text(holder)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
     fn release_all_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
         let changed = self
             .sql

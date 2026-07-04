@@ -1346,6 +1346,15 @@ fn print_effect(
                 rn(key_expr)
             )
         }
+        BodyEffectKind::LeaseRenew {
+            acquire_binding,
+            ttl_seconds,
+        } => {
+            let until = ttl_seconds
+                .map(|seconds| format!(" until {seconds}s"))
+                .unwrap_or_default();
+            format!("renew {}{until}{binding}", rn(acquire_binding))
+        }
         BodyEffectKind::LedgerAppend {
             ledger,
             schema,

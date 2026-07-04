@@ -1414,6 +1414,7 @@ pub enum IrEffectKind {
     QueueRelease,
     QueueFinish,
     LeaseAcquire,
+    LeaseRenew,
     LedgerAppend,
     CounterConsume,
     SignalEmit,
@@ -3529,6 +3530,16 @@ fn effect_contract_for_kind(
             strings(&["effect.output"]),
             TypedOutputValidation::None,
         ),
+        IrEffectKind::LeaseRenew => (
+            "std.coord",
+            strings(&["renew"]),
+            Some("lease.renew.input"),
+            Some("LeaseRenewOutcome"),
+            Vec::new(),
+            Vec::new(),
+            strings(&["effect.output"]),
+            TypedOutputValidation::None,
+        ),
         IrEffectKind::LedgerAppend => (
             "std.coord",
             strings(&["append"]),
@@ -3637,6 +3648,7 @@ impl IrEffectKind {
             Self::QueueRelease => "queue.release",
             Self::QueueFinish => "queue.finish",
             Self::LeaseAcquire => "lease.acquire",
+            Self::LeaseRenew => "lease.renew",
             Self::LedgerAppend => "ledger.append",
             Self::CounterConsume => "counter.consume",
             Self::SignalEmit => "signal.emit",
@@ -8784,6 +8796,7 @@ fn terminal_completed_payload_type(
         | IrEffectKind::QueueRelease
         | IrEffectKind::QueueFinish
         | IrEffectKind::LeaseAcquire
+        | IrEffectKind::LeaseRenew
         | IrEffectKind::LedgerAppend
         | IrEffectKind::CounterConsume
         | IrEffectKind::SignalEmit
@@ -9322,6 +9335,7 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
         body::BodyEffectKind::QueueRelease { .. } => IrEffectKind::QueueRelease,
         body::BodyEffectKind::QueueFinish { .. } => IrEffectKind::QueueFinish,
         body::BodyEffectKind::LeaseAcquire { .. } => IrEffectKind::LeaseAcquire,
+        body::BodyEffectKind::LeaseRenew { .. } => IrEffectKind::LeaseRenew,
         body::BodyEffectKind::LedgerAppend { .. } => IrEffectKind::LedgerAppend,
         body::BodyEffectKind::CounterConsume { .. } => IrEffectKind::CounterConsume,
         body::BodyEffectKind::Notify { .. } => IrEffectKind::SignalEmit,
@@ -9431,6 +9445,7 @@ fn is_ast_only_effect_kind(kind: &body::BodyEffectKind) -> bool {
             | body::BodyEffectKind::QueueRelease { .. }
             | body::BodyEffectKind::QueueFinish { .. }
             | body::BodyEffectKind::LeaseAcquire { .. }
+            | body::BodyEffectKind::LeaseRenew { .. }
             | body::BodyEffectKind::LedgerAppend { .. }
             | body::BodyEffectKind::CounterConsume { .. }
             | body::BodyEffectKind::Notify { .. }
@@ -12337,6 +12352,7 @@ fn effect_binding_schema(
         | IrEffectKind::QueueRelease
         | IrEffectKind::QueueFinish
         | IrEffectKind::LeaseAcquire
+        | IrEffectKind::LeaseRenew
         | IrEffectKind::LedgerAppend
         | IrEffectKind::CounterConsume
         | IrEffectKind::SignalEmit
