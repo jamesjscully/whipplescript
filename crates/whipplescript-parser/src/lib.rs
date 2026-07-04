@@ -5785,6 +5785,18 @@ impl SchemaIndex {
                 ("correlation", string_ty()),
             ],
         );
+        // The typed receipt a `send via <channel> { ... } as r` binding sees
+        // (std.messaging; the `messaging.send` contract's output schema). The
+        // real local-mailbox provider returns exactly these fields; the fixture
+        // provider is a partial stand-in and does not populate them.
+        index.insert_class(
+            "MessageSendReceipt",
+            [
+                ("provider_message_id", string_ty()),
+                ("channel", string_ty()),
+                ("delivered", bool_ty()),
+            ],
+        );
         index
     }
 
@@ -5946,6 +5958,13 @@ fn zero_span() -> SourceSpan {
 fn string_ty() -> TypeSyntax {
     TypeSyntax::Primitive {
         name: "string".to_owned(),
+        span: zero_span(),
+    }
+}
+
+fn bool_ty() -> TypeSyntax {
+    TypeSyntax::Primitive {
+        name: "bool".to_owned(),
         span: zero_span(),
     }
 }
@@ -28013,6 +28032,9 @@ rule j
             .any(|library| library.id == "std.messaging"));
         // The generic `Message` envelope is a built-in referenceable schema.
         assert!(SchemaIndex::with_builtins().class_exists("Message"));
+        // The `send` construct's typed receipt (the messaging.send contract's
+        // output schema) is a built-in class so `send … as r` binds a typed r.
+        assert!(SchemaIndex::with_builtins().class_exists("MessageSendReceipt"));
     }
 
     #[test]
