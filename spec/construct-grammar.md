@@ -954,6 +954,123 @@ package B: recall from <source> for <expr> as <binding>
 Reason: construct matching must be unambiguous. Resolution may require
 namespaced forms or an explicit import alias.
 
+## DR-0011 Two-Shape Meta-Grammar (S6 build)
+
+Status: design settled 2026-07-04 for build (ecosystem-shape note M1, resolved
+by Jack: build DR-0011 now). This section is the model-first design the parser
+rebuild (S6c) implements and `validation-by-deletion` of `parse_recall` /
+`parse_send` verifies. The shipped `constructs[].fields` (a flat name+kind list,
+e.g. `memory.json` recall = pool/query/binding) cannot express connective words
+(`recall … for …`) or a payload block (`send via … { text … }`), so the parser
+hardcodes those shapes today. The meta-grammar replaces the flat `fields[]` with
+a `grammar` object in exactly **two shapes**; the parser reads it and parses
+generically. A construct that neither shape can express is a **core-grammar
+exception** (a hardcoded parser arm, the authorize-post-parse fallback), not a
+new shape — that constraint is the design's falsifier.
+
+### Shape 1 — `declaration_block`
+
+`<keyword> <name> { <clause>* }` — a top-level declaration (family
+`declaration_block` / `source_declaration`). Manifest:
+
+```json
+"grammar": {
+  "shape": "declaration_block",
+  "keyword": "memory pool",
+  "name": { "kind": "identifier", "required": true },
+  "clauses": [
+    { "name": "provider", "kind": "identifier", "required": true },
+    { "name": "retain",   "kind": "duration",   "required": false }
+  ]
+}
+```
+
+Clause `kind` ∈ {`identifier`, `expression`, `duration`, `glob`, `schema`,
+`scalar`} (the fixed clause vocabulary). Order-free clauses, each optional or
+required; unknown clause name is an error.
+
+### Shape 2 — `effect_operation`
+
+`<keyword> [<connective> <slot>]* [{ <payload-field>* }]? as <binding>` — a
+rule-body effect (family `effect_operation`). One template covers both shipped
+package constructs. Manifest:
+
+```json
+"grammar": {
+  "shape": "effect_operation",
+  "keyword": "recall",
+  "slots": [
+    { "name": "pool",  "kind": "identifier" },
+    { "name": "query", "kind": "expression", "connective": "for" }
+  ],
+  "payload": null,
+  "binding": "required",
+  "target_capability": "memory.query"
+}
+```
+
+```json
+"grammar": {
+  "shape": "effect_operation",
+  "keyword": "send",
+  "slots": [ { "name": "channel", "kind": "identifier", "connective": "via" } ],
+  "payload": {
+    "fields": [
+      { "name": "text",      "kind": "expression", "required": true  },
+      { "name": "markdown",  "kind": "expression", "required": false },
+      { "name": "thread_id", "kind": "expression", "required": false }
+    ]
+  },
+  "binding": "required",
+  "target_capability": "messaging.send"
+}
+```
+
+- **slots**: ordered; each has a `name`, a `kind` (`identifier` | `expression`),
+  and an optional `connective` — a fixed word from {`from`, `for`, `into`,
+  `to`, `via`} consumed *before* the slot. The first slot's connective is
+  usually absent (`recall <pool>`); a present one is required literally
+  (`send via <channel>`).
+- **payload**: `null`, or a `{ fields[] }` block of named `expression` fields,
+  each `required` or not; an unknown block field is an error, a missing required
+  one is an error (exactly today's `send` "requires a `text` field").
+- **binding**: `required` | `optional` | `none` — the trailing `as <binding>`.
+- **target_capability**: the capability the use authorizes (M3 capability
+  plane); the lowering class stays `capability_call`.
+
+### Parse semantics (what S6c builds)
+
+For a package-registered construct whose keyword leads a statement, the body
+parser looks up its `grammar` (from the merged manifest/catalog registry) and:
+consumes the keyword; for each slot, consumes its connective (error if absent
+when required) then parses the slot's `kind`; parses the optional payload block
+against `payload.fields` (required/unknown checks); parses the `binding` per its
+mode. Success lowers to the same `ConstructCapabilityCall { keyword,
+target_capability, fields }` the hardcoded parsers emit today — which is how
+`validation-by-deletion` is checked: re-express `recall` and `send` as `grammar`
+specs, delete `parse_recall`/`parse_send`, and every existing recall/send test
+plus the `.ir` snapshots must stay byte-identical.
+
+### Authorability door (S6, from the coherence pass)
+
+Registering a construct whose lowering class is `package_authorable: false`
+(coord `resource_effect`; the source family's `signal_source` / `signal_emit` /
+`metadata`; time `clock_source`) is admitted only when a platform-catalog
+privilege tuple grants that `(library, keyword, family, scope, lowering)` — the
+same mechanism re-keyed in `std-construct-authorization.maude` (coverage: a
+privileged std manifest authors the class; bite: an unprivileged manifest with
+the same row is rejected). The two shapes above are the *grammar*; the
+authorability door is orthogonal *authorization*.
+
+### Model expectation (S6b, model-first)
+
+`construct-grammar.maude` gains parse-coverage + bite for the two shapes:
+coverage = a well-formed `declaration_block` and a well-formed `effect_operation`
+(both slot-only and payload forms) each parse to an accepted construct use; bite
+= a missing required connective, an unknown payload field, a missing required
+payload field, a missing required binding, and a statement matching neither
+shape each reach a `rejected` term. Built before S6c per model-first.
+
 ## Package Author Contract
 
 A package author declares construct instances in manifest data:
