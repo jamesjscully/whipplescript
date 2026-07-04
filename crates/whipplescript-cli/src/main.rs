@@ -29789,10 +29789,13 @@ fn coordination_list(options: &CliOptions, kind: &str) -> ExitCode {
 /// exporter that tails the durable event log and emits OTLP/HTTP JSON traces.
 /// The event log is the buffer — zero hot-path overhead, failure isolation,
 /// and the cursor makes emission exactly-once across re-runs and replays.
-/// Config is the standard OTel environment; with no endpoint and no
-/// `--dry-run` it refuses rather than guessing. Plain-HTTP endpoints only:
-/// the standard sidecar deployment posts to a local OpenTelemetry Collector,
-/// which owns TLS and fan-out to backends.
+/// Config is the standard OTel environment (`OTEL_EXPORTER_OTLP_ENDPOINT`,
+/// `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_HEADERS`,
+/// `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME`); with no endpoint set it
+/// defaults to `http://localhost:4318` (the local sidecar Collector). The POST
+/// rides the in-tree `ureq` client, so `https://` endpoints work directly;
+/// auth headers over a plaintext endpoint are refused unless the host is
+/// loopback or `WHIPPLESCRIPT_OTEL_ALLOW_INSECURE_HEADERS` is set.
 /// The export-cursor management surface for `std.telemetry` (spec/std-telemetry.md):
 /// `whip telemetry status` reports the emit-once cursor + exporter config, and
 /// `whip telemetry reset-cursor [<instance>]` clears it so the next `otel-export`
@@ -29820,22 +29823,52 @@ fn telemetry(options: &CliOptions) -> ExitCode {
     let endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| "http://localhost:4318".to_owned());
     let service_name = env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "whipplescript".to_owned());
-    let read_cursor = || -> serde_json::Map<String, Value> {
-        fs::read_to_string(&cursor_path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default()
-    };
     match subcommand {
         Some("status") => {
-            let cursor = read_cursor();
-            let per_instance: Vec<Value> = cursor
+            let cursor = read_otel_cursor_v2(&cursor_path);
+            let empty_scopes = serde_json::Map::new();
+            let scopes_map = cursor
+                .get("cursors")
+                .and_then(Value::as_object)
+                .unwrap_or(&empty_scopes);
+            // List every scope (spec/std-telemetry.md "Cursor scoping": `status`
+            // lists every scope) and aggregate per-instance run counts across
+            // scopes for a stable summary line.
+            let mut per_instance_counts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let mut scopes: Vec<Value> = Vec::new();
+            for (scope_key, scope) in scopes_map {
+                let mut scope_instances: Vec<Value> = Vec::new();
+                if let Some(instances) = scope.get("instances").and_then(Value::as_object) {
+                    for (instance, runs) in instances {
+                        let count = runs.as_array().map(Vec::len).unwrap_or(0);
+                        *per_instance_counts.entry(instance.clone()).or_default() += count;
+                        scope_instances.push(json!({
+                            "instance_id": instance,
+                            "exported_runs": count,
+                        }));
+                    }
+                }
+                scopes.push(json!({
+                    "scope_key": scope_key,
+                    "provider": scope
+                        .get("provider")
+                        .cloned()
+                        .unwrap_or_else(|| json!(OTEL_PROVIDER_ID)),
+                    "endpoint": scope.get("endpoint").cloned().unwrap_or(Value::Null),
+                    "mapping_version": scope
+                        .get("mapping_version")
+                        .cloned()
+                        .unwrap_or_else(|| json!(OTEL_MAPPING_VERSION)),
+                    "instances": scope_instances,
+                }));
+            }
+            let per_instance: Vec<Value> = per_instance_counts
                 .iter()
-                .map(|(instance, runs)| {
+                .map(|(instance, count)| {
                     json!({
                         "instance_id": instance,
-                        "exported_runs": runs.as_array().map(Vec::len).unwrap_or(0),
+                        "exported_runs": count,
                     })
                 })
                 .collect();
@@ -29844,41 +29877,71 @@ fn telemetry(options: &CliOptions) -> ExitCode {
                     "endpoint": endpoint,
                     "service_name": service_name,
                     "cursor_path": cursor_path.display().to_string(),
+                    "scopes": scopes,
                     "instances": per_instance,
                 }));
             } else {
                 println!("telemetry exporter: otlp -> {endpoint} (service {service_name})");
+                println!(
+                    "  env: OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL (http/json only), OTEL_EXPORTER_OTLP_HEADERS (secret), OTEL_RESOURCE_ATTRIBUTES, OTEL_SERVICE_NAME"
+                );
                 println!("cursor: {}", cursor_path.display());
-                if per_instance.is_empty() {
+                if scopes.is_empty() {
                     println!("  no exports recorded yet");
                 } else {
-                    for entry in &per_instance {
+                    for scope in &scopes {
                         println!(
-                            "  {} — {} run(s) exported",
-                            entry
-                                .get("instance_id")
+                            "  scope {} -> {}",
+                            scope.get("scope_key").and_then(Value::as_str).unwrap_or(""),
+                            scope
+                                .get("endpoint")
                                 .and_then(Value::as_str)
-                                .unwrap_or(""),
-                            entry
-                                .get("exported_runs")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0),
+                                .unwrap_or("(unknown)"),
                         );
+                        if let Some(entries) = scope.get("instances").and_then(Value::as_array) {
+                            for entry in entries {
+                                println!(
+                                    "    {} — {} run(s) exported",
+                                    entry
+                                        .get("instance_id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or(""),
+                                    entry
+                                        .get("exported_runs")
+                                        .and_then(Value::as_u64)
+                                        .unwrap_or(0),
+                                );
+                            }
+                        }
                     }
                 }
             }
             ExitCode::SUCCESS
         }
         Some("reset-cursor") => {
-            let mut cursor = read_cursor();
-            let cleared = match &instance_id {
-                // Reset one instance's cursor; the rest keep their checkpoints.
-                Some(instance) => cursor.remove(instance).is_some(),
+            let (cleared, write_back) = match &instance_id {
+                // Reset one instance across every scope; the rest keep theirs.
+                Some(instance) => {
+                    let mut cursor = read_otel_cursor_v2(&cursor_path);
+                    let mut cleared = false;
+                    if let Some(scopes) = cursor.get_mut("cursors").and_then(Value::as_object_mut) {
+                        for (_scope_key, scope) in scopes.iter_mut() {
+                            if let Some(instances) =
+                                scope.get_mut("instances").and_then(Value::as_object_mut)
+                            {
+                                if instances.remove(instance).is_some() {
+                                    cleared = true;
+                                }
+                            }
+                        }
+                    }
+                    (cleared, Some(cursor))
+                }
                 // Reset everything by removing the cursor file entirely.
-                None => !cursor.is_empty() || cursor_path.exists(),
+                None => (cursor_path.exists(), None),
             };
-            let write_result = match &instance_id {
-                Some(_) => fs::write(&cursor_path, Value::Object(cursor).to_string()),
+            let write_result = match write_back {
+                Some(cursor) => fs::write(&cursor_path, cursor.to_string()),
                 None => match fs::remove_file(&cursor_path) {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                     other => other,
@@ -29903,7 +29966,7 @@ fn telemetry(options: &CliOptions) -> ExitCode {
 }
 
 fn otel_export(options: &CliOptions) -> ExitCode {
-    let usage = "usage: whip otel-export <instance> [--dry-run]";
+    let usage = "usage: whip otel-export <instance> [--dry-run]\n  env: OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL (http/json), OTEL_EXPORTER_OTLP_HEADERS, OTEL_RESOURCE_ATTRIBUTES, OTEL_SERVICE_NAME";
     let mut instance_id = None;
     let mut dry_run = false;
     for arg in &options.args {
@@ -29924,6 +29987,16 @@ fn otel_export(options: &CliOptions) -> ExitCode {
         eprintln!("{usage}");
         return ExitCode::from(2);
     };
+    // Validate export config before any network I/O; `--dry-run` runs the same
+    // validation (spec/std-telemetry.md Static Checks). Header values are
+    // secrets and never surface in output or the cursor file.
+    let config = match resolve_otel_config() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("otel-export: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let store = match open_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
@@ -29938,15 +30011,18 @@ fn otel_export(options: &CliOptions) -> ExitCode {
     };
     drop(store);
 
-    // Emit-once cursor: runs already exported are skipped; a crash mid-export
-    // resumes from the cursor without duplication.
+    // Emit-once cursor, scoped per (provider, endpoint, mapping_version): runs
+    // already exported under this scope are skipped; a new endpoint gets full
+    // history exactly once (spec/std-telemetry.md "Cursor scoping"). A crash
+    // mid-export resumes from the cursor without duplication.
     let cursor_path = options.store_path.with_extension("otel-cursor.json");
-    let mut cursor: Value = fs::read_to_string(&cursor_path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_else(|| json!({}));
+    let scope_key = otel_scope_key(&config.endpoint);
+    let mut cursor = read_otel_cursor_v2(&cursor_path);
     let exported = cursor
-        .get(&instance_id)
+        .get("cursors")
+        .and_then(|cursors| cursors.get(&scope_key))
+        .and_then(|scope| scope.get("instances"))
+        .and_then(|instances| instances.get(&instance_id))
         .and_then(Value::as_array)
         .map(|ids| {
             ids.iter()
@@ -29960,7 +30036,7 @@ fn otel_export(options: &CliOptions) -> ExitCode {
         "{:032x}",
         u128::from(stable_hash(&instance_id)) << 64 | u128::from(stable_hash("trace"))
     );
-    let service_name = env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "whipplescript".to_owned());
+    let service_name = config.service_name.clone();
     let mut spans = Vec::new();
     let mut newly_exported = Vec::new();
     for run in &runs {
@@ -30020,9 +30096,19 @@ fn otel_export(options: &CliOptions) -> ExitCode {
         println!("otel-export {instance_id}: nothing new to export");
         return ExitCode::SUCCESS;
     }
+    // service.name from OTEL_SERVICE_NAME wins; OTEL_RESOURCE_ATTRIBUTES adds
+    // the rest of the resource attributes (spec/std-telemetry.md Q2). With no
+    // resource attributes set this is byte-identical to the shipped payload.
+    let mut resource_attributes = vec![otel_attr("service.name", &service_name)];
+    for (key, value) in &config.resource_attributes {
+        if key == "service.name" {
+            continue;
+        }
+        resource_attributes.push(otel_attr(key, value));
+    }
     let payload = json!({
         "resourceSpans": [{
-            "resource": {"attributes": [otel_attr("service.name", &service_name)]},
+            "resource": {"attributes": resource_attributes},
             "scopeSpans": [{
                 "scope": {"name": "whipplescript", "version": whipplescript_core::version()},
                 "spans": spans,
@@ -30034,9 +30120,8 @@ fn otel_export(options: &CliOptions) -> ExitCode {
         println!("{payload:#}");
         return ExitCode::SUCCESS;
     }
-    let endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:4318".to_owned());
-    if let Err(error) = otel_post(&endpoint, &payload.to_string()) {
+    let endpoint = config.endpoint.clone();
+    if let Err(error) = otel_post(&endpoint, &config.headers, &payload.to_string()) {
         // Failure isolation: the log persists; the exporter catches up on the
         // next pass. Nothing was marked exported.
         eprintln!("otel-export failed (will catch up next pass): {error}");
@@ -30044,7 +30129,23 @@ fn otel_export(options: &CliOptions) -> ExitCode {
     }
     let mut all = exported;
     all.extend(newly_exported.iter().cloned());
-    cursor[&instance_id] = json!(all.into_iter().collect::<Vec<_>>());
+    // Record the newly-exported runs under this scope's cursor entry; the scope
+    // carries its provider/endpoint/mapping_version so `status` can list it.
+    if !cursor["cursors"].is_object() {
+        cursor["cursors"] = json!({});
+    }
+    let scope_entry = cursor["cursors"]
+        .as_object_mut()
+        .expect("cursors is an object")
+        .entry(scope_key)
+        .or_insert_with(|| json!({ "instances": {} }));
+    scope_entry["provider"] = json!(OTEL_PROVIDER_ID);
+    scope_entry["endpoint"] = json!(endpoint);
+    scope_entry["mapping_version"] = json!(OTEL_MAPPING_VERSION);
+    if !scope_entry["instances"].is_object() {
+        scope_entry["instances"] = json!({});
+    }
+    scope_entry["instances"][&instance_id] = json!(all.into_iter().collect::<Vec<_>>());
     if let Err(error) = fs::write(&cursor_path, cursor.to_string()) {
         eprintln!("failed to persist otel cursor: {error}");
         return ExitCode::FAILURE;
@@ -30089,40 +30190,202 @@ fn iso_like_to_unix_seconds(value: &str) -> Option<i64> {
     Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
-/// Minimal OTLP/HTTP POST over plain HTTP — the sidecar's peer is a local
-/// OpenTelemetry Collector, which owns TLS and backend fan-out.
-fn otel_post(endpoint: &str, body: &str) -> Result<(), String> {
-    use std::io::{Read, Write};
-    let stripped = endpoint
-        .strip_prefix("http://")
-        .ok_or_else(|| format!("only http:// endpoints are supported (got `{endpoint}`); point at a local OpenTelemetry Collector"))?;
-    let host_port = stripped.split('/').next().unwrap_or(stripped);
-    let address = if host_port.contains(':') {
-        host_port.to_owned()
-    } else {
-        format!("{host_port}:4318")
-    };
-    let mut stream = std::net::TcpStream::connect(&address)
-        .map_err(|error| format!("connect {address}: {error}"))?;
-    let request = format!(
-        "POST /v1/traces HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("send: {error}"))?;
-    let mut response = String::new();
-    let _ = stream.read_to_string(&mut response);
-    let status = response
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("");
-    if status.starts_with('2') {
-        Ok(())
-    } else {
-        Err(format!("collector responded {status}"))
+/// Provider id contributed by the embedded manifest (spec/std-telemetry.md).
+const OTEL_PROVIDER_ID: &str = "otlp";
+/// OTLP mapping version; a bump deliberately re-exports under a new cursor scope.
+const OTEL_MAPPING_VERSION: u64 = 1;
+
+/// Resolved, validated OTLP exporter configuration read from the standard OTel
+/// environment (spec/std-telemetry.md "Auth Headers And Cursor Scoping").
+/// Header values are secrets: never printed by `--dry-run`/`status`, never
+/// written to the cursor file, never exported.
+struct OtelExportConfig {
+    endpoint: String,
+    service_name: String,
+    headers: Vec<(String, String)>,
+    resource_attributes: Vec<(String, String)>,
+}
+
+/// Read + validate the OTel export environment, failing before any network I/O
+/// on an unsupported protocol, a malformed header/resource list, or auth headers
+/// over an unsafe plaintext endpoint.
+fn resolve_otel_config() -> Result<OtelExportConfig, String> {
+    let endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:4318".to_owned());
+    let service_name = env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "whipplescript".to_owned());
+
+    // Protocol validates before export: only the shipped wire shape is
+    // accepted; anything else is a config error, not a silent ignore.
+    if let Ok(protocol) = env::var("OTEL_EXPORTER_OTLP_PROTOCOL") {
+        let protocol = protocol.trim();
+        if !protocol.is_empty() && protocol != "http/json" {
+            return Err(format!(
+                "OTEL_EXPORTER_OTLP_PROTOCOL=`{protocol}` is unsupported; v1 exports only `http/json`"
+            ));
+        }
     }
+
+    let headers = match env::var("OTEL_EXPORTER_OTLP_HEADERS") {
+        Ok(raw) => parse_otel_kv_list(&raw)
+            .map_err(|error| format!("OTEL_EXPORTER_OTLP_HEADERS: {error}"))?,
+        Err(_) => Vec::new(),
+    };
+    let resource_attributes = match env::var("OTEL_RESOURCE_ATTRIBUTES") {
+        Ok(raw) => parse_otel_kv_list(&raw)
+            .map_err(|error| format!("OTEL_RESOURCE_ATTRIBUTES: {error}"))?,
+        Err(_) => Vec::new(),
+    };
+
+    // Sending credentials in cleartext is the hazard the spec calls out: refuse
+    // auth headers over a plaintext endpoint unless the host is loopback (a
+    // local Collector) or the operator explicitly opts in.
+    if !headers.is_empty() && !otel_endpoint_carries_headers_safely(&endpoint) {
+        return Err(format!(
+            "refusing to send {} auth header(s) over plaintext endpoint `{endpoint}`: use an https:// endpoint, a loopback host, or set WHIPPLESCRIPT_OTEL_ALLOW_INSECURE_HEADERS=1 to override",
+            headers.len()
+        ));
+    }
+
+    Ok(OtelExportConfig {
+        endpoint,
+        service_name,
+        headers,
+        resource_attributes,
+    })
+}
+
+/// Whether auth headers may ride this endpoint: `https://` always; plaintext
+/// only for a loopback host or with the documented insecure opt-in.
+fn otel_endpoint_carries_headers_safely(endpoint: &str) -> bool {
+    if endpoint.starts_with("https://") {
+        return true;
+    }
+    if env::var("WHIPPLESCRIPT_OTEL_ALLOW_INSECURE_HEADERS")
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    otel_endpoint_is_loopback(endpoint)
+}
+
+/// True when the endpoint's host is loopback (`localhost`, `127.0.0.0/8`, `::1`).
+fn otel_endpoint_is_loopback(endpoint: &str) -> bool {
+    let authority = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .unwrap_or(endpoint);
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal, e.g. `[::1]:4318`.
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        authority
+            .rsplit_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or(authority)
+    };
+    let host = host.to_ascii_lowercase();
+    host == "localhost" || host == "::1" || host.starts_with("127.")
+}
+
+/// Parse an OTel comma-separated `key=value` list (headers or resource
+/// attributes); values are percent-decoded per the OTel spec.
+fn parse_otel_kv_list(raw: &str) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("expected `key=value`, got `{pair}`"))?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(format!("empty key in `{pair}`"));
+        }
+        out.push((key.to_owned(), otel_percent_decode(value.trim())));
+    }
+    Ok(out)
+}
+
+/// Minimal percent-decoding for OTel header/attribute values (`%XX` octets).
+fn otel_percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Cursor scope key = H(provider, endpoint, mapping_version), so a new endpoint
+/// or mapping bump gets its own emit-once ledger (spec/std-telemetry.md).
+fn otel_scope_key(endpoint: &str) -> String {
+    format!(
+        "{:016x}",
+        stable_hash(&format!(
+            "{OTEL_PROVIDER_ID}|{endpoint}|{OTEL_MAPPING_VERSION}"
+        ))
+    )
+}
+
+/// Read the scope-keyed (version 2) cursor file. A legacy v1 file is treated as
+/// absent — ignored on read, superseded on first write (no migration).
+fn read_otel_cursor_v2(path: &Path) -> Value {
+    let parsed = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    match parsed {
+        Some(value) if value.get("version").and_then(Value::as_u64) == Some(2) => value,
+        _ => json!({ "version": 2, "cursors": {} }),
+    }
+}
+
+/// OTLP/HTTP POST over the in-tree `ureq` client — `https://` and plaintext
+/// both work; the sidecar peer is usually a local OpenTelemetry Collector. Auth
+/// headers ride the request; the response body is ignored beyond status.
+fn otel_post(endpoint: &str, headers: &[(String, String)], body: &str) -> Result<(), String> {
+    let url = otel_traces_url(endpoint)?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("whipplescript-telemetry")
+        .build();
+    let mut request = agent.post(&url).set("Content-Type", "application/json");
+    for (name, value) in headers {
+        request = request.set(name, value);
+    }
+    match request.send_bytes(body.as_bytes()) {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, _)) => Err(format!("collector responded {code}")),
+        Err(ureq::Error::Transport(transport)) => Err(format!("{url}: {transport}")),
+    }
+}
+
+/// Resolve the OTLP traces URL from a base endpoint, appending the `/v1/traces`
+/// signal path (the shipped POST target).
+fn otel_traces_url(endpoint: &str) -> Result<String, String> {
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+        return Err(format!(
+            "unsupported endpoint `{endpoint}`: expected an http:// or https:// URL"
+        ));
+    }
+    Ok(format!("{}/v1/traces", endpoint.trim_end_matches('/')))
 }
 
 fn evidence(options: &CliOptions) -> ExitCode {

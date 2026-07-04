@@ -2858,6 +2858,346 @@ fn otel_export_posts_to_collector_then_status_and_reset() {
     let _ = fs::remove_file(coordination);
 }
 
+/// Stand up an exportable instance (one terminal lease run) and return its
+/// store path + instance id, for the Q2 env-surface tests below.
+fn otel_export_fixture(bin: &str, label: &str) -> (PathBuf, PathBuf, PathBuf, String) {
+    let store = temp_path(label, "sqlite");
+    let source = temp_path(label, "whip");
+    let coordination = temp_path(&format!("{label}-coord"), "sqlite");
+    fs::write(&source, LEASE_SOURCE).expect("write source");
+    let dev = dev_with_coordination(
+        bin,
+        store.to_str().expect("utf-8"),
+        source.to_str().expect("utf-8"),
+        coordination.to_str().expect("utf-8"),
+    );
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+    (store, source, coordination, instance)
+}
+
+/// A one-shot in-process collector that captures the full raw request (request
+/// line + headers + body) and replies 200. Returns (port, receiver, handle).
+#[allow(clippy::type_complexity)]
+fn spawn_otel_collector() -> (
+    u16,
+    std::sync::mpsc::Receiver<String>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind collector");
+    let port = listener.local_addr().expect("addr").port();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..read]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buf[..pos]).to_string();
+                    let content_length = headers
+                        .to_lowercase()
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let body_start = pos + 4;
+                    while buf.len() < body_start + content_length {
+                        let read = stream.read(&mut chunk).unwrap_or(0);
+                        if read == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..read]);
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                    let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+                    break;
+                }
+            }
+        }
+    });
+    (port, rx, handle)
+}
+
+/// Q2: `OTEL_EXPORTER_OTLP_PROTOCOL` validates before any socket — only the
+/// shipped `http/json` encoding is accepted; anything else is a config error.
+#[test]
+fn otel_export_rejects_unsupported_protocol() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, coordination, instance) = otel_export_fixture(bin, "otel-proto");
+    let store_str = store.to_str().expect("utf-8");
+
+    // `--dry-run` runs the same config validation, so no endpoint is needed.
+    let out = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
+        .env("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+        .output()
+        .expect("otel-export runs");
+    assert!(
+        !out.status.success(),
+        "unsupported protocol must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("OTEL_EXPORTER_OTLP_PROTOCOL") && stderr.contains("http/json"),
+        "expected a protocol config error: {stderr}"
+    );
+
+    // The shipped protocol is accepted.
+    let ok = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
+        .env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
+        .output()
+        .expect("otel-export runs");
+    assert!(ok.status.success(), "http/json must be accepted");
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(coordination);
+}
+
+/// Q2: auth headers over a plaintext, non-loopback endpoint are refused (the
+/// cleartext-credential hazard) unless the operator sets the documented opt-in;
+/// header values never leak into the dry-run output either way.
+#[test]
+fn otel_export_refuses_headers_over_plaintext_without_optin() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, coordination, instance) = otel_export_fixture(bin, "otel-plain");
+    let store_str = store.to_str().expect("utf-8");
+    let secret = "Bearer super-secret-token";
+
+    let refused = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
+        .env(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "http://collector.example.com:4318",
+        )
+        .env(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            format!("authorization={secret}"),
+        )
+        .output()
+        .expect("otel-export runs");
+    assert!(
+        !refused.status.success(),
+        "headers over plaintext non-loopback must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("refusing"), "expected a refusal: {stderr}");
+    assert!(
+        !stderr.contains("super-secret-token"),
+        "the header value must never be printed: {stderr}"
+    );
+
+    // The documented opt-in re-enables plaintext headers; dry-run then succeeds
+    // and still never prints the secret value.
+    let allowed = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
+        .env(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "http://collector.example.com:4318",
+        )
+        .env(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            format!("authorization={secret}"),
+        )
+        .env("WHIPPLESCRIPT_OTEL_ALLOW_INSECURE_HEADERS", "1")
+        .output()
+        .expect("otel-export runs");
+    assert!(
+        allowed.status.success(),
+        "opt-in must permit plaintext headers: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&allowed.stdout),
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert!(
+        !combined.contains("super-secret-token"),
+        "the header value must never appear in dry-run output: {combined}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(coordination);
+}
+
+/// Q2: `OTEL_RESOURCE_ATTRIBUTES` are parsed (percent-decoded) and merged onto
+/// the OTLP resource alongside `service.name`.
+#[test]
+fn otel_export_merges_resource_attributes() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, coordination, instance) = otel_export_fixture(bin, "otel-res");
+    let store_str = store.to_str().expect("utf-8");
+
+    let out = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
+        .env("OTEL_SERVICE_NAME", "checkout")
+        .env(
+            "OTEL_RESOURCE_ATTRIBUTES",
+            "deployment.environment=prod,service.version=1.2.3,note=hello%20world",
+        )
+        .output()
+        .expect("otel-export runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let payload: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("payload json");
+    let attributes = payload
+        .pointer("/resourceSpans/0/resource/attributes")
+        .and_then(Value::as_array)
+        .expect("resource attributes");
+    let attr = |key: &str| -> Option<String> {
+        attributes.iter().find_map(|entry| {
+            (entry.get("key").and_then(Value::as_str) == Some(key)).then(|| {
+                entry
+                    .pointer("/value/stringValue")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+        })
+    };
+    assert_eq!(attr("service.name").as_deref(), Some("checkout"));
+    assert_eq!(attr("deployment.environment").as_deref(), Some("prod"));
+    assert_eq!(attr("service.version").as_deref(), Some("1.2.3"));
+    // Percent-decoding of the OTel value.
+    assert_eq!(attr("note").as_deref(), Some("hello world"));
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(coordination);
+}
+
+/// Q2: `OTEL_EXPORTER_OTLP_HEADERS` are parsed, percent-decoded, and attached to
+/// the POST (verified over a loopback endpoint, where plaintext headers are
+/// allowed without the opt-in).
+#[test]
+fn otel_export_attaches_parsed_headers_to_post() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, coordination, instance) = otel_export_fixture(bin, "otel-hdr");
+    let store_str = store.to_str().expect("utf-8");
+    let (port, rx, collector) = spawn_otel_collector();
+
+    let export = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance])
+        .env(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            format!("http://127.0.0.1:{port}"),
+        )
+        .env(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "authorization=Bearer%20xyz,x-tenant=acme",
+        )
+        .output()
+        .expect("otel-export runs");
+    assert!(
+        export.status.success(),
+        "otel-export failed: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let raw = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("collector received the POST");
+    collector.join().ok();
+    let lower = raw.to_lowercase();
+    assert!(
+        lower.contains("authorization: bearer xyz"),
+        "percent-decoded auth header must ride the POST: {raw}"
+    );
+    assert!(
+        lower.contains("x-tenant: acme"),
+        "second header must ride the POST: {raw}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(coordination);
+}
+
+/// Q2 cursor scoping: changing the endpoint re-keys the cursor, so the new scope
+/// re-exports the full history exactly once without disturbing the old scope.
+#[test]
+fn otel_export_rekeys_cursor_per_endpoint() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, coordination, instance) = otel_export_fixture(bin, "otel-scope");
+    let store_str = store.to_str().expect("utf-8");
+
+    // First endpoint exports the history.
+    let (port_a, rx_a, collector_a) = spawn_otel_collector();
+    let export_a = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance])
+        .env(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            format!("http://127.0.0.1:{port_a}"),
+        )
+        .output()
+        .expect("otel-export runs");
+    assert!(
+        export_a.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export_a.stderr)
+    );
+    let body_a = rx_a
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("collector A received the POST");
+    collector_a.join().ok();
+    assert!(body_a.contains("resourceSpans"), "A got spans");
+
+    // A second endpoint is a new scope: full history re-exports exactly once.
+    let (port_b, rx_b, collector_b) = spawn_otel_collector();
+    let export_b = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance])
+        .env(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            format!("http://127.0.0.1:{port_b}"),
+        )
+        .output()
+        .expect("otel-export runs");
+    assert!(
+        export_b.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export_b.stderr)
+    );
+    let body_b = rx_b
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("collector B re-exports under the new scope");
+    collector_b.join().ok();
+    assert!(
+        body_b.contains("resourceSpans"),
+        "B got spans under its own scope"
+    );
+
+    // Status now lists two scopes.
+    let status = run_json(
+        bin,
+        &["--store", store_str, "--json", "telemetry", "status"],
+    );
+    let scopes = status
+        .pointer("/scopes")
+        .and_then(Value::as_array)
+        .expect("scopes");
+    assert_eq!(scopes.len(), 2, "two endpoints => two scopes: {status}");
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(coordination);
+}
+
 const EVENT_SOURCE: &str = r#"
 workflow EventDemo
 

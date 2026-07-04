@@ -302,9 +302,18 @@ none depends on another except T3 → S6.
   pre-export config validation incl. `--dry-run`; fix D5. *Tests:* in-process
   collector asserts the received header; invalid protocol errors before any
   socket; headers absent from status/dry-run output; https path exercised.
-- **T2 — cursor scoping v2.** Scope-keyed cursor; legacy v1 cursor file
+- **T2 — cursor scoping v2. CODE LANDED 2026-07-04 (Q2 commit); Maude model
+  OUTSTANDING.** Scope-keyed cursor (`scope-key = H(provider, endpoint,
+  mapping_version)`); legacy v1 cursor file
   ignored and superseded (no migration mechanism — one idempotent re-export);
-  status lists scopes; reset-cursor per scope. *Model expectation:* a small
+  status lists scopes; reset-cursor per scope. All shipped and covered by
+  `otel_export_rekeys_cursor_per_endpoint` + 4 sibling tests. **Deferred with
+  cause:** the *Model expectation* below (a small Maude model of the cursor
+  lifecycle — emit-once per scope + scope isolation, coverage AND bite) was NOT
+  built with the code — a knowing deviation from model-first for this
+  operator-plane, failure-isolated cursor, whose behavior the 5 tests pin. Build
+  the model to formally close T2 (low-stakes; not on the effect/rule invariant
+  plane). *Model expectation:* a small
   Maude model of the cursor lifecycle — emit-once per scope + scope isolation,
   coverage AND bite (a negative fixture where two scopes share a cursor must
   reach double-export). *Tests:* endpoint change re-exports under the new
