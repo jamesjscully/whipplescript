@@ -20500,6 +20500,7 @@ struct WorkerReport {
     deadlines_expired: usize,
     clock_occurrences_admitted: u64,
     file_lines_admitted: u64,
+    inbound_messages_admitted: u64,
     cancellation_acknowledgements: usize,
     cancellation_diagnostics: usize,
     terminal_events: Vec<String>,
@@ -20547,6 +20548,17 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
                 if ir.sources.iter().any(|source| source.is_file) {
                     report.file_lines_admitted +=
                         resolve_due_file_sources(store_path, &options.instance_id, &ir)?;
+                }
+                // Admit received messages from `local` channel inboxes
+                // (spec/messaging.md, RECEIVE side). Only when the program
+                // declares a `local` channel, so other workflows pay nothing.
+                if ir
+                    .channels
+                    .iter()
+                    .any(|channel| channel.provider == "local")
+                {
+                    report.inbound_messages_admitted +=
+                        resolve_due_inbound_messages(store_path, &options.instance_id, &ir)?;
                 }
             }
         }
@@ -21150,6 +21162,127 @@ fn resolve_due_file_sources(
                 Some(&idempotency_key(&[
                     instance_id,
                     "file-fact",
+                    &received.event_id,
+                ])),
+            )?;
+            admitted += 1;
+        }
+    }
+    Ok(admitted)
+}
+
+/// Autonomous inbound RECEIVE for `local` channels (spec/messaging.md): the
+/// SOURCE side that complements the `when message from <channel> as msg`
+/// reaction. Mirrors `resolve_due_file_sources` for the `file` source — a
+/// worker-boundary read that admits new external signals — but the signal it
+/// admits is the generic `Message` envelope on `message.<channel>`, byte-for-
+/// byte the same fact `whip message` injects (so the same reaction rules fire).
+///
+/// For every declared `channel` whose `provider` is `local`, the per-channel
+/// inbox lives at `<store>.inbox.<channel>.jsonl` (the RECEIVE mirror of the
+/// outbound `<store>.mailbox.jsonl` local mailbox). A missing inbox is not an
+/// error: the channel has simply received nothing yet. Each non-empty line is a
+/// JSON object with at least `{ "text": … }` (optionally `sender`, `thread_id`,
+/// `markdown`); the line at ordinal `i` becomes a `Message` with
+/// `message_id = idempotency_key([channel, i])` and `provider = "local"`.
+///
+/// The cursor is the count of external events already admitted for
+/// `message.<channel>` — each admitted line appends exactly one such event
+/// (`derive_fact` appends a `fact.derived` event, a different type, so it does
+/// not inflate the count). Non-empty ordinals are gap-free and admissions form
+/// a prefix `0..count`, so skipping `i < count` is exactly the already-admitted
+/// set. The store's `append_event` is a plain INSERT (no idempotency dedup), so
+/// re-attempting an admitted ordinal would hit UNIQUE and error — the cursor,
+/// not the idempotency key, is what makes a re-poll idempotent.
+fn resolve_due_inbound_messages(
+    store_path: &Path,
+    instance_id: &str,
+    ir: &IrProgram,
+) -> Result<u64, StoreError> {
+    let mut admitted = 0u64;
+    for channel in &ir.channels {
+        if channel.provider != "local" {
+            continue;
+        }
+        // Same fact/event name the inbound reaction resolves and `whip message`
+        // injects: `message.<channel>`. A rule `when message from <channel>`
+        // fires on exactly this fact.
+        let fact_name = format!("message.{}", channel.name);
+        let inbox_path = store_path.with_extension(format!("inbox.{}.jsonl", channel.name));
+        let already_admitted = {
+            let store = SqliteStore::open(store_path)?;
+            if store.get_instance(instance_id)?.is_none() {
+                continue;
+            }
+            store
+                .list_events(instance_id)?
+                .into_iter()
+                .filter(|event| event.source == "external" && event.event_type == fact_name)
+                .count()
+        };
+        // A missing inbox is not an error: nothing has been received yet.
+        let contents = match fs::read_to_string(&inbox_path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(StoreError::Conflict(error.to_string())),
+        };
+        for (index, line) in contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .enumerate()
+        {
+            if index < already_admitted {
+                continue;
+            }
+            let record: Value = serde_json::from_str(line)
+                .map_err(|error| StoreError::Conflict(format!("inbox line {index}: {error}")))?;
+            let field = |key: &str| {
+                record
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let message_id = idempotency_key(&[&channel.name, &index.to_string()]);
+            // The generic `Message` envelope (spec/messaging.md), identical in
+            // shape to what `whip message` builds so the `msg` binding resolves
+            // every field; provider context is `local` for this SOURCE.
+            let payload = json!({
+                "message_id": message_id,
+                "channel": channel.name,
+                "provider": "local",
+                "received_at": "",
+                "sender": field("sender"),
+                "sender_claims": "{}",
+                "thread_id": field("thread_id"),
+                "text": field("text"),
+                "markdown": field("markdown"),
+                "attachments": [],
+                "interaction": "{}",
+                "raw_ref": "",
+                "correlation": "{}",
+            });
+            let payload_json = payload.to_string();
+            let event_key = idempotency_key(&[&channel.name, "inbox", &index.to_string()]);
+            let store = SqliteStore::open(store_path)?;
+            let mut kernel = RuntimeKernel::new(store);
+            // Record the received message, then derive its durable fact
+            // (mirroring `whip message`), both keyed so replay stays idempotent.
+            let received = kernel.ingest_external_event(
+                instance_id,
+                &fact_name,
+                &payload_json,
+                Some(&event_key),
+            )?;
+            kernel.derive_fact(
+                instance_id,
+                &fact_name,
+                &received.event_id,
+                &payload_json,
+                Some(&received.event_id),
+                Some(&idempotency_key(&[
+                    instance_id,
+                    "inbox-fact",
                     &received.event_id,
                 ])),
             )?;
@@ -25466,7 +25599,8 @@ fn dev(options: &CliOptions) -> ExitCode {
         // admits nothing more.
         let idle = step_report.committed_rules == 0
             && worker_report.ran_effects == 0
-            && worker_report.file_lines_admitted == 0;
+            && worker_report.file_lines_admitted == 0
+            && worker_report.inbound_messages_admitted == 0;
         steps.push(step_report);
         workers.push(worker_report);
         if idle {
@@ -26299,7 +26433,8 @@ fn acceptance_dev_report(
         // admits nothing more.
         let idle = step_report.committed_rules == 0
             && worker_report.ran_effects == 0
-            && worker_report.file_lines_admitted == 0;
+            && worker_report.file_lines_admitted == 0
+            && worker_report.inbound_messages_admitted == 0;
         steps.push(step_report);
         workers.push(worker_report);
         if idle {
@@ -29118,6 +29253,7 @@ fn worker_report_to_json(report: &WorkerReport) -> Value {
         "provider": report.provider,
         "ran_effects": report.ran_effects,
         "file_lines_admitted": report.file_lines_admitted,
+        "inbound_messages_admitted": report.inbound_messages_admitted,
         "cancellation_acknowledgements": report.cancellation_acknowledgements,
         "cancellation_diagnostics": report.cancellation_diagnostics,
         "terminal_events": report.terminal_events,

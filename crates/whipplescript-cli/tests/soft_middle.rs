@@ -658,6 +658,147 @@ fn send_via_local_channel_delivers_to_local_mailbox() {
     let _ = fs::remove_file(mailbox);
 }
 
+/// Autonomous inbound RECEIVE for a `local` channel (spec/messaging.md): the
+/// SOURCE side that complements outbound `send` and the `whip message`
+/// injection. A worker pass polls the per-channel inbox at
+/// `<store>.inbox.<channel>.jsonl` and admits each JSON line as a `Message` on
+/// `message.<channel>` — the same fact `whip message` injects, so a
+/// `when message from <channel>` rule fires autonomously, once per received
+/// message. Admission is idempotent by (channel, line ordinal): a second worker
+/// pass over the same inbox re-admits nothing. Mirrors the file-ingress source
+/// (`dev_file_source_admits_one_signal_per_line_idempotently`), inbound.
+#[test]
+fn inbound_local_channel_admits_messages_from_inbox_idempotently() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("inbound-local", "sqlite");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/messaging-inbound-local.whip");
+    let store_str = store.to_str().expect("utf-8");
+    let source_str = source.to_str().expect("utf-8");
+
+    // The per-channel inbox: `<store>.inbox.<channel>.jsonl` (channel `inbox`).
+    // Two received messages, each a JSON object carrying at least `text`.
+    let inbox = store.with_extension("inbox.inbox.jsonl");
+    fs::write(
+        &inbox,
+        "{\"text\":\"first message\",\"sender\":\"alice\"}\n\
+         {\"text\":\"second message\",\"thread_id\":\"t7\"}\n",
+    )
+    .expect("seed inbox");
+
+    // A worker-boundary poll admits both inbox lines and the reacting rule fires
+    // once per message, recording a `Received` fact.
+    let dev = dev_until_idle(bin, store_str, source_str, &[]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // Both messages were admitted (summed across the worker passes).
+    let admitted: u64 = dev
+        .get("workers")
+        .and_then(Value::as_array)
+        .expect("workers")
+        .iter()
+        .filter_map(|w| w.get("inbound_messages_admitted").and_then(Value::as_u64))
+        .sum();
+    assert_eq!(admitted, 2, "both inbox lines were admitted: {dev}");
+
+    // One `message.inbox` fact per received message, in file order, each a
+    // well-formed local `Message` envelope carrying that line's text.
+    let inbox_texts = |instance: &str| -> Vec<String> {
+        let facts = run_json(bin, &["--store", store_str, "--json", "facts", instance]);
+        let mut rows: Vec<(String, String)> = facts
+            .as_array()
+            .expect("facts array")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("message.inbox"))
+            .map(|fact| {
+                assert_eq!(
+                    fact.pointer("/value/provider").and_then(Value::as_str),
+                    Some("local"),
+                    "the admitted Message declares the local provider"
+                );
+                let message_id = fact
+                    .pointer("/value/message_id")
+                    .and_then(Value::as_str)
+                    .expect("message carries an id")
+                    .to_owned();
+                let text = fact
+                    .pointer("/value/text")
+                    .and_then(Value::as_str)
+                    .expect("message carries text")
+                    .to_owned();
+                (message_id, text)
+            })
+            .collect();
+        rows.sort_by(|a, b| a.1.cmp(&b.1));
+        rows.into_iter().map(|(_, text)| text).collect()
+    };
+    assert_eq!(
+        inbox_texts(&instance),
+        vec!["first message".to_owned(), "second message".to_owned()],
+        "one `message.inbox` Message fact per inbox line"
+    );
+
+    // The `when message from inbox` rule fired once per message: an unresolved
+    // `msg.text` would have failed rather than record. Two `Received` facts.
+    let received_count = |instance: &str| -> usize {
+        let facts = run_json(bin, &["--store", store_str, "--json", "facts", instance]);
+        facts
+            .as_array()
+            .expect("facts array")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("Received"))
+            .count()
+    };
+    assert_eq!(
+        received_count(&instance),
+        2,
+        "the reacting rule fired once per admitted message"
+    );
+
+    // Idempotency: a second worker pass over the *same* instance and the *same*
+    // inbox re-admits nothing. Without the (channel, line ordinal) cursor this
+    // would hit the event log's UNIQUE(idempotency_key) constraint or double the
+    // facts; instead the counts are unchanged.
+    let worker = run_json(
+        bin,
+        &[
+            "--store",
+            store_str,
+            "--json",
+            "worker",
+            &instance,
+            "--program",
+            source_str,
+            "--provider",
+            "fixture",
+        ],
+    );
+    assert_eq!(
+        worker
+            .get("inbound_messages_admitted")
+            .and_then(Value::as_u64),
+        Some(0),
+        "a re-poll of an unchanged inbox admits no new messages: {worker}"
+    );
+    assert_eq!(
+        inbox_texts(&instance),
+        vec!["first message".to_owned(), "second message".to_owned()],
+        "re-polling admits no duplicate Message facts (idempotent by line ordinal)"
+    );
+    assert_eq!(
+        received_count(&instance),
+        2,
+        "no duplicate Received facts after the idempotent re-poll"
+    );
+
+    let _ = fs::remove_file(&store);
+    let _ = fs::remove_file(&inbox);
+}
+
 /// `send via <channel>` where the channel declares `provider stdio` is delivered
 /// by the native stdio provider: the workflow completes and a
 /// `[messaging.stdio] channel=… text=…` marker line is written to stdout. The
