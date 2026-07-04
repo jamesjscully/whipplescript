@@ -1051,6 +1051,21 @@ target_capability, fields }` the hardcoded parsers emit today — which is how
 specs, delete `parse_recall`/`parse_send`, and every existing recall/send test
 plus the `.ir` snapshots must stay byte-identical.
 
+**Scope note (S6c approach, verified 2026-07-04):** byte-identical applies to
+the SUCCESS path only. The hand-written parsers emit tuned failure messages
+("expected `for` after recall pool", "`send` requires a `text` field"); a
+data-driven parser emits generic ones ("missing required connective `for`",
+"missing required field `text`"). A repo-wide search found NO test asserting
+those tuned strings, so the generic messages are acceptable and S6c does not
+need per-construct message templates. The gate is: all recall/send *success*
+tests + the `.ir` snapshots unchanged. S6c is a coupled build — (1) extend the
+manifest/`ConstructRegistration` schema with the `grammar` object (core
+`ConstructField` → a `grammar` struct, cli JSON parse + validation), populating
+`memory.json` recall and the built-in `send` registration
+(`builtin_messaging_send_construct`); (2) the data-driven body parser reading it;
+(3) delete `parse_recall`/`parse_send`. The `grammar` field is only non-decorative
+once (2) reads it, so the two land together.
+
 ### Authorability door (S6, from the coherence pass)
 
 Registering a construct whose lowering class is `package_authorable: false`
