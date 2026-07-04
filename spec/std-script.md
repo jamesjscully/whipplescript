@@ -127,13 +127,18 @@ Two layers, both required. The panel was unanimous that the check-time gate
 alone does not resist forged IR; the runtime backstop is the load-bearing
 security property.
 
-**Layer 1 — check-time gate (M5 hard-off).** If `ir.uses` does not contain
-`std.script`, EVERY `exec` source form — raw or capability, either profile —
-is a check error, diagnostic id `security.script_disabled` (the id already
-exists in "Diagnostic ids" in `spec/error-handling.md`, and
-`spec/verification.md` pins its no-boundary-crossed contract). This is the
-author-facing consent surface and the only std package with a hard import
-requirement in v1 (E5 ladder).
+**Layer 1 — check-time gate (M5 hard-off). LANDED 2026-07-04.** If `ir.uses`
+does not contain `std.script`, EVERY `exec` source form — raw or capability,
+either profile — is a check error, diagnostic id `security.script_disabled`.
+Shipped as `check_script_hard_off` in `compile_source_path_for_validation`
+(cli/main.rs), detecting `IrEffectKind::ExecCommand` effects; the 4 exec
+examples were migrated to `use std.script` and their `.ir` snapshots
+regenerated; tests `exec_is_hard_off_without_use_std_script` +
+`hosted_check_rejects_raw_exec` (fixture migrated). This is the author-facing
+consent surface and the only std package with a hard import requirement in v1
+(E5 ladder). **Layer 2 remains the load-bearing security property** (below,
+deferred to the S6d embedded-manifest seeding infra): Layer 1 alone does not
+resist forged IR, since the `use` line is itself forgeable.
 
 **Layer 2 — runtime backstop: import-conditional per-program seeding
 (CHOSEN) over an IR-uses gate at exec dispatch.** All `exec.command` effects
