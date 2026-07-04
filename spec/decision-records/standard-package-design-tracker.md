@@ -44,22 +44,28 @@ decision: keep / merge / split / defer / drop
 
 ## Package Inventory
 
-| Package | Design review status | Current question |
+Concrete per-package designs WRITTEN 2026-07-04 (Process step 6), each
+adversarially reviewed + revised + coherence-checked. Each `spec/std-*.md`
+carries the design-tracker checklist fields plus Surface / Providers / Manifest
+/ Static-checks / IFC-face / v1-slices / Deferred-with-cause, bound to the
+constitution ([std-package-ecosystem-shape.md](../std-package-ecosystem-shape.md)).
+
+| Package | Design review status | Concrete design |
 | --- | --- | --- |
-| `std.tracker` | Core concept accepted | Use issues as the source of orchestrated work; refine claim/readiness/CLI shape before implementation. |
-| `std.agent` | Core concept accepted | Shared feature-report contract; Codex, Claude, and Pi split into provider-specific packages with native semantics. |
-| `std.agent.codex` | Core concept accepted | App Server/SDK boundary, Codex-native slash commands/plugins/hooks/subagents reported as features. |
-| `std.agent.claude` | Core concept accepted | Claude Agent SDK sidecar boundary, tool/permission policy, hooks/plugins/subagents reported as features. |
-| `std.agent.pi` | Core concept accepted | Pi RPC boundary plus `pi_variant` package/extension sets and runtime command/tool discovery. |
-| `std.messaging` | Core concept accepted | Communication channels, outbound `send`, generic inbound `Message`; human review is a use case, not a separate package. |
-| `std.memory` | Core concept accepted | Memory pools, explicit recall/learn, turn-scoped access grants, and policy-driven curation. |
-| `std.time` | Core concept accepted | Clock source provider for recurring typed signals; core keeps one-shot timers/timeouts. |
-| `std.ingress` | Core concept accepted | External `source` providers and typed `signal` admission; messaging can feed it explicitly. |
-| `std.files` | Core concept accepted | Capability-scoped file stores, deterministic format codecs, read/write/import/export effects, and turn-scoped agent file grants. |
-| `std.script` | Core concept accepted | Narrow named, pinned `exec` capabilities; hard-off must be prompt-injection resistant. |
-| `std.coord` | Core concept accepted | Closed package family: generic leases, ledgers, counters; no arbitrary shared store. |
-| `std.telemetry` | Core concept accepted | Read-only event/evidence-log exporters; operator/provider surface, not workflow syntax. |
-| `std.coercion` | Core concept accepted | Core owns `coerce`/`decide`; package owns schema-coercion backend/toolchain support. |
+| `std.tracker` | Concrete design written | [std-tracker.md](../std-tracker.md) — rename+identity now; ADR-0002 event-sourced rebuild deferred behind WorkItems seam |
+| `std.agent` | Concrete design written | [std-agent.md](../std-agent.md) — boundary/taxonomy pkg; codex/claude thin sub-pkgs in-doc; `agent.turn` is the grandfathered id≠kind |
+| `std.agent.codex` | Designed in std-agent.md | provider-catalog sub-package (open provider registry from manifests) |
+| `std.agent.claude` | Designed in std-agent.md | provider-catalog sub-package (SDK sidecar; centralized 7-preset profile table) |
+| `std.agent.pi` | Deferred (name reserved) | `pi_variant` is pure spec — no lock/provenance/discovery design yet |
+| `std.messaging` | Concrete design written | [std-messaging.md](../std-messaging.md) — 3 local providers; owns human-review migration question |
+| `std.memory` | Concrete design written | [std-memory.md](../std-memory.md) — forcing case for the CapabilityProvider seam (M2/S5) |
+| `std.time` | Concrete design written | [std-time.md](../std-time.md) — updated in place; recurrence shipped; package identity + clock_source authorability |
+| `std.ingress` | Concrete design written | [std-ingress.md](../std-ingress.md) — owns source-family authorability obligations; Q1 emit-names-signal check |
+| `std.files` | Concrete design written | [std-files.md](../std-files.md) — typed_effect_call keeping file.* kinds; grant∩store-policy fix (Q3) |
+| `std.script` | Concrete design written | [std-script.md](../std-script.md) — hard-off + runtime backstop; exec via authorable typed_effect_call |
+| `std.coord` | Concrete design written | [std-coord.md](../std-coord.md) — owns resource_effect authorability + coordination.md lease-primitive resolution |
+| `std.telemetry` | Concrete design written | [std-telemetry.md](../std-telemetry.md) — updated in place; operator-config pkg; Q2 auth headers + cursor scoping |
+| `std.coercion` | Concrete design written | [std-coercion.md](../std-coercion.md) — post-S2 rename; owns DR-0014 amendment + shared codex credential layer |
 
 ## Meta Questions
 
@@ -80,8 +86,8 @@ No new implementation commitments from this pass until:
 ```text
 package-by-package review complete        [x] (inventory rows + Current Notes)
 overall ecosystem shape settled           [x] 2026-07-04 → std-package-ecosystem-shape.md
-concrete package designs written          [ ] ← current gate
-implementation slices chosen from those designs   [ ]
+concrete package designs written          [x] 2026-07-04 → spec/std-*.md (11 designs, reviewed+coherence-checked)
+implementation slices chosen from those designs   [ ] ← current gate (slices enumerated per-design + constitution build order)
 ```
 
 ## Current Notes

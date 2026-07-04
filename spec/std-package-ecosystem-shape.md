@@ -262,6 +262,33 @@ registration" to "manifest embedded in this binary", same no-squatting
 property) REQUIRES re-modeling models/maude/std-construct-authorization.maude
 in the same slice — model-first; all three judges flagged this.
 
+**Authorability door (added 2026-07-04, concrete-design coherence pass).** The
+concrete designs for std.coord, std.ingress, std.messaging, and std.time each
+independently hit a wall this decision did not originally name: their embedded
+manifests must author constructs whose lowering class is
+`package_authorable: false` (`resource_effect` for coord; `signal_source` /
+`signal_emit` / `metadata` for the source family; `clock_source` for time),
+and the shipped validator rejects any non-authorable construct row
+(cli/main.rs:13200-13204) *before and independently of* the reserved-keyword
+privilege check (cli/main.rs:13217-13228). Reserved-keyword privilege
+authorizes a bare *word*; it does not authorize a *class*. So S6 gains a
+second, adjacent mechanism: a platform-catalog privilege tuple whose
+`lowering_target` is a non-authorable class also authorizes *that class* for
+exactly that `(library, keyword, family, scope, lowering)` tuple — the classes
+stay `package_authorable: false` for unprivileged third parties. This is one
+door built once in S6, re-modeled once in std-construct-authorization.maude
+(coverage: privileged std manifest authors the class; bite: an unprivileged
+manifest with the same construct row is still rejected). std.ingress (owner of
+the shared source-declaration family) registers the source-family obligations;
+std.coord owns the `resource_effect` obligation. std.script deliberately avoids
+the door by choosing the already-authorable `typed_effect_call` class for
+`exec` (the std.files DR-0020 precedent). Rationale: convergent across four
+independent designs, mechanically identical to the keyword-privilege door
+already in S6, and cheaper than promoting four classes to universally
+authorable (which would let any third party emit them). Cheapest-to-reverse:
+if the tuple mechanism proves wrong, the fallback is per-class authorability
+promotion, a strictly larger grant — so starting narrow forecloses nothing.
+
 **Why.** Embedded manifests exercise the exact validation machinery third
 parties will use, give `use` semantic bite (today inert except
 workflow_tools), and give the lock exemption a principled shape. The
@@ -469,7 +496,9 @@ rename B (schema.coerce/std.coercion + key commitments + DR-0014 amendment)
 → **S3** rename C (tracker.* nouns) → **S4** capability-namespace invariants
 (contract ⊆ bound ⊇ grant checks) → **S5** CapabilityProvider seam +
 capability_bound promotion (fixture-as-named-provider) → **S6** embedded std
-manifests + import lint + script hard-off + Maude re-model → **S7** bounded
+manifests + import lint + script hard-off + the lock-exemption re-key AND the
+authorability door (privilege tuple authorizes a non-authorable lowering class;
+see M5 "Authorability door") + Maude re-model of both doors → **S7** bounded
 kernel lift of the registry core.
 
 Parallel quick wins (any time): **Q1** ingress `emit`-names-a-declared-signal
