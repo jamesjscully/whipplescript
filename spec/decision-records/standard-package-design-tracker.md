@@ -1,6 +1,10 @@
 # Standard Package Design Tracker
 
-Status: active design todo
+Status: active — ecosystem shape SETTLED 2026-07-04 (see
+[std-package-ecosystem-shape.md](../std-package-ecosystem-shape.md), status
+feeding-ADR; two forks ⚑-flagged for Jack: M1 meta-grammar deferral, M5
+embedded std manifests). Process steps 1–5 satisfied; current gate = step 6
+(concrete per-package designs), then step 7 (implementation slices).
 
 ## Purpose
 
@@ -59,24 +63,25 @@ decision: keep / merge / split / defer / drop
 
 ## Meta Questions
 
-- Are these the right package names?
-- Which packages are semantic domains, and which are provider catalogs?
-- Which packages are first-class workflow authoring surfaces versus operator
-  configuration packages?
-- Which packages require construct/lowering classes that do not exist yet?
-- Which packages should be bundled by default but explicitly imported?
-- Which packages should be merged, split, deferred, or dropped?
-- Where is the line between package feature and core lifecycle invariant?
+ANSWERED 2026-07-04 — each question maps to a decision in
+[std-package-ecosystem-shape.md](../std-package-ecosystem-shape.md):
+names → "Names" (E1); domains vs catalogs → E2; authoring vs operator-config
+→ E3; missing lowering classes → E4; bundled-but-imported → E5;
+merge/split/defer/drop → E6 (std.agent.pi deferred name-reserved; std.test
+stays dropped; no new merges/splits); package-vs-core line → E7. The
+cross-cutting mechanism answers (meta-grammar, provider seam, capability
+planes, renames, std-as-manifest, versions, DO plane, static checks) are that
+note's M1–M8.
 
 ## Current Rule
 
 No new implementation commitments from this pass until:
 
 ```text
-package-by-package review complete
-overall ecosystem shape settled
-concrete package designs written
-implementation slices chosen from those designs
+package-by-package review complete        [x] (inventory rows + Current Notes)
+overall ecosystem shape settled           [x] 2026-07-04 → std-package-ecosystem-shape.md
+concrete package designs written          [ ] ← current gate
+implementation slices chosen from those designs   [ ]
 ```
 
 ## Current Notes
@@ -106,10 +111,13 @@ implementation slices chosen from those designs
   provider-specific.
 - Pi installed extension/package sets should be modeled as `pi_variant`; reserve
   `environment` for a future package-manager or deployment-environment concept.
-- Reserved bare words such as `claim`, `renew`, `release`, and `lease` are
-  platform catalog privileges. Package manifests may use them only when the
-  platform catalog grants that exact library, construct family, scope, and
-  lowering class.
+- Reserved bare words such as `claim`, `renew`, and `release` are platform
+  catalog privileges. Package manifests may use them only when the platform
+  catalog grants that exact library, construct family, scope, and lowering
+  class. (Corrected 2026-07-04: `lease` was listed here but has no privilege
+  row — it is a core declaration keyword, not a granted bare word; the shipped
+  privilege rows are exactly claim/renew/release → std.tracker,
+  core/lib.rs reserved_keyword_privileges.)
 - Standard package specs should reuse the shared abstraction vocabulary:
   declared resources, source declarations, effect operations, projections,
   turn access grants, provider capability reports, typed signal admission, and
