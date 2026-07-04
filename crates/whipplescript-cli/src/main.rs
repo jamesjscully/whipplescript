@@ -23270,6 +23270,73 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for MemoryCapabil
                     "items": items,
                 }))
             }
+            Some("memory.curate") => {
+                // Deterministic maintenance: dedupe the pool's records by their
+                // `source`/`note` content (keep the first occurrence, drop later
+                // duplicates), rewrite the store, and report removed/kept. Records
+                // for OTHER pools are preserved verbatim. A missing store is empty
+                // (removed 0, kept 0). No wall-clock, no randomness — replay-stable.
+                let Ok(content) = std::fs::read_to_string(&self.store_path) else {
+                    return CapabilityOutcome::Produced(json!({
+                        "pool": pool,
+                        "removed": 0,
+                        "kept": 0,
+                    }));
+                };
+                let mut kept_lines: Vec<String> = Vec::new();
+                let mut seen: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                let mut removed: usize = 0;
+                let mut kept_in_pool: usize = 0;
+                for line in content.lines() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let record: Value = match serde_json::from_str(line) {
+                        Ok(value) => value,
+                        // Preserve unparseable lines untouched (never lose data).
+                        Err(_) => {
+                            kept_lines.push(line.to_owned());
+                            continue;
+                        }
+                    };
+                    // Records for other pools pass through unchanged.
+                    if record.get("pool").and_then(Value::as_str) != Some(pool.as_str()) {
+                        kept_lines.push(line.to_owned());
+                        continue;
+                    }
+                    // Dedup key = the pool's content identity: (source, note).
+                    let dedup_key = serde_json::to_string(&json!({
+                        "source": record.get("source").cloned().unwrap_or(Value::Null),
+                        "note": record.get("note").cloned().unwrap_or(Value::Null),
+                    }))
+                    .unwrap_or_default();
+                    if seen.insert(dedup_key) {
+                        kept_lines.push(line.to_owned());
+                        kept_in_pool += 1;
+                    } else {
+                        removed += 1;
+                    }
+                }
+                let mut rewritten = kept_lines.join("\n");
+                if !rewritten.is_empty() {
+                    rewritten.push('\n');
+                }
+                if let Err(err) = std::fs::write(&self.store_path, rewritten.as_bytes()) {
+                    return CapabilityOutcome::Failed {
+                        error_kind: "memory".to_owned(),
+                        message: format!(
+                            "memory curate of {} failed: {err}",
+                            self.store_path.display()
+                        ),
+                    };
+                }
+                CapabilityOutcome::Produced(json!({
+                    "pool": pool,
+                    "removed": removed,
+                    "kept": kept_in_pool,
+                }))
+            }
             other => CapabilityOutcome::Failed {
                 error_kind: "memory".to_owned(),
                 message: format!(

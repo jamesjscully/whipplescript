@@ -2988,6 +2988,47 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 after: current_after,
             });
             index = next_index;
+        } else if trimmed.strip_prefix("curate ").is_some() {
+            // curate <pool> [{ reason <expr> }] as <binding> (std.memory). The
+            // optional `{ reason <expr> }` block may span lines, so gather it; the
+            // reason expression resolves at commit against the (after-)context, so
+            // it is carried raw in `args`. Lowers to a `memory.curate` capability.call
+            // (maintenance/compaction partner of `recall`/`learn`).
+            let (statement, next_index) =
+                parse_statement_until_balanced_braces(&lines, index, trimmed);
+            let header = statement.split('{').next().unwrap_or(&statement);
+            let pool = header
+                .trim()
+                .strip_prefix("curate ")
+                .unwrap_or("")
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            // Optional `{ reason <expr> }` payload; empty string when absent.
+            let reason_expr = invoke_body(&statement)
+                .and_then(|inner| {
+                    inner
+                        .trim()
+                        .strip_prefix("reason ")
+                        .map(str::trim)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            let target = "memory.curate".to_owned();
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(&statement),
+                kind: "capability.call".to_owned(),
+                target: Some(target.clone()),
+                name: Some("curate".to_owned()),
+                binding: binding_after_as(&statement),
+                args: vec![pool, reason_expr],
+                prompt: None,
+                prompt_content_type: None,
+                required_capabilities: vec![target],
+                after: current_after,
+            });
+            index = next_index;
         } else if let Some(rest) = trimmed.strip_prefix("call ") {
             let target = rest
                 .split_whitespace()
@@ -3655,6 +3696,23 @@ pub fn parsed_effect_input_json(
             input.insert("source_expr".to_owned(), json!(source_expr));
             if !note_expr.is_empty() {
                 input.insert("note".to_owned(), parse_field_value(&note_expr, context));
+            }
+            input.insert("bindings".to_owned(), context_bindings_json(context));
+            input.insert("rule".to_owned(), json!(rule.name));
+            Value::Object(input)
+        }
+        "capability.call" if effect.name.as_deref() == Some("curate") => {
+            let pool = effect.args.first().cloned().unwrap_or_default();
+            let reason_expr = effect.args.get(1).cloned().unwrap_or_default();
+            let mut input = serde_json::Map::new();
+            input.insert("target".to_owned(), json!(effect.target));
+            input.insert("source_form".to_owned(), json!("curate"));
+            input.insert("pool".to_owned(), json!(pool));
+            if !reason_expr.is_empty() {
+                input.insert(
+                    "reason".to_owned(),
+                    parse_field_value(&reason_expr, context),
+                );
             }
             input.insert("bindings".to_owned(), context_bindings_json(context));
             input.insert("rule".to_owned(), json!(rule.name));

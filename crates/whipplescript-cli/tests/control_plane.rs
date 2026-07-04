@@ -6815,6 +6815,139 @@ fn memory_roundtrip_without_a_lock_uses_the_embedded_manifest() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// MEM-6 `curate` end-to-end, lock-free (embedded manifest). A workflow learns two
+/// duplicate items (same `source`/`note`) and one distinct item into a pool, then
+/// `curate`s it, then `recall`s. The three learns and the curate/recall are chained
+/// across rules by marker facts so they execute strictly in order (a single rule's
+/// nested effects are not serialized by the runtime). The curation result reports the
+/// duplicate removed, and the post-curate recall returns exactly the deduped set.
+#[test]
+fn memory_curate_dedupes_the_pool_without_a_lock() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("memory-curate-no-lock");
+    let store_path = dir.join("store.db");
+    let workflow_src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/memory-curate.whip");
+    let workflow_path = dir.join("wf.whip");
+    fs::copy(&workflow_src, &workflow_path).expect("copy curate example");
+
+    // `check` resolves `use memory` + the `learn`/`curate`/`recall` constructs from
+    // the embedded manifest — no lock present, no `--package-lock` flag.
+    let checked = Command::new(bin)
+        .args(["check", workflow_path.to_str().expect("utf-8 workflow")])
+        .output()
+        .expect("check runs");
+    assert!(
+        checked.status.success(),
+        "check must pass with no lock via the embedded `memory` manifest\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store"),
+            "--json",
+            "dev",
+            workflow_path.to_str().expect("utf-8 workflow"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+
+    // All three `learn` writes settled (memory.write capability).
+    let writes = facts
+        .iter()
+        .filter(|fact| {
+            fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded")
+                && fact.pointer("/value/target").and_then(Value::as_str) == Some("memory.write")
+        })
+        .count();
+    assert_eq!(writes, 3, "all three learns should settle a memory.write");
+
+    // The `curate` maintenance op settled and reports the duplicate removed.
+    let curation = facts
+        .iter()
+        .find(|fact| {
+            fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded")
+                && fact.pointer("/value/target").and_then(Value::as_str) == Some("memory.curate")
+        })
+        .expect("curate should settle a memory.curate success fact");
+    let result = curation
+        .pointer("/value/value")
+        .expect("curation result value");
+    assert_eq!(
+        result.get("pool").and_then(Value::as_str),
+        Some("project_memory"),
+        "curation result reports its pool"
+    );
+    let removed = result
+        .get("removed")
+        .and_then(Value::as_u64)
+        .expect("removed count");
+    assert!(
+        removed >= 1,
+        "curate must drop at least the one duplicate (removed = {removed})"
+    );
+    assert_eq!(
+        result.get("kept").and_then(Value::as_u64),
+        Some(2),
+        "curate keeps the deduped set: one `dup` + one `distinct`"
+    );
+
+    // The post-curate `recall` returns exactly the deduped set (no duplicate `dup`).
+    let context = facts
+        .iter()
+        .find(|fact| {
+            fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded")
+                && fact.pointer("/value/target").and_then(Value::as_str) == Some("memory.query")
+        })
+        .expect("recall should settle a memory.query success fact");
+    let memory = context
+        .pointer("/value/value")
+        .expect("recall context value");
+    assert_eq!(
+        memory.get("count").and_then(Value::as_u64),
+        Some(2),
+        "the deduped pool recalls exactly two entries"
+    );
+    let items = memory
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("items array");
+    let mut notes: Vec<&str> = items
+        .iter()
+        .filter_map(|item| item.get("note").and_then(Value::as_str))
+        .collect();
+    notes.sort_unstable();
+    assert_eq!(
+        notes,
+        vec!["distinct", "dup"],
+        "the surviving entries are one `dup` (the deduped duplicate) and the `distinct` one"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Create a unique temp directory tagged with `label`.
 fn unique_temp_dir(label: &str) -> PathBuf {
     let nanos = SystemTime::now()

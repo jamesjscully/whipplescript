@@ -484,6 +484,24 @@ const EFFECT_OPERATION_GRAMMAR: &[EffectOperationSpec] = &[
         binding: BindingMode::Required,
         target_capability: "memory.write",
     },
+    // `curate <pool> [{ reason <expr> }] as <binding>` -> memory.curate. Maintains
+    // /compacts a pool; the optional `{ reason <expr> }` records why. The pool is
+    // the sole slot (no connective); `reason` is an optional payload field, the
+    // curate mirror of `learn`'s optional `note`.
+    EffectOperationSpec {
+        keyword: "curate",
+        slots: &[EffectSlotSpec {
+            name: "pool",
+            kind: SlotKind::Identifier,
+            connective: None,
+        }],
+        payload: Some(&[PayloadFieldSpec {
+            name: "reason",
+            required: false,
+        }]),
+        binding: BindingMode::Required,
+        target_capability: "memory.curate",
+    },
 ];
 
 /// Look up the `effect_operation` grammar for a leading rule-body keyword.

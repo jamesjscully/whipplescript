@@ -40,6 +40,22 @@
           "required_capabilities": ["memory.write"],
           "provider_kinds": ["memory-provider"],
           "validation": "runtime_boundary"
+        },
+        {
+          "id": "memory.curate",
+          "effect_kind": "capability.call",
+          "source_forms": ["call memory.curate", "curate <pool> as <binding>"],
+          "input_schema": {
+            "pool": "string"
+          },
+          "output_schema": {
+            "pool": "string",
+            "removed": "int",
+            "kept": "int"
+          },
+          "required_capabilities": ["memory.curate"],
+          "provider_kinds": ["memory-provider"],
+          "validation": "runtime_boundary"
         }
       ],
       "constructs": [
@@ -121,6 +137,43 @@
           ],
           "lowering_target": "capability_call",
           "target_capability": "memory.write"
+        },
+        {
+          "id": "memory.curate",
+          "construct_family": "effect_operation",
+          "keyword": "curate",
+          "scope": "rule_body",
+          "fields": [
+            {
+              "name": "pool",
+              "kind": "identifier",
+              "required": true
+            },
+            {
+              "name": "reason",
+              "kind": "expression",
+              "required": false
+            },
+            {
+              "name": "binding",
+              "kind": "identifier",
+              "required": true
+            }
+          ],
+          "requires": [
+            {
+              "kind": "Capability",
+              "name": "memory.curate"
+            }
+          ],
+          "provides": [
+            {
+              "kind": "EffectHandle",
+              "type": "memory.curate.output"
+            }
+          ],
+          "lowering_target": "capability_call",
+          "target_capability": "memory.curate"
         }
       ]
     }
@@ -143,6 +196,15 @@
           "summary": "string"
         }
       }
+    },
+    {
+      "id": "memory.curate",
+      "description": "Maintain and compact package memory.",
+      "schema": {
+        "input": {
+          "pool": "string"
+        }
+      }
     }
   ],
   "providers": [
@@ -157,6 +219,12 @@
       "provider_kind": "memory-provider",
       "capability": "memory.write",
       "config": {}
+    },
+    {
+      "id": "provider-memory-curate",
+      "provider_kind": "memory-provider",
+      "capability": "memory.curate",
+      "config": {}
     }
   ],
   "profiles": [
@@ -165,7 +233,7 @@
       "name": "memory-user",
       "description": "Allow memory package queries and writes.",
       "enforcement_mode": "enforce",
-      "allowed_capabilities": ["memory.query", "memory.write"],
+      "allowed_capabilities": ["memory.query", "memory.write", "memory.curate"],
       "config": {}
     }
   ],
@@ -181,6 +249,13 @@
       "id": "binding-memory-write-global",
       "program_id": null,
       "capability": "memory.write",
+      "provider": "memory-provider",
+      "config": {}
+    },
+    {
+      "id": "binding-memory-curate-global",
+      "program_id": null,
+      "capability": "memory.curate",
       "provider": "memory-provider",
       "config": {}
     }
