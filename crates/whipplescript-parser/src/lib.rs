@@ -457,6 +457,10 @@ pub struct SourceDecl {
     pub provider: Ident,
     /// Recurrence/timezone/missed policy; `Some` only for the `clock` provider.
     pub clock: Option<ClockPolicy>,
+    /// `path "<file>"` — required for the `file` provider, rejected elsewhere.
+    /// The file is read line-by-line; each non-empty line is admitted once as a
+    /// durable signal fact (spec/std-time.md admission semantics, append-only).
+    pub path: Option<StringLiteral>,
     /// `observe as <binding>` — binds the provider observation schema.
     pub observe_binding: Ident,
     /// `emit <signal> { <field> <value> ... }` — maps the observation into the
@@ -1040,9 +1044,14 @@ pub struct IrSource {
     pub name: String,
     pub provider: String,
     pub is_clock: bool,
+    /// The `file` provider: reads `path` line-by-line and admits one signal per
+    /// non-empty line, keyed by (source, line index) so re-reads are idempotent.
+    pub is_file: bool,
     pub recurrence: Option<Recurrence>,
     pub timezone: Option<String>,
     pub missed: Option<MissedPolicy>,
+    /// `path "<file>"` — the file read by a `file` source (`None` otherwise).
+    pub path: Option<String>,
     pub observe_binding: String,
     pub emit_signal: String,
     pub emit_fields: Vec<IrSourceEmitField>,
@@ -6513,7 +6522,39 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
             });
         }
     }
+    // File-source static checks: a `file` source reads a declared path, and the
+    // `path` clause is meaningful only for `file` (rejecting it elsewhere keeps
+    // provider intent unambiguous, mirroring the clock-only-clause rejection).
+    let is_file = source.provider.name == "file";
+    if is_file && source.path.is_none() {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: source.span,
+            message: format!(
+                "`file` source `{}` requires a `path` clause",
+                source.name.name
+            ),
+            suggestion: Some("add `path \"./inbox.txt\"`".to_owned()),
+        });
+    }
+    if !is_file {
+        if let Some(path) = &source.path {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: path.span,
+                message: format!(
+                    "source `{}` declares a `path` clause but its provider is `{}`, not `file`",
+                    source.name.name, source.provider.name
+                ),
+                suggestion: Some(
+                    "use `source file as ...` for a `path`, or remove the clause".to_owned(),
+                ),
+            });
+        }
+    }
     let is_clock = source.clock.is_some();
+    let is_file = source.provider.name == "file";
+    let path = source.path.as_ref().map(|literal| literal.value.clone());
     let recurrence = source.clock.as_ref().map(|clock| clock.recurrence.clone());
     let timezone = source
         .clock
@@ -6524,9 +6565,11 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
         name: source.name.name,
         provider: source.provider.name,
         is_clock,
+        is_file,
         recurrence,
         timezone,
         missed,
+        path,
         observe_binding: source.observe_binding.name,
         emit_signal: source.emit.signal,
         emit_fields: source
@@ -16595,6 +16638,9 @@ fn format_source(source: SourceDecl, formatted: &mut String) {
             None => {}
         }
     }
+    if let Some(path) = &source.path {
+        push_line(formatted, format!("  path {:?}", path.value));
+    }
     push_line(
         formatted,
         format!("  observe as {}", source.observe_binding.name),
@@ -18969,6 +19015,7 @@ impl Parser<'_> {
         let mut recurrence: Option<Recurrence> = None;
         let mut timezone: Option<StringLiteral> = None;
         let mut missed: Option<MissedPolicy> = None;
+        let mut path: Option<StringLiteral> = None;
         let mut observe_binding: Option<Ident> = None;
         let mut emit: Option<SourceEmit> = None;
 
@@ -18982,6 +19029,9 @@ impl Parser<'_> {
             } else if self.at_ident("timezone") {
                 self.advance();
                 timezone = self.expect_string("timezone string");
+            } else if self.at_ident("path") {
+                self.advance();
+                path = self.expect_string("path string");
             } else if self.at_ident("missed") {
                 missed = self.parse_missed_policy();
             } else if self.at_ident("observe") {
@@ -18994,7 +19044,7 @@ impl Parser<'_> {
                 emit = self.parse_source_emit();
             } else {
                 self.unexpected(
-                    "a source clause (`every`/`at`, `timezone`, `missed`, `observe`, `emit`)",
+                    "a source clause (`every`/`at`, `timezone`, `path`, `missed`, `observe`, `emit`)",
                 );
                 self.synchronize_to_block_item();
             }
@@ -19076,6 +19126,7 @@ impl Parser<'_> {
             name,
             provider,
             clock,
+            path,
             observe_binding,
             emit,
             span,

@@ -20499,6 +20499,7 @@ struct WorkerReport {
     timers_fired: usize,
     deadlines_expired: usize,
     clock_occurrences_admitted: u64,
+    file_lines_admitted: u64,
     cancellation_acknowledgements: usize,
     cancellation_diagnostics: usize,
     terminal_events: Vec<String>,
@@ -20540,6 +20541,12 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
                         options.virtual_now.as_deref().unwrap_or("now"),
                         &ir,
                     )?;
+                }
+                // Admit new lines from `file` sources (spec/std-time.md). Only
+                // when the program declares one, so other workflows pay nothing.
+                if ir.sources.iter().any(|source| source.is_file) {
+                    report.file_lines_admitted +=
+                        resolve_due_file_sources(store_path, &options.instance_id, &ir)?;
                 }
             }
         }
@@ -21048,6 +21055,101 @@ fn resolve_due_clock_sources(
                 Some(&idempotency_key(&[
                     instance_id,
                     "clock-fact",
+                    &received.event_id,
+                ])),
+            )?;
+            admitted += 1;
+        }
+    }
+    Ok(admitted)
+}
+
+/// Admits durable signal facts from `file` sources (spec/std-time.md admission
+/// semantics): read each source's `path`, and for every non-empty line at
+/// (non-empty) ordinal `i`, admit one signal keyed by `line_id = H(source, i)`
+/// — append-only log semantics, so re-reading the file re-admits nothing already
+/// seen and a growing file only adds its new tail.
+///
+/// Dedup mirrors the clock source's cursor, not a store-level upsert: the event
+/// log hard-errors on a duplicate idempotency key (no `ON CONFLICT`), so — as
+/// `resolve_due_clock_sources` does with `last_clock_occurrence` — we must never
+/// re-attempt an already-admitted line. The cursor is the count of external
+/// events already admitted for this signal (each admitted line appends exactly
+/// one such event; `derive_fact` appends a `fact.derived` event, not one of this
+/// type, so it does not inflate the count). Because non-empty ordinals are
+/// gap-free and admissions form a prefix `0..count`, skipping `i < count` is
+/// exactly the set already admitted.
+///
+/// A missing file is not an error: the source simply has nothing to admit yet.
+/// The observation record `{ line, line_index, path }` is mapped onto the
+/// declared signal by the author's `emit` clause exactly as a clock occurrence
+/// is mapped by `clock_emit_payload`.
+fn resolve_due_file_sources(
+    store_path: &Path,
+    instance_id: &str,
+    ir: &IrProgram,
+) -> Result<u64, StoreError> {
+    let mut admitted = 0u64;
+    for source in &ir.sources {
+        if !source.is_file {
+            continue;
+        }
+        let Some(path) = source.path.as_ref() else {
+            continue;
+        };
+        let already_admitted = {
+            let store = SqliteStore::open(store_path)?;
+            if store.get_instance(instance_id)?.is_none() {
+                continue;
+            }
+            store
+                .list_events(instance_id)?
+                .into_iter()
+                .filter(|event| {
+                    event.source == "external" && event.event_type == source.emit_signal
+                })
+                .count()
+        };
+        // A missing file is not an error: there is simply nothing to admit yet.
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(StoreError::Conflict(error.to_string())),
+        };
+        for (index, line) in contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .enumerate()
+        {
+            if index < already_admitted {
+                continue;
+            }
+            let line_id = idempotency_key(&[&source.name, &index.to_string()]);
+            let mut observation = serde_json::Map::new();
+            observation.insert("line".to_owned(), Value::String(line.to_owned()));
+            observation.insert("line_index".to_owned(), json!(index));
+            observation.insert("path".to_owned(), Value::String(path.clone()));
+            let payload_json = clock_emit_payload(source, &observation).to_string();
+            let store = SqliteStore::open(store_path)?;
+            let mut kernel = RuntimeKernel::new(store);
+            // Record the line event, then derive its durable signal fact
+            // (mirroring `whip signal`), keyed by `line_id` so both steps stay
+            // idempotent under replay.
+            let received = kernel.ingest_external_event(
+                instance_id,
+                &source.emit_signal,
+                &payload_json,
+                Some(&line_id),
+            )?;
+            kernel.derive_fact(
+                instance_id,
+                &source.emit_signal,
+                &received.event_id,
+                &payload_json,
+                Some(&received.event_id),
+                Some(&idempotency_key(&[
+                    instance_id,
+                    "file-fact",
                     &received.event_id,
                 ])),
             )?;
@@ -25358,7 +25460,13 @@ fn dev(options: &CliOptions) -> ExitCode {
         {
             return code;
         }
-        let idle = step_report.committed_rules == 0 && worker_report.ran_effects == 0;
+        // Newly-admitted `file` source lines are fresh signals the next `step`
+        // must evaluate rules against, so an admitting pass is never idle. File
+        // admission is idempotent, so this converges: the pass after admission
+        // admits nothing more.
+        let idle = step_report.committed_rules == 0
+            && worker_report.ran_effects == 0
+            && worker_report.file_lines_admitted == 0;
         steps.push(step_report);
         workers.push(worker_report);
         if idle {
@@ -26185,7 +26293,13 @@ fn acceptance_dev_report(
             Ok(report) => report,
             Err(error) => return Err(report_store_error("failed to run worker", error)),
         };
-        let idle = step_report.committed_rules == 0 && worker_report.ran_effects == 0;
+        // Newly-admitted `file` source lines are fresh signals the next `step`
+        // must evaluate rules against, so an admitting pass is never idle. File
+        // admission is idempotent, so this converges: the pass after admission
+        // admits nothing more.
+        let idle = step_report.committed_rules == 0
+            && worker_report.ran_effects == 0
+            && worker_report.file_lines_admitted == 0;
         steps.push(step_report);
         workers.push(worker_report);
         if idle {
@@ -29003,6 +29117,7 @@ fn worker_report_to_json(report: &WorkerReport) -> Value {
         "instance_id": report.instance_id,
         "provider": report.provider,
         "ran_effects": report.ran_effects,
+        "file_lines_admitted": report.file_lines_admitted,
         "cancellation_acknowledgements": report.cancellation_acknowledgements,
         "cancellation_diagnostics": report.cancellation_diagnostics,
         "terminal_events": report.terminal_events,

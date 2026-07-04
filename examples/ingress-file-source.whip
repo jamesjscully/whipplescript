@@ -1,0 +1,43 @@
+@service
+workflow IngressFileSource
+
+# A `file` ingress source admits one durable signal fact per non-empty line of a
+# file, mirroring how a `clock` source admits a fact per scheduled occurrence
+# (spec/std-time.md). The source never fires a rule directly: it materializes the
+# `fed` signal, and rules react to the admitted signal. Admission is idempotent
+# by (source, line index) — re-reading the file re-admits nothing already seen
+# (append-only log semantics), so a growing file only ever adds new lines.
+
+signal ingress.fed {
+  text string
+  index int
+}
+
+class FedLine {
+  text string
+  index int
+}
+
+# `observe as obs` binds the file observation record `{ line, line_index, path }`;
+# the `emit` clause maps those observation fields onto the `fed` signal payload,
+# exactly as a clock source maps `obs.scheduled_at`.
+source file as feed {
+  path "./inbox.txt"
+
+  observe as obs
+  emit ingress.fed {
+    text obs.line
+    index obs.line_index
+  }
+}
+
+# Rules react to the admitted signal, not the source. Each admitted line drives
+# one `record`, so a two-line file yields two `FedLine` facts.
+rule record_line
+  when ingress.fed as f
+=> {
+  record FedLine {
+    text f.text
+    index f.index
+  }
+}

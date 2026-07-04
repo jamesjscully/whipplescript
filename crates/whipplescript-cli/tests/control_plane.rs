@@ -410,6 +410,172 @@ rule pick
     let _ = fs::remove_dir_all(root);
 }
 
+/// A `file` ingress source (mirroring the `clock` source, spec/std-time.md)
+/// admits one durable signal fact per non-empty line of its `path`, mapping the
+/// observation record `{ line, line_index, path }` onto the declared signal via
+/// the author's `emit` clause. This exercises the full vertical: parse the
+/// `path` clause -> lower an `is_file` source -> read the file on a worker pass
+/// -> admit one `ingress.fed` signal per line -> a rule reacts and records a
+/// `FedLine` fact. Admission is idempotent by (source, line ordinal): a second
+/// worker pass over the same file re-admits nothing (append-only log semantics),
+/// so the store never double-counts a line.
+#[test]
+fn dev_file_source_admits_one_signal_per_line_idempotently() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let root = unique_temp_dir("file-source-root");
+    let inbox = root.join("inbox.txt");
+    fs::write(&inbox, "first line\nsecond line\n").expect("seed inbox");
+    let source_path = temp_workflow_path("file-source");
+    fs::write(
+        &source_path,
+        format!(
+            r#"
+@service
+workflow IngressFileSource
+
+signal ingress.fed {{
+  text string
+  index int
+}}
+
+class FedLine {{
+  text string
+  index int
+}}
+
+source file as feed {{
+  path "{}"
+
+  observe as obs
+  emit ingress.fed {{
+    text obs.line
+    index obs.line_index
+  }}
+}}
+
+rule record_line
+  when ingress.fed as f
+=> {{
+  record FedLine {{
+    text f.text
+    index f.index
+  }}
+}}
+"#,
+            inbox.display()
+        ),
+    )
+    .expect("write source");
+
+    let store = store_path.to_str().expect("utf-8 store path");
+    let program = source_path.to_str().expect("utf-8 source path");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            program,
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // One `ingress.fed` signal fact per line, carrying that line's text.
+    let fed_texts = |instance: &str| -> Vec<String> {
+        let facts = run_json(bin, &["--store", store, "--json", "facts", instance]);
+        let mut rows: Vec<(i64, String)> = facts
+            .as_array()
+            .expect("facts array")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("ingress.fed"))
+            .map(|fact| {
+                let index = fact
+                    .pointer("/value/index")
+                    .and_then(Value::as_i64)
+                    .expect("fed fact carries a line index");
+                let text = fact
+                    .pointer("/value/text")
+                    .and_then(Value::as_str)
+                    .expect("fed fact carries the line text")
+                    .to_owned();
+                (index, text)
+            })
+            .collect();
+        rows.sort_by_key(|(index, _)| *index);
+        rows.into_iter().map(|(_, text)| text).collect()
+    };
+
+    assert_eq!(
+        fed_texts(&instance_id),
+        vec!["first line".to_owned(), "second line".to_owned()],
+        "the file source admits one `ingress.fed` signal per non-empty line, in file order"
+    );
+
+    // The rule reacted to each admitted signal (one `FedLine` per line).
+    let fed_line_count = |instance: &str| -> usize {
+        let facts = run_json(bin, &["--store", store, "--json", "facts", instance]);
+        facts
+            .as_array()
+            .expect("facts array")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("FedLine"))
+            .count()
+    };
+    assert_eq!(
+        fed_line_count(&instance_id),
+        2,
+        "each admitted signal drove the reacting rule to record a FedLine fact"
+    );
+
+    // Idempotency: a second worker pass over the *same* instance and the *same*
+    // file re-admits nothing. Without the (source, line ordinal) cursor this
+    // re-attempt would hit the event log's UNIQUE(idempotency_key) constraint or
+    // double the facts; instead the count is unchanged.
+    let worker = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "worker",
+            &instance_id,
+            "--program",
+            program,
+            "--provider",
+            "fixture",
+        ],
+    );
+    assert_eq!(
+        worker.get("file_lines_admitted").and_then(Value::as_u64),
+        Some(0),
+        "a re-read of an unchanged file admits no new lines: {worker}"
+    );
+    assert_eq!(
+        fed_texts(&instance_id),
+        vec!["first line".to_owned(), "second line".to_owned()],
+        "re-running admits no duplicate signal facts (idempotent by line ordinal)"
+    );
+    assert_eq!(
+        fed_line_count(&instance_id),
+        2,
+        "no duplicate FedLine facts after the idempotent re-read"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_dir_all(root);
+}
+
 /// std.files `write` (spec/std-library/files.md): `write text to <store> at
 /// <path> { body <expr> mode <mode> }` renders a body to disk through the real
 /// worker, settling `file.write.completed`. The mode is enforced ("no silent
