@@ -7836,6 +7836,12 @@ fn analyze_rule(
     validate_record_blocks(rule, semantic, &binding_types, &known_roots, diagnostics);
     validate_effect_payloads(rule, semantic, &binding_types, &known_roots, diagnostics);
     validate_effect_field_roots(rule, &body_ast.statements, &known_roots, diagnostics);
+    validate_emit_signal_declarations(
+        rule,
+        &body_ast.statements,
+        &semantic.schemas.events,
+        diagnostics,
+    );
     validate_workflow_invocations(rule, semantic, &binding_types, &known_roots, diagnostics);
     validate_milestone_statements(rule, semantic, diagnostics);
     let mut block_stack: Vec<BlockFrame> = Vec::new();
@@ -13909,6 +13915,80 @@ fn collect_all_binding_names(statements: &[body::BodyStmt], out: &mut BTreeSet<S
             | body::BodyStmt::Terminal(_)
             | body::BodyStmt::Milestone { .. }
             | body::BodyStmt::Cancel { .. } => {}
+        }
+    }
+}
+
+/// `emit signal <name> to <target>` requires `<name>` to be a declared `signal`
+/// — the declaration is the typed payload contract at the emit site, symmetric
+/// with the reaction-side "reacts to undeclared signal" check on `when <signal>`
+/// (spec/event-ingress.md, "Directed injection"). Without this, an emit of an
+/// undeclared signal only fails at runtime when the effect input is built
+/// (`whipplescript_kernel::rule_lowering`, "emit signal of undeclared signal");
+/// this lifts the same guarantee to static `whip check`. Recurses into
+/// `after`/`case`/`branch`/`handler` bodies so a nested emit is covered too.
+fn validate_emit_signal_declarations(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    declared_signals: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                if let body::BodyEffectKind::Notify { event, .. } = &effect.kind {
+                    if !declared_signals.contains(event) {
+                        diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: effect.span,
+                            message: format!(
+                                "rule `{}` emits undeclared signal `{event}`",
+                                rule.name.name
+                            ),
+                            suggestion: Some(format!(
+                                "declare `signal {event} {{ ... }}` so the emitted payload is typed and admissible, \
+                                 or check the signal name"
+                            )),
+                        });
+                    }
+                }
+            }
+            body::BodyStmt::After(after) => {
+                validate_emit_signal_declarations(rule, &after.body, declared_signals, diagnostics)
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    validate_emit_signal_declarations(
+                        rule,
+                        &branch.body,
+                        declared_signals,
+                        diagnostics,
+                    );
+                }
+            }
+            body::BodyStmt::Branch(branch) => {
+                validate_emit_signal_declarations(
+                    rule,
+                    &branch.then_body,
+                    declared_signals,
+                    diagnostics,
+                );
+                if let Some(else_body) = &branch.else_body {
+                    validate_emit_signal_declarations(
+                        rule,
+                        else_body,
+                        declared_signals,
+                        diagnostics,
+                    );
+                }
+            }
+            body::BodyStmt::Handler(handler) => validate_emit_signal_declarations(
+                rule,
+                &handler.body,
+                declared_signals,
+                diagnostics,
+            ),
+            _ => {}
         }
     }
 }
@@ -23174,6 +23254,40 @@ rule_dependencies
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message == "unknown schema reference `MissingOutput`"));
+    }
+
+    #[test]
+    fn emit_of_undeclared_signal_is_flagged_statically() {
+        // Q1: `emit signal <name>` must name a declared signal, caught at
+        // `whip check` time (previously only at runtime effect-input building).
+        let source = "\
+workflow Emitter
+signal trigger.x { peer string }
+signal known.sig { note string }
+rule relay
+  when trigger.x as t
+=> {
+  emit signal known.sig to t.peer { note \"ok\" } as a
+  emit signal unknown.sig to t.peer { note \"bad\" } as b
+}
+";
+        let compiled = compile_program(source);
+        let messages: Vec<&str> = compiled
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(
+            messages.contains(&"rule `relay` emits undeclared signal `unknown.sig`"),
+            "expected the undeclared-emit diagnostic, got {messages:?}"
+        );
+        // The declared emit (`known.sig`) is not flagged.
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("emits undeclared signal `known.sig`")),
+            "a declared signal must not be flagged: {messages:?}"
+        );
     }
 
     #[test]
