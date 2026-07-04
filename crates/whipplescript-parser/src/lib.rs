@@ -14128,6 +14128,68 @@ fn validate_source_emit_signal_declared(
             suggestion: Some(suggestion),
         });
     }
+
+    // The emit fields map the source's observation record onto the signal
+    // payload by name. Each `<field> <observe>.<obsfield>` must read a real
+    // observation field for this source's kind, else it silently maps null at
+    // runtime. The observation schemas below MUST mirror the records built in
+    // the CLI source resolvers (`resolve_due_{clock,file,http}_sources`): add a
+    // field there → add it here. Unknown providers have no known schema, so
+    // their emit fields are not checked (avoids false positives).
+    let observation_fields: Option<&[&str]> = match source.provider.name.as_str() {
+        "clock" => Some(&[
+            "scheduled_at",
+            "observed_at",
+            "occurrence_id",
+            "missed_count",
+        ]),
+        "file" => Some(&["line", "line_index", "path"]),
+        "http" => Some(&["item", "item_index", "url"]),
+        _ => None,
+    };
+    if let Some(fields) = observation_fields {
+        let observe = &source.observe_binding.name;
+        for emit_field in &source.emit.fields {
+            let SourceValue::Path {
+                binding,
+                segments,
+                span,
+            } = &emit_field.value
+            else {
+                continue;
+            };
+            if &binding.name != observe {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: *span,
+                    message: format!(
+                        "source `{}` emit reads unknown binding `{}`",
+                        source.name.name, binding.name
+                    ),
+                    suggestion: Some(format!(
+                        "the source's observation binding is `{observe}` (declared by `observe as {observe}`)"
+                    )),
+                });
+                continue;
+            }
+            if let Some(obs_field) = segments.first() {
+                if !fields.contains(&obs_field.name.as_str()) {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: obs_field.span,
+                        message: format!(
+                            "source `{}` emit reads `{}.{}`, but a `{}` source's observation has no field `{}`",
+                            source.name.name, observe, obs_field.name, source.provider.name, obs_field.name
+                        ),
+                        suggestion: Some(format!(
+                            "available observation fields: {}",
+                            fields.join(", ")
+                        )),
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// `emit signal <name> to <target>` requires `<name>` to be a declared `signal`
@@ -23654,6 +23716,48 @@ rule react
                 .iter()
                 .map(|d| d.message.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn source_emit_of_unknown_observation_field_is_flagged_statically() {
+        // A source emit maps the observation record by name; reading a field the
+        // source kind's observation doesn't have (here a `file` source has only
+        // line/line_index/path) is caught at `whip check`, not silently mapped
+        // null at runtime.
+        let source = "\
+workflow BadObs
+signal ingress.fed { text string }
+source file as feed {
+  path \"/tmp/x.txt\"
+  observe as obs
+  emit ingress.fed { text obs.nosuchfield }
+}
+output result Done
+class Done { ok string }
+rule react
+  when ingress.fed as f
+=> { complete result { ok \"ok\" } }
+";
+        let messages: Vec<String> = compile_program(source)
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            messages.iter().any(|m| m.contains(
+                "emit reads `obs.nosuchfield`, but a `file` source's observation has no field"
+            )),
+            "expected the unknown-observation-field diagnostic, got {messages:?}"
+        );
+        // A valid observation field (`line`) must not be flagged.
+        let ok = source.replace("obs.nosuchfield", "obs.line");
+        assert!(
+            !compile_program(&ok)
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("observation has no field")),
+            "a valid observation field must not be flagged"
         );
     }
 
