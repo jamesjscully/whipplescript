@@ -618,6 +618,72 @@ pub struct ContractRegistryDiagnostic {
     pub message: String,
 }
 
+// --- Embedded standard-package manifest data (M5) -----------------------------
+//
+// std packages ship as data compiled into the binary rather than as scattered
+// per-package builtin functions. This is the first entry (std.messaging `send`);
+// the parser's `contract_registry` and the CLI both source std definitions from
+// here, so there is one source of truth. Each `std_*` function returns the same
+// `ConstructRegistration` / `EffectContract` the parser previously hand-rolled,
+// so the move is behaviour-preserving. Later slices relocate the remaining std
+// libraries here and drive `use std.*` authority from the same data.
+
+/// The `messaging.send` capability id — the target of the `send` construct and
+/// the id of its `capability.call` effect contract.
+pub const MESSAGING_SEND_CAPABILITY: &str = "messaging.send";
+
+/// `std.messaging` `send` construct registration (effect_operation → capability.call).
+pub fn std_messaging_send_construct() -> ConstructRegistration {
+    ConstructRegistration {
+        id: MESSAGING_SEND_CAPABILITY.to_owned(),
+        library_id: "std.messaging".to_owned(),
+        version: "v0".to_owned(),
+        construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION.to_owned(),
+        keyword: "send".to_owned(),
+        scope: CONSTRUCT_SCOPE_RULE_BODY.to_owned(),
+        fields: vec![
+            ConstructField {
+                name: "channel".to_owned(),
+                kind: "identifier".to_owned(),
+                required: true,
+            },
+            ConstructField {
+                name: "text".to_owned(),
+                kind: "expression".to_owned(),
+                required: true,
+            },
+        ],
+        requires: vec![ConstructInterface {
+            kind: CONSTRUCT_INTERFACE_CAPABILITY.to_owned(),
+            name: Some(MESSAGING_SEND_CAPABILITY.to_owned()),
+            type_ref: None,
+            phase: CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME.to_owned(),
+            cardinality: CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE.to_owned(),
+        }],
+        provides: Vec::new(),
+        lowering_target: CONSTRUCT_LOWERING_CAPABILITY_CALL.to_owned(),
+        target_capability: Some(MESSAGING_SEND_CAPABILITY.to_owned()),
+    }
+}
+
+/// `std.messaging` `messaging.send` `capability.call` effect contract — the
+/// target the `send` construct lowers to.
+pub fn std_messaging_send_effect_contract() -> EffectContract {
+    EffectContract {
+        id: MESSAGING_SEND_CAPABILITY.to_owned(),
+        library_id: "std.messaging".to_owned(),
+        version: "v0".to_owned(),
+        effect_kind: "capability.call".to_owned(),
+        source_forms: vec!["send".to_owned()],
+        input_schema: Some("messaging.send.input".to_owned()),
+        output_schema: Some("MessageSendReceipt".to_owned()),
+        required_capabilities: vec![MESSAGING_SEND_CAPABILITY.to_owned()],
+        provider_kinds: vec!["messaging".to_owned()],
+        projected_facts: vec!["effect.output".to_owned()],
+        validation: TypedOutputValidation::RuntimeBoundary,
+    }
+}
+
 impl ContractRegistry {
     pub fn merge(&mut self, other: ContractRegistry) {
         for library in other.libraries {

@@ -13,11 +13,8 @@ use std::{
     fmt,
 };
 use whipplescript_core::{
-    ConstructField, ConstructInterface, ConstructRegistration, ContractRegistry, EffectContract,
-    LibraryRegistration, TypedOutputValidation, CONSTRUCT_FAMILY_EFFECT_OPERATION,
-    CONSTRUCT_INTERFACE_CAPABILITY, CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE,
-    CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME, CONSTRUCT_LOWERING_CAPABILITY_CALL,
-    CONSTRUCT_SCOPE_RULE_BODY,
+    ConstructRegistration, ContractRegistry, EffectContract, LibraryRegistration,
+    TypedOutputValidation, MESSAGING_SEND_CAPABILITY,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3253,64 +3250,17 @@ impl IrProgram {
     }
 }
 
-/// The `std.messaging` outbound `send` capability id (the target of the `send`
-/// construct's `capability.call` lowering).
-const MESSAGING_SEND_CAPABILITY: &str = "messaging.send";
-
-/// Built-in `std.messaging` `send` construct registration (1929 OPTION A): the
-/// compiler-provided equivalent of a package-authored `capability_call`
-/// construct, available without a package lock. Mirrors how a `recall`-style
-/// construct would be declared in a package manifest, but owned by the platform.
+/// Built-in `std.messaging` `send` construct registration. The data now lives in
+/// `whipplescript_core` as embedded std-manifest data (M5); this is a thin
+/// delegate so `contract_registry` and the parser tests keep their call site.
 fn builtin_messaging_send_construct() -> ConstructRegistration {
-    ConstructRegistration {
-        id: MESSAGING_SEND_CAPABILITY.to_owned(),
-        library_id: "std.messaging".to_owned(),
-        version: "v0".to_owned(),
-        construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION.to_owned(),
-        keyword: "send".to_owned(),
-        scope: CONSTRUCT_SCOPE_RULE_BODY.to_owned(),
-        fields: vec![
-            ConstructField {
-                name: "channel".to_owned(),
-                kind: "identifier".to_owned(),
-                required: true,
-            },
-            ConstructField {
-                name: "text".to_owned(),
-                kind: "expression".to_owned(),
-                required: true,
-            },
-        ],
-        requires: vec![ConstructInterface {
-            kind: CONSTRUCT_INTERFACE_CAPABILITY.to_owned(),
-            name: Some(MESSAGING_SEND_CAPABILITY.to_owned()),
-            type_ref: None,
-            phase: CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME.to_owned(),
-            cardinality: CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE.to_owned(),
-        }],
-        provides: Vec::new(),
-        lowering_target: CONSTRUCT_LOWERING_CAPABILITY_CALL.to_owned(),
-        target_capability: Some(MESSAGING_SEND_CAPABILITY.to_owned()),
-    }
+    whipplescript_core::std_messaging_send_construct()
 }
 
-/// Built-in `std.messaging` `messaging.send` `capability.call` effect contract,
-/// the target the `send` construct lowers to. Present without a lock so
-/// `validate_construct_uses` resolves the std-library exemption.
+/// Built-in `std.messaging` `messaging.send` `capability.call` effect contract.
+/// Data lives in `whipplescript_core` (M5 embedded std-manifest data).
 fn builtin_messaging_send_effect_contract() -> EffectContract {
-    EffectContract {
-        id: MESSAGING_SEND_CAPABILITY.to_owned(),
-        library_id: "std.messaging".to_owned(),
-        version: "v0".to_owned(),
-        effect_kind: "capability.call".to_owned(),
-        source_forms: vec!["send".to_owned()],
-        input_schema: Some("messaging.send.input".to_owned()),
-        output_schema: Some("MessageSendReceipt".to_owned()),
-        required_capabilities: vec![MESSAGING_SEND_CAPABILITY.to_owned()],
-        provider_kinds: vec!["messaging".to_owned()],
-        projected_facts: vec!["effect.output".to_owned()],
-        validation: TypedOutputValidation::RuntimeBoundary,
-    }
+    whipplescript_core::std_messaging_send_effect_contract()
 }
 
 fn register_standard_library(libraries: &mut BTreeMap<String, LibraryRegistration>, id: &str) {
