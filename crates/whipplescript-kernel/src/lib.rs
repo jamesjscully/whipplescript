@@ -41,8 +41,8 @@ use serde_json::{json, Value};
 use trace::{DependencyEdge, EffectStatus, TraceEvent, TraceRecord};
 use whipplescript_core::Severity;
 use whipplescript_parser::{
-    DependencyPredicate, IrEffectKind, IrPrimitiveType, IrProgram, IrSchema, IrType,
-    IrWorkflowContractKind, SourceSpan,
+    DependencyPredicate, IrPrimitiveType, IrProgram, IrSchema, IrType, IrWorkflowContractKind,
+    SourceSpan,
 };
 use whipplescript_store::{
     ArtifactRecord, ClaimableEffect, DerivedFact, DiagnosticRecord, EffectCancellation,
@@ -2929,7 +2929,7 @@ fn generated_declaration_payload(program: &IrProgram, declaration: &str) -> Opti
                             .iter()
                             .map(|effect| json!({
                                 "id": effect.id,
-                                "kind": effect_kind_name(&effect.kind),
+                                "kind": effect.kind.as_str(),
                                 "binding": effect.binding,
                                 "required_capabilities": effect.required_capabilities,
                                 "idempotency_key": effect.idempotency_key,
@@ -2993,32 +2993,6 @@ fn ir_type_signature(ty: &IrType) -> String {
                 .join(" | ");
             format!("union<{variants}>")
         }
-    }
-}
-
-fn effect_kind_name(kind: &IrEffectKind) -> &'static str {
-    match kind {
-        IrEffectKind::AgentTell => "agent.tell",
-        IrEffectKind::Coerce => "coerce",
-        IrEffectKind::LoftClaim => "loft.claim",
-        IrEffectKind::HumanAsk => "human.ask",
-        IrEffectKind::CapabilityCall => "capability.call",
-        IrEffectKind::EventEmit => "event.emit",
-        IrEffectKind::WorkflowInvoke => "workflow.invoke",
-        IrEffectKind::TimerWait => "timer.wait",
-        IrEffectKind::ExecCommand => "exec.command",
-        IrEffectKind::QueueFile => "queue.file",
-        IrEffectKind::QueueClaim => "queue.claim",
-        IrEffectKind::QueueRelease => "queue.release",
-        IrEffectKind::QueueFinish => "queue.finish",
-        IrEffectKind::LeaseAcquire => "lease.acquire",
-        IrEffectKind::LedgerAppend => "ledger.append",
-        IrEffectKind::CounterConsume => "counter.consume",
-        IrEffectKind::EventNotify => "event.notify",
-        IrEffectKind::FileRead => "file.read",
-        IrEffectKind::FileWrite => "file.write",
-        IrEffectKind::FileImport => "file.import",
-        IrEffectKind::FileExport => "file.export",
     }
 }
 

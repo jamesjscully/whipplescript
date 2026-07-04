@@ -4378,7 +4378,7 @@ fn construct_graph_json_with_digests(
                 continue;
             }
 
-            let effect_kind = ir_effect_kind_name(&effect.kind);
+            let effect_kind = effect.kind.as_str();
             let contract = registry
                 .effect_contracts
                 .iter()
@@ -28192,32 +28192,6 @@ fn binary_op_label(op: BinaryOp) -> &'static str {
         BinaryOp::Sub => "-",
         BinaryOp::Mul => "*",
         BinaryOp::Div => "/",
-    }
-}
-
-fn ir_effect_kind_name(kind: &IrEffectKind) -> &'static str {
-    match kind {
-        IrEffectKind::AgentTell => "agent.tell",
-        IrEffectKind::Coerce => "coerce",
-        IrEffectKind::LoftClaim => "loft.claim",
-        IrEffectKind::HumanAsk => "human.ask",
-        IrEffectKind::CapabilityCall => "capability.call",
-        IrEffectKind::EventEmit => "event.emit",
-        IrEffectKind::WorkflowInvoke => "workflow.invoke",
-        IrEffectKind::TimerWait => "timer.wait",
-        IrEffectKind::ExecCommand => "exec.command",
-        IrEffectKind::QueueFile => "queue.file",
-        IrEffectKind::QueueClaim => "queue.claim",
-        IrEffectKind::QueueRelease => "queue.release",
-        IrEffectKind::QueueFinish => "queue.finish",
-        IrEffectKind::LeaseAcquire => "lease.acquire",
-        IrEffectKind::LedgerAppend => "ledger.append",
-        IrEffectKind::CounterConsume => "counter.consume",
-        IrEffectKind::EventNotify => "event.notify",
-        IrEffectKind::FileRead => "file.read",
-        IrEffectKind::FileWrite => "file.write",
-        IrEffectKind::FileImport => "file.import",
-        IrEffectKind::FileExport => "file.export",
     }
 }
 

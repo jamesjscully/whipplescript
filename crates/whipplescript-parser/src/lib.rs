@@ -3607,7 +3607,9 @@ fn effect_contract_for_kind(
 }
 
 impl IrEffectKind {
-    fn as_str(&self) -> &'static str {
+    /// The single canonical `IrEffectKind` → effect-kind string map. Kernel and
+    /// CLI delegate here (S0 dedup) so a rename touches exactly one match.
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::AgentTell => "agent.tell",
             Self::Coerce => "coerce",
