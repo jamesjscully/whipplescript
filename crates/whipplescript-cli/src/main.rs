@@ -164,6 +164,7 @@ fn main() -> ExitCode {
         Some("check") => check(&options),
         Some("gov") => gov(&options),
         Some("agent") => whip_agent(&options),
+        Some("agents") => agents(&options),
         Some("lint") => lint(&options),
         Some("lsp") => lsp(&options),
         Some("fmt") => fmt(&options),
@@ -322,6 +323,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "retry" => "usage: whip retry <instance> <effect>",
         "recover" => "usage: whip recover <instance>",
         "doctor" => "usage: whip doctor [--providers] [--provider-config <path>] [--record-provider-evidence <instance>]",
+        "agents" => "usage: whip [--json] agents [--root <workflow>] <workflow.whip>",
         "auth" => "usage: whip auth <status | set <openai|anthropic> <key>>",
         "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--from <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
         _ => return None,
@@ -1582,6 +1584,95 @@ fn lint_source(
 /// reports it, `deny` reports it and exits nonzero (spec/editor-tooling.md). With one
 /// source the JSON report is `{schema, path, findings}`; with several it is `{schema,
 /// reports: [{path, findings}, …]}`.
+/// `whip agents <workflow.whip>` — the std.agent introspection surface (DR-0015
+/// truthful capability report, declared tier): list each declared `agent` with
+/// its provider/harness/profile/capacity and its declared skills, capabilities,
+/// and workflow tools. Reads the compiled IR; no provider probing (that is the
+/// separate probed tier).
+fn agents(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip [--json] agents [--root <workflow>] <workflow.whip>";
+    let mut source: Option<String> = None;
+    let mut root: Option<String> = None;
+    let mut index = 0;
+    while index < options.args.len() {
+        match options.args[index].as_str() {
+            "--root" => {
+                index += 1;
+                root = options.args.get(index).cloned();
+            }
+            // Accept + ignore so the same arg set works across check/lint/agents.
+            "--package-lock" => {
+                index += 1;
+            }
+            arg if !arg.starts_with('-') => source = Some(arg.to_owned()),
+            other => {
+                eprintln!("unknown agents option `{other}`");
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+        index += 1;
+    }
+    let Some(source_path) = source else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let (_source, ir) = match compile_source_path_with_root(&source_path, root.as_deref()) {
+        Ok(pair) => pair,
+        Err(error) => return report_compile_failure(&source_path, error),
+    };
+
+    if options.json {
+        let agents_json: Vec<Value> = ir
+            .agents
+            .iter()
+            .map(|agent| {
+                json!({
+                    "name": agent.name,
+                    "provider": agent.provider,
+                    "harness": agent.harness,
+                    "profile": agent.profile,
+                    "capacity": agent.capacity,
+                    "skills": agent.skills,
+                    "capabilities": agent.capabilities,
+                    "tools": agent.tools,
+                })
+            })
+            .collect();
+        return emit_json(json!({ "agents": agents_json }));
+    }
+
+    if ir.agents.is_empty() {
+        println!("no agents declared");
+        return ExitCode::SUCCESS;
+    }
+    for agent in &ir.agents {
+        println!("agent {}", agent.name);
+        if let Some(provider) = &agent.provider {
+            println!("  provider {provider}");
+        }
+        if let Some(harness) = &agent.harness {
+            println!("  harness {harness}");
+        }
+        if let Some(profile) = &agent.profile {
+            println!("  profile {profile}");
+        }
+        if let Some(capacity) = agent.capacity {
+            println!("  capacity {capacity}");
+        }
+        if !agent.capabilities.is_empty() {
+            println!("  capabilities {}", agent.capabilities.join(", "));
+        }
+        if !agent.tools.is_empty() {
+            println!("  tools {}", agent.tools.join(", "));
+        }
+        if !agent.skills.is_empty() {
+            println!("  skills {}", agent.skills.join(", "));
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 fn lint(options: &CliOptions) -> ExitCode {
     let usage =
         "usage: whip [--json] lint [--root <workflow>] [--rule <id>] [--allow <id>] [--deny <id>] <source-or-dir>...";

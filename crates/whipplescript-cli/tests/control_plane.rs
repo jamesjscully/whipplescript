@@ -63,6 +63,33 @@ fn checks_all_example_workflows() {
 
 /// DR-0023: prove an `action`-expanded effect chain actually executes at runtime,
 /// not just compiles. The inlined `tell -> after succeeds -> done + record` chain
+/// `whip agents <workflow>` (std.agent introspection, DR-0015 declared tier)
+/// lists each declared agent with its provider/profile/capacity and declared
+/// skills/capabilities/tools, read from the compiled IR.
+#[test]
+fn agents_command_lists_declared_agents() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let example = example_path("clock-source.whip");
+    let report = run_json(bin, &["--json", "agents", example.to_str().expect("utf-8")]);
+    let agents = report
+        .get("agents")
+        .and_then(Value::as_array)
+        .expect("agents array");
+    let triager = agents
+        .iter()
+        .find(|agent| agent.get("name").and_then(Value::as_str) == Some("triager"))
+        .expect("triager agent");
+    assert_eq!(
+        triager.get("provider").and_then(Value::as_str),
+        Some("owned")
+    );
+    assert_eq!(
+        triager.get("profile").and_then(Value::as_str),
+        Some("repo-writer")
+    );
+    assert_eq!(triager.get("capacity").and_then(Value::as_u64), Some(1));
+}
+
 /// (with a hygienic `turn__act0` binding) must run end to end under the fixture
 /// provider: the tell effect completes, the seeded `ChangeRequest` is consumed,
 /// and a `ReviewedChange` fact is recorded.
