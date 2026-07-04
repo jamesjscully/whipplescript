@@ -15972,7 +15972,11 @@ impl LoadedPackageLock {
                 continue;
             }
             let Some(manifest) = packages.get(library).copied() else {
-                missing.push(library.to_owned());
+                // A name the lock omits is still resolvable if it ships as an
+                // embedded std manifest (M5) — the binary is its own supply chain.
+                if !is_embedded_std_manifest(library) {
+                    missing.push(library.to_owned());
+                }
                 continue;
             };
             registry.merge(manifest.registry.clone());
@@ -15988,9 +15992,88 @@ impl LoadedPackageLock {
                     .join(", ")
             ));
         }
+        // The lock is authoritative for the names it supplies; embedded manifests
+        // fill in only the imported names it does not (no double-merge).
+        let locked_names = packages.keys().copied().collect::<BTreeSet<_>>();
+        merge_embedded_std_manifests(&mut registry, ir, &locked_names);
         validate_construct_uses(Some(self), ir, &registry)?;
         Ok(registry)
     }
+}
+
+/// Standard-library package manifests compiled into the binary (M5 "embedded
+/// manifest"). Each entry is `(import name, manifest JSON)`; the binary is its
+/// own supply chain, so a workflow that `use`s one of these names validates and
+/// runs with no `--package-lock` at all. An explicit lock for the same name
+/// still wins — the embedded copy is only a fallback. Add more std packages by
+/// appending `(name, include_str!(..))` pairs here.
+const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[(
+    "memory",
+    include_str!("../../../examples/packages/memory.json"),
+)];
+
+/// Whether `name` is shipped as an embedded std manifest.
+fn is_embedded_std_manifest(name: &str) -> bool {
+    EMBEDDED_STD_MANIFESTS
+        .iter()
+        .any(|(embedded, _)| *embedded == name)
+}
+
+/// Parse the embedded std manifests. Panics only if a manifest baked into the
+/// binary is invalid (a build-time bug, guarded by `embedded_std_manifests_parse`).
+fn embedded_std_manifests() -> Vec<PackageManifest> {
+    EMBEDDED_STD_MANIFESTS
+        .iter()
+        .map(|(name, json)| {
+            let label = PathBuf::from(format!("<embedded:{name}>"));
+            package_manifest_from_json(&label, (*json).to_owned()).unwrap_or_else(|error| {
+                panic!("embedded std manifest `{name}` failed to parse: {error}")
+            })
+        })
+        .collect()
+}
+
+/// A registry holding every embedded std manifest's contracts/constructs — used
+/// to authorize a construct use (e.g. `recall`) without a lock.
+fn embedded_std_registry() -> ContractRegistry {
+    let mut registry = ContractRegistry::default();
+    for manifest in embedded_std_manifests() {
+        registry.merge(manifest.registry);
+    }
+    registry
+}
+
+/// Merge embedded std manifests into `registry` for every imported name that is
+/// NOT already `provided` (e.g. by the lock). The lock wins: a provided name is
+/// skipped so its manifest is never double-merged with the embedded copy.
+fn merge_embedded_std_manifests(
+    registry: &mut ContractRegistry,
+    ir: &IrProgram,
+    provided: &BTreeSet<&str>,
+) {
+    let imported = ir
+        .uses
+        .iter()
+        .map(|use_decl| use_decl.name.as_str())
+        .collect::<BTreeSet<_>>();
+    for manifest in embedded_std_manifests() {
+        if imported.contains(manifest.name.as_str()) && !provided.contains(manifest.name.as_str()) {
+            registry.merge(manifest.registry);
+        }
+    }
+}
+
+/// Whether a construct use is authorized by an embedded std manifest whose owning
+/// package is actually imported. This is the no-lock exemption for embedded
+/// packages, mirroring the standard-library built-in exemption.
+fn construct_use_is_embedded_std(ir: &IrProgram, use_form: &IrConstructUse) -> bool {
+    let embedded_registry = embedded_std_registry();
+    let Some(form) = registry_construct_for_use(&embedded_registry, use_form) else {
+        return false;
+    };
+    ir.uses
+        .iter()
+        .any(|use_decl| use_decl.name == form.library_id)
 }
 
 fn contract_registry_for_ir(
@@ -16000,7 +16083,10 @@ fn contract_registry_for_ir(
     match package_lock {
         Some(lock) => lock.registry_for_ir(ir),
         None => {
-            let registry = ir.contract_registry();
+            let mut registry = ir.contract_registry();
+            // No lock at all: embedded std manifests still resolve their imported
+            // names (M5), so `use memory` + `recall` validates with no supply chain.
+            merge_embedded_std_manifests(&mut registry, ir, &BTreeSet::new());
             validate_construct_uses(None, ir, &registry)?;
             Ok(registry)
         }
@@ -16025,14 +16111,21 @@ fn validate_construct_uses(
         // recognized built-in registration, not a name, so a third-party package
         // cannot bypass the lock by claiming the std namespace. Modeled in
         // `models/maude/std-construct-authorization.maude`.
+        //
+        // EXCEPTION (M5 embedded manifest): a std package compiled into the binary
+        // (e.g. `memory`) is likewise its own supply chain, so an import of — or a
+        // construct owned by — an embedded manifest is exempt from the lock too.
         let mut blockers = BTreeSet::new();
         for use_decl in &ir.uses {
-            if !use_decl.name.starts_with("std.") {
-                blockers.insert(format!("import `{}`", use_decl.name));
+            if use_decl.name.starts_with("std.") || is_embedded_std_manifest(&use_decl.name) {
+                continue;
             }
+            blockers.insert(format!("import `{}`", use_decl.name));
         }
         for form in &uses {
-            if construct_use_is_standard_builtin(registry, form) {
+            if construct_use_is_standard_builtin(registry, form)
+                || construct_use_is_embedded_std(ir, form)
+            {
                 continue;
             }
             blockers.insert(format!("construct `{}`", form.keyword));
@@ -18954,10 +19047,23 @@ fn register_locked_packages(
     store: &SqliteStore,
     package_lock: Option<&LoadedPackageLock>,
 ) -> Result<(), StoreError> {
-    let Some(package_lock) = package_lock else {
-        return Ok(());
-    };
-    for manifest in &package_lock.manifests {
+    // Names the lock registers, so the embedded fallback below does not re-seed
+    // them. `register_package_manifest` is idempotent (every write is
+    // `ON CONFLICT DO UPDATE`), but skipping keeps the lock authoritative for any
+    // name it shares with an embedded manifest — the lock wins.
+    let mut registered = BTreeSet::new();
+    if let Some(package_lock) = package_lock {
+        for manifest in &package_lock.manifests {
+            store.register_package_manifest(&manifest.manifest_json)?;
+            registered.insert(manifest.name.clone());
+        }
+    }
+    // Seed embedded std manifests (M5) so their capabilities/providers/bindings
+    // (e.g. `memory.query`/`memory.write`) exist in the store with no lock at all.
+    for manifest in embedded_std_manifests() {
+        if registered.contains(&manifest.name) {
+            continue;
+        }
         store.register_package_manifest(&manifest.manifest_json)?;
     }
     Ok(())
@@ -38423,12 +38529,45 @@ rule start
 "#;
         let compiled = whipplescript_parser::compile_program(source);
         let ir = compiled.ir.expect("source compiles");
-        let no_lock_error =
-            contract_registry_for_ir(None, &ir).expect_err("construct use requires a package lock");
+        // `memory` now ships as an embedded std manifest (M5), so `use memory` +
+        // `recall` resolves with no lock at all — no supply chain required.
+        let embedded = contract_registry_for_ir(None, &ir)
+            .expect("embedded `memory` manifest resolves without a lock");
+        assert!(
+            embedded.constructs.iter().any(|form| {
+                form.keyword == "recall"
+                    && form.target_capability.as_deref() == Some("memory.query")
+            }),
+            "embedded resolution authorizes the `recall` construct"
+        );
+        // A genuinely-unlocked (non-embedded) import still trips the no-lock guard.
+        let unlocked_ir = whipplescript_parser::compile_program(
+            r#"
+workflow Unlocked
+
+use notebook
+
+class Task {
+  title string
+}
+
+rule start
+  when Task as task
+=> {
+  record Task {
+    title "keep"
+  }
+}
+"#,
+        )
+        .ir
+        .expect("unlocked source compiles");
+        let no_lock_error = contract_registry_for_ir(None, &unlocked_ir)
+            .expect_err("a non-embedded import requires a package lock");
         assert!(
             no_lock_error.contains("requires a package lock")
                 && no_lock_error.contains("whip package sync")
-                && no_lock_error.contains("construct `recall`"),
+                && no_lock_error.contains("import `notebook`"),
             "{no_lock_error}"
         );
         let registry = lock.registry_for_ir(&ir).expect("registry resolves");

@@ -36,11 +36,11 @@ fn checks_all_example_workflows() {
         "multi-agent-bounded-concurrency.whip",
         "messaging-demo.whip",
         "file-store-demo.whip",
-        // `openclaw-lite.whip` and `package-memory.whip` import the non-`std.`
-        // `memory` package, so they require a `whip.lock` and cannot be checked in
-        // this lock-free bundle. openclaw-lite's locked check + fixture dev run is
-        // covered by `dev_openclaw_lite_observes_heartbeat_and_files_work`;
-        // package-memory by `check_discovers_*` and `dev_capability_call_*`.
+        // `openclaw-lite.whip` and `package-memory.whip` import `memory`, which now
+        // ships as an embedded std manifest (M5) — so they check clean in this
+        // lock-free bundle, proving the embedded payoff for a real package.
+        "openclaw-lite.whip",
+        "package-memory.whip",
         "provider-language-e2e.whip",
     ];
     let paths = examples
@@ -6716,6 +6716,105 @@ fn memory_roundtrip_recalls_the_learned_item() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// M5 embedded-manifest payoff: the same `learn`/`recall` round-trip runs with NO
+/// `--package-lock` and no `whip.lock` anywhere. `memory` ships compiled into the
+/// binary, so `check` passes and `dev` executes the real file-backed provider —
+/// the recalled `MemoryContext` still carries the learned item. This is the proof
+/// that the embedded manifest removes the lock requirement for a real package.
+#[test]
+fn memory_roundtrip_without_a_lock_uses_the_embedded_manifest() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("memory-roundtrip-no-lock");
+    let store_path = dir.join("store.db");
+    let workflow_src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/memory-roundtrip.whip");
+    let workflow_path = dir.join("wf.whip");
+    fs::copy(&workflow_src, &workflow_path).expect("copy roundtrip example");
+
+    // `check` resolves `use memory` + the `recall`/`learn` constructs from the
+    // embedded manifest — no lock present, no `--package-lock` flag.
+    let checked = Command::new(bin)
+        .args(["check", workflow_path.to_str().expect("utf-8 workflow")])
+        .output()
+        .expect("check runs");
+    assert!(
+        checked.status.success(),
+        "check must pass with no lock via the embedded `memory` manifest\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    // `dev` runs with no `--package-lock`: the embedded manifest seeds the store's
+    // `memory.query`/`memory.write` providers + bindings, so the round-trip runs.
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store"),
+            "--json",
+            "dev",
+            workflow_path.to_str().expect("utf-8 workflow"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+
+    // The `learn` write settled successfully (memory.write capability).
+    assert!(
+        facts.iter().any(|fact| {
+            fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded")
+                && fact.pointer("/value/target").and_then(Value::as_str) == Some("memory.write")
+        }),
+        "learn should settle a memory.write success fact without a lock"
+    );
+
+    // The `recall` read back a real MemoryContext containing the learned item.
+    let context = facts
+        .iter()
+        .find(|fact| {
+            fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded")
+                && fact.pointer("/value/target").and_then(Value::as_str) == Some("memory.query")
+        })
+        .expect("recall should settle a memory.query success fact without a lock");
+    let memory = context
+        .pointer("/value/value")
+        .expect("recall context value");
+    assert_eq!(
+        memory.get("count").and_then(Value::as_u64),
+        Some(1),
+        "exactly the one learned item is recalled"
+    );
+    let items = memory
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("note").and_then(Value::as_str),
+        Some("remember alpha"),
+        "the recalled item carries the learned note"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Create a unique temp directory tagged with `label`.
 fn unique_temp_dir(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -10626,7 +10725,7 @@ fn check_rejects_sources_implying_different_locks() {
 }
 
 #[test]
-fn check_discovers_nearest_whip_lock_and_guards_when_absent() {
+fn check_resolves_embedded_memory_then_coexists_with_discovered_lock() {
     let bin = env!("CARGO_BIN_EXE_whip");
     // A project directory holding the workflow, its manifest copy, and the lock.
     let project_dir = {
@@ -10683,27 +10782,26 @@ rule recall_before_work
     )
     .expect("workflow writes");
 
-    // No `whip.lock` yet: a non-`std.` construct use must fail with the guard,
-    // even though no explicit `--package-lock` is given.
+    // No `whip.lock` at all: `memory` now ships as an embedded std manifest (M5),
+    // so `use memory` + `recall` resolves from the binary itself — check passes
+    // with no supply chain. (The no-lock guard for genuinely non-embedded packages
+    // is covered by `package_lock_supplies_package_import_registry`.)
     let absent = Command::new(bin)
         .current_dir(&project_dir)
         .args(["check", "wf.whip"])
         .output()
         .expect("check runs");
     assert!(
-        !absent.status.success(),
-        "check without a discoverable lock must fail the no-lock guard"
-    );
-    let absent_stderr = String::from_utf8_lossy(&absent.stderr);
-    assert!(
-        absent_stderr.contains("requires a package lock")
-            && absent_stderr.contains("whip package sync"),
-        "expected the no-lock guard diagnostic suggesting `whip package sync`, got:\n{absent_stderr}"
+        absent.status.success(),
+        "embedded `memory` manifest must let check pass with no lock\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&absent.stdout),
+        String::from_utf8_lossy(&absent.stderr)
     );
 
     // Place a portable `whip.lock` (with its manifest co-located) in the project
     // directory and re-run check WITHOUT `--package-lock`; discovery walks up from
-    // the cwd, finds the lock, and authorizes the `recall` construct.
+    // the cwd and finds the lock. The lock and the embedded manifest must coexist
+    // (the lock wins; no duplicate-registration conflict).
     let memory_manifest =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
     let manifest_copy = project_dir.join("memory.json");
