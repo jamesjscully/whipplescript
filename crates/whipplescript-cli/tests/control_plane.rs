@@ -635,6 +635,296 @@ rule record_line
     let _ = fs::remove_dir_all(root);
 }
 
+/// Spawns an in-process HTTP server on an ephemeral loopback port that answers
+/// every GET with `200 OK` and the given JSON body (mirrors `spawn_otel_collector`
+/// in soft_middle.rs, but serves rather than records, and loops so repeated
+/// worker-pass GETs all get the same feed). Returns the bound port; the server
+/// thread is detached and dies with the test process.
+fn spawn_json_feed_server(body: String) -> u16 {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind feed server");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            // Drain the request headers (a GET carries no body); we don't parse
+            // them — every request gets the same feed.
+            let mut scratch = [0u8; 2048];
+            let _ = stream.read(&mut scratch);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    port
+}
+
+/// An `http` ingress source (mirroring the `file` source) GETs a URL returning a
+/// JSON array and admits one durable signal fact per element, mapping the
+/// observation record `{ item, item_index, url }` onto the declared signal via
+/// the author's `emit` clause. This exercises the full vertical: parse the `url`
+/// clause -> lower an `is_http` source -> GET the endpoint on a worker pass ->
+/// admit one `ingress.ingested` signal per array element -> a rule reacts and
+/// records an `IngestedItem` fact. Admission is idempotent by (source, element
+/// ordinal): a second worker pass over the same (still-serving) feed re-admits
+/// nothing (append-only feed semantics). Also asserts a dead endpoint does NOT
+/// crash `dev`: a network error admits nothing rather than failing the worker.
+#[test]
+fn dev_http_source_admits_one_signal_per_array_element_idempotently() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+
+    // The feed returns a JSON array of two elements. `emit`'s `text obs.item`
+    // maps each element, re-stringified, onto the signal — so the admitted text
+    // is exactly the element's JSON serialization (mirrors the runtime).
+    let body = r#"["alpha","beta"]"#.to_owned();
+    let expected_texts: Vec<String> = serde_json::from_str::<Value>(&body)
+        .expect("valid feed json")
+        .as_array()
+        .expect("feed is an array")
+        .iter()
+        .map(|element| element.to_string())
+        .collect();
+    let port = spawn_json_feed_server(body);
+    let feed_url = format!("http://127.0.0.1:{port}/feed.json");
+
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("http-source");
+    fs::write(
+        &source_path,
+        format!(
+            r#"
+@service
+workflow IngressHttpSource
+
+signal ingress.ingested {{
+  text string
+  index int
+}}
+
+class IngestedItem {{
+  text string
+  index int
+}}
+
+source http as feed {{
+  url "{feed_url}"
+
+  observe as obs
+  emit ingress.ingested {{
+    text obs.item
+    index obs.item_index
+  }}
+}}
+
+rule record_item
+  when ingress.ingested as f
+=> {{
+  record IngestedItem {{
+    text f.text
+    index f.index
+  }}
+}}
+"#
+        ),
+    )
+    .expect("write source");
+
+    let store = store_path.to_str().expect("utf-8 store path");
+    let program = source_path.to_str().expect("utf-8 source path");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            program,
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // One `ingress.ingested` signal fact per array element, in feed order.
+    let ingested_texts = |instance: &str| -> Vec<String> {
+        let facts = run_json(bin, &["--store", store, "--json", "facts", instance]);
+        let mut rows: Vec<(i64, String)> = facts
+            .as_array()
+            .expect("facts array")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("ingress.ingested"))
+            .map(|fact| {
+                let index = fact
+                    .pointer("/value/index")
+                    .and_then(Value::as_i64)
+                    .expect("ingested fact carries an element index");
+                let text = fact
+                    .pointer("/value/text")
+                    .and_then(Value::as_str)
+                    .expect("ingested fact carries the element text")
+                    .to_owned();
+                (index, text)
+            })
+            .collect();
+        rows.sort_by_key(|(index, _)| *index);
+        rows.into_iter().map(|(_, text)| text).collect()
+    };
+
+    assert_eq!(
+        ingested_texts(&instance_id),
+        expected_texts,
+        "the http source admits one `ingress.ingested` signal per array element, in feed order"
+    );
+
+    // The rule reacted to each admitted signal (one `IngestedItem` per element).
+    let ingested_item_count = |instance: &str| -> usize {
+        let facts = run_json(bin, &["--store", store, "--json", "facts", instance]);
+        facts
+            .as_array()
+            .expect("facts array")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("IngestedItem"))
+            .count()
+    };
+    assert_eq!(
+        ingested_item_count(&instance_id),
+        2,
+        "each admitted signal drove the reacting rule to record an IngestedItem fact"
+    );
+
+    // Idempotency: a second worker pass over the *same* instance re-polls the
+    // *same* feed and re-admits nothing. Without the (source, element ordinal)
+    // cursor this re-attempt would hit the event log's UNIQUE(idempotency_key)
+    // constraint or double the facts; instead the count is unchanged.
+    let worker = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "worker",
+            &instance_id,
+            "--program",
+            program,
+            "--provider",
+            "fixture",
+        ],
+    );
+    assert_eq!(
+        worker.get("http_items_admitted").and_then(Value::as_u64),
+        Some(0),
+        "a re-poll of an unchanged feed admits no new elements: {worker}"
+    );
+    assert_eq!(
+        ingested_texts(&instance_id),
+        expected_texts,
+        "re-polling admits no duplicate signal facts (idempotent by element ordinal)"
+    );
+    assert_eq!(
+        ingested_item_count(&instance_id),
+        2,
+        "no duplicate IngestedItem facts after the idempotent re-poll"
+    );
+
+    // A network error is not a hard failure: a second workflow pointed at a dead
+    // port (nothing listening) must let `dev` complete with nothing admitted,
+    // never crash the worker.
+    let dead_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind for dead port");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener); // close it so the port refuses connections
+        port
+    };
+    let dead_store = temp_store_path();
+    let dead_source = temp_workflow_path("http-source-dead");
+    fs::write(
+        &dead_source,
+        format!(
+            r#"
+@service
+workflow IngressHttpDead
+
+signal ingress.ingested {{
+  text string
+}}
+
+class IngestedItem {{
+  text string
+}}
+
+source http as feed {{
+  url "http://127.0.0.1:{dead_port}/feed.json"
+
+  observe as obs
+  emit ingress.ingested {{
+    text obs.item
+  }}
+}}
+
+rule record_item
+  when ingress.ingested as f
+=> {{
+  record IngestedItem {{
+    text f.text
+  }}
+}}
+"#
+        ),
+    )
+    .expect("write dead source");
+
+    let dead_store_str = dead_store.to_str().expect("utf-8 dead store");
+    let dead_program = dead_source.to_str().expect("utf-8 dead source");
+    // `dev --until idle` completes (run_json asserts exit 0) despite the dead
+    // endpoint; nothing is admitted.
+    let dead_dev = run_json(
+        bin,
+        &[
+            "--store",
+            dead_store_str,
+            "--json",
+            "dev",
+            dead_program,
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let dead_instance = dead_dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("dead instance id");
+    let dead_facts = run_json(
+        bin,
+        &["--store", dead_store_str, "--json", "facts", dead_instance],
+    );
+    let dead_ingested = dead_facts
+        .as_array()
+        .expect("facts array")
+        .iter()
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("ingress.ingested"))
+        .count();
+    assert_eq!(
+        dead_ingested, 0,
+        "a dead endpoint admits nothing and does not crash `dev`"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_file(dead_store);
+    let _ = fs::remove_file(dead_source);
+}
+
 /// std.files `write` (spec/std-library/files.md): `write text to <store> at
 /// <path> { body <expr> mode <mode> }` renders a body to disk through the real
 /// worker, settling `file.write.completed`. The mode is enforced ("no silent

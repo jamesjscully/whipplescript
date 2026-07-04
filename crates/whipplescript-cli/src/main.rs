@@ -20675,6 +20675,7 @@ struct WorkerReport {
     deadlines_expired: usize,
     clock_occurrences_admitted: u64,
     file_lines_admitted: u64,
+    http_items_admitted: u64,
     inbound_messages_admitted: u64,
     cancellation_acknowledgements: usize,
     cancellation_diagnostics: usize,
@@ -20723,6 +20724,12 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
                 if ir.sources.iter().any(|source| source.is_file) {
                     report.file_lines_admitted +=
                         resolve_due_file_sources(store_path, &options.instance_id, &ir)?;
+                }
+                // Admit new elements from `http` sources (GET a JSON array). Only
+                // when the program declares one, so other workflows pay nothing.
+                if ir.sources.iter().any(|source| source.is_http) {
+                    report.http_items_admitted +=
+                        resolve_due_http_sources(store_path, &options.instance_id, &ir)?;
                 }
                 // Admit received messages from `local` channel inboxes
                 // (spec/messaging.md, RECEIVE side). Only when the program
@@ -21342,6 +21349,140 @@ fn resolve_due_file_sources(
                 Some(&idempotency_key(&[
                     instance_id,
                     "file-fact",
+                    &received.event_id,
+                ])),
+            )?;
+            admitted += 1;
+        }
+    }
+    Ok(admitted)
+}
+
+/// Admits durable signal facts from `http` sources: GET each source's `url`,
+/// parse the body as a JSON array, and for every element at ordinal `i`, admit
+/// one signal keyed by `item_id = H(source, i)` — append-only feed semantics, so
+/// re-polling the endpoint re-admits nothing already seen and a growing feed only
+/// adds its new tail.
+///
+/// Idempotency mirrors the `file` source exactly: the event log hard-errors on a
+/// duplicate idempotency key (no `ON CONFLICT`), so a per-signal admitted-count
+/// CURSOR (not the store) is what makes a re-poll idempotent. The cursor is the
+/// count of external events already admitted for this signal (each admitted
+/// element appends exactly one such event; `derive_fact` appends a `fact.derived`
+/// event, a different type, so it does not inflate the count). Non-empty ordinals
+/// are gap-free and admissions form a prefix `0..count`, so skipping `i < count`
+/// is exactly the already-admitted set.
+///
+/// The observation record `{ item, item_index, url }` (where `item` is the JSON
+/// element, re-stringified) is mapped onto the declared signal by the author's
+/// `emit` clause exactly as a file line is mapped by `resolve_due_file_sources`.
+/// A network error is NOT a hard failure: a flaky endpoint admits nothing this
+/// pass (logged/skipped) rather than crashing the worker.
+///
+/// v1 limitation: this polls on EVERY worker pass (no recurrence gate yet) and
+/// assumes an APPEND-ONLY feed (the cursor is keyed by cumulative array index, so
+/// an element inserted at the head or a shrinking feed would desync the cursor).
+/// A recurrence-gated cadence and content-keyed dedup are follow-ons.
+fn resolve_due_http_sources(
+    store_path: &Path,
+    instance_id: &str,
+    ir: &IrProgram,
+) -> Result<u64, StoreError> {
+    let mut admitted = 0u64;
+    for source in &ir.sources {
+        if !source.is_http {
+            continue;
+        }
+        let Some(url) = source.url.as_ref() else {
+            continue;
+        };
+        let already_admitted = {
+            let store = SqliteStore::open(store_path)?;
+            if store.get_instance(instance_id)?.is_none() {
+                continue;
+            }
+            store
+                .list_events(instance_id)?
+                .into_iter()
+                .filter(|event| {
+                    event.source == "external" && event.event_type == source.emit_signal
+                })
+                .count()
+        };
+        // GET the endpoint over the in-tree `ureq` client (mirrors the coerce and
+        // otel transports). A network/HTTP error is not a hard failure: admit
+        // nothing this pass so a flaky endpoint can't crash the worker.
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(5))
+            .user_agent("whipplescript-ingress")
+            .build();
+        let body = match agent.get(url).call() {
+            Ok(response) => match response.into_string() {
+                Ok(body) => body,
+                Err(error) => {
+                    eprintln!(
+                        "http source `{}`: reading {url} failed: {error}",
+                        source.name
+                    );
+                    continue;
+                }
+            },
+            Err(error) => {
+                eprintln!("http source `{}`: GET {url} failed: {error}", source.name);
+                continue;
+            }
+        };
+        // The body must be a JSON array; anything else admits nothing this pass.
+        let elements = match serde_json::from_str::<Value>(&body) {
+            Ok(Value::Array(elements)) => elements,
+            Ok(_) => {
+                eprintln!(
+                    "http source `{}`: {url} did not return a JSON array; skipping",
+                    source.name
+                );
+                continue;
+            }
+            Err(error) => {
+                eprintln!(
+                    "http source `{}`: {url} returned invalid JSON: {error}",
+                    source.name
+                );
+                continue;
+            }
+        };
+        for (index, element) in elements.into_iter().enumerate() {
+            if index < already_admitted {
+                continue;
+            }
+            let item_id = idempotency_key(&[&source.name, &index.to_string()]);
+            let mut observation = serde_json::Map::new();
+            // `item` carries the element re-stringified, so a source can emit the
+            // whole element as a string field (or, once field access lands, drill
+            // into it); `item_index`/`url` mirror `line_index`/`path`.
+            observation.insert("item".to_owned(), Value::String(element.to_string()));
+            observation.insert("item_index".to_owned(), json!(index));
+            observation.insert("url".to_owned(), Value::String(url.clone()));
+            let payload_json = clock_emit_payload(source, &observation).to_string();
+            let store = SqliteStore::open(store_path)?;
+            let mut kernel = RuntimeKernel::new(store);
+            // Record the item event, then derive its durable signal fact
+            // (mirroring `whip signal`), keyed by `item_id` so both steps stay
+            // idempotent under replay.
+            let received = kernel.ingest_external_event(
+                instance_id,
+                &source.emit_signal,
+                &payload_json,
+                Some(&item_id),
+            )?;
+            kernel.derive_fact(
+                instance_id,
+                &source.emit_signal,
+                &received.event_id,
+                &payload_json,
+                Some(&received.event_id),
+                Some(&idempotency_key(&[
+                    instance_id,
+                    "http-fact",
                     &received.event_id,
                 ])),
             )?;
@@ -25789,6 +25930,7 @@ fn dev(options: &CliOptions) -> ExitCode {
         let idle = step_report.committed_rules == 0
             && worker_report.ran_effects == 0
             && worker_report.file_lines_admitted == 0
+            && worker_report.http_items_admitted == 0
             && worker_report.inbound_messages_admitted == 0;
         steps.push(step_report);
         workers.push(worker_report);
@@ -26623,6 +26765,7 @@ fn acceptance_dev_report(
         let idle = step_report.committed_rules == 0
             && worker_report.ran_effects == 0
             && worker_report.file_lines_admitted == 0
+            && worker_report.http_items_admitted == 0
             && worker_report.inbound_messages_admitted == 0;
         steps.push(step_report);
         workers.push(worker_report);
@@ -29442,6 +29585,7 @@ fn worker_report_to_json(report: &WorkerReport) -> Value {
         "provider": report.provider,
         "ran_effects": report.ran_effects,
         "file_lines_admitted": report.file_lines_admitted,
+        "http_items_admitted": report.http_items_admitted,
         "inbound_messages_admitted": report.inbound_messages_admitted,
         "cancellation_acknowledgements": report.cancellation_acknowledgements,
         "cancellation_diagnostics": report.cancellation_diagnostics,

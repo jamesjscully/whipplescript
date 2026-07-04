@@ -461,6 +461,10 @@ pub struct SourceDecl {
     /// The file is read line-by-line; each non-empty line is admitted once as a
     /// durable signal fact (spec/std-time.md admission semantics, append-only).
     pub path: Option<StringLiteral>,
+    /// `url "<url>"` — required for the `http` provider, rejected elsewhere. The
+    /// URL is GET'd and its JSON-array body admitted one element per signal,
+    /// keyed by (source, element index) so re-polls are idempotent (append-only).
+    pub url: Option<StringLiteral>,
     /// `observe as <binding>` — binds the provider observation schema.
     pub observe_binding: Ident,
     /// `emit <signal> { <field> <value> ... }` — maps the observation into the
@@ -1047,11 +1051,17 @@ pub struct IrSource {
     /// The `file` provider: reads `path` line-by-line and admits one signal per
     /// non-empty line, keyed by (source, line index) so re-reads are idempotent.
     pub is_file: bool,
+    /// The `http` provider: GETs `url`, parses a JSON array, and admits one
+    /// signal per element, keyed by (source, element index) so re-polls are
+    /// idempotent.
+    pub is_http: bool,
     pub recurrence: Option<Recurrence>,
     pub timezone: Option<String>,
     pub missed: Option<MissedPolicy>,
     /// `path "<file>"` — the file read by a `file` source (`None` otherwise).
     pub path: Option<String>,
+    /// `url "<url>"` — the endpoint GET'd by an `http` source (`None` otherwise).
+    pub url: Option<String>,
     pub observe_binding: String,
     pub emit_signal: String,
     pub emit_fields: Vec<IrSourceEmitField>,
@@ -6552,9 +6562,41 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
             });
         }
     }
+    // HTTP-source static checks: an `http` source GETs a declared url, and the
+    // `url` clause is meaningful only for `http` (rejecting it elsewhere keeps
+    // provider intent unambiguous, mirroring the file-only-clause rejection).
+    let is_http = source.provider.name == "http";
+    if is_http && source.url.is_none() {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: source.span,
+            message: format!(
+                "`http` source `{}` requires a `url` clause",
+                source.name.name
+            ),
+            suggestion: Some("add `url \"https://example.com/feed.json\"`".to_owned()),
+        });
+    }
+    if !is_http {
+        if let Some(url) = &source.url {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: url.span,
+                message: format!(
+                    "source `{}` declares a `url` clause but its provider is `{}`, not `http`",
+                    source.name.name, source.provider.name
+                ),
+                suggestion: Some(
+                    "use `source http as ...` for a `url`, or remove the clause".to_owned(),
+                ),
+            });
+        }
+    }
     let is_clock = source.clock.is_some();
     let is_file = source.provider.name == "file";
+    let is_http = source.provider.name == "http";
     let path = source.path.as_ref().map(|literal| literal.value.clone());
+    let url = source.url.as_ref().map(|literal| literal.value.clone());
     let recurrence = source.clock.as_ref().map(|clock| clock.recurrence.clone());
     let timezone = source
         .clock
@@ -6566,10 +6608,12 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
         provider: source.provider.name,
         is_clock,
         is_file,
+        is_http,
         recurrence,
         timezone,
         missed,
         path,
+        url,
         observe_binding: source.observe_binding.name,
         emit_signal: source.emit.signal,
         emit_fields: source
@@ -16641,6 +16685,9 @@ fn format_source(source: SourceDecl, formatted: &mut String) {
     if let Some(path) = &source.path {
         push_line(formatted, format!("  path {:?}", path.value));
     }
+    if let Some(url) = &source.url {
+        push_line(formatted, format!("  url {:?}", url.value));
+    }
     push_line(
         formatted,
         format!("  observe as {}", source.observe_binding.name),
@@ -19016,6 +19063,7 @@ impl Parser<'_> {
         let mut timezone: Option<StringLiteral> = None;
         let mut missed: Option<MissedPolicy> = None;
         let mut path: Option<StringLiteral> = None;
+        let mut url: Option<StringLiteral> = None;
         let mut observe_binding: Option<Ident> = None;
         let mut emit: Option<SourceEmit> = None;
 
@@ -19032,6 +19080,9 @@ impl Parser<'_> {
             } else if self.at_ident("path") {
                 self.advance();
                 path = self.expect_string("path string");
+            } else if self.at_ident("url") {
+                self.advance();
+                url = self.expect_string("url string");
             } else if self.at_ident("missed") {
                 missed = self.parse_missed_policy();
             } else if self.at_ident("observe") {
@@ -19044,7 +19095,7 @@ impl Parser<'_> {
                 emit = self.parse_source_emit();
             } else {
                 self.unexpected(
-                    "a source clause (`every`/`at`, `timezone`, `path`, `missed`, `observe`, `emit`)",
+                    "a source clause (`every`/`at`, `timezone`, `path`, `url`, `missed`, `observe`, `emit`)",
                 );
                 self.synchronize_to_block_item();
             }
@@ -19127,6 +19178,7 @@ impl Parser<'_> {
             provider,
             clock,
             path,
+            url,
             observe_binding,
             emit,
             span,
