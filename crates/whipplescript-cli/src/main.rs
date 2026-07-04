@@ -20396,6 +20396,7 @@ struct WorkerReport {
 }
 
 fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerReport, StoreError> {
+    guard_no_stale_effect_kinds(store_path)?;
     let mut report = WorkerReport {
         instance_id: options.instance_id.clone(),
         provider: options.provider.clone(),
@@ -20498,6 +20499,43 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
         report.terminal_events.push(terminal.event_id);
     }
     Ok(report)
+}
+
+/// Effect-kind strings retired by a one-way rename (M4). A store written before
+/// the rename can still hold a pending effect carrying the old string, which no
+/// dispatcher arm matches — so `run_claimable_effect` returns `None` for it
+/// forever and the worker spins without progress. Append the old string here in
+/// the same slice that performs each rename; the guard turns the silent hang
+/// into an actionable error. (A denylist, not an allowlist: not every live
+/// runtime kind has an `IrEffectKind` variant — e.g. `lease.release` — so an
+/// allowlist would false-positive on legitimate effects.)
+const RETIRED_EFFECT_KINDS: &[&str] = &[
+    "event.notify", // S1 → signal.emit
+];
+
+fn is_retired_effect_kind(kind: &str) -> bool {
+    RETIRED_EFFECT_KINDS.contains(&kind)
+}
+
+/// Fail loudly if the store holds a pending effect whose kind was retired by a
+/// rename (see [`RETIRED_EFFECT_KINDS`]). Cheap: one indexed DISTINCT query.
+fn guard_no_stale_effect_kinds(store_path: &Path) -> Result<(), StoreError> {
+    let store = SqliteStore::open(store_path)?;
+    let stale: Vec<String> = store
+        .pending_effect_kinds()?
+        .into_iter()
+        .filter(|kind| is_retired_effect_kind(kind))
+        .collect();
+    if !stale.is_empty() {
+        return Err(StoreError::Conflict(format!(
+            "store `{}` holds pending effects of retired kind(s) [{}] — this store \
+             predates an effect-kind rename; re-initialize it (remove the \
+             `.whipplescript` store directory) or migrate it before running",
+            store_path.display(),
+            stale.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// Execute one claimable effect, dispatching on its kind. Returns `None` for a
@@ -35571,6 +35609,19 @@ mod tests {
     use whipplescript_store::{NewEffect, RuleCommit};
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn retired_effect_kinds_are_flagged_but_current_kinds_are_not() {
+        // The S1 rename retired event.notify -> signal.emit; a store still holding
+        // an event.notify effect must be flagged, while every current kind
+        // (including runtime kinds with no IrEffectKind variant, e.g. lease.release)
+        // must pass.
+        assert!(is_retired_effect_kind("event.notify"));
+        assert!(!is_retired_effect_kind("signal.emit"));
+        assert!(!is_retired_effect_kind("lease.release"));
+        assert!(!is_retired_effect_kind("coerce"));
+        assert!(!is_retired_effect_kind("queue.claim"));
+    }
 
     #[test]
     fn lint_flags_tool_grant_on_non_owned_agent_only() {

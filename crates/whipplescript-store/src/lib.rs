@@ -2435,6 +2435,22 @@ impl SqliteStore {
         Ok(event)
     }
 
+    /// Distinct kinds of effects still awaiting resolution (any non-terminal
+    /// status). Used by the store-open guard to detect effects left behind by a
+    /// kind rename (M4): after a one-way rename a persisted effect keeps its old
+    /// kind string, which no dispatcher matches, so it would loop forever. The
+    /// guard turns that silent hang into a loud, actionable error.
+    pub fn pending_effect_kinds(&self) -> StoreResult<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT kind FROM effects \
+             WHERE status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')",
+        )?;
+        let kinds = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(kinds)
+    }
+
     pub fn claimable_effects(&self, instance_id: &str) -> StoreResult<Vec<ClaimableEffect>> {
         if let Some(status) = instance_status_on(&self.connection, instance_id)? {
             if status != "running" {
@@ -9861,6 +9877,48 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(row_count(&store, "events"), 0);
         assert_eq!(row_count(&store, "effects"), 0);
+    }
+
+    #[test]
+    fn pending_effect_kinds_lists_nonterminal_and_excludes_settled() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[
+                    test_effect("t", "agent.tell", "rule=start;effect=t"),
+                    test_effect("s", "signal.emit", "rule=start;effect=s"),
+                ],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("rule commit succeeds");
+
+        // Both queued effects are reported.
+        let mut kinds = store.pending_effect_kinds().expect("pending kinds");
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            vec!["agent.tell".to_owned(), "signal.emit".to_owned()]
+        );
+
+        // Settle one; a terminal effect drops out of the pending set.
+        store
+            .connection
+            .execute(
+                "UPDATE effects SET status = 'completed' WHERE effect_id = 't'",
+                [],
+            )
+            .expect("settle effect");
+        assert_eq!(
+            store.pending_effect_kinds().expect("pending kinds"),
+            vec!["signal.emit".to_owned()]
+        );
     }
 
     #[test]
