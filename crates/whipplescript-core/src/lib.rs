@@ -554,7 +554,8 @@ pub const PLATFORM_CONSTRUCT_CATALOG: PlatformConstructCatalog = PlatformConstru
     reserved_keywords: &[
         "agent", "ask", "call", "cancel", "case", "claim", "class", "coerce", "complete",
         "counter", "decide", "effect", "else", "emit", "enum", "event", "fail", "flow", "from",
-        "harness", "if", "ledger", "lease", "let", "match", "queue", "release", "renew", "rule",
+        "harness", "if", "ledger", "lease", "let", "match", "release", "renew", "rule",
+        "tracker",
         "signal", "tell", "then", "use", "when", "workflow",
     ],
     reserved_keyword_privileges: &[

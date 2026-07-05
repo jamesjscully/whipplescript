@@ -6512,11 +6512,11 @@ fn policy_block_on(
         return Ok(Some(block));
     }
 
-    // Timers, builtin-queue verbs, and coordination verbs
+    // Timers, builtin-tracker verbs, and coordination verbs
     // (spec/coordination.md) are resolved by the runtime itself on worker
     // passes: no provider, capability, or profile applies.
     if effect.kind == "timer.wait"
-        || effect.kind.starts_with("queue.")
+        || effect.kind.starts_with("tracker.")
         || effect.kind.starts_with("lease.")
         || effect.kind.starts_with("ledger.")
         || effect.kind.starts_with("counter.")

@@ -206,7 +206,7 @@ pub fn ready_contexts(
                 .iter()
                 .filter(|fact| fact.name == schema || fact.name == normalize_pattern_name(schema))
                 .filter(|fact| pattern_agent_matches(ir, schema, fact))
-                .filter(|fact| pattern_queue_matches(schema, fact))
+                .filter(|fact| pattern_tracker_matches(schema, fact))
                 .cloned()
                 .collect::<Vec<_>>();
             if matching.is_empty() {
@@ -250,7 +250,7 @@ pub fn ready_contexts(
             let satisfied = facts.iter().any(|fact| {
                 fact.name == normalized
                     && pattern_agent_matches(ir, pattern, fact)
-                    && pattern_queue_matches(pattern, fact)
+                    && pattern_tracker_matches(pattern, fact)
             });
             if !satisfied {
                 return ReadyContexts::empty(guard_reports);
@@ -265,23 +265,23 @@ pub fn ready_contexts(
     }
 }
 
-/// For `<queue> has ready item` patterns, only the named queue's projected
-/// items match.
-pub fn pattern_queue_matches(pattern: &str, fact: &FactView) -> bool {
+/// For `<tracker> has ready issue` patterns, only the named tracker's projected
+/// issues match.
+pub fn pattern_tracker_matches(pattern: &str, fact: &FactView) -> bool {
     let mut words = pattern.split_whitespace();
-    let Some(queue) = words.next() else {
+    let Some(tracker) = words.next() else {
         return true;
     };
     if !(words.next() == Some("has")
         && words.next() == Some("ready")
-        && words.next() == Some("item"))
+        && words.next() == Some("issue"))
     {
         return true;
     }
     json_from_str(&fact.value_json)
         .get("queue")
         .and_then(Value::as_str)
-        .is_none_or(|fact_queue| fact_queue == queue)
+        .is_none_or(|fact_queue| fact_queue == tracker)
 }
 
 /// For `<agent> completed turn` patterns where the leading word names a
@@ -477,7 +477,7 @@ pub fn empty_ir_program() -> IrProgram {
         workflow_contracts: Vec::new(),
         uses: Vec::new(),
         harnesses: Vec::new(),
-        queues: Vec::new(),
+        trackers: Vec::new(),
         channels: Vec::new(),
         file_stores: Vec::new(),
         memory_pools: Vec::new(),
@@ -2151,7 +2151,7 @@ pub fn rewrite_lease_releases(effects: &mut [ParsedEffect], rule_body: &str) {
         })
         .collect::<std::collections::BTreeSet<_>>();
     for effect in effects {
-        if effect.kind == "queue.release"
+        if effect.kind == "tracker.release"
             && effect
                 .args
                 .first()
@@ -2499,7 +2499,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
             let (statement, next_index) =
                 parse_statement_until_balanced_braces(&lines, index, trimmed);
             let queue = rest
-                .strip_prefix("item into ")
+                .strip_prefix("issue into ")
                 .and_then(|tail| tail.split_whitespace().next())
                 .unwrap_or_default()
                 .trim_end_matches('{')
@@ -2507,7 +2507,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
             let body = invoke_body(&statement).unwrap_or_default();
             effects.push(ParsedEffect {
                 timeout_seconds: parse_timeout_clause_seconds(trimmed),
-                kind: "queue.file".to_owned(),
+                kind: "tracker.file".to_owned(),
                 target: Some(queue),
                 name: None,
                 binding: binding_after_as(&statement),
@@ -2528,7 +2528,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 .to_owned();
             effects.push(ParsedEffect {
                 timeout_seconds: parse_timeout_clause_seconds(trimmed),
-                kind: "queue.claim".to_owned(),
+                kind: "tracker.claim".to_owned(),
                 target: None,
                 name: None,
                 binding: binding_after_as(trimmed),
@@ -2546,7 +2546,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 .to_owned();
             effects.push(ParsedEffect {
                 timeout_seconds: None,
-                kind: "queue.release".to_owned(),
+                kind: "tracker.release".to_owned(),
                 target: None,
                 name: None,
                 binding: binding_after_as(trimmed),
@@ -2602,7 +2602,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
             let body = invoke_body(&statement).unwrap_or_default();
             effects.push(ParsedEffect {
                 timeout_seconds: None,
-                kind: "queue.finish".to_owned(),
+                kind: "tracker.finish".to_owned(),
                 target: None,
                 name: None,
                 binding: binding_after_as(&statement),
@@ -3526,7 +3526,7 @@ pub fn parsed_effect_input_json(
                 "rule": rule.name,
             })
         }
-        "queue.file" => {
+        "tracker.file" => {
             let fields = parse_record_fields(
                 effect.args.first().map(String::as_str).unwrap_or_default(),
                 context,
@@ -3539,7 +3539,7 @@ pub fn parsed_effect_input_json(
                 "rule": rule.name,
             })
         }
-        "queue.claim" | "queue.release" | "queue.finish" => {
+        "tracker.claim" | "tracker.release" | "tracker.finish" => {
             let binding = effect.args.first().map(String::as_str).unwrap_or_default();
             let item = parse_field_value(binding, context);
             let mut input = json!({
@@ -3547,7 +3547,7 @@ pub fn parsed_effect_input_json(
                 "id": item.get("id").cloned().unwrap_or(Value::Null),
                 "rule": rule.name,
             });
-            if effect.kind == "queue.finish" {
+            if effect.kind == "tracker.finish" {
                 let fields = parse_record_fields(
                     effect.args.get(1).map(String::as_str).unwrap_or_default(),
                     context,

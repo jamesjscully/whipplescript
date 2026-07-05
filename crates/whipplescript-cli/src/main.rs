@@ -1179,7 +1179,7 @@ fn lint_unused_coerce_results(ir: &IrProgram) -> Vec<LintFinding> {
 /// in-program-only declaration (coordination resource / queue / file store) is
 /// referenced only by a rule operation that names it — in a body (`acquire`,
 /// `append … to`, `consume`, `file … into`, `import … from`, `export … to`) or a
-/// `when` clause (`when <queue> has ready item`). A name absent from this set is
+/// `when` clause (`when <queue> has ready issue`). A name absent from this set is
 /// therefore unreferenced. Whole-token (not substring) matching avoids spurious
 /// matches; treating any appearance as a use keeps the analysis conservative (it
 /// can only under-report, never wrongly flag).
@@ -1246,16 +1246,16 @@ fn lint_unused_resources(ir: &IrProgram) -> Vec<LintFinding> {
             });
         }
     }
-    for queue in &ir.queues {
-        if !tokens.contains(queue.name.as_str()) {
+    for tracker in &ir.trackers {
+        if !tokens.contains(tracker.name.as_str()) {
             findings.push(LintFinding {
-                code: "lint.unused_queue",
+                code: "lint.unused_tracker",
                 severity: Severity::Warning,
                 message: format!(
-                    "queue `{}` is declared but never filed into or claimed",
-                    queue.name
+                    "tracker `{}` is declared but never filed into or claimed",
+                    tracker.name
                 ),
-                name: Some(queue.name.clone()),
+                name: Some(tracker.name.clone()),
                 span: None,
             });
         }
@@ -2162,7 +2162,7 @@ fn lsp_completion_kind(kind: &str) -> i32 {
 /// typed prefix; context-aware filtering is future work.
 const LSP_KEYWORDS: &[&str] = &[
     "workflow", "class", "enum", "agent", "rule", "coerce", "flow", "action", "signal", "source",
-    "table", "queue", "channel", "lease", "ledger", "counter", "output", "failure", "input",
+    "table", "tracker", "channel", "lease", "ledger", "counter", "output", "failure", "input",
     "when", "record", "done", "tell", "decide", "askHuman", "exec", "call", "invoke", "with",
     "access", "to", "read", "write", "import", "export", "recall", "learn", "emit", "after",
     "case", "complete", "fail", "timer", "cancel", "claim", "release", "finish", "file", "acquire",
@@ -11398,7 +11398,7 @@ fn execute_scenario(
     let store_path = scenario_store_path(&test.name);
     // Isolate the workspace-scoped builtin tracker per scenario so `given tracker`
     // seeding (and any queue effects) never touch the developer's real items
-    // store; the projection (`project_queue_items` in `step_instance`) reads the
+    // store; the projection (`project_tracker_issues` in `step_instance`) reads the
     // same path via this env var.
     let items_store_path = store_path.with_extension("items.sqlite");
     env::set_var("WHIPPLESCRIPT_ITEMS_STORE", &items_store_path);
@@ -11602,8 +11602,8 @@ fn execute_scenario(
             }
             // `given tracker <name> issue { … }` seeds an existing issue into the
             // builtin tracker (the isolated per-scenario items store). The
-            // workflow's queue projection (`step_instance` → `project_queue_items`)
-            // then surfaces it as a `queue.item.ready` fact, exactly as a real
+            // workflow's queue projection (`step_instance` → `project_tracker_issues`)
+            // then surfaces it as a `tracker.issue.ready` fact, exactly as a real
             // pre-existing issue would — going through the real projection path,
             // not a hand-seeded fact.
             TestClause::Given(GivenClause::Tracker {
@@ -20460,7 +20460,7 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
                 &PackageLockCapabilityContract(package_lock),
                 &FixtureCapabilityProvider,
             )?,
-            "queue.file" | "queue.claim" | "queue.release" | "queue.finish" => {
+            "tracker.file" | "tracker.claim" | "tracker.release" | "tracker.finish" => {
                 run_queue_effect_generic(kernel, id, effect, &config)?
             }
             "lease.acquire" | "lease.release" | "lease.renew" | "ledger.append"
@@ -20894,7 +20894,11 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
 /// runtime kind has an `IrEffectKind` variant — e.g. `lease.release` — so an
 /// allowlist would false-positive on legitimate effects.)
 const RETIRED_EFFECT_KINDS: &[&str] = &[
-    "event.notify", // S1 → signal.emit
+    "event.notify",  // S1 → signal.emit
+    "queue.file",    // S3 → tracker.file
+    "queue.claim",   // S3 → tracker.claim
+    "queue.release", // S3 → tracker.release
+    "queue.finish",  // S3 → tracker.finish
 ];
 
 fn is_retired_effect_kind(kind: &str) -> bool {
@@ -20942,7 +20946,7 @@ fn run_claimable_effect(
         }
         "event.emit" => run_event_effect(store_path, instance_id, effect, options),
         "workflow.invoke" => run_workflow_invoke_effect(store_path, instance_id, effect, options),
-        "queue.file" | "queue.claim" | "queue.release" | "queue.finish" => {
+        "tracker.file" | "tracker.claim" | "tracker.release" | "tracker.finish" => {
             run_queue_effect(store_path, instance_id, effect, options)
         }
         "exec.command" => run_exec_effect(
@@ -37050,10 +37054,14 @@ mod tests {
         // (including runtime kinds with no IrEffectKind variant, e.g. lease.release)
         // must pass.
         assert!(is_retired_effect_kind("event.notify"));
+        assert!(is_retired_effect_kind("queue.file"));
+        assert!(is_retired_effect_kind("queue.claim"));
+        assert!(is_retired_effect_kind("queue.release"));
+        assert!(is_retired_effect_kind("queue.finish"));
         assert!(!is_retired_effect_kind("signal.emit"));
         assert!(!is_retired_effect_kind("lease.release"));
         assert!(!is_retired_effect_kind("coerce"));
-        assert!(!is_retired_effect_kind("queue.claim"));
+        assert!(!is_retired_effect_kind("tracker.claim"));
     }
 
     #[test]
@@ -44624,7 +44632,7 @@ invoke Child { item ticket.title } as child
 timer 5m as wait
 timer until ticket.due_at as deadline
 exec "echo hi" as run
-file item into backlog { title ticket.title body "body" } as filed
+file issue into backlog { title ticket.title body "body" } as filed
 claim item as lease
 release item
 finish item { summary ticket.title }
@@ -44652,10 +44660,10 @@ export json Row to docs at "rows.json" { mode create } as exported
             ("timer.wait", Some("wait")),
             ("timer.wait", Some("deadline")),
             ("exec.command", Some("run")),
-            ("queue.file", Some("filed")),
-            ("queue.claim", Some("lease")),
-            ("queue.release", None),
-            ("queue.finish", None),
+            ("tracker.file", Some("filed")),
+            ("tracker.claim", Some("lease")),
+            ("tracker.release", None),
+            ("tracker.finish", None),
             ("lease.acquire", Some("slot")),
             ("ledger.append", Some("entry")),
             ("counter.consume", Some("spend")),
@@ -45518,8 +45526,8 @@ rule start
         let source = r#"
 workflow QueueReadyAlias
 
-queue backlog {
-  tracker builtin
+tracker backlog {
+  provider builtin
 }
 
 agent worker {
@@ -45529,7 +45537,7 @@ agent worker {
 }
 
 rule claim_ready
-  when backlog has ready item as item
+  when backlog has ready issue as item
   when worker is available
 => {
   claim item as lease
@@ -45542,7 +45550,7 @@ rule claim_ready
             fact_id: "fact-queue-item".to_owned(),
             program_version_id: None,
             revision_epoch: 0,
-            name: "queue.item.ready".to_owned(),
+            name: "tracker.issue.ready".to_owned(),
             key: "backlog:WS-1:gen".to_owned(),
             value_json: r#"{"queue":"backlog","id":"WS-1","title":"Ready item","body":"Do work"}"#
                 .to_owned(),
@@ -45553,7 +45561,7 @@ rule claim_ready
             fact_id: "fact-other-item".to_owned(),
             program_version_id: None,
             revision_epoch: 0,
-            name: "queue.item.ready".to_owned(),
+            name: "tracker.issue.ready".to_owned(),
             key: "other:WS-2:gen".to_owned(),
             value_json: r#"{"queue":"other","id":"WS-2","title":"Other","body":""}"#.to_owned(),
             provenance_class: "queue".to_owned(),

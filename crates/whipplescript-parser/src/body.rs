@@ -263,19 +263,19 @@ pub enum BodyEffectKind {
         /// stdout at the effect-result boundary (spec/json-ingestion.md).
         parse_target: Option<ExecParse>,
     },
-    /// Work-queue verbs (`file item into q { ... }`, `claim x`, `release x`,
+    /// Work-queue verbs (`file issue into q { ... }`, `claim x`, `release x`,
     /// `finish x [{ ... }]`).
-    QueueFile {
+    TrackerFile {
         queue: String,
         fields: Vec<FieldAssign>,
     },
-    QueueClaim {
+    TrackerClaim {
         item: String,
     },
-    QueueRelease {
+    TrackerRelease {
         item: String,
     },
-    QueueFinish {
+    TrackerFinish {
         item: String,
         fields: Vec<FieldAssign>,
     },
@@ -1252,10 +1252,10 @@ impl<'a> BodyParser<'a> {
             "timer" => self.parse_timer(),
             "cancel" => self.parse_cancel(),
             "exec" => self.parse_exec(),
-            "file" => self.parse_queue_file(),
-            "claim" => self.parse_queue_claim(),
-            "release" => self.parse_queue_release(),
-            "finish" => self.parse_queue_finish(),
+            "file" => self.parse_tracker_file(),
+            "claim" => self.parse_tracker_claim(),
+            "release" => self.parse_tracker_release(),
+            "finish" => self.parse_tracker_finish(),
             "acquire" => self.parse_lease_acquire(),
             "renew" => self.parse_lease_renew(),
             "append" => self.parse_ledger_append(),
@@ -3273,26 +3273,26 @@ impl<'a> BodyParser<'a> {
         }))
     }
 
-    // -- queue verbs ---------------------------------------------------------
+    // -- tracker verbs ---------------------------------------------------------
 
-    fn parse_queue_file(&mut self) -> Option<BodyStmt> {
+    fn parse_tracker_file(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
         self.pos += 1; // file
-        if !self.consume_ident("item") {
+        if !self.consume_ident("issue") {
             let span = self.span_here();
             self.error(
                 span,
-                "expected `item` after `file`",
-                Some("write `file item into <queue> { ... }`".to_owned()),
+                "expected `issue` after `file`",
+                Some("write `file issue into <tracker> { ... }`".to_owned()),
             );
             return None;
         }
         if !self.consume_ident("into") {
             let span = self.span_here();
-            self.error(span, "expected `into <queue>` after `file item`", None);
+            self.error(span, "expected `into <tracker>` after `file issue`", None);
             return None;
         }
-        let queue = self.ident_text("queue name")?;
+        let queue = self.ident_text("tracker name")?;
         let fields = self.parse_field_block(false)?;
         let mut binding = None;
         let mut requires = Vec::new();
@@ -3301,7 +3301,7 @@ impl<'a> BodyParser<'a> {
             return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::QueueFile { queue, fields },
+            kind: BodyEffectKind::TrackerFile { queue, fields },
             binding,
             requires,
             timeout_seconds,
@@ -3310,16 +3310,16 @@ impl<'a> BodyParser<'a> {
         }))
     }
 
-    fn parse_queue_claim(&mut self) -> Option<BodyStmt> {
+    fn parse_tracker_claim(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
         self.pos += 1; // claim
-        let item = self.ident_text("item binding after `claim`")?;
+        let item = self.ident_text("issue binding after `claim`")?;
         if self.at_ident("with") {
             let span = self.span_here();
             self.error(
                 span,
-                "`claim <item> with ...` is not supported".to_owned(),
-                Some("declare a `queue` and write `claim <item> [as x]`".to_owned()),
+                "`claim <issue> with ...` is not supported".to_owned(),
+                Some("declare a `tracker` and write `claim <issue> [as x]`".to_owned()),
             );
             self.pos += 1;
             let _ = self.advance();
@@ -3331,7 +3331,7 @@ impl<'a> BodyParser<'a> {
             return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::QueueClaim { item },
+            kind: BodyEffectKind::TrackerClaim { item },
             binding,
             requires,
             timeout_seconds,
@@ -3340,12 +3340,12 @@ impl<'a> BodyParser<'a> {
         }))
     }
 
-    fn parse_queue_release(&mut self) -> Option<BodyStmt> {
+    fn parse_tracker_release(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
         self.pos += 1; // release
-        let item = self.ident_text("item binding after `release`")?;
+        let item = self.ident_text("issue binding after `release`")?;
         Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::QueueRelease { item },
+            kind: BodyEffectKind::TrackerRelease { item },
             binding: None,
             requires: Vec::new(),
             timeout_seconds: None,
@@ -3354,17 +3354,17 @@ impl<'a> BodyParser<'a> {
         }))
     }
 
-    fn parse_queue_finish(&mut self) -> Option<BodyStmt> {
+    fn parse_tracker_finish(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
         self.pos += 1; // finish
-        let item = self.ident_text("item binding after `finish`")?;
+        let item = self.ident_text("issue binding after `finish`")?;
         let fields = if self.at_sym('{') {
             self.parse_field_block(false)?
         } else {
             Vec::new()
         };
         Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::QueueFinish { item, fields },
+            kind: BodyEffectKind::TrackerFinish { item, fields },
             binding: None,
             requires: Vec::new(),
             timeout_seconds: None,
@@ -4014,18 +4014,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_queue_verbs() {
+    fn parses_tracker_verbs() {
         let ast = parse_ok(
-            "file item into backlog {\n  title \"Fix login\"\n  body \"Repro...\"\n}\n\nclaim item as lease\nrelease item\nfinish item {\n  summary turn.summary\n}",
+            "file issue into backlog {\n  title \"Fix login\"\n  body \"Repro...\"\n}\n\nclaim item as lease\nrelease item\nfinish item {\n  summary turn.summary\n}",
         );
         assert_eq!(ast.statements.len(), 4);
         assert!(matches!(
             &ast.statements[0],
-            BodyStmt::Effect(EffectStmt { kind: BodyEffectKind::QueueFile { queue, .. }, .. }) if queue == "backlog"
+            BodyStmt::Effect(EffectStmt { kind: BodyEffectKind::TrackerFile { queue, .. }, .. }) if queue == "backlog"
         ));
         assert!(matches!(
             &ast.statements[1],
-            BodyStmt::Effect(EffectStmt { kind: BodyEffectKind::QueueClaim { .. }, binding: Some(b), .. }) if b == "lease"
+            BodyStmt::Effect(EffectStmt { kind: BodyEffectKind::TrackerClaim { .. }, binding: Some(b), .. }) if b == "lease"
         ));
     }
 

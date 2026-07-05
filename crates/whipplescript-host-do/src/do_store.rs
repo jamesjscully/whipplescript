@@ -6301,7 +6301,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
 //
 // The builtin work-item tracker (`spec/work-queues.md`) ported to the DO's one
 // SQLite, so the DO backs the `WorkItems` surface the rule pass reaches
-// (`project_queue_items` / holder-release) the same way it backs `RuntimeStore`.
+// (`project_tracker_issues` / holder-release) the same way it backs `RuntimeStore`.
 // Natively this is a separate `.whipplescript/items.sqlite`; on the DO it is the
 // `items` + `item_counter` tables in the single durable store. The native SQL used
 // a rusqlite transaction for the file/claim atomic pairs; the DO's single-writer
@@ -6474,7 +6474,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         let changed = self
             .sql
             .execute(
-                "UPDATE items SET status = 'done', claim_summary = ?2, \
+                "UPDATE items SET status = 'closed', claim_summary = ?2, \
                  updated_at = CURRENT_TIMESTAMP \
                  WHERE item_id = ?1 AND status IN ('open', 'in_progress')",
                 &[text(item_id), opt_text(summary)],
@@ -7194,7 +7194,7 @@ mod tests {
                 .expect("get2")
                 .expect("row")
                 .status,
-            "done"
+            "closed"
         );
     }
 

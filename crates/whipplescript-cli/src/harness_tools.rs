@@ -1223,17 +1223,17 @@ fn todo_to_item_status(todo: &str) -> String {
     match todo {
         "pending" => "open",
         "in_progress" => "in_progress",
-        "completed" => "done",
+        "completed" => "closed",
         other => other,
     }
     .to_string()
 }
 
-/// Map a tracker item status back to the TodoWrite-style status.
+/// Map a tracker issue status back to the TodoWrite-style status.
 fn item_to_todo_status(item: &str) -> &'static str {
     match item {
         "in_progress" => "in_progress",
-        "done" | "cancelled" => "completed",
+        "closed" | "canceled" | "archived" => "completed",
         _ => "pending",
     }
 }

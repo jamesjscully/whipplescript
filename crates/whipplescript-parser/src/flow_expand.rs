@@ -1321,16 +1321,16 @@ fn print_effect(
             push_stmt_line(out, indent, &format!("{head}{parse}{binding}{timeout}"));
             return;
         }
-        BodyEffectKind::QueueFile { queue, fields } => {
-            push_stmt_line(out, indent, &format!("file item into {queue} {{"));
+        BodyEffectKind::TrackerFile { queue, fields } => {
+            push_stmt_line(out, indent, &format!("file issue into {queue} {{"));
             print_fields(fields, indent + 1, &rn, out);
             push_stmt_line(out, indent, &format!("}}{binding}"));
             return;
         }
-        BodyEffectKind::QueueClaim { item, .. } => {
+        BodyEffectKind::TrackerClaim { item, .. } => {
             format!("claim {}{binding}{timeout}", rn(item))
         }
-        BodyEffectKind::QueueRelease { item } => format!("release {}", rn(item)),
+        BodyEffectKind::TrackerRelease { item } => format!("release {}", rn(item)),
         BodyEffectKind::LeaseAcquire {
             resource,
             key_expr,
@@ -1388,7 +1388,7 @@ fn print_effect(
             push_stmt_line(out, indent, &format!("}}{binding}"));
             return;
         }
-        BodyEffectKind::QueueFinish { item, fields } => {
+        BodyEffectKind::TrackerFinish { item, fields } => {
             if fields.is_empty() {
                 format!("finish {}", rn(item))
             } else {

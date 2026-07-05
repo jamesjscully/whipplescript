@@ -13,32 +13,32 @@ schemas
   class ReviewedWork
     itemId string
     review ref<WorkReview>
-queues
-  queue backlog tracker=builtin
+trackers
+  tracker backlog provider=builtin
 agents
   agent worker harness=<fallback> provider=owned profile=repo-writer capacity=1 skills=[] capabilities=[] tools=[]
 coerces
   coerce reviewWork(itemTitle string, agentSummary string) -> ref<WorkReview>
 rules
   rule work_ready_item
-    when backlog has ready item as item
+    when backlog has ready issue as issue
     when worker is available
     reads
-      pattern:backlog has ready item as item
+      pattern:backlog has ready issue as issue
       pattern:worker is available
     writes
       schema:ReviewedWork
     effects
-      lease kind=queue.claim binding=lease key=252c03eef6eb637c
+      active_claim kind=tracker.claim binding=active_claim key=4f1eba1192865a81
       turn kind=agent.tell binding=turn key=1d124f49240816a7
       review kind=coerce binding=review key=d9e1c7e7a0918dcc
-      effect4 kind=queue.finish binding=- key=aabf35896b0239ad
-      effect5 kind=queue.release binding=- key=3b95f9b3fc1d5dba
+      effect4 kind=tracker.finish binding=- key=8707324facb2e308
+      effect5 kind=tracker.release binding=- key=0e796dff366d7f0d
       effect6 kind=human.ask binding=- key=631378576107ef4f
     dependencies
-      lease --succeeds--> turn
+      active_claim --succeeds--> turn
       turn --succeeds--> review
       review --succeeds--> effect4
       review --fails--> effect5
       review --fails--> effect6
-    body_hash ed9c49b92bbafae5
+    body_hash 7cb189b7fa690d35

@@ -1392,7 +1392,7 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
     })?;
 
     let outcome: Result<Value, String> = match effect.kind.as_str() {
-        "queue.file" => {
+        "tracker.file" => {
             let queue = effect.target.clone().unwrap_or_default();
             let item = input.get("item").cloned().unwrap_or_else(|| json!({}));
             let title = item
@@ -1425,7 +1425,7 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
                 })
                 .map_err(|error| format!("file failed: {error:?}"))
         }
-        "queue.claim" => {
+        "tracker.claim" => {
             let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
             match kernel.store_mut().claim_item(id, instance_id) {
                 Ok(ClaimOutcome::Claimed) => Ok(json!({"id": id, "claimed_by": instance_id})),
@@ -1436,7 +1436,7 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
                 Err(error) => Err(format!("claim failed: {error:?}")),
             }
         }
-        "queue.release" => {
+        "tracker.release" => {
             let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
             match kernel.store_mut().release_item(id) {
                 Ok(true) => Ok(json!({"id": id, "status": "open"})),
@@ -1444,7 +1444,7 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
                 Err(error) => Err(format!("release failed: {error:?}")),
             }
         }
-        "queue.finish" => {
+        "tracker.finish" => {
             let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
             let summary = input
                 .pointer("/payload/summary")

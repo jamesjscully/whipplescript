@@ -5887,10 +5887,10 @@ fn dev_queue_claim_success_releases_agent_turn_dependency() {
         &workflow_path,
         r#"
 @service
-workflow QueueClaim
+workflow TrackerClaim
 
-queue backlog {
-  tracker builtin
+tracker backlog {
+  provider builtin
 }
 
 agent worker {
@@ -5902,14 +5902,14 @@ agent worker {
 rule seed
   when started
 => {
-  file item into backlog {
+  file issue into backlog {
     title "Fix it"
     body "Please"
   }
 }
 
 rule start_item
-  when backlog has ready item as item
+  when backlog has ready issue as item
   when worker is available
 => {
   claim item as lease
@@ -5970,13 +5970,13 @@ rule start_item
     let facts = facts.as_array().expect("facts array");
     assert!(facts
         .iter()
-        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("queue.claim.completed")));
+        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("tracker.claim.completed")));
     assert!(facts
         .iter()
         .any(|fact| fact.get("name").and_then(Value::as_str) == Some("agent.turn.completed")));
     assert!(facts
         .iter()
-        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("queue.finish.completed")));
+        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("tracker.finish.completed")));
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(items_path);
@@ -6147,8 +6147,8 @@ fn cancel_releases_held_queue_claims() {
 @service
 workflow CancelReleasesClaim
 
-queue backlog {
-  tracker builtin
+tracker backlog {
+  provider builtin
 }
 
 class Marker { note string }
@@ -6156,14 +6156,14 @@ class Marker { note string }
 rule seed
   when started
 => {
-  file item into backlog {
+  file issue into backlog {
     title "work"
     body "do it"
   }
 }
 
 rule grab
-  when backlog has ready item as item
+  when backlog has ready issue as item
 => {
   claim item as lease
 
@@ -8389,8 +8389,8 @@ rule done_now
 fn test_harness_given_tracker_seeds_builtin_tracker_issue() {
     // `given tracker <name> issue { … }` seeds an existing issue into the builtin
     // tracker (isolated per scenario). The workflow's queue projection surfaces it
-    // as a `queue.item.ready` fact — going through the real projection path — so a
-    // `<queue> has ready item` rule fires on it.
+    // as a `tracker.issue.ready` fact — going through the real projection path — so a
+    // `<queue> has ready issue` rule fires on it.
     let bin = env!("CARGO_BIN_EXE_whip");
     let dir = unique_temp_dir("harness-tracker");
     let wf = dir.join("wf.whip");
@@ -8399,8 +8399,8 @@ fn test_harness_given_tracker_seeds_builtin_tracker_issue() {
         r#"
 workflow TrackerSeed
 
-queue backlog {
-  tracker builtin
+tracker backlog {
+  provider builtin
 }
 
 output done Result
@@ -8411,7 +8411,7 @@ class Result {
 
 rule pick
   when {
-    backlog has ready item as item
+    backlog has ready issue as item
   }
 => {
   complete done {
@@ -8424,7 +8424,7 @@ test "seeded issue is picked up" {
     title "Existing issue"
   }
   run until idle
-  expect queue.item.ready where title == "Existing issue"
+  expect tracker.issue.ready where title == "Existing issue"
   expect rule pick fired
   expect workflow completed
 }
@@ -9468,8 +9468,8 @@ lease used_slot { key Env  slots 1  ttl 10m }
 lease dead_slot { key Env  slots 1  ttl 10m }
 ledger dead_log { entry Decision  partition by area  retain 90d }
 counter dead_budget { key Customer  cap 1000  reset daily }
-queue used_q { tracker builtin }
-queue dead_q { tracker builtin }
+tracker used_q { provider builtin }
+tracker dead_q { provider builtin }
 
 rule run
   when Ticket as t
@@ -9486,7 +9486,7 @@ rule run
 }
 
 rule drain
-  when used_q has ready item as item
+  when used_q has ready issue as item
 => {
   claim item as claimed
 
@@ -9521,7 +9521,7 @@ rule drain
         ("lint.unused_lease", "dead_slot"),
         ("lint.unused_ledger", "dead_log"),
         ("lint.unused_counter", "dead_budget"),
-        ("lint.unused_queue", "dead_q"),
+        ("lint.unused_tracker", "dead_q"),
     ] {
         assert!(
             codes_and_messages
@@ -9530,7 +9530,7 @@ rule drain
             "expected {code} for {name}: {report}"
         );
     }
-    // `used_q` is referenced only by a `when ... has ready item` clause, not the
+    // `used_q` is referenced only by a `when ... has ready issue` clause, not the
     // body — so the when-clause scan must keep it from being flagged.
     assert!(
         !codes_and_messages.iter().any(|(_, m)| m.contains("used_q")),
@@ -11188,7 +11188,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         "agent worker {\n  # which provider\n  provider fixture  # trailing provider\n  capacity 1\n}\n",
         "enum Status {\n  # accepted\n  Accept  # trailing accept\n  # rejected\n  Reject\n}\n",
         "signal deploy.finished {\n  # the service\n  service string  # trailing service\n  status string\n}\n",
-        "queue tickets {\n  # the backend\n  tracker builtin  # builtin only\n}\n",
+        "tracker tickets {\n  # the backend\n  provider builtin  # builtin only\n}\n",
         "file store docs {\n  # the root dir\n  root \"./docs\"\n  allow read [\"*.md\"]  # markdown only\n}\n",
     );
     fs::write(&class_comment, class_src).expect("write class_comment");
@@ -11215,7 +11215,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         "provider fixture  # trailing provider",
         "Accept  # trailing accept",
         "service string  # trailing service",
-        "tracker builtin  # builtin only",
+        "provider builtin  # builtin only",
     ] {
         assert!(
             class_out.contains(marker),

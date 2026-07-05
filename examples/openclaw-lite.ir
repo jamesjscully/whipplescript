@@ -14,8 +14,8 @@ schemas
   class ReviewDecision
     decision string
     decidedBy string
-queues
-  queue backlog tracker=builtin
+trackers
+  tracker backlog provider=builtin
 agents
   agent planner harness=<fallback> provider=codex profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[]
   agent reviewer harness=<fallback> provider=claude profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[]
@@ -26,9 +26,9 @@ assertions
   assert count(Plan where status == "ready") == 1
     reads
       fact:Plan where status == "ready"
-  assert count(effect kind queue.file where status == completed) == 1
+  assert count(effect kind tracker.file where status == completed) == 1
     reads
-      effect:kind queue.file where status == completed
+      effect:kind tracker.file where status == completed
 rules
   rule observe_heartbeat
     when started
@@ -48,13 +48,13 @@ rules
     effects
       context kind=capability.call binding=context key=7e81e084dae5eb13
       planTurn kind=agent.tell binding=planTurn key=97a3c1a4726b15f5
-      effect3 kind=queue.file binding=- key=581529889869fddd
+      effect3 kind=tracker.file binding=- key=2c88ace5c002bad0
       effect4 kind=capability.call binding=- key=557da7ba98895333
     dependencies
       context --succeeds--> planTurn
       planTurn --succeeds--> effect3
       planTurn --succeeds--> effect4
-    body_hash 5654b62679877045
+    body_hash 39f20e5078b2b4e7
   rule escalate_plan_for_review
     when Plan as plan where plan.status == "ready"
     when reviewer is available

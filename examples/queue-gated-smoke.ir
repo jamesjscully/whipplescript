@@ -9,14 +9,14 @@ schemas
     itemTitle string
     summary string
     status literal<"done">
-queues
-  queue backlog tracker=builtin
+trackers
+  tracker backlog provider=builtin
 agents
   agent worker harness=<fallback> provider=codex profile=repo-writer capacity=1 skills=[] capabilities=[] tools=[]
 assertions
-  assert count(effect kind queue.claim where status == completed) == 1
+  assert count(effect kind tracker.claim where status == completed) == 1
     reads
-      effect:kind queue.claim where status == completed
+      effect:kind tracker.claim where status == completed
   assert count(effect kind agent.tell where status == completed) == 1
     reads
       effect:kind agent.tell where status == completed
@@ -28,20 +28,20 @@ assertions
       effect:kind human.ask
 rules
   rule implement_ready_item
-    when backlog has ready item as item
+    when backlog has ready issue as issue
     when worker is available
     reads
-      pattern:backlog has ready item as item
+      pattern:backlog has ready issue as issue
       pattern:worker is available
     writes
       schema:QueueGatedResult
     effects
-      lease kind=queue.claim binding=lease key=d3aa32b90b607b00
+      active_claim kind=tracker.claim binding=active_claim key=3cba9b8315a66f35
       turn kind=agent.tell binding=turn key=5d570b6e6c35c283
-      effect3 kind=queue.finish binding=- key=92c2c9125f74b92c
+      effect3 kind=tracker.finish binding=- key=e749cc2695072071
       effect4 kind=human.ask binding=- key=eb8e38cee174b049
     dependencies
-      lease --succeeds--> turn
+      active_claim --succeeds--> turn
       turn --succeeds--> effect3
-      lease --fails--> effect4
-    body_hash 598c4d31111540e0
+      active_claim --fails--> effect4
+    body_hash 0ce7777d170dc70d

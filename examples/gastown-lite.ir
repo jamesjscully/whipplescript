@@ -20,8 +20,8 @@ schemas
     verdict literal<"merge">
   class WorkspaceReady
     workspace ref<Workspace>
-queues
-  queue backlog tracker=builtin
+trackers
+  tracker backlog provider=builtin
 agents
   agent frontend harness=<fallback> provider=owned profile=repo-writer capacity=1 skills=[] capabilities=[] tools=[]
   agent backend harness=<fallback> provider=owned profile=repo-writer capacity=1 skills=[] capabilities=[] tools=[]
@@ -35,35 +35,35 @@ rules
     writes
       schema:WorkspaceReady
     record_sources
-      schema:WorkspaceReady construct=table_row span=881..920
+      schema:WorkspaceReady construct=table_row span=884..923
     body_hash be140b933c7ae3a2
   rule file_ticket
     when started
     reads
       pattern:started
     effects
-      effect1 kind=queue.file binding=- key=86894c0bca5b2ae5
-    body_hash 338d6ad789f3a0b1
+      effect1 kind=tracker.file binding=- key=d1b74731af37a848
+    body_hash 8fa8a12919dc7ccb
   rule implement_ready_ticket
-    when backlog has ready item as item
+    when backlog has ready issue as issue
     when WorkspaceReady as ready
     when frontend is available
     reads
-      pattern:backlog has ready item as item
+      pattern:backlog has ready issue as issue
       pattern:frontend is available
       schema:WorkspaceReady
     writes
       schema:MergeRecord
     effects
-      claimed kind=queue.claim binding=claimed key=c1f22dc3c78ab3dd
+      claimed kind=tracker.claim binding=claimed key=0a6face830b3191e
       slot kind=lease.acquire binding=slot key=7e41121b2b82c668
       turn kind=agent.tell binding=turn key=0f484580de9b735e
-      effect4 kind=queue.release binding=- key=c073a6ab53599798
+      effect4 kind=tracker.release binding=- key=aed137f183034383
       effect5 kind=human.ask binding=- key=22a2e9667ad9099f
       review kind=coerce binding=review key=26c43d260ec4c541
       log_entry kind=ledger.append binding=log_entry key=486742921bd48ea1
-      effect8 kind=queue.finish binding=- key=3d9ec6b22e572e38
-      effect9 kind=queue.release binding=- key=e9dc4bfff08a3011
+      effect8 kind=tracker.finish binding=- key=c02fb4f193f8720d
+      effect9 kind=tracker.release binding=- key=fe5eb51b72fd3d06
       effect10 kind=human.ask binding=- key=d025b57c989c4a71
     dependencies
       claimed --succeeds--> slot
@@ -76,9 +76,9 @@ rules
       log_entry --succeeds--> effect9
       log_entry --succeeds--> effect10
     case_branches
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"merge" guard=- body_hash=37fd2c0ced334e60 span=2245..2252
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"revise" guard=- body_hash=9d28cc8c79a2b851 span=2427..2435
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"blocked" guard=- body_hash=5740253f987ec22b span=2476..2485
-    body_hash 7f3227538e459837
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"merge" guard=- body_hash=104d5324dd84bda4 span=2258..2265
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"revise" guard=- body_hash=fb9e3c965f9df749 span=2442..2450
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"blocked" guard=- body_hash=e73625310a0c4637 span=2492..2501
+    body_hash 6f028d2403a11cdd
 rule_dependencies
   table_workspaces --schema:WorkspaceReady--> implement_ready_ticket

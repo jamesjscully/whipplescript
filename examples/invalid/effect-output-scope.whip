@@ -1,7 +1,7 @@
 workflow EffectOutputScope
 
-queue backlog {
-  tracker builtin
+tracker backlog {
+  provider builtin
 }
 
 agent worker {
@@ -11,7 +11,7 @@ agent worker {
 }
 
 rule bad_scope
-  when backlog has ready item as item
+  when backlog has ready issue as item
 => {
   claim item as claim
 

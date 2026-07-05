@@ -1,7 +1,7 @@
 //! The rule-pass orchestration, lifted host-agnostic (DR-0033 chunk 4 groundwork).
 //!
 //! `step_instance_generic` drives the native `dev`-loop rule fixpoint
-//! (project_queue_items + match/lower/commit) over ONE held `RuntimeKernel<S>`,
+//! (project_tracker_issues + match/lower/commit) over ONE held `RuntimeKernel<S>`,
 //! where `S` unifies the runtime / coordination / work-items surfaces (native
 //! `NativeStores`; the DO's `DoSqliteStore`). This is the piece the instance step
 //! machine drives; it lives in the wasm-clean kernel so the DO host can call it.
@@ -42,7 +42,7 @@ pub struct StepReport {
 }
 
 /// The host-agnostic rule pass (DR-0033 instance-scheduler lift): the fixpoint of
-/// `project_queue_items` + rule matching/lowering/commit, run over ONE held store
+/// `project_tracker_issues` + rule matching/lowering/commit, run over ONE held store
 /// handle instead of re-opening per operation. `S` unifies the runtime,
 /// coordination, and work-items surfaces — natively `NativeStores`, on the DO the
 /// one `DoSqliteStore`.
@@ -78,7 +78,7 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
         let active_version_id = status.instance.version_id;
         let active_revision_epoch = status.instance.revision_epoch;
         let active_revision_epoch_key = active_revision_epoch.to_string();
-        project_queue_items(kernel, instance_id, ir)?;
+        project_tracker_issues(kernel, instance_id, ir)?;
         let events = kernel.store().list_events(instance_id)?;
         let facts = kernel.store().list_facts(instance_id)?;
         let all_facts = kernel.store().list_facts_including_consumed(instance_id)?;
@@ -283,19 +283,19 @@ pub fn release_holder_resources_on_terminal<S: Coordination + WorkItems>(
 }
 
 /// Projects ready work items from declared builtin queues into
-/// instance-local `queue.item.ready` facts, and retires projections whose
+/// instance-local `tracker.issue.ready` facts, and retires projections whose
 /// items are no longer ready. The tracker is the source of truth; the run
 /// store holds a cache keyed (queue, id).
-pub fn project_queue_items<S: RuntimeStore + WorkItems>(
+pub fn project_tracker_issues<S: RuntimeStore + WorkItems>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     ir: &IrProgram,
 ) -> Result<(), StoreError> {
-    if ir.queues.is_empty() {
+    if ir.trackers.is_empty() {
         return Ok(());
     }
-    for queue in &ir.queues {
-        if queue.tracker != "builtin" {
+    for queue in &ir.trackers {
+        if queue.provider != "builtin" {
             continue;
         }
         // Keep a projection alive while this instance holds the claim: the
@@ -314,7 +314,7 @@ pub fn project_queue_items<S: RuntimeStore + WorkItems>(
             .store()
             .list_facts(instance_id)?
             .into_iter()
-            .filter(|fact| fact.name == "queue.item.ready")
+            .filter(|fact| fact.name == "tracker.issue.ready")
             .filter(|fact| {
                 json_from_str(&fact.value_json)
                     .get("queue")
@@ -349,13 +349,13 @@ pub fn project_queue_items<S: RuntimeStore + WorkItems>(
             // fact generation instead of colliding with its retired one.
             kernel.derive_fact(
                 instance_id,
-                "queue.item.ready",
+                "tracker.issue.ready",
                 &key,
                 &value_json,
                 None,
                 Some(&idempotency_key(&[
                     instance_id,
-                    "queue.item.ready",
+                    "tracker.issue.ready",
                     &key,
                     &item.updated_at,
                 ])),

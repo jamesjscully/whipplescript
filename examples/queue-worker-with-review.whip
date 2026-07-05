@@ -3,8 +3,8 @@ description "Claim ready work items, implement them, review each turn, and escal
 workflow QueueWorkerWithReview
 
 # Queues make work ownership explicit: claim before turn, finish or release after review.
-queue backlog {
-  tracker builtin
+tracker backlog {
+  provider builtin
 }
 
 enum ReviewStatus {
@@ -27,7 +27,7 @@ class ReviewedWork {
 
 coerce reviewWork(itemTitle string, agentSummary string) -> WorkReview {
   prompt """markdown
-  Review this completed agent turn for the work item.
+  Review this completed agent turn for the work issue.
 
   Item:
   {{ itemTitle }}
@@ -48,43 +48,43 @@ agent worker {
 }
 
 rule work_ready_item
-  when backlog has ready item as item
+  when backlog has ready issue as issue
   when worker is available
 => {
-  claim item as lease
+  claim issue as active_claim
 
-  after lease succeeds {
+  after active_claim succeeds {
     tell worker as turn """markdown
     Implement this work item:
 
-    {{ item.title }}
+    {{ issue.title }}
 
-    {{ item.body }}
+    {{ issue.body }}
 
     Finish with a concise summary.
     """
   }
 
   after turn succeeds as outcome {
-    coerce reviewWork(item.title, outcome.summary) as review
+    coerce reviewWork(issue.title, outcome.summary) as review
   }
 
   after review succeeds as verdict {
-    finish item {
+    finish issue {
       summary outcome.summary
     }
     record ReviewedWork {
-      itemId item.id
+      itemId issue.id
       review verdict
     }
   }
 
   after review fails {
-    release item
+    release issue
     askHuman """markdown
-    Review failed for work item {{ item.id }}: {{ item.title }}
+    Review failed for work item {{ issue.id }}: {{ issue.title }}
 
-    Please inspect the turn and decide whether to accept, revise, or block the item.
+    Please inspect the turn and decide whether to accept, revise, or block the issue.
     """
   }
 }

@@ -127,7 +127,7 @@ pub enum Item {
     Apply(ApplyDecl),
     WorkflowContract(WorkflowContractDecl),
     Harness(HarnessDecl),
-    Queue(QueueDecl),
+    Tracker(TrackerDecl),
     Channel(ChannelDecl),
     FileStore(FileStoreDecl),
     MemoryPool(MemoryPoolDecl),
@@ -160,7 +160,7 @@ impl Item {
             Self::Apply(decl) => decl.span,
             Self::WorkflowContract(decl) => decl.span,
             Self::Harness(decl) => decl.span,
-            Self::Queue(decl) => decl.span,
+            Self::Tracker(decl) => decl.span,
             Self::Channel(decl) => decl.span,
             Self::FileStore(decl) => decl.span,
             Self::MemoryPool(decl) => decl.span,
@@ -257,9 +257,9 @@ pub struct HarnessDecl {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueueDecl {
+pub struct TrackerDecl {
     pub name: Ident,
-    pub tracker: Ident,
+    pub provider: Ident,
     pub span: SourceSpan,
 }
 
@@ -847,7 +847,7 @@ pub struct IrProgram {
     pub workflow_contracts: Vec<IrWorkflowContract>,
     pub uses: Vec<IrUse>,
     pub harnesses: Vec<IrHarness>,
-    pub queues: Vec<IrQueue>,
+    pub trackers: Vec<IrTracker>,
     pub channels: Vec<IrChannel>,
     pub file_stores: Vec<IrFileStore>,
     pub memory_pools: Vec<IrMemoryPool>,
@@ -964,9 +964,9 @@ pub enum IrUseKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IrQueue {
+pub struct IrTracker {
     pub name: String,
-    pub tracker: String,
+    pub provider: String,
     pub span: SourceSpan,
 }
 
@@ -1411,10 +1411,10 @@ pub enum IrEffectKind {
     WorkflowInvoke,
     TimerWait,
     ExecCommand,
-    QueueFile,
-    QueueClaim,
-    QueueRelease,
-    QueueFinish,
+    TrackerFile,
+    TrackerClaim,
+    TrackerRelease,
+    TrackerFinish,
     LeaseAcquire,
     LeaseRenew,
     LedgerAppend,
@@ -1948,7 +1948,7 @@ pub fn document_symbols(source: &str) -> Vec<DeclSymbol> {
             Item::Lease(decl) => ("lease", decl.name.name.clone(), decl.span),
             Item::Ledger(decl) => ("ledger", decl.name.name.clone(), decl.span),
             Item::Counter(decl) => ("counter", decl.name.name.clone(), decl.span),
-            Item::Queue(decl) => ("queue", decl.name.name.clone(), decl.span),
+            Item::Tracker(decl) => ("tracker", decl.name.name.clone(), decl.span),
             Item::Channel(decl) => ("channel", decl.name.name.clone(), decl.span),
             Item::FileStore(decl) => ("file store", decl.name.name.clone(), decl.span),
             Item::MemoryPool(decl) => ("memory pool", decl.name.name.clone(), decl.span),
@@ -2043,7 +2043,7 @@ pub fn format_program_preserving_comments(source: &str) -> Option<String> {
             Item::Event(event) => Some(try_format_event_with_comments(
                 event, source, &comments, &mut chunk,
             )),
-            Item::Queue(queue) => Some(try_format_queue_with_comments(
+            Item::Tracker(queue) => Some(try_format_tracker_with_comments(
                 queue, source, &comments, &mut chunk,
             )),
             Item::FileStore(file_store) => Some(try_format_filestore_with_comments(
@@ -2301,21 +2301,21 @@ fn try_format_class_with_comments(
 /// Format a `queue` body (its single `tracker` member) with own-line and trailing
 /// comments preserved. Returns `false` (caller refuses the file) when a body
 /// comment cannot be placed safely.
-fn try_format_queue_with_comments(
-    queue: &QueueDecl,
+fn try_format_tracker_with_comments(
+    queue: &TrackerDecl,
     source: &str,
     comments: &[Comment],
     formatted: &mut String,
 ) -> bool {
     let members: Vec<(SourceSpan, Vec<String>)> = vec![(
-        queue.tracker.span,
-        vec![format!("  tracker {}", queue.tracker.name)],
+        queue.provider.span,
+        vec![format!("  provider {}", queue.provider.name)],
     )];
     let Some((own_line, trailing)) = classify_body_comments(source, queue.span, &members, comments)
     else {
         return false;
     };
-    push_line(formatted, format!("queue {} {{", queue.name.name));
+    push_line(formatted, format!("tracker {} {{", queue.name.name));
     emit_members_with_comments(&members, &own_line, &trailing, "  ", formatted);
     push_line(formatted, "}");
     true
@@ -2569,7 +2569,7 @@ fn referenced_decl_name(item: &Item) -> Option<(String, SourceSpan)> {
         Item::Lease(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::Ledger(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::Counter(decl) => Some((decl.name.name.clone(), decl.span)),
-        Item::Queue(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::Tracker(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::Channel(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::FileStore(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::MemoryPool(decl) => Some((decl.name.name.clone(), decl.span)),
@@ -2749,7 +2749,7 @@ impl IrProgram {
         if !self.harnesses.is_empty() || !self.agents.is_empty() {
             register_standard_library(&mut libraries, "std.agent");
         }
-        if !self.queues.is_empty() {
+        if !self.trackers.is_empty() {
             register_standard_library(&mut libraries, "std.tracker");
         }
         if !self.events.is_empty() {
@@ -2971,12 +2971,12 @@ impl IrProgram {
                 );
             }
         }
-        if !self.queues.is_empty() {
-            push_line(&mut snapshot, "queues");
-            for queue in &self.queues {
+        if !self.trackers.is_empty() {
+            push_line(&mut snapshot, "trackers");
+            for queue in &self.trackers {
                 push_line(
                     &mut snapshot,
-                    format!("  queue {} tracker={}", queue.name, queue.tracker),
+                    format!("  tracker {} provider={}", queue.name, queue.provider),
                 );
             }
         }
@@ -3482,40 +3482,40 @@ fn effect_contract_for_kind(
             strings(&["effect.output"]),
             TypedOutputValidation::RuntimeBoundary,
         ),
-        IrEffectKind::QueueFile => (
+        IrEffectKind::TrackerFile => (
             "std.tracker",
             strings(&["file"]),
-            Some("queue.file.input"),
+            Some("tracker.file.input"),
             None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
             TypedOutputValidation::None,
         ),
-        IrEffectKind::QueueClaim => (
+        IrEffectKind::TrackerClaim => (
             "std.tracker",
             strings(&["claim"]),
-            Some("queue.claim.input"),
-            Some("QueueClaim"),
+            Some("tracker.claim.input"),
+            Some("TrackerClaim"),
             Vec::new(),
             Vec::new(),
             strings(&["effect.output"]),
             TypedOutputValidation::None,
         ),
-        IrEffectKind::QueueRelease => (
+        IrEffectKind::TrackerRelease => (
             "std.tracker",
             strings(&["release"]),
-            Some("queue.release.input"),
+            Some("tracker.release.input"),
             None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
             TypedOutputValidation::None,
         ),
-        IrEffectKind::QueueFinish => (
+        IrEffectKind::TrackerFinish => (
             "std.tracker",
             strings(&["finish"]),
-            Some("queue.finish.input"),
+            Some("tracker.finish.input"),
             None,
             Vec::new(),
             Vec::new(),
@@ -3645,10 +3645,10 @@ impl IrEffectKind {
             Self::WorkflowInvoke => "workflow.invoke",
             Self::TimerWait => "timer.wait",
             Self::ExecCommand => "exec.command",
-            Self::QueueFile => "queue.file",
-            Self::QueueClaim => "queue.claim",
-            Self::QueueRelease => "queue.release",
-            Self::QueueFinish => "queue.finish",
+            Self::TrackerFile => "tracker.file",
+            Self::TrackerClaim => "tracker.claim",
+            Self::TrackerRelease => "tracker.release",
+            Self::TrackerFinish => "tracker.finish",
             Self::LeaseAcquire => "lease.acquire",
             Self::LeaseRenew => "lease.renew",
             Self::LedgerAppend => "ledger.append",
@@ -3802,7 +3802,7 @@ fn lower_program(
         workflow_contracts: Vec::new(),
         uses: Vec::new(),
         harnesses: Vec::new(),
-        queues: Vec::new(),
+        trackers: Vec::new(),
         channels: Vec::new(),
         file_stores: Vec::new(),
         memory_pools: Vec::new(),
@@ -3888,7 +3888,7 @@ fn lower_program(
                 ),
             }),
             Item::Harness(harness) => lower_harness(harness, &mut ir, &mut diagnostics),
-            Item::Queue(queue) => lower_queue(queue, &mut ir, &mut diagnostics),
+            Item::Tracker(queue) => lower_tracker(queue, &mut ir, &mut diagnostics),
             Item::Channel(channel) => lower_channel(channel, &mut ir, &mut diagnostics),
             // The `file store` declaration (capability-scoped store identity)
             // lowers to its name + literal root; the runtime file provider reads
@@ -4759,7 +4759,7 @@ fn expand_pattern_item(
             Item::Include(include),
         )),
         Item::Use(use_decl) => Some((format!("use:{}", use_decl.name.value), Item::Use(use_decl))),
-        Item::Queue(queue) => Some((format!("queue:{}", queue.name.name), Item::Queue(queue))),
+        Item::Tracker(queue) => Some((format!("tracker:{}", queue.name.name), Item::Tracker(queue))),
         Item::Channel(channel) => Some((
             format!("channel:{}", channel.name.name),
             Item::Channel(channel),
@@ -6069,25 +6069,25 @@ fn lower_use(use_decl: UseDecl, ir: &mut IrProgram, _diagnostics: &mut Vec<Diagn
     });
 }
 
-fn lower_queue(queue: QueueDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
-    if queue.tracker.name != "builtin" {
+fn lower_tracker(tracker: TrackerDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    if tracker.provider.name != "builtin" {
         diagnostics.push(Diagnostic {
             related: Vec::new(),
-            span: queue.tracker.span,
+            span: tracker.provider.span,
             message: format!(
-                "queue `{}` uses unavailable tracker `{}`",
-                queue.name.name, queue.tracker.name
+                "tracker `{}` uses unavailable provider `{}`",
+                tracker.name.name, tracker.provider.name
             ),
             suggestion: Some(
-                "`builtin` is the available tracker; loft/github/linear/jira are deferred bindings"
+                "`builtin` is the available provider; loft/github/linear/jira are deferred bindings"
                     .to_owned(),
             ),
         });
     }
-    ir.queues.push(IrQueue {
-        name: queue.name.name,
-        tracker: queue.tracker.name,
-        span: queue.span,
+    ir.trackers.push(IrTracker {
+        name: tracker.name.name,
+        provider: tracker.provider.name,
+        span: tracker.span,
     });
 }
 
@@ -8822,10 +8822,10 @@ fn terminal_completed_payload_type(
         | IrEffectKind::WorkflowInvoke
         | IrEffectKind::TimerWait
         | IrEffectKind::ExecCommand
-        | IrEffectKind::QueueFile
-        | IrEffectKind::QueueClaim
-        | IrEffectKind::QueueRelease
-        | IrEffectKind::QueueFinish
+        | IrEffectKind::TrackerFile
+        | IrEffectKind::TrackerClaim
+        | IrEffectKind::TrackerRelease
+        | IrEffectKind::TrackerFinish
         | IrEffectKind::LeaseAcquire
         | IrEffectKind::LeaseRenew
         | IrEffectKind::LedgerAppend
@@ -9361,10 +9361,10 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
         body::BodyEffectKind::Invoke { .. } => IrEffectKind::WorkflowInvoke,
         body::BodyEffectKind::Timer { .. } => IrEffectKind::TimerWait,
         body::BodyEffectKind::Exec { .. } => IrEffectKind::ExecCommand,
-        body::BodyEffectKind::QueueFile { .. } => IrEffectKind::QueueFile,
-        body::BodyEffectKind::QueueClaim { .. } => IrEffectKind::QueueClaim,
-        body::BodyEffectKind::QueueRelease { .. } => IrEffectKind::QueueRelease,
-        body::BodyEffectKind::QueueFinish { .. } => IrEffectKind::QueueFinish,
+        body::BodyEffectKind::TrackerFile { .. } => IrEffectKind::TrackerFile,
+        body::BodyEffectKind::TrackerClaim { .. } => IrEffectKind::TrackerClaim,
+        body::BodyEffectKind::TrackerRelease { .. } => IrEffectKind::TrackerRelease,
+        body::BodyEffectKind::TrackerFinish { .. } => IrEffectKind::TrackerFinish,
         body::BodyEffectKind::LeaseAcquire { .. } => IrEffectKind::LeaseAcquire,
         body::BodyEffectKind::LeaseRenew { .. } => IrEffectKind::LeaseRenew,
         body::BodyEffectKind::LedgerAppend { .. } => IrEffectKind::LedgerAppend,
@@ -9471,10 +9471,10 @@ fn is_ast_only_effect_kind(kind: &body::BodyEffectKind) -> bool {
             | body::BodyEffectKind::Timer { .. }
             | body::BodyEffectKind::Exec { .. }
             | body::BodyEffectKind::Decide { .. }
-            | body::BodyEffectKind::QueueFile { .. }
-            | body::BodyEffectKind::QueueClaim { .. }
-            | body::BodyEffectKind::QueueRelease { .. }
-            | body::BodyEffectKind::QueueFinish { .. }
+            | body::BodyEffectKind::TrackerFile { .. }
+            | body::BodyEffectKind::TrackerClaim { .. }
+            | body::BodyEffectKind::TrackerRelease { .. }
+            | body::BodyEffectKind::TrackerFinish { .. }
             | body::BodyEffectKind::LeaseAcquire { .. }
             | body::BodyEffectKind::LeaseRenew { .. }
             | body::BodyEffectKind::LedgerAppend { .. }
@@ -12294,12 +12294,12 @@ pub fn runtime_fact_name_for_pattern(pattern: &str) -> Option<String> {
     }
     {
         let mut words = pattern.split_whitespace();
-        let _queue = words.next();
+        let _tracker = words.next();
         if words.next() == Some("has")
             && words.next() == Some("ready")
-            && words.next() == Some("item")
+            && words.next() == Some("issue")
         {
-            return Some("queue.item.ready".to_owned());
+            return Some("tracker.issue.ready".to_owned());
         }
     }
     if first.chars().next().is_some_and(char::is_uppercase) {
@@ -12320,10 +12320,10 @@ fn binding_from_when(when: &str) -> Option<(String, String)> {
         words.next();
         words.next() == Some("completed") && words.next() == Some("turn")
     };
-    let has_ready_item = {
+    let has_ready_issue = {
         let mut words = pattern.split_whitespace();
         words.next();
-        words.next() == Some("has") && words.next() == Some("ready") && words.next() == Some("item")
+        words.next() == Some("has") && words.next() == Some("ready") && words.next() == Some("issue")
     };
     let schema = if let Some(rest) = pattern.strip_prefix("fact ") {
         rest.split_whitespace().next()?.to_owned()
@@ -12338,7 +12338,7 @@ fn binding_from_when(when: &str) -> Option<(String, String)> {
         "AgentTurn".to_owned()
     } else if pattern.starts_with("human answered ") {
         "HumanAnswer".to_owned()
-    } else if has_ready_item {
+    } else if has_ready_issue {
         "WorkItem".to_owned()
     } else if pattern.starts_with("message from ") {
         // Inbound messaging (spec/messaging.md): `when message from <channel> as
@@ -12378,10 +12378,10 @@ fn effect_binding_schema(
         | IrEffectKind::WorkflowInvoke
         | IrEffectKind::TimerWait
         | IrEffectKind::ExecCommand
-        | IrEffectKind::QueueFile
-        | IrEffectKind::QueueClaim
-        | IrEffectKind::QueueRelease
-        | IrEffectKind::QueueFinish
+        | IrEffectKind::TrackerFile
+        | IrEffectKind::TrackerClaim
+        | IrEffectKind::TrackerRelease
+        | IrEffectKind::TrackerFinish
         | IrEffectKind::LeaseAcquire
         | IrEffectKind::LeaseRenew
         | IrEffectKind::LedgerAppend
@@ -13292,7 +13292,7 @@ fn releases_or_terminates(statements: &[body::BodyStmt], binding: &str) -> bool 
     statements.iter().any(|statement| match statement {
         body::BodyStmt::Effect(effect) => matches!(
             &effect.kind,
-            body::BodyEffectKind::QueueRelease { item } if item == binding
+            body::BodyEffectKind::TrackerRelease { item } if item == binding
         ),
         body::BodyStmt::Terminal(_) => true,
         body::BodyStmt::After(after) => releases_or_terminates(&after.body, binding),
@@ -14329,7 +14329,7 @@ fn validate_emit_signal_declarations(
 
 /// Flags dangling roots in the field payloads of body-AST effects that the
 /// line-based validators don't reach: `emit`/`notify` (`Notify`), `file item
-/// into` (`QueueFile`), and ledger `append` (`LedgerAppend`). Uses the parsed
+/// into` (`TrackerFile`), and ledger `append` (`LedgerAppend`). Uses the parsed
 /// AST and the same root check as the record/coerce/tell/invoke validators.
 fn validate_effect_field_roots(
     rule: &RuleDecl,
@@ -14360,7 +14360,7 @@ fn validate_effect_field_roots(
                         diagnostics,
                     );
                 }
-                body::BodyEffectKind::QueueFile { queue, fields } => {
+                body::BodyEffectKind::TrackerFile { queue, fields } => {
                     check_field_value_roots(
                         rule,
                         &format!("file into `{queue}`"),
@@ -14369,7 +14369,7 @@ fn validate_effect_field_roots(
                         diagnostics,
                     );
                 }
-                body::BodyEffectKind::QueueFinish { item, fields } => {
+                body::BodyEffectKind::TrackerFinish { item, fields } => {
                     check_operand_root(rule, "finish item", item, known_roots, diagnostics);
                     check_field_value_roots(rule, "finish", fields, known_roots, diagnostics);
                 }
@@ -16371,9 +16371,9 @@ fn format_item(item: Item, formatted: &mut String) {
         Item::Use(use_decl) => {
             push_line(formatted, format!("use {}", use_decl.name.value));
         }
-        Item::Queue(queue) => {
-            push_line(formatted, format!("queue {} {{", queue.name.name));
-            push_line(formatted, format!("  tracker {}", queue.tracker.name));
+        Item::Tracker(queue) => {
+            push_line(formatted, format!("tracker {} {{", queue.name.name));
+            push_line(formatted, format!("  provider {}", queue.provider.name));
             push_line(formatted, "}");
         }
         Item::Channel(channel) => {
@@ -17828,10 +17828,10 @@ impl Parser<'_> {
             self.reject_pending_tags(pending_tags, "action");
             self.reject_pending_description(pending_description, "action");
             self.parse_action().map(Item::Action)
-        } else if self.at_ident("queue") {
-            self.reject_pending_tags(pending_tags, "queue");
-            self.reject_pending_description(pending_description, "queue");
-            self.parse_queue().map(Item::Queue)
+        } else if self.at_ident("tracker") {
+            self.reject_pending_tags(pending_tags, "tracker");
+            self.reject_pending_description(pending_description, "tracker");
+            self.parse_tracker().map(Item::Tracker)
         } else if self.at_ident("channel") {
             self.reject_pending_tags(pending_tags, "channel");
             self.reject_pending_description(pending_description, "channel");
@@ -18310,47 +18310,47 @@ impl Parser<'_> {
         })
     }
 
-    fn parse_queue(&mut self) -> Option<QueueDecl> {
-        let start = self.expect_keyword("queue")?.span.start;
-        let name = self.expect_ident("queue name")?;
+    fn parse_tracker(&mut self) -> Option<TrackerDecl> {
+        let start = self.expect_keyword("tracker")?.span.start;
+        let name = self.expect_ident("tracker name")?;
         self.expect_symbol('{')?;
-        let mut tracker = None;
+        let mut provider = None;
         while !self.is_at_end() && !self.at_symbol('}') {
-            let Some(field) = self.expect_ident("queue field") else {
+            let Some(field) = self.expect_ident("tracker field") else {
                 self.synchronize_to_block_item();
                 continue;
             };
             match field.name.as_str() {
-                "tracker" => {
-                    tracker = self.expect_ident("tracker kind");
+                "provider" => {
+                    provider = self.expect_ident("provider name");
                 }
                 other => {
                     self.diagnostics.push(Diagnostic {
                         related: Vec::new(),
                         span: field.span,
-                        message: format!("unknown queue field `{other}`"),
-                        suggestion: Some("the only queue field is `tracker`".to_owned()),
+                        message: format!("unknown tracker field `{other}`"),
+                        suggestion: Some("the only tracker field is `provider`".to_owned()),
                     });
                     self.synchronize_to_block_item();
                 }
             }
         }
         let close = self.expect_symbol('}')?;
-        let Some(tracker) = tracker else {
+        let Some(provider) = provider else {
             self.diagnostics.push(Diagnostic {
                 related: Vec::new(),
                 span: SourceSpan {
                     start,
                     end: close.span.end,
                 },
-                message: format!("queue `{}` is missing a tracker", name.name),
-                suggestion: Some("add `tracker builtin` inside the queue block".to_owned()),
+                message: format!("tracker `{}` is missing a provider", name.name),
+                suggestion: Some("add `provider builtin` inside the tracker block".to_owned()),
             });
             return None;
         };
-        Some(QueueDecl {
+        Some(TrackerDecl {
             name,
-            tracker,
+            provider,
             span: SourceSpan {
                 start,
                 end: close.span.end,
@@ -20876,8 +20876,8 @@ workflow B1gMatrix {
     status string
   }
 
-  queue backlog {
-    tracker builtin
+  tracker backlog {
+    provider builtin
   }
 
   lease workspace_slot {
@@ -20919,7 +20919,7 @@ workflow B1gMatrix {
   rule probe
     when Ticket as ticket
     when Workspace as workspace
-    when backlog has ready item as item
+    when backlog has ready issue as item
     when worker is available
   => {
 __BODY__
@@ -21128,26 +21128,26 @@ lease shared_slot { shared key Key slots 1 ttl 30m }
             ),
             (
                 "queue_file",
-                r#"    file item into backlog { title ticket.title body "body" } as filed"#,
-                IrEffectKind::QueueFile,
+                r#"    file issue into backlog { title ticket.title body "body" } as filed"#,
+                IrEffectKind::TrackerFile,
                 Some("filed"),
             ),
             (
                 "queue_claim",
                 r#"    claim item as lease"#,
-                IrEffectKind::QueueClaim,
+                IrEffectKind::TrackerClaim,
                 Some("lease"),
             ),
             (
                 "queue_release",
                 r#"    release item"#,
-                IrEffectKind::QueueRelease,
+                IrEffectKind::TrackerRelease,
                 None,
             ),
             (
                 "queue_finish",
                 r#"    finish item { summary ticket.title }"#,
-                IrEffectKind::QueueFinish,
+                IrEffectKind::TrackerFinish,
                 None,
             ),
             (
@@ -21373,8 +21373,8 @@ workflow QueueWorkerSlice
 
 use memory
 
-queue backlog {
-  tracker builtin
+tracker backlog {
+  provider builtin
 }
 
 enum ReviewStatus {
@@ -21404,7 +21404,7 @@ agent worker {
 }
 
 rule start_ready_item
-  when backlog has ready item as item
+  when backlog has ready issue as item
   when worker is available
 => {
   claim item as claim
@@ -21446,7 +21446,7 @@ rule start_ready_item
             None => panic!("expected rule item"),
         };
         assert_eq!(rule.whens.len(), 2);
-        assert_eq!(rule.whens[0].text, "backlog has ready item as item");
+        assert_eq!(rule.whens[0].text, "backlog has ready issue as item");
         assert!(rule.body.text.contains("after claim succeeds"));
     }
 
@@ -26955,7 +26955,7 @@ rule strike
 
     #[test]
     fn rejects_dangling_root_in_queue_file_payload() {
-        // Body-AST effect payloads (`file item into`, `emit`, ledger `append`)
+        // Body-AST effect payloads (`file issue into`, `emit`, ledger `append`)
         // are validated via `validate_effect_field_roots`, not the line-based
         // validators; their field values were previously unchecked for roots.
         let source = r#"
@@ -26964,14 +26964,14 @@ workflow QueueFieldDangling
 
 class Ticket { id string }
 
-queue backlog { tracker builtin }
+tracker backlog { provider builtin }
 
 table seed as Ticket [ { id "1" } ]
 
 rule r
   when Ticket as ticket
 => {
-  file item into backlog {
+  file issue into backlog {
     title tikcet.id
     body "x"
   }

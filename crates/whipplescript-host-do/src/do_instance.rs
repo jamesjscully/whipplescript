@@ -350,7 +350,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     }
                 }
             }
-            "queue.file" | "queue.claim" | "queue.release" | "queue.finish" => {
+            "tracker.file" | "tracker.claim" | "tracker.release" | "tracker.finish" => {
                 run_queue_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
             }
             "lease.acquire" | "lease.release" | "lease.renew" | "ledger.append"

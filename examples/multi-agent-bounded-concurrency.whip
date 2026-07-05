@@ -3,8 +3,8 @@ description "Two agents with bounded capacity handing work to each other through
 workflow MultiAgentBoundedConcurrency
 
 # Agent capacity is part of matching, so dispatch naturally back-pressures.
-queue backlog {
-  tracker builtin
+tracker backlog {
+  provider builtin
 }
 
 # Optional-provider exhibit: this example deliberately binds the Codex and Claude
@@ -23,23 +23,23 @@ agent reviewer {
 }
 
 rule implement_ready_work
-  when backlog has ready item as item
+  when backlog has ready issue as issue
   when implementer is available
 => {
-  claim item as lease
+  claim issue as active_claim
 
-  after lease succeeds {
+  after active_claim succeeds {
     tell implementer as turn """markdown
     Implement this work item:
 
-    {{ item.title }}
+    {{ issue.title }}
 
-    {{ item.body }}
+    {{ issue.body }}
     """
   }
 
   after turn succeeds as outcome {
-    finish item {
+    finish issue {
       summary outcome.summary
     }
   }

@@ -2,8 +2,8 @@
 description "The agent turn only runs after the work-item claim succeeds"
 workflow QueueGatedSmoke
 
-queue backlog {
-  tracker builtin
+tracker backlog {
+  provider builtin
 }
 
 class QueueGatedResult {
@@ -19,40 +19,40 @@ agent worker {
   capacity 1
 }
 
-assert count(effect kind queue.claim where status == completed) == 1
+assert count(effect kind tracker.claim where status == completed) == 1
 assert count(effect kind agent.tell where status == completed) == 1
 assert count(QueueGatedResult where status == "done") == 1
 assert count(effect kind human.ask) == 0
 
 rule implement_ready_item
   when {
-    backlog has ready item as item
+    backlog has ready issue as issue
     worker is available
   }
 => {
-  claim item as lease
+  claim issue as active_claim
 
-  after lease succeeds {
+  after active_claim succeeds {
     tell worker as turn """markdown
     This turn must only run after the work-item claim succeeds.
 
-    {{ item.title }}
+    {{ issue.title }}
     """
   }
 
   after turn succeeds as outcome {
-    finish item {
+    finish issue {
       summary outcome.summary
     }
     record QueueGatedResult {
-      itemId item.id
-      itemTitle item.title
+      itemId issue.id
+      itemTitle issue.title
       summary outcome.summary
       status "done"
     }
   }
 
-  after lease fails {
+  after active_claim fails {
     askHuman """markdown
     The work-item claim failed, so the worker turn must not start.
     """

@@ -42,8 +42,8 @@ ledger review_log {
   retain 30d
 }
 
-queue backlog {
-  tracker builtin
+tracker backlog {
+  provider builtin
 }
 
 agent frontend {
@@ -80,18 +80,18 @@ coerce reviewPatch(ticketId string, summary string) -> ReviewDecision {
 rule file_ticket
   when started
 => {
-  file item into backlog {
+  file issue into backlog {
     title "Add retry telemetry"
     body "Record retry count and final outcome for checkout requests."
   }
 }
 
 rule implement_ready_ticket
-  when backlog has ready item as item
+  when backlog has ready issue as issue
   when WorkspaceReady as ready
   when frontend is available
 => {
-  claim item as claimed
+  claim issue as claimed
 
   after claimed succeeds {
     acquire workspace_slot for ready.workspace until ttl as slot
@@ -101,25 +101,25 @@ rule implement_ready_ticket
     tell frontend as turn """markdown
     Implement this ticket in the checkout workspace:
 
-    {{ item.title }}
-    {{ item.body }}
+    {{ issue.title }}
+    {{ issue.body }}
     """
   }
 
   after slot contended {
-    release item
+    release issue
     askHuman """markdown
-    Checkout workspace is busy. Split or retry {{ item.id }}.
+    Checkout workspace is busy. Split or retry {{ issue.id }}.
     """
   }
 
   after turn succeeds as work {
-    coerce reviewPatch(item.id, work.summary) as review
+    coerce reviewPatch(issue.id, work.summary) as review
   }
 
   after review succeeds as decision {
     append ReviewDecision {
-      ticketId item.id
+      ticketId issue.id
       area "frontend"
       verdict decision.verdict
     } to review_log as log_entry
@@ -128,20 +128,20 @@ rule implement_ready_ticket
   after log_entry succeeds {
     case decision.verdict {
       "merge" => {
-        finish item {
+        finish issue {
           summary turn.summary
         }
         record MergeRecord {
-          ticketId item.id
+          ticketId issue.id
           verdict "merge"
         }
       }
       "revise" => {
-        release item
+        release issue
       }
       "blocked" => {
         askHuman """markdown
-        Review blocked {{ item.id }}. Inspect the turn before continuing.
+        Review blocked {{ issue.id }}. Inspect the turn before continuing.
         """
       }
     }

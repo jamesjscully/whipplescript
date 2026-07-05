@@ -3,26 +3,26 @@ source_tags
 @service workflow MultiAgentBoundedConcurrency
 source_descriptions
 "Two agents with bounded capacity handing work to each other through a queue" workflow MultiAgentBoundedConcurrency
-queues
-  queue backlog tracker=builtin
+trackers
+  tracker backlog provider=builtin
 agents
   agent implementer harness=<fallback> provider=codex profile=repo-writer capacity=2 skills=[] capabilities=[] tools=[]
   agent reviewer harness=<fallback> provider=claude profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[]
 rules
   rule implement_ready_work
-    when backlog has ready item as item
+    when backlog has ready issue as issue
     when implementer is available
     reads
-      pattern:backlog has ready item as item
+      pattern:backlog has ready issue as issue
       pattern:implementer is available
     effects
-      lease kind=queue.claim binding=lease key=e0d536a1a81513be
+      active_claim kind=tracker.claim binding=active_claim key=31e03c41bb5953eb
       turn kind=agent.tell binding=turn key=5b6982b2c1404341
-      effect3 kind=queue.finish binding=- key=22fd3dde78d9ffee
+      effect3 kind=tracker.finish binding=- key=0d29a2e9d4b3995b
     dependencies
-      lease --succeeds--> turn
+      active_claim --succeeds--> turn
       turn --succeeds--> effect3
-    body_hash a9870df894e15fbb
+    body_hash aeb5bf8302a9f2d9
   rule review_completed_turn
     when implementer completed turn as turn
     when reviewer is available

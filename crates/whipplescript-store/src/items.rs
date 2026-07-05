@@ -22,7 +22,7 @@ use crate::StoreResult;
 
 /// Core status categories — the layer every surveyed tracker shares.
 /// `ready` is a derived predicate (open and unclaimed), never a status.
-pub const ITEM_STATUSES: &[&str] = &["open", "in_progress", "done", "cancelled"];
+pub const ITEM_STATUSES: &[&str] = &["open", "in_progress", "closed", "canceled", "archived"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkItem {
@@ -241,7 +241,7 @@ impl WorkItemStore {
         let changed = self.connection.execute(
             r#"
             UPDATE items
-            SET status = 'done', claim_summary = ?2, updated_at = CURRENT_TIMESTAMP
+            SET status = 'closed', claim_summary = ?2, updated_at = CURRENT_TIMESTAMP
             WHERE item_id = ?1 AND status IN ('open', 'in_progress')
             "#,
             params![item_id, summary],
@@ -417,7 +417,7 @@ mod tests {
         assert!(items.finish_item(&filed.id, Some("done")).expect("finish"));
         assert_eq!(
             items
-                .list_items(Some("backlog"), Some("done"))
+                .list_items(Some("backlog"), Some("closed"))
                 .expect("list")
                 .len(),
             1
@@ -581,7 +581,7 @@ mod tests {
             .finish_item(&item.id, Some("done by agent"))
             .expect("finishes"));
         let item = store.get_item(&item.id).expect("gets").expect("exists");
-        assert_eq!(item.status, "done");
+        assert_eq!(item.status, "closed");
         assert!(store.ready_items("backlog").expect("ready").is_empty());
     }
 }

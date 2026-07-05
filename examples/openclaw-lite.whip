@@ -23,8 +23,8 @@ class ReviewDecision {
   decidedBy string
 }
 
-queue backlog {
-  tracker builtin
+tracker backlog {
+  provider builtin
 }
 
 agent planner {
@@ -43,7 +43,7 @@ assert count(Heartbeat where status == "observed") == 1
 
 assert count(Plan where status == "ready") == 1
 
-assert count(effect kind queue.file where status == completed) == 1
+assert count(effect kind tracker.file where status == completed) == 1
 
 # OpenClaw-like scheduling is modeled as an ordinary observed heartbeat.
 rule observe_heartbeat
@@ -78,7 +78,7 @@ rule plan_recurring_work
       status "ready"
     }
 
-    file item into backlog {
+    file issue into backlog {
       title "Review stale automation"
       body planned.summary
     }

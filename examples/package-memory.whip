@@ -4,8 +4,8 @@ workflow PackageMemory
 
 use memory
 
-queue backlog {
-  tracker builtin
+tracker backlog {
+  provider builtin
 }
 
 agent worker {
@@ -15,27 +15,27 @@ agent worker {
 }
 
 rule recall_before_work
-  when backlog has ready item as item
+  when backlog has ready issue as issue
   when worker is available
 => {
-  claim item as lease
+  claim issue as active_claim
 
-  after lease succeeds {
-    call memory.query for item as context
+  after active_claim succeeds {
+    call memory.query for issue as context
   }
 
   after context succeeds as recalled {
     tell worker as turn """markdown
     Use the recalled project context explicitly while working:
 
-    {{ item.title }}
+    {{ issue.title }}
 
     {{ recalled.summary }}
     """
   }
 
   after turn succeeds as outcome {
-    finish item {
+    finish issue {
       summary outcome.summary
     }
   }
