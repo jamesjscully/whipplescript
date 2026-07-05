@@ -111,14 +111,18 @@ run_check external "Codex app-server schema pin" \
   "cd '$ROOT' && scripts/check-codex-app-server-schema.sh"
 run_check external "native provider endpoint health" \
   "cd '$ROOT' && WHIPPLESCRIPT_NATIVE_PROVIDER_HEALTH_LIVE='$STRICT_EXTERNAL' scripts/check-native-provider-endpoint-health.sh"
+# The disposable-target ack is scoped to THIS check (not global) so it does not
+# leak into the `real-provider destructive fixture gate`, which verifies that a
+# run WITHOUT the ack refuses. The artifact smoke's workspace is disposable by
+# construction, so the target is a marker; override either var to supply your own.
 run_check external "Codex app-server artifact smoke" \
-  "cd '$ROOT' && WHIPPLESCRIPT_CODEX_APP_SERVER_ARTIFACT_LIVE='$STRICT_EXTERNAL' scripts/check-codex-app-server-artifact-smoke.sh"
+  "cd '$ROOT' && WHIPPLESCRIPT_CODEX_APP_SERVER_ARTIFACT_LIVE='$STRICT_EXTERNAL' WHIPPLESCRIPT_CODEX_DISPOSABLE_ACK=\"\${WHIPPLESCRIPT_CODEX_DISPOSABLE_ACK:-I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE}\" WHIPPLESCRIPT_CODEX_DISPOSABLE_TARGET=\"\${WHIPPLESCRIPT_CODEX_DISPOSABLE_TARGET:-release-gate-disposable-codex-artifact-marker}\" scripts/check-codex-app-server-artifact-smoke.sh"
 run_check external "Codex app-server error smoke" \
   "cd '$ROOT' && WHIPPLESCRIPT_CODEX_APP_SERVER_ERROR_LIVE='$STRICT_EXTERNAL' scripts/check-codex-app-server-error-smoke.sh"
 run_check external "Codex native workflow smoke" \
   "cd '$ROOT' && WHIPPLESCRIPT_CODEX_NATIVE_WORKFLOW_LIVE='$STRICT_EXTERNAL' scripts/check-codex-native-workflow-smoke.sh"
 run_check external "Claude Agent SDK surface" \
-  "cd '$ROOT' && scripts/check-claude-agent-sdk-surface.sh && node --check scripts/claude-agent-sdk-sidecar.mjs && scripts/check-claude-agent-sdk-live-smoke.sh && scripts/check-claude-agent-sdk-interrupt-smoke.sh && WHIPPLESCRIPT_CLAUDE_AGENT_SDK_ARTIFACT_LIVE='$STRICT_EXTERNAL' scripts/check-claude-agent-sdk-artifact-smoke.sh && WHIPPLESCRIPT_CLAUDE_AGENT_SDK_ERROR_LIVE='$STRICT_EXTERNAL' scripts/check-claude-agent-sdk-error-smoke.sh"
+  "cd '$ROOT' && scripts/check-claude-agent-sdk-surface.sh && node --check scripts/claude-agent-sdk-sidecar.mjs && scripts/check-claude-agent-sdk-live-smoke.sh && scripts/check-claude-agent-sdk-interrupt-smoke.sh && WHIPPLESCRIPT_CLAUDE_AGENT_SDK_ARTIFACT_LIVE='$STRICT_EXTERNAL' WHIPPLESCRIPT_CLAUDE_DISPOSABLE_ACK=\"\${WHIPPLESCRIPT_CLAUDE_DISPOSABLE_ACK:-I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE}\" WHIPPLESCRIPT_CLAUDE_DISPOSABLE_TARGET=\"\${WHIPPLESCRIPT_CLAUDE_DISPOSABLE_TARGET:-release-gate-disposable-claude-artifact-marker}\" scripts/check-claude-agent-sdk-artifact-smoke.sh && WHIPPLESCRIPT_CLAUDE_AGENT_SDK_ERROR_LIVE='$STRICT_EXTERNAL' scripts/check-claude-agent-sdk-error-smoke.sh"
 run_check external "Claude native workflow smoke" \
   "cd '$ROOT' && WHIPPLESCRIPT_CLAUDE_NATIVE_WORKFLOW_LIVE='$STRICT_EXTERNAL' scripts/check-claude-native-workflow-smoke.sh"
 # Pi native-provider validation is DEFERRED from the v0.2 native gate (Jack,
