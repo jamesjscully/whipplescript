@@ -4395,7 +4395,13 @@ impl SqliteStore {
             });
         }
 
-        let fingerprint = execution_fingerprint_on(&tx, run.instance_id, run.effect_id)?;
+        let fingerprint_salt = fingerprint_salt_from_metadata(run.metadata_json);
+        let fingerprint = execution_fingerprint_on(
+            &tx,
+            run.instance_id,
+            run.effect_id,
+            fingerprint_salt.as_deref(),
+        )?;
         let run_metadata = inject_execution_fingerprint(run.metadata_json, &fingerprint);
         let payload = run_start_payload(run, &run_metadata);
         let event = append_event_on(
@@ -8237,6 +8243,7 @@ fn execution_fingerprint_on(
     connection: &Connection,
     instance_id: &str,
     effect_id: &str,
+    salt: Option<&str>,
 ) -> StoreResult<String> {
     let input_json: String = connection
         .query_row(
@@ -8256,10 +8263,33 @@ fn execution_fingerprint_on(
         })?
         .collect::<Result<_, _>>()?;
     upstream.sort();
-    Ok(stable_hash_hex(&format!(
-        "{input_json}|{}",
-        upstream.join(",")
-    )))
+    let base = format!("{input_json}|{}", upstream.join(","));
+    // A non-empty salt (the runtime-resolved model for `schema.coerce` runs,
+    // carried in run metadata under `__fingerprint_model`; DR-0014 amendment)
+    // makes the execution fingerprint model-sensitive, so a coercion whose only
+    // change is the model re-runs instead of deduping a stale result. An
+    // absent/empty salt keeps the fingerprint byte-identical to the pre-salt
+    // behaviour for every other effect kind.
+    let fingerprint_input = match salt {
+        Some(salt) if !salt.is_empty() => format!("{base}|model={salt}"),
+        _ => base,
+    };
+    Ok(stable_hash_hex(&fingerprint_input))
+}
+
+/// The reserved run-metadata key carrying the runtime-resolved model for a
+/// `schema.coerce` run, folded into the execution fingerprint (DR-0014). A run
+/// whose `metadata_json` sets this key gets a model-sensitive fingerprint.
+pub const FINGERPRINT_MODEL_METADATA_KEY: &str = "__fingerprint_model";
+
+/// Extract the fingerprint model salt from a run's metadata JSON, if present.
+fn fingerprint_salt_from_metadata(metadata_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(metadata_json)
+        .ok()?
+        .get(FINGERPRINT_MODEL_METADATA_KEY)
+        .and_then(|value| value.as_str())
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
 }
 
 #[cfg(feature = "native")]
@@ -10295,12 +10325,51 @@ mod tests {
         // It is the deterministic materialized-input fingerprint.
         assert_eq!(
             fingerprint,
-            execution_fingerprint_on(&store.connection, "instance-a", "tell").expect("recompute")
+            execution_fingerprint_on(&store.connection, "instance-a", "tell", None)
+                .expect("recompute")
         );
         // A different materialized input is a different fingerprint.
         assert_ne!(
-            execution_fingerprint_on(&store.connection, "instance-a", "tell").expect("fp tell"),
-            execution_fingerprint_on(&store.connection, "instance-a", "other").expect("fp other"),
+            execution_fingerprint_on(&store.connection, "instance-a", "tell", None)
+                .expect("fp tell"),
+            execution_fingerprint_on(&store.connection, "instance-a", "other", None)
+                .expect("fp other"),
+        );
+
+        // DR-0014: the model salt makes the execution fingerprint model-sensitive
+        // so a coercion whose only change is the model re-runs. An empty/absent
+        // salt is byte-identical to the pre-salt fingerprint (every other effect).
+        let base =
+            execution_fingerprint_on(&store.connection, "instance-a", "tell", None).expect("base");
+        assert_eq!(
+            base,
+            execution_fingerprint_on(&store.connection, "instance-a", "tell", Some(""))
+                .expect("empty salt"),
+            "an empty salt leaves the fingerprint unchanged",
+        );
+        assert_ne!(
+            base,
+            execution_fingerprint_on(&store.connection, "instance-a", "tell", Some("gpt-5"))
+                .expect("salted"),
+            "a model salt changes the fingerprint",
+        );
+        assert_ne!(
+            execution_fingerprint_on(&store.connection, "instance-a", "tell", Some("gpt-5"))
+                .expect("model a"),
+            execution_fingerprint_on(&store.connection, "instance-a", "tell", Some("claude"))
+                .expect("model b"),
+            "different models produce different fingerprints",
+        );
+        // The salt is carried under the reserved run-metadata key.
+        assert_eq!(
+            fingerprint_salt_from_metadata(r#"{"__fingerprint_model":"gpt-5"}"#).as_deref(),
+            Some("gpt-5"),
+        );
+        assert_eq!(fingerprint_salt_from_metadata("{}"), None);
+        assert_eq!(
+            fingerprint_salt_from_metadata(r#"{"__fingerprint_model":""}"#),
+            None,
+            "an empty model is treated as no salt",
         );
     }
 

@@ -345,6 +345,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             lease_id: &lease_id,
                             lease_expires_at: "2030-01-01T00:00:00Z",
                             request: &request,
+                            model: None,
                         };
                         self.kernel.settle_coerce_result(execution, &result)?
                     }

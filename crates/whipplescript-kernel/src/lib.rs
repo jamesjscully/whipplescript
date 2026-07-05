@@ -113,6 +113,11 @@ pub struct CoerceExecution<'a> {
     pub lease_id: &'a str,
     pub lease_expires_at: &'a str,
     pub request: &'a CoerceRequest,
+    /// The runtime-resolved model, if any, folded into the run's execution
+    /// fingerprint so a coercion whose only change is the model re-runs
+    /// (DR-0014). `None` for the fixture path and any run without a resolved
+    /// model — fingerprint stays model-insensitive, exactly as before.
+    pub model: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1596,6 +1601,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         execution: CoerceExecution<'_>,
         client: &dyn CoerceClient,
     ) -> StoreResult<StoredEvent> {
+        let start_metadata = coerce_run_start_metadata(execution.model);
         self.start_run(RunStart {
             instance_id: execution.instance_id,
             effect_id: execution.effect_id,
@@ -1604,7 +1610,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             worker_id: execution.worker_id,
             lease_id: execution.lease_id,
             lease_expires_at: execution.lease_expires_at,
-            metadata_json: "{}",
+            metadata_json: &start_metadata,
         })?;
 
         let result = client.coerce(execution.request);
@@ -3696,6 +3702,24 @@ fn coerce_exit_code(status: &CoerceStatus) -> Option<i64> {
         CoerceStatus::Succeeded => Some(0),
         CoerceStatus::Failed => Some(1),
         CoerceStatus::TimedOut => None,
+    }
+}
+
+/// Build a coerce run's start metadata, carrying the runtime-resolved model
+/// under the store's fingerprint-model key so `start_run` folds it into the
+/// execution fingerprint (DR-0014). No model (or empty) yields `{}`, leaving the
+/// fingerprint model-insensitive exactly as before.
+fn coerce_run_start_metadata(model: Option<&str>) -> String {
+    match model.filter(|model| !model.is_empty()) {
+        Some(model) => {
+            let mut map = serde_json::Map::new();
+            map.insert(
+                whipplescript_store::FINGERPRINT_MODEL_METADATA_KEY.to_owned(),
+                serde_json::Value::String(model.to_owned()),
+            );
+            serde_json::Value::Object(map).to_string()
+        }
+        None => "{}".to_owned(),
     }
 }
 
@@ -6751,6 +6775,7 @@ rule wait
                     lease_id: "lease-review",
                     lease_expires_at: "2030-01-01T00:00:00Z",
                     request: &request,
+                    model: None,
                 },
                 &FakeCoerceClient::succeeds(r#"{"status":"Accept","reason":"ok"}"#),
             )
@@ -6852,6 +6877,7 @@ rule wait
                     lease_id: "lease-review",
                     lease_expires_at: "2030-01-01T00:00:00Z",
                     request: &request,
+                    model: None,
                 },
                 &FakeCoerceClient::fails("invalid output"),
             )

@@ -23379,6 +23379,7 @@ fn run_coerce_effect(
             lease_id: &lease_id,
             lease_expires_at: "2030-01-01T00:00:00Z",
             request: &request,
+            model: None,
         },
         &client,
     )
@@ -23565,6 +23566,7 @@ fn run_native_coerce_effect(
             lease_id: &lease_id,
             lease_expires_at: "2030-01-01T00:00:00Z",
             request,
+            model: Some(client.model.as_str()),
         },
         &client,
     )

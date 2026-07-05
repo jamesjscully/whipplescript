@@ -222,6 +222,7 @@ fn e2e_coerce_success_and_failure_branches_are_deterministic() {
                 lease_id: "lease-classification",
                 lease_expires_at: "2030-01-01T00:00:00Z",
                 request: &request,
+                model: None,
             },
             &FakeCoerceClient::succeeds(
                 r#"{"priority":"Urgent","summary":"triage now","confidence":0.99}"#,
@@ -275,6 +276,7 @@ fn e2e_coerce_success_and_failure_branches_are_deterministic() {
                 lease_id: "lease-classification",
                 lease_expires_at: "2030-01-01T00:00:00Z",
                 request: &request,
+                model: None,
             },
             &FakeCoerceClient::fails("invalid classification"),
         )
