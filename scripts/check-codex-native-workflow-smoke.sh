@@ -45,6 +45,7 @@ cat >"$WORKFLOW" <<'WHIP'
 workflow CodexNativeWorkflowSmoke
 
 agent worker {
+  provider codex
   profile "repo-reader"
   capacity 1
 }

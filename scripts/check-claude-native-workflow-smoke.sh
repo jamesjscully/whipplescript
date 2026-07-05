@@ -46,6 +46,7 @@ cat >"$WORKFLOW" <<'WHIP'
 workflow ClaudeNativeWorkflowSmoke
 
 agent worker {
+  provider claude
   profile "repo-reader"
   capacity 1
 }
