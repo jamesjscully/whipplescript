@@ -7344,7 +7344,7 @@ mod tests {
         store
             .register_effect_provider(EffectProviderRegistration {
                 provider_id: "prov_1",
-                effect_kind: "coerce",
+                effect_kind: "schema.coerce",
                 provider: "anthropic",
                 capability: "std.model",
                 config_json: "{}",
@@ -7560,7 +7560,7 @@ mod tests {
         e(
             "INSERT INTO effects (effect_id, instance_id, kind, target, status, program_version_id) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            &[text("eff_1"), text("i1"), text("coerce"), SqlValue::Null, text("queued"), text("ver_1")],
+            &[text("eff_1"), text("i1"), text("schema.coerce"), SqlValue::Null, text("queued"), text("ver_1")],
         );
         e(
             "INSERT INTO runs (run_id, instance_id, effect_id, provider, worker_id, status, \
@@ -7975,7 +7975,7 @@ mod tests {
             &[
                 text("eff_1"),
                 text("i1"),
-                text("coerce"),
+                text("schema.coerce"),
                 text("queued"),
                 text("evt_create"),
             ],
@@ -8249,7 +8249,7 @@ mod tests {
             &[
                 text("up"),
                 text("i1"),
-                text("coerce"),
+                text("schema.coerce"),
                 text("completed"),
                 text("{}"),
             ],
@@ -8260,7 +8260,7 @@ mod tests {
             &[
                 text("down"),
                 text("i1"),
-                text("coerce"),
+                text("schema.coerce"),
                 text("blocked_by_dependency"),
                 text("{}"),
             ],
@@ -8339,7 +8339,7 @@ mod tests {
                 &[
                     text("eff_1"),
                     text("i1"),
-                    text("coerce"),
+                    text("schema.coerce"),
                     text("queued"),
                     text("{}"),
                 ],
@@ -8605,7 +8605,7 @@ mod tests {
             &[
                 text("eff_1"),
                 text("i1"),
-                text("coerce"),
+                text("schema.coerce"),
                 text("running"),
                 text("{}"),
             ],
@@ -8673,7 +8673,7 @@ mod tests {
                 &[
                     text("eff_1"),
                     text("i1"),
-                    text("coerce"),
+                    text("schema.coerce"),
                     text("failed"),
                     text("{}"),
                 ],
@@ -8757,7 +8757,7 @@ mod tests {
             &[
                 text("eff_p"),
                 text("i1"),
-                text("coerce"),
+                text("schema.coerce"),
                 text("queued"),
                 text("{}"),
                 text("[]"),
@@ -8864,7 +8864,7 @@ mod tests {
             &[
                 text("eff_p"),
                 text("i1"),
-                text("coerce"),
+                text("schema.coerce"),
                 text("queued"),
                 text("{}"),
                 text("[]"),
@@ -8973,12 +8973,12 @@ mod tests {
             (
                 "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                vec![text("eff_1"), text("i1"), text("coerce"), text("running"), text("{}")],
+                vec![text("eff_1"), text("i1"), text("schema.coerce"), text("running"), text("{}")],
             ),
             (
                 "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                vec![text("eff_dep"), text("i1"), text("coerce"), text("blocked_by_dependency"), text("{}")],
+                vec![text("eff_dep"), text("i1"), text("schema.coerce"), text("blocked_by_dependency"), text("{}")],
             ),
             (
                 "INSERT INTO effect_dependencies (instance_id, downstream_effect_id, \
@@ -9064,7 +9064,7 @@ mod tests {
                 &[
                     text("eff_2"),
                     text("i1"),
-                    text("coerce"),
+                    text("schema.coerce"),
                     text("running"),
                     text("{}"),
                 ],
@@ -9168,7 +9168,7 @@ mod tests {
         }];
         let effects = [NewEffect {
             effect_id: "eff_new",
-            kind: "coerce",
+            kind: "schema.coerce",
             target: None,
             input_json: "{}",
             status: "queued",
@@ -9356,7 +9356,7 @@ mod tests {
             &[
                 text("eff_q"),
                 text("i1"),
-                text("coerce"),
+                text("schema.coerce"),
                 text("queued"),
                 text("{}"),
             ],
@@ -9367,7 +9367,7 @@ mod tests {
             &[
                 text("eff_r"),
                 text("i1"),
-                text("coerce"),
+                text("schema.coerce"),
                 text("running"),
                 text("{}"),
             ],
@@ -9517,7 +9517,7 @@ mod tests {
             (
                 "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                vec![text("eff_q"), text("i1"), text("coerce"), text("queued"), text("{}")],
+                vec![text("eff_q"), text("i1"), text("schema.coerce"), text("queued"), text("{}")],
             ),
         ] {
             store.sql.execute(sql, &params).expect("seed");

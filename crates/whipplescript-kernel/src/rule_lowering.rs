@@ -2072,7 +2072,7 @@ pub struct ParsedEffect {
 impl ParsedEffect {
     pub fn required_capabilities_json(&self) -> String {
         let mut capabilities = match self.kind.as_str() {
-            "coerce" => vec!["coerce".to_owned()],
+            "schema.coerce" => vec!["schema.coerce".to_owned()],
             "loft.claim" => vec!["loft.claim".to_owned()],
             "human.ask" => vec!["human.ask".to_owned()],
             "capability.call" => Vec::new(),
@@ -2628,7 +2628,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 .unwrap_or_default();
             effects.push(ParsedEffect {
                 timeout_seconds: parse_timeout_clause_seconds(trimmed),
-                kind: "coerce".to_owned(),
+                kind: "schema.coerce".to_owned(),
                 target: None,
                 name: Some("decide".to_owned()),
                 binding: binding_after_as(trimmed),
@@ -2901,7 +2901,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
             if binding.is_some() {
                 effects.push(ParsedEffect {
                     timeout_seconds: parse_timeout_clause_seconds(&statement),
-                    kind: "coerce".to_owned(),
+                    kind: "schema.coerce".to_owned(),
                     target: prompt_provider_after_using(&statement),
                     name: Some("prompt".to_owned()),
                     binding,
@@ -2926,7 +2926,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 .unwrap_or_default();
             effects.push(ParsedEffect {
                 timeout_seconds: parse_timeout_clause_seconds(trimmed),
-                kind: "coerce".to_owned(),
+                kind: "schema.coerce".to_owned(),
                 target: Some(name.to_owned()),
                 name: Some(name.to_owned()),
                 binding: binding_after_as(trimmed),
@@ -3408,7 +3408,7 @@ pub fn parsed_effect_input_json(
                 "rule": rule.name,
             })
         }
-        "coerce" => {
+        "schema.coerce" => {
             let function_name = effect.name.as_deref().unwrap_or("coerce");
             let coerce_prompt = if function_name == "prompt" {
                 Some(ParsedPrompt {
@@ -3854,7 +3854,10 @@ pub fn parsed_effect_input_json(
             }
         }
     }
-    if matches!(effect.kind.as_str(), "agent.tell" | "human.ask" | "coerce") {
+    if matches!(
+        effect.kind.as_str(),
+        "agent.tell" | "human.ask" | "schema.coerce"
+    ) {
         if let Some(content_type) = &effect.prompt_content_type {
             if let Some(object) = input.as_object_mut() {
                 object.insert(

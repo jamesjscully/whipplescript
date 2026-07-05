@@ -1403,7 +1403,7 @@ pub struct IrConstructUse {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IrEffectKind {
     AgentTell,
-    Coerce,
+    SchemaCoerce,
     LoftClaim,
     HumanAsk,
     CapabilityCall,
@@ -2762,11 +2762,11 @@ impl IrProgram {
             register_standard_library(&mut libraries, "std.messaging");
         }
         if !self.coerces.is_empty() {
-            register_standard_library(&mut libraries, "std.coerce");
+            register_standard_library(&mut libraries, "std.coercion");
             register_effect_contract(
                 &mut libraries,
                 &mut contracts,
-                IrEffectKind::Coerce,
+                IrEffectKind::SchemaCoerce,
                 Vec::new(),
             );
         }
@@ -3402,10 +3402,10 @@ fn effect_contract_for_kind(
             strings(&["effect.output"]),
             TypedOutputValidation::RuntimeBoundary,
         ),
-        IrEffectKind::Coerce => (
-            "std.coerce",
+        IrEffectKind::SchemaCoerce => (
+            "std.coercion",
             strings(&["coerce", "decide", "prompt"]),
-            Some("coerce.input"),
+            Some("schema.coerce.input"),
             Some("typed-provider-output"),
             strings(&["model.invoke"]),
             strings(&["model"]),
@@ -3637,7 +3637,7 @@ impl IrEffectKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AgentTell => "agent.tell",
-            Self::Coerce => "coerce",
+            Self::SchemaCoerce => "schema.coerce",
             Self::LoftClaim => "loft.claim",
             Self::HumanAsk => "human.ask",
             Self::CapabilityCall => "capability.call",
@@ -4759,7 +4759,9 @@ fn expand_pattern_item(
             Item::Include(include),
         )),
         Item::Use(use_decl) => Some((format!("use:{}", use_decl.name.value), Item::Use(use_decl))),
-        Item::Tracker(queue) => Some((format!("tracker:{}", queue.name.name), Item::Tracker(queue))),
+        Item::Tracker(queue) => {
+            Some((format!("tracker:{}", queue.name.name), Item::Tracker(queue)))
+        }
         Item::Channel(channel) => Some((
             format!("channel:{}", channel.name.name),
             Item::Channel(channel),
@@ -8806,10 +8808,10 @@ fn terminal_completed_payload_type(
     semantic: &SemanticContext,
 ) -> IrType {
     match kind {
-        IrEffectKind::Coerce if line.starts_with("prompt ") => {
+        IrEffectKind::SchemaCoerce if line.starts_with("prompt ") => {
             IrType::Primitive(IrPrimitiveType::String)
         }
-        IrEffectKind::Coerce => parse_coerce_call_name(line)
+        IrEffectKind::SchemaCoerce => parse_coerce_call_name(line)
             .and_then(|name| semantic.coerce_outputs.get(name))
             .cloned()
             .map(lower_type)
@@ -9354,7 +9356,7 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
         body::BodyEffectKind::Tell { .. } => IrEffectKind::AgentTell,
         body::BodyEffectKind::Coerce { .. }
         | body::BodyEffectKind::Prompt { .. }
-        | body::BodyEffectKind::Decide { .. } => IrEffectKind::Coerce,
+        | body::BodyEffectKind::Decide { .. } => IrEffectKind::SchemaCoerce,
         body::BodyEffectKind::AskHuman { .. } => IrEffectKind::HumanAsk,
         body::BodyEffectKind::Call { .. }
         | body::BodyEffectKind::ConstructCapabilityCall { .. } => IrEffectKind::CapabilityCall,
@@ -12323,7 +12325,9 @@ fn binding_from_when(when: &str) -> Option<(String, String)> {
     let has_ready_issue = {
         let mut words = pattern.split_whitespace();
         words.next();
-        words.next() == Some("has") && words.next() == Some("ready") && words.next() == Some("issue")
+        words.next() == Some("has")
+            && words.next() == Some("ready")
+            && words.next() == Some("issue")
     };
     let schema = if let Some(rest) = pattern.strip_prefix("fact ") {
         rest.split_whitespace().next()?.to_owned()
@@ -12366,7 +12370,7 @@ fn effect_binding_schema(
     match kind {
         IrEffectKind::LoftClaim => Some("LoftClaim".to_owned()),
         IrEffectKind::HumanAsk => Some("HumanAnswer".to_owned()),
-        IrEffectKind::Coerce => parse_coerce_call_name(line).and_then(|name| {
+        IrEffectKind::SchemaCoerce => parse_coerce_call_name(line).and_then(|name| {
             semantic
                 .coerce_outputs
                 .get(name)
@@ -15915,7 +15919,7 @@ fn parse_effect_line(line: &str) -> Option<(IrEffectKind, Option<String>)> {
     let kind = if line.starts_with("tell ") {
         IrEffectKind::AgentTell
     } else if line.starts_with("coerce ") || line.starts_with("prompt ") {
-        IrEffectKind::Coerce
+        IrEffectKind::SchemaCoerce
     } else if line.starts_with("claim ") {
         IrEffectKind::LoftClaim
     } else if line.starts_with("askHuman") {
@@ -20705,14 +20709,14 @@ rule start
         assert!(registry
             .libraries
             .iter()
-            .any(|library| library.id == "std.coerce" && library.standard));
+            .any(|library| library.id == "std.coercion" && library.standard));
 
         let coerce = registry
             .effect_contracts
             .iter()
-            .find(|contract| contract.id == "coerce")
+            .find(|contract| contract.id == "schema.coerce")
             .expect("coerce contract");
-        assert_eq!(coerce.library_id, "std.coerce");
+        assert_eq!(coerce.library_id, "std.coercion");
         assert_eq!(coerce.validation, TypedOutputValidation::RuntimeBoundary);
         assert!(coerce.source_forms.contains(&"coerce".to_owned()));
         assert!(coerce.source_forms.contains(&"prompt".to_owned()));
@@ -21063,13 +21067,13 @@ lease shared_slot { shared key Key slots 1 ttl 30m }
             (
                 "coerce",
                 r#"    coerce classify(ticket.title) as review"#,
-                IrEffectKind::Coerce,
+                IrEffectKind::SchemaCoerce,
                 Some("review"),
             ),
             (
                 "prompt",
                 r#"    prompt "Summarize {{ ticket.title }}" using fixture as summary"#,
-                IrEffectKind::Coerce,
+                IrEffectKind::SchemaCoerce,
                 Some("summary"),
             ),
             (
@@ -21081,7 +21085,7 @@ lease shared_slot { shared key Key slots 1 ttl 30m }
             (
                 "decide",
                 r#"    decide "fixed?" -> { fixed bool } as verdict"#,
-                IrEffectKind::Coerce,
+                IrEffectKind::SchemaCoerce,
                 Some("verdict"),
             ),
             (
@@ -21355,13 +21359,13 @@ rule ask
             .iter()
             .find(|effect| effect.binding.as_deref() == Some("answer"))
             .expect("prompt effect");
-        assert_eq!(effect.kind, IrEffectKind::Coerce);
+        assert_eq!(effect.kind, IrEffectKind::SchemaCoerce);
 
         let coerce = ir
             .contract_registry()
             .effect_contracts
             .into_iter()
-            .find(|contract| contract.id == "coerce")
+            .find(|contract| contract.id == "schema.coerce")
             .expect("coerce contract");
         assert!(coerce.source_forms.contains(&"prompt".to_owned()));
     }

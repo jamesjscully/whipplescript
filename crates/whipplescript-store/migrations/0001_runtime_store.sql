@@ -374,7 +374,7 @@ CREATE TABLE inbox_items (
 INSERT INTO capability_schemas (capability, description, schema_json)
 VALUES
     ('agent.tell', 'Run an agent turn through a provider harness.', '{}'),
-    ('coerce', 'Coerce unstructured data into a typed value.', '{}'),
+    ('schema.coerce', 'Coerce unstructured data into a typed value.', '{}'),
     ('loft.show', 'Read a Loft issue as JSON.', '{}'),
     ('loft.claim', 'Claim external work before provider execution.', '{}'),
     ('loft.renew', 'Renew a local Loft execution lease.', '{}'),
@@ -398,7 +398,7 @@ VALUES
 INSERT INTO effect_providers (provider_id, effect_kind, provider, capability)
 VALUES
     ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell'),
-    ('provider_coerce_builtin', 'coerce', 'builtin-coerce', 'coerce'),
+    ('provider_coerce_builtin', 'schema.coerce', 'builtin-coerce', 'schema.coerce'),
     ('provider_loft_show_builtin', 'loft.show', 'builtin-loft', 'loft.show'),
     ('provider_loft_claim_builtin', 'loft.claim', 'builtin-loft', 'loft.claim'),
     ('provider_loft_renew_builtin', 'loft.renew', 'builtin-loft', 'loft.renew'),
@@ -418,15 +418,15 @@ VALUES
 INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities)
 VALUES
     ('profile_permissive', 'permissive', 'Allow all registered capabilities.', 'audit', '["*"]'),
-    ('profile_repo_reader', 'repo-reader', 'Allow repository reads and agent turns without writes.', 'enforce', '["agent.tell","repo.read","human.ask","coerce","event.emit","workflow.invoke"]'),
-    ('profile_repo_writer', 'repo-writer', 'Allow repository-writing agent workflows.', 'enforce', '["agent.tell","repo.read","repo.write","command.run","loft.show","loft.claim","loft.renew","loft.release","loft.note","loft.transition","loft.evidence","loft.resource_intent","loft.complete","loft.fail","human.ask","coerce","event.emit","workflow.invoke","capability.call"]'),
-    ('profile_internet_research', 'internet-research', 'Allow networked research workflows.', 'enforce', '["agent.tell","internet.research","human.ask","coerce","event.emit","workflow.invoke"]'),
+    ('profile_repo_reader', 'repo-reader', 'Allow repository reads and agent turns without writes.', 'enforce', '["agent.tell","repo.read","human.ask","schema.coerce","event.emit","workflow.invoke"]'),
+    ('profile_repo_writer', 'repo-writer', 'Allow repository-writing agent workflows.', 'enforce', '["agent.tell","repo.read","repo.write","command.run","loft.show","loft.claim","loft.renew","loft.release","loft.note","loft.transition","loft.evidence","loft.resource_intent","loft.complete","loft.fail","human.ask","schema.coerce","event.emit","workflow.invoke","capability.call"]'),
+    ('profile_internet_research', 'internet-research', 'Allow networked research workflows.', 'enforce', '["agent.tell","internet.research","human.ask","schema.coerce","event.emit","workflow.invoke"]'),
     ('profile_human_review', 'human-review', 'Allow human review requests, answers, and read-only repository context.', 'enforce', '["human.ask","repo.read","event.emit","workflow.invoke"]');
 
 INSERT INTO capability_bindings (binding_id, program_id, capability, provider)
 VALUES
     ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness'),
-    ('binding_coerce_builtin', NULL, 'coerce', 'builtin-coerce'),
+    ('binding_coerce_builtin', NULL, 'schema.coerce', 'builtin-coerce'),
     ('binding_loft_show_builtin', NULL, 'loft.show', 'builtin-loft'),
     ('binding_loft_claim_builtin', NULL, 'loft.claim', 'builtin-loft'),
     ('binding_loft_renew_builtin', NULL, 'loft.renew', 'builtin-loft'),

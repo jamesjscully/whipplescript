@@ -2062,7 +2062,7 @@ flow f
             rule.body
         );
         assert!(rule.metadata.effects.iter().any(|effect| {
-            effect.kind == crate::IrEffectKind::Coerce
+            effect.kind == crate::IrEffectKind::SchemaCoerce
                 && effect.binding.as_deref() == Some("summary")
         }));
     }

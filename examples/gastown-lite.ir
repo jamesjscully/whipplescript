@@ -60,7 +60,7 @@ rules
       turn kind=agent.tell binding=turn key=0f484580de9b735e
       effect4 kind=tracker.release binding=- key=aed137f183034383
       effect5 kind=human.ask binding=- key=22a2e9667ad9099f
-      review kind=coerce binding=review key=26c43d260ec4c541
+      review kind=schema.coerce binding=review key=6b1a67e24724727a
       log_entry kind=ledger.append binding=log_entry key=486742921bd48ea1
       effect8 kind=tracker.finish binding=- key=c02fb4f193f8720d
       effect9 kind=tracker.release binding=- key=fe5eb51b72fd3d06

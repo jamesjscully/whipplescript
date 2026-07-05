@@ -11,7 +11,7 @@ pub enum ProviderKind {
     Pi,
     Fixture,
     Command,
-    Coerce,
+    SchemaCoerce,
     Loft,
 }
 
@@ -23,7 +23,7 @@ impl ProviderKind {
             Self::Pi => "pi",
             Self::Fixture => "fixture",
             Self::Command => "command",
-            Self::Coerce => "coerce",
+            Self::SchemaCoerce => "schema_coercer",
             Self::Loft => "loft",
         }
     }
@@ -35,7 +35,7 @@ impl ProviderKind {
             "pi" => Some(Self::Pi),
             "fixture" => Some(Self::Fixture),
             "command" => Some(Self::Command),
-            "coerce" => Some(Self::Coerce),
+            "schema_coercer" => Some(Self::SchemaCoerce),
             "loft" => Some(Self::Loft),
             _ => None,
         }

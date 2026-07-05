@@ -256,7 +256,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
             // and yields `NeedsHttp`; the host awaits `fetch` and re-enters with the
             // response, which `parse_response` + `settle_coerce_result` turn into the
             // terminal — every piece host-neutral in the kernel but the creds.
-            "coerce" => {
+            "schema.coerce" => {
                 let cfg = self.coerce.ok_or_else(|| {
                     StoreError::Conflict(
                         "coerce provider is not configured on this durable object".to_owned(),
@@ -547,11 +547,11 @@ mod tests {
         let store = store();
         for stmt in [
             "INSERT INTO capability_schemas (capability, description, schema_json) \
-             VALUES ('coerce', 'Coerce unstructured data into a typed value.', '{}')",
+             VALUES ('schema.coerce', 'Coerce unstructured data into a typed value.', '{}')",
             "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
-             VALUES ('provider_coerce_builtin', 'coerce', 'builtin-coerce', 'coerce', '{}')",
+             VALUES ('provider_coerce_builtin', 'schema.coerce', 'builtin-coerce', 'schema.coerce', '{}')",
             "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
-             VALUES ('binding_coerce_builtin', NULL, 'coerce', 'builtin-coerce', '{}')",
+             VALUES ('binding_coerce_builtin', NULL, 'schema.coerce', 'builtin-coerce', '{}')",
         ] {
             store.sql.execute(stmt, &[]).expect("seed coerce provider");
         }

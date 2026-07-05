@@ -20899,6 +20899,7 @@ const RETIRED_EFFECT_KINDS: &[&str] = &[
     "queue.claim",   // S3 → tracker.claim
     "queue.release", // S3 → tracker.release
     "queue.finish",  // S3 → tracker.finish
+    "coerce",        // S2 → schema.coerce
 ];
 
 fn is_retired_effect_kind(kind: &str) -> bool {
@@ -20938,7 +20939,7 @@ fn run_claimable_effect(
     let instance_id = &options.instance_id;
     let result = match effect.kind.as_str() {
         "agent.tell" => run_agent_effect(store_path, instance_id, effect, options),
-        "coerce" => run_coerce_effect(store_path, instance_id, effect, options),
+        "schema.coerce" => run_coerce_effect(store_path, instance_id, effect, options),
         "loft.claim" => run_loft_effect(store_path, instance_id, effect, options),
         "human.ask" => run_human_effect(store_path, instance_id, effect, options),
         "capability.call" => {
@@ -31213,7 +31214,7 @@ fn otel_export(options: &CliOptions) -> ExitCode {
             attributes.push(otel_attr("whipplescript.effect.kind", &effect.kind));
             // GenAI semantic conventions (version-pinned in the spec) for
             // model-backed spans, so fleets land in LLM dashboards natively.
-            if effect.kind == "agent.tell" || effect.kind == "coerce" {
+            if effect.kind == "agent.tell" || effect.kind == "schema.coerce" {
                 attributes.push(otel_attr("gen_ai.system", &run.provider));
             }
         }
@@ -37060,7 +37061,8 @@ mod tests {
         assert!(is_retired_effect_kind("queue.finish"));
         assert!(!is_retired_effect_kind("signal.emit"));
         assert!(!is_retired_effect_kind("lease.release"));
-        assert!(!is_retired_effect_kind("coerce"));
+        assert!(is_retired_effect_kind("coerce"));
+        assert!(!is_retired_effect_kind("schema.coerce"));
         assert!(!is_retired_effect_kind("tracker.claim"));
     }
 
@@ -37631,14 +37633,14 @@ coerce review() -> Review {
             .and_then(Value::as_array)
             .expect("libraries")
             .iter()
-            .any(|library| library.get("id").and_then(Value::as_str) == Some("std.coerce")));
+            .any(|library| library.get("id").and_then(Value::as_str) == Some("std.coercion")));
         assert!(registry
             .get("effect_contracts")
             .and_then(Value::as_array)
             .expect("effect contracts")
             .iter()
             .any(|contract| {
-                contract.get("id").and_then(Value::as_str) == Some("coerce")
+                contract.get("id").and_then(Value::as_str) == Some("schema.coerce")
                     && contract.get("validation").and_then(Value::as_str)
                         == Some("runtime_boundary")
             }));
@@ -38329,7 +38331,7 @@ coerce review() -> Review {
       "effect_contracts": [
         {
           "id": "memory.query",
-          "effect_kind": "coerce",
+          "effect_kind": "schema.coerce",
           "required_capabilities": ["memory.query"]
         }
       ]
@@ -44612,7 +44614,7 @@ prompt "Summarize {{ ticket.title }}" as summary
 "#;
         let effects = parse_effect_statements(body, &RuleContext::default());
         assert_eq!(effects.len(), 1, "only the real prompt effect: {effects:?}");
-        assert_eq!(effects[0].kind, "coerce");
+        assert_eq!(effects[0].kind, "schema.coerce");
         assert_eq!(effects[0].name.as_deref(), Some("prompt"));
         assert_eq!(effects[0].binding.as_deref(), Some("summary"));
     }
@@ -44649,10 +44651,10 @@ export json Row to docs at "rows.json" { mode create } as exported
         let effects = parse_effect_statements(body, &RuleContext::default());
         let expected = [
             ("agent.tell", Some("turn")),
-            ("coerce", Some("review")),
-            ("coerce", Some("summary")),
+            ("schema.coerce", Some("review")),
+            ("schema.coerce", Some("summary")),
             ("human.ask", Some("answer")),
-            ("coerce", Some("verdict")),
+            ("schema.coerce", Some("verdict")),
             ("capability.call", Some("called")),
             ("capability.call", Some("memories")),
             ("capability.call", Some("sent")),
@@ -45269,7 +45271,7 @@ rule start
             .ir
             .expect("compile");
         let effect = ParsedEffect {
-            kind: "coerce".to_owned(),
+            kind: "schema.coerce".to_owned(),
             target: Some("fixture".to_owned()),
             name: Some("prompt".to_owned()),
             binding: Some("answer".to_owned()),

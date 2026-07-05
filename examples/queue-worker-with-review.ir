@@ -31,7 +31,7 @@ rules
     effects
       active_claim kind=tracker.claim binding=active_claim key=4f1eba1192865a81
       turn kind=agent.tell binding=turn key=1d124f49240816a7
-      review kind=coerce binding=review key=d9e1c7e7a0918dcc
+      review kind=schema.coerce binding=review key=d8e8ca8d5f1369f1
       effect4 kind=tracker.finish binding=- key=8707324facb2e308
       effect5 kind=tracker.release binding=- key=0e796dff366d7f0d
       effect6 kind=human.ask binding=- key=631378576107ef4f

@@ -1263,14 +1263,14 @@ mod tests {
     fn validates_duplicate_and_malformed_contracts() {
         let registry = ContractRegistry {
             libraries: vec![LibraryRegistration {
-                id: "std.coerce".to_owned(),
+                id: "std.coercion".to_owned(),
                 version: "v0".to_owned(),
                 standard: true,
             }],
             constructs: vec![
                 ConstructRegistration {
                     id: "coerce.form".to_owned(),
-                    library_id: "std.coerce".to_owned(),
+                    library_id: "std.coercion".to_owned(),
                     version: "v0".to_owned(),
                     construct_family: "declaration_block".to_owned(),
                     keyword: "coerce".to_owned(),
@@ -1318,12 +1318,12 @@ mod tests {
             ],
             effect_contracts: vec![
                 EffectContract {
-                    id: "coerce".to_owned(),
-                    library_id: "std.coerce".to_owned(),
+                    id: "schema.coerce".to_owned(),
+                    library_id: "std.coercion".to_owned(),
                     version: "v0".to_owned(),
-                    effect_kind: "coerce".to_owned(),
+                    effect_kind: "schema.coerce".to_owned(),
                     source_forms: vec!["coerce".to_owned()],
-                    input_schema: Some("coerce.input".to_owned()),
+                    input_schema: Some("schema.coerce.input".to_owned()),
                     output_schema: Some("typed-provider-output".to_owned()),
                     required_capabilities: vec!["model.invoke".to_owned()],
                     provider_kinds: vec!["model".to_owned()],
@@ -1331,10 +1331,10 @@ mod tests {
                     validation: TypedOutputValidation::RuntimeBoundary,
                 },
                 EffectContract {
-                    id: "coerce".to_owned(),
+                    id: "schema.coerce".to_owned(),
                     library_id: "missing".to_owned(),
                     version: "v0".to_owned(),
-                    effect_kind: "coerce".to_owned(),
+                    effect_kind: "schema.coerce".to_owned(),
                     source_forms: Vec::new(),
                     input_schema: None,
                     output_schema: None,

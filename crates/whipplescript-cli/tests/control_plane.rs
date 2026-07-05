@@ -5793,7 +5793,7 @@ rule classify_request
     let facts = facts.as_array().expect("facts array");
     assert!(facts
         .iter()
-        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("coerce.failed")));
+        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("schema.coerce.failed")));
     assert!(facts
         .iter()
         .any(|fact| fact.get("name").and_then(Value::as_str) == Some("human.ask.created")));
@@ -7013,7 +7013,7 @@ rule classify_request
     let facts = facts.as_array().expect("facts array");
     assert!(facts
         .iter()
-        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("coerce.succeeded")));
+        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("schema.coerce.succeeded")));
     assert!(facts.iter().any(|fact| {
         fact.get("name").and_then(Value::as_str) == Some("ClassifiedMessage")
             && fact
@@ -13955,7 +13955,7 @@ fn dev_provider_language_rehydrates_after_bound_coerce_arguments() {
         .expect("evidence array");
     let coerce = evidence_items
         .iter()
-        .find(|item| item.get("kind").and_then(Value::as_str) == Some("coerce.provider"))
+        .find(|item| item.get("kind").and_then(Value::as_str) == Some("schema.coerce.provider"))
         .expect("coerce provider evidence");
     let arguments = coerce
         .get("metadata")
@@ -14190,7 +14190,9 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
     assert_eq!(
         facts
             .iter()
-            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("coerce.succeeded"))
+            .filter(
+                |fact| fact.get("name").and_then(Value::as_str) == Some("schema.coerce.succeeded")
+            )
             .count(),
         6
     );
@@ -15640,7 +15642,7 @@ rule review
         .and_then(Value::as_array)
         .expect("evidence array")
         .iter()
-        .find(|item| item.get("kind").and_then(Value::as_str) == Some("coerce.provider"))
+        .find(|item| item.get("kind").and_then(Value::as_str) == Some("schema.coerce.provider"))
         .and_then(|item| item.get("metadata"))
         .and_then(|metadata| metadata.get("arguments"))
         .expect("coerce arguments");

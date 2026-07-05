@@ -205,7 +205,7 @@ fn e2e_coerce_success_and_failure_branches_are_deterministic() {
         &success_instance,
         effect(
             "classification",
-            "coerce",
+            "schema.coerce",
             r#"{"function_name":"classifyMessage"}"#,
         ),
         "classify_request",
@@ -234,13 +234,13 @@ fn e2e_coerce_success_and_failure_branches_are_deterministic() {
         .list_facts(&success_instance)
         .expect("facts list")
         .iter()
-        .any(|fact| fact.name == "coerce.succeeded"));
+        .any(|fact| fact.name == "schema.coerce.succeeded"));
 
     let (mut failure_kernel, failure_instance) = kernel_from_source("CoerceBranch", source);
     let effects = [
         effect(
             "classification",
-            "coerce",
+            "schema.coerce",
             r#"{"function_name":"classifyMessage"}"#,
         ),
         effect("fallback", "human.ask", r#"{"prompt":"classify manually"}"#),
@@ -302,7 +302,7 @@ fn e2e_coerce_success_and_failure_branches_are_deterministic() {
     let facts = failure_store
         .list_facts(&failure_instance)
         .expect("facts list");
-    assert!(facts.iter().any(|fact| fact.name == "coerce.failed"));
+    assert!(facts.iter().any(|fact| fact.name == "schema.coerce.failed"));
     assert!(facts.iter().any(|fact| fact.name == "human.ask.created"));
 }
 

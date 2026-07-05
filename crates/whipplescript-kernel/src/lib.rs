@@ -1659,9 +1659,9 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             coerce_effect_status(&result.status),
             &safe_summary,
             Some(match result.status {
-                CoerceStatus::Succeeded => "coerce.succeeded",
-                CoerceStatus::Failed => "coerce.failed",
-                CoerceStatus::TimedOut => "coerce.timed_out",
+                CoerceStatus::Succeeded => "schema.coerce.succeeded",
+                CoerceStatus::Failed => "schema.coerce.failed",
+                CoerceStatus::TimedOut => "schema.coerce.timed_out",
             }),
             &metadata_json,
             &evidence,
@@ -2015,7 +2015,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         .to_string();
         let evidence_id = self.store.record_evidence(EvidenceRecord {
             instance_id: execution.instance_id,
-            kind: "coerce.provider",
+            kind: "schema.coerce.provider",
             subject_type: "run",
             subject_id: execution.run_id,
             causation_id: Some(execution.effect_id),
@@ -2040,9 +2040,9 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
     ) -> StoreResult<()> {
         let status = coerce_status(&result.status);
         let fact_name = match result.status {
-            CoerceStatus::Succeeded => "coerce.succeeded",
-            CoerceStatus::Failed => "coerce.failed",
-            CoerceStatus::TimedOut => "coerce.timed_out",
+            CoerceStatus::Succeeded => "schema.coerce.succeeded",
+            CoerceStatus::Failed => "schema.coerce.failed",
+            CoerceStatus::TimedOut => "schema.coerce.timed_out",
         };
         let succeeded = matches!(result.status, CoerceStatus::Succeeded);
         let summary = redacted_provider_summary(&result.summary);
@@ -2057,7 +2057,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             // the already-redacted summary, NOT the raw-error-derived text — echoing
             // the provider error here would leak it into the persisted fact value.
             Some(effect_failure_base(
-                "coerce",
+                "schema.coerce",
                 &summary,
                 &summary,
                 execution.effect_id,
@@ -6708,12 +6708,12 @@ rule wait
         let effects = [NewEffect {
             timeout_seconds: None,
             effect_id: "review",
-            kind: "coerce",
+            kind: "schema.coerce",
             target: None,
             input_json: r#"{"function_name":"reviewWork"}"#,
             status: "queued",
             idempotency_key: "rule=start;effect=review",
-            required_capabilities_json: r#"["coerce"]"#,
+            required_capabilities_json: r#"["schema.coerce"]"#,
             profile: Some("repo-writer"),
             correlation_id: None,
             source_span_json: None,
@@ -6763,7 +6763,7 @@ rule wait
         assert_eq!(evidence.len(), 2);
         let coerce_evidence = evidence
             .iter()
-            .find(|evidence| evidence.kind == "coerce.provider")
+            .find(|evidence| evidence.kind == "schema.coerce.provider")
             .expect("coerce provider evidence recorded");
         assert!(coerce_evidence.metadata_json.contains("reviewWork"));
         assert!(coerce_evidence.metadata_json.contains("coerce-source"));
@@ -6785,8 +6785,10 @@ rule wait
             .metadata_json
             .contains(r#""summary":"done""#));
         let facts = store.list_facts(&instance_id).expect("facts list");
-        assert!(facts.iter().any(|fact| fact.name == "coerce.succeeded"
-            && fact.value_json.contains("\"status\":\"Accept\"")));
+        assert!(facts
+            .iter()
+            .any(|fact| fact.name == "schema.coerce.succeeded"
+                && fact.value_json.contains("\"status\":\"Accept\"")));
     }
 
     #[test]
@@ -6807,12 +6809,12 @@ rule wait
         let effects = [NewEffect {
             timeout_seconds: None,
             effect_id: "review",
-            kind: "coerce",
+            kind: "schema.coerce",
             target: None,
             input_json: r#"{"function_name":"reviewWork"}"#,
             status: "queued",
             idempotency_key: "rule=start;effect=review",
-            required_capabilities_json: r#"["coerce"]"#,
+            required_capabilities_json: r#"["schema.coerce"]"#,
             profile: Some("repo-writer"),
             correlation_id: None,
             source_span_json: None,
@@ -6877,7 +6879,7 @@ rule wait
             .list_diagnostics(Some(&instance_id))
             .expect("diagnostics list");
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code.as_deref(), Some("coerce.failed"));
+        assert_eq!(diagnostics[0].code.as_deref(), Some("schema.coerce.failed"));
         assert_eq!(diagnostics[0].subject_id.as_deref(), Some("review"));
         assert_eq!(diagnostics[0].run_id.as_deref(), Some("run-review"));
         assert!(!diagnostics[0].message.contains("invalid output"));
@@ -6885,7 +6887,7 @@ rule wait
         let facts = store.list_facts(&instance_id).expect("facts list");
         let failed_fact = facts
             .iter()
-            .find(|fact| fact.name == "coerce.failed")
+            .find(|fact| fact.name == "schema.coerce.failed")
             .expect("failed coerce fact");
         assert!(failed_fact.value_json.contains("\"redacted\":true"));
         assert!(!failed_fact.value_json.contains("invalid output"));

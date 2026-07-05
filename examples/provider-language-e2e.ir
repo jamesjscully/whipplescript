@@ -8,7 +8,7 @@ source_tags
 @acceptance assertion c85987961124ce71
 @acceptance assertion 78aac8e288a30964
 @acceptance assertion 680e3adc36120f16
-@acceptance assertion 50e48dfc801b169d
+@acceptance assertion 6d151ce022887cf8
 @fixture table language_tasks
 source_descriptions
 "Fixture-backed provider x language acceptance workflow" workflow ProviderLanguageE2E
@@ -17,7 +17,7 @@ source_descriptions
 "Pi completes both assigned language tasks" assertion c85987961124ce71
 "All seeded language tasks are consumed" assertion 78aac8e288a30964
 "All agent turns complete" assertion 680e3adc36120f16
-"All language reviews complete" assertion 50e48dfc801b169d
+"All language reviews complete" assertion 6d151ce022887cf8
 "Static provider x language task rows" table language_tasks
 "Route one queued language task to its selected provider" rule run_language_task
 schemas
@@ -63,9 +63,9 @@ assertions
   assert count(effect kind agent.tell where status == completed) == 6
     reads
       effect:kind agent.tell where status == completed
-  assert count(effect kind coerce where status == completed) == 6
+  assert count(effect kind schema.coerce where status == completed) == 6
     reads
-      effect:kind coerce where status == completed
+      effect:kind schema.coerce where status == completed
 rules
   rule table_language_tasks
     when started
@@ -74,12 +74,12 @@ rules
     writes
       schema:LanguageTask
     record_sources
-      schema:LanguageTask construct=table_row span=2184..2415
-      schema:LanguageTask construct=table_row span=2419..2642
-      schema:LanguageTask construct=table_row span=2646..2872
-      schema:LanguageTask construct=table_row span=2876..3101
-      schema:LanguageTask construct=table_row span=3105..3339
-      schema:LanguageTask construct=table_row span=3343..3559
+      schema:LanguageTask construct=table_row span=2191..2422
+      schema:LanguageTask construct=table_row span=2426..2649
+      schema:LanguageTask construct=table_row span=2653..2879
+      schema:LanguageTask construct=table_row span=2883..3108
+      schema:LanguageTask construct=table_row span=3112..3346
+      schema:LanguageTask construct=table_row span=3350..3566
     body_hash c7caf87da16ccacc
   rule run_language_task
     when LanguageTask as task where task.status == "queued"
@@ -93,7 +93,7 @@ rules
       schema:LanguageTask
     effects
       turn kind=agent.tell binding=turn key=dcc419597b331e20
-      review kind=coerce binding=review key=1acb0e3e2e6f69af
+      review kind=schema.coerce binding=review key=46ffc1fc9cbe8a58
     dependencies
       turn --succeeds--> review
     body_hash 8e33bd71144e3452

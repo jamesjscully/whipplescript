@@ -89,7 +89,7 @@ description "All agent turns complete"
 assert count(effect kind agent.tell where status == completed) == 6
 @acceptance
 description "All language reviews complete"
-assert count(effect kind coerce where status == completed) == 6
+assert count(effect kind schema.coerce where status == completed) == 6
 
 @fixture
 description "Static provider x language task rows"
