@@ -121,10 +121,14 @@ run_check external "Claude Agent SDK surface" \
   "cd '$ROOT' && scripts/check-claude-agent-sdk-surface.sh && node --check scripts/claude-agent-sdk-sidecar.mjs && scripts/check-claude-agent-sdk-live-smoke.sh && scripts/check-claude-agent-sdk-interrupt-smoke.sh && WHIPPLESCRIPT_CLAUDE_AGENT_SDK_ARTIFACT_LIVE='$STRICT_EXTERNAL' scripts/check-claude-agent-sdk-artifact-smoke.sh && WHIPPLESCRIPT_CLAUDE_AGENT_SDK_ERROR_LIVE='$STRICT_EXTERNAL' scripts/check-claude-agent-sdk-error-smoke.sh"
 run_check external "Claude native workflow smoke" \
   "cd '$ROOT' && WHIPPLESCRIPT_CLAUDE_NATIVE_WORKFLOW_LIVE='$STRICT_EXTERNAL' scripts/check-claude-native-workflow-smoke.sh"
-run_check external "Pi RPC surface" \
-  "cd '$ROOT' && scripts/check-pi-rpc-surface.sh && WHIPPLESCRIPT_PI_RPC_INTERRUPT_LIVE='$STRICT_EXTERNAL' scripts/check-pi-rpc-interrupt-smoke.sh && WHIPPLESCRIPT_PI_RPC_ARTIFACT_LIVE='$STRICT_EXTERNAL' scripts/check-pi-rpc-artifact-smoke.sh && WHIPPLESCRIPT_PI_RPC_ERROR_LIVE='$STRICT_EXTERNAL' scripts/check-pi-rpc-error-smoke.sh"
-run_check external "Pi native workflow smoke" \
-  "cd '$ROOT' && WHIPPLESCRIPT_PI_NATIVE_WORKFLOW_LIVE='$STRICT_EXTERNAL' scripts/check-pi-native-workflow-smoke.sh"
+# Pi native-provider validation is DEFERRED from the v0.2 native gate (Jack,
+# 2026-07-05): with the owned/native harness the standalone Pi provider has no
+# remaining point for now. The Pi adapter + smokes stay in the tree; re-enable
+# these checks if/when Pi native support is revived.
+# run_check external "Pi RPC surface" \
+#   "cd '$ROOT' && scripts/check-pi-rpc-surface.sh && WHIPPLESCRIPT_PI_RPC_INTERRUPT_LIVE='$STRICT_EXTERNAL' scripts/check-pi-rpc-interrupt-smoke.sh && WHIPPLESCRIPT_PI_RPC_ARTIFACT_LIVE='$STRICT_EXTERNAL' scripts/check-pi-rpc-artifact-smoke.sh && WHIPPLESCRIPT_PI_RPC_ERROR_LIVE='$STRICT_EXTERNAL' scripts/check-pi-rpc-error-smoke.sh"
+# run_check external "Pi native workflow smoke" \
+#   "cd '$ROOT' && WHIPPLESCRIPT_PI_NATIVE_WORKFLOW_LIVE='$STRICT_EXTERNAL' scripts/check-pi-native-workflow-smoke.sh"
 run_check external "native provider config validation" \
   "cd '$ROOT' && WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIG_STRICT='$STRICT_EXTERNAL' scripts/check-native-provider-configs.sh"
 
