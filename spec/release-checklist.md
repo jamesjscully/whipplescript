@@ -32,6 +32,56 @@ Before declaring v0 complete:
 
 Known v0 deferrals must include owner, rationale, and follow-up location.
 
+## v0.2.0 Cut Runbook
+
+The 0.2 baseline is verified green (full readiness gate, 0 required failures) and
+the version is staged at 0.2.0. Below is the ordered sequence to cut and publish.
+Every step requires a maintainer decision or maintainer credentials and is not
+automatable from inside the build.
+
+1. **Lock scope — the two held renames.** Decide build-for-0.2 or defer-to-0.3:
+   `coerce` → `schema.coerce` (S2; precursor in DR-0014's amendment) and
+   `queue.*` → `tracker.*` (S3; spec `spec/std-tracker.md`). If building, land each
+   as a gated model-first pass **first**, then re-run the readiness gate. If
+   deferring, current names ship in 0.2 (update the CHANGELOG note).
+
+2. **Live provider validation (G-008).** With real Codex/Claude/Pi credentials:
+   `WHIPPLESCRIPT_RELEASE_STRICT_EXTERNAL=1 scripts/check-release-readiness.sh` —
+   the external native-provider checks must pass (they are the only gate reds in a
+   credential-less environment). Required to advertise production native support.
+
+3. **Final green + version.** Working tree clean; `whip --version` →
+   `whipplescript 0.2.0`; `dist plan` reports 0.2.0; set the CHANGELOG date.
+
+4. **Tag → GitHub Release (CI-built artifacts).** A tag push is the only path that
+   creates a GitHub Release; the cargo-dist workflow builds/uploads the five
+   platform archives, shell/PowerShell installers, and checksums:
+   `git tag v0.2.0 && git push origin v0.2.0`
+   Watch `.github/workflows/release.yml`: confirm all platform archives + the
+   packaged-binary smoke job pass and the release body is correct.
+
+5. **Publish to crates.io in dependency order** (each must be live before the next
+   resolves; path deps already pin `version = "0.2.0"`):
+   `cargo publish -p whipplescript-core`
+   `cargo publish -p whipplescript-parser`
+   `cargo publish -p whipplescript-store`
+   `cargo publish -p whipplescript-kernel`
+   `cargo publish -p whipplescript`
+   (`whipplescript-host-do` is the Durable-Object host on the 0.3 track — not
+   published for 0.2.)
+
+6. **Homebrew formula.** From the tagged release assets take the macOS/Linux
+   tarball URLs + SHA256s and update `Formula/` in `jamesjscully/homebrew-tap`;
+   smoke with `brew install jamesjscully/tap/whip`.
+
+7. **Post-publish smoke.**
+   `cargo install --git https://github.com/jamesjscully/whipplescript --tag v0.2.0 --locked -p whipplescript`
+   then `whip --version` (0.2.0) · `whip doctor --json` ·
+   `whip check examples/minimal-noop.whip`.
+
+Deferred past 0.2 (not blockers): macOS Developer ID signing + notarization,
+Windows Authenticode, WinGet/Scoop/Chocolatey, release provenance attestations.
+
 ## Native Provider Release Gate
 
 For a release that advertises usable native Codex, Claude, and Pi providers,
