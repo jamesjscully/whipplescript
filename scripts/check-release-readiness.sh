@@ -130,7 +130,7 @@ run_check external "Claude native workflow smoke" \
 # run_check external "Pi native workflow smoke" \
 #   "cd '$ROOT' && WHIPPLESCRIPT_PI_NATIVE_WORKFLOW_LIVE='$STRICT_EXTERNAL' scripts/check-pi-native-workflow-smoke.sh"
 run_check external "native provider config validation" \
-  "cd '$ROOT' && WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIG_STRICT='$STRICT_EXTERNAL' scripts/check-native-provider-configs.sh"
+  "cd '$ROOT' && WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIG_STRICT='$STRICT_EXTERNAL' WHIPPLESCRIPT_PROVIDER_CONFIGS=\"\${WHIPPLESCRIPT_PROVIDER_CONFIGS:-examples/provider-configs/native/native.example.json}\" scripts/check-native-provider-configs.sh"
 
 mkdir -p "$(dirname "$REPORT")"
 {
