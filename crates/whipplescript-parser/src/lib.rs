@@ -136,7 +136,9 @@ pub enum Item {
     Agent(AgentDecl),
     Enum(EnumDecl),
     Event(EventDecl),
-    Source(SourceDecl),
+    // Boxed: SourceDecl carries the ingress path/url/emit surface and is by far
+    // the largest Item variant; boxing keeps the enum small (clippy large_enum_variant).
+    Source(Box<SourceDecl>),
     Test(TestDecl),
     Lease(LeaseDecl),
     Ledger(LedgerDecl),
@@ -3917,7 +3919,7 @@ fn lower_program(
                     &semantic.schemas.events,
                     &mut diagnostics,
                 );
-                lower_source(source, &mut ir, &mut diagnostics)
+                lower_source(*source, &mut ir, &mut diagnostics)
             }
             Item::Test(test) => lower_test(test, &mut ir, &mut diagnostics),
             Item::Lease(lease) => {
@@ -16447,7 +16449,7 @@ fn format_item(item: Item, formatted: &mut String) {
         Item::Agent(agent) => format_agent(agent, formatted),
         Item::Enum(enum_decl) => format_enum(enum_decl, formatted),
         Item::Event(event) => format_event(event, formatted),
-        Item::Source(source) => format_source(source, formatted),
+        Item::Source(source) => format_source(*source, formatted),
         Item::Test(test) => format_test(test, formatted),
         Item::Lease(lease) => {
             push_line(formatted, format!("lease {} {{", lease.name.name));
@@ -17861,7 +17863,8 @@ impl Parser<'_> {
         } else if self.at_ident("source") {
             self.reject_pending_tags(pending_tags, "source");
             self.reject_pending_description(pending_description, "source");
-            self.parse_source().map(Item::Source)
+            self.parse_source()
+                .map(|source| Item::Source(Box::new(source)))
         } else if self.at_ident("test") {
             self.reject_pending_tags(pending_tags, "test");
             self.reject_pending_description(pending_description, "test");

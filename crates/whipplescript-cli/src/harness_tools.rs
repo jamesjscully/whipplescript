@@ -2584,10 +2584,16 @@ mod tests {
         assert!(prompt.contains("Current date: 2026-07-04"));
         assert!(prompt.contains("Current working directory: /repo"));
         // Canonical order: persona/tools/guidelines before date before cwd.
-        let persona_at = prompt.find("expert coding assistant").unwrap();
-        let tools_at = prompt.find("Available tools:").unwrap();
-        let date_at = prompt.find("Current date:").unwrap();
-        let cwd_at = prompt.find("Current working directory:").unwrap();
+        let persona_at = prompt
+            .find("expert coding assistant")
+            .expect("persona marker present");
+        let tools_at = prompt
+            .find("Available tools:")
+            .expect("tools marker present");
+        let date_at = prompt.find("Current date:").expect("date marker present");
+        let cwd_at = prompt
+            .find("Current working directory:")
+            .expect("cwd marker present");
         assert!(persona_at < tools_at && tools_at < date_at && date_at < cwd_at);
         // One provenance row per included bundle (persona, tools, guidelines, date, cwd).
         assert_eq!(assembled.bundles.len(), 5);
