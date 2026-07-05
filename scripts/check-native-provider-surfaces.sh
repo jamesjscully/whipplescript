@@ -91,7 +91,9 @@ schema_contains() {
   local check="$1"
   local needle="$2"
 
-  if rg -q -- "$needle" "$CODEX_SCHEMA_DIR"; then
+  # grep (not rg) so the surface probe does not depend on ripgrep being on PATH;
+  # -F treats the needle as a literal method name, -r searches the schema dir.
+  if grep -rqF -- "$needle" "$CODEX_SCHEMA_DIR"; then
     record_check codex app-server-schema "$check" pass "schema includes $needle"
     return
   fi
