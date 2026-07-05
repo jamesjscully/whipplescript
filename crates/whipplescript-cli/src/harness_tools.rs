@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use whipplescript_kernel::coerce_native::{json_schema_for_type, CoerceProvider};
+use whipplescript_kernel::context_assembly::{assemble, BundleKind, ContextBundle};
 use whipplescript_kernel::harness_loop::{
     BrokeredTurnInput, ChatMessage, HarnessModelClient, HarnessModelError, ModelReply, ToolCall,
     ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
@@ -1789,10 +1790,102 @@ fn walk(root: &Path, dir: &Path, walked: &mut usize, visit: &mut dyn FnMut(&str)
     }
 }
 
-/// System prompt for the slice-1 owned harness.
-const OWNED_SYSTEM_PROMPT: &str = "You are a coding agent. Use only the provided \
-tools and the authority granted for this turn to do the task. When finished, \
-reply with a short summary and make no further tool calls.";
+/// Persona bundle for the owned harness. Mirrors pi's persona shape, adapted to
+/// the WhippleScript brokered harness, and folds in the turn-scoped authority the
+/// loop relies on. Termination guidance lives in [`OWNED_GUIDELINES`].
+const OWNED_PERSONA: &str = "You are an expert coding assistant operating inside the \
+WhippleScript owned agent harness. You help by reading files, running commands, \
+editing code, and writing new files. Use only the provided tools and the authority \
+granted for this turn to do the task.";
+
+/// Guidelines bundle lines. The first two mirror pi's always-on guidelines; the
+/// last two carry the owned-loop contract (only the provided tools; the turn ends
+/// when the model stops calling tools).
+const OWNED_GUIDELINES: &[&str] = &[
+    "Be concise in your responses.",
+    "Show file paths clearly when working with files.",
+    "Use only the tools provided for this turn; do not assume tools you were not given.",
+    "When finished, reply with a short summary and make no further tool calls.",
+];
+
+/// The owned-harness system-prompt bundles in pi's order: persona, one-line tool
+/// snippets, guidelines, current date, current working directory. Project-context
+/// and available-skills slots are populated in later tracker phases. The host
+/// supplies `date`/`cwd` (kept out of the pure kernel assembler).
+fn owned_context_bundles(tools: &[ToolSpec], date: &str, cwd: &str) -> Vec<ContextBundle> {
+    let mut bundles = vec![ContextBundle::new(
+        BundleKind::Persona,
+        "builtin:persona",
+        "v1",
+        OWNED_PERSONA,
+    )];
+
+    if !tools.is_empty() {
+        let mut body = String::from("Available tools:\n");
+        for tool in tools {
+            body.push_str(&format!(
+                "- {}: {}\n",
+                tool.name,
+                first_line(&tool.description)
+            ));
+        }
+        bundles.push(ContextBundle::new(
+            BundleKind::Tools,
+            "builtin:tools",
+            "v1",
+            body.trim_end(),
+        ));
+    }
+
+    let mut guidelines = String::from("Guidelines:\n");
+    for line in OWNED_GUIDELINES {
+        guidelines.push_str(&format!("- {line}\n"));
+    }
+    bundles.push(ContextBundle::new(
+        BundleKind::Guidelines,
+        "builtin:guidelines",
+        "v1",
+        guidelines.trim_end(),
+    ));
+
+    bundles.push(ContextBundle::new(
+        BundleKind::Date,
+        "host:clock",
+        "v1",
+        format!("Current date: {date}"),
+    ));
+    bundles.push(ContextBundle::new(
+        BundleKind::Cwd,
+        "host:cwd",
+        "v1",
+        format!("Current working directory: {cwd}"),
+    ));
+    bundles
+}
+
+/// The first non-empty line of a tool description, for the one-line prompt snippet.
+fn first_line(description: &str) -> &str {
+    description
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+}
+
+/// The current UTC date as `YYYY-MM-DD` for the date bundle. Date-only (not
+/// time-of-day) keeps the assembled prefix stable within a day, which is a
+/// prompt-cache technique, not just cosmetics.
+fn owned_context_date() -> String {
+    // The CLI's chrono is built without the `clock` feature, so derive the date
+    // from the system clock via a UNIX timestamp (pure arithmetic, no `clock`).
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|delta| delta.as_secs())
+        .unwrap_or(0);
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
 
 /// Default per-turn model-step budget (overridable via WHIPPLESCRIPT_HARNESS_MAX_STEPS).
 const OWNED_MAX_STEPS: usize = 16;
@@ -2354,8 +2447,18 @@ pub fn run_owned_agent_turn(
             workflow_tool_specs,
         ));
     }
+    // Assemble the system prompt from provenance-tagged bundles (mirror pi):
+    // persona, tool snippets, guidelines, date, cwd. The host supplies date/cwd;
+    // the kernel assembler renders them in canonical order (context-assembly
+    // tracker Phase 1). Per-bundle provenance (`assembled.bundles`) is recorded as
+    // evidence in a later phase.
+    let assembled = assemble(owned_context_bundles(
+        &tools,
+        &owned_context_date(),
+        &workspace.display().to_string(),
+    ));
     let input = BrokeredTurnInput {
-        system: OWNED_SYSTEM_PROMPT.to_string(),
+        system: assembled.system_prompt,
         user: input_json.to_string(),
         tools,
         max_steps: owned_max_steps(),
@@ -2462,13 +2565,40 @@ mod tests {
     }
 
     #[test]
-    fn owned_system_prompt_describes_turn_scoped_tool_authority() {
-        assert!(OWNED_SYSTEM_PROMPT.contains("provided tools"));
-        assert!(OWNED_SYSTEM_PROMPT.contains("authority granted for this turn"));
-        assert!(
-            !OWNED_SYSTEM_PROMPT.contains("file tools"),
-            "owned harness prompt must not imply file tools are the whole surface"
-        );
+    fn owned_context_prompt_mirrors_pi_shape_and_keeps_authority_contract() {
+        let tools = vec![ToolSpec {
+            name: "read".into(),
+            description: "Read a file from the workspace.".into(),
+            input_schema: json!({}),
+        }];
+        let assembled = assemble(owned_context_bundles(&tools, "2026-07-04", "/repo"));
+        let prompt = assembled.system_prompt;
+
+        // Persona + guidelines carry the turn-scoped authority + termination contract.
+        assert!(prompt.contains("authority granted for this turn"));
+        assert!(prompt.contains("make no further tool calls"));
+        // pi-shape: the tool list is enumerated in prose (one line per tool).
+        assert!(prompt.contains("Available tools:"));
+        assert!(prompt.contains("- read: Read a file from the workspace."));
+        // Date + cwd bundles are present.
+        assert!(prompt.contains("Current date: 2026-07-04"));
+        assert!(prompt.contains("Current working directory: /repo"));
+        // Canonical order: persona/tools/guidelines before date before cwd.
+        let persona_at = prompt.find("expert coding assistant").unwrap();
+        let tools_at = prompt.find("Available tools:").unwrap();
+        let date_at = prompt.find("Current date:").unwrap();
+        let cwd_at = prompt.find("Current working directory:").unwrap();
+        assert!(persona_at < tools_at && tools_at < date_at && date_at < cwd_at);
+        // One provenance row per included bundle (persona, tools, guidelines, date, cwd).
+        assert_eq!(assembled.bundles.len(), 5);
+    }
+
+    #[test]
+    fn owned_context_prompt_omits_tool_list_when_no_tools_offered() {
+        let assembled = assemble(owned_context_bundles(&[], "2026-07-04", "/repo"));
+        assert!(!assembled.system_prompt.contains("Available tools:"));
+        // persona, guidelines, date, cwd -- no tools bundle.
+        assert_eq!(assembled.bundles.len(), 4);
     }
 
     #[test]
