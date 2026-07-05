@@ -1,9 +1,50 @@
 # Final Audit
 
-Status: active v0 audit log; workflow revision audit complete.
+Status: active v0 audit log; workflow revision audit complete; v0.2 release
+readiness signed off (baseline green, 2026-07-05).
 
 This file collects the audit findings from the staged implementation plan and
 classifies them for v0.
+
+## v0.2 Release Readiness (2026-07-05)
+
+Release plan: the `spec/TRACKERS.md` Release column. v0.2 =
+language + std packages + native runtime, polished; v0.3 = cloud + owned harness;
+v0.4 = improve/evals + version control.
+
+**Code baseline: GREEN and verified.** `WHIPPLESCRIPT_RELEASE_READINESS_FULL=1
+scripts/check-release-readiness.sh` exits 0 at commit `2bafd44` — Required checks
+failed: 0 (shell, trackers, docs snippets/site, IR goldens, report schemas,
+artifact admission, fmt, clippy `-D warnings`, whitespace, Loft fixtures, native
+adapters/contract/policy-denials, control-plane, workspace records, provider
+scheduling, expression routing, incident UX, cancellation matrix, store replay,
+provider doctor, artifact redaction, and — under FULL — workspace tests, Maude,
+TLA, e2e). Two required failures were fixed en route: clippy (`cf2f64a`: box
+`Item::Source`; `.expect` over `.unwrap` in the context-assembly test) and a stale
+IR golden (`2bafd44`: `package-memory.ir` `tools=[]`).
+
+**Only remaining gate red = external native-provider surface probe** — the live
+tooling is absent in the build environment; non-blocking (`STRICT_EXTERNAL=0`).
+Becomes blocking for the v0.2 ship gate under the "advertise production native
+support" decision (see below), which requires a live run.
+
+**Distribution: mechanically ready.** cargo-dist 0.32.0 + `dist-workspace.toml`
+(5 targets, shell/powershell installers); `dist plan` resolves 15 artifacts
+clean. Crates carry versioned path deps for ordered crates.io publish. **All
+crates are at `0.1.0`; a bump to `0.2.0` is the required last-before-tag step.**
+
+**Ship gate — remaining items (owner-gated, not code):**
+
+| Item | Status | Owner action |
+| --- | --- | --- |
+| S2/S3 std-package renames (`coerce`→`schema.coerce`, `queue.*`→`tracker.*`, `archived` status, DR-0014 amendment, effect-key commitments) | Held — carry design decisions; touch effect-key hashing | Lift hold to build in v0.2, or defer to v0.3 and ship current names |
+| Native-provider live validation (G-008) | Deterministic coverage complete; live gate unrun here | Run live Codex/Claude/Pi gate with real credentials (v0.2 advertises production native support) |
+| Publish | Plumbing verified | Version bump `0.2.0`, tag push (triggers release workflow), crates.io + Homebrew credentials |
+
+Not v0.2: `consume` removal (deprecation-window gated — stays through v0.2,
+removed in v0.3); B1a lowering-move (deferred to v0.3 with the DO sans-IO
+refactor); expression-kernel is already thoroughly tested (206 parser tests) — the
+tracker's remaining rows are deferred-with-cause polish, not release blockers.
 
 ## Workflow Revision Final Audit
 
