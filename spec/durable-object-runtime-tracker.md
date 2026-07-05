@@ -126,7 +126,12 @@ in flight and expensive to retrofit:
    evidence semantics (research note, "Evidence identity — the slice hash" +
    "Architecture" sections). Phase 3 (store behind
    a trait) is the cheap moment to shape this: cut the coordination trait with
-   a snapshot/manifest capability in view.
+   a snapshot/manifest capability in view. *Generalized 2026-07-03 by the
+   versioned-workspace note's "Scope semantics": the cut spans both planes —
+   substance by manifest, workspace-plane stores (evidence ledger, tracker,
+   coordination tables) by **position / high-water mark**, which their
+   monotonicity makes a per-store integer. Shape the snapshot capability as
+   cheap position capture, not deep copy.*
 2. **Content-addressing stays canonical and stable** across tiers and hosts
    (Decision 4): the subsystem keys evidence by content hash (kernel identity,
    file manifests), so hash identity must not vary by storage tier, host
@@ -629,37 +634,40 @@ linear undo chain). No phase work now.
       deliverable; native/OSS backs files with local fs. *(Needs the platform
       object store.)*
 
-### Phase 8 — Sidecar compute plane (registered 2026-07-03; NOT designed)
+### Phase 8 — Sidecar compute plane (designed 2026-07-04; NOT built)
 
-The pure-DO host solves the **orchestrator + storage plane**; real workflows
-also trigger exec/agent compute that cannot live in the isolate (Decision 7:
-subprocess effects are HTTP to a container sidecar). This phase registers
-that compute plane as open intent — cloud deployment is only partially
-solved without it. A design pass is required before any box is checked;
-shared design with `versioned-workspace-research-note.md` (the
-materialization + evidence-grade boundary sections: atomic, recorded,
-complete imports).
+**Design SSOT: `spec/compute-plane-design-note.md`** (design pass
+2026-07-04, four forks settled: two service classes with a workspace-wide
+delta-kernel result cache; Class-A pool owned by the *workspace* DO —
+revising the earlier 1:1-per-instance sketch; Class-B = container-per-turn
+with **hibernatable WebSocket from day one**, satisfying Decision 6's
+reserved case by decision; one workspace image; default-deny IFC span;
+priority classes production > working > counterfactual). Platform state
+verified 2026-07-04 (limits 15×'d Feb 2026; autoscaling still unshipped —
+fixed-size `getRandom` pools). Open build work:
 
-- [ ] Sidecar lifecycle: container-per-DO controller model (Cloudflare
-      Containers pairs each container instance with a controlling DO — maps
-      1:1 onto the workflow-instance DO; verify current platform state,
-      knowledge as of early 2026).
-- [ ] Materialization protocol over HTTP: sidecar pulls only missing
-      content-addressed blobs (R2/object tier), materializes the branch
-      manifest, execs, pushes the diff back keyed by effect id — idempotent
-      by Decisions 3/4; just another step-machine effect.
-- [ ] **Image digest = environment hash**: the container image digest slots
-      into generator-hash ambient config (experimentation note, "Evidence
-      identity — the slice hash") — a toolchain bump becomes a visible
-      warm-start, never silent.
-- [ ] Economics: cold starts (seconds) + billed-while-running → exec
-      batching, warm-pool policy, DO↔sidecar placement affinity.
-- [ ] IFC span: egress doors must be enforced where whip cannot see
-      syscalls — container network policy (default-deny egress + per-grant
-      allowlists) as the backstop; stronger than native exec today, weaker
-      than owned-harness — design deliberately, don't inherit accidentally.
-- [ ] `whip deploy` packaging surface: DO bindings, R2 bucket, container
-      images, secrets, wrangler artifacts — an undesigned product surface.
+- [ ] Class-A executor pool: workspace-DO-owned, `getRandom`-routed lite/
+      basic instances; priority queue (production > working >
+      counterfactual); manual size knob w/ working zero-config default.
+- [ ] Delta-kernel result cache: content-keyed memoization in the
+      effect-ledger discipline (script+env+input hashes); eviction joins
+      the versioned-workspace retention policy.
+- [ ] Materialization protocol endpoints: pull-missing-blobs → run →
+      diff-back keyed by effect id (atomic/recorded/complete; idempotent
+      by Decisions 3/4); Class-A batching (several execs per manifest
+      request); branch marker + scoped secrets (P6) in the request.
+- [ ] Class-B turn containers: per-turn/per-branch controller DOs;
+      hibernatable-WebSocket progress channel (frame format TBD);
+      diff-back on completion via the same import.
+- [ ] **Image digest = environment hash** wiring: workspace image
+      declaration → digest into generator-hash ambient config; rolling
+      redeploy surfaces as a warm-start epoch.
+- [ ] IFC span enforcement: default-deny egress + allowlists derived from
+      the exec-grant declarations; verify counterfactual execs are
+      network-denied by default on this host.
+- [ ] `whip deploy` v1: one zero-config command (wasm kernel + image +
+      DO/bucket/pool provisioning + secrets; wrangler underneath, never
+      surfaced).
 
 ---
 

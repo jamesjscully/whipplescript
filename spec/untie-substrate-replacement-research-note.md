@@ -103,11 +103,30 @@ outcome enums.
   preserving replay of handles+metadata. Their `content-erasure.qnt`
   invariants become dischargeable over the substrate itself.
 - **Workstreams and instance forking are native**, not layered.
+- **No large-file cliff** (added 2026-07-05): git's large-file story is
+  LFS — a bolt-on second system with its own server and failure modes.
+  Whip's tiering + content-defined chunking are native
+  (versioned-workspace note, "All files, including large ones"), so big
+  context resources (datasets, PDFs, video) version like everything else,
+  on both desktop and cloud.
 - **Certified merge** — with an honest caveat: un-tie content is mostly
   *not* whip source (working files, documents, definitions), so day one
   the merge engine delivers git-parity-plus-provenance on blobs; the
   slice-certificate power arrives as content becomes whip-legible, which
   the Pi replacement drives (§4, archetype-as-package).
+- **The interactive surface is designed by census, not vibe** (added
+  2026-07-05, answering the "git has a bazillion escape hatches" concern):
+  git's operation surface was enumerated and classified
+  (versioned-workspace note, "Selective operations — the interactive VCS
+  surface"). Compensations dissolve structurally (stash / index / reflog /
+  rebase-squash-amend — the record–narrative separation); the surviving
+  payload is a **provenance-native selection algebra** with three verbs
+  (`undo <selection>` with dependency-closure stranding checks,
+  identity-preserving `transport`, `adopt --only`), structured conflict
+  objects with content-addressed resolution memory, provenance
+  archaeology (blame-superseding; mostly pre-answered bisect), and a
+  **no-destructive-verbs** surface whose complete hatch list is: manual
+  state authoring, export bundles, the git bridge.
 
 **New requirement:** a **bundle-equivalent workspace export** for handoff
 (`STATE_BEFORE_HOME` ships full content) — manifest + reachable blobs,
@@ -265,7 +284,10 @@ migration sequencing (the M1/M2 milestone analysis in the 2026-07-04
 sweeps is **stale** per Jack — sequencing is decided at build start, not
 assumed); the diff/presentation surface for review UX;
 where the `whip` primitive in un-tie's specs lands once whip is *below*
-rather than above (both postures coexist during migration).
+rather than above (both postures coexist during migration); **whether the
+workspace API ships git-backed first** (jj's backend-split adoption path —
+semantics early, storage swap later; the readiness tracker's ⚑ sequencing
+fork).
 
 ## 10. Relationships
 
