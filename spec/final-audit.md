@@ -37,9 +37,9 @@ crates are at `0.1.0`; a bump to `0.2.0` is the required last-before-tag step.**
 
 | Item | Status | Owner action |
 | --- | --- | --- |
-| S2/S3 std-package renames (`coerce`→`schema.coerce`, `queue.*`→`tracker.*`, `archived` status, DR-0014 amendment, effect-key commitments) | Held — carry design decisions; touch effect-key hashing | Lift hold to build in v0.2, or defer to v0.3 and ship current names |
-| Native-provider live validation (G-008) | Deterministic coverage complete; live gate unrun here | Run live Codex/Claude/Pi gate with real credentials (v0.2 advertises production native support) |
-| Publish | Plumbing verified | Version bump `0.2.0`, tag push (triggers release workflow), crates.io + Homebrew credentials |
+| S2/S3 std-package renames + S2b model-id effect-key fold | **DONE** — built, runtime-verified, gate-green (e57be7d / bd940e4 / 8abc7aa); DR-0014 → accepted | None |
+| Native-provider live validation (G-008) | **Codex + Claude live-validated 2026-07-05** — app-server / Agent SDK / native source-workflow / artifact / error smokes + endpoint-health + config, strict gate green (external failures 0). **Pi deferred** for v0.2 (owned/native harness supersedes the standalone Pi provider). En route the surface probe was switched off `rg`→`grep` and two native-workflow smokes that predated the agent-provider validation were unbroken. | At cut: re-run `WHIPPLESCRIPT_RELEASE_STRICT_EXTERNAL=1 scripts/check-release-readiness.sh` with `codex` + `claude` logged in (the gate self-supplies config + disposable acks). |
+| Publish | Plumbing verified; version at `0.2.0` | Tag push (triggers release workflow), crates.io (dependency order) + Homebrew credentials |
 
 Not v0.2: `consume` removal (deprecation-window gated — stays through v0.2,
 removed in v0.3); B1a lowering-move (deferred to v0.3 with the DO sans-IO
