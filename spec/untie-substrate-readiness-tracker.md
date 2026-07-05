@@ -27,7 +27,29 @@ code); per-piece review gate; native gates stay green.
 
 ---
 
-## Phase 0 — formal models (the workspace build's model-first gate)
+## Release mapping (v0.2 / v0.3 / v0.4 — sliced 2026-07-05)
+
+This tracker's phases **do not ship together**. Under the release plan
+([[project-release-plan]]) they split across two releases — **nothing here is
+v0.2**:
+
+- **v0.3 (cloud deployment + owned harness).** Only **Phase 3 minus its fork
+  item**: the Pi-conformance surface (tool ergonomics, turn lifecycle, abort,
+  thread continuation, multimodal, workbench event projection) and the
+  chat-shaped instance. It rides with the DO runtime
+  (`durable-object-runtime-tracker.md`) and the owned-harness context assembler
+  (`context-assembly-tracker.md`) — those two are the *rest* of the v0.3 owned
+  harness and are not in this tracker.
+- **v0.4 (version control).** Everything else: **Phases 0–2** (versioned-workspace
+  floor + API + per-blob erasure), the **Sequencing fork**, **Phase 3's fork
+  item** (needs Phase 1 branches), and **Phases 4–5** (policy epochs/auth + store
+  seam) — the full substrate replacement.
+
+Per-heading `· vN` tags below restate this at each phase.
+
+---
+
+## Phase 0 — formal models (the workspace build's model-first gate) · **v0.4**
 
 - [ ] Shared program/edit model for merge + transfer: disjoint-slice
       composition over manifests (coverage) + the essential bite — a
@@ -42,8 +64,15 @@ code); per-piece review gate; native gates stay green.
 - [ ] Branch-distinct effect keys bite: a counterfactual/branch effect that
       dedupes against a real one absent the branch id in the key (silent
       corruption demonstrated, then rejected).
+- [ ] Selective-undo stranding bite: a file-scoped `undo` that a naive
+      path filter accepts and the dependency-closure check rejects (a
+      later edit read the undone writes).
+- [ ] Stat-cache soundness invariant: import-back must never miss a
+      same-size-same-mtime content change (git's racy-timestamp hazard) —
+      model the invariant + a bite where a naive fingerprint cache
+      silently drops a real change.
 
-## Phase 1 — versioned-workspace floor (canonical build home)
+## Phase 1 — versioned-workspace floor (canonical build home) · **v0.4**
 
 - [ ] Branch manifests: cuts with **divergent children** (parent pointers,
       not a linear chain); O(1) branch creation over the content-addressed
@@ -69,12 +98,42 @@ code); per-piece review gate; native gates stay green.
       boundary-gated promotion; archive re-homes members.
 - [ ] Branch-distinct effect keys as a general rule (branch/cut id joins
       program_version + revision_epoch in the idempotency key).
+- [ ] **Content-defined chunking** for large blobs (vw note §10.1):
+      FastCDC-style chunk trees, file identity = stable Merkle root
+      (nothing upstream re-keys); whole-blob below threshold; erasure at
+      chunk level with retained root.
+- [ ] **Stat cache** in the virtual working set: mtime/size/inode
+      fingerprints so import-back is O(touched) not O(tree); implements
+      the P0 soundness invariant.
+- [ ] **Partial materialization**: manifest-subset materialization from
+      slicer-computed input closures; fetch-on-demand; clear failure at
+      disk bounds (required for Class-B sidecars; optional-lazy on
+      desktop where reflinks apply — fallback matrix: reflink APFS/btrfs/
+      XFS, copy on ext4/NTFS, hardlink only for read-only inputs).
+
+- [ ] **Stable change identity (dual identity, jj import)**: an
+      edit/intent id assigned at creation, stable across rewrites,
+      carried alongside content hashes by selections and transport;
+      merges reunify on either; intent-identical/content-divergent =
+      detected divergent change (both versions surfaced).
 
 *(Out of scope here: counterfactual postures / subject-instrument grants /
 divert plumbing — the experimentation subsystem's build, not needed to
 replace git for working branches + workstreams.)*
 
-## Phase 2 — workspace API for external hosts (the git-replacement surface)
+## Sequencing fork (⚑ OPEN — decide at build start) · **v0.4**
+
+- [ ] ⚑ **Git-backed workspace API first?** (jj's adoption path: semantics
+      over a git object-store backend, native store as the later swap.)
+      Ship the whip workspace API in gaugewright-workbench over git
+      objects — workstreams, certified merge on whip-legible content,
+      selective verbs, the no-destructive surface all live early — then
+      flip the backend when Phase 1 lands. Interim degradations, tagged:
+      no per-blob erasure, no chunk transfer, no two-plane-cut elegance.
+      Trade: earlier product value + de-risked storage swap behind a
+      stable API, vs. a temporary second substrate.
+
+## Phase 2 — workspace API for external hosts (the git-replacement surface) · **v0.4**
 
 - [ ] The mapped operation surface (un-tie's 13 consumed git capabilities):
       init / branch / fork-with-lineage / cut-at-quiescence / merge-probe /
@@ -85,17 +144,47 @@ replace git for working branches + workstreams.)*
       idempotent re-materialization on the receiving side (the handoff
       `STATE_BEFORE_HOME` carrier); **erasure-respecting** (tombstoned
       blobs never travel).
+- [ ] **Chunk-granular transfer**: pull-missing extends from blobs to
+      chunks (bundles, hybrid desktop↔cloud, sidecar warm-up become
+      rsync-class incremental); object-tier **chunk packing** (pack
+      objects indexed by the manifest — internal optimization, never
+      user-visible); presigned direct transfer for big artifacts on the
+      cloud path.
 - [ ] Per-blob erasure: tombstone/crypto-erase with retained hashes + the
       honesty downgrade (keep scores/identity, lose payload/replay);
       discharge un-tie's content-erasure invariants (`HISTORY_PRESERVED`,
       `EXPORTED_COPY_NOT_RECALLED`) over the substrate itself.
+- [ ] **Selection algebra + selective verbs** (vw note §7.3): a
+      **revset-shaped composable expression language** (∪/∩/− plus
+      structural operators: `dependents-of`, `slice-of`, `by-effect`,
+      `in-branch`) over provenance events (path/declaration/effect/
+      instance/agent/time/branch/semantic-impact); `undo <selection>`
+      with the dependency-closure stranding check (slicer's 7th client;
+      result = proposal, tagged synthetic until gates/gauges revalidate);
+      `transport <selection>` (dual-identity-preserving — reunifies at
+      later merge; divergence detected); `adopt --only <selection>`;
+      dry-run previews as default.
+- [ ] Structured conflict surface: conflict objects (base + both sides +
+      provenance) per declaration/path; **conflict-bearing cuts are
+      legal, tagged states** (never adoptable while conflicted; work
+      proceeds around and atop them); per-item resolution as a
+      provenance-carrying edit re-running gates; **resolution memory**
+      keyed by content-addressed conflict pairs, with resolutions
+      **auto-propagating to descendants** via the reconciliation daemon.
+- [ ] Provenance archaeology surfaces: write-attribution query
+      (blame-superseding), lineage/log views; checkout-free bisect over
+      materialized cuts (mostly pre-answered by evidence attribution —
+      surface, not machinery).
+- [ ] **Workspace-operation undo as a front-and-center verb** ("undo the
+      adopt", "undo that reconciliation") — the op-log query surfaced as
+      jj's most-loved feature, not left as a property.
 
-## Phase 3 — conversational runtime readiness (the Pi-replacement surface, whip half)
+## Phase 3 — conversational runtime readiness (the Pi-replacement surface, whip half) · **v0.3** (fork item → v0.4)
 
 - [ ] Chat-shaped instance: a long-lived conversational instance pattern —
       persistent thread = instance event log + restorable context; resumes
       across process restarts.
-- [ ] Instance fork surface (chat fork) over branches.
+- [ ] Instance fork surface (chat fork) over branches. **[v0.4 — needs Phase 1 branches.]**
 - [ ] **Pi-conformance checklist**: extraction pass over pi-mono 0.73.1
       for harness-owned behaviors — tool ergonomics (read/edit/bash/fetch,
       truncation, result digests), turn lifecycle, abort semantics, thread
@@ -109,7 +198,7 @@ replace git for working branches + workstreams.)*
       (tool dispatch/settle, pending-asks) consumable by an external UI —
       **no token streaming** (settled 2026-07-04).
 
-## Phase 4 — policy plane + auth
+## Phase 4 — policy plane + auth · **v0.4**
 
 - [ ] Policy-epoch consumption: a versioned policy snapshot as ambient
       config (capability grants, provider allowlists, egress policy, label
@@ -119,7 +208,7 @@ replace git for working branches + workstreams.)*
       credentials; whip's own auth shrinks to the thin standalone resolver
       (current env/keychain design becomes the fallback path).
 
-## Phase 5 — store seam (two stores, three disciplines)
+## Phase 5 — store seam (two stores, three disciplines) · **v0.4**
 
 - [ ] Referenceable handles for external admission logs: stable event-log
       positions, workspace cut ids, effect ids exposed so a policy
