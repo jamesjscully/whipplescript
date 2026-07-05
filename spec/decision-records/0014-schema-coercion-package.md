@@ -187,3 +187,55 @@ durable history: define compatibility or migration for old coerce records
 
 This should be a single implementation migration pass, not piecemeal drift:
 exact effect names are authority, report, and fixture keys, not just comments.
+
+## Amendment (proposed 2026-07-05): pre-release rename + idempotency-key commitments
+
+The precursor the `schema.coerce` rename (campaign S2) was gated on — the
+"idempotency-key commitments + DR-0014 amendment" — resolved/framed here so the
+rename is decision-ready. Items marked **(DECIDE)** are the author's call.
+
+### 1. The durable-history clause is moot pre-release — one-way rename
+
+The Migration Target's "preserve existing durable history ... versioned contract
+compatibility or explicit migration tooling" and "durable history: define
+compatibility or migration for old coerce records" both assumed shipped stores.
+The repo is **pre-release**: no persisted production store carries `coerce`-kind
+effects (tests use fresh stores; migration 0001 is the single baseline). So the
+rename is a **one-way, no-back-compat change** — no compatibility shim, no
+migration tooling. The store-open legacy-kind guard (`RETIRED_EFFECT_KINDS`,
+introduced for the signal.emit rename) gains a `coerce` row so any stray
+old-kind store fails loud rather than silently deduping. This **deletes** the
+migration-tooling scope from the sections above.
+
+### 2. Effect identity and the kind-string change
+
+The effect execution fingerprint is `H(input_json | sorted upstream effect ids)`
+(store `execution_fingerprint_on`), and the coerce `input_json` already folds the
+**prompt and schema name** (the coerce input builder in `rule_lowering`), so a
+prompt or schema change already re-runs rather than deduping a stale result. The
+rename changes these authority strings (one pass):
+- effect **kind string** `coerce` -> `schema.coerce` (~85 sites incl. IR enum
+  `Coerce` -> `SchemaCoerce`, `as_str`, every exhaustive match, and the
+  `flow_expand` re-serialize arm the compiler will flag);
+- **completion facts** `coerce.completed|failed` -> `schema.coerce.*` (the
+  after-branch predicates, 6 sites);
+- **capability name** `coerce` -> `schema.coerce`;
+- **migration-0001 seeds** — provider `provider_coerce_builtin`, binding
+  `binding_coerce_builtin`, and the `coerce` capability inside three profile
+  capability lists (repo-reader / repo-writer / internet-research);
+- report schemas, acceptance fixtures, checked-example assertions, IR goldens.
+
+**(DECIDE) Model identity in the effect key.** `input_json` binds prompt + schema
+but not the resolved model id, so a coerce whose only change is the model (same
+prompt/schema/input) dedups to the prior result on replay. Recommendation: fold
+the resolved model id (and the schema hash) into `input_json` in this same pass —
+a model swap is a semantically different coercion and should re-run. If
+model-stability-on-replay is instead preferred, leave as-is. Low blast radius
+either way; decide it here rather than discover it later.
+
+### Execution note
+
+One migration pass (as the section above already instructs), model-first per
+house rules: rename the kind in the effect-key / std-construct-authorization
+Maude models first, then the code pass, then regen goldens + report schemas; gate
+on full readiness. DR-0014 can move `proposed` -> `accepted` when this lands.
