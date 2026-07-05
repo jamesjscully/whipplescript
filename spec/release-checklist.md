@@ -39,16 +39,20 @@ the version is staged at 0.2.0. Below is the ordered sequence to cut and publish
 Every step requires a maintainer decision or maintainer credentials and is not
 automatable from inside the build.
 
-1. **Lock scope — the two held renames.** Decide build-for-0.2 or defer-to-0.3:
-   `coerce` → `schema.coerce` (S2; precursor in DR-0014's amendment) and
-   `queue.*` → `tracker.*` (S3; spec `spec/std-tracker.md`). If building, land each
-   as a gated model-first pass **first**, then re-run the readiness gate. If
-   deferring, current names ship in 0.2 (update the CHANGELOG note).
+1. **Std-package renames — DONE.** S3 `queue.*`→`tracker.*` (e57be7d), S2
+   `coerce`→`schema.coerce` (bd940e4), and the S2b model-id effect-key fold
+   (8abc7aa) are built, runtime-verified, and gate-green. DR-0014 can move
+   `proposed`→`accepted`. No scope decision remains here.
 
-2. **Live provider validation (G-008).** With real Codex/Claude/Pi credentials:
-   `WHIPPLESCRIPT_RELEASE_STRICT_EXTERNAL=1 scripts/check-release-readiness.sh` —
-   the external native-provider checks must pass (they are the only gate reds in a
-   credential-less environment). Required to advertise production native support.
+2. **Live provider validation (G-008) — Codex + Claude only.** Pi is deferred for
+   0.2 (the owned/native harness supersedes the standalone Pi provider); its live
+   checks are commented out of the gate and endpoint-health is codex+claude-only.
+   With Codex logged in (`codex`) and Claude authed (`claude` — claude.ai login or
+   `ANTHROPIC_API_KEY`), and a provider config for config-validation:
+   `WHIPPLESCRIPT_RELEASE_STRICT_EXTERNAL=1 WHIPPLESCRIPT_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json scripts/check-release-readiness.sh`
+   Codex + Claude were validated live 2026-07-05 (app-server + Agent SDK + both
+   native source-workflow smokes; surface probe uses grep, not rg). Required to
+   advertise production native support.
 
 3. **Final green + version.** Working tree clean; `whip --version` →
    `whipplescript 0.2.0`; `dist plan` reports 0.2.0; set the CHANGELOG date.
