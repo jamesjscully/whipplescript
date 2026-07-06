@@ -4564,18 +4564,17 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {
         serde_json::from_str::<Value>(skill.required_capabilities_json)?;
         serde_json::from_str::<Value>(skill.metadata_json)?;
-        let content_hash = stable_hash_hex(&format!(
-            "{}\n{}\n{}\n{}",
-            skill.name, skill.version, skill.source_path, skill.source
-        ));
+        // Content-address the body (Decision 3); byte-identical to the native
+        // store so a skill's hash matches across backends.
+        let content_hash = stable_hash_hex(skill.body);
         self.sql
             .execute(
                 "INSERT INTO skills (skill_id, name, version, source, source_path, \
-                 content_hash, description, required_capabilities, metadata_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(name) DO UPDATE SET \
+                 content_hash, body, description, required_capabilities, metadata_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(name) DO UPDATE SET \
                  version = excluded.version, source = excluded.source, \
                  source_path = excluded.source_path, content_hash = excluded.content_hash, \
-                 description = excluded.description, \
+                 body = excluded.body, description = excluded.description, \
                  required_capabilities = excluded.required_capabilities, \
                  metadata_json = excluded.metadata_json",
                 &[
@@ -4585,6 +4584,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                     text(skill.source),
                     text(skill.source_path),
                     text(&content_hash),
+                    text(skill.body),
                     text(skill.description),
                     text(skill.required_capabilities_json),
                     text(skill.metadata_json),
@@ -6997,6 +6997,7 @@ pub(crate) mod test_support {
             CREATE TABLE skills (
                 skill_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL,
                 source TEXT NOT NULL, source_path TEXT NOT NULL, content_hash TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
                 description TEXT NOT NULL DEFAULT '', required_capabilities TEXT NOT NULL DEFAULT '[]',
                 metadata_json TEXT NOT NULL DEFAULT '{}'
             );
@@ -7401,15 +7402,17 @@ mod tests {
                 skill_id: "skl_1",
                 name: "triage",
                 version: "1.0.0",
-                source: "body",
+                source: "fs",
                 source_path: "skills/triage.md",
+                body: "# Triage\nTriage the inbox.\n",
                 description: "triage inbox",
                 required_capabilities_json: "[]",
                 metadata_json: "{}",
             })
             .expect("register_skill");
+        // content_hash is the hash of the body (Decision 3), matching the native store.
         assert_eq!(
-            stable_hash_hex("triage\n1.0.0\nskills/triage.md\nbody"),
+            stable_hash_hex("# Triage\nTriage the inbox.\n"),
             store.list_skills().expect("list_skills")[0].content_hash,
         );
 
@@ -8038,8 +8041,9 @@ mod tests {
                 skill_id: "skl_1",
                 name: "triage",
                 version: "2.0.0",
-                source: "b",
+                source: "fs",
                 source_path: "p",
+                body: "# Triage\n",
                 description: "",
                 required_capabilities_json: "[]",
                 metadata_json: "{}",

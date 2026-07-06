@@ -5083,6 +5083,7 @@ rule wait
                 version: "1.0.0",
                 source: "# Loft User\n",
                 source_path: "skills/loft-user/SKILL.md",
+                body: "# Loft User\nUse Loft carefully.\n",
                 description: "Loft instructions",
                 required_capabilities_json: r#"["loft.claim"]"#,
                 metadata_json: "{}",

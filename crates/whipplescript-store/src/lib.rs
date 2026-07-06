@@ -337,6 +337,9 @@ pub struct SkillRegistration<'a> {
     pub version: &'a str,
     pub source: &'a str,
     pub source_path: &'a str,
+    /// The full SKILL.md bytes the model reads on activation. `content_hash` is
+    /// this body's hash (Decision 3), so it is content-addressed and replay-stable.
+    pub body: &'a str,
     pub description: &'a str,
     pub required_capabilities_json: &'a str,
     pub metadata_json: &'a str,
@@ -912,11 +915,18 @@ struct Migration {
 }
 
 #[cfg(feature = "native")]
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "runtime-store-schema",
-    sql: include_str!("../migrations/0001_runtime_store.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "runtime-store-schema",
+        sql: include_str!("../migrations/0001_runtime_store.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "skill-body",
+        sql: include_str!("../migrations/0002_skill_body.sql"),
+    },
+];
 
 /// Stage marker retained for the CLI/kernel scaffold.
 pub fn store_stage() -> &'static str {
@@ -2856,10 +2866,9 @@ impl SqliteStore {
     pub fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {
         serde_json::from_str::<Value>(skill.required_capabilities_json)?;
         serde_json::from_str::<Value>(skill.metadata_json)?;
-        let content_hash = stable_hash_hex(&format!(
-            "{}\n{}\n{}\n{}",
-            skill.name, skill.version, skill.source_path, skill.source
-        ));
+        // Content-address the body (Decision 3): the hash tracks the exact bytes
+        // the model reads, so it moves iff the SKILL.md body changes.
+        let content_hash = stable_hash_hex(skill.body);
         self.connection.execute(
             r#"
             INSERT INTO skills (
@@ -2869,16 +2878,18 @@ impl SqliteStore {
                 source,
                 source_path,
                 content_hash,
+                body,
                 description,
                 required_capabilities,
                 metadata_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(name) DO UPDATE SET
                 version = excluded.version,
                 source = excluded.source,
                 source_path = excluded.source_path,
                 content_hash = excluded.content_hash,
+                body = excluded.body,
                 description = excluded.description,
                 required_capabilities = excluded.required_capabilities,
                 metadata_json = excluded.metadata_json
@@ -2890,6 +2901,7 @@ impl SqliteStore {
                 skill.source,
                 skill.source_path,
                 content_hash,
+                skill.body,
                 skill.description,
                 skill.required_capabilities_json,
                 skill.metadata_json,
@@ -14180,6 +14192,7 @@ mod tests {
                 version: "1.0.0",
                 source: "# Loft User\nUse Loft carefully.\n",
                 source_path: "skills/loft-user/SKILL.md",
+                body: "# Loft User\nUse Loft carefully.\n",
                 description: "Loft workflow instructions",
                 required_capabilities_json: r#"["loft.claim"]"#,
                 metadata_json: r#"{"package":"core"}"#,
