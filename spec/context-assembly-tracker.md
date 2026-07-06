@@ -226,15 +226,21 @@ Everything else in this tracker rides this seam.
 
 Mirror pi's discovery exactly, registry-backed for the DO.
 
-- [ ] Filenames `AGENTS.md / AGENTS.MD / CLAUDE.md / CLAUDE.MD`, first match per
-  directory.
-- [ ] Search order: global agent dir first, then walk cwd → filesystem root
-  (root-most injected first, nearest-cwd last), de-duped.
-- [ ] Inject verbatim into the system prompt wrapped as
-  `<project_context><project_instructions path="…">…</project_instructions></project_context>`.
-  Disable flag (pi's `--no-context-files` equivalent).
-- [ ] On the DO (no fs): resolve the same content from the store (content-addressed),
-  so behaviour is host-uniform.
+**Native discovery + injection DONE 2026-07-06** (v0.3) — `project_context` module.
+
+- [x] Filenames `AGENTS.md / AGENTS.MD / CLAUDE.md / CLAUDE.MD`, first match per
+  directory (`CONTEXT_FILENAMES` precedence).
+- [x] Search order: optional global dir (`WHIPPLESCRIPT_GLOBAL_CONTEXT_DIR`) first,
+  then walk cwd → filesystem root injected root-most-first / nearest-cwd-last,
+  de-duped. Unit-tested for order + precedence.
+- [x] Inject verbatim wrapped as
+  `<project_context><project_instructions path="…">…</project_instructions></project_context>`,
+  via the owned harness `ProjectContext` bundle (rides the Phase 1 seam →
+  `context.bundle` evidence). Disable flag = `WHIPPLESCRIPT_NO_CONTEXT_FILES`.
+  Integration test (workspace AGENTS.md → project_context evidence).
+- [ ] On the DO (no fs): resolve the same content from the store (content-addressed)
+  — **follow-on** (like the skill activation read; the DO agent turn is still a
+  no-tools stub, so there is no DO-side consumer yet).
 
 ---
 
