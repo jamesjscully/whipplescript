@@ -3,14 +3,12 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
-> **Draft for the 0.2.0 cut.** Content reflects the shipped 0.2 surface (the
-> language, standard packages, and native runtime). Cloud deployment + the owned
-> harness (0.3) and the experimentation/evals + versioned-workspace work (0.4)
-> are tracked separately and are **not** part of 0.2. Two standard-package
-> renames (`coerce` → `schema.coerce`, `queue.*` → `tracker.*`) are decision-ready
-> but gated on a build-or-defer call; if deferred, the current names ship in 0.2.
+> 0.2 is the language, standard packages, and native runtime. Cloud deployment +
+> the owned harness (0.3) and the experimentation/evals + versioned-workspace work
+> (0.4) are tracked separately and are **not** part of 0.2. Native provider support
+> is validated for **Codex and Claude**; the Pi native provider is deferred.
 
-## [0.2.0] — unreleased
+## [0.2.0] — 2026-07-06
 
 WhippleScript is a small scripting language for AI to orchestrate AI: a durable,
 replayable rule/effect kernel with a scriptable surface. This release is the
@@ -73,9 +71,10 @@ privileges — with no ambient authority.
   failures (`fails as f`), and a hermetic Lean proof layer.
 
 ### Native providers & runtime
-- Native Codex (app-server), Claude (Agent SDK sidecar), and Pi (RPC) adapters:
-  lifecycle normalization to `agent.turn.*`, provider-native cancellation,
-  artifact/evidence capture with redaction, and crash/restart recovery.
+- Native **Codex** (app-server) and **Claude** (Agent SDK sidecar) providers,
+  live-validated: lifecycle normalization to `agent.turn.*`, provider-native
+  cancellation, artifact/evidence capture with redaction, and crash/restart
+  recovery. A Pi (RPC) adapter is present in-tree but deferred (not part of 0.2).
 - Durable SQLite runtime with event-sourced replay, workflow revision, and a
   worker/`dev` driver; deterministic fixtures for CI.
 
