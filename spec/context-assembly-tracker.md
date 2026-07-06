@@ -251,9 +251,10 @@ distinct layers replace it:
 
 **Layer A — per-tool-output caps at capture (deterministic, always-on, not a
 "compactor").**
-- [ ] Middle-truncate individual tool outputs at capture with a head+tail header
-  (Codex ≈10k tokens to the model, pi ≈2000 lines / 50 KB) and a hard byte cap so a
-  runaway command cannot OOM. Large outputs remain fully addressable as evidence.
+- [x] Middle-truncate individual tool outputs at capture (v0.3) — `middle_truncate`
+  keeps a head + tail with an elision marker, applied per-tool (read/grep/bash, 50 KB
+  budget) and as a uniform safety net in `execute()`; `bash` is source-bounded via
+  `run_bounded_command`. Full output stays addressable as evidence. Unit test.
 
 **Layer B — the `Compactor` trait (conversation compaction, cache-aware).**
 - [ ] `trait Compactor { should_compact(stats, window) -> bool; plan(transcript)
