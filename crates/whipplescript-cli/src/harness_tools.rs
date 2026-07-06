@@ -2505,6 +2505,9 @@ pub fn run_owned_agent_turn(
                 config.model,
                 config.base_url,
                 config.max_tokens,
+                // Stable cache key for this turn-thread (Decision 7): the effect id,
+                // constant across the turn's model steps.
+                Some(effect_id.to_owned()),
             );
             kernel.run_brokered_agent_turn(&ctx, &client, &executor, &input)
         }

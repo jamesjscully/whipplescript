@@ -207,6 +207,9 @@ fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
             .get("max_tokens")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(4096),
+        // Constructed once per durable object, so no per-turn id here; the
+        // Anthropic cache_control breakpoint still applies (Decision 7).
+        None,
     ))
 }
 

@@ -36,6 +36,10 @@ pub struct RealHarnessModelClient<'a, T: CoerceTransport + ?Sized> {
     model: String,
     base_url: String,
     max_tokens: u64,
+    /// Stable cache key for this turn-thread (Decision 7): the run/effect id.
+    /// Sent as `prompt_cache_key` on OpenAI; Anthropic caches by prefix hash
+    /// (via `cache_control` breakpoints) and does not use it.
+    cache_key: Option<String>,
 }
 
 impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
@@ -46,6 +50,7 @@ impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
         model: impl Into<String>,
         base_url: impl Into<String>,
         max_tokens: u64,
+        cache_key: Option<String>,
     ) -> Self {
         Self {
             transport,
@@ -54,6 +59,7 @@ impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
             model: model.into(),
             base_url: base_url.into(),
             max_tokens,
+            cache_key,
         }
     }
 }
@@ -66,6 +72,7 @@ impl<T: CoerceTransport + ?Sized> HttpModelClient for RealHarnessModelClient<'_,
             &self.api_key,
             &self.model,
             self.max_tokens,
+            self.cache_key.as_deref(),
             messages,
             tools,
         )
@@ -108,6 +115,12 @@ pub struct MessagesApiClient {
     model: String,
     base_url: String,
     max_tokens: u64,
+    /// Stable per-turn-thread cache key (Decision 7). The durable-object host
+    /// constructs this client once per object (not per turn), so it has no
+    /// per-effect id at construction and passes `None` for now; the Anthropic
+    /// `cache_control` breakpoint still applies. Wiring the per-turn key through
+    /// the DO agent path is a later-phase follow-up.
+    cache_key: Option<String>,
 }
 
 impl MessagesApiClient {
@@ -117,6 +130,7 @@ impl MessagesApiClient {
         model: impl Into<String>,
         base_url: impl Into<String>,
         max_tokens: u64,
+        cache_key: Option<String>,
     ) -> Self {
         Self {
             provider,
@@ -124,6 +138,7 @@ impl MessagesApiClient {
             model: model.into(),
             base_url: base_url.into(),
             max_tokens,
+            cache_key,
         }
     }
 }
@@ -136,6 +151,7 @@ impl HttpModelClient for MessagesApiClient {
             &self.api_key,
             &self.model,
             self.max_tokens,
+            self.cache_key.as_deref(),
             messages,
             tools,
         )
@@ -171,14 +187,20 @@ fn build_request(
     api_key: &str,
     model: &str,
     max_tokens: u64,
+    cache_key: Option<&str>,
     messages: &[ChatMessage],
     tools: &[ToolSpec],
 ) -> HttpRequest {
     match provider {
         CoerceProvider::Anthropic => {
+            // Anthropic caches by prefix hash via `cache_control` breakpoints, so
+            // the stable-key intent (Decision 7) is carried by the breakpoint, not
+            // an explicit key.
             build_anthropic_request(base_url, api_key, model, max_tokens, messages, tools)
         }
-        CoerceProvider::OpenAi => build_openai_request(base_url, api_key, model, messages, tools),
+        CoerceProvider::OpenAi => {
+            build_openai_request(base_url, api_key, model, cache_key, messages, tools)
+        }
     }
 }
 
@@ -205,7 +227,19 @@ fn build_anthropic_request(
     body.insert("model".into(), json!(model));
     body.insert("max_tokens".into(), json!(max_tokens));
     if let Some(system) = system {
-        body.insert("system".into(), json!(system));
+        // Cache breakpoint at the end of the system prompt (Decision 7). The
+        // deterministic assembler makes [tools, system] a byte-stable prefix, so
+        // marking the system block `ephemeral` caches that prefix and lets it be
+        // reused across the turn's model steps. Messages append after the
+        // breakpoint and are not part of this cached prefix.
+        body.insert(
+            "system".into(),
+            json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": { "type": "ephemeral" },
+            }]),
+        );
     }
     body.insert("messages".into(), json!(msgs));
     body.insert("tools".into(), json!(tool_defs));
@@ -273,6 +307,7 @@ fn build_openai_request(
     base_url: &str,
     api_key: &str,
     model: &str,
+    cache_key: Option<&str>,
     messages: &[ChatMessage],
     tools: &[ToolSpec],
 ) -> HttpRequest {
@@ -288,11 +323,17 @@ fn build_openai_request(
             })
         })
         .collect();
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "input": input,
         "tools": tool_defs,
     });
+    if let Some(key) = cache_key {
+        // Stable per-turn-thread cache key (Decision 7): the run/effect id, held
+        // constant across the turn's model steps so the server serves the growing
+        // request prefix from cache instead of re-reading it each round.
+        body["prompt_cache_key"] = json!(key);
+    }
     HttpRequest {
         url: format!("{base_url}/v1/responses"),
         headers: vec![
@@ -527,7 +568,10 @@ mod tests {
             .headers
             .iter()
             .any(|(k, v)| k == "x-api-key" && v == "sk-ant-api-key"));
-        assert_eq!(req.body["system"], json!("be helpful"));
+        // System is a single text block carrying the end-of-prompt cache
+        // breakpoint (Decision 7); the text the model sees is unchanged.
+        assert_eq!(req.body["system"][0]["type"], json!("text"));
+        assert_eq!(req.body["system"][0]["text"], json!("be helpful"));
         let msgs = req.body["messages"].as_array().expect("messages");
         // user, assistant(tool_use), user(tool_result)
         assert_eq!(msgs.len(), 3);
@@ -564,6 +608,7 @@ mod tests {
             "https://api.openai.com",
             "sk-key",
             "gpt-5.5",
+            None,
             &convo(),
             &tool_specs(),
         );
@@ -580,6 +625,36 @@ mod tests {
                     && i["call_id"] == json!("call_1"))
         );
         assert_eq!(req.body["tools"][0]["type"], json!("function"));
+    }
+
+    #[test]
+    fn cache_breakpoints_and_stable_key_follow_decision_7() {
+        // Anthropic: the system prompt is sent as a content block carrying a
+        // `cache_control` breakpoint at its end (the stable [tools, system] prefix).
+        let anthropic =
+            build_anthropic_request("https://api.anthropic.com", "k", "m", 4096, &convo(), &tool_specs());
+        let system = anthropic.body["system"]
+            .as_array()
+            .expect("system rendered as cache-controllable blocks");
+        assert_eq!(
+            system.last().expect("a system block")["cache_control"]["type"],
+            json!("ephemeral")
+        );
+
+        // OpenAI: a stable per-turn-thread key rides as `prompt_cache_key` when
+        // supplied, and is absent otherwise (no key => no field, not null).
+        let with_key = build_openai_request(
+            "https://api.openai.com",
+            "k",
+            "m",
+            Some("turn-42"),
+            &convo(),
+            &tool_specs(),
+        );
+        assert_eq!(with_key.body["prompt_cache_key"], json!("turn-42"));
+        let without_key =
+            build_openai_request("https://api.openai.com", "k", "m", None, &convo(), &tool_specs());
+        assert!(without_key.body.get("prompt_cache_key").is_none());
     }
 
     #[test]
@@ -611,6 +686,7 @@ mod tests {
             "m",
             "https://api.anthropic.com",
             4096,
+            None,
         );
         let err = client
             .next(&convo(), &tool_specs())
@@ -634,6 +710,7 @@ mod tests {
             "m",
             "https://api.openai.com",
             4096,
+            None,
         );
         assert_eq!(
             client.next(&convo(), &tool_specs()),
@@ -653,6 +730,7 @@ mod tests {
             "claude-opus-4-8",
             "https://api.anthropic.com",
             4096,
+            None,
         );
         let request = client.build_request(&convo(), &tool_specs());
         assert_eq!(request.url, "https://api.anthropic.com/v1/messages");
@@ -692,6 +770,7 @@ mod tests {
             "m",
             "https://api.anthropic.com",
             4096,
+            None,
         );
         let reply = client.next(&convo(), &tool_specs()).expect("reply");
         assert_eq!(reply.text, "done");

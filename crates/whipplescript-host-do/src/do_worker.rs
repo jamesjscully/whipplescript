@@ -400,6 +400,7 @@ mod tests {
                 "claude-test",
                 "https://api.anthropic.com",
                 1024,
+                None,
             ))),
             ..DurableEffectPorts::default()
         };
