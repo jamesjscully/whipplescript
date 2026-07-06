@@ -185,16 +185,19 @@ Everything else in this tracker rides this seam.
   `name` (≤64, `[a-z0-9-]`, no leading/trailing/consecutive hyphen) + `description`
   (≤1024), parses `license`/`compatibility`/`metadata`/`allowed-tools`
   (allowed-tools as provenance only). Directory-match is the loader's check.
-- [~] **Registry loader** (v0.3) — `skills_loader::load_skills_from_dir` ingests a
+- [x] **Registry loader** (v0.3) — `skills_loader::load_skills_from_dir` ingests a
   skills dir (each `<name>/SKILL.md`) → `skills` rows with **content-addressed
   bodies** (`body` column via migration `0002` + the DO store's mirrored schema;
   `content_hash = H(body)`). Deterministic (sorted) load order; name==dir enforced;
-  license/compatibility/allowed-tools recorded as metadata. **Remaining:** startup
-  wiring (workspace `.whipplescript/skills/` + first-party + package resources) —
-  lands with the catalogue below.
-- [ ] **Catalogue bundle** (Phase 1 seam): render `<available_skills>` with
-  `name`/`description`/`location`, pi's exact XML, only when a `read`-class tool is
-  present.
+  license/compatibility/allowed-tools recorded as metadata. Wired into `dev` startup
+  (`load_workspace_skills`, `<store-dir>/skills/`). **Follow-on:** first-party +
+  package-resource sources (only workspace `.whipplescript/skills/` today).
+- [x] **Catalogue bundle** (Phase 1 seam) (v0.3) — `owned_context_bundles` renders
+  the `<available_skills>` bundle (name/description/location per skill) from
+  `list_skills`, only when a read-class tool is present; rides the assembler seam so
+  it is a `context.bundle` evidence row. Unit test (read-tool gate) + integration
+  test (workspace skill → owned turn → available_skills evidence). Exact pi XML is
+  approximated; the Pi-conformance pass (un-tie Phase 3) reconciles the wording.
 - [ ] **Activation = registry-backed read**: the location the model reads resolves
   to the content-addressed body on both native and DO. Record the read as evidence
   (it is already a brokered tool call).
