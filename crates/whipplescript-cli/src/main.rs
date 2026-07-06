@@ -25868,6 +25868,27 @@ fn ifc_admission(program_path: &str, root: Option<&str>) -> Result<(), ExitCode>
     Err(ExitCode::FAILURE)
 }
 
+/// Load workspace skills (`<store-dir>/skills/`) into the store so the owned
+/// harness can offer them in its `<available_skills>` catalogue (context-assembly
+/// Phase 2). A missing directory is a no-op; a malformed `SKILL.md` is a warning
+/// that does not abort the run.
+fn load_workspace_skills(store_path: &Path) {
+    let skills_dir = store_path
+        .parent()
+        .map(|dir| dir.join("skills"))
+        .unwrap_or_else(|| PathBuf::from(".whipplescript/skills"));
+    match SqliteStore::open(store_path) {
+        Ok(store) => {
+            if let Err(error) =
+                skills_loader::load_skills_from_dir(&store, &skills_dir, "workspace")
+            {
+                eprintln!("warning: skill load failed: {error}");
+            }
+        }
+        Err(error) => eprintln!("warning: could not open store to load skills: {error:?}"),
+    }
+}
+
 fn dev(options: &CliOptions) -> ExitCode {
     let dev_options = match DevOptions::parse(&options.args) {
         Ok(options) => options,
@@ -25903,6 +25924,10 @@ fn dev(options: &CliOptions) -> ExitCode {
         Ok(started) => started,
         Err(code) => return code,
     };
+    // Load workspace skills (context-assembly Phase 2) into the store so the owned
+    // harness can offer them in its `<available_skills>` catalogue. Idempotent
+    // (UPSERT by name); a missing skills directory loads nothing.
+    load_workspace_skills(&options.store_path);
     let (_source, ir) =
         match compile_source_path_with_root(&dev_options.program_path, dev_options.root.as_deref())
         {

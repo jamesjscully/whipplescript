@@ -16,9 +16,6 @@ use whipplescript_store::skill_frontmatter::parse_skill_frontmatter;
 use whipplescript_store::{SkillRegistration, SqliteStore};
 
 /// A skill that was ingested into the store.
-// Wired into `dev`/`worker` startup by item 3 (the catalogue bundle consumes
-// `list_skills`); until then only the unit tests exercise the loader.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoadedSkill {
     pub name: String,
@@ -30,7 +27,6 @@ pub struct LoadedSkill {
 /// `source` (e.g. `"workspace"`, `"builtin"`). Returns the loaded skills in
 /// deterministic order. A subdirectory without a `SKILL.md` is skipped; a present
 /// but invalid `SKILL.md` is a hard error naming the offending skill.
-#[allow(dead_code)] // wired into dev/worker startup by item 3
 pub fn load_skills_from_dir(
     store: &SqliteStore,
     skills_dir: &Path,
@@ -121,9 +117,9 @@ mod tests {
 
     fn write_skill(root: &Path, name: &str, frontmatter_name: &str, body_line: &str) {
         let dir = root.join(name);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("create skill dir");
         let content = format!("---\nname: {frontmatter_name}\ndescription: A {name} skill.\n---\n# {name}\n{body_line}\n");
-        std::fs::write(dir.join("SKILL.md"), content).unwrap();
+        std::fs::write(dir.join("SKILL.md"), content).expect("write SKILL.md");
     }
 
     #[test]
@@ -133,7 +129,7 @@ mod tests {
         write_skill(&tmp, "beta", "beta", "second");
         write_skill(&tmp, "alpha", "alpha", "first");
         // A directory with no SKILL.md is skipped.
-        std::fs::create_dir_all(tmp.join("empty")).unwrap();
+        std::fs::create_dir_all(tmp.join("empty")).expect("create empty dir");
 
         let store = SqliteStore::open_in_memory().expect("store");
         let loaded = load_skills_from_dir(&store, &tmp, "workspace").expect("loads");

@@ -5001,6 +5001,112 @@ fn dev_owned_harness_completes_turn_with_leaf_invariants() {
 }
 
 #[test]
+fn dev_owned_harness_offers_available_skills_catalogue() {
+    // context-assembly Phase 2: a workspace skill is loaded into the store at
+    // startup, and an owned turn with a read tool offers it in the
+    // `<available_skills>` catalogue (recorded as a context.bundle evidence row).
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let ws = std::env::temp_dir().join(format!(
+        "whip-skill-catalogue-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = fs::remove_dir_all(&ws);
+    let skill_dir = ws.join(".whipplescript").join("skills").join("demo");
+    fs::create_dir_all(&skill_dir).expect("skill dir");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: A demo skill for the catalogue.\n---\n# Demo\nDo the demo.\n",
+    )
+    .expect("write skill");
+    let store_path = ws.join(".whipplescript").join("store.sqlite");
+    let workflow = ws.join("catalogue.whip");
+    fs::write(
+        &workflow,
+        r#"class Done { note string }
+
+file store workspace_files {
+  root "."
+  allow read ["**"]
+}
+
+workflow SkillCatalogueSmoke {
+  output result Done
+
+  agent helper {
+    provider owned
+    profile "repo-reader"
+    capacity 1
+  }
+
+  rule begin
+    when started
+    when helper is available
+  => {
+    tell helper as turn
+      with access to workspace_files {
+        read ["**"]
+      }
+    """
+    List the available skills and stop.
+    """
+
+    after turn succeeds {
+      complete result {
+        note turn.summary
+      }
+    }
+  }
+}
+"#,
+    )
+    .expect("write workflow");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store path"),
+            "--json",
+            "dev",
+            workflow.to_str().expect("utf-8 workflow path"),
+            "--provider",
+            "owned",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let evidence = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store path"),
+            "--json",
+            "evidence",
+            instance_id,
+        ],
+    );
+    let evidence = evidence
+        .get("evidence")
+        .and_then(Value::as_array)
+        .expect("evidence array");
+    assert!(
+        evidence.iter().any(|item| {
+            item.get("kind").and_then(Value::as_str) == Some("context.bundle")
+                && item.get("summary").and_then(Value::as_str) == Some("available_skills")
+        }),
+        "expected an available_skills context.bundle evidence row (loaded skill offered in the catalogue)"
+    );
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
 fn dev_native_fixture_records_provider_lifecycle_and_artifacts_from_source_workflow() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();

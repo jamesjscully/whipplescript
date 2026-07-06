@@ -1812,7 +1812,44 @@ const OWNED_GUIDELINES: &[&str] = &[
 /// snippets, guidelines, current date, current working directory. Project-context
 /// and available-skills slots are populated in later tracker phases. The host
 /// supplies `date`/`cwd` (kept out of the pure kernel assembler).
-fn owned_context_bundles(tools: &[ToolSpec], date: &str, cwd: &str) -> Vec<ContextBundle> {
+/// One entry in the `<available_skills>` catalogue: what the model needs to decide
+/// relevance and where to read the full instructions (Decision 2, discover-all).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillCatalogueEntry {
+    pub name: String,
+    pub description: String,
+    pub location: String,
+}
+
+/// Whether the turn has a read-class tool the model can use to load a skill body.
+/// Without one the catalogue is pointless (nothing can fetch the SKILL.md).
+fn has_read_class_tool(tools: &[ToolSpec]) -> bool {
+    tools.iter().any(|tool| tool.name == TOOL_READ)
+}
+
+/// Render the `<available_skills>` catalogue bundle body: one entry per skill with
+/// its `name`, `description`, and `location` (the model reads the location on
+/// demand to activate a skill — an ordinary, evidence-logged tool call).
+fn render_available_skills(skills: &[SkillCatalogueEntry]) -> String {
+    let mut body = String::from(
+        "Available skills — read a skill's location to load its full instructions:\n<available_skills>",
+    );
+    for skill in skills {
+        body.push_str(&format!(
+            "\n  <skill name=\"{}\" location=\"{}\">\n  {}\n  </skill>",
+            skill.name, skill.location, skill.description
+        ));
+    }
+    body.push_str("\n</available_skills>");
+    body
+}
+
+fn owned_context_bundles(
+    tools: &[ToolSpec],
+    date: &str,
+    cwd: &str,
+    skills: &[SkillCatalogueEntry],
+) -> Vec<ContextBundle> {
     let mut bundles = vec![ContextBundle::new(
         BundleKind::Persona,
         "builtin:persona",
@@ -1860,6 +1897,19 @@ fn owned_context_bundles(tools: &[ToolSpec], date: &str, cwd: &str) -> Vec<Conte
         "v1",
         format!("Current working directory: {cwd}"),
     ));
+
+    // The `<available_skills>` catalogue (Decision 2: discover-all). Only when a
+    // read-class tool is present — otherwise the model cannot load a skill body.
+    // The assembler renders this in its canonical slot regardless of push order.
+    if !skills.is_empty() && has_read_class_tool(tools) {
+        bundles.push(ContextBundle::new(
+            BundleKind::AvailableSkills,
+            "registry:skills",
+            "v1",
+            render_available_skills(skills),
+        ));
+    }
+
     bundles
 }
 
@@ -2447,15 +2497,31 @@ pub fn run_owned_agent_turn(
             workflow_tool_specs,
         ));
     }
+    // The registered-skills catalogue (context-assembly Phase 2): discover-all, so
+    // every registered skill's name/description/location goes in and the model
+    // reads a body on demand. A store read failure degrades to no catalogue.
+    let skill_catalogue: Vec<SkillCatalogueEntry> = kernel
+        .store()
+        .list_skills()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|skill| SkillCatalogueEntry {
+            name: skill.name,
+            description: skill.description,
+            location: skill.source_path,
+        })
+        .collect();
     // Assemble the system prompt from provenance-tagged bundles (mirror pi):
-    // persona, tool snippets, guidelines, date, cwd. The host supplies date/cwd;
-    // the kernel assembler renders them in canonical order (context-assembly
-    // tracker Phase 1). Per-bundle provenance (`assembled.bundles`) is recorded as
-    // evidence in a later phase.
+    // persona, tool snippets, guidelines, available skills, date, cwd. The host
+    // supplies date/cwd + the skill catalogue; the kernel assembler renders them in
+    // canonical order (context-assembly Phase 1). Per-bundle provenance
+    // (`assembled.bundles`) is recorded as `context.bundle` evidence by
+    // `run_brokered_agent_turn` before the turn (Decision 5).
     let assembled = assemble(owned_context_bundles(
         &tools,
         &owned_context_date(),
         &workspace.display().to_string(),
+        &skill_catalogue,
     ));
     let input = BrokeredTurnInput {
         system: assembled.system_prompt,
@@ -2577,7 +2643,7 @@ mod tests {
             description: "Read a file from the workspace.".into(),
             input_schema: json!({}),
         }];
-        let assembled = assemble(owned_context_bundles(&tools, "2026-07-04", "/repo"));
+        let assembled = assemble(owned_context_bundles(&tools, "2026-07-04", "/repo", &[]));
         let prompt = assembled.system_prompt;
 
         // Persona + guidelines carry the turn-scoped authority + termination contract.
@@ -2607,10 +2673,40 @@ mod tests {
 
     #[test]
     fn owned_context_prompt_omits_tool_list_when_no_tools_offered() {
-        let assembled = assemble(owned_context_bundles(&[], "2026-07-04", "/repo"));
+        let assembled = assemble(owned_context_bundles(&[], "2026-07-04", "/repo", &[]));
         assert!(!assembled.system_prompt.contains("Available tools:"));
         // persona, guidelines, date, cwd -- no tools bundle.
         assert_eq!(assembled.bundles.len(), 4);
+    }
+
+    #[test]
+    fn available_skills_catalogue_renders_only_with_a_read_tool() {
+        let read = vec![ToolSpec {
+            name: "read".into(),
+            description: "Read a file.".into(),
+            input_schema: json!({}),
+        }];
+        let skills = vec![SkillCatalogueEntry {
+            name: "triage".into(),
+            description: "Triage the inbox.".into(),
+            location: ".whipplescript/skills/triage/SKILL.md".into(),
+        }];
+
+        // With a read tool present, the catalogue renders name/description/location.
+        let with_read = assemble(owned_context_bundles(&read, "2026-07-04", "/repo", &skills));
+        assert!(with_read.system_prompt.contains("<available_skills>"));
+        assert!(with_read.system_prompt.contains(
+            "<skill name=\"triage\" location=\".whipplescript/skills/triage/SKILL.md\">"
+        ));
+        assert!(with_read.system_prompt.contains("Triage the inbox."));
+        assert!(with_read
+            .bundles
+            .iter()
+            .any(|bundle| bundle.kind == BundleKind::AvailableSkills));
+
+        // Without a read-class tool the model can't fetch a body, so no catalogue.
+        let no_read = assemble(owned_context_bundles(&[], "2026-07-04", "/repo", &skills));
+        assert!(!no_read.system_prompt.contains("<available_skills>"));
     }
 
     #[test]
