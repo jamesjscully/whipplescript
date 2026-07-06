@@ -212,9 +212,13 @@ Everything else in this tracker rides this seam.
   `<store-dir>/skills/<name>/`, then registers into the store). Built over items
   1–2. Integration test for install→list. The `~/.codex/skills` install script is
   orthogonal (delegated Codex provider discovery) and kept.
-- [ ] Resolve `agent { skills [...] }` (and attachments) into per-turn provenance
-  so `skills.injected` stops being empty — but as **pinning, not a catalogue
-  filter** (Decision 2).
+- [x] Resolve `agent { skills [...] }` into per-turn provenance (v0.3) —
+  `run_agent_effect` reads the turning agent's declared skills from the IR
+  (compile the program, find the agent) and passes them as `skill_names`, so
+  `skills.injected` records the pinned skills instead of always-empty. **Pinning,
+  not a catalogue filter** (Decision 2) — the `<available_skills>` catalogue stays
+  discover-all. Integration test. (Store-backed skill *attachments* remain a
+  follow-on; today the source declaration is the pin.)
 
 ---
 
