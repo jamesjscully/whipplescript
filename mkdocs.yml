@@ -9,6 +9,8 @@ strict: true
 
 theme:
   name: material
+  logo: assets/logo.svg
+  favicon: assets/favicon.svg
   font:
     text: Figtree
     code: Inconsolata
@@ -16,13 +18,13 @@ theme:
     # Navy-led by default (ecosystem-aligned); light is a toggle.
     - scheme: slate
       primary: black
-      accent: green
+      accent: blue
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
     - scheme: default
       primary: black
-      accent: green
+      accent: blue
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
