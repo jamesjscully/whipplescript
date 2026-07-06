@@ -5159,6 +5159,102 @@ fn skill_cli_installs_into_the_registry_and_lists_it() {
 }
 
 #[test]
+fn agent_declared_skills_are_pinned_as_injected_evidence() {
+    // context-assembly Phase 2 item 6: an agent's `skills [...]` declaration is
+    // resolved from the IR and recorded as `skills.injected` provenance (pinning,
+    // not a catalogue filter — Decision 2).
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let ws =
+        std::env::temp_dir().join(format!("whip-skill-pin-{}-{}", std::process::id(), line!()));
+    let _ = fs::remove_dir_all(&ws);
+    let skill_dir = ws.join(".whipplescript").join("skills").join("demo");
+    fs::create_dir_all(&skill_dir).expect("skill dir");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: A demo skill.\n---\n# Demo\n",
+    )
+    .expect("write skill");
+    let store_path = ws.join(".whipplescript").join("store.sqlite");
+    let workflow = ws.join("pin.whip");
+    fs::write(
+        &workflow,
+        r#"class Done { note string }
+
+workflow SkillPinSmoke {
+  output result Done
+
+  agent helper {
+    provider fixture
+    profile "repo-reader"
+    skills ["demo"]
+    capacity 1
+  }
+
+  rule begin
+    when started
+    when helper is available
+  => {
+    tell helper "do the thing"
+  }
+
+  rule finish
+    when helper completed turn
+  => {
+    complete result { note "done" }
+  }
+}
+"#,
+    )
+    .expect("write workflow");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store path"),
+            "--json",
+            "dev",
+            workflow.to_str().expect("utf-8 workflow path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let evidence = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store path"),
+            "--json",
+            "evidence",
+            instance_id,
+        ],
+    );
+    let evidence = evidence
+        .get("evidence")
+        .and_then(Value::as_array)
+        .expect("evidence array");
+    assert!(
+        evidence.iter().any(|item| {
+            item.get("kind").and_then(Value::as_str) == Some("skills.injected")
+                && item
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .is_some_and(|summary| summary.contains("demo"))
+        }),
+        "expected a skills.injected evidence row naming the pinned `demo` skill"
+    );
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
 fn dev_native_fixture_records_provider_lifecycle_and_artifacts_from_source_workflow() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();

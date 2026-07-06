@@ -22079,6 +22079,26 @@ fn run_agent_effect(
     let mut kernel = RuntimeKernel::new(store);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "lease"]);
+    // Resolve this agent's declared skills from the IR (context-assembly Phase 2,
+    // item 6): per-turn pinning provenance, so `skills.injected` reflects the
+    // agent's `skills [...]` declaration. This is pinning, NOT a catalogue filter
+    // (Decision 2) — the owned catalogue stays discover-all. Degrades to no skills
+    // when the program is unavailable (e.g. `whip worker` without `--program`).
+    let agent_name = effect.target.as_deref().unwrap_or("agent");
+    let declared_skills: Vec<String> = options
+        .program_path
+        .as_deref()
+        .and_then(|path| path.to_str())
+        .and_then(|path| compile_source_path_with_root(path, options.root.as_deref()).ok())
+        .map(|(_, ir)| {
+            ir.agents
+                .iter()
+                .find(|agent| agent.name == agent_name)
+                .map(|agent| agent.skills.clone())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let skill_refs: Vec<&str> = declared_skills.iter().map(String::as_str).collect();
     let execution = AgentTurnExecution {
         instance_id,
         effect_id: &effect.effect_id,
@@ -22087,10 +22107,10 @@ fn run_agent_effect(
         worker_id: "whip-worker",
         lease_id: &lease_id,
         lease_expires_at: "2030-01-01T00:00:00Z",
-        agent: effect.target.as_deref().unwrap_or("agent"),
+        agent: agent_name,
         profile: effect.profile.as_deref(),
         input_json: &input_json,
-        skill_names: &[],
+        skill_names: &skill_refs,
     };
     // Binding pre-check (DR-0020): for native providers that carry a binding
     // config, block before provider execution when the config lacks a required
