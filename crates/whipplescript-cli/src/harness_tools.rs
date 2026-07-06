@@ -861,7 +861,7 @@ impl FileToolExecutor {
             let offset = usize_arg(args, "offset");
             let limit = usize_arg(args, "limit");
             let sliced = slice_lines(body, offset, limit);
-            return Ok(bound(&sliced, self.max_bytes));
+            return Ok(middle_truncate(&sliced, self.max_bytes));
         }
         if let Some(reason) = self.policy(path, "read") {
             return Err(reason);
@@ -871,7 +871,7 @@ impl FileToolExecutor {
         let offset = usize_arg(args, "offset");
         let limit = usize_arg(args, "limit");
         let sliced = slice_lines(&content, offset, limit);
-        Ok(bound(&sliced, self.max_bytes))
+        Ok(middle_truncate(&sliced, self.max_bytes))
     }
 
     fn write(&self, args: &Value) -> Result<String, String> {
@@ -967,7 +967,7 @@ impl FileToolExecutor {
         if hits.is_empty() {
             Ok("No files found".to_string())
         } else {
-            Ok(bound(&hits.join("\n"), self.max_bytes))
+            Ok(middle_truncate(&hits.join("\n"), self.max_bytes))
         }
     }
 
@@ -1014,7 +1014,7 @@ impl FileToolExecutor {
         if hits.is_empty() {
             Ok("No matches".to_string())
         } else {
-            Ok(bound(&hits.join("\n"), self.max_bytes))
+            Ok(middle_truncate(&hits.join("\n"), self.max_bytes))
         }
     }
 
@@ -1052,7 +1052,7 @@ impl FileToolExecutor {
                 .unwrap_or(BASH_DEFAULT_TIMEOUT_SECS),
         );
         let output = run_bounded_command(command, &self.root, timeout)?;
-        let combined = bound(&output.combined, self.max_bytes);
+        let combined = middle_truncate(&output.combined, self.max_bytes);
         match output.exit_code {
             Some(0) => Ok(combined),
             Some(code) => Err(format!("command exited with status {code}\n{combined}")),
@@ -1733,13 +1733,16 @@ fn run_bounded_command(
 impl ToolExecutor for FileToolExecutor {
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
         match self.dispatch(call) {
+            // Deterministic capture-time cap (Phase 4 Layer A): every tool output
+            // is middle-truncated to the byte budget as a uniform safety net, on top
+            // of the per-tool caps, so no tool can bloat the model context.
             Ok(content) => ToolOutcome {
                 status: ToolStatus::Ok,
-                content,
+                content: middle_truncate(&content, self.max_bytes),
             },
             Err(reason) => ToolOutcome {
                 status: ToolStatus::Error,
-                content: reason,
+                content: middle_truncate(&reason, self.max_bytes),
             },
         }
     }
@@ -1779,18 +1782,33 @@ fn slice_lines(content: &str, offset: Option<usize>, limit: Option<usize>) -> St
 }
 
 /// Bound returned content to a byte budget, appending a truncation marker.
-fn bound(text: &str, max_bytes: usize) -> String {
+/// Middle-truncate a tool output to at most ~`max_bytes` (context-assembly Phase 4,
+/// Layer A — deterministic, always-on capture-time cap). Keeps a head and a tail
+/// with an elision marker between, so both the start and end of a large output
+/// survive and a runaway output cannot bloat the context (the full output stays
+/// addressable as evidence). A small output is returned unchanged.
+fn middle_truncate(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
     }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
+    // Reserve room for the elision marker; split the remainder head/tail.
+    let keep = max_bytes.saturating_sub(96);
+    let head_len = keep / 2;
+    let tail_len = keep - head_len;
+    let mut head_end = head_len.min(text.len());
+    while head_end > 0 && !text.is_char_boundary(head_end) {
+        head_end -= 1;
     }
+    let mut tail_start = text.len().saturating_sub(tail_len);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let elided = tail_start.saturating_sub(head_end);
     format!(
-        "{}\n[truncated: showing {end} of {} bytes]",
-        &text[..end],
-        text.len()
+        "{}\n[... {elided} of {} bytes elided (full output kept as evidence) ...]\n{}",
+        &text[..head_end],
+        text.len(),
+        &text[tail_start..]
     )
 }
 
@@ -2825,6 +2843,20 @@ mod tests {
         let miss = exec.execute(&call(TOOL_READ, json!({ "path": "nope.txt" })));
         assert_eq!(miss.status, ToolStatus::Error);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn middle_truncate_keeps_head_and_tail_within_budget() {
+        // Small output is untouched.
+        assert_eq!(middle_truncate("hello", 100), "hello");
+
+        // A large output keeps both ends, elides the middle, and fits the budget.
+        let big: String = (0..4000).map(|i| format!("line-{i}\n")).collect();
+        let out = middle_truncate(&big, 800);
+        assert!(out.len() <= 800 + 128, "over budget: {}", out.len());
+        assert!(out.contains("line-0\n"), "head dropped");
+        assert!(out.contains("line-3999"), "tail dropped");
+        assert!(out.contains("elided"), "no elision marker");
     }
 
     #[test]
