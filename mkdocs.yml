@@ -40,6 +40,10 @@ theme:
   icon:
     repo: fontawesome/brands/github
 
+extra:
+  # Clicking the logo / site title goes to the marketing landing, not the docs home.
+  homepage: https://whipplescript.com/
+
 extra_css:
   - assets/brand.css
 
