@@ -93,6 +93,7 @@ mod gov;
 mod harness_tools;
 mod ifc;
 mod principal;
+mod project_context;
 mod skills_loader;
 
 const CORE_EFFECT_LOWERING_CLASS: &str = "core_effect";

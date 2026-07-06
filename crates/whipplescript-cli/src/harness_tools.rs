@@ -1877,6 +1877,7 @@ fn owned_context_bundles(
     date: &str,
     cwd: &str,
     skills: &[SkillCatalogueEntry],
+    project_instructions: &[crate::project_context::ProjectInstruction],
 ) -> Vec<ContextBundle> {
     let mut bundles = vec![ContextBundle::new(
         BundleKind::Persona,
@@ -1925,6 +1926,17 @@ fn owned_context_bundles(
         "v1",
         format!("Current working directory: {cwd}"),
     ));
+
+    // Project instructions (AGENTS.md / CLAUDE.md), injected verbatim wrapped in
+    // `<project_context>` (context-assembly Phase 3). The host discovers them.
+    if !project_instructions.is_empty() {
+        bundles.push(ContextBundle::new(
+            BundleKind::ProjectContext,
+            "fs:project-instructions",
+            "v1",
+            crate::project_context::render_project_context(project_instructions),
+        ));
+    }
 
     // The `<available_skills>` catalogue (Decision 2: discover-all). Only when a
     // read-class tool is present — otherwise the model cannot load a skill body.
@@ -2555,17 +2567,26 @@ pub fn run_owned_agent_turn(
         })
         .collect();
     executor = executor.with_skill_bodies(skill_bodies);
+    // Project instructions (AGENTS.md / CLAUDE.md) rooted at the workspace, plus an
+    // optional env-configured global directory (context-assembly Phase 3).
+    let global_context_dir =
+        std::env::var_os("WHIPPLESCRIPT_GLOBAL_CONTEXT_DIR").map(PathBuf::from);
+    let project_instructions = crate::project_context::discover_project_instructions(
+        &workspace,
+        global_context_dir.as_deref(),
+    );
     // Assemble the system prompt from provenance-tagged bundles (mirror pi):
-    // persona, tool snippets, guidelines, available skills, date, cwd. The host
-    // supplies date/cwd + the skill catalogue; the kernel assembler renders them in
-    // canonical order (context-assembly Phase 1). Per-bundle provenance
-    // (`assembled.bundles`) is recorded as `context.bundle` evidence by
-    // `run_brokered_agent_turn` before the turn (Decision 5).
+    // persona, tool snippets, guidelines, project context, available skills, date,
+    // cwd. The host supplies date/cwd + the skill catalogue + project instructions;
+    // the kernel assembler renders them in canonical order (context-assembly
+    // Phase 1). Per-bundle provenance (`assembled.bundles`) is recorded as
+    // `context.bundle` evidence by `run_brokered_agent_turn` (Decision 5).
     let assembled = assemble(owned_context_bundles(
         &tools,
         &owned_context_date(),
         &workspace.display().to_string(),
         &skill_catalogue,
+        &project_instructions,
     ));
     let input = BrokeredTurnInput {
         system: assembled.system_prompt,
@@ -2687,7 +2708,13 @@ mod tests {
             description: "Read a file from the workspace.".into(),
             input_schema: json!({}),
         }];
-        let assembled = assemble(owned_context_bundles(&tools, "2026-07-04", "/repo", &[]));
+        let assembled = assemble(owned_context_bundles(
+            &tools,
+            "2026-07-04",
+            "/repo",
+            &[],
+            &[],
+        ));
         let prompt = assembled.system_prompt;
 
         // Persona + guidelines carry the turn-scoped authority + termination contract.
@@ -2717,7 +2744,7 @@ mod tests {
 
     #[test]
     fn owned_context_prompt_omits_tool_list_when_no_tools_offered() {
-        let assembled = assemble(owned_context_bundles(&[], "2026-07-04", "/repo", &[]));
+        let assembled = assemble(owned_context_bundles(&[], "2026-07-04", "/repo", &[], &[]));
         assert!(!assembled.system_prompt.contains("Available tools:"));
         // persona, guidelines, date, cwd -- no tools bundle.
         assert_eq!(assembled.bundles.len(), 4);
@@ -2737,7 +2764,13 @@ mod tests {
         }];
 
         // With a read tool present, the catalogue renders name/description/location.
-        let with_read = assemble(owned_context_bundles(&read, "2026-07-04", "/repo", &skills));
+        let with_read = assemble(owned_context_bundles(
+            &read,
+            "2026-07-04",
+            "/repo",
+            &skills,
+            &[],
+        ));
         assert!(with_read.system_prompt.contains("<available_skills>"));
         assert!(with_read.system_prompt.contains(
             "<skill name=\"triage\" location=\".whipplescript/skills/triage/SKILL.md\">"
@@ -2749,7 +2782,13 @@ mod tests {
             .any(|bundle| bundle.kind == BundleKind::AvailableSkills));
 
         // Without a read-class tool the model can't fetch a body, so no catalogue.
-        let no_read = assemble(owned_context_bundles(&[], "2026-07-04", "/repo", &skills));
+        let no_read = assemble(owned_context_bundles(
+            &[],
+            "2026-07-04",
+            "/repo",
+            &skills,
+            &[],
+        ));
         assert!(!no_read.system_prompt.contains("<available_skills>"));
     }
 

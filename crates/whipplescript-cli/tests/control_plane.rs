@@ -5255,6 +5255,100 @@ workflow SkillPinSmoke {
 }
 
 #[test]
+fn owned_harness_injects_project_context_from_agents_md() {
+    // context-assembly Phase 3: an AGENTS.md in the turn workspace is injected as a
+    // <project_context> bundle (recorded as a context.bundle evidence row).
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let ws = std::env::temp_dir().join(format!("whip-proj-ctx-{}-{}", std::process::id(), line!()));
+    let _ = fs::remove_dir_all(&ws);
+    fs::create_dir_all(ws.join(".whipplescript")).expect("ws dir");
+    fs::write(ws.join("AGENTS.md"), "Follow the house style.\n").expect("agents");
+    let store_path = ws.join(".whipplescript").join("store.sqlite");
+    let store = store_path.to_str().expect("utf-8 store path");
+    let workflow = ws.join("ctx.whip");
+    fs::write(
+        &workflow,
+        r#"class Done { note string }
+
+file store workspace_files {
+  root "."
+  allow read ["**"]
+}
+
+workflow ProjCtxSmoke {
+  output result Done
+
+  agent helper {
+    provider owned
+    profile "repo-reader"
+    capacity 1
+  }
+
+  rule begin
+    when started
+    when helper is available
+  => {
+    tell helper as turn
+      with access to workspace_files {
+        read ["**"]
+      }
+    """
+    Summarize and stop.
+    """
+
+    after turn succeeds {
+      complete result { note "done" }
+    }
+  }
+}
+"#,
+    )
+    .expect("write workflow");
+
+    // The discovery roots at WHIPPLESCRIPT_HARNESS_WORKSPACE (owned_workspace_root).
+    let dev = Command::new(bin)
+        .env("WHIPPLESCRIPT_HARNESS_WORKSPACE", &ws)
+        .args([
+            "--store",
+            store,
+            "--json",
+            "dev",
+            workflow.to_str().expect("utf-8 workflow path"),
+            "--provider",
+            "owned",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("dev runs");
+    assert!(
+        dev.status.success(),
+        "dev failed: {}",
+        String::from_utf8_lossy(&dev.stderr)
+    );
+    let dev: Value = serde_json::from_slice(&dev.stdout).expect("dev json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let evidence = run_json(bin, &["--store", store, "--json", "evidence", instance_id]);
+    let evidence = evidence
+        .get("evidence")
+        .and_then(Value::as_array)
+        .expect("evidence array");
+    assert!(
+        evidence.iter().any(|item| {
+            item.get("kind").and_then(Value::as_str) == Some("context.bundle")
+                && item.get("summary").and_then(Value::as_str) == Some("project_context")
+        }),
+        "expected a project_context context.bundle evidence row from the workspace AGENTS.md"
+    );
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
 fn dev_native_fixture_records_provider_lifecycle_and_artifacts_from_source_workflow() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
