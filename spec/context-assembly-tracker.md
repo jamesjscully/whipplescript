@@ -206,9 +206,12 @@ Everything else in this tracker rides this seam.
   brokered tool-call observation → evidence. Store + executor unit tests. **DO:**
   the store method is native today; the DO read path lands with the DO agent-tool
   executor (the DO agent turn is still a no-tools stub).
-- [ ] **`whip skill` CLI**: `list` / `validate` / `install` — replace the
-  file-copy shell scripts (`scripts/install-whipplescript-skill.sh`) with
-  registry ingestion. Keep packaging.
+- [x] **`whip skill` CLI** (v0.3) — `list` (loads workspace skills + shows the
+  registry with content_hash), `validate <SKILL.md|dir>` (frontmatter check, per-
+  skill ok/FAIL + exit code), `install <SKILL.md|dir>` (copies into
+  `<store-dir>/skills/<name>/`, then registers into the store). Built over items
+  1–2. Integration test for install→list. The `~/.codex/skills` install script is
+  orthogonal (delegated Codex provider discovery) and kept.
 - [ ] Resolve `agent { skills [...] }` (and attachments) into per-turn provenance
   so `skills.injected` stops being empty — but as **pinning, not a catalogue
   filter** (Decision 2).
