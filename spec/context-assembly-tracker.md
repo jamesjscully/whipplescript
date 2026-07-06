@@ -180,13 +180,18 @@ Everything else in this tracker rides this seam.
 
 ## Phase 2 — Skills control plane
 
-- [ ] **Registry loader**: ingest skills from `.whipplescript/skills/`, first-party
-  bundles, and package resources → `skills` rows **with content-addressed bodies**
-  (Decision 3). Deterministic load order; provenance recorded.
-- [ ] **Frontmatter validation** to the agentskills.io spec: promote the test-only
-  `parse_skill_frontmatter` to a real validator for `name` (≤64, `[a-z0-9-]`, no
-  leading/trailing/consecutive hyphen, matches dir), `description` (≤1024),
-  `license`, `compatibility`, `metadata`, `allowed-tools`.
+- [x] **Frontmatter validation** to the agentskills.io spec (v0.3) — production
+  `whipplescript-store::skill_frontmatter` (dependency-free YAML subset) validates
+  `name` (≤64, `[a-z0-9-]`, no leading/trailing/consecutive hyphen) + `description`
+  (≤1024), parses `license`/`compatibility`/`metadata`/`allowed-tools`
+  (allowed-tools as provenance only). Directory-match is the loader's check.
+- [~] **Registry loader** (v0.3) — `skills_loader::load_skills_from_dir` ingests a
+  skills dir (each `<name>/SKILL.md`) → `skills` rows with **content-addressed
+  bodies** (`body` column via migration `0002` + the DO store's mirrored schema;
+  `content_hash = H(body)`). Deterministic (sorted) load order; name==dir enforced;
+  license/compatibility/allowed-tools recorded as metadata. **Remaining:** startup
+  wiring (workspace `.whipplescript/skills/` + first-party + package resources) —
+  lands with the catalogue below.
 - [ ] **Catalogue bundle** (Phase 1 seam): render `<available_skills>` with
   `name`/`description`/`location`, pi's exact XML, only when a `read`-class tool is
   present.
