@@ -154,18 +154,27 @@ Replace `OWNED_SYSTEM_PROMPT` with an assembler that composes the system prompt
 from an ordered list of provenance-tagged bundles, each recorded as evidence.
 Everything else in this tracker rides this seam.
 
-- [ ] `ContextBundle { kind, provenance (source/version/hash), render() }` and an
+**DONE 2026-07-06** (v0.3) — native owned harness path.
+
+- [x] `ContextBundle { kind, provenance (source/version/hash), render() }` and an
   assembler that renders them in pi's fixed order into the system prompt.
-- [ ] Bundles for the always-on pieces: persona, one-line tool snippets (derived
-  from the existing `ToolSpec`s), guidelines, doc pointers, `Current date`,
-  `Current working directory`. Mirror pi's text/wrapping exactly.
-- [ ] Assembler emits one `context.bundle` (or equivalent) evidence row per bundle
-  (Decision 5).
-- [ ] The wire request builder (`harness_model.rs`) places **cache breakpoints**
-  at the stable seams (end of system prompt; later, end of summary; rolling near
-  tail) and sends a **stable cache key** per turn-thread (Decision 7).
-- [ ] Delete the raw-`input_json`-as-user-message shortcut only if pi-parity
-  requires it; otherwise leave the user-message path unchanged.
+  (`kernel/context_assembly.rs`: slot order = `BundleKind` decl order; pure,
+  deterministic, content-hashed; empty-body bundles drop with no provenance row.)
+- [x] Bundles for the always-on pieces: persona, one-line tool snippets (derived
+  from the existing `ToolSpec`s), guidelines, `Current date`, `Current working
+  directory` (`harness_tools::owned_context_bundles`). The `doc pointers`,
+  `<project_context>`, and `<available_skills>` slots are populated in Phases 2–3
+  (they need pi's exact text plus the skills / project-instruction stores).
+- [x] Assembler emits one `context.bundle` evidence row per bundle (Decision 5).
+  `run_brokered_agent_turn` records source/version/content_hash before the turn,
+  exactly once (guarded on a fresh start so crash-recovery resume never duplicates).
+- [x] The wire request builder (`harness_model.rs`) places the **cache breakpoint**
+  at the stable seam (end of system prompt) and sends a **stable cache key** per
+  turn-thread (Decision 7): Anthropic `cache_control: ephemeral` on the system
+  block; OpenAI `prompt_cache_key` = the effect id. (Summary + rolling-tail
+  breakpoints arrive with the Phase 4 compactor.)
+- [x] Raw-`input_json`-as-user-message shortcut **left unchanged** — pi-parity does
+  not require deleting it; the user message path stays the turn input.
 
 ---
 
