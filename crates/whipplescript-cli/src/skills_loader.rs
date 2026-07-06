@@ -141,6 +141,14 @@ mod tests {
         // content_hash addresses the body, so the two distinct bodies differ.
         assert_ne!(skills[0].content_hash, skills[1].content_hash);
 
+        // Activation read (Decision 3): the location resolves to the stored body.
+        let body = store
+            .skill_body(&skills[0].source_path)
+            .expect("query")
+            .expect("body present");
+        assert!(body.contains("# alpha"));
+        assert!(store.skill_body("no/such/path").expect("query").is_none());
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

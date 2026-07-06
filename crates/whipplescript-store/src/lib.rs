@@ -2937,6 +2937,21 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// The content-addressed body of the skill registered at `source_path`, or
+    /// `None` if no skill is registered there (context-assembly Phase 2, activation
+    /// read — Decision 3). Resolving through the registry means the model reads the
+    /// exact registered bytes, identically on native and the durable object.
+    pub fn skill_body(&self, source_path: &str) -> StoreResult<Option<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT body FROM skills WHERE source_path = ?1")?;
+        let mut rows = statement.query(params![source_path])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get::<_, String>(0)?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn list_skills(&self) -> StoreResult<Vec<SkillView>> {
         let mut statement = self.connection.prepare(
             r#"

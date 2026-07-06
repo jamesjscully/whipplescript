@@ -308,6 +308,11 @@ pub struct FileToolExecutor {
     /// The parent turn's provider configuration, carried into sub-workflow drives
     /// so a `@tool` workflow's own effects run under the same provider (DR-0025).
     provider_ctx: Option<crate::SubworkflowProviderContext>,
+    /// Skill activation (context-assembly Phase 2, Decision 3): map of catalogue
+    /// `location` → the registered content-addressed body. A `read` of a skill
+    /// location resolves here (the registry) rather than the filesystem, so the
+    /// model reads the exact registered bytes — identical on native and the DO.
+    skill_bodies: std::collections::HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -650,7 +655,19 @@ impl FileToolExecutor {
             max_child_iterations: 8,
             work_unit: String::new(),
             provider_ctx: None,
+            skill_bodies: std::collections::HashMap::new(),
         }
+    }
+
+    /// Install the skill activation registry: a map of catalogue `location` → the
+    /// registered content-addressed body. A `read` of one of these locations
+    /// resolves through the registry instead of the filesystem (Decision 3).
+    pub fn with_skill_bodies(
+        mut self,
+        skill_bodies: std::collections::HashMap<String, String>,
+    ) -> Self {
+        self.skill_bodies = skill_bodies;
+        self
     }
 
     /// Register `@tool` sub-workflows (DR-0025) for synchronous dispatch. The
@@ -835,6 +852,17 @@ impl FileToolExecutor {
 
     fn read(&self, args: &Value) -> Result<String, String> {
         let path = str_arg(args, "path")?;
+        // Skill activation (Decision 3): a read of a catalogue location resolves to
+        // the registered content-addressed body from the registry, not the
+        // filesystem — identical bytes on native and the durable object. The
+        // catalogue is only offered alongside a read tool, so this activation is
+        // authorized independently of the workspace file globs.
+        if let Some(body) = self.skill_bodies.get(path) {
+            let offset = usize_arg(args, "offset");
+            let limit = usize_arg(args, "limit");
+            let sliced = slice_lines(body, offset, limit);
+            return Ok(bound(&sliced, self.max_bytes));
+        }
         if let Some(reason) = self.policy(path, "read") {
             return Err(reason);
         }
@@ -2511,6 +2539,22 @@ pub fn run_owned_agent_turn(
             location: skill.source_path,
         })
         .collect();
+    // Skill activation (Decision 3): resolve each catalogue location to its
+    // registered content-addressed body, so a `read` of that location returns the
+    // exact registered bytes through the registry (not the filesystem — the read
+    // then works identically on native and the durable object).
+    let skill_bodies: std::collections::HashMap<String, String> = skill_catalogue
+        .iter()
+        .filter_map(|entry| {
+            kernel
+                .store()
+                .skill_body(&entry.location)
+                .ok()
+                .flatten()
+                .map(|body| (entry.location.clone(), body))
+        })
+        .collect();
+    executor = executor.with_skill_bodies(skill_bodies);
     // Assemble the system prompt from provenance-tagged bundles (mirror pi):
     // persona, tool snippets, guidelines, available skills, date, cwd. The host
     // supplies date/cwd + the skill catalogue; the kernel assembler renders them in
@@ -2721,6 +2765,26 @@ mod tests {
         let r = exec.execute(&call(TOOL_READ, json!({ "path": "a/b.txt" })));
         assert_eq!(r.status, ToolStatus::Ok);
         assert_eq!(r.content, "hello");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_of_a_skill_location_resolves_the_registry_body_not_the_filesystem() {
+        let root = temp_root();
+        let mut bodies = std::collections::HashMap::new();
+        bodies.insert(
+            "skills/demo/SKILL.md".to_string(),
+            "# Demo\nregistry body bytes\n".to_string(),
+        );
+        let exec = FileToolExecutor::new(&root).with_skill_bodies(bodies);
+        // The location is not a file under root, yet the read succeeds from the
+        // registry — bypassing the filesystem and the file-glob policy (Decision 3).
+        let r = exec.execute(&call(TOOL_READ, json!({ "path": "skills/demo/SKILL.md" })));
+        assert_eq!(r.status, ToolStatus::Ok);
+        assert!(r.content.contains("registry body bytes"));
+        // A non-skill path still resolves against the filesystem (missing here).
+        let miss = exec.execute(&call(TOOL_READ, json!({ "path": "nope.txt" })));
+        assert_eq!(miss.status, ToolStatus::Error);
         std::fs::remove_dir_all(&root).ok();
     }
 
