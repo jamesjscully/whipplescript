@@ -168,6 +168,7 @@ fn main() -> ExitCode {
         Some("agents") => agents(&options),
         Some("providers") => providers(&options),
         Some("skills") => skills(&options),
+        Some("skill") => skill(&options),
         Some("lint") => lint(&options),
         Some("lsp") => lsp(&options),
         Some("fmt") => fmt(&options),
@@ -329,6 +330,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "agents" => "usage: whip [--json] agents [--root <workflow>] <workflow.whip>",
         "providers" => "usage: whip [--json] providers [--root <workflow>] <workflow.whip>",
         "skills" => "usage: whip [--json] skills [--root <workflow>] <workflow.whip>",
+        "skill" => "usage: whip [--store path] [--json] skill <list | validate <SKILL.md|dir> | install <SKILL.md|dir>>",
         "auth" => "usage: whip auth <status | set <openai|anthropic> <key>>",
         "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--from <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
         _ => return None,
@@ -25866,6 +25868,214 @@ fn ifc_admission(program_path: &str, root: Option<&str>) -> Result<(), ExitCode>
         "refusing to run `{program_path}`: information-flow violation under the governance envelope"
     );
     Err(ExitCode::FAILURE)
+}
+
+/// `whip skill <list|validate|install>` — manage the skill registry
+/// (context-assembly Phase 2, item 5), replacing the file-copy install script with
+/// store-backed registry ingestion.
+fn skill(options: &CliOptions) -> ExitCode {
+    match options.args.first().map(String::as_str) {
+        Some("list") => skill_list(options),
+        Some("validate") => skill_validate(options),
+        Some("install") => skill_install(options),
+        _ => {
+            eprintln!("{}", command_usage("skill").unwrap_or_default());
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// The workspace skills directory (`<store-dir>/skills/`).
+fn workspace_skills_dir(store_path: &Path) -> PathBuf {
+    store_path
+        .parent()
+        .map(|dir| dir.join("skills"))
+        .unwrap_or_else(|| PathBuf::from(".whipplescript/skills"))
+}
+
+/// Collect the `SKILL.md` paths a validate/install target refers to: a `SKILL.md`
+/// file directly, a skill directory containing one, or a parent directory of skill
+/// subdirectories.
+fn collect_skill_md_paths(path: &Path) -> Vec<PathBuf> {
+    if path.is_file() {
+        return vec![path.to_path_buf()];
+    }
+    let direct = path.join("SKILL.md");
+    if direct.is_file() {
+        return vec![direct];
+    }
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(path) {
+        let mut dirs: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|child| child.is_dir())
+            .collect();
+        dirs.sort();
+        for dir in dirs {
+            let md = dir.join("SKILL.md");
+            if md.is_file() {
+                found.push(md);
+            }
+        }
+    }
+    found
+}
+
+fn skill_list(options: &CliOptions) -> ExitCode {
+    // Reflect reality: load the workspace skills before listing the registry.
+    load_workspace_skills(&options.store_path);
+    let store = match SqliteStore::open(&options.store_path) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("could not open store: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let skills = match store.list_skills() {
+        Ok(skills) => skills,
+        Err(error) => {
+            eprintln!("could not list skills: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if options.json {
+        let rows: Vec<Value> = skills
+            .iter()
+            .map(|skill| {
+                json!({
+                    "name": skill.name,
+                    "version": skill.version,
+                    "source": skill.source,
+                    "source_path": skill.source_path,
+                    "content_hash": skill.content_hash,
+                    "description": skill.description,
+                })
+            })
+            .collect();
+        return emit_json(json!({ "skills": rows }));
+    }
+    if skills.is_empty() {
+        println!("no skills registered (workspace skills live in <store-dir>/skills/)");
+    }
+    for skill in &skills {
+        let summary = skill.description.lines().next().unwrap_or("");
+        println!(
+            "{}  {}  [{}]  {summary}",
+            skill.name, skill.version, skill.source
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+fn skill_validate(options: &CliOptions) -> ExitCode {
+    let Some(target) = options.args.get(1) else {
+        eprintln!("{}", command_usage("skill").unwrap_or_default());
+        return ExitCode::from(2);
+    };
+    let targets = collect_skill_md_paths(Path::new(target));
+    if targets.is_empty() {
+        eprintln!("no SKILL.md found at `{target}`");
+        return ExitCode::from(2);
+    }
+    let mut all_ok = true;
+    let mut results: Vec<(PathBuf, Result<String, String>)> = Vec::new();
+    for md in targets {
+        let outcome = match std::fs::read_to_string(&md) {
+            Ok(body) => whipplescript_store::skill_frontmatter::parse_skill_frontmatter(&body)
+                .map(|frontmatter| frontmatter.name),
+            Err(error) => Err(format!("cannot read: {error}")),
+        };
+        if outcome.is_err() {
+            all_ok = false;
+        }
+        results.push((md, outcome));
+    }
+    if options.json {
+        let rows: Vec<Value> = results
+            .iter()
+            .map(|(md, outcome)| match outcome {
+                Ok(name) => json!({ "path": md.to_string_lossy(), "ok": true, "name": name }),
+                Err(error) => json!({ "path": md.to_string_lossy(), "ok": false, "error": error }),
+            })
+            .collect();
+        let _ = emit_json(json!({ "valid": all_ok, "skills": rows }));
+    } else {
+        for (md, outcome) in &results {
+            match outcome {
+                Ok(name) => println!("ok    {name}  ({})", md.display()),
+                Err(error) => println!("FAIL  {}  {error}", md.display()),
+            }
+        }
+    }
+    if all_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn skill_install(options: &CliOptions) -> ExitCode {
+    let Some(src) = options.args.get(1) else {
+        eprintln!("{}", command_usage("skill").unwrap_or_default());
+        return ExitCode::from(2);
+    };
+    let src = Path::new(src);
+    let src_md = if src.is_file() {
+        src.to_path_buf()
+    } else {
+        src.join("SKILL.md")
+    };
+    let body = match std::fs::read_to_string(&src_md) {
+        Ok(body) => body,
+        Err(error) => {
+            eprintln!("cannot read {src_md:?}: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let frontmatter = match whipplescript_store::skill_frontmatter::parse_skill_frontmatter(&body) {
+        Ok(frontmatter) => frontmatter,
+        Err(error) => {
+            eprintln!("invalid skill: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Install into the workspace skills directory (so it persists and loads on
+    // dev), then register the whole directory so the store reflects it.
+    let skills_dir = workspace_skills_dir(&options.store_path);
+    let dest_dir = skills_dir.join(&frontmatter.name);
+    if let Err(error) = std::fs::create_dir_all(&dest_dir) {
+        eprintln!("cannot create {dest_dir:?}: {error}");
+        return ExitCode::FAILURE;
+    }
+    let dest_md = dest_dir.join("SKILL.md");
+    if let Err(error) = std::fs::write(&dest_md, &body) {
+        eprintln!("cannot write {dest_md:?}: {error}");
+        return ExitCode::FAILURE;
+    }
+    let store = match SqliteStore::open(&options.store_path) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("could not open store: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = skills_loader::load_skills_from_dir(&store, &skills_dir, "workspace") {
+        eprintln!("registration failed: {error}");
+        return ExitCode::FAILURE;
+    }
+    if options.json {
+        return emit_json(json!({
+            "installed": frontmatter.name,
+            "location": dest_md.to_string_lossy(),
+        }));
+    }
+    println!(
+        "installed skill `{}` -> {}",
+        frontmatter.name,
+        dest_md.display()
+    );
+    ExitCode::SUCCESS
 }
 
 /// Load workspace skills (`<store-dir>/skills/`) into the store so the owned

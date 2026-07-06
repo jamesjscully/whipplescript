@@ -5107,6 +5107,58 @@ workflow SkillCatalogueSmoke {
 }
 
 #[test]
+fn skill_cli_installs_into_the_registry_and_lists_it() {
+    // context-assembly Phase 2 item 5: `whip skill install` ingests a SKILL.md into
+    // the store (content-addressed), and `whip skill list` reflects the registry.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let ws =
+        std::env::temp_dir().join(format!("whip-skill-cli-{}-{}", std::process::id(), line!()));
+    let _ = fs::remove_dir_all(&ws);
+    let src = ws.join("src").join("demo");
+    fs::create_dir_all(&src).expect("src dir");
+    fs::write(
+        src.join("SKILL.md"),
+        "---\nname: demo\ndescription: A demo skill.\n---\n# Demo\nDo the demo.\n",
+    )
+    .expect("write skill");
+    let store_path = ws.join(".whipplescript").join("store.sqlite");
+    let store = store_path.to_str().expect("utf-8 store path");
+
+    let installed = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "skill",
+            "install",
+            src.to_str().expect("src"),
+        ],
+    );
+    assert_eq!(
+        installed.get("installed").and_then(Value::as_str),
+        Some("demo")
+    );
+
+    let listed = run_json(bin, &["--store", store, "--json", "skill", "list"]);
+    let skills = listed
+        .get("skills")
+        .and_then(Value::as_array)
+        .expect("skills");
+    let demo = skills
+        .iter()
+        .find(|s| s.get("name").and_then(Value::as_str) == Some("demo"))
+        .expect("demo skill listed");
+    // Content-addressed: a non-empty body hash is recorded.
+    assert!(demo
+        .get("content_hash")
+        .and_then(Value::as_str)
+        .is_some_and(|hash| hash.len() >= 16));
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
 fn dev_native_fixture_records_provider_lifecycle_and_artifacts_from_source_workflow() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
