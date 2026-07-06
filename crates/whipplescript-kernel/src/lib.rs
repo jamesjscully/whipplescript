@@ -264,6 +264,32 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         // persisted transcript for this effect, continue from it; otherwise start
         // fresh. The loop persists the transcript after each step via `checkpoint`.
         let resume_from = self.load_brokered_transcript(ctx.instance_id, ctx.effect_id);
+
+        // Context-assembly Phase 1 (Decision 5): record one `context.bundle`
+        // evidence row per assembled bundle (source, version, hash) before the
+        // turn. Guarded on a fresh start (no persisted transcript) so crash
+        // recovery, which resumes from the transcript, does not duplicate the rows.
+        if resume_from.is_empty() {
+            for bundle in &input.context_bundles {
+                self.store.record_evidence(EvidenceRecord {
+                    instance_id: ctx.instance_id,
+                    kind: "context.bundle",
+                    subject_type: "run",
+                    subject_id: &run_id,
+                    causation_id: None,
+                    correlation_id: Some(ctx.effect_id),
+                    summary: Some(bundle.kind.tag()),
+                    metadata_json: &json!({
+                        "kind": bundle.kind.tag(),
+                        "source": bundle.source,
+                        "version": bundle.version,
+                        "content_hash": bundle.content_hash,
+                    })
+                    .to_string(),
+                })?;
+            }
+        }
+
         let resume_input;
         let run_input: &crate::harness_loop::BrokeredTurnInput = if resume_from.is_empty() {
             input

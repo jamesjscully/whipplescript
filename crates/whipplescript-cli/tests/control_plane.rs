@@ -4984,6 +4984,19 @@ fn dev_owned_harness_completes_turn_with_leaf_invariants() {
         "expected a model_request evidence row"
     );
 
+    // context-assembly Phase 1 (Decision 5): every assembled context bundle is
+    // recorded as a `context.bundle` evidence row before the turn. The owned
+    // harness always assembles persona, guidelines, date, and cwd (tools too when
+    // present), so there must be at least four such rows.
+    let context_bundle_rows = evidence
+        .iter()
+        .filter(|item| item.get("kind").and_then(Value::as_str) == Some("context.bundle"))
+        .count();
+    assert!(
+        context_bundle_rows >= 4,
+        "expected one context.bundle evidence row per assembled bundle (>=4), got {context_bundle_rows}"
+    );
+
     let _ = fs::remove_file(store_path);
 }
 

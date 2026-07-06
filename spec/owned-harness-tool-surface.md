@@ -40,7 +40,10 @@ bash    command, timeout?                         exec capability (confinement)
 - `bash` is fresh-spawn, **no persistent session** in v0 (sessions deferred,
   DR-0024). Giving `grep`/`find`/`ls`/`read` as first-class read tools diverts the
   bulk of read-style work *off* `bash`, shrinking the polymorphic-`bash` surface
-  that step 4 must classify for confinement/redaction.
+  that step 4 must classify for confinement/redaction. A draft design exists to
+  replace this restricted surface with an in-process virtual interpreter tier
+  (un-crippling pipes/substitution, DO-compatible):
+  [`in-isolate-bash-design-note.md`](in-isolate-bash-design-note.md).
 - The exec sandbox writable-roots and the file-store write-globs **must describe
   the same writable region** (else `bash` writes what `edit` forbids). Unifying
   that boundary is a step-4 item.
@@ -168,7 +171,9 @@ update_todo               tracker capability; status-specific
   ingress** (taint source, like an inbound message). A capability grantable via
   `with access to` — the first real customer of the workflow authority model (a
   subagent gets web search only if delegated it). Settled in shape; **gated on
-  the broader network-tool policy discussion** (open, per Jack).
+  the broader network-tool policy discussion** (open, per Jack). Draft design
+  for that discussion: [`web-tools-design-note.md`](web-tools-design-note.md)
+  (fetchkit as the default engine; search-provider fork open).
 - **remaining runtime-governance policy extensions** (from encapsulation
   Phase 4b; canonical home for this item): the live owned harness binds tool
   exposure and execution to turn grants, profile/registry capabilities, known

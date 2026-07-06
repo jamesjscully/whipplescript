@@ -281,6 +281,12 @@ pub struct BrokeredTurnInput {
     /// this persisted transcript instead of starting fresh from system+user. A
     /// dangling final tool-call (crash between request and result) is tolerated.
     pub resume_from: Vec<ChatMessage>,
+    /// Per-bundle provenance for the assembled system prompt (context-assembly
+    /// Phase 1, Decision 5). The turn runner records one `context.bundle` evidence
+    /// row per entry, before the turn, on a fresh start only (not on resume, so
+    /// recovery does not duplicate). Empty when the host does not assemble context
+    /// (e.g. the current DO agent stub).
+    pub context_bundles: Vec<crate::context_assembly::BundleProvenance>,
 }
 
 /// Drive a brokered tool-use loop to a single terminal.
@@ -936,6 +942,7 @@ mod tests {
             }],
             max_steps,
             resume_from: Vec::new(),
+            context_bundles: Vec::new(),
         }
     }
 

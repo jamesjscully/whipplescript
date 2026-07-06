@@ -189,6 +189,8 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     tools: Vec::new(),
                     max_steps: 8,
                     resume_from: Vec::new(),
+                    // DO agent stub: no context assembler yet, so no bundle rows.
+                    context_bundles: Vec::new(),
                 };
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "agent-run"]);
                 let lease_id =

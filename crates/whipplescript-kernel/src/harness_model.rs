@@ -181,6 +181,7 @@ fn map_transport_response(
 
 // -- request construction -------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn build_request(
     provider: CoerceProvider,
     base_url: &str,
@@ -631,8 +632,14 @@ mod tests {
     fn cache_breakpoints_and_stable_key_follow_decision_7() {
         // Anthropic: the system prompt is sent as a content block carrying a
         // `cache_control` breakpoint at its end (the stable [tools, system] prefix).
-        let anthropic =
-            build_anthropic_request("https://api.anthropic.com", "k", "m", 4096, &convo(), &tool_specs());
+        let anthropic = build_anthropic_request(
+            "https://api.anthropic.com",
+            "k",
+            "m",
+            4096,
+            &convo(),
+            &tool_specs(),
+        );
         let system = anthropic.body["system"]
             .as_array()
             .expect("system rendered as cache-controllable blocks");
@@ -652,8 +659,14 @@ mod tests {
             &tool_specs(),
         );
         assert_eq!(with_key.body["prompt_cache_key"], json!("turn-42"));
-        let without_key =
-            build_openai_request("https://api.openai.com", "k", "m", None, &convo(), &tool_specs());
+        let without_key = build_openai_request(
+            "https://api.openai.com",
+            "k",
+            "m",
+            None,
+            &convo(),
+            &tool_specs(),
+        );
         assert!(without_key.body.get("prompt_cache_key").is_none());
     }
 

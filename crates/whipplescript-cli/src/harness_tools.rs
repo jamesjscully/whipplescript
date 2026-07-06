@@ -2465,6 +2465,9 @@ pub fn run_owned_agent_turn(
         // The runner populates resume_from from any persisted transcript on
         // crash recovery (slice 6); a fresh turn starts empty.
         resume_from: Vec::new(),
+        // Per-bundle provenance for the assembled prompt; the runner records one
+        // context.bundle evidence row each before the turn (Decision 5).
+        context_bundles: assembled.bundles,
     };
     let ctx = BrokeredTurnContext {
         instance_id,
