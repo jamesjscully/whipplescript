@@ -1,7 +1,7 @@
 # Whipplescript as un-tie's Substrate — Research Note (replacing Pi and git)
 
 > **Update 2026-07-05:** the un-tie half is ratified and moving. The monorepo
-> split completed — the gaugewright-side home is now **`~/code/gaugewright-workbench`**
+> split completed — the gaugewright-side home is now **`~/code/gaugebench`**
 > (with `gaugewright-cloud`/`-directory` consuming it via a pinned `platform/`
 > submodule); `~/code/un-tie` is the archived pre-split history. The decision
 > below is recorded there as **workbench ADR 0071** (renumbered from un-tie's

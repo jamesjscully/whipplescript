@@ -13,7 +13,7 @@ note's early M1/M2 sequencing analysis is **stale** (Jack, 2026-07-04);
 sequencing is decided at build start, not assumed here.
 
 > **Update 2026-07-05:** the gaugewright-side repo is now
-> **`gaugewright-workbench`** (un-tie archived; four-repo split done). Its half
+> **`gaugebench`** (un-tie archived; four-repo split done). Its half
 > of the decision is workbench **ADR 0071**; its seam-finishing pass (SUB-0) is
 > done — the `Workspace`/`ChatWorkspace` traits and `HarnessSpec`/`HarnessFactory`
 > surfaces this tracker's Phases 2-3 must fit are now concrete code there.
@@ -125,7 +125,7 @@ replace git for working branches + workstreams.)*
 
 - [ ] ⚑ **Git-backed workspace API first?** (jj's adoption path: semantics
       over a git object-store backend, native store as the later swap.)
-      Ship the whip workspace API in gaugewright-workbench over git
+      Ship the whip workspace API in gaugebench over git
       objects — workstreams, certified merge on whip-legible content,
       selective verbs, the no-destructive surface all live early — then
       flip the backend when Phase 1 lands. Interim degradations, tagged:
