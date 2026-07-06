@@ -5,6 +5,7 @@ pub mod files;
 pub mod items;
 #[cfg(feature = "native")]
 pub mod native_stores;
+pub mod skill_frontmatter;
 
 use std::result;
 #[cfg(feature = "native")]
