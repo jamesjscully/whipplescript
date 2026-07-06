@@ -198,9 +198,14 @@ Everything else in this tracker rides this seam.
   it is a `context.bundle` evidence row. Unit test (read-tool gate) + integration
   test (workspace skill → owned turn → available_skills evidence). Exact pi XML is
   approximated; the Pi-conformance pass (un-tie Phase 3) reconciles the wording.
-- [ ] **Activation = registry-backed read**: the location the model reads resolves
-  to the content-addressed body on both native and DO. Record the read as evidence
-  (it is already a brokered tool call).
+- [x] **Activation = registry-backed read** (v0.3) — `SqliteStore::skill_body`
+  resolves a catalogue location to the registered content-addressed body; the owned
+  read tool checks the skill registry first (bypassing the file-glob policy, since
+  the catalogue is only offered with a read tool), so the model reads the exact
+  registered bytes rather than the filesystem. The read is already recorded as a
+  brokered tool-call observation → evidence. Store + executor unit tests. **DO:**
+  the store method is native today; the DO read path lands with the DO agent-tool
+  executor (the DO agent turn is still a no-tools stub).
 - [ ] **`whip skill` CLI**: `list` / `validate` / `install` — replace the
   file-copy shell scripts (`scripts/install-whipplescript-skill.sh`) with
   registry ingestion. Keep packaging.
