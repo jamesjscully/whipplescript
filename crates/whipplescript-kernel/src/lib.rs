@@ -303,6 +303,20 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                     .to_string(),
                 })?;
             }
+            // Turn-scoped skill pins (`tell … with skills [...]`, Phase 7): recorded
+            // once as provenance. The discover-all catalogue is unchanged.
+            if !input.pinned_skills.is_empty() {
+                self.store.record_evidence(EvidenceRecord {
+                    instance_id: ctx.instance_id,
+                    kind: "skills.pinned",
+                    subject_type: "run",
+                    subject_id: &run_id,
+                    causation_id: None,
+                    correlation_id: Some(ctx.effect_id),
+                    summary: Some("turn-scoped skills"),
+                    metadata_json: &json!({ "skills": input.pinned_skills }).to_string(),
+                })?;
+            }
         }
 
         let resume_input;

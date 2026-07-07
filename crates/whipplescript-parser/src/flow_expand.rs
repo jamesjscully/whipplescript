@@ -1138,12 +1138,28 @@ fn print_effect(
         BodyEffectKind::Tell {
             target,
             access_grants,
+            skills,
         } => {
             // Re-serialize `with access to <resource> { <op clauses> }` grants so a
             // flow `tell` preserves its access metadata. `for <target>` refs are flow
             // bindings (renamed); resource names and globs are literals.
             let grants = format_access_grants(access_grants, rn);
-            format!("tell {}{requires}{binding}{timeout}{grants}", rn(target))
+            // Re-serialize `with skills [...]` (Phase 7) so a flow `tell` preserves
+            // its turn-scoped skill pins (string literals, not renamed).
+            let skills = if skills.is_empty() {
+                String::new()
+            } else {
+                let list = skills
+                    .iter()
+                    .map(|skill| format!("{skill:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(" with skills [{list}]")
+            };
+            format!(
+                "tell {}{requires}{binding}{timeout}{grants}{skills}",
+                rn(target)
+            )
         }
         BodyEffectKind::Prompt { provider } => {
             let using = provider

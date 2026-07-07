@@ -1355,6 +1355,10 @@ pub struct IrEffectNode {
     /// Turn-access grants (`with access to …`) lowered onto an `agent.tell` effect as
     /// authority-narrowing metadata (Proposal A). Empty for non-grant effects.
     pub access_grants: Vec<IrAccessGrant>,
+    /// Turn-scoped skills (`with skills [...]`) pinned onto an `agent.tell` effect as
+    /// provenance (context-assembly Phase 7). Recorded, not enforced — the owned
+    /// catalogue stays discover-all. Empty for effects without a skill pin.
+    pub turn_skills: Vec<String>,
     /// The named resource (file store / channel) a direct effect touches, if any —
     /// e.g. the store of a `read`/`write`. Surfaced so information-flow analysis can
     /// see rule-body data flows, not just turn-access grants. `None` for effects
@@ -3208,16 +3212,24 @@ impl IrProgram {
                                 .join(";");
                             format!(" grants={rendered}")
                         };
+                        // Turn-scoped skill pins (Phase 7) append only when present,
+                        // so pin-free effects keep their existing snapshot shape.
+                        let skills = if effect.turn_skills.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" skills={}", effect.turn_skills.join(","))
+                        };
                         push_line(
                             &mut snapshot,
                             format!(
-                                "      {} kind={} binding={}{} key={}{}",
+                                "      {} kind={} binding={}{} key={}{}{}",
                                 effect.id,
                                 effect.kind.as_str(),
                                 binding,
                                 construct,
                                 effect.idempotency_key,
-                                grants
+                                grants,
+                                skills
                             ),
                         );
                     }
@@ -8297,6 +8309,7 @@ fn analyze_rule(
                 // The line-scanner result is overwritten by collect_effects_from_ast
                 // below (which carries the real grants); empty here is fine.
                 access_grants: Vec::new(),
+                turn_skills: Vec::new(),
                 resource: None,
                 agent: None,
                 workflow_target: None,
@@ -9435,6 +9448,14 @@ fn agent_for_body(kind: &body::BodyEffectKind) -> Option<String> {
     }
 }
 
+/// Turn-scoped `with skills [...]` pinned onto an `agent.tell` effect (Phase 7).
+fn turn_skills_for_body(kind: &body::BodyEffectKind) -> Vec<String> {
+    match kind {
+        body::BodyEffectKind::Tell { skills, .. } => skills.clone(),
+        _ => Vec::new(),
+    }
+}
+
 /// The workflow an `invoke` targets, surfaced for IFC membrane-door enumeration.
 fn workflow_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
     match kind {
@@ -9676,6 +9697,7 @@ fn walk_effects(
                 required_capabilities.dedup();
                 let construct_use = construct_use_for_body(&effect.kind);
                 let access_grants = ir_access_grants_for_body(&effect.kind);
+                let turn_skills = turn_skills_for_body(&effect.kind);
                 let resource = resource_for_body(&effect.kind);
                 let agent = agent_for_body(&effect.kind);
                 let workflow_target = workflow_target_for_body(&effect.kind);
@@ -9691,6 +9713,7 @@ fn walk_effects(
                     span: effect.span,
                     timeout_seconds: effect.timeout_seconds,
                     access_grants,
+                    turn_skills,
                     resource,
                     agent,
                     workflow_target,
@@ -22876,6 +22899,39 @@ agent worker {
                 .any(|d| d.message.contains("grants tool `X` more than once")),
             "diagnostics: {:?}",
             dup.diagnostics
+        );
+    }
+
+    #[test]
+    fn tell_with_skills_lowers_to_effect_turn_skills_and_ir_snapshot() {
+        let source = concat!(
+            "workflow W\n",
+            "agent coder {\n  provider owned\n  profile \"p\"\n  capacity 1\n}\n",
+            "class Task {\n  note string\n}\n",
+            "rule go\n  when Task as t\n=> {\n  tell coder with skills [\"review\", \"lint\"] \"do it\" as turn\n}\n",
+        );
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("ir");
+        let effect = ir
+            .rules
+            .iter()
+            .flat_map(|rule| &rule.metadata.effects)
+            .find(|effect| effect.kind == IrEffectKind::AgentTell)
+            .expect("tell effect");
+        assert_eq!(
+            effect.turn_skills,
+            vec!["review".to_owned(), "lint".to_owned()]
+        );
+        // The .ir snapshot carries the pin (appended only when present).
+        assert!(
+            ir.to_snapshot().contains("skills=review,lint"),
+            "{}",
+            ir.to_snapshot()
         );
     }
 

@@ -306,6 +306,11 @@ pub struct BrokeredTurnInput {
     /// recovery does not duplicate). Empty when the host does not assemble context
     /// (e.g. the current DO agent stub).
     pub context_bundles: Vec<crate::context_assembly::BundleProvenance>,
+    /// Turn-scoped skills pinned by `tell … with skills [...]` (context-assembly
+    /// Phase 7). Recorded once as `skills.pinned` provenance before the turn (fresh
+    /// start only), like `context_bundles`. Provenance only — the discover-all
+    /// catalogue is unchanged. Empty for turns with no pin.
+    pub pinned_skills: Vec<String>,
 }
 
 /// Drive a brokered tool-use loop to a single terminal.
@@ -1511,6 +1516,7 @@ mod tests {
             max_steps,
             resume_from: Vec::new(),
             context_bundles: Vec::new(),
+            pinned_skills: Vec::new(),
         }
     }
 

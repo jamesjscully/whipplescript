@@ -3220,6 +3220,7 @@ pub fn parsed_effect_input_json(
         "agent.tell" => json!({
             "prompt": effect.prompt.as_deref().unwrap_or_default(),
             "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::AgentTell),
+            "turn_skills": effect_turn_skills_json(rule, effect, IrEffectKind::AgentTell),
             "rule": rule.name,
             "bindings": context_bindings_json(context),
         }),
@@ -3911,6 +3912,30 @@ pub fn effect_access_grants_json(
                         .collect::<Vec<_>>(),
                 })
             })
+            .collect(),
+    )
+}
+
+/// The turn-scoped `with skills [...]` pins on an `agent.tell` effect (context-assembly
+/// Phase 7), emitted into the effect input so the harness records them as provenance.
+pub fn effect_turn_skills_json(rule: &IrRule, effect: &ParsedEffect, kind: IrEffectKind) -> Value {
+    let Some(node) = rule.metadata.effects.iter().find(|node| {
+        if node.kind != kind {
+            return false;
+        }
+        if let Some(binding) = &effect.binding {
+            if node.binding.as_ref() != Some(binding) {
+                return false;
+            }
+        }
+        node.agent == effect.target
+    }) else {
+        return json!([]);
+    };
+    Value::Array(
+        node.turn_skills
+            .iter()
+            .map(|skill| Value::String(skill.clone()))
             .collect(),
     )
 }

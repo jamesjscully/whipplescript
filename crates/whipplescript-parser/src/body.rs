@@ -209,6 +209,9 @@ pub enum BodyEffectKind {
     Tell {
         target: String,
         access_grants: Vec<AccessGrant>,
+        /// Turn-scoped `with skills [...]` (context-assembly Phase 7): skills pinned
+        /// into this turn's provenance. Does NOT filter the discover-all catalogue.
+        skills: Vec<String>,
     },
     Coerce {
         name: String,
@@ -1639,13 +1642,15 @@ impl<'a> BodyParser<'a> {
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
         let mut access_grants = Vec::new();
+        let mut skills = Vec::new();
         // Pre-prompt modifiers may interleave the standard ones (`as`/`requires`/
-        // `timeout`) with `with access to` grants.
+        // `timeout`) with `with access to` grants and `with skills [...]`.
         if !self.parse_effect_modifiers_with_access(
             &mut binding,
             &mut requires,
             &mut timeout_seconds,
             &mut access_grants,
+            Some(&mut skills),
         ) {
             return None;
         }
@@ -1655,6 +1660,7 @@ impl<'a> BodyParser<'a> {
             &mut requires,
             &mut timeout_seconds,
             &mut access_grants,
+            Some(&mut skills),
         ) {
             return None;
         }
@@ -1662,6 +1668,7 @@ impl<'a> BodyParser<'a> {
             kind: BodyEffectKind::Tell {
                 target,
                 access_grants,
+                skills,
             },
             binding,
             requires,
@@ -1679,18 +1686,53 @@ impl<'a> BodyParser<'a> {
         requires: &mut Vec<String>,
         timeout_seconds: &mut Option<u64>,
         access_grants: &mut Vec<AccessGrant>,
+        mut skills: Option<&mut Vec<String>>,
     ) -> bool {
         loop {
             if !self.parse_effect_modifiers(binding, requires, timeout_seconds, None) {
                 return false;
             }
             if self.at_ident("with") {
+                // Turn-scoped `with skills [...]` (Phase 7) vs `with access to …`.
+                // `with skills` is only valid where a skills accumulator is offered
+                // (`tell`); elsewhere it falls through to the access-grant error.
+                if matches!(self.peek_at(1).map(|t| &t.tok), Some(Tok::Ident(v)) if v == "skills") {
+                    if let Some(acc) = skills.as_deref_mut() {
+                        if !self.parse_with_skills(acc) {
+                            return false;
+                        }
+                        continue;
+                    }
+                }
                 if !self.parse_access_grant(access_grants) {
                     return false;
                 }
                 continue;
             }
             return true;
+        }
+    }
+
+    /// Parse `with skills ["a", "b"]` (context-assembly Phase 7): turn-scoped skills
+    /// pinned into the turn's provenance. Assumes the cursor is at `with`.
+    fn parse_with_skills(&mut self, skills: &mut Vec<String>) -> bool {
+        self.pos += 1; // with
+        self.pos += 1; // skills (peeked by the caller)
+        if !self.at_sym('[') {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `[\"skill\", …]` after `with skills`".to_owned(),
+                None,
+            );
+            return false;
+        }
+        match self.parse_string_array() {
+            Some(values) => {
+                skills.extend(values);
+                true
+            }
+            None => false,
         }
     }
 
@@ -2549,6 +2591,7 @@ impl<'a> BodyParser<'a> {
             &mut requires,
             &mut timeout_seconds,
             &mut access_grants,
+            None,
         ) {
             return None;
         }
@@ -3851,6 +3894,7 @@ mod tests {
         let BodyEffectKind::Tell {
             target,
             access_grants,
+            ..
         } = &effect.kind
         else {
             panic!("expected tell");
@@ -3882,6 +3926,42 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("not supported yet")),
             "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn parses_tell_with_turn_scoped_skills() {
+        // `with skills [...]` interleaves with `with access to` around the prompt.
+        let ast = parse_ok(
+            "tell coder as turn\n  with skills [\"review\", \"lint\"]\n  with access to project_files {\n    read [\"src/**\"]\n  }\n\"Work it.\"",
+        );
+        let BodyStmt::Effect(effect) = &ast.statements[0] else {
+            panic!("expected effect");
+        };
+        let BodyEffectKind::Tell {
+            skills,
+            access_grants,
+            ..
+        } = &effect.kind
+        else {
+            panic!("expected tell");
+        };
+        assert_eq!(skills, &vec!["review".to_owned(), "lint".to_owned()]);
+        assert_eq!(
+            access_grants.len(),
+            1,
+            "access grant still parsed alongside"
+        );
+
+        // `invoke ... with skills` is NOT accepted (skills are tell-scoped).
+        let (_, diagnostics) = parse_rule_body(
+            "invoke Build { x task.x } with skills [\"a\"]",
+            0,
+            BodyMode::Rule,
+        );
+        assert!(
+            !diagnostics.is_empty(),
+            "invoke must reject a turn-scoped skills pin"
         );
     }
 

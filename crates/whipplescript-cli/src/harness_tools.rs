@@ -2438,6 +2438,24 @@ fn turn_file_access_from_input(input_json: &str) -> Result<TurnFileAccess, Strin
     Ok(turn_tool_access_from_input(input_json)?.file)
 }
 
+/// Turn-scoped skills pinned by `tell … with skills [...]` (context-assembly Phase
+/// 7), read from the tell effect input. Provenance only — recorded, not enforced.
+fn turn_pinned_skills_from_input(input_json: &str) -> Vec<String> {
+    serde_json::from_str::<Value>(input_json)
+        .ok()
+        .and_then(|input| {
+            input
+                .get("turn_skills")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
 fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, String> {
     let input = serde_json::from_str::<Value>(input_json)
         .map_err(|error| format!("owned turn input is not valid JSON: {error}"))?;
@@ -2799,6 +2817,9 @@ pub fn run_owned_agent_turn(
         // Per-bundle provenance for the assembled prompt; the runner records one
         // context.bundle evidence row each before the turn (Decision 5).
         context_bundles: assembled.bundles,
+        // Turn-scoped `with skills [...]` pins (Phase 7), carried on the tell effect
+        // input; recorded once as `skills.pinned` provenance by the runner.
+        pinned_skills: turn_pinned_skills_from_input(input_json),
     };
     let ctx = BrokeredTurnContext {
         instance_id,

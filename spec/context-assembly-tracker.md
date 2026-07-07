@@ -341,9 +341,17 @@ harness assemble context.
 
 ## Phase 7 — `tell … with skills [...]` parse
 
-- [ ] Build the turn-scoped `with skills [...]` parse (currently rejected). Rides
-  on the `agent.tell` effect as metadata (per `spec/skills.md`), pins skills into
-  the turn's provenance; does not filter the discover-all catalogue.
+**DONE 2026-07-07** (v0.3).
+
+- [x] `tell … with skills [...]` parses (was rejected): a turn modifier interleaving
+  with `with access to` around the prompt (`BodyEffectKind::Tell.skills`), tell-scoped
+  only (`invoke` rejects it). Rides on the `agent.tell` effect as metadata —
+  `IrEffectNode.turn_skills`, emitted into the effect input_json
+  (`effect_turn_skills_json`) and the `.ir` snapshot (appended only when set). The
+  owned turn reads it (`turn_pinned_skills_from_input`) and the runner records one
+  `skills.pinned` provenance row before the turn (fresh start only, like
+  `context.bundle`). **Provenance only** — the discover-all catalogue is unchanged.
+  Parser + IR + flow re-serialization + formatter round-trip tests.
 
 ---
 
